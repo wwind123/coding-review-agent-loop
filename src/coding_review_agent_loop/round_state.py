@@ -154,6 +154,10 @@ class PostedRoundMetadata:
     # Canonical bounded local-test evidence. Raw environments and identity
     # bytes are never persisted in this field.
     local_test_evidence: str | None = None
+    # Orchestrator-derived matrix evidence and bounded post-auth diagnostics.
+    # Execution handles are deliberately absent from this durable payload.
+    risk_test_matrix_evidence: dict | None = None
+    risk_test_matrix_diagnostics: tuple[dict, ...] = ()
     # Optional selective-intermediate scheduler audit fields. They are omitted
     # from legacy encodings unless a scheduler checkpoint actually wrote them.
     scheduler_contract: dict | None = None
@@ -1586,6 +1590,10 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             canonicalize_bounded_evidence(metadata.local_test_evidence)
             if metadata.local_test_evidence is not None else None
         ),
+        "risk_test_matrix_evidence": metadata.risk_test_matrix_evidence,
+        "risk_test_matrix_diagnostics": [
+            dict(item) for item in metadata.risk_test_matrix_diagnostics
+        ],
     }
     semantic_values = {
         "response_form": metadata.response_form,
@@ -1853,6 +1861,16 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             ),
             local_test_evidence=(
                 canonicalize_bounded_evidence(payload.get("local_test_evidence"))
+            ),
+            risk_test_matrix_evidence=(
+                payload.get("risk_test_matrix_evidence")
+                if isinstance(payload.get("risk_test_matrix_evidence"), dict)
+                else None
+            ),
+            risk_test_matrix_diagnostics=tuple(
+                dict(item)
+                for item in payload.get("risk_test_matrix_diagnostics", [])
+                if isinstance(item, dict)
             ),
             qualification_checkpoint=(
                 QualificationCheckpoint.from_mapping(payload["qualification_checkpoint"])

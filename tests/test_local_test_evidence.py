@@ -452,6 +452,16 @@ def test_broker_authenticates_turn_and_forwards_only_snapshot_environment(tmp_pa
             cwd=tmp_path,
         )
         assert result.outcome == "passed"
+        repeat = BrokerClient(environment).run(
+            [sys.executable, "-c", "pass"],
+            timeout_seconds=5,
+            cwd=tmp_path,
+        )
+        assert result.execution_ref and repeat.execution_ref
+        assert result.execution_ref != repeat.execution_ref
+        assert {
+            row["execution_ref"] for row in server.live_execution_catalog()
+        } == {result.execution_ref, repeat.execution_ref}
         forwarded = observed["environment"]
         assert isinstance(forwarded, dict)
         assert forwarded["AGENT_LOOP_INVOCATION_ID"] == "turn-761"

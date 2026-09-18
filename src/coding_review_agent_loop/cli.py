@@ -1275,7 +1275,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 else:
                     # The receipt is the only durable citation handle exposed to
-                    # the coder. The parent owns the observation journal.
+                    # the coder. The execution_ref is only an invocation-local
+                    # semantic selector; the parent owns the journal and later
+                    # converts a selected observation into the receipt citation.
+                    if broker_result.execution_ref:
+                        print(
+                            f"agent-loop test execution_ref: {broker_result.execution_ref}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     print(
                         f"agent-loop test observation receipt: {broker_result.receipt_id}",
                         file=sys.stderr,

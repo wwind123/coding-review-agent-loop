@@ -765,6 +765,7 @@ def _validate_coder_followup_response(
     required_risk_test_matrix_contract: int = 0,
     authoritative_test_observations=None,
     delivered_risk_test_matrix_row_ids=None,
+    execution_catalog=None,
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -775,6 +776,7 @@ def _validate_coder_followup_response(
         required_risk_test_matrix_contract=required_risk_test_matrix_contract,
         authoritative_test_observations=authoritative_test_observations,
         delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
+        execution_catalog=execution_catalog,
     )
     if structured_followup is not None:
         _validate_structured_coder_followup_items(

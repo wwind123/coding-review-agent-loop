@@ -231,6 +231,8 @@ You are a format-repair assistant. An AI agent produced an initial plan state, c
 
 {expected_kind_instruction}
 
+{semantic_evidence_instruction}
+
 {issue_implementation_instruction}
 
 {coder_followup_required_items_instruction}
@@ -1327,6 +1329,15 @@ def _build_repair_prompt(
         if expected_kind is not None
         else "## Expected response kind:\nNo expected response kind was provided; choose from the format-selection rules.\n"
     )
+    semantic_evidence_instruction = (
+        "## Semantic implementation evidence boundary:\n"
+        "For `issue_implementation` and `coder_followup`, repair only bounded semantic "
+        "coverage claims. Claims may select approved row IDs and current-turn execution_ref "
+        "handles plus test facts and caveats. Do not generate or preserve matrix identities, "
+        "canonical rows, receipt IDs/citations, mappings, statuses, ordering, or a final "
+        "risk-test evidence envelope. Fresh legacy evidence fields are removed.\n"
+        if expected_kind in {"issue_implementation", "coder_followup"} else ""
+    )
     fresh_contract_instruction = (
         "This is a fresh generation-1 planning response. Preserve the complete, mechanically "
         "recovered execution_strategy_contract_version and execution_recommendation exactly; "
@@ -1378,6 +1389,7 @@ def _build_repair_prompt(
             "The complete-marker grammar and a bare identifier are not interchangeable. "
             "Keep the required response footer and signature intact.\n"
         )),
+        ("{semantic_evidence_instruction}", semantic_evidence_instruction),
         ("{issue_implementation_instruction}", issue_implementation_instruction),
         ("{coder_followup_required_items_instruction}", coder_followup_required_items_instruction),
         ("{coder_followup_human_requirements_instruction}", coder_followup_human_requirements_instruction),
@@ -1418,7 +1430,8 @@ def _issue_implementation_instruction(
     return (
         "## Issue implementation repair rules:\n"
         "Repair only the issue_implementation envelope. Preserve `summary`, `pr_number`, "
-        "`tests_run`, `test_observations`, and the meaning of every disposition; do not invent a PR identity. "
+        "`tests_run`, semantic `risk_test_matrix_claims`, and the meaning of every disposition; do not invent a PR identity. "
+        "Remove fresh `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, and other legacy evidence-envelope fields instead of recreating them. "
         + requirement_rule
         + " A positive PR with a blocked disposition remains a terminal conflict after repair; "
         "do not relabel or silently remove that blocker.\n"

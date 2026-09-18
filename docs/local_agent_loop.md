@@ -354,6 +354,37 @@ history for coders and reviewers, including same-head and changed-head resume;
 it cannot replace GitHub CI, override configured gates, or turn every
 historical intermediate failure into a permanent blocker.
 
+#### Semantic matrix claims and derived evidence
+
+When an approved plan has an applicable risk matrix, implementation and
+follow-up responses submit only bounded `risk_test_matrix_claims`. Each claim
+uses an approved `row_id`, one or more opaque `execution_ref` selectors from
+the current broker turn, actual test identifiers and locations, semantic
+workflow/outcome/forbidden-effect assertions, and optional caveats. Selectors
+are unique to the live invocation and repeated commands receive different
+selectors; they are not receipt IDs and are never durable authority.
+
+After the issue PR is authenticated at its exact pushed head, or after a
+follow-up head is fetched and reconciled, the orchestrator's shared builder
+derives the canonical `risk_test_matrix_evidence`. It supplies the approved
+matrix identity and rows, deterministic ordering, receipt citations, and
+statuses from the closed selector catalog plus the complete authoritative
+journal. Only an authoritative passing observation bound to the current
+invocation and exact eventual head/tree can verify a row. Failed, timed-out,
+stale, cross-turn, wrong-tree, unbound, and restart-limited observations stay
+uncited with explicit non-verified caveats; a passing subset cannot erase an
+unsuperseded broader failure. Every enforceable row is retained, while
+not-applicable rows create no coder obligation.
+
+The derived object and bounded diagnostics are carried through public comments,
+review context, round metadata, retry, and idempotent replay. Execution
+selectors are not persisted as receipt authority. Missing or malformed claims
+trigger bounded semantic correction that preserves the committed work and
+authenticated PR; it never asks repair to recreate rows, identities, receipts,
+mappings, statuses, or an evidence envelope. If correction is exhausted or a
+head race occurs, the same PR remains resumable with complete non-verified
+evidence. Planned tests and unverified command text remain non-evidence.
+
 Fix a GitHub issue:
 
 ```bash

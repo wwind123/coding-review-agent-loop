@@ -2228,6 +2228,53 @@ def test_validate_structured_coder_followup_accepts_v1_payload():
     assert parsed.remaining_item_notes == {}
 
 
+def test_semantic_matrix_claims_use_current_turn_execution_refs_only():
+    payload = {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "Implemented the change.",
+        "pr_number": 77,
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "risk_test_matrix_claims": [{
+            "row_id": "row-1",
+            "execution_refs": ["turn:observation-1"],
+            "test_identifiers": ["test_protocol"],
+            "test_locations": ["tests/test_protocol.py"],
+            "workflow_path_claim": "The implementation path ran.",
+            "outcome_assertions": ["The test passed."],
+            "forbidden_effect_assertions": ["No evidence was invented."],
+            "caveats": [],
+        }],
+    }
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    parsed = validate_structured_issue_implementation(
+        text,
+        delivered_risk_test_matrix_row_ids=["row-1"],
+        execution_catalog=[{
+            "execution_ref": "turn:observation-1",
+            "outcome": "passed",
+            "provenance": "parent-observed",
+        }],
+    )
+    assert parsed is not None
+    assert parsed.risk_test_matrix_claims is not None
+    assert parsed.risk_test_matrix_claims.claims[0].execution_refs == ("turn:observation-1",)
+
+    payload["risk_test_matrix_claims"][0]["execution_refs"] = ["other-turn:observation-1"]
+    with pytest.raises(Exception, match="unknown or cross-turn"):
+        validate_structured_issue_implementation(
+            json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            delivered_risk_test_matrix_row_ids=["row-1"],
+            execution_catalog=[{
+                "execution_ref": "turn:observation-1",
+                "outcome": "passed",
+                "provenance": "parent-observed",
+            }],
+        )
+
+
 def test_validate_structured_coder_followup_accepts_exact_test_observation_shape():
     payload = json.dumps({
         "schema_version": 1, "kind": "coder_followup", "state": "blocking",

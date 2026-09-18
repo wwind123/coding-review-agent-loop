@@ -15,6 +15,9 @@ from coding_review_agent_loop.comment_rendering import (
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.protocol import (
     RiskTestMatrixChange,
+    SemanticRiskCoverageClaim,
+    SemanticRiskCoverageClaims,
+    derive_risk_test_matrix_evidence,
     parse_risk_test_matrix,
     parse_risk_test_matrix_evidence,
     risk_test_matrix_identity,
@@ -69,6 +72,106 @@ def _not_applicable() -> dict[str, object]:
         "important_exclusions": [],
         "not_applicable_rationale": "This is a local formatting-only change with no stateful entry path.",
     }
+
+
+def _derived_observation(
+    *,
+    execution_ref: str,
+    receipt_id: str,
+    outcome: str = "passed",
+    turn_id: str = "turn-current",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        execution_ref=execution_ref,
+        receipt_id=receipt_id,
+        command=("python3", "-m", "pytest", "tests/test_protocol.py", "-q"),
+        normalized_command="python3 -m pytest tests/test_protocol.py -q",
+        outcome=outcome,
+        provenance="parent-observed",
+        turn_id=turn_id,
+        attribution={
+            "state": "current-head",
+            "head": "head-current",
+            "tracked_digest": "tree-current",
+            "stable": True,
+            "untracked_input": False,
+            "caveats": [],
+        },
+        environment_state="not-compared",
+        superseded_by=None,
+        caveats=(),
+        wrapper_bootstrap="verified",
+        inner_exec="started",
+        suite_start="verified",
+    )
+
+
+def test_derived_matrix_evidence_is_complete_and_selector_citations_are_tool_owned() -> None:
+    matrix = parse_risk_test_matrix({
+        **_matrix(),
+        "rows": [_row("row-first"), _row("row-second")],
+    })
+    observation = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-1")
+    claims = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-first",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=("test_first",),
+        test_locations=("tests/test_protocol.py::test_first",),
+        workflow_path_claim="The first workflow path ran.",
+        outcome_assertions=("The first test passed.",),
+        forbidden_effect_assertions=("No unauthorized evidence was accepted.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+    assert result.evidence.rows[0].status == "verified"
+    assert result.evidence.rows[0].evidence_citations[0].receipt_id == "receipt-1"
+    assert result.evidence.rows[1].status == "missing"
+    assert result.diagnostics[0].code == "missing-claim"
+    assert "execution_ref" not in result.evidence.to_payload()["rows"][0]["evidence_citations"][0]
+
+
+def test_derived_matrix_evidence_preserves_unsuperseded_failure_caveat() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    passing = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-pass")
+    failed = _derived_observation(
+        execution_ref="invocation:observation-2",
+        receipt_id="receipt-fail",
+        outcome="failed",
+    )
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_protocol.py::test_ordinary",),
+        workflow_path_claim="The workflow path ran.",
+        outcome_assertions=("The selected test passed.",),
+        forbidden_effect_assertions=("No stale head was merged.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=(passing, failed),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    row = result.evidence.rows[0]
+    assert row.status == "incomplete"
+    assert any("unsuperseded" in caveat for caveat in row.caveats)
+    assert any(diagnostic.code == "unsuperseded-journal-failure" for diagnostic in result.diagnostics)
 
 
 def test_m780_01_matrix_is_bounded_and_rendered_from_structured_payload() -> None:

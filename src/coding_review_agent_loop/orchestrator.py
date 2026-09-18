@@ -263,6 +263,7 @@ from .protocol import (
     ReviewItemDisposition,
     StructuredCoderFollowup,
     StructuredIssueImplementation,
+    DerivedRiskEvidenceResult,
     StructuredPlanState,
     StructuredPlanRevision,
     PlanRevisionPatch,
@@ -292,6 +293,7 @@ from .protocol import (
     validate_structured_plan_revision_patch,
     validate_risk_test_matrix_revision,
     validate_structured_task_result,
+    derive_risk_test_matrix_evidence,
     risk_test_matrix_identity,
     validate_structured_discuss_agenda,
     parse_structured_discuss_final_synthesis,
@@ -322,6 +324,10 @@ from .repair_preservation import (
     validate_repair_preservation,
 )
 from .runner import Runner
+from .local_test_evidence import (
+    reconcile_test_observations,
+    stable_tracked_tree_snapshot,
+)
 from .salvage import (
     SalvageArtifacts,
     SalvageContext,
@@ -4028,6 +4034,7 @@ def _validate_issue_implementation_response(
     require_risk_test_matrix_contract: bool = False,
     authoritative_test_observations=None,
     delivered_risk_test_matrix_row_ids=None,
+    execution_catalog=None,
 ) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
@@ -4041,6 +4048,7 @@ def _validate_issue_implementation_response(
             required_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
             authoritative_test_observations=authoritative_test_observations,
             delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
+            execution_catalog=execution_catalog,
         )
     except IssueImplementationConflictError as exc:
         parsed = exc.payload
@@ -4056,6 +4064,68 @@ def _validate_issue_implementation_response(
         )
     _validate_issue_implementation_contract(parsed, human_requirements=human_requirements)
     return parsed
+
+
+def _derive_authenticated_risk_evidence_for_coder(
+    parsed: StructuredIssueImplementation | StructuredCoderFollowup,
+    *,
+    approved_plan_context: ApprovedPlanContext | None,
+    runner: Runner,
+    assigned_workdir: Path,
+    head_sha: str | None,
+) -> tuple[StructuredIssueImplementation | StructuredCoderFollowup, DerivedRiskEvidenceResult | None]:
+    """Attach canonical evidence only after the PR head is authenticated."""
+    if approved_plan_context is None or not approved_plan_context.matrix_available:
+        return parsed, None
+    matrix_payload = approved_plan_context.risk_test_matrix_payload
+    identity = approved_plan_context.risk_test_matrix_identity
+    if matrix_payload is None or identity is None:
+        return parsed, None
+    observations = tuple(runner.local_test_observations())
+    try:
+        snapshot = stable_tracked_tree_snapshot(assigned_workdir)
+    except Exception:
+        snapshot = None
+    reconciled = reconcile_test_observations(
+        observations,
+        current_head=head_sha,
+        current_snapshot=snapshot,
+        cwd=assigned_workdir,
+    )
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix_payload,
+        claims=parsed.risk_test_matrix_claims,
+        observations=reconciled.observations,
+        invocation_id=runner.latest_test_turn_id,
+        current_head=head_sha,
+        current_tree_digest=(snapshot.tracked_digest if snapshot is not None else None),
+        expected_identity=identity,
+    )
+    # Historical responses may still carry a canonical evidence object. It is
+    # never used for identity, status, ordering, mappings, or citations, but
+    # its bounded caveat prose remains useful as explicitly non-authoritative
+    # context while the fresh builder emits the real row status.
+    if parsed.risk_test_matrix_evidence is not None and parsed.risk_test_matrix_claims is None:
+        legacy_caveats = {
+            row.row_id: row.caveats
+            for row in parsed.risk_test_matrix_evidence.rows
+        }
+        derived_rows = tuple(
+            dataclasses_replace(
+                row,
+                caveats=tuple(dict.fromkeys((*row.caveats, *legacy_caveats.get(row.row_id, ())))),
+            )
+            for row in result.evidence.rows
+        )
+        result = dataclasses_replace(
+            result,
+            evidence=dataclasses_replace(result.evidence, rows=derived_rows),
+        )
+    return dataclasses_replace(
+        parsed,
+        risk_test_matrix_evidence=result.evidence,
+        risk_test_matrix_diagnostics=result.diagnostics,
+    ), result
 
 
 def _post_no_pr_implementation_terminal_comment(
@@ -7177,6 +7247,7 @@ def _implement_approved_issue(
                 approved_plan_context is not None and approved_plan_context.matrix_available
             ),
             authoritative_test_observations=runner.local_test_observations(),
+            execution_catalog=runner.local_test_observations(),
             delivered_risk_test_matrix_row_ids=(
                 approved_plan_context.risk_test_matrix_expected_row_ids
                 if approved_plan_context is not None and approved_plan_context.matrix_available
@@ -7385,6 +7456,13 @@ def _implement_approved_issue(
                 if execution_identity is not None else None
             ),
         )
+    implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
+        implementation_result,
+        approved_plan_context=approved_plan_context,
+        runner=runner,
+        assigned_workdir=active_workdir(implementation_config),
+        head_sha=initial_pr_context.metadata.head_sha,
+    )
     initial_local_test_evidence = runner.render_local_test_evidence(
         current_head=initial_pr_context.metadata.head_sha,
         legacy_tests_run=implementation_result.tests_run,
@@ -7409,6 +7487,15 @@ def _implement_approved_issue(
             prior_items=(),
             raw_structured_coder_response=coder_output,
             local_test_evidence=initial_local_test_evidence,
+            risk_test_matrix_evidence=(
+                implementation_result.risk_test_matrix_evidence.to_payload()
+                if implementation_result.risk_test_matrix_evidence is not None
+                else None
+            ),
+            risk_test_matrix_diagnostics=tuple(
+                diagnostic.to_payload()
+                for diagnostic in implementation_result.risk_test_matrix_diagnostics
+            ),
             model_used=coder_response.model_used,
             **_metadata_identity_fields(coder_response),
             **_architecture_metadata_fields(
@@ -10326,6 +10413,13 @@ def run_issue_loop(
             plan_hash=None,
             expected_closing_issue_ids=closing_contract.issue_ids,
         )
+        implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
+            implementation_result,
+            approved_plan_context=None,
+            runner=runner,
+            assigned_workdir=active_workdir(config),
+            head_sha=initial_pr_metadata.head_sha,
+        )
         initial_local_test_evidence = runner.render_local_test_evidence(
             current_head=initial_pr_metadata.head_sha,
             legacy_tests_run=implementation_result.tests_run,
@@ -10350,6 +10444,15 @@ def run_issue_loop(
                 prior_items=(),
                 raw_structured_coder_response=coder_output,
                 local_test_evidence=initial_local_test_evidence,
+                risk_test_matrix_evidence=(
+                    implementation_result.risk_test_matrix_evidence.to_payload()
+                    if implementation_result.risk_test_matrix_evidence is not None
+                    else None
+                ),
+                risk_test_matrix_diagnostics=tuple(
+                    diagnostic.to_payload()
+                    for diagnostic in implementation_result.risk_test_matrix_diagnostics
+                ),
                 model_used=coder_response.model_used,
                 **_metadata_identity_fields(coder_response),
                 acquisition_outcome=coder_response.acquisition_outcome,
@@ -16488,6 +16591,7 @@ def run_pr_loop(
                         else 0
                     ),
                     authoritative_test_observations=runner.local_test_observations(),
+                    execution_catalog=runner.local_test_observations(),
                     delivered_risk_test_matrix_row_ids=(
                         approved_plan_context.risk_test_matrix_expected_row_ids
                         if approved_plan_context is not None and approved_plan_context.matrix_available
@@ -16565,6 +16669,20 @@ def run_pr_loop(
                 unresolved_items,
                 current_head_sha=updated_pr_context.metadata.head_sha,
             )
+            if isinstance(coder_response.marker_value, StructuredCoderFollowup):
+                derived_followup, _followup_derived_risk_evidence = (
+                    _derive_authenticated_risk_evidence_for_coder(
+                        coder_response.marker_value,
+                        approved_plan_context=approved_plan_context,
+                        runner=runner,
+                        assigned_workdir=active_workdir(config),
+                        head_sha=updated_pr_context.metadata.head_sha,
+                    )
+                )
+                coder_response = dataclasses_replace(
+                    coder_response,
+                    marker_value=derived_followup,
+                )
             local_test_evidence = runner.render_local_test_evidence(
                 current_head=updated_pr_context.metadata.head_sha,
                 legacy_tests_run=(
@@ -16619,6 +16737,20 @@ def run_pr_loop(
                 prior_items=tuple(unresolved_items),
                 raw_structured_coder_response=raw_structured_coder_response,
                 local_test_evidence=local_test_evidence,
+                risk_test_matrix_evidence=(
+                    coder_response.marker_value.risk_test_matrix_evidence.to_payload()
+                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                    and coder_response.marker_value.risk_test_matrix_evidence is not None
+                    else None
+                ),
+                risk_test_matrix_diagnostics=(
+                    tuple(
+                        diagnostic.to_payload()
+                        for diagnostic in coder_response.marker_value.risk_test_matrix_diagnostics
+                    )
+                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                    else ()
+                ),
                 compact_prior_summaries=tuple(pr_compact_prior_summaries),
                 model_used=coder_response.model_used,
                 acquisition_outcome=coder_response.acquisition_outcome,

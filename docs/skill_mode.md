@@ -54,10 +54,17 @@ For stateful or multi-mode work, a fresh plan can require generation 1 with
 applicable rows or a proportionate not-applicable rationale. The structured
 payload is carried in round metadata and sidecars, while the rendered matrix is
 only a projection; renderer drift does not replace or invalidate authenticated
-matrix semantics. Coder and PR-review prompts receive the semantic rows first,
-and implementation/follow-up evidence must map each delivered row to the
-intended workflow test, preserving incomplete and receipt caveats. Historical
-plans without a matrix remain compatible. Use
+matrix semantics. Coder and PR-review prompts receive the approved semantic
+rows first. Fresh implementation and follow-up turns submit bounded semantic
+coverage claims using current-turn `execution_ref` selectors; the orchestrator,
+after exact PR head/tree authentication, derives canonical rows, identities,
+mappings, statuses, and receipt citations. Historical accepted canonical
+evidence remains readable for resume, but selectors are ephemeral and cannot be
+reused after a restart. Bounded repair removes legacy canonical fields and
+corrects only row or execution claims, preserving the same PR when derivation
+is incomplete. Failed, timed-out, stale, and incomplete observations remain
+caveats, and planned tests or unverified commands are never evidence.
+Historical plans without a matrix remain compatible. Use
 `helpers.validate_response` or `helpers.render_response` with
 `--require-risk-test-matrix-contract` when explicitly checking a fresh matrix
 contract.
