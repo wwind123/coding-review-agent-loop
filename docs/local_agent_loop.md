@@ -3459,6 +3459,19 @@ sentinel. Metadata coverage does not hide precise row-operation entries.
 The assembled canonical JSON, aggregate identity, response form, base binding,
 and raw patch provenance can be carried in round metadata. The canonical
 sidecar is the restart authority; raw patch text cannot be reparsed as state.
-This phase does not activate semantic prompts or retrofit old records. Prompt
-pinning, eligibility, bounded repair, and prospective publication seeding are
-the activation phase's responsibility.
+Fresh validated full-state planning and newly produced legacy-form full-state
+revisions are seeded at publication with an authenticated sidecar and
+aggregate identity. The first eligible unapproved revision is pinned to
+`semantic-patch-v1`; the pin survives full/compact prompts, retries, and
+restart. The model receives the canonical plan as read-only context and emits
+only bounded semantic decisions. Publication hydrates the sidecar, assembles
+the generation-1 object, validates it, and renders the existing Markdown
+surface.
+
+Historical and already-started legacy rounds remain pinned to their original
+form. Matrix-less history does not acquire fabricated matrix obligations, and
+old records are never backfilled with sidecars. Missing, partial, conflicting,
+or identity-mismatched hydration fails closed before prompting, assembly, or
+publication. Repair is limited to envelope presentation before assembly and
+must preserve the semantic patch, rationale, operation ordering, and base
+binding exactly.

@@ -67,6 +67,7 @@ from .protocol import (
     sanitize_risk_test_matrix,
     parse_plan_revision_patch,
 )
+from .plan_assembly import decode_assembled_plan_sidecar
 from .review_scheduling import ReviewSchedulingContract, SCHEDULER_PHASES
 from .unresolved_items import _apply_unresolved_item_dispositions
 
@@ -2965,7 +2966,42 @@ def _resume_plan_round(
     coder_output = latest_coder_record.metadata.raw_structured_coder_response or current_plan
     metadata_version = latest_coder_record.metadata.execution_strategy_contract_version
     matrix_metadata_version = latest_coder_record.metadata.risk_test_matrix_contract_version
-    if metadata_version == 1:
+    semantic_response_form = latest_coder_record.metadata.response_form
+    if semantic_response_form == "semantic-patch-v1":
+        # Semantic rounds resume from the authenticated assembled sidecar. The
+        # raw model patch is provenance only and is never reparsed into the
+        # canonical plan used by prompts or reviewers.
+        metadata = latest_coder_record.metadata
+        if metadata.assembled_plan_sidecar is None or metadata.canonical_plan is None:
+            raise AgentLoopError(
+                "Semantic planning metadata is incomplete: authenticated assembled state "
+                "and canonical Markdown are both required for restart."
+            )
+        try:
+            sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+            if sidecar.response_form != "semantic-patch-v1":
+                raise AgentLoopError("semantic sidecar response form mismatch")
+            if sidecar.round_number != metadata.round_number:
+                raise AgentLoopError("semantic sidecar round mismatch")
+            if metadata.aggregate_plan_identity != sidecar.aggregate_identity:
+                raise AgentLoopError("semantic sidecar aggregate identity mismatch")
+            patch = parse_plan_revision_patch(metadata.raw_patch_provenance or {})
+            if patch.base_round_number != metadata.base_round_number:
+                raise AgentLoopError("semantic patch base round mismatch")
+            if patch.base_state_identity != metadata.base_state_identity:
+                raise AgentLoopError("semantic patch base identity mismatch")
+            if sidecar.raw_patch != patch.to_payload():
+                raise AgentLoopError("semantic sidecar patch provenance mismatch")
+        except (AgentLoopError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise AgentLoopError(
+                "Authenticated semantic planning state is missing or contradictory; "
+                "refusing to prompt from raw patch text."
+            ) from exc
+        if _plan_subject(metadata.canonical_plan) != metadata.subject:
+            raise AgentLoopError(
+                "Semantic planning metadata subject does not match canonical Markdown."
+            )
+    if metadata_version == 1 and semantic_response_form != "semantic-patch-v1":
         # A generation-1 plan is identified by its canonical rendered text.
         # Never resume a record whose subject was computed from a different
         # representation (for example, raw host JSON versus rendered plan

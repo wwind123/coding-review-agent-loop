@@ -2731,6 +2731,92 @@ needed for this response.
 """
 
 
+def _build_semantic_plan_revision_prompt(
+    issue_number: int,
+    round_number: int,
+    previous_plan: str,
+    review: str,
+    config: AgentLoopConfig,
+    *,
+    memory: AgentMemoryContext | None,
+    issue_context: IssueContext | None,
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    base_round_number: int,
+    base_state_identity: str,
+    plan_validation_diagnostic: object | None,
+) -> str:
+    """Prompt for the revision-only semantic contract.
+
+    The prior canonical plan is authenticated context, not a response target.
+    The model returns only decisions; assembly supplies the generation-1 wire
+    object and all derived metadata.
+    """
+    coder_signature = agent_signature(config.coder, config, role="coder")
+    unresolved_items_block = _format_unresolved_plan_items(unresolved_items)
+    human_requirements_context = _issue_human_requirements_prompt_context(
+        issue_context,
+        requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+        config=config,
+    )
+    return f"""Revise the implementation plan for GitHub issue #{issue_number} in {config.repo}.
+
+This is an eligible unapproved planning revision. Return the semantic patch
+contract `plan_revision_patch` v1 only. Do not echo the prior canonical plan,
+unchanged matrix rows, execution metadata, architecture metadata, closing
+declarations, or audit records. Deterministic code will hydrate the
+authenticated base and assemble the complete generation-1 plan.
+
+{_coder_workdir_guidance(config, implementation=False)}
+{_scratch_file_guidance()}
+{human_requirements_context.block}
+{_issue_context_block(issue_context)}
+{_memory_block(memory, config, include_runtime=True)}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
+
+Authenticated base binding:
+- base_round_number: {base_round_number}
+- base_state_identity: {base_state_identity}
+
+Current canonical plan (read-only context):
+
+{previous_plan}
+
+Blocking plan review payload:
+
+{review}
+
+{unresolved_items_block}
+
+Use this exact response shape. `summary` describes this response and does not
+change canonical plan state. Include every prior plan item disposition exactly
+once. Use complete replacement values for whole-field `replace` operations and
+complete rows for matrix operations. Never write derived fields such as
+schema versions, identities, ordering, sidecars, or audits.
+
+{{
+  "schema_version": 1,
+  "kind": "plan_revision_patch",
+  "semantic_patch_contract_version": 1,
+  "state": "blocking",
+  "summary": "Changed the plan decisions required by the blocking review.",
+  "prior_plan_item_dispositions": [],
+  "base_round_number": {base_round_number},
+  "base_state_identity": "{base_state_identity}",
+  "operations": [
+    {{"op": "replace", "field": "plan_steps", "value": ["Complete step"]}}
+  ]
+}}
+<!-- AGENT_PLAN_STATE: blocking -->
+-- {coder_signature}
+
+Operations are applied atomically and simultaneously. The patch must contain
+at least one real change, and its binding must match the authenticated values
+above exactly. Repair may fix only response-envelope presentation; it cannot
+invent or rewrite semantic operations.
+"""
+
+
 def build_plan_revision_prompt(
     issue_number: int,
     round_number: int,
@@ -2746,8 +2832,27 @@ def build_plan_revision_prompt(
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     require_risk_test_matrix_contract: bool = True,
     plan_validation_diagnostic: object | None = None,
+    response_form: str | None = None,
+    base_round_number: int | None = None,
+    base_state_identity: str | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
+    if response_form == "semantic-patch-v1":
+        if base_round_number is None or base_state_identity is None:
+            raise ValueError("semantic-patch-v1 prompts require an authenticated base binding")
+        return _build_semantic_plan_revision_prompt(
+            issue_number,
+            round_number,
+            previous_plan,
+            review,
+            config,
+            memory=memory,
+            issue_context=issue_context,
+            unresolved_items=unresolved_items,
+            base_round_number=base_round_number,
+            base_state_identity=base_state_identity,
+            plan_validation_diagnostic=plan_validation_diagnostic,
+        )
     if compact_context:
         return _build_compact_plan_revision_prompt(
             issue_number,

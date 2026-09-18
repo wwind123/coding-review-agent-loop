@@ -13,7 +13,7 @@ from .protocol_markers import historical_text_fragments
 
 
 _KINDS = {
-    "pr_review", "plan_review", "plan_revision", "plan_state",
+    "pr_review", "plan_review", "plan_revision", "plan_revision_patch", "plan_state",
     "coder_followup", "issue_implementation",
     "task_result",
 }
@@ -201,6 +201,17 @@ def validate_repair_preservation(
         return
     if source.get("kind") != target.get("kind"):
         return  # Kind selection belongs to the caller's schema/context validator.
+
+    # A semantic patch is the complete bounded decision set. Repair can fix
+    # only its envelope/footer; it must not invent or rewrite operations,
+    # rationales, or authenticated base bindings.
+    if source["kind"] == "plan_revision_patch":
+        if source != target:
+            raise AgentLoopError(
+                "Repair content preservation failed for plan_revision_patch: "
+                "semantic operations and base binding must be preserved exactly."
+            )
+        return
 
     def require(condition: bool, field: str) -> None:
         if not condition:

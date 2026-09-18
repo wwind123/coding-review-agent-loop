@@ -257,6 +257,7 @@ from coding_review_agent_loop.salvage import (
     post_salvage_comment,
 )
 from coding_review_agent_loop.runner import CommandResult
+from coding_review_agent_loop.plan_assembly import AuthenticatedPlanState
 from agent_loop_helpers import (
     FakeRunner as _FakeRunner,
     command_index,
@@ -2649,6 +2650,65 @@ def test_issue_loop_plan_revision_stores_raw_structured_metadata(tmp_path):
     assert match is not None
     metadata = _decode_round_metadata(match.group("payload"))
     assert metadata.raw_structured_coder_response == raw_structured_revision
+
+
+def test_issue_loop_activates_semantic_revision_from_fresh_authenticated_base(tmp_path):
+    fresh = structured_v1_plan_state()
+    parsed = validate_structured_plan_state(fresh)
+    base = AuthenticatedPlanState.from_plan(parsed, round_number=1)
+    patch = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Apply the reviewed semantic decision.",
+        "prior_plan_item_dispositions": [
+            {"item_id": "item-1", "disposition": "resolved"}
+        ],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "summary", "value": "Revised semantic plan."}
+        ],
+    }
+    patch_text = (
+        json.dumps(patch)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = FakeRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking", blocking_plan_issues=["Review the plan."]
+            ),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+    )
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(tmp_path, max_rounds=3, plan_execution_mode="plan-only"),
+        plan_first=True,
+    ) == 0
+
+    raw_comment = runner.issue_comments[2]["body"]
+    match = re.search(
+        r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+        raw_comment,
+    )
+    assert match is not None
+    metadata = _decode_round_metadata(match.group("payload"))
+    assert metadata.response_form == "semantic-patch-v1"
+    assert metadata.base_state_identity == base.state_identity
+    assert metadata.raw_patch_provenance == patch
+    assert metadata.assembled_plan_sidecar is not None
+    assert "Revised semantic plan." in runner.comments[2]
 
 def test_issue_loop_plan_revision_rejects_missing_human_requirements_acknowledgement(tmp_path):
     runner = FakeRunner(

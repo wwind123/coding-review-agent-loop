@@ -106,7 +106,7 @@ def strip_unknown_prior_item_dispositions(
 
 def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> str | None:
     """Trim envelope-only trailing material without changing structured JSON."""
-    if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "coder_followup", "issue_implementation", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
+    if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "plan_revision_patch", "coder_followup", "issue_implementation", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
         return None
 
     stripped = raw.lstrip()
@@ -127,7 +127,7 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
 
     json_text = stripped[:json_end].rstrip()
     trailing = stripped[json_end:]
-    state_re = PLAN_STATE_RE if expected_kind in {"plan_state", "plan_review", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation"} else STATE_RE
+    state_re = PLAN_STATE_RE if expected_kind in {"plan_state", "plan_review", "plan_revision", "plan_revision_patch", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation"} else STATE_RE
     state_match = state_re.search(trailing)
     if state_match is None:
         return None
@@ -164,7 +164,7 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
             preserved_before = before_lstripped[: marker_match.end()].strip()
         elif before_footer.strip():
             return None
-    elif expected_kind in {"plan_state", "plan_revision"} and before_footer.strip():
+    elif expected_kind in {"plan_state", "plan_revision", "plan_revision_patch"} and before_footer.strip():
         parsed_human_requirements = parse_human_requirements_acknowledgement(before_footer)
         if (
             parsed_human_requirements.marker_present
@@ -1181,7 +1181,7 @@ Output ONLY the repaired response. No explanations.
 {raw_response}"""
 
 _REPAIR_MODEL = "gemini-3.1-flash-lite"
-_SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_followup", "issue_implementation", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation"}
+_SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_followup", "issue_implementation", "plan_revision", "plan_revision_patch", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation"}
 RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
