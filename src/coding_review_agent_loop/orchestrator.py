@@ -4199,13 +4199,10 @@ def _current_plan_has_complete_human_requirement_dispositions(
                 patch = validate_structured_plan_revision_patch(coder_output)
                 if patch is None:
                     return False
-                dispositions = None
-                for operation in patch.operations:
-                    if operation.op == "replace" and operation.field == "human_requirement_dispositions":
-                        dispositions = operation.value
-                        break
-                if dispositions is None:
-                    dispositions = inherited_dispositions
+                dispositions = _effective_plan_revision_patch_dispositions(
+                    patch,
+                    inherited_dispositions,
+                )
                 if dispositions is None:
                     return False
                 validate_human_requirement_dispositions(
@@ -4224,6 +4221,22 @@ def _current_plan_has_complete_human_requirement_dispositions(
     except AgentLoopError:
         return False
     return True
+
+
+def _effective_plan_revision_patch_dispositions(
+    patch: PlanRevisionPatch,
+    inherited_dispositions: Sequence[object] | None,
+) -> object | None:
+    """Return the dispositions that semantic assembly will publish.
+
+    Omission means preserve the authenticated base. Treating omission as an
+    empty list would reject an unrelated edit and encourage a payload-identical
+    no-op replacement of a field the patch does not own.
+    """
+    for operation in patch.operations:
+        if operation.op == "replace" and operation.field == "human_requirement_dispositions":
+            return operation.value
+    return inherited_dispositions
 
 
 def _merge_human_requirements(
@@ -4411,13 +4424,10 @@ def _validate_plan_revision_patch_response(
         surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
         requires_direct_discussion_ack=requirements_context.requires_direct_discussion_ack,
     )
-    dispositions = None
-    for operation in parsed.operations:
-        if operation.op == "replace" and operation.field == "human_requirement_dispositions":
-            dispositions = operation.value
-            break
-    if dispositions is None:
-        dispositions = inherited_human_requirement_dispositions
+    dispositions = _effective_plan_revision_patch_dispositions(
+        parsed,
+        inherited_human_requirement_dispositions,
+    )
     if dispositions is None:
         dispositions = ()
     validate_human_requirement_dispositions(

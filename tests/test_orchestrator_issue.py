@@ -2756,6 +2756,24 @@ def test_semantic_revision_inherits_signed_requirement_dispositions(tmp_path):
         f"- Requirement {requirement.requirement_id}: the authenticated disposition remains valid.\n"
         "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     )
+    direct_patch_text = (
+        json.dumps({**patch, "prior_plan_item_dispositions": []})
+        + "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n"
+        f"- Requirement {requirement.requirement_id}: the authenticated disposition remains valid.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    validated_patch = orchestrator_module._validate_plan_revision_patch_response(
+        direct_patch_text,
+        human_requirements=(requirement,),
+        inherited_human_requirement_dispositions=base.plan.human_requirement_dispositions,
+    )
+    assert validated_patch.operations[0].field == "summary"
+    assert orchestrator_module._current_plan_has_complete_human_requirement_dispositions(
+        direct_patch_text,
+        surfaced_requirement_ids=(requirement.requirement_id,),
+        inherited_dispositions=base.plan.human_requirement_dispositions,
+    )
     runner = FakeRunner(
         issue_payload={
             "author": {"login": "maintainer"},

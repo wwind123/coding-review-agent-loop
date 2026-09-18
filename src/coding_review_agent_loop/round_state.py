@@ -2967,7 +2967,8 @@ def _resume_plan_round(
     metadata_version = latest_coder_record.metadata.execution_strategy_contract_version
     matrix_metadata_version = latest_coder_record.metadata.risk_test_matrix_contract_version
     semantic_response_form = latest_coder_record.metadata.response_form
-    if semantic_response_form == "semantic-patch-v1":
+    semantic_sidecar_authoritative = semantic_response_form == "semantic-patch-v1"
+    if semantic_sidecar_authoritative:
         # Semantic rounds resume from the authenticated assembled sidecar. The
         # raw model patch is provenance only and is never reparsed into the
         # canonical plan used by prompts or reviewers.
@@ -3001,7 +3002,7 @@ def _resume_plan_round(
             raise AgentLoopError(
                 "Semantic planning metadata subject does not match canonical Markdown."
             )
-    if metadata_version == 1 and semantic_response_form != "semantic-patch-v1":
+    if metadata_version == 1 and not semantic_sidecar_authoritative:
         # A generation-1 plan is identified by its canonical rendered text.
         # Never resume a record whose subject was computed from a different
         # representation (for example, raw host JSON versus rendered plan
