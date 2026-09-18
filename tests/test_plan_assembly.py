@@ -10,6 +10,7 @@ from coding_review_agent_loop.plan_assembly import (
     assemble_authenticated_plan_revision,
     decode_assembled_plan_sidecar,
     hydrate_authenticated_plan_state,
+    make_assembled_plan_sidecar,
     structured_plan_revision_to_payload,
 )
 from coding_review_agent_loop.protocol import (
@@ -274,6 +275,14 @@ def test_no_ops_stale_bases_approved_bases_and_sidecar_hydration_fail_closed() -
     with pytest.raises(AgentLoopError, match="unapproved"):
         assemble_authenticated_plan_revision(approved, _patch(approved, [{"op": "replace", "field": "summary", "value": "New."}]))
 
+    for result_round_number in (4, 3):
+        with pytest.raises(AgentLoopError, match="greater than the authenticated base round"):
+            assemble_authenticated_plan_revision(
+                state,
+                _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
+                result_round_number=result_round_number,
+            )
+
     _, sidecar = assemble_authenticated_plan_revision(
         state,
         _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
@@ -363,3 +372,73 @@ def test_semantic_round_metadata_rejects_partial_wrong_type_and_conflicting_auth
                 "base_round_number": None,
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("response_form", "wrong_kind"),
+    (
+        ("semantic-patch-v1", "plan_state"),
+        ("legacy-full-state", "plan_state"),
+        ("fresh-plan-state", "plan_revision"),
+    ),
+)
+def test_semantic_round_metadata_rejects_response_form_kind_mismatch(
+    response_form: str, wrong_kind: str
+) -> None:
+    state = _state(_base([_row("row-a")]))
+    _, revision_sidecar = assemble_authenticated_plan_revision(
+        state,
+        _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
+        result_round_number=5,
+    )
+    plan_state_payload = copy.deepcopy(revision_sidecar.canonical_json)
+    plan_state_payload["kind"] = "plan_state"
+    plan_state_payload.pop("prior_plan_item_dispositions", None)
+    fresh_sidecar = make_assembled_plan_sidecar(
+        plan_state_payload,
+        round_number=5,
+        response_form="fresh-plan-state",
+    )
+    valid_sidecar = {
+        "semantic-patch-v1": revision_sidecar,
+        "legacy-full-state": make_assembled_plan_sidecar(
+            revision_sidecar.canonical_json,
+            round_number=5,
+            response_form="legacy-full-state",
+        ),
+        "fresh-plan-state": fresh_sidecar,
+    }[response_form]
+    metadata = PostedRoundMetadata(
+        flow="plan",
+        role="coder",
+        agent="Codex",
+        round_number=5,
+        subject="subject",
+        response_form=response_form,
+        base_round_number=state.round_number if response_form == "semantic-patch-v1" else None,
+        base_state_identity=state.state_identity if response_form == "semantic-patch-v1" else None,
+        aggregate_plan_identity=valid_sidecar.aggregate_identity,
+        raw_patch_provenance=(
+            valid_sidecar.raw_patch if response_form == "semantic-patch-v1" else None
+        ),
+        assembled_plan_sidecar=valid_sidecar.to_payload(),
+    )
+    payload = decode_mapping(_encode_round_metadata(metadata))
+    wrong_payload = copy.deepcopy(payload)
+    wrong_canonical = copy.deepcopy(valid_sidecar.canonical_json)
+    wrong_canonical["kind"] = wrong_kind
+    if wrong_kind == "plan_state":
+        wrong_canonical.pop("prior_plan_item_dispositions", None)
+    else:
+        wrong_canonical["prior_plan_item_dispositions"] = []
+    wrong_sidecar = make_assembled_plan_sidecar(
+        wrong_canonical,
+        round_number=5,
+        response_form=response_form,
+        raw_patch=valid_sidecar.raw_patch,
+    )
+    wrong_payload["assembled_plan_sidecar"] = wrong_sidecar.to_payload()
+    wrong_payload["aggregate_plan_identity"] = wrong_sidecar.aggregate_identity
+
+    with pytest.raises(AgentLoopError, match="does not match canonical plan kind"):
+        _decode_round_metadata_mapping(wrong_payload)

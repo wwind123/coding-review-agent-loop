@@ -356,6 +356,14 @@ def _validate_semantic_round_metadata(metadata: PostedRoundMetadata) -> None:
     if sidecar.raw_patch != metadata.raw_patch_provenance:
         raise ValueError("raw semantic patch does not match assembled sidecar")
 
+    expected_kind = (
+        "plan_state" if metadata.response_form == "fresh-plan-state" else "plan_revision"
+    )
+    if sidecar.canonical_json.get("kind") != expected_kind:
+        raise ValueError(
+            f"semantic response form {metadata.response_form} does not match canonical plan kind"
+        )
+
     if metadata.response_form == "semantic-patch-v1":
         assert metadata.raw_patch_provenance is not None
         assert metadata.base_round_number is not None

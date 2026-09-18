@@ -644,6 +644,10 @@ def assemble_authenticated_plan_revision(
         result_round_number = base.round_number + 1
     if isinstance(result_round_number, bool) or result_round_number < 0:
         raise AgentLoopError("Authenticated plan result_round_number must be non-negative.")
+    if result_round_number <= base.round_number:
+        raise AgentLoopError(
+            "Authenticated plan result_round_number must be greater than the authenticated base round."
+        )
     if parsed_patch.base_round_number != base.round_number:
         raise AgentLoopError(
             f"Semantic patch base_round_number {parsed_patch.base_round_number} does not match authenticated base round {base.round_number}."
