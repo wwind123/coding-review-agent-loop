@@ -299,6 +299,10 @@ class AssembledPlanSidecar:
     canonical_json: Mapping[str, object]
     aggregate_identity: str
     raw_patch: Mapping[str, object] | None = None
+    # The public Markdown is a separate rendering surface from canonical JSON.
+    # Newly published sidecars bind that surface by digest so restart cannot
+    # combine an authenticated state with unrelated reviewer-visible prose.
+    rendered_plan_identity: str | None = None
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -309,6 +313,7 @@ class AssembledPlanSidecar:
             "canonical_json": copy.deepcopy(dict(self.canonical_json)),
             "aggregate_identity": self.aggregate_identity,
             "raw_patch": copy.deepcopy(dict(self.raw_patch)) if self.raw_patch is not None else None,
+            "rendered_plan_identity": self.rendered_plan_identity,
         }
 
     def encode(self) -> str:
@@ -321,6 +326,7 @@ def make_assembled_plan_sidecar(
     round_number: int,
     response_form: str = "semantic-patch-v1",
     raw_patch: Mapping[str, object] | None = None,
+    rendered_plan: str | None = None,
 ) -> AssembledPlanSidecar:
     payload = (
         copy.deepcopy(dict(plan))
@@ -335,7 +341,17 @@ def make_assembled_plan_sidecar(
         canonical_json=payload,
         aggregate_identity=aggregate_plan_identity(payload),
         raw_patch=raw_patch,
+        rendered_plan_identity=(
+            rendered_plan_identity(rendered_plan) if rendered_plan is not None else None
+        ),
     )
+
+
+def rendered_plan_identity(text: str) -> str:
+    """Return the identity used to bind a rendered canonical plan to a sidecar."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("rendered canonical plan must be non-empty text")
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
 
 def decode_assembled_plan_sidecar(value: str | Mapping[str, object]) -> AssembledPlanSidecar:
@@ -343,11 +359,12 @@ def decode_assembled_plan_sidecar(value: str | Mapping[str, object]) -> Assemble
         payload = json.loads(value) if isinstance(value, str) else dict(value)
         if not isinstance(payload, dict):
             raise ValueError("sidecar is not an object")
-        expected = {
+        legacy_expected = {
             "schema_version", "kind", "response_form", "round_number",
             "canonical_json", "aggregate_identity", "raw_patch",
         }
-        if set(payload) != expected:
+        expected = legacy_expected | {"rendered_plan_identity"}
+        if set(payload) != legacy_expected and set(payload) != expected:
             raise ValueError("sidecar keys are not exact")
         if payload["schema_version"] != ASSEMBLED_PLAN_SIDECAR_SCHEMA_VERSION:
             raise ValueError("unsupported sidecar schema")
@@ -366,6 +383,12 @@ def decode_assembled_plan_sidecar(value: str | Mapping[str, object]) -> Assemble
         raw_patch = payload["raw_patch"]
         if raw_patch is not None and not isinstance(raw_patch, dict):
             raise ValueError("invalid sidecar raw patch provenance")
+        rendered_identity = payload.get("rendered_plan_identity")
+        if rendered_identity is not None and (
+            not isinstance(rendered_identity, str)
+            or re.fullmatch(r"[0-9a-f]{64}", rendered_identity) is None
+        ):
+            raise ValueError("invalid rendered canonical plan identity")
         _parse_wire_plan_payload(canonical)
         return AssembledPlanSidecar(
             schema_version=1,
@@ -375,6 +398,7 @@ def decode_assembled_plan_sidecar(value: str | Mapping[str, object]) -> Assemble
             canonical_json=copy.deepcopy(canonical),
             aggregate_identity=identity,
             raw_patch=copy.deepcopy(raw_patch) if raw_patch is not None else None,
+            rendered_plan_identity=rendered_identity,
         )
     except (AgentLoopError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
         raise AgentLoopError(f"Invalid assembled plan sidecar: {exc}") from exc

@@ -317,6 +317,10 @@ from .repair import (
     require_recoverable_fresh_execution_contract,
     require_recoverable_fresh_risk_test_matrix_contract,
 )
+from .repair_preservation import (
+    require_recoverable_semantic_patch,
+    validate_repair_preservation,
+)
 from .runner import Runner
 from .salvage import (
     SalvageArtifacts,
@@ -2273,6 +2277,23 @@ def _run_structured_repair(
     repair_kwargs: dict[str, object],
 ) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
     """Run configured repair, retaining compatibility with patched legacy test hooks."""
+    if repair_kwargs.get("expected_kind") == "plan_revision_patch":
+        try:
+            require_recoverable_semantic_patch(raw)
+        except AgentLoopError as exc:
+            return None, None, [
+                RepairAttemptResult(
+                    backend="none",
+                    model="semantic-patch-integrity",
+                    prompt="",
+                    output=raw,
+                    returncode=None,
+                    outcome="semantic_patch_integrity",
+                    diagnostic=str(exc),
+                    log_path=None,
+                    fallback_planned=False,
+                )
+            ]
     if repair_kwargs.get("require_execution_strategy_contract"):
         expected_kind = repair_kwargs.get("expected_kind")
         if isinstance(expected_kind, str):
@@ -2340,6 +2361,8 @@ def _run_structured_repair(
         if repaired is None:
             return None, None, []
         try:
+            if repair_kwargs.get("expected_kind") == "plan_revision_patch":
+                validate_repair_preservation(raw, repaired)
             parsed = validate(repaired)
         except AgentLoopError as exc:
             return repaired, None, [
@@ -3676,6 +3699,19 @@ def _run_validated_agent(
                             "fresh planning execution recommendation requires a new planner turn"
                             if terminal_repair.integrity_contract == "execution_recommendation"
                             else "fresh planning risk-test-matrix contract is not mechanically recoverable"
+                        )
+                    elif (
+                        terminal_repair is not None
+                        and terminal_repair.outcome == "semantic_patch_integrity"
+                    ):
+                        # A malformed semantic payload has no authenticated
+                        # decision set for an envelope-only repair to retain.
+                        # Give the planner a fresh attempt; never let a repair
+                        # model synthesize operations, rationales, or bindings.
+                        should_retry = True
+                        last_failure_category = "semantic-patch-integrity"
+                        last_classification_text = (
+                            "semantic patch is not mechanically recoverable; planner retry required"
                         )
                     elif terminal_repair is not None:
                         repaired_exhaustion = _capture_terminal_plan_repair_rejection(
@@ -8005,6 +8041,7 @@ def _run_plan_first_loop(
                 structured_plan,
                 round_number=1,
                 response_form="fresh-plan-state",
+                rendered_plan=canonical_plan,
             )
             current_response_form = "fresh-plan-state"
         plan_round_body = _attach_round_metadata(
@@ -9418,6 +9455,13 @@ def _run_plan_first_loop(
             canonical_plan = render_canonical_plan_revision(
                 assembled_plan, must_fix_items, config
             )
+            assembled_sidecar = make_assembled_plan_sidecar(
+                assembled_plan,
+                round_number=round_number + 1,
+                response_form="semantic-patch-v1",
+                raw_patch=assembled_sidecar.raw_patch,
+                rendered_plan=canonical_plan,
+            )
             current_plan = canonical_plan
             current_coder_output = plan_response.text
             current_plan_sidecar = assembled_sidecar
@@ -9458,6 +9502,7 @@ def _run_plan_first_loop(
                 plan_response.marker_value,
                 round_number=round_number + 1,
                 response_form="legacy-full-state",
+                rendered_plan=canonical_plan,
             )
             current_response_form = "legacy-full-state"
             public_comment = render_public_agent_comment(

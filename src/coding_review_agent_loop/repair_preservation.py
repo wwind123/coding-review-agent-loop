@@ -8,6 +8,7 @@ from .protocol import (
     _extract_json_object_prefix,
     _normalize_requirement_label,
     normalize_response_file_structured_text,
+    parse_plan_revision_patch,
 )
 from .protocol_markers import historical_text_fragments
 
@@ -66,6 +67,27 @@ def _payload(text: str) -> dict | None:
     except AgentLoopError:
         return None
     return parsed[0] if parsed else None
+
+
+def require_recoverable_semantic_patch(raw: str) -> None:
+    """Require a complete semantic patch before any model repair is attempted.
+
+    A semantic patch is a bounded decision set, not a prose response that a
+    repair model may reconstruct.  Envelope-only repair is safe once this
+    complete payload has been recovered; a missing or malformed payload must
+    return to the planner instead.
+    """
+    payload = _payload(raw)
+    if not isinstance(payload, dict) or payload.get("kind") != "plan_revision_patch":
+        raise AgentLoopError(
+            "Semantic patch repair requires a mechanically recoverable complete patch payload."
+        )
+    try:
+        parse_plan_revision_patch(payload)
+    except AgentLoopError as exc:
+        raise AgentLoopError(
+            "Semantic patch repair requires a mechanically recoverable complete patch payload."
+        ) from exc
 
 
 def _normalized(text: str) -> str:

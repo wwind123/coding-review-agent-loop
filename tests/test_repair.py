@@ -1,5 +1,6 @@
 from agent_loop_helpers import *  # noqa: F403
 
+from types import SimpleNamespace
 
 from coding_review_agent_loop.repair import (
     _REPAIR_PROMPT,
@@ -12,6 +13,7 @@ from coding_review_agent_loop.repair import (
     require_recoverable_fresh_risk_test_matrix_contract,
 )
 from coding_review_agent_loop.errors import FreshContractIntegrityError
+from coding_review_agent_loop.orchestrator import _run_structured_repair
 from coding_review_agent_loop.protocol import (
     RISK_TEST_MATRIX_CHANGE_KEYS,
     RISK_TEST_MATRIX_REQUIRED_KEYS,
@@ -85,6 +87,30 @@ def test_fresh_matrix_repair_prompt_renders_exact_schema_and_examples():
     assert "Validator-accepted applicable matrix example" in prompt
     assert "Validator-accepted not-applicable matrix example" in prompt
     assert "Do not invent, omit, or weaken matrix scenarios." in prompt
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"kind":"plan_revision_patch","operations":[{"op":"replace"',
+        '{"schema_version":1,"kind":"plan_revision_patch","operations":',
+    ],
+)
+def test_semantic_patch_repair_rejects_malformed_source_before_model_call(raw):
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        repaired, parsed, attempts = _run_structured_repair(
+            raw,
+            runner=None,
+            config=SimpleNamespace(gemini_cmd="gemini"),
+            usage_context=None,
+            validate=lambda text: text,
+            repair_kwargs={"expected_kind": "plan_revision_patch"},
+        )
+
+    assert repaired is None
+    assert parsed is None
+    assert attempts[-1].outcome == "semantic_patch_integrity"
+    repair_mock.assert_not_called()
 
 
 @pytest.mark.parametrize("missing", ["risk_test_matrix_contract_version", "risk_test_matrix", "risk_test_matrix_changes"])

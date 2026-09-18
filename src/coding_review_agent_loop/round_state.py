@@ -67,7 +67,7 @@ from .protocol import (
     sanitize_risk_test_matrix,
     parse_plan_revision_patch,
 )
-from .plan_assembly import decode_assembled_plan_sidecar
+from .plan_assembly import decode_assembled_plan_sidecar, rendered_plan_identity
 from .review_scheduling import ReviewSchedulingContract, SCHEDULER_PHASES
 from .unresolved_items import _apply_unresolved_item_dispositions
 
@@ -2993,10 +2993,18 @@ def _resume_plan_round(
                 raise AgentLoopError("semantic patch base identity mismatch")
             if sidecar.raw_patch != patch.to_payload():
                 raise AgentLoopError("semantic sidecar patch provenance mismatch")
+            if (
+                sidecar.rendered_plan_identity is None
+                or sidecar.rendered_plan_identity
+                != rendered_plan_identity(metadata.canonical_plan)
+            ):
+                raise AgentLoopError(
+                    "semantic sidecar rendered-plan identity does not match canonical Markdown"
+                )
         except (AgentLoopError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
             raise AgentLoopError(
                 "Authenticated semantic planning state is missing or contradictory; "
-                "refusing to prompt from raw patch text."
+                f"refusing to prompt from raw patch text: {exc}"
             ) from exc
         if _plan_subject(metadata.canonical_plan) != metadata.subject:
             raise AgentLoopError(

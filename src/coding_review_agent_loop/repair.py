@@ -1185,7 +1185,7 @@ _SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_fo
 RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
-    "fresh_contract_integrity",
+    "fresh_contract_integrity", "semantic_patch_integrity",
 ]
 
 
