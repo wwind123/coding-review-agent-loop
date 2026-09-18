@@ -10,6 +10,7 @@ from coding_review_agent_loop.plan_assembly import (
     assemble_authenticated_plan_revision,
     decode_assembled_plan_sidecar,
     hydrate_authenticated_plan_state,
+    structured_plan_revision_to_payload,
 )
 from coding_review_agent_loop.protocol import (
     parse_plan_revision_patch,
@@ -171,6 +172,16 @@ def test_audits_are_normalized_and_metadata_keeps_precise_structural_entries() -
     assert [change.operation for change in assembled.risk_test_matrix_changes] == ["change", "change"]
     assert assembled.risk_test_matrix_changes[0].row_ids == ("row-a", "row-b")
     assert assembled.risk_test_matrix_changes[1].row_ids == ("row-b",)
+
+
+def test_same_base_replay_is_byte_identical() -> None:
+    state = _state(_base([_row("row-a")]))
+    patch = _patch(state, [{"op": "replace", "field": "summary", "value": "Replay me."}])
+    first, first_sidecar = assemble_authenticated_plan_revision(state, patch)
+    second, second_sidecar = assemble_authenticated_plan_revision(state, patch)
+    assert structured_plan_revision_to_payload(first) == structured_plan_revision_to_payload(second)
+    assert first_sidecar.to_payload() == second_sidecar.to_payload()
+    assert first_sidecar.aggregate_identity == second_sidecar.aggregate_identity
 
 
 def test_zero_row_not_applicable_metadata_uses_matrix_sentinel() -> None:
