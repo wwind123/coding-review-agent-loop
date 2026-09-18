@@ -526,8 +526,18 @@ The identity explicitly covers the full plan plus architecture, execution,
 matrix, closing, human-disposition, and typed-category data. Rendered
 Markdown remains a downstream presentation surface.
 
-This phase adds the codecs and durable metadata fields prospectively without
-activating model prompt negotiation. Historical full-state records therefore
-remain legacy-compatible and are not backfilled or silently upgraded. The
-later activation phase owns eligibility, prompt pinning, repair routing, and
-publication-time seeding.
+Publication now seeds that sidecar prospectively for fresh `plan_state` and
+new validated full-state `plan_revision` records. A new unapproved round with
+a complete authenticated matrix is pinned to `semantic-patch-v1`; its full,
+compact, retry, and restart paths all hydrate the same sidecar and invoke the
+same assembler. The response form is durable round metadata, so a legacy or
+in-flight round cannot silently switch forms. Matrix-less and pre-rollout
+records remain on the legacy path and are never backfilled.
+
+Repair runs before assembly and is lossless for semantic patches: it may fix
+only the response envelope and cannot add operations, change rationales, or
+alter base bindings. A cross-form, approved, stale, incomplete, or identity-
+mismatched response fails before publication. The assembled generation-1
+Markdown and its existing subject/hash remain the downstream review and
+implementation surface; the sidecar is the durable authority used for
+hydration.

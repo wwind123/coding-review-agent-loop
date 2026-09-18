@@ -265,6 +265,7 @@ from .protocol import (
     StructuredIssueImplementation,
     StructuredPlanState,
     StructuredPlanRevision,
+    PlanRevisionPatch,
     StructuredTaskResult,
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
@@ -288,6 +289,7 @@ from .protocol import (
     validate_structured_issue_implementation,
     validate_structured_plan_state,
     validate_structured_plan_revision,
+    validate_structured_plan_revision_patch,
     validate_risk_test_matrix_revision,
     validate_structured_task_result,
     risk_test_matrix_identity,
@@ -314,6 +316,10 @@ from .repair import (
     strip_unknown_prior_item_dispositions,
     require_recoverable_fresh_execution_contract,
     require_recoverable_fresh_risk_test_matrix_contract,
+)
+from .repair_preservation import (
+    require_recoverable_semantic_patch,
+    validate_repair_preservation,
 )
 from .runner import Runner
 from .salvage import (
@@ -448,6 +454,14 @@ from .round_state import (
     sanitize_plan_validation_diagnostic,
 )
 from .round_transport import is_round_transport_sidecar
+from .plan_assembly import (
+    AssembledPlanSidecar,
+    AuthenticatedPlanState,
+    assemble_authenticated_plan_revision,
+    decode_assembled_plan_sidecar,
+    hydrate_authenticated_plan_state,
+    make_assembled_plan_sidecar,
+)
 from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
 from .review_scheduling import (
     GitChange,
@@ -520,7 +534,7 @@ PUBLIC_RESPONSE_ARTIFACT_PREFIX_RE = re.compile(
     re.I,
 )
 STRUCTURED_PUBLIC_RESPONSE_KINDS = frozenset(
-    {"plan_state", "plan_review", "pr_review", "coder_followup", "issue_implementation", "plan_revision", "discuss_review", "discuss_answer", "discuss_semantic_comparison", "discuss_answer_confirmation"}
+    {"plan_state", "plan_review", "pr_review", "coder_followup", "issue_implementation", "plan_revision", "plan_revision_patch", "discuss_review", "discuss_answer", "discuss_semantic_comparison", "discuss_answer_confirmation"}
 )
 PLAN_REVISION_FOOTER_RE = re.compile(r"(?m)^<!--\s*AGENT_PLAN_STATE:\s*(approved|blocking)\s*-->\s*$")
 STRUCTURED_FENCE_RE = re.compile(
@@ -2263,6 +2277,23 @@ def _run_structured_repair(
     repair_kwargs: dict[str, object],
 ) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
     """Run configured repair, retaining compatibility with patched legacy test hooks."""
+    if repair_kwargs.get("expected_kind") == "plan_revision_patch":
+        try:
+            require_recoverable_semantic_patch(raw)
+        except AgentLoopError as exc:
+            return None, None, [
+                RepairAttemptResult(
+                    backend="none",
+                    model="semantic-patch-integrity",
+                    prompt="",
+                    output=raw,
+                    returncode=None,
+                    outcome="semantic_patch_integrity",
+                    diagnostic=str(exc),
+                    log_path=None,
+                    fallback_planned=False,
+                )
+            ]
     if repair_kwargs.get("require_execution_strategy_contract"):
         expected_kind = repair_kwargs.get("expected_kind")
         if isinstance(expected_kind, str):
@@ -2330,6 +2361,8 @@ def _run_structured_repair(
         if repaired is None:
             return None, None, []
         try:
+            if repair_kwargs.get("expected_kind") == "plan_revision_patch":
+                validate_repair_preservation(raw, repaired)
             parsed = validate(repaired)
         except AgentLoopError as exc:
             return repaired, None, [
@@ -3667,6 +3700,19 @@ def _run_validated_agent(
                             if terminal_repair.integrity_contract == "execution_recommendation"
                             else "fresh planning risk-test-matrix contract is not mechanically recoverable"
                         )
+                    elif (
+                        terminal_repair is not None
+                        and terminal_repair.outcome == "semantic_patch_integrity"
+                    ):
+                        # A malformed semantic payload has no authenticated
+                        # decision set for an envelope-only repair to retain.
+                        # Give the planner a fresh attempt; never let a repair
+                        # model synthesize operations, rationales, or bindings.
+                        should_retry = True
+                        last_failure_category = "semantic-patch-integrity"
+                        last_classification_text = (
+                            "semantic patch is not mechanically recoverable; planner retry required"
+                        )
                     elif terminal_repair is not None:
                         repaired_exhaustion = _capture_terminal_plan_repair_rejection(
                             terminal_repair,
@@ -4170,6 +4216,7 @@ def _current_plan_has_complete_human_requirement_dispositions(
     coder_output: str | None,
     *,
     surfaced_requirement_ids: Sequence[str],
+    inherited_dispositions: Sequence[object] | None = None,
 ) -> bool:
     """Return whether the current coder plan has the required attestation.
 
@@ -4182,7 +4229,24 @@ def _current_plan_has_complete_human_requirement_dispositions(
         try:
             parsed = validate_structured_plan_state(coder_output)
         except AgentLoopError:
-            parsed = validate_structured_plan_revision(coder_output)
+            try:
+                parsed = validate_structured_plan_revision(coder_output)
+            except AgentLoopError:
+                patch = validate_structured_plan_revision_patch(coder_output)
+                if patch is None:
+                    return False
+                dispositions = _effective_plan_revision_patch_dispositions(
+                    patch,
+                    inherited_dispositions,
+                )
+                if dispositions is None:
+                    return False
+                validate_human_requirement_dispositions(
+                    dispositions,
+                    surfaced_requirement_ids=surfaced_requirement_ids,
+                    context="plan_revision_patch.human_requirement_dispositions",
+                )
+                return True
         if parsed is None:
             return False
         validate_human_requirement_dispositions(
@@ -4193,6 +4257,22 @@ def _current_plan_has_complete_human_requirement_dispositions(
     except AgentLoopError:
         return False
     return True
+
+
+def _effective_plan_revision_patch_dispositions(
+    patch: PlanRevisionPatch,
+    inherited_dispositions: Sequence[object] | None,
+) -> object | None:
+    """Return the dispositions that semantic assembly will publish.
+
+    Omission means preserve the authenticated base. Treating omission as an
+    empty list would reject an unrelated edit and encourage a payload-identical
+    no-op replacement of a field the patch does not own.
+    """
+    for operation in patch.operations:
+        if operation.op == "replace" and operation.field == "human_requirement_dispositions":
+            return operation.value
+    return inherited_dispositions
 
 
 def _merge_human_requirements(
@@ -4346,6 +4426,52 @@ def _validate_plan_revision_response(
             )
         return parsed
     raise AgentLoopError("Plan revision did not use the required structured format.")
+
+
+def _validate_plan_revision_patch_response(
+    text: str,
+    *,
+    unresolved_items: Sequence[UnresolvedReviewItem] = (),
+    human_requirements=(),
+    inherited_human_requirement_dispositions: Sequence[object] | None = None,
+) -> object:
+    """Validate a semantic patch and its carried review-item ledger."""
+    parsed = validate_structured_plan_revision_patch(text)
+    if parsed is None:
+        raise AgentLoopError("Semantic plan revision did not use the required structured patch format.")
+    allowed_ids = {item.item_id for item in unresolved_items}
+    unknown = {item.item_id for item in parsed.prior_plan_item_dispositions} - allowed_ids
+    if unknown:
+        raise UnknownPriorItemDispositionError(
+            unknown_ids=tuple(sorted(unknown)),
+            allowed_ids=tuple(sorted(allowed_ids)),
+            same_round_description=(
+                "Same-round findings are informational only and must not be dispositioned "
+                "as prior carried items."
+            ),
+        )
+    requirements_context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+    )
+    validate_human_requirements_acknowledgement(
+        text,
+        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+        requires_direct_discussion_ack=requirements_context.requires_direct_discussion_ack,
+    )
+    dispositions = _effective_plan_revision_patch_dispositions(
+        parsed,
+        inherited_human_requirement_dispositions,
+    )
+    if dispositions is None:
+        dispositions = ()
+    validate_human_requirement_dispositions(
+        dispositions,
+        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+        context="plan_revision_patch.human_requirement_dispositions",
+    )
+    return parsed
 
 
 def _drop_repeated_carried_future_followups(
@@ -7790,6 +7916,8 @@ def _run_plan_first_loop(
     unresolved_items: list[UnresolvedReviewItem] = []
     compact_prior_summaries: list[str] = []
     next_unresolved_item_number = 1
+    current_plan_sidecar: AssembledPlanSidecar | None = None
+    current_response_form: str | None = None
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
     plan_validation_diagnostic: PlanValidationDiagnosticTransport | None = None
     if resume_state is None:
@@ -7905,6 +8033,17 @@ def _run_plan_first_loop(
             public_plan_output = normalize_freeform_signature(
                 plan_output, agent=config.coder, config=config, model_used=plan_response.model_used
             )
+        if isinstance(structured_plan, StructuredPlanState):
+            # Publication-time bootstrap: the first eligible revision must
+            # bind to an authenticated complete state, never to rendered text
+            # or a model-echoed copy of the plan.
+            current_plan_sidecar = make_assembled_plan_sidecar(
+                structured_plan,
+                round_number=1,
+                response_form="fresh-plan-state",
+                rendered_plan=canonical_plan,
+            )
+            current_response_form = "fresh-plan-state"
         plan_round_body = _attach_round_metadata(
             public_plan_output,
             PostedRoundMetadata(
@@ -7966,6 +8105,17 @@ def _run_plan_first_loop(
                         if structured_plan is not None and structured_plan.risk_test_matrix is not None
                         else None
                     ),
+                    response_form=(
+                        current_response_form if current_plan_sidecar is not None else None
+                    ),
+                    aggregate_plan_identity=(
+                        current_plan_sidecar.aggregate_identity
+                        if current_plan_sidecar is not None else None
+                    ),
+                    assembled_plan_sidecar=(
+                        current_plan_sidecar.to_payload()
+                        if current_plan_sidecar is not None else None
+                    ),
             )
         )
         if _post_plan_coder_round_comment(
@@ -7991,6 +8141,11 @@ def _run_plan_first_loop(
         compact_prior_summaries = list(resumed_round.compact_prior_summaries)
         next_unresolved_item_number = resumed_round.next_unresolved_item_number
         start_round_number = resumed_round.round_number
+        if resumed_round.coder_metadata is not None and resumed_round.coder_metadata.assembled_plan_sidecar is not None:
+            current_plan_sidecar = decode_assembled_plan_sidecar(
+                resumed_round.coder_metadata.assembled_plan_sidecar
+            )
+            current_response_form = resumed_round.coder_metadata.response_form
         log(config, f"Planning issue #{issue_number}: resuming round {start_round_number}")
         # A resumed round carries its planning-generation discriminator in
         # durable coder metadata. Historical rounds intentionally have no
@@ -8471,6 +8626,12 @@ def _run_plan_first_loop(
             coder_dispositions_complete = _current_plan_has_complete_human_requirement_dispositions(
                 current_coder_output,
                 surfaced_requirement_ids=hr_ids,
+                inherited_dispositions=(
+                    hydrate_authenticated_plan_state(current_plan_sidecar).plan.human_requirement_dispositions
+                    if current_response_form == "semantic-patch-v1"
+                    and current_plan_sidecar is not None
+                    else None
+                ),
             )
             missing_acknowledgements = (
                 [reviewer_name for reviewer_name, _review_output in approved_review_outputs]
@@ -9172,6 +9333,18 @@ def _run_plan_first_loop(
             requirement_scope="planning requirements",
             full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
         )
+        semantic_revision = (
+            current_plan_sidecar is not None
+            and current_response_form in {
+                "fresh-plan-state", "legacy-full-state", "semantic-patch-v1"
+            }
+            and isinstance(current_plan_sidecar.canonical_json.get("risk_test_matrix"), dict)
+        )
+        semantic_base: AuthenticatedPlanState | None = None
+        if semantic_revision:
+            # Hydration is a pre-prompt gate. Missing or conflicting durable
+            # authority must not be papered over with the visible Markdown.
+            semantic_base = hydrate_authenticated_plan_state(current_plan_sidecar)
         plan_response = _run_validated_agent(
             runner,
             agent=config.coder,
@@ -9193,60 +9366,116 @@ def _run_plan_first_loop(
                 ),
                 require_risk_test_matrix_contract=require_fresh_matrix_contract,
                 plan_validation_diagnostic=plan_validation_diagnostic,
+                response_form=("semantic-patch-v1" if semantic_revision else None),
+                base_round_number=(semantic_base.round_number if semantic_base is not None else None),
+                base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
             ),
             session_id=coder_session_id,
             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-            validate=lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_response_with_human_requirements(
-                text,
-                marker_validator=lambda revised_text: _validate_plan_revision_response(
-                    revised_text,
+            validate=(
+                (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_response(
+                    text,
                     unresolved_items=items,
-                    require_architecture_impact=True,
-                    require_execution_strategy_contract=require_fresh_execution_contract,
-                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
-                    reject_unsolicited_risk_test_matrix_contract=(
-                        not require_fresh_matrix_contract
+                    human_requirements=human_requirements,
+                    inherited_human_requirement_dispositions=(
+                        semantic_base.plan.human_requirement_dispositions
+                        if semantic_base is not None else None
                     ),
-                ),
-                human_requirements=human_requirements,
-                requirement_scope="planning requirements",
-                full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+                ))
+                if semantic_revision
+                else (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_response_with_human_requirements(
+                    text,
+                    marker_validator=lambda revised_text: _validate_plan_revision_response(
+                        revised_text,
+                        unresolved_items=items,
+                        require_architecture_impact=True,
+                        require_execution_strategy_contract=require_fresh_execution_contract,
+                        require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                        reject_unsolicited_risk_test_matrix_contract=(
+                            not require_fresh_matrix_contract
+                        ),
+                    ),
+                    human_requirements=human_requirements,
+                    requirement_scope="planning requirements",
+                    full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+                ))
             ),
             usage_context=usage_context,
             use_repair=True,
-            repair_expected_kind="plan_revision",
+            repair_expected_kind=("plan_revision_patch" if semantic_revision else "plan_revision"),
             repair_surfaced_requirement_ids=(
                 plan_revision_human_requirements_context.surfaced_requirement_ids
             ),
             repair_requires_direct_discussion_ack=(
                 plan_revision_human_requirements_context.requires_direct_discussion_ack
             ),
-            require_execution_strategy_contract=require_fresh_execution_contract,
-            require_risk_test_matrix_contract=require_fresh_matrix_contract,
+            require_execution_strategy_contract=(
+                False if semantic_revision else require_fresh_execution_contract
+            ),
+            require_risk_test_matrix_contract=(
+                False if semantic_revision else require_fresh_matrix_contract
+            ),
             reject_unsolicited_risk_test_matrix_contract=(
-                not require_fresh_matrix_contract
+                False if semantic_revision else not require_fresh_matrix_contract
             ),
             repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
             ledger_incomplete=round_ledger_incomplete,
             operation_description="plan revision",
-            plan_validation_failure_handler=lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
-                runner,
-                config=config,
-                issue_context=issue_context,
-                issue_number=issue_number,
-                original_error=error,
-                exhaustion=exhaustion,
-                target_coder_round=round_number + 1,
-                prior_plan_subject=current_plan_subject,
-                candidate_kind="plan_revision",
-                require_execution_strategy_contract=require_fresh_execution_contract,
-                require_risk_test_matrix_contract=require_fresh_matrix_contract,
+            plan_validation_failure_handler=(
+                None if semantic_revision else lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
+                    runner,
+                    config=config,
+                    issue_context=issue_context,
+                    issue_number=issue_number,
+                    original_error=error,
+                    exhaustion=exhaustion,
+                    target_coder_round=round_number + 1,
+                    prior_plan_subject=current_plan_subject,
+                    candidate_kind="plan_revision",
+                    require_execution_strategy_contract=require_fresh_execution_contract,
+                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                )
             ),
         )
         canonical_plan: str | None = None
         public_comment = plan_response.text
         raw_structured_coder_response: str | None = None
-        if isinstance(plan_response.marker_value, StructuredPlanRevision):
+        if semantic_revision:
+            if not isinstance(plan_response.marker_value, PlanRevisionPatch):
+                raise AgentLoopError(
+                    "Semantic planning response crossed the pinned response form."
+                )
+            assert semantic_base is not None
+            assembled_plan, assembled_sidecar = assemble_authenticated_plan_revision(
+                semantic_base,
+                plan_response.marker_value,
+                result_round_number=round_number + 1,
+            )
+            raw_structured_coder_response = plan_response.text
+            canonical_plan = render_canonical_plan_revision(
+                assembled_plan, must_fix_items, config
+            )
+            assembled_sidecar = make_assembled_plan_sidecar(
+                assembled_plan,
+                round_number=round_number + 1,
+                response_form="semantic-patch-v1",
+                raw_patch=assembled_sidecar.raw_patch,
+                rendered_plan=canonical_plan,
+            )
+            current_plan = canonical_plan
+            current_coder_output = plan_response.text
+            current_plan_sidecar = assembled_sidecar
+            current_response_form = "semantic-patch-v1"
+            public_comment = render_public_agent_comment(
+                kind="plan_revision",
+                parsed=assembled_plan,
+                agent=config.coder,
+                prior_items=must_fix_items,
+                raw_text=plan_response.text,
+                config=config,
+                model_used=plan_response.model_used,
+            )
+        elif isinstance(plan_response.marker_value, StructuredPlanRevision):
             raw_structured_coder_response = plan_response.text
             previous_matrix_match = RISK_TEST_MATRIX_MARKER_RE.search(current_plan)
             if previous_matrix_match is not None and plan_response.marker_value.risk_test_matrix is None:
@@ -9269,6 +9498,13 @@ def _run_plan_first_loop(
             )
             current_plan = canonical_plan
             current_coder_output = plan_response.text
+            current_plan_sidecar = make_assembled_plan_sidecar(
+                plan_response.marker_value,
+                round_number=round_number + 1,
+                response_form="legacy-full-state",
+                rendered_plan=canonical_plan,
+            )
+            current_response_form = "legacy-full-state"
             public_comment = render_public_agent_comment(
                 kind="plan_revision",
                 parsed=plan_response.marker_value,
@@ -9281,12 +9517,21 @@ def _run_plan_first_loop(
         else:
             current_plan = plan_response.text
             current_coder_output = plan_response.text
+            current_plan_sidecar = None
+            current_response_form = None
             # Free-form revisions also need a lossless canonical sidecar. The
             # rendered signature is presentation only and is not plan identity.
             canonical_plan = current_plan
             public_comment = normalize_freeform_signature(
                 plan_response.text, agent=config.coder, config=config, model_used=plan_response.model_used
             )
+        metadata_plan = (
+            assembled_plan
+            if semantic_revision
+            else plan_response.marker_value
+            if isinstance(plan_response.marker_value, StructuredPlanRevision)
+            else None
+        )
         coder_session_id = plan_response.session_id
         plan_round_body = _attach_round_metadata(
             public_comment,
@@ -9305,47 +9550,72 @@ def _run_plan_first_loop(
                     **_metadata_identity_fields(plan_response),
                     execution_strategy_contract_version=(
                         1
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.execution_recommendation is not None
+                        if metadata_plan is not None
+                        and metadata_plan.execution_recommendation is not None
                         else None
                     ),
                     execution_strategy_identity=(
-                        plan_response.marker_value.execution_recommendation.identity()
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.execution_recommendation is not None
+                        metadata_plan.execution_recommendation.identity()
+                        if metadata_plan is not None
+                        and metadata_plan.execution_recommendation is not None
                         else None
                     ),
                     risk_test_matrix_contract_version=(
-                        plan_response.marker_value.risk_test_matrix_contract_version
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision) else None
+                        metadata_plan.risk_test_matrix_contract_version
+                        if metadata_plan is not None else None
                     ),
                     risk_test_matrix_payload=(
-                        plan_response.marker_value.risk_test_matrix.to_payload()
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.risk_test_matrix is not None else None
+                        metadata_plan.risk_test_matrix.to_payload()
+                        if metadata_plan is not None
+                        and metadata_plan.risk_test_matrix is not None else None
                     ),
                     risk_test_matrix_changes_payload=(
-                        tuple(change.to_payload() for change in plan_response.marker_value.risk_test_matrix_changes)
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision) else ()
+                        tuple(change.to_payload() for change in metadata_plan.risk_test_matrix_changes)
+                        if metadata_plan is not None else ()
                     ),
                     risk_test_matrix_identity=(
                         risk_test_matrix_identity(
-                            plan_response.marker_value.risk_test_matrix,
-                            plan_response.marker_value.risk_test_matrix_changes,
+                            metadata_plan.risk_test_matrix,
+                            metadata_plan.risk_test_matrix_changes,
                         )
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.risk_test_matrix is not None else None
+                        if metadata_plan is not None
+                        and metadata_plan.risk_test_matrix is not None else None
                     ),
                     risk_test_matrix_boundary_digest=(
                         risk_test_matrix_identity(
-                            plan_response.marker_value.risk_test_matrix,
-                            plan_response.marker_value.risk_test_matrix_changes,
+                            metadata_plan.risk_test_matrix,
+                            metadata_plan.risk_test_matrix_changes,
                         )
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.risk_test_matrix is not None else None
+                        if metadata_plan is not None
+                        and metadata_plan.risk_test_matrix is not None else None
+                    ),
+                    response_form=(
+                        current_response_form if current_plan_sidecar is not None else None
+                    ),
+                    base_round_number=(
+                        plan_response.marker_value.base_round_number
+                        if semantic_revision and isinstance(plan_response.marker_value, PlanRevisionPatch)
+                        else None
+                    ),
+                    base_state_identity=(
+                        plan_response.marker_value.base_state_identity
+                        if semantic_revision and isinstance(plan_response.marker_value, PlanRevisionPatch)
+                        else None
+                    ),
+                    aggregate_plan_identity=(
+                        current_plan_sidecar.aggregate_identity
+                        if current_plan_sidecar is not None else None
+                    ),
+                    raw_patch_provenance=(
+                        current_plan_sidecar.raw_patch
+                        if semantic_revision and current_plan_sidecar is not None else None
+                    ),
+                    assembled_plan_sidecar=(
+                        current_plan_sidecar.to_payload()
+                        if current_plan_sidecar is not None else None
                     ),
                     **_architecture_metadata_fields(
-                        config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
+                        config, impact=getattr(metadata_plan, "architecture_impact", None)
                     ),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,

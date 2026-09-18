@@ -1,9 +1,11 @@
 import copy
 import json
+from dataclasses import replace
 
 import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.comment_rendering import render_canonical_plan_revision
 from coding_review_agent_loop.plan_assembly import (
     AuthenticatedPlanState,
     aggregate_plan_identity,
@@ -18,10 +20,13 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_revision_patch,
 )
 from coding_review_agent_loop.round_state import (
+    _attach_round_metadata,
     PostedRoundMetadata,
     _decode_round_metadata,
     _decode_round_metadata_mapping,
     _encode_round_metadata,
+    _plan_subject,
+    _resume_plan_round,
 )
 from coding_review_agent_loop.round_transport import decode_mapping
 
@@ -324,6 +329,116 @@ def test_semantic_round_metadata_round_trips_provenance_and_sidecar_without_lega
     assert decoded.aggregate_plan_identity == sidecar.aggregate_identity
     assert decoded.raw_patch_provenance == sidecar.raw_patch
     assert decoded.assembled_plan_sidecar == sidecar.to_payload()
+
+
+def test_semantic_round_resume_uses_authenticated_sidecar_not_raw_patch() -> None:
+    state = _state(_base([_row("row-a")]))
+    assembled, sidecar = assemble_authenticated_plan_revision(
+        state,
+        _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
+        result_round_number=5,
+    )
+    canonical_plan = render_canonical_plan_revision(assembled, ())
+    sidecar = make_assembled_plan_sidecar(
+        assembled,
+        round_number=5,
+        response_form="semantic-patch-v1",
+        raw_patch=sidecar.raw_patch,
+        rendered_plan=canonical_plan,
+    )
+    raw_patch = json.dumps(sidecar.raw_patch) + (
+        "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    metadata = PostedRoundMetadata(
+        flow="plan",
+        role="coder",
+        agent="Claude",
+        round_number=5,
+        subject=_plan_subject(canonical_plan),
+        canonical_plan=canonical_plan,
+        raw_structured_coder_response=raw_patch,
+        response_form="semantic-patch-v1",
+        base_round_number=state.round_number,
+        base_state_identity=state.state_identity,
+        aggregate_plan_identity=sidecar.aggregate_identity,
+        raw_patch_provenance=sidecar.raw_patch,
+        assembled_plan_sidecar=sidecar.to_payload(),
+        execution_strategy_contract_version=1,
+    )
+    comment = _attach_round_metadata("Published canonical plan", metadata)
+
+    resumed = _resume_plan_round(
+        [type("Comment", (), {"body": comment})()],
+        configured_reviewers=("codex",),
+    )
+
+    assert resumed is not None
+    current_plan, resumed_round = resumed
+    assert current_plan == canonical_plan
+    assert resumed_round.coder_output == raw_patch
+
+    mismatched = replace(
+        metadata,
+        canonical_plan="## Unrelated canonical plan\n",
+        subject=_plan_subject("## Unrelated canonical plan\n"),
+    )
+    with pytest.raises(AgentLoopError, match="rendered-plan identity"):
+        _resume_plan_round(
+            [type("Comment", (), {"body": _attach_round_metadata("Published canonical plan", mismatched)})()],
+            configured_reviewers=("codex",),
+        )
+
+
+@pytest.mark.parametrize("response_form", ("fresh-plan-state", "legacy-full-state"))
+def test_full_state_round_resume_rejects_mismatched_sidecar_markdown(
+    response_form: str,
+) -> None:
+    state = _state(_base([_row("row-a")]))
+    assembled, _ = assemble_authenticated_plan_revision(
+        state,
+        _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
+        result_round_number=5,
+    )
+    canonical_payload = copy.deepcopy(structured_plan_revision_to_payload(assembled))
+    if response_form == "fresh-plan-state":
+        canonical_payload["kind"] = "plan_state"
+        canonical_payload.pop("prior_plan_item_dispositions", None)
+    canonical_plan = f"## {response_form} canonical plan\n"
+    sidecar = make_assembled_plan_sidecar(
+        canonical_payload,
+        round_number=5,
+        response_form=response_form,
+        rendered_plan=canonical_plan,
+    )
+    metadata = PostedRoundMetadata(
+        flow="plan",
+        role="coder",
+        agent="Codex",
+        round_number=5,
+        subject=_plan_subject(canonical_plan),
+        canonical_plan=canonical_plan,
+        response_form=response_form,
+        aggregate_plan_identity=sidecar.aggregate_identity,
+        assembled_plan_sidecar=sidecar.to_payload(),
+    )
+    mismatched_plan = "## Swapped reviewer-visible plan\n"
+    mismatched = replace(
+        metadata,
+        canonical_plan=mismatched_plan,
+        subject=_plan_subject(mismatched_plan),
+    )
+
+    with pytest.raises(AgentLoopError, match="rendered-plan identity"):
+        _resume_plan_round(
+            [
+                type(
+                    "Comment",
+                    (),
+                    {"body": _attach_round_metadata("Published canonical plan", mismatched)},
+                )()
+            ],
+            configured_reviewers=("codex",),
+        )
 
 
 def test_semantic_round_metadata_rejects_partial_wrong_type_and_conflicting_authority() -> None:

@@ -67,6 +67,7 @@ from .protocol import (
     sanitize_risk_test_matrix,
     parse_plan_revision_patch,
 )
+from .plan_assembly import decode_assembled_plan_sidecar, rendered_plan_identity
 from .review_scheduling import ReviewSchedulingContract, SCHEDULER_PHASES
 from .unresolved_items import _apply_unresolved_item_dispositions
 
@@ -2965,7 +2966,85 @@ def _resume_plan_round(
     coder_output = latest_coder_record.metadata.raw_structured_coder_response or current_plan
     metadata_version = latest_coder_record.metadata.execution_strategy_contract_version
     matrix_metadata_version = latest_coder_record.metadata.risk_test_matrix_contract_version
-    if metadata_version == 1:
+    semantic_response_form = latest_coder_record.metadata.response_form
+    semantic_sidecar_authoritative = semantic_response_form == "semantic-patch-v1"
+    if semantic_response_form in {"fresh-plan-state", "legacy-full-state"}:
+        # Fresh and legacy full-state publications seed the next semantic
+        # revision.  Their authenticated sidecar must bind to the exact
+        # canonical Markdown persisted with the round; a subject check alone
+        # is insufficient because both the Markdown and subject can be
+        # replaced while leaving the sidecar untouched.
+        metadata = latest_coder_record.metadata
+        if metadata.assembled_plan_sidecar is None or metadata.canonical_plan is None:
+            raise AgentLoopError(
+                "Authenticated full-state planning metadata is incomplete: "
+                "authenticated assembled state and canonical Markdown are both required "
+                "for restart."
+            )
+        try:
+            sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+            if sidecar.response_form != semantic_response_form:
+                raise AgentLoopError("full-state sidecar response form mismatch")
+            if sidecar.round_number != metadata.round_number:
+                raise AgentLoopError("full-state sidecar round mismatch")
+            if metadata.aggregate_plan_identity != sidecar.aggregate_identity:
+                raise AgentLoopError("full-state sidecar aggregate identity mismatch")
+            if (
+                sidecar.rendered_plan_identity is None
+                or sidecar.rendered_plan_identity
+                != rendered_plan_identity(metadata.canonical_plan)
+            ):
+                raise AgentLoopError(
+                    "full-state sidecar rendered-plan identity does not match canonical Markdown"
+                )
+        except (AgentLoopError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise AgentLoopError(
+                "Authenticated full-state planning state is missing or contradictory; "
+                f"refusing to resume from an unbound canonical Markdown: {exc}"
+            ) from exc
+    if semantic_sidecar_authoritative:
+        # Semantic rounds resume from the authenticated assembled sidecar. The
+        # raw model patch is provenance only and is never reparsed into the
+        # canonical plan used by prompts or reviewers.
+        metadata = latest_coder_record.metadata
+        if metadata.assembled_plan_sidecar is None or metadata.canonical_plan is None:
+            raise AgentLoopError(
+                "Semantic planning metadata is incomplete: authenticated assembled state "
+                "and canonical Markdown are both required for restart."
+            )
+        try:
+            sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+            if sidecar.response_form != "semantic-patch-v1":
+                raise AgentLoopError("semantic sidecar response form mismatch")
+            if sidecar.round_number != metadata.round_number:
+                raise AgentLoopError("semantic sidecar round mismatch")
+            if metadata.aggregate_plan_identity != sidecar.aggregate_identity:
+                raise AgentLoopError("semantic sidecar aggregate identity mismatch")
+            patch = parse_plan_revision_patch(metadata.raw_patch_provenance or {})
+            if patch.base_round_number != metadata.base_round_number:
+                raise AgentLoopError("semantic patch base round mismatch")
+            if patch.base_state_identity != metadata.base_state_identity:
+                raise AgentLoopError("semantic patch base identity mismatch")
+            if sidecar.raw_patch != patch.to_payload():
+                raise AgentLoopError("semantic sidecar patch provenance mismatch")
+            if (
+                sidecar.rendered_plan_identity is None
+                or sidecar.rendered_plan_identity
+                != rendered_plan_identity(metadata.canonical_plan)
+            ):
+                raise AgentLoopError(
+                    "semantic sidecar rendered-plan identity does not match canonical Markdown"
+                )
+        except (AgentLoopError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise AgentLoopError(
+                "Authenticated semantic planning state is missing or contradictory; "
+                f"refusing to prompt from raw patch text: {exc}"
+            ) from exc
+        if _plan_subject(metadata.canonical_plan) != metadata.subject:
+            raise AgentLoopError(
+                "Semantic planning metadata subject does not match canonical Markdown."
+            )
+    if metadata_version == 1 and not semantic_sidecar_authoritative:
         # A generation-1 plan is identified by its canonical rendered text.
         # Never resume a record whose subject was computed from a different
         # representation (for example, raw host JSON versus rendered plan
@@ -2981,43 +3060,44 @@ def _resume_plan_round(
                 "Generation-1 planning metadata subject does not match its canonical plan; "
                 "repair the handoff or start a new plan round."
             )
-    all_bodies = tuple(
-        body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
-    )
-    fresh_artifact = False
-    fresh_matrix_artifact = False
-    try:
-        raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
-        fresh_artifact = (
-            isinstance(raw_payload, dict)
-            and (
-                "execution_strategy_contract_version" in raw_payload
-                or "execution_recommendation" in raw_payload
-            )
-        ) or "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
-        fresh_matrix_artifact = (
-            isinstance(raw_payload, dict)
-            and (
-                "risk_test_matrix_contract_version" in raw_payload
-                or "risk_test_matrix" in raw_payload
-            )
-        ) or RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
-    except (AttributeError, json.JSONDecodeError):
-        fresh_artifact = "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
-        fresh_matrix_artifact = RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
-    if fresh_artifact and metadata_version != 1:
-        raise AgentLoopError(
-            "Fresh generation-1 planning data is present but its round metadata is "
-            "missing or not generation 1; restart the planning handoff instead of "
-            "downgrading it to legacy-undecided."
+    if semantic_response_form != "semantic-patch-v1":
+        all_bodies = tuple(
+            body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
         )
-    if fresh_matrix_artifact and matrix_metadata_version != 1:
-        raise AgentLoopError(
-            "Fresh generation-1 risk matrix data is present but its round metadata is "
-            "missing or not generation 1; restart the planning handoff instead of "
-            "downgrading it to legacy-undecided."
-        )
-    if metadata_version == 1:
+        fresh_artifact = False
+        fresh_matrix_artifact = False
+        try:
+            raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
+            fresh_artifact = (
+                isinstance(raw_payload, dict)
+                and (
+                    "execution_strategy_contract_version" in raw_payload
+                    or "execution_recommendation" in raw_payload
+                )
+            ) or "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+            fresh_matrix_artifact = (
+                isinstance(raw_payload, dict)
+                and (
+                    "risk_test_matrix_contract_version" in raw_payload
+                    or "risk_test_matrix" in raw_payload
+                )
+            ) or RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
+        except (AttributeError, json.JSONDecodeError):
+            fresh_artifact = "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+            fresh_matrix_artifact = RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
+        if fresh_artifact and metadata_version != 1:
+            raise AgentLoopError(
+                "Fresh generation-1 planning data is present but its round metadata is "
+                "missing or not generation 1; restart the planning handoff instead of "
+                "downgrading it to legacy-undecided."
+            )
+        if fresh_matrix_artifact and matrix_metadata_version != 1:
+            raise AgentLoopError(
+                "Fresh generation-1 risk matrix data is present but its round metadata is "
+                "missing or not generation 1; restart the planning handoff instead of "
+                "downgrading it to legacy-undecided."
+            )
+    if metadata_version == 1 and semantic_response_form != "semantic-patch-v1":
         # A generation-1 round is never downgraded to legacy on resume.  The
         # raw response is the provenance source; the visible canonical plan is
         # intentionally markdown and cannot substitute for it.
