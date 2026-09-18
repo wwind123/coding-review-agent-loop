@@ -415,6 +415,46 @@ def test_coder_context_carries_persisted_local_failures_to_reviewers():
     assert "identity-unknown" in context
 
 
+def test_coder_context_carries_derived_matrix_evidence_and_diagnostics():
+    evidence = {
+        "matrix_identity": "a" * 64,
+        "rows": [{
+            "row_id": "implementation-derived-evidence",
+            "status": "verified",
+            "test_identifiers": ["tests/test_orchestrator_pr.py::test_handoff"],
+            "test_locations": ["tests/test_orchestrator_pr.py"],
+            "workflow_path_claim": "follow-up review",
+            "outcome_assertions": ["the handoff was preserved"],
+            "forbidden_effect_assertions": ["no duplicate PR was created"],
+            "evidence_citations": [{
+                "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
+                "receipt_id": "receipt-1",
+                "claim": "current-result",
+            }],
+            "caveats": [],
+        }],
+    }
+    diagnostics = ({
+        "row_id": "implementation-derived-evidence",
+        "code": "checkout-head-mismatch",
+        "message": "assigned checkout was not authenticated at the PR head",
+    },)
+    output = structured_coder_followup(summary="The implementation is handed off.")
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Codex", round_number=4, subject="abc123",
+        risk_test_matrix_evidence=evidence,
+        risk_test_matrix_diagnostics=diagnostics,
+    )
+
+    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+
+    assert '"risk_test_matrix_evidence"' in context
+    assert "implementation-derived-evidence" in context
+    assert "receipt-1" in context
+    assert '"risk_test_matrix_diagnostics"' in context
+    assert "checkout-head-mismatch" in context
+
+
 @pytest.mark.parametrize("head", [None, "different-head"])
 def test_coder_notes_not_presented_as_current_after_head_change(head):
     output = structured_coder_followup(summary="Unique old-head fix claim.")

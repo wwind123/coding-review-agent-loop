@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ from coding_review_agent_loop.protocol import (
     parse_risk_test_matrix,
     parse_risk_test_matrix_evidence,
     risk_test_matrix_identity,
+    validate_structured_coder_followup,
     validate_structured_plan_state,
     validate_risk_test_matrix_revision,
 )
@@ -40,6 +42,7 @@ from coding_review_agent_loop.round_transport import (
     prepare_round_comment,
     risk_test_matrix_section_boundary,
 )
+from agent_loop_helpers import structured_coder_followup
 
 
 def _row(row_id: str = "row-ordinary") -> dict[str, object]:
@@ -178,6 +181,78 @@ def test_derived_matrix_evidence_preserves_unsuperseded_failure_caveat() -> None
     assert row.status == "incomplete"
     assert any("unsuperseded" in caveat for caveat in row.caveats)
     assert any(diagnostic.code == "unsuperseded-journal-failure" for diagnostic in result.diagnostics)
+
+
+def test_orchestrator_derivation_ignores_prior_turn_failure(monkeypatch, tmp_path) -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    plan_context = make_approved_plan_context(
+        None,
+        expected_hash="a" * 16,
+        expected_subject="b" * 64,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    prior_failure = _derived_observation(
+        execution_ref="old-turn:observation-1",
+        receipt_id="receipt-old-failure",
+        outcome="failed",
+        turn_id="turn-old",
+    )
+    current_pass = _derived_observation(
+        execution_ref="current-turn:observation-1",
+        receipt_id="receipt-current-pass",
+        turn_id="turn-current",
+    )
+    parsed = validate_structured_coder_followup(structured_coder_followup())
+    parsed = dataclasses.replace(parsed, risk_test_matrix_claims=SemanticRiskCoverageClaims((
+        SemanticRiskCoverageClaim(
+            row_id="row-ordinary",
+            execution_refs=("current-turn:observation-1",),
+            test_identifiers=("test_ordinary",),
+            test_locations=("tests/test_risk_test_matrix.py::test_ordinary",),
+            workflow_path_claim="The current coder turn ran the workflow.",
+            outcome_assertions=("The selected test passed.",),
+            forbidden_effect_assertions=("No stale head was merged.",),
+        ),
+    )))
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "stable_tracked_tree_snapshot",
+        lambda _cwd: SimpleNamespace(
+            head="head-current", tracked_digest="tree-current", complete=True,
+            stable=True, status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "reconcile_test_observations",
+        lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
+    )
+    runner = SimpleNamespace(
+        local_test_observations=lambda: (prior_failure, current_pass),
+    )
+
+    derived, result = orchestrator_module._derive_authenticated_risk_evidence_for_coder(
+        parsed,
+        approved_plan_context=plan_context,
+        runner=runner,
+        assigned_workdir=tmp_path,
+        head_sha="head-current",
+        invocation_id="turn-current",
+        _closed_execution_catalog=(current_pass,),
+    )
+
+    assert result is not None
+    assert derived.risk_test_matrix_evidence.rows[0].status == "verified"
+    assert not any(
+        diagnostic.code == "unsuperseded-journal-failure"
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_derived_matrix_evidence_rejects_a_matching_tree_from_the_wrong_checkout_head() -> None:

@@ -13,6 +13,7 @@ import time
 import zoneinfo
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import ContextVar
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 from typing import Literal
@@ -327,6 +328,16 @@ from .repair_preservation import (
     validate_repair_preservation,
 )
 from .runner import Runner
+
+
+# Validation may invoke format repair, whose runner intentionally starts a new
+# broker turn. Keep the acquisition snapshot in a context-local seam so the
+# existing validators continue to receive the coder turn while repair runs.
+_VALIDATION_TEST_TURN_CONTEXT: ContextVar[
+    tuple[Runner, str | None, tuple[object, ...]] | None
+] = ContextVar("validation_test_turn_context", default=None)
+
+
 from .local_test_evidence import (
     reconcile_test_observations,
     stable_tracked_tree_snapshot,
@@ -866,6 +877,10 @@ class ValidatedAgentResponse:
     observation_provenance: str | None = None
     acquisition_outcome: Literal["success", "accepted_nonzero_exit", "accepted_timeout"] = "success"
     acquisition_returncode: int | None = None
+    # Ephemeral coder acquisition authority. These values survive format
+    # repair in memory but are intentionally excluded from durable metadata.
+    acquisition_test_turn_id: str | None = None
+    acquisition_test_observations: tuple[object, ...] = ()
 
 
 def _response_identity_fields(result: AgentResult) -> dict[str, object]:
@@ -878,6 +893,14 @@ def _response_identity_fields(result: AgentResult) -> dict[str, object]:
         "observed_model": result.observed_model,
         "observed_effort": result.observed_effort,
         "observation_provenance": result.observation_provenance,
+        "acquisition_test_turn_id": getattr(
+            result, "test_turn_id", getattr(result, "acquisition_test_turn_id", None)
+        ),
+        "acquisition_test_observations": getattr(
+            result,
+            "test_turn_observations",
+            getattr(result, "acquisition_test_observations", ()),
+        ),
     }
 
 
@@ -885,6 +908,8 @@ def _metadata_identity_fields(response: object) -> dict[str, object]:
     """Identity fields safe to expand into PostedRoundMetadata."""
     fields = _response_identity_fields(response)  # type: ignore[arg-type]
     fields.pop("role", None)
+    fields.pop("acquisition_test_turn_id", None)
+    fields.pop("acquisition_test_observations", None)
     return fields
 
 
@@ -2806,10 +2831,27 @@ def _run_validated_agent(
     # the validation seam so every artifact recovery and repair path receives
     # the same provenance check before it can be accepted.
     response_validator = validate
+    validation_acquisition: AgentResult | None = None
 
     def validate(text: str) -> object:
         TrustedBody.current_untrusted_visible(text)
-        return response_validator(text)
+        token = None
+        if (
+            validation_acquisition is not None
+            and validation_acquisition.test_turn_id is not None
+        ):
+            token = _VALIDATION_TEST_TURN_CONTEXT.set(
+                (
+                    runner,
+                    validation_acquisition.test_turn_id,
+                    validation_acquisition.test_turn_observations,
+                )
+            )
+        try:
+            return response_validator(text)
+        finally:
+            if token is not None:
+                _VALIDATION_TEST_TURN_CONTEXT.reset(token)
 
     agent_name = agent_display_name(agent)
     operation_description = operation_description or _operation_description_from_context(
@@ -2918,6 +2960,10 @@ def _run_validated_agent(
             timeout_seconds=next_timeout_seconds,
             **invocation_kwargs,
         )
+        # Keep this acquisition result fixed through every validation and
+        # repair callback for the current response. Repair itself may replace
+        # runner.latest_test_turn_id, but it cannot replace this snapshot.
+        validation_acquisition = result
         # The bounded deadline belongs only to the interrupted invocation and
         # its dedicated replay. A later ordinary retry has its normal budget.
         if is_executable_replacement_replay:
@@ -4071,6 +4117,9 @@ def _validate_issue_implementation_response(
 
 def _current_test_turn_observations(runner: Runner) -> tuple[object, ...]:
     """Return the closed invocation-local catalog, never the cumulative journal."""
+    validation_context = _VALIDATION_TEST_TURN_CONTEXT.get()
+    if validation_context is not None and validation_context[0] is runner:
+        return validation_context[2]
     turn_id = getattr(runner, "latest_test_turn_id", None)
     if not isinstance(turn_id, str) or not turn_id:
         return ()
@@ -4213,7 +4262,16 @@ def _derive_authenticated_risk_evidence_for_coder(
     journal_observations = (
         tuple(_journal_observations)
         if _journal_observations is not None
-        else tuple(runner.local_test_observations())
+        else tuple(
+            observation
+            for observation in runner.local_test_observations()
+            if bound_invocation_id is None
+            or (
+                observation.get("turn_id")
+                if isinstance(observation, Mapping)
+                else getattr(observation, "turn_id", None)
+            ) == bound_invocation_id
+        )
     )
     try:
         snapshot = stable_tracked_tree_snapshot(assigned_workdir)
@@ -7739,6 +7797,9 @@ def _implement_approved_issue(
         head_sha=initial_pr_context.metadata.head_sha,
         config=implementation_config,
         session_id=coder_response.session_id,
+        invocation_id=coder_response.acquisition_test_turn_id,
+        _closed_execution_catalog=coder_response.acquisition_test_observations,
+        _journal_observations=coder_response.acquisition_test_observations,
         reauthenticate_head=lambda: get_pr_review_context(
             runner, config=implementation_config, pr_number=pr_number
         ).metadata.head_sha,
@@ -7756,7 +7817,7 @@ def _implement_approved_issue(
             config=implementation_config,
             model_used=coder_response.model_used,
             local_test_evidence=initial_local_test_evidence,
-            current_test_turn_id=runner.latest_test_turn_id,
+            current_test_turn_id=coder_response.acquisition_test_turn_id,
         ),
         PostedRoundMetadata(
             flow="pr",
@@ -10701,6 +10762,9 @@ def run_issue_loop(
             head_sha=initial_pr_metadata.head_sha,
             config=config,
             session_id=coder_response.session_id,
+            invocation_id=coder_response.acquisition_test_turn_id,
+            _closed_execution_catalog=coder_response.acquisition_test_observations,
+            _journal_observations=coder_response.acquisition_test_observations,
             reauthenticate_head=lambda: get_pr_review_context(
                 runner, config=config, pr_number=pr_number
             ).metadata.head_sha,
@@ -10718,7 +10782,7 @@ def run_issue_loop(
                 config=config,
                 model_used=coder_response.model_used,
                 local_test_evidence=initial_local_test_evidence,
-                current_test_turn_id=runner.latest_test_turn_id,
+                current_test_turn_id=coder_response.acquisition_test_turn_id,
             ),
             PostedRoundMetadata(
                 flow="pr",
@@ -10968,6 +11032,15 @@ def _coder_followup_review_context(
         "tests_run": tests,
         "local_test_evidence": metadata.local_test_evidence,
     }
+    # Reviewers receive the orchestrator-derived authority carried by the
+    # same round metadata as the public comment. Do not reconstruct it from
+    # the coder's fresh response or from the cumulative local journal.
+    if metadata.risk_test_matrix_evidence is not None:
+        payload["risk_test_matrix_evidence"] = metadata.risk_test_matrix_evidence
+    if metadata.risk_test_matrix_diagnostics:
+        payload["risk_test_matrix_diagnostics"] = [
+            dict(item) for item in metadata.risk_test_matrix_diagnostics
+        ]
     if isinstance(parsed, StructuredCoderFollowup):
         payload.update(
             addressed_items=parsed.addressed_items,
@@ -16972,6 +17045,9 @@ def run_pr_loop(
                         predecessor_head=pr_metadata.head_sha,
                         config=config,
                         session_id=coder_response.session_id,
+                        invocation_id=coder_response.acquisition_test_turn_id,
+                        _closed_execution_catalog=coder_response.acquisition_test_observations,
+                        _journal_observations=coder_response.acquisition_test_observations,
                         assigned_worktree_head=assigned_worktree_head_after_followup,
                         reauthenticate_head=lambda: get_pr_review_context(
                             runner, config=config, pr_number=pr_number
@@ -17005,7 +17081,7 @@ def run_pr_loop(
                     config=config,
                     model_used=coder_response.model_used,
                     local_test_evidence=local_test_evidence,
-                    current_test_turn_id=runner.latest_test_turn_id,
+                    current_test_turn_id=coder_response.acquisition_test_turn_id,
                 )
 
             qualification_checkpoint = _machine_obligation_checkpoint(
