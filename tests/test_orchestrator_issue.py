@@ -2710,6 +2710,96 @@ def test_issue_loop_activates_semantic_revision_from_fresh_authenticated_base(tm
     assert metadata.assembled_plan_sidecar is not None
     assert "Revised semantic plan." in runner.comments[2]
 
+
+def test_semantic_revision_inherits_signed_requirement_dispositions(tmp_path):
+    requirement = HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Preserve backward compatibility.",
+    )
+    fresh_payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    fresh_payload["human_requirement_dispositions"] = [{
+        "requirement_id": requirement.requirement_id,
+        "disposition": "addressed",
+        "evidence": "The authenticated base preserves backward compatibility.",
+    }]
+    fresh = (
+        json.dumps(fresh_payload)
+        + "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n"
+        f"- Requirement {requirement.requirement_id}: the base preserves backward compatibility.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    parsed = validate_structured_plan_state(fresh)
+    base = AuthenticatedPlanState.from_plan(parsed, round_number=1)
+    patch = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Change only the plan summary.",
+        "prior_plan_item_dispositions": [
+            {"item_id": "item-1", "disposition": "resolved"}
+        ],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "summary", "value": "Summary changed."}
+        ],
+    }
+    patch_text = (
+        json.dumps(patch)
+        + "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n"
+        f"- Requirement {requirement.requirement_id}: the authenticated disposition remains valid.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = FakeRunner(
+        issue_payload={
+            "author": {"login": "maintainer"},
+            "createdAt": "2026-05-17T08:00:00Z",
+            "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
+        },
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking", blocking_plan_issues=["Review the plan."]
+            ),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+                human_requirements_resolved=True,
+            ),
+        ],
+    )
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(tmp_path, max_rounds=3, plan_execution_mode="plan-only"),
+        plan_first=True,
+    ) == 0
+
+    raw_comment = runner.issue_comments[2]["body"]
+    match = re.search(
+        r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+        raw_comment,
+    )
+    assert match is not None
+    metadata = _decode_round_metadata(match.group("payload"))
+    assert metadata.response_form == "semantic-patch-v1"
+    assert metadata.assembled_plan_sidecar["canonical_json"]["human_requirement_dispositions"] == [
+        {
+            "requirement_id": requirement.requirement_id,
+            "disposition": "addressed",
+            "evidence": "The authenticated base preserves backward compatibility.",
+        }
+    ]
+
 def test_issue_loop_plan_revision_rejects_missing_human_requirements_acknowledgement(tmp_path):
     runner = FakeRunner(
         issue_payload={

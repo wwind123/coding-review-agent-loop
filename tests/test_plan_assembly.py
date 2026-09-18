@@ -18,10 +18,13 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_revision_patch,
 )
 from coding_review_agent_loop.round_state import (
+    _attach_round_metadata,
     PostedRoundMetadata,
     _decode_round_metadata,
     _decode_round_metadata_mapping,
     _encode_round_metadata,
+    _plan_subject,
+    _resume_plan_round,
 )
 from coding_review_agent_loop.round_transport import decode_mapping
 
@@ -324,6 +327,46 @@ def test_semantic_round_metadata_round_trips_provenance_and_sidecar_without_lega
     assert decoded.aggregate_plan_identity == sidecar.aggregate_identity
     assert decoded.raw_patch_provenance == sidecar.raw_patch
     assert decoded.assembled_plan_sidecar == sidecar.to_payload()
+
+
+def test_semantic_round_resume_uses_authenticated_sidecar_not_raw_patch() -> None:
+    state = _state(_base([_row("row-a")]))
+    _, sidecar = assemble_authenticated_plan_revision(
+        state,
+        _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
+        result_round_number=5,
+    )
+    canonical_plan = "## Authenticated canonical plan\n"
+    raw_patch = json.dumps(sidecar.raw_patch) + (
+        "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    metadata = PostedRoundMetadata(
+        flow="plan",
+        role="coder",
+        agent="Claude",
+        round_number=5,
+        subject=_plan_subject(canonical_plan),
+        canonical_plan=canonical_plan,
+        raw_structured_coder_response=raw_patch,
+        response_form="semantic-patch-v1",
+        base_round_number=state.round_number,
+        base_state_identity=state.state_identity,
+        aggregate_plan_identity=sidecar.aggregate_identity,
+        raw_patch_provenance=sidecar.raw_patch,
+        assembled_plan_sidecar=sidecar.to_payload(),
+        execution_strategy_contract_version=1,
+    )
+    comment = _attach_round_metadata("Published canonical plan", metadata)
+
+    resumed = _resume_plan_round(
+        [type("Comment", (), {"body": comment})()],
+        configured_reviewers=("codex",),
+    )
+
+    assert resumed is not None
+    current_plan, resumed_round = resumed
+    assert current_plan == canonical_plan
+    assert resumed_round.coder_output == raw_patch
 
 
 def test_semantic_round_metadata_rejects_partial_wrong_type_and_conflicting_authority() -> None:

@@ -3017,43 +3017,44 @@ def _resume_plan_round(
                 "Generation-1 planning metadata subject does not match its canonical plan; "
                 "repair the handoff or start a new plan round."
             )
-    all_bodies = tuple(
-        body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
-    )
-    fresh_artifact = False
-    fresh_matrix_artifact = False
-    try:
-        raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
-        fresh_artifact = (
-            isinstance(raw_payload, dict)
-            and (
-                "execution_strategy_contract_version" in raw_payload
-                or "execution_recommendation" in raw_payload
-            )
-        ) or "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
-        fresh_matrix_artifact = (
-            isinstance(raw_payload, dict)
-            and (
-                "risk_test_matrix_contract_version" in raw_payload
-                or "risk_test_matrix" in raw_payload
-            )
-        ) or RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
-    except (AttributeError, json.JSONDecodeError):
-        fresh_artifact = "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
-        fresh_matrix_artifact = RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
-    if fresh_artifact and metadata_version != 1:
-        raise AgentLoopError(
-            "Fresh generation-1 planning data is present but its round metadata is "
-            "missing or not generation 1; restart the planning handoff instead of "
-            "downgrading it to legacy-undecided."
+    if semantic_response_form != "semantic-patch-v1":
+        all_bodies = tuple(
+            body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
         )
-    if fresh_matrix_artifact and matrix_metadata_version != 1:
-        raise AgentLoopError(
-            "Fresh generation-1 risk matrix data is present but its round metadata is "
-            "missing or not generation 1; restart the planning handoff instead of "
-            "downgrading it to legacy-undecided."
-        )
-    if metadata_version == 1:
+        fresh_artifact = False
+        fresh_matrix_artifact = False
+        try:
+            raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
+            fresh_artifact = (
+                isinstance(raw_payload, dict)
+                and (
+                    "execution_strategy_contract_version" in raw_payload
+                    or "execution_recommendation" in raw_payload
+                )
+            ) or "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+            fresh_matrix_artifact = (
+                isinstance(raw_payload, dict)
+                and (
+                    "risk_test_matrix_contract_version" in raw_payload
+                    or "risk_test_matrix" in raw_payload
+                )
+            ) or RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
+        except (AttributeError, json.JSONDecodeError):
+            fresh_artifact = "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+            fresh_matrix_artifact = RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
+        if fresh_artifact and metadata_version != 1:
+            raise AgentLoopError(
+                "Fresh generation-1 planning data is present but its round metadata is "
+                "missing or not generation 1; restart the planning handoff instead of "
+                "downgrading it to legacy-undecided."
+            )
+        if fresh_matrix_artifact and matrix_metadata_version != 1:
+            raise AgentLoopError(
+                "Fresh generation-1 risk matrix data is present but its round metadata is "
+                "missing or not generation 1; restart the planning handoff instead of "
+                "downgrading it to legacy-undecided."
+            )
+    if metadata_version == 1 and semantic_response_form != "semantic-patch-v1":
         # A generation-1 round is never downgraded to legacy on resume.  The
         # raw response is the provenance source; the visible canonical plan is
         # intentionally markdown and cannot substitute for it.

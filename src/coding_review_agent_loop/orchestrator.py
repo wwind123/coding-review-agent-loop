@@ -4180,6 +4180,7 @@ def _current_plan_has_complete_human_requirement_dispositions(
     coder_output: str | None,
     *,
     surfaced_requirement_ids: Sequence[str],
+    inherited_dispositions: Sequence[object] | None = None,
 ) -> bool:
     """Return whether the current coder plan has the required attestation.
 
@@ -4198,11 +4199,15 @@ def _current_plan_has_complete_human_requirement_dispositions(
                 patch = validate_structured_plan_revision_patch(coder_output)
                 if patch is None:
                     return False
-                dispositions = ()
+                dispositions = None
                 for operation in patch.operations:
                     if operation.op == "replace" and operation.field == "human_requirement_dispositions":
                         dispositions = operation.value
                         break
+                if dispositions is None:
+                    dispositions = inherited_dispositions
+                if dispositions is None:
+                    return False
                 validate_human_requirement_dispositions(
                     dispositions,
                     surfaced_requirement_ids=surfaced_requirement_ids,
@@ -4379,6 +4384,7 @@ def _validate_plan_revision_patch_response(
     *,
     unresolved_items: Sequence[UnresolvedReviewItem] = (),
     human_requirements=(),
+    inherited_human_requirement_dispositions: Sequence[object] | None = None,
 ) -> object:
     """Validate a semantic patch and its carried review-item ledger."""
     parsed = validate_structured_plan_revision_patch(text)
@@ -4405,11 +4411,15 @@ def _validate_plan_revision_patch_response(
         surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
         requires_direct_discussion_ack=requirements_context.requires_direct_discussion_ack,
     )
-    dispositions = ()
+    dispositions = None
     for operation in parsed.operations:
         if operation.op == "replace" and operation.field == "human_requirement_dispositions":
             dispositions = operation.value
             break
+    if dispositions is None:
+        dispositions = inherited_human_requirement_dispositions
+    if dispositions is None:
+        dispositions = ()
     validate_human_requirement_dispositions(
         dispositions,
         surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
@@ -8569,6 +8579,12 @@ def _run_plan_first_loop(
             coder_dispositions_complete = _current_plan_has_complete_human_requirement_dispositions(
                 current_coder_output,
                 surfaced_requirement_ids=hr_ids,
+                inherited_dispositions=(
+                    hydrate_authenticated_plan_state(current_plan_sidecar).plan.human_requirement_dispositions
+                    if current_response_form == "semantic-patch-v1"
+                    and current_plan_sidecar is not None
+                    else None
+                ),
             )
             missing_acknowledgements = (
                 [reviewer_name for reviewer_name, _review_output in approved_review_outputs]
@@ -9314,6 +9330,10 @@ def _run_plan_first_loop(
                     text,
                     unresolved_items=items,
                     human_requirements=human_requirements,
+                    inherited_human_requirement_dispositions=(
+                        semantic_base.plan.human_requirement_dispositions
+                        if semantic_base is not None else None
+                    ),
                 ))
                 if semantic_revision
                 else (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_response_with_human_requirements(
