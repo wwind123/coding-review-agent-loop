@@ -2100,6 +2100,40 @@ def _authoritative_receipt_passes(
     )
 
 
+def _known_launch_integrity_passes(observation: object) -> bool:
+    """Reject explicit broker launch failures before PR/head authentication.
+
+    Head and tree attribution are intentionally checked by the post-authentication
+    builder. Launch-boundary states, however, are known as soon as the broker
+    closes the current turn and must not be deferred into that phase. Older
+    lightweight projections may omit these fields, so absence remains a
+    compatibility case rather than being treated as a known failure.
+    """
+    launch_fields = ("wrapper_bootstrap", "inner_exec", "suite_start")
+    if isinstance(observation, Mapping):
+        supplied = any(field in observation for field in launch_fields)
+    else:
+        supplied = any(hasattr(observation, field) for field in launch_fields)
+        if not supplied:
+            projected = getattr(observation, "public_projection", None)
+            if callable(projected):
+                try:
+                    value = projected()
+                except Exception:  # pragma: no cover - defensive provider boundary
+                    value = None
+                supplied = isinstance(value, Mapping) and any(
+                    field in value for field in launch_fields
+                )
+    if not supplied:
+        return True
+    semantics, _rich = _observation_semantics(observation)
+    return (
+        semantics["wrapper_bootstrap"] == "verified"
+        and semantics["inner_exec"] == "started"
+        and semantics["suite_start"] == "verified"
+    )
+
+
 def _receipt_expected_status(observation: object, *, claim: str) -> str | None:
     semantics, rich = _observation_semantics(observation)
     if not rich:
@@ -3017,6 +3051,11 @@ def _parse_semantic_risk_coverage_claims(
                 if semantics["outcome"] != "passed" or semantics["provenance"] != "parent-observed":
                     raise AgentLoopError(
                         f"{claim_context}.execution_refs selector `{ref}` is not an admissible passing observation."
+                    )
+                if not _known_launch_integrity_passes(observation):
+                    raise AgentLoopError(
+                        f"{claim_context}.execution_refs selector `{ref}` has known non-authoritative "
+                        "launch-integrity state and cannot be selected before authentication."
                     )
         test_identifiers = _risk_bounded_string_list(
             payload["test_identifiers"], context=f"{claim_context}.test_identifiers"
