@@ -54,6 +54,8 @@ from coding_review_agent_loop.protocol import (
     parse_plan_review,
     parse_plan_review_items,
     parse_plan_state,
+    parse_risk_test_matrix,
+    parse_risk_test_matrix_changes,
     parse_structured_discuss_agenda,
     parse_structured_discuss_answer,
     parse_legacy_structured_discuss_answer,
@@ -76,6 +78,10 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
     validate_structured_plan_revision,
     sanitize_architecture_impact,
+    RISK_TEST_MATRIX_CHANGE_KEYS,
+    RISK_TEST_MATRIX_REQUIRED_KEYS,
+    RISK_TEST_MATRIX_ROW_KEYS,
+    risk_test_matrix_prompt_examples,
 )
 
 
@@ -2689,6 +2695,20 @@ def test_validate_structured_human_requirements_acknowledgement_rejects_invalid_
             surfaced_requirement_ids=surfaced_ids,
             requires_direct_discussion_ack=requires_direct_discussion_ack,
         )
+
+
+def test_risk_matrix_prompt_examples_match_strict_wire_key_sets():
+    examples = risk_test_matrix_prompt_examples()
+    applicable = examples["applicable"]
+    row = applicable["rows"][0]
+    change = examples["changes"][0]
+
+    assert set(applicable) == set(RISK_TEST_MATRIX_REQUIRED_KEYS)
+    assert set(row) == set(RISK_TEST_MATRIX_ROW_KEYS)
+    assert set(change) == set(RISK_TEST_MATRIX_CHANGE_KEYS)
+    assert parse_risk_test_matrix(applicable).is_applicable
+    assert not parse_risk_test_matrix(examples["not_applicable"]).is_applicable
+    assert parse_risk_test_matrix_changes(examples["changes"])
 
 
 def test_validate_structured_plan_revision_accepts_v1_payload():

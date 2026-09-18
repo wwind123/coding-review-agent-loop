@@ -134,6 +134,17 @@ enforces only its owned rows while retaining sibling, later, and final rows as
 read-only pending obligations, and a separately planned child must link its
 rows to inherited parent obligations or surface a provenance conflict.
 
+The validated matrix wire schema is the canonical source for planner and
+repair prompt key lists and minimal applicable/not-applicable examples. Repair
+is bounded format recovery: it preserves a complete fresh matrix and rejects
+missing or semantically inconsistent matrix content rather than inventing
+scenarios. Fresh execution-recommendation integrity remains eligible for the
+existing planner replay, while an unrecoverable absent or malformed fresh
+matrix terminates after one planner response. That fail-fast path retains the
+original validator diagnostic and candidate provenance and reuses the durable
+planning-validation diagnostic handler; the rejected response is never stored
+as canonical plan state.
+
 Decomposition into child phases and materialization of split proposals are
 distinct workflows, with typed topology and durable checkpoints. They are not
 inferred by creating an issue for every sentence mentioning deferred work.

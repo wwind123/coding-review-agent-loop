@@ -13,6 +13,9 @@ from coding_review_agent_loop.repair import (
 )
 from coding_review_agent_loop.errors import FreshContractIntegrityError
 from coding_review_agent_loop.protocol import (
+    RISK_TEST_MATRIX_CHANGE_KEYS,
+    RISK_TEST_MATRIX_REQUIRED_KEYS,
+    RISK_TEST_MATRIX_ROW_KEYS,
     validate_human_requirement_dispositions,
     validate_structured_discuss_answer,
     validate_structured_coder_followup,
@@ -68,6 +71,20 @@ def test_fresh_contract_guard_requires_mechanically_recoverable_source():
         require_recoverable_fresh_execution_contract(
             "leading prose before the JSON", expected_kind="plan_state"
         )
+
+
+def test_fresh_matrix_repair_prompt_renders_exact_schema_and_examples():
+    prompt = _build_repair_prompt(
+        "malformed",
+        expected_kind="plan_state",
+        require_risk_test_matrix_contract=True,
+    )
+    for key in (*RISK_TEST_MATRIX_REQUIRED_KEYS, *RISK_TEST_MATRIX_ROW_KEYS,
+                *RISK_TEST_MATRIX_CHANGE_KEYS):
+        assert f"`{key}`" in prompt or f'"{key}"' in prompt
+    assert "Validator-accepted applicable matrix example" in prompt
+    assert "Validator-accepted not-applicable matrix example" in prompt
+    assert "Do not invent, omit, or weaken matrix scenarios." in prompt
 
 
 @pytest.mark.parametrize("missing", ["risk_test_matrix_contract_version", "risk_test_matrix", "risk_test_matrix_changes"])

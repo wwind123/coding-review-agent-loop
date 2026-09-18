@@ -31,6 +31,13 @@ from coding_review_agent_loop.comment_rendering import render_canonical_plan_sta
 from coding_review_agent_loop.protocol import (
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
+    RISK_TEST_MATRIX_CHANGE_KEYS,
+    RISK_TEST_MATRIX_OPTIONAL_KEYS,
+    RISK_TEST_MATRIX_REQUIRED_KEYS,
+    RISK_TEST_MATRIX_ROW_KEYS,
+    parse_risk_test_matrix,
+    parse_risk_test_matrix_changes,
+    risk_test_matrix_prompt_examples,
 )
 
 _EXPECTED_UNRESOLVED_ITEMS_GUIDANCE = """Prior unresolved items are present. Disposition every listed
@@ -93,6 +100,29 @@ def test_fresh_plan_prompts_show_the_exact_one_shot_contract_shape(tmp_path):
         assert '"execution_recommendation"' in prompt
         assert '"child_stages": []' in prompt
         assert '"retained_parent_work": {"status": "none"' in prompt
+
+
+def test_all_fresh_planning_prompt_variants_render_validator_matrix_contract(tmp_path):
+    config = make_config(tmp_path)
+    prompts = (
+        build_issue_plan_prompt(783, config),
+        build_plan_revision_prompt(783, 2, "Previous plan", "Blocking review", config),
+        build_plan_revision_prompt(
+            783, 2, "Previous plan", "Blocking review", config, compact_context=True
+        ),
+    )
+    examples = risk_test_matrix_prompt_examples()
+    parse_risk_test_matrix(examples["applicable"])
+    parse_risk_test_matrix(examples["not_applicable"])
+    parse_risk_test_matrix_changes(examples["changes"])
+
+    for prompt in prompts:
+        for key in (*RISK_TEST_MATRIX_REQUIRED_KEYS, *RISK_TEST_MATRIX_OPTIONAL_KEYS,
+                    *RISK_TEST_MATRIX_ROW_KEYS, *RISK_TEST_MATRIX_CHANGE_KEYS):
+            assert f'"{key}"' in prompt
+        assert "Minimal validator-accepted applicable matrix example" in prompt
+        assert "Minimal validator-accepted not-applicable matrix example" in prompt
+        assert "not_applicable_rationale" in prompt
 
 
 def test_plan_prompts_render_authenticated_validation_diagnostic_as_trusted_context(tmp_path):
