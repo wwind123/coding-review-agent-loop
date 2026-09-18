@@ -2968,6 +2968,40 @@ def _resume_plan_round(
     matrix_metadata_version = latest_coder_record.metadata.risk_test_matrix_contract_version
     semantic_response_form = latest_coder_record.metadata.response_form
     semantic_sidecar_authoritative = semantic_response_form == "semantic-patch-v1"
+    if semantic_response_form in {"fresh-plan-state", "legacy-full-state"}:
+        # Fresh and legacy full-state publications seed the next semantic
+        # revision.  Their authenticated sidecar must bind to the exact
+        # canonical Markdown persisted with the round; a subject check alone
+        # is insufficient because both the Markdown and subject can be
+        # replaced while leaving the sidecar untouched.
+        metadata = latest_coder_record.metadata
+        if metadata.assembled_plan_sidecar is None or metadata.canonical_plan is None:
+            raise AgentLoopError(
+                "Authenticated full-state planning metadata is incomplete: "
+                "authenticated assembled state and canonical Markdown are both required "
+                "for restart."
+            )
+        try:
+            sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+            if sidecar.response_form != semantic_response_form:
+                raise AgentLoopError("full-state sidecar response form mismatch")
+            if sidecar.round_number != metadata.round_number:
+                raise AgentLoopError("full-state sidecar round mismatch")
+            if metadata.aggregate_plan_identity != sidecar.aggregate_identity:
+                raise AgentLoopError("full-state sidecar aggregate identity mismatch")
+            if (
+                sidecar.rendered_plan_identity is None
+                or sidecar.rendered_plan_identity
+                != rendered_plan_identity(metadata.canonical_plan)
+            ):
+                raise AgentLoopError(
+                    "full-state sidecar rendered-plan identity does not match canonical Markdown"
+                )
+        except (AgentLoopError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise AgentLoopError(
+                "Authenticated full-state planning state is missing or contradictory; "
+                f"refusing to resume from an unbound canonical Markdown: {exc}"
+            ) from exc
     if semantic_sidecar_authoritative:
         # Semantic rounds resume from the authenticated assembled sidecar. The
         # raw model patch is provenance only and is never reparsed into the

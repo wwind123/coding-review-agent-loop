@@ -389,6 +389,58 @@ def test_semantic_round_resume_uses_authenticated_sidecar_not_raw_patch() -> Non
         )
 
 
+@pytest.mark.parametrize("response_form", ("fresh-plan-state", "legacy-full-state"))
+def test_full_state_round_resume_rejects_mismatched_sidecar_markdown(
+    response_form: str,
+) -> None:
+    state = _state(_base([_row("row-a")]))
+    assembled, _ = assemble_authenticated_plan_revision(
+        state,
+        _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
+        result_round_number=5,
+    )
+    canonical_payload = copy.deepcopy(structured_plan_revision_to_payload(assembled))
+    if response_form == "fresh-plan-state":
+        canonical_payload["kind"] = "plan_state"
+        canonical_payload.pop("prior_plan_item_dispositions", None)
+    canonical_plan = f"## {response_form} canonical plan\n"
+    sidecar = make_assembled_plan_sidecar(
+        canonical_payload,
+        round_number=5,
+        response_form=response_form,
+        rendered_plan=canonical_plan,
+    )
+    metadata = PostedRoundMetadata(
+        flow="plan",
+        role="coder",
+        agent="Codex",
+        round_number=5,
+        subject=_plan_subject(canonical_plan),
+        canonical_plan=canonical_plan,
+        response_form=response_form,
+        aggregate_plan_identity=sidecar.aggregate_identity,
+        assembled_plan_sidecar=sidecar.to_payload(),
+    )
+    mismatched_plan = "## Swapped reviewer-visible plan\n"
+    mismatched = replace(
+        metadata,
+        canonical_plan=mismatched_plan,
+        subject=_plan_subject(mismatched_plan),
+    )
+
+    with pytest.raises(AgentLoopError, match="rendered-plan identity"):
+        _resume_plan_round(
+            [
+                type(
+                    "Comment",
+                    (),
+                    {"body": _attach_round_metadata("Published canonical plan", mismatched)},
+                )()
+            ],
+            configured_reviewers=("codex",),
+        )
+
+
 def test_semantic_round_metadata_rejects_partial_wrong_type_and_conflicting_authority() -> None:
     state = _state(_base([_row("row-a")]))
     _, sidecar = assemble_authenticated_plan_revision(
