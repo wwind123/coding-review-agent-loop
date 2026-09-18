@@ -626,11 +626,24 @@ def _apply_matrix_operations(
 def assemble_authenticated_plan_revision(
     base: AuthenticatedPlanState,
     patch: PlanRevisionPatch | Mapping[str, object],
+    *,
+    result_round_number: int | None = None,
 ) -> tuple[StructuredPlanRevision, AssembledPlanSidecar]:
-    """Atomically assemble one patch against one authenticated base."""
+    """Atomically assemble one patch against one authenticated base.
+
+    ``base.round_number`` authenticates the input state, while
+    ``result_round_number`` identifies the newly published canonical state.
+    The default derives the next round for compatibility with direct callers;
+    publication callers should pass the round assigned to the result so a
+    restart cannot hydrate the result as its stale predecessor.
+    """
     parsed_patch = parse_plan_revision_patch(patch)
     if base.approved:
         raise AgentLoopError("Semantic patches require an unapproved blocking plan base.")
+    if result_round_number is None:
+        result_round_number = base.round_number + 1
+    if isinstance(result_round_number, bool) or result_round_number < 0:
+        raise AgentLoopError("Authenticated plan result_round_number must be non-negative.")
     if parsed_patch.base_round_number != base.round_number:
         raise AgentLoopError(
             f"Semantic patch base_round_number {parsed_patch.base_round_number} does not match authenticated base round {base.round_number}."
@@ -693,7 +706,7 @@ def assemble_authenticated_plan_revision(
         raise AgentLoopError("Assembler did not emit a generation-1 plan_revision.")
     sidecar = make_assembled_plan_sidecar(
         payload,
-        round_number=base.round_number,
+        round_number=result_round_number,
         response_form="semantic-patch-v1",
         raw_patch=parsed_patch.to_payload(),
     )

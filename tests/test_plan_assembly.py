@@ -19,8 +19,10 @@ from coding_review_agent_loop.protocol import (
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
     _decode_round_metadata,
+    _decode_round_metadata_mapping,
     _encode_round_metadata,
 )
+from coding_review_agent_loop.round_transport import decode_mapping
 
 
 def _row(row_id: str, *, outcome: str | None = None) -> dict[str, object]:
@@ -184,6 +186,34 @@ def test_same_base_replay_is_byte_identical() -> None:
     assert first_sidecar.aggregate_identity == second_sidecar.aggregate_identity
 
 
+def test_published_round_identity_survives_chained_restart_and_revision() -> None:
+    state = _state(_base([_row("row-a")]), round_number=4)
+    first, first_sidecar = assemble_authenticated_plan_revision(
+        state,
+        _patch(
+            state,
+            [{"op": "replace", "field": "summary", "value": "First published result."}],
+        ),
+        result_round_number=5,
+    )
+    assert first.summary == "First published result."
+    assert first_sidecar.round_number == 5
+
+    restarted = hydrate_authenticated_plan_state(first_sidecar, round_number=5)
+    assert restarted.round_number == 5
+    assert restarted.state_identity == first_sidecar.aggregate_identity
+    second, second_sidecar = assemble_authenticated_plan_revision(
+        restarted,
+        _patch(
+            restarted,
+            [{"op": "replace", "field": "summary", "value": "Second published result."}],
+        ),
+        result_round_number=6,
+    )
+    assert second.summary == "Second published result."
+    assert second_sidecar.round_number == 6
+
+
 def test_zero_row_not_applicable_metadata_uses_matrix_sentinel() -> None:
     base = {
         **_base([]),
@@ -247,6 +277,7 @@ def test_no_ops_stale_bases_approved_bases_and_sidecar_hydration_fail_closed() -
     _, sidecar = assemble_authenticated_plan_revision(
         state,
         _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
+        result_round_number=5,
     )
     decoded = decode_assembled_plan_sidecar(sidecar.encode())
     hydrated = hydrate_authenticated_plan_state(decoded)
@@ -263,6 +294,7 @@ def test_semantic_round_metadata_round_trips_provenance_and_sidecar_without_lega
     _, sidecar = assemble_authenticated_plan_revision(
         state,
         _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
+        result_round_number=5,
     )
     metadata = PostedRoundMetadata(
         flow="plan",
@@ -283,3 +315,51 @@ def test_semantic_round_metadata_round_trips_provenance_and_sidecar_without_lega
     assert decoded.aggregate_plan_identity == sidecar.aggregate_identity
     assert decoded.raw_patch_provenance == sidecar.raw_patch
     assert decoded.assembled_plan_sidecar == sidecar.to_payload()
+
+
+def test_semantic_round_metadata_rejects_partial_wrong_type_and_conflicting_authority() -> None:
+    state = _state(_base([_row("row-a")]))
+    _, sidecar = assemble_authenticated_plan_revision(
+        state,
+        _patch(state, [{"op": "replace", "field": "summary", "value": "New."}]),
+        result_round_number=5,
+    )
+    metadata = PostedRoundMetadata(
+        flow="plan",
+        role="coder",
+        agent="Codex",
+        round_number=5,
+        subject="subject",
+        response_form="semantic-patch-v1",
+        base_round_number=state.round_number,
+        base_state_identity=state.state_identity,
+        aggregate_plan_identity=sidecar.aggregate_identity,
+        raw_patch_provenance=sidecar.raw_patch,
+        assembled_plan_sidecar=sidecar.to_payload(),
+    )
+    payload = decode_mapping(_encode_round_metadata(metadata))
+
+    malformed = [
+        {key: value for key, value in payload.items() if key != "aggregate_plan_identity"},
+        {**payload, "raw_patch_provenance": [payload["raw_patch_provenance"]]},
+        {**payload, "assembled_plan_sidecar": "not-an-object"},
+        {**payload, "round_number": 4},
+    ]
+    conflicting_sidecar = copy.deepcopy(sidecar.to_payload())
+    conflicting_sidecar["raw_patch"] = {"conflicting": True}
+    malformed.append({**payload, "assembled_plan_sidecar": conflicting_sidecar})
+    for candidate in malformed:
+        with pytest.raises(AgentLoopError):
+            _decode_round_metadata_mapping(candidate)
+
+    with pytest.raises(AgentLoopError, match="response_form"):
+        _decode_round_metadata_mapping(
+            {
+                "flow": "plan",
+                "role": "coder",
+                "agent": "Codex",
+                "round_number": 5,
+                "subject": "subject",
+                "base_round_number": None,
+            }
+        )
