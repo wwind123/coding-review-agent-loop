@@ -3222,7 +3222,10 @@ def _parse_semantic_risk_coverage_claims(
     or are owned elsewhere: unknown keys; invalid, unapproved, or duplicate
     row IDs; a missing ``execution_refs`` key or an empty list (#855); more
     than eight refs, non-string or blank refs, or refs over the hard cap;
-    duplicate admissible selectors; catalog collisions; in-catalog selectors
+    an admissible selector repeated within one row (#865: the same
+    admissible selector may be cited by several rows, because one wrapper
+    run routinely covers several rows and each row still verifies on its own
+    facts); catalog collisions; in-catalog selectors
     that are not passing parent-observed observations, or whose supplied
     launch-integrity state is failing or unknown (any of wrapper bootstrap,
     inner exec, or suite start not authoritative) -- these are real broker

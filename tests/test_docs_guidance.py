@@ -376,3 +376,11 @@ def test_cli_help_documents_ci_queued_grace_seconds():
             help_text = sub_action.help
     assert help_text is not None
     assert "1200" in help_text
+
+
+def test_architecture_states_cross_row_selector_reuse_policy():
+    # #865: only repetition within one row is fatal; cross-row reuse is valid.
+    text = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    assert "duplicate admissible selectors" not in text
+    assert "One admissible selector may be cited by several rows" in text
+    assert "an admissible selector repeated within one row" in text
