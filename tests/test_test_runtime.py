@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from _proc_probe import DEAD_STATES, proc_state as _proc_state, wait_until_gone
+
 import coding_review_agent_loop.test_runtime as runtime
 from agent_loop_helpers import make_config
 from coding_review_agent_loop.cli import build_parser, main
@@ -25,30 +27,24 @@ def _now() -> datetime:
 
 def _assert_process_not_active(pid: int) -> None:
     """Treat a POSIX zombie as terminated while allowing init to reap it."""
-    stat_path = Path(f"/proc/{pid}/stat")
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        try:
-            stat = stat_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return
-        state = stat.split(") ", 1)[1].split(maxsplit=1)[0]
-        if state == "Z":
-            return
-        time.sleep(0.01)
-    raise AssertionError(f"probe descendant {pid} is still active")
+    if not wait_until_gone(pid, timeout=10.0):
+        raise AssertionError(f"probe descendant {pid} is still active")
 
 
 def _kill_if_active(pid: int) -> None:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except FileNotFoundError:
+    """Best-effort cleanup for a pid whose caller recorded no starttime.
+
+    Callers here never capture an identity to compare against, so this stays a
+    liveness-guarded kill; it is not the model for identity-aware fallbacks,
+    which must go through ``kill_if_same_instance``.
+    """
+    state = _proc_state(pid)
+    if state is None or state in DEAD_STATES:
         return
-    if stat.split(") ", 1)[1].split(maxsplit=1)[0] != "Z":
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def _windows_process_is_active(pid: int) -> bool:
