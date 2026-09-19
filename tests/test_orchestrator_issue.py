@@ -1105,6 +1105,188 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
         ) is False
 
 
+def _selector_only_issue_implementation_text(execution_ref: str) -> str:
+    """The #1187 shape: a claim with only row_id and execution_refs."""
+    raw = structured_issue_implementation(pr_number=77)
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["risk_test_matrix_claims"] = [{
+        "row_id": "implementation-derived-evidence",
+        "execution_refs": [execution_ref],
+    }]
+    return json.dumps(payload) + raw[end:]
+
+
+def _still_incomplete_issue_implementation_text(execution_ref: str) -> str:
+    raw = structured_issue_implementation(pr_number=77)
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["risk_test_matrix_claims"] = [{
+        "row_id": "implementation-derived-evidence",
+        "execution_refs": [execution_ref],
+        "test_identifiers": ["tests/test_orchestrator_issue.py::test_workflow"],
+        "workflow_path_claim": None,
+        "outcome_assertions": [],
+    }]
+    return json.dumps(payload) + raw[end:]
+
+
+@pytest.mark.parametrize("mode", ["completes", "still-incomplete"])
+def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_after_handoff(
+    tmp_path, monkeypatch, mode
+):
+    """#849: a claim missing all semantic facts must not reject the envelope.
+
+    The PR contract and issue handoff are recorded before the single
+    post-authentication correction runs, implementation is not re-run, and
+    repair is never invoked.
+    """
+    approved_plan, plan_context = _implementation_matrix_context()
+    current = _workflow_observation(
+        execution_ref="coder-turn:observation-1",
+        receipt_id="receipt-current-head",
+        head="abc123",
+    )
+    initial_text = _selector_only_issue_implementation_text(current.execution_ref)
+    corrected_text = (
+        _semantic_issue_implementation_text(current.execution_ref)
+        if mode == "completes"
+        else _still_incomplete_issue_implementation_text(current.execution_ref)
+    )
+    initial_parsed = validate_structured_issue_implementation(
+        initial_text,
+        delivered_risk_test_matrix_row_ids=("implementation-derived-evidence",),
+        execution_catalog=(current,),
+    )
+    assert initial_parsed is not None
+    assert initial_parsed.risk_test_matrix_claims.claims[0].workflow_path_claim == ""
+    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "abc123"})
+    config = make_config(tmp_path, coder="claude")
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+        human_requirements=(),
+    )
+    coder_response = ValidatedAgentResponse(
+        text=initial_text,
+        session_id="coder-session",
+        marker_value=initial_parsed,
+        acquisition_test_turn_id="coder-turn",
+        acquisition_test_observations=(current,),
+    )
+    implementation_calls = []
+    recorded = []
+    correction_prompts = []
+    run_pr_calls = []
+
+    def fake_validated_agent(*_a, **_k):
+        implementation_calls.append(1)
+        return coder_response
+
+    real_contract_record = orchestrator_module.post_trusted_pr_contract_record
+    real_handoff = orchestrator_module.post_issue_pr_handoff_comment
+
+    def recording_contract_record(*args, **kwargs):
+        result = real_contract_record(*args, **kwargs)
+        recorded.append("pr-contract")
+        return result
+
+    def recording_handoff(*args, **kwargs):
+        result = real_handoff(*args, **kwargs)
+        recorded.append(("issue-handoff", kwargs.get("pr_number")))
+        return result
+
+    def fake_correction(*_a, **kwargs):
+        assert kwargs.get("label") == "semantic-evidence-correction"
+        # Inspect the durable records at call time, not after the flow ends.
+        assert "pr-contract" in recorded
+        assert ("issue-handoff", 77) in recorded
+        correction_prompts.append(kwargs["prompt"])
+        return SimpleNamespace(text=corrected_text)
+
+    def forbidden_repair(*_a, **_k):
+        raise AssertionError("repair must not run for an incomplete semantic claim")
+
+    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", fake_validated_agent)
+    monkeypatch.setattr(orchestrator_module, "post_trusted_pr_contract_record", recording_contract_record)
+    monkeypatch.setattr(orchestrator_module, "post_issue_pr_handoff_comment", recording_handoff)
+    monkeypatch.setattr(orchestrator_module, "run_agent_result", fake_correction)
+    monkeypatch.setattr(orchestrator_module, "attempt_repair", forbidden_repair)
+    monkeypatch.setattr(orchestrator_module, "execute_repair", forbidden_repair)
+    monkeypatch.setattr(
+        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "validate_assigned_head_advanced", lambda **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "run_pr_loop",
+        lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "reconcile_test_observations",
+        lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head="abc123",
+            tracked_digest="tree-current",
+            complete=True,
+            stable=True,
+            status_clean=True,
+        ),
+    )
+
+    result = orchestrator_module._implement_approved_issue(
+        runner,
+        issue_number=56,
+        approved_plan=approved_plan,
+        config=config,
+        memory=None,
+        issue_context=issue_context,
+        coder_session_id=None,
+        usage_context=orchestrator_module._new_usage_context(config),
+        approved_plan_context=plan_context,
+    )
+
+    assert result == 0
+    assert implementation_calls == [1]
+    assert len(correction_prompts) == 1
+    assert "forbidden_effect_assertions" in correction_prompts[0]
+    assert run_pr_calls and run_pr_calls[0]["pr_number"] == 77
+    raw_comments = [
+        item["body"] for item in runner.pr_payload.get("comments", [])
+        if isinstance(item, dict) and isinstance(item.get("body"), str)
+    ]
+    metadata = _metadata_from_public_comment(
+        next(comment for comment in raw_comments if "AGENT_LOOP_META: " in comment)
+    )
+    evidence_row = metadata.risk_test_matrix_evidence["rows"][0]
+    codes = [item["code"] for item in metadata.risk_test_matrix_diagnostics]
+    if mode == "completes":
+        assert evidence_row["status"] == "verified"
+        assert "incomplete-semantic-claim" not in codes
+    else:
+        assert evidence_row["status"] == "stale/unverified"
+        assert evidence_row["evidence_citations"] == []
+        assert evidence_row["workflow_path_claim"] == ""
+        assert evidence_row["outcome_assertions"] == []
+        assert "incomplete-semantic-claim" in codes
+        assert "semantic-correction-exhausted" in codes
+
+
 def _issue_context_with_blocked_requirement() -> IssueContext:
     return IssueContext(
         number=56,

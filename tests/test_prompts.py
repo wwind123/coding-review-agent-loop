@@ -16,6 +16,7 @@ from coding_review_agent_loop.round_state import (
 )
 import coding_review_agent_loop.test_runtime as runtime
 import coding_review_agent_loop.prompts as prompts_module
+from coding_review_agent_loop.protocol import semantic_risk_claim_example_json
 from coding_review_agent_loop.prompts import (
     build_followup_prompt,
     build_issue_implementation_prompt,
@@ -2186,7 +2187,7 @@ def test_coder_followup_prompts_require_structured_json(tmp_path, builder):
     assert "The JSON `state` must match the `AGENT_STATE` footer exactly." in prompt
     assert "Use this mandatory structured JSON follow-up format" in prompt
     assert "include `risk_test_matrix_evidence` as a JSON object with exactly `matrix_identity` and `rows`" in prompt
-    assert '"workflow_path_claim":"<path exercised>"' in prompt
+    assert semantic_risk_claim_example_json() in prompt
     assert '"evidence_citations"' in prompt
     assert "Do not emit `risk_test_matrix_evidence` as an array" in prompt
     assert "`coverage_level`" in prompt
@@ -3915,3 +3916,67 @@ def test_superseded_prepanel_review_context_block_is_non_authoritative(tmp_path)
         assert "x" * 700 not in prompt
     plain = build_review_prompt(77, 3, config, reviewer="gemini")
     assert "Superseded pre-panel review context" not in plain
+
+
+def test_semantic_claim_schema_is_shared_by_every_prompt_and_repair_surface():
+    """#849: every coder, correction, and repair surface shows the exact claim keys."""
+    from types import SimpleNamespace as _Namespace
+
+    import coding_review_agent_loop.orchestrator as orchestrator_module
+    import coding_review_agent_loop.repair as repair_module
+    from coding_review_agent_loop.protocol import (
+        SEMANTIC_RISK_CLAIM_KEYS,
+        _parse_semantic_risk_coverage_claims,
+        semantic_risk_claim_example,
+        semantic_risk_claim_example_json,
+    )
+
+    context = prompts_module.CoderHumanRequirementsPromptContext(
+        block="", surfaced_requirement_ids=(), requires_direct_discussion_ack=False
+    )
+    surfaces = {
+        "issue-implementation": prompts_module._structured_issue_implementation_guidance(
+            human_requirements_context=context, coder_signature="-- Coder"
+        ),
+        "coder-followup": prompts_module._structured_coder_followup_guidance(
+            reviewer_name="Reviewer", human_requirements_context=context, coder_signature="-- Coder"
+        ),
+        "correction": orchestrator_module._post_auth_correction_prompt(
+            _Namespace(kind="issue_implementation"),
+            matrix_row_ids=("row-1",),
+            diagnostics=(),
+            execution_catalog=(),
+        ),
+        "repair-issue": repair_module._build_repair_prompt(
+            "{}", expected_kind="issue_implementation"
+        ),
+        "repair-followup": repair_module._build_repair_prompt(
+            "{}", expected_kind="coder_followup"
+        ),
+        "repair-issue-rules": repair_module._issue_implementation_instruction(
+            "issue_implementation", None, False
+        ),
+    }
+    example_json = semantic_risk_claim_example_json()
+    for name, text in surfaces.items():
+        for key in SEMANTIC_RISK_CLAIM_KEYS:
+            assert f"`{key}`" in text or f'"{key}"' in text, (name, key)
+        assert example_json in text, name
+    assert "Format K" in surfaces["repair-issue"]
+    format_k = surfaces["repair-issue"].split("Valid Format K", 1)[1].split("## Valid Format", 1)[0]
+    assert example_json in format_k
+    assert "{semantic_risk_claim_example}" not in repair_module._REPAIR_PROMPT
+
+    example = json.loads(example_json)
+    assert example == semantic_risk_claim_example()
+    parsed = _parse_semantic_risk_coverage_claims(
+        [example],
+        context="example",
+        expected_row_ids=[example["row_id"]],
+        execution_catalog=[{
+            "execution_ref": example["execution_refs"][0],
+            "outcome": "passed",
+            "provenance": "parent-observed",
+        }],
+    )
+    assert parsed.claims[0].row_id == example["row_id"]

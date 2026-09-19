@@ -44,6 +44,8 @@ from .protocol import (
     RISK_TEST_MATRIX_REQUIRED_KEYS,
     RISK_TEST_MATRIX_ROW_KEYS,
     risk_test_matrix_prompt_examples,
+    semantic_risk_claim_example_json,
+    semantic_risk_claim_schema_text,
 )
 from .errors import FreshContractIntegrityError
 
@@ -416,7 +418,8 @@ terminates for human resolution; do not invent a new escalation field or state.
   "human_requirements": {
     "addressed_ids": [],
     "checked_discussion_directly": false
-  }
+  },
+  "risk_test_matrix_claims": [{semantic_risk_claim_example}]
 }
 <!-- AGENT_STATE: blocking -->
 -- <Coder Name>
@@ -439,7 +442,8 @@ For an approved coder follow-up, use `"state": "approved"`, an
   },
   "human_requirement_dispositions": [],
   "tests_run": ["<exact command>"],
-  "test_observations": [{"command": "<exact command>", "receipt_id": "<receipt>", "claim": "current-result"}]
+  "test_observations": [{"command": "<exact command>", "receipt_id": "<receipt>", "claim": "current-result"}],
+  "risk_test_matrix_claims": [{semantic_risk_claim_example}]
 }
 <!-- AGENT_STATE: blocking -->
 -- <Coder Name>
@@ -1231,6 +1235,11 @@ Output ONLY the repaired response. No explanations.
 ## Original (malformed) response:
 
 {raw_response}"""
+# Substitute the machine-owned claim-row example once, before any runtime
+# placeholder (including the untrusted raw response) is inserted.
+_REPAIR_PROMPT = _REPAIR_PROMPT.replace(
+    "{semantic_risk_claim_example}", semantic_risk_claim_example_json(), 2
+)
 
 _REPAIR_MODEL = "gemini-3.1-flash-lite"
 _SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_followup", "issue_implementation", "plan_revision", "plan_revision_patch", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation"}
@@ -1385,7 +1394,10 @@ def _build_repair_prompt(
         "coverage claims. Claims may select approved row IDs and current-turn execution_ref "
         "handles plus test facts and caveats. Do not generate or preserve matrix identities, "
         "canonical rows, receipt IDs/citations, mappings, statuses, ordering, or a final "
-        "risk-test evidence envelope. Fresh legacy evidence fields are removed.\n"
+        "risk-test evidence envelope. Fresh legacy evidence fields are removed. "
+        + semantic_risk_claim_schema_text()
+        + " Never invent `execution_refs`, test identifiers, or assertions; leave an unknown "
+        "fact empty or remove the claim row rather than fabricate facts.\n"
         if expected_kind in {"issue_implementation", "coder_followup"} else ""
     )
     fresh_contract_instruction = (
@@ -1481,6 +1493,9 @@ def _issue_implementation_instruction(
         "## Issue implementation repair rules:\n"
         "Repair only the issue_implementation envelope. Preserve `summary`, `pr_number`, "
         "`tests_run`, semantic `risk_test_matrix_claims`, and the meaning of every disposition; do not invent a PR identity. "
+        + semantic_risk_claim_schema_text()
+        + " Never invent `execution_refs`, test identifiers, or assertions; leave an unknown fact "
+        "empty or remove the claim row rather than fabricate facts. "
         "Remove fresh `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, and other legacy evidence-envelope fields instead of recreating them. "
         + requirement_rule
         + " A positive PR with a blocked disposition remains a terminal conflict after repair; "

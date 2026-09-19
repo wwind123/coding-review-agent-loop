@@ -50,6 +50,7 @@ from .protocol import (
     RISK_TEST_MATRIX_REQUIRED_KEYS,
     RISK_TEST_MATRIX_ROW_KEYS,
     risk_test_matrix_prompt_examples,
+    semantic_risk_claim_schema_text,
 )
 from .protocol_markers import sanitize_historical_text
 from .workdirs import agent_workdir
@@ -1111,8 +1112,9 @@ def _structured_coder_followup_guidance(
         "Use `addressed_item_notes` to summarize how each addressed item was resolved, and use `remaining_item_notes` to give a visible reason for each intentionally deferred remaining item.",
         "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) or when the reviewer requests a change that is mutually incompatible with a verified approved-plan decision and you have counter-evidence. For a plan conflict, `dispute_evidence` must name the conflicting approved decision, concrete counter-evidence, and why the requested change is incompatible. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`; never park a verified plan conflict in `remaining_items`, whose retry semantics would silently recycle it. Ordinary implementation defects and evidence-backed correctness, security, compatibility, or test defects must be fixed and classified as addressed or genuinely remaining, never disputed merely because the implementation followed the plan. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
         "When you use the managed `agent-loop run-tests` wrapper, report the exact command, outcome, caveats, test identifiers, and locations. The wrapper prints an invocation-local `execution_ref`; use that selector only in semantic coverage claims. Never copy a receipt ID into a risk claim, and never infer a selector from command text, test identifiers, list position, or outcome.",
-        "If the approved plan delivered an applicable risk matrix, include `risk_test_matrix_claims` as a bounded JSON array of semantic claims: "
-        '`[{"row_id":"<approved row id>","execution_refs":["<invocation-local execution_ref>"],"test_identifiers":["tests/test_file.py::test_name"],"test_locations":["tests/test_file.py"],"workflow_path_claim":"<path exercised>","outcome_assertions":["<observed outcome>"],"forbidden_effect_assertions":["<effect shown absent>"],"caveats":[]}]`. '
+        "If the approved plan delivered an applicable risk matrix, include `risk_test_matrix_claims` as a bounded JSON array of semantic claims. "
+        + semantic_risk_claim_schema_text()
+        + " "
         "Claims may name only approved row IDs and execution_ref selectors printed by the current managed-test turn. The orchestrator supplies the matrix identity, canonical rows, statuses, ordering, receipt citations, mappings, and authoritative caveats after PR/head authentication. Omit the claim set when no row was exercised; the orchestrator will retain complete non-verified rows.",
         "Do not include `risk_test_matrix_evidence` as a JSON object with exactly `matrix_identity` and `rows`, or \"evidence_citations\". Do not emit `risk_test_matrix_evidence` as an array or legacy `coverage_level` either; those canonical fields are removed during fresh semantic repair.",
         _agent_unavailable_guidance(coder_signature),
@@ -1211,7 +1213,7 @@ Rules:
 - A null-PR blocker unrelated to signed requirements is valid with the empty ledger required by the rules above.
 - `tests_run` is optional and may be absent, `null`, or an empty array when no tests ran. When supplied, it contains only exact command strings; report why tests could not run in `summary`.
 - `test_observations` is optional display evidence; when supplied, report only exact managed-wrapper commands and outcomes. A legacy or direct-shell report remains capture-limited.
-- When the approved-plan context contains an applicable risk matrix, report semantic `risk_test_matrix_claims` only: each claim names an approved `row_id`, current-turn `execution_refs`, actual test identifiers/locations, workflow/outcome/forbidden-effect assertions, and optional caveats. Do not emit `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, or envelope bookkeeping. The orchestrator derives those fields from the approved matrix, authoritative journal, and authenticated PR head. Planned tests and unverified commands are not evidence.
+- When the approved-plan context contains an applicable risk matrix, report semantic `risk_test_matrix_claims` only: each claim names an approved `row_id`, current-turn `execution_refs`, actual test identifiers/locations, workflow/outcome/forbidden-effect assertions, and optional caveats. {semantic_risk_claim_schema_text()} Do not emit `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, or envelope bookkeeping. The orchestrator derives those fields from the approved matrix, authoritative journal, and authenticated PR head. Planned tests and unverified commands are not evidence.
 - Start directly with exactly one top-level JSON object. Put the `<!-- AGENT_STATE: blocking -->` footer immediately after it and only your standalone signature after the footer.
 
 The structured result is the public implementation record. Do not add prose,

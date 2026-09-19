@@ -2276,18 +2276,15 @@ def test_semantic_matrix_claims_use_current_turn_execution_refs_only():
         )
 
 
-@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
-@pytest.mark.parametrize(
-    "field",
-    [
-        "test_identifiers",
-        "test_locations",
-        "outcome_assertions",
-        "forbidden_effect_assertions",
-    ],
-)
-def test_semantic_matrix_claims_require_facts_for_verified_coverage(kind, field):
-    claim = {
+_ADMISSIBLE_CATALOG = [{
+    "execution_ref": "turn:observation-1",
+    "outcome": "passed",
+    "provenance": "parent-observed",
+}]
+
+
+def _complete_semantic_claim() -> dict[str, object]:
+    return {
         "row_id": "row-1",
         "execution_refs": ["turn:observation-1"],
         "test_identifiers": ["test_protocol"],
@@ -2296,7 +2293,9 @@ def test_semantic_matrix_claims_require_facts_for_verified_coverage(kind, field)
         "outcome_assertions": ["The test passed."],
         "forbidden_effect_assertions": ["No evidence was invented."],
     }
-    claim[field] = []
+
+
+def _validate_claims_envelope(kind, claims, *, row_ids=("row-1",), catalog=None):
     payload = {
         "schema_version": 1,
         "kind": kind,
@@ -2304,28 +2303,137 @@ def test_semantic_matrix_claims_require_facts_for_verified_coverage(kind, field)
         "summary": "Implemented the change.",
         "human_requirement_dispositions": [],
         "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
-        "risk_test_matrix_claims": [claim],
+        "risk_test_matrix_claims": claims,
     }
-    validator = (
-        validate_structured_issue_implementation
-        if kind == "issue_implementation"
-        else validate_structured_coder_followup
-    )
     if kind == "issue_implementation":
         payload["pr_number"] = 77
+        validator = validate_structured_issue_implementation
     else:
         payload.update({"addressed_items": [], "remaining_items": []})
+        validator = validate_structured_coder_followup
+    return validator(
+        json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+        delivered_risk_test_matrix_row_ids=list(row_ids),
+        execution_catalog=_ADMISSIBLE_CATALOG if catalog is None else catalog,
+    )
 
-    with pytest.raises(AgentLoopError, match=field):
-        validator(
-            json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
-            delivered_risk_test_matrix_row_ids=["row-1"],
-            execution_catalog=[{
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_with_only_selector_parses_with_empty_facts(kind):
+    """#849/#1187: a claim with only row_id and execution_refs must not reject the envelope."""
+    parsed = _validate_claims_envelope(
+        kind,
+        [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+    )
+
+    assert parsed is not None
+    if kind == "issue_implementation":
+        assert parsed.pr_number == 77
+    claim = parsed.risk_test_matrix_claims.claims[0]
+    assert claim.row_id == "row-1"
+    assert claim.execution_refs == ("turn:observation-1",)
+    assert claim.test_identifiers == ()
+    assert claim.test_locations == ()
+    assert claim.workflow_path_claim == ""
+    assert claim.outcome_assertions == ()
+    assert claim.forbidden_effect_assertions == ()
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("workflow_path_claim", "", ""),
+        ("workflow_path_claim", "   ", ""),
+        ("workflow_path_claim", None, ""),
+        ("test_identifiers", None, ()),
+        ("test_identifiers", [], ()),
+        ("test_locations", None, ()),
+        ("test_locations", [], ()),
+        ("outcome_assertions", None, ()),
+        ("outcome_assertions", [], ()),
+        ("forbidden_effect_assertions", None, ()),
+        ("forbidden_effect_assertions", [], ()),
+    ],
+)
+def test_semantic_matrix_claim_empty_fact_normalizes_to_default(kind, field, value, expected):
+    claim = _complete_semantic_claim()
+    claim[field] = value
+
+    parsed = _validate_claims_envelope(kind, [claim])
+
+    assert parsed is not None
+    assert getattr(parsed.risk_test_matrix_claims.claims[0], field) == expected
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda c: c.update(workflow_path_claim=5), "workflow_path_claim must be a string"),
+        (lambda c: c.update(workflow_path_claim=["path"]), "workflow_path_claim must be a string"),
+        (lambda c: c.update(workflow_path_claim=True), "workflow_path_claim must be a string"),
+        (lambda c: c.update(test_identifiers="test_protocol"), "test_identifiers must be a JSON array"),
+        (lambda c: c.update(test_locations={"a": 1}), "test_locations must be a JSON array"),
+        (lambda c: c.update(outcome_assertions=[3]), "outcome_assertions"),
+        (lambda c: c.update(forbidden_effect_assertions=[""]), "forbidden_effect_assertions"),
+        (lambda c: c.update(workflow_path_claim="x" * 5000), "workflow_path_claim exceeds"),
+        (lambda c: c.update(test_identifiers=["x" * 5000]), "test_identifiers"),
+        (lambda c: c.update(surprise="value"), "unknown field"),
+        (lambda c: c.pop("execution_refs"), "missing required field"),
+        (lambda c: c.update(execution_refs=[]), "at least one selector"),
+        (lambda c: c.pop("row_id"), "missing required field"),
+        (lambda c: c.update(row_id="row-unknown"), "not an approved enforceable matrix row"),
+        (lambda c: c.update(execution_refs=["other-turn:observation-9"]), "unknown or cross-turn"),
+    ],
+)
+def test_semantic_matrix_claim_authority_defects_still_reject(kind, mutate, match):
+    claim = {"row_id": "row-1", "execution_refs": ["turn:observation-1"]}
+    mutate(claim)
+
+    with pytest.raises(AgentLoopError, match=match):
+        _validate_claims_envelope(kind, [claim])
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_inadmissible_selector_still_rejects(kind):
+    with pytest.raises(AgentLoopError, match="not an admissible passing observation"):
+        _validate_claims_envelope(
+            kind,
+            [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+            catalog=[{
                 "execution_ref": "turn:observation-1",
-                "outcome": "passed",
+                "outcome": "failed",
                 "provenance": "parent-observed",
             }],
         )
+
+
+def test_shared_semantic_claim_example_parses_through_claim_parser():
+    from coding_review_agent_loop.protocol import (
+        SEMANTIC_RISK_CLAIM_KEYS,
+        _parse_semantic_risk_coverage_claims,
+        semantic_risk_claim_example,
+        semantic_risk_claim_example_json,
+    )
+
+    example = json.loads(semantic_risk_claim_example_json())
+    assert tuple(example) == SEMANTIC_RISK_CLAIM_KEYS
+    assert example == semantic_risk_claim_example()
+    parsed = _parse_semantic_risk_coverage_claims(
+        [example],
+        context="example",
+        expected_row_ids=[example["row_id"]],
+        execution_catalog=[{
+            "execution_ref": example["execution_refs"][0],
+            "outcome": "passed",
+            "provenance": "parent-observed",
+        }],
+    )
+    claim = parsed.claims[0]
+    assert claim.test_identifiers and claim.test_locations
+    assert claim.workflow_path_claim
+    assert claim.outcome_assertions and claim.forbidden_effect_assertions
 
 
 @pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
