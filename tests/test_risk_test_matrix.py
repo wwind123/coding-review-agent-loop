@@ -192,6 +192,75 @@ def test_builder_downgrades_incomplete_semantic_facts(field) -> None:
     assert any(diagnostic.code == "incomplete-semantic-claim" for diagnostic in result.diagnostics)
 
 
+def _derive_for_claims(matrix, claims):
+    observation = _derived_observation(
+        execution_ref="invocation:observation-1", receipt_id="receipt-1"
+    )
+    return derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+
+def test_builder_keeps_empty_facts_for_present_incomplete_claim() -> None:
+    """#849: an all-empty present claim fails closed without copying approved-row text."""
+    from coding_review_agent_loop.protocol import SEMANTIC_RISK_CLAIM_FACT_KEYS
+
+    matrix = parse_risk_test_matrix(_matrix())
+    approved = matrix.rows[0]
+    claims = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=(),
+        test_locations=(),
+        workflow_path_claim="",
+        outcome_assertions=(),
+        forbidden_effect_assertions=(),
+    ),))
+
+    result = _derive_for_claims(matrix, claims)
+
+    row = result.evidence.rows[0]
+    assert row.status != "verified"
+    assert row.evidence_citations == ()
+    assert row.test_identifiers == ()
+    assert row.test_locations == ()
+    assert row.workflow_path_claim == ""
+    assert row.outcome_assertions == ()
+    assert row.forbidden_effect_assertions == ()
+    assert row.workflow_path_claim != approved.entry_path_or_mode
+    assert approved.expected_outcome not in row.outcome_assertions
+    assert not set(approved.forbidden_side_effects) & set(row.forbidden_effect_assertions)
+    incomplete = [d for d in result.diagnostics if d.code == "incomplete-semantic-claim"]
+    assert len(incomplete) == 1
+    assert incomplete[0].message == (
+        "Semantic coverage is missing required facts: "
+        + ", ".join(SEMANTIC_RISK_CLAIM_FACT_KEYS)
+        + "."
+    )
+
+
+def test_builder_absent_claim_keeps_missing_status_and_approved_fallback() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    approved = matrix.rows[0]
+
+    result = _derive_for_claims(matrix, None)
+
+    row = result.evidence.rows[0]
+    assert row.status == "missing"
+    assert row.workflow_path_claim == approved.entry_path_or_mode
+    assert row.outcome_assertions == (approved.expected_outcome,)
+    assert row.forbidden_effect_assertions == approved.forbidden_side_effects
+    assert [d.code for d in result.diagnostics] == ["missing-claim"]
+
+
 def test_derived_matrix_evidence_preserves_unsuperseded_failure_caveat() -> None:
     matrix = parse_risk_test_matrix(_matrix())
     passing = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-pass")

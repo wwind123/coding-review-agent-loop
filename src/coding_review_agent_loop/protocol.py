@@ -483,6 +483,70 @@ SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS = 8
 SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES = 1_024
 SEMANTIC_RISK_CLAIMS_MAX_CAVEATS = 16
 
+# Machine-owned claim-row schema shared by the parser, the fresh coder
+# prompts, the post-auth correction prompt, and repair.  Keeping one source
+# prevents models from having to guess exact keys (#849).
+SEMANTIC_RISK_CLAIM_REQUIRED_KEYS = ("row_id", "execution_refs")
+SEMANTIC_RISK_CLAIM_FACT_KEYS = (
+    "test_identifiers",
+    "test_locations",
+    "workflow_path_claim",
+    "outcome_assertions",
+    "forbidden_effect_assertions",
+)
+SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS = ("caveats",)
+SEMANTIC_RISK_CLAIM_KEYS = (
+    SEMANTIC_RISK_CLAIM_REQUIRED_KEYS
+    + SEMANTIC_RISK_CLAIM_FACT_KEYS
+    + SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS
+)
+
+
+def semantic_risk_claim_example(
+    *,
+    row_id: str = "example-row-id",
+    execution_ref: str = "exec-ref-from-this-turn-catalog",
+) -> dict[str, object]:
+    """Return one complete example claim row containing every schema key."""
+    example: dict[str, object] = {
+        "row_id": row_id,
+        "execution_refs": [execution_ref],
+        "test_identifiers": ["tests/test_example.py::test_behavior"],
+        "test_locations": ["tests/test_example.py"],
+        "workflow_path_claim": "issue mode / fresh implementation parse",
+        "outcome_assertions": ["The response parses and the row keeps its selector."],
+        "forbidden_effect_assertions": ["No envelope rejection is raised."],
+        "caveats": [],
+    }
+    return example
+
+
+def semantic_risk_claim_example_json(
+    *,
+    row_id: str = "example-row-id",
+    execution_ref: str = "exec-ref-from-this-turn-catalog",
+) -> str:
+    """Render the shared complete claim-row example as compact JSON."""
+    return json.dumps(
+        semantic_risk_claim_example(row_id=row_id, execution_ref=execution_ref),
+        separators=(", ", ": "),
+    )
+
+
+def semantic_risk_claim_schema_text() -> str:
+    """Describe the exact claim-row keys for prompt and repair surfaces."""
+    return (
+        "Each `risk_test_matrix_claims` row uses exactly these keys: "
+        + ", ".join(f"`{key}`" for key in SEMANTIC_RISK_CLAIM_KEYS)
+        + ". `row_id` and a non-empty `execution_refs` list are mandatory. "
+        "Every fact key ("
+        + ", ".join(f"`{key}`" for key in SEMANTIC_RISK_CLAIM_FACT_KEYS)
+        + ") must be present and non-empty for the row to verify; a missing, "
+        "null, or empty fact leaves the row unverified. `caveats` is optional. "
+        "Complete example row: "
+        + semantic_risk_claim_example_json()
+    )
+
 
 @dataclass(frozen=True)
 class SemanticRiskCoverageClaim:
@@ -1685,14 +1749,8 @@ def derive_risk_test_matrix_evidence(
             candidate_citations: list[TestObservationCitation] = []
             missing_semantic_facts = [
                 field_name
-                for field_name, value in (
-                    ("test_identifiers", claim.test_identifiers),
-                    ("test_locations", claim.test_locations),
-                    ("workflow_path_claim", claim.workflow_path_claim),
-                    ("outcome_assertions", claim.outcome_assertions),
-                    ("forbidden_effect_assertions", claim.forbidden_effect_assertions),
-                )
-                if not value
+                for field_name in SEMANTIC_RISK_CLAIM_FACT_KEYS
+                if not getattr(claim, field_name)
             ]
             if missing_semantic_facts:
                 valid_selected = False
@@ -3019,6 +3077,37 @@ def _semantic_execution_ref(observation: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
+def _optional_semantic_fact_string(value: object, *, context: str) -> str:
+    """Normalize an absent/null/blank semantic fact string to ``""``.
+
+    Only a wrong non-empty type or an oversize value still raises.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise AgentLoopError(f"{context} must be a string.")
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    if len(normalized.encode("utf-8")) > RISK_MATRIX_MAX_FIELD_BYTES:
+        raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_FIELD_BYTES}-byte bound.")
+    return normalized
+
+
+def _optional_semantic_fact_list(value: object, *, context: str) -> tuple[str, ...]:
+    """Normalize an absent/null/empty semantic fact list to ``()``.
+
+    Non-list values, non-string or blank items, duplicate items, and bound
+    violations still raise.
+    """
+    if value is None:
+        return ()
+    rendered = _risk_bounded_string_list(value, context=context)
+    if len(set(rendered)) != len(rendered):
+        raise AgentLoopError(f"{context} contains duplicate items.")
+    return rendered
+
+
 def _parse_semantic_risk_coverage_claims(
     value: object,
     *,
@@ -3031,6 +3120,13 @@ def _parse_semantic_risk_coverage_claims(
     This parser deliberately has no receipt-ID or canonical-row fields.  When
     a live catalog is supplied, selectors are checked against that one
     invocation before the PR/head authentication phase begins.
+
+    Missing, null, or empty semantic facts are accepted here and normalized
+    to empty defaults: they are recoverable after authentication, where
+    derivation records the row as unverified with an
+    ``incomplete-semantic-claim`` diagnostic.  Missing or invalid selectors
+    and row IDs, unknown keys, and ill-typed or oversize facts carry (or
+    corrupt) authority and still reject the whole envelope.
     """
     if not isinstance(value, list):
         raise AgentLoopError(f"{context} must be a JSON array.")
@@ -3059,11 +3155,8 @@ def _parse_semantic_risk_coverage_claims(
         _expect_exact_keys(
             payload,
             context=claim_context,
-            required={
-                "row_id", "execution_refs", "test_identifiers", "test_locations",
-                "workflow_path_claim", "outcome_assertions", "forbidden_effect_assertions",
-            },
-            optional={"caveats"},
+            required=set(SEMANTIC_RISK_CLAIM_REQUIRED_KEYS),
+            optional=set(SEMANTIC_RISK_CLAIM_FACT_KEYS + SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS),
         )
         row_id = _validate_risk_row_id(payload["row_id"], context=f"{claim_context}.row_id")
         if allowed_rows and row_id not in allowed_rows:
@@ -3104,33 +3197,30 @@ def _parse_semantic_risk_coverage_claims(
                         f"{claim_context}.execution_refs selector `{ref}` has known non-authoritative "
                         "launch-integrity state and cannot be selected before authentication."
                     )
-        test_identifiers = _risk_bounded_string_list(
-            payload["test_identifiers"],
+        test_identifiers = _optional_semantic_fact_list(
+            payload.get("test_identifiers"),
             context=f"{claim_context}.test_identifiers",
-            min_items=1,
         )
-        test_locations = _risk_bounded_string_list(
-            payload["test_locations"],
+        test_locations = _optional_semantic_fact_list(
+            payload.get("test_locations"),
             context=f"{claim_context}.test_locations",
-            min_items=1,
         )
-        outcome_assertions = _risk_bounded_string_list(
-            payload["outcome_assertions"],
+        outcome_assertions = _optional_semantic_fact_list(
+            payload.get("outcome_assertions"),
             context=f"{claim_context}.outcome_assertions",
-            min_items=1,
         )
-        forbidden_effect_assertions = _risk_bounded_string_list(
-            payload["forbidden_effect_assertions"],
+        forbidden_effect_assertions = _optional_semantic_fact_list(
+            payload.get("forbidden_effect_assertions"),
             context=f"{claim_context}.forbidden_effect_assertions",
-            min_items=1,
         )
         claim = SemanticRiskCoverageClaim(
             row_id=row_id,
             execution_refs=refs,
             test_identifiers=test_identifiers,
             test_locations=test_locations,
-            workflow_path_claim=_risk_bounded_string(
-                payload["workflow_path_claim"], context=f"{claim_context}.workflow_path_claim"
+            workflow_path_claim=_optional_semantic_fact_string(
+                payload.get("workflow_path_claim"),
+                context=f"{claim_context}.workflow_path_claim",
             ),
             outcome_assertions=outcome_assertions,
             forbidden_effect_assertions=forbidden_effect_assertions,

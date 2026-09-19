@@ -385,6 +385,25 @@ mappings, statuses, or an evidence envelope. If correction is exhausted or a
 head race occurs, the same PR remains resumable with complete non-verified
 evidence. Planned tests and unverified command text remain non-evidence.
 
+The claim-row keys come from one machine-owned schema: `row_id`,
+`execution_refs`, the five semantic facts (`test_identifiers`,
+`test_locations`, `workflow_path_claim`, `outcome_assertions`,
+`forbidden_effect_assertions`), and optional `caveats`. The fresh
+implementation prompt, the follow-up prompt, the post-authentication correction
+prompt, and repair all show the same key list and complete example row. Before
+authentication, a claim whose semantic facts are missing, `null`, or empty
+(including a blank `workflow_path_claim`) is accepted rather than rejecting the
+whole envelope, so an otherwise valid pushed PR still reaches authentication and
+handoff. After authentication such a row is recorded as unverified with empty
+facts (never the approved row's planned text), carries an
+`incomplete-semantic-claim` diagnostic naming the missing fields, and triggers
+the single bounded correction continuation. A correction that is still
+incomplete leaves the row unverified; there is no second correction. Missing or
+invalid `row_id` and `execution_refs`, unknown or inadmissible selectors,
+unknown keys, and ill-typed or oversize facts still reject the envelope because
+they carry execution authority. Broader handoff atomicity for other envelope
+failures after a PR is pushed is owned by #827 and #828.
+
 Fix a GitHub issue:
 
 ```bash

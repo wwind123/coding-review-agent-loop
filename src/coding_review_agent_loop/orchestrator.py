@@ -301,6 +301,7 @@ from .protocol import (
     validate_risk_test_matrix_revision,
     validate_structured_task_result,
     derive_risk_test_matrix_evidence,
+    semantic_risk_claim_schema_text,
     risk_test_matrix_identity,
     validate_structured_discuss_agenda,
     parse_structured_discuss_final_synthesis,
@@ -4240,7 +4241,10 @@ def _post_auth_correction_prompt(
         "identities, canonical rows, receipt IDs, citations, mappings, statuses, "
         "or envelope bookkeeping. Use only approved row IDs and handles in the "
         "closed catalog below; a missing claim is allowed when no admissible "
-        "execution exists.\n\n"
+        "execution exists. "
+        + semantic_risk_claim_schema_text()
+        + " If you cannot truthfully state a fact, leave it empty rather than "
+        "inventing it; the row then stays unverified.\n\n"
         f"Response kind: {parsed.kind}\n"
         f"Approved enforceable row IDs: {json.dumps(list(matrix_row_ids))}\n"
         f"Post-authentication diagnostics: {json.dumps([item.to_payload() for item in diagnostics])}\n"
