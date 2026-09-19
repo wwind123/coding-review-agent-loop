@@ -62,6 +62,12 @@ available to skill helpers: use `helpers.validate_response` or
 `helpers.render_response` with `--require-risk-test-matrix-contract` when a fresh
 generation-1 matrix is required.
 
+Sidecar comments that precede a large plan or review carry machine-readable
+overflow data and are not independent agent responses. Each shows a short
+visible label such as `Agent-loop plan attachment 2/5 (machine-readable
+overflow: ...)`; keep them with the comment that follows. Older unlabeled
+sidecars remain valid.
+
 ## Requirements
 
 - Python 3.11 or newer.
