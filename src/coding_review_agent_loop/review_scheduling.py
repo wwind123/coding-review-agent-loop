@@ -73,6 +73,23 @@ def pre_panel_safety_message(detail: str) -> str:
     return PRE_PANEL_SAFETY_MESSAGE.format(detail=detail)
 
 
+UNDECODABLE_HISTORY_MESSAGE = (
+    "pre-panel safety cannot be established: the PR scheduler history could not be "
+    "decoded ({error}), so panel state and the finding ledger are unknowable; no "
+    "reviewer was invoked. Restore the missing round-metadata records or sidecars (or "
+    "remove the incomplete record) and rerun. --pr-review-force-full cannot authorize "
+    "the complete board over an undecodable ledger, because resume, approval, and "
+    "qualification accounting all depend on that history."
+)
+
+
+def undecodable_history_message(error: object) -> str:
+    detail = " ".join(str(error).split())
+    if len(detail) > 300:
+        detail = detail[:297].rstrip() + "..."
+    return UNDECODABLE_HISTORY_MESSAGE.format(error=detail or "unknown decode error")
+
+
 @dataclass(frozen=True)
 class ReviewPolicyCapabilities:
     """Named scheduler capabilities shared by every orchestration safety gate.

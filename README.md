@@ -611,16 +611,21 @@ recorded after the qualified opening.
 After the panel has opened, the existing conservative rules apply, with audit
 reasons prefixed `post-panel fallback:`. An active finding with a broad,
 ambiguous, out-of-scope, or unreconstructible change, and any unsafe head change,
-selects the complete board. An automatic recovery reason raises a durable latch
-recorded with source `automatic`, and missing input is never treated as
-approval.
+selects the complete board. That full-board decision, like any automatic
+recovery reason, raises a durable latch recorded with source `automatic`, so
+later heads stay on the complete board instead of returning to owner-scoped
+remediation. Missing input is never treated as approval.
 
 If safety cannot be established without the panel, the run stops with a
 `PR review scheduling diagnostic` instead of silently spending it. That happens
-when a finding is pending on a configured secondary, a premature secondary
-review in an interrupted round is blocking, or the history cannot be decoded,
-and there is no qualified opening. No reviewer runs. Rerun with
-`--pr-review-force-full` to authorize the complete board. That operator latch
+when a finding is pending on a configured secondary, or a premature secondary
+review in an interrupted round is blocking, and there is no qualified opening.
+No reviewer runs. Rerun with `--pr-review-force-full` to authorize the complete
+board. Undecodable scheduler history (for example a missing round-metadata
+sidecar) also stops with the diagnostic, at startup or at a round boundary. It
+stops even with the flag, because resume, approval, and qualification
+accounting all depend on that history; restore the missing records and rerun.
+The operator latch
 is durable, is recorded with source `operator`, and is itself a qualified
 opening. Under the override, a premature blocking secondary review is
 superseded rather than consumed: it is listed in the operator audit comment,

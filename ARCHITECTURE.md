@@ -285,9 +285,11 @@ opening derived from comment order: a `secondary-audit` record preceded by the
 primary's approval of the same head, or an operator-sourced force-full record.
 Secondary approvals count only after that opening. After it, unsafe
 scope/history, head changes, and the durable automatic latch use the complete
-board (`post-panel fallback:`). A pre-panel state that cannot be made safe
-without the panel stops with a diagnostic, and `--pr-review-force-full` (source
-`operator`) is the explicit override. Phase,
+board (`post-panel fallback:`), and such a full-board decision raises the
+monotonic automatic latch. A pre-panel state that cannot be made safe without
+the panel stops with a diagnostic, and `--pr-review-force-full` (source
+`operator`) is the explicit override; undecodable history stops in both flag
+states. Phase,
 owner, selection, approval-head, and scheduler-policy call-accounting metadata
 are optional extensions to the legacy scheduler core, so old records remain
 decodable and grant no staged phase authority.

@@ -497,6 +497,7 @@ from .review_scheduling import (
     policy_capabilities,
     pre_panel_safety_message,
     select_reviewers,
+    undecodable_history_message,
 )
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
@@ -13724,9 +13725,32 @@ def run_pr_loop(
         pending_automatic_fallback_reasons: list[str] = []
         scheduler_calls_avoided = 0
         final_sweep_pending = False
+        def stop_pre_panel(message: str, *, round_number: int | None) -> None:
+            """Log and post the pre-panel diagnostic, then stop before any reviewer."""
+            label = f"round {round_number}" if round_number is not None else "startup"
+            log(config, f"{label.capitalize()}: {message}")
+            # Plain audit text only: no round metadata that could later be
+            # mistaken for a scheduler checkpoint or a panel opening.
+            post_pr_comment(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                body=f"PR review scheduling diagnostic ({label}): {message}",
+            )
+            raise PrePanelSafetyError(message)
+
         # A scheduler contract written by an earlier run is immutable. Missing
         # legacy scheduler fields intentionally mean "use the full board".
-        for record in _extract_round_metadata_records(initial_pr_context.comments, flow="pr"):
+        try:
+            startup_records = _extract_round_metadata_records(initial_pr_context.comments, flow="pr")
+        except AgentLoopError as exc:
+            if not scheduler_capabilities.requires_primary:
+                raise
+            # Staged policy: panel state is unknowable.  Stop through the same
+            # no-reviewer diagnostic path as an in-round decode failure.
+            stop_pre_panel(undecodable_history_message(exc), round_number=None)
+            raise
+        for record in startup_records:
             persisted_contract = _scheduler_contract_from_metadata(record.metadata)
             if persisted_contract is not None and persisted_contract != scheduler_contract:
                 raise AgentLoopError(
@@ -13756,19 +13780,6 @@ def run_pr_loop(
                     pending_automatic_fallback_reasons.append(reason)
             else:
                 scheduler_force_full = True
-
-        def stop_pre_panel(message: str, *, round_number: int) -> None:
-            """Log and post the pre-panel diagnostic, then stop before any reviewer."""
-            log(config, f"Round {round_number}: {message}")
-            # Plain audit text only: no round metadata that could later be
-            # mistaken for a scheduler checkpoint or a panel opening.
-            post_pr_comment(
-                runner,
-                config=config,
-                pr_number=pr_number,
-                body=f"PR review scheduling diagnostic (round {round_number}): {message}",
-            )
-            raise PrePanelSafetyError(message)
 
         unresolved_items: list[UnresolvedReviewItem] = []
         pr_compact_prior_summaries: list[str] = []
@@ -14107,26 +14118,27 @@ def run_pr_loop(
             panel_evidence: PrPanelEvidence | None = None
             superseded_prepanel_reviews: dict[str, PostedRoundRecord] = {}
             if scheduler_capabilities.requires_primary:
+                panel_history_error: AgentLoopError | None = None
                 try:
                     panel_history = _extract_round_metadata_records(pr_comments, flow="pr")
-                except AgentLoopError:
+                except AgentLoopError as exc:
                     panel_history = None
+                    panel_history_error = exc
                 if panel_history is None:
-                    if not scheduler_operator_force_full:
-                        stop_pre_panel(
-                            pre_panel_safety_message(
-                                "the PR scheduler history could not be decoded, so panel state "
-                                "is unknowable,"
-                            ),
-                            round_number=round_number,
-                        )
-                    panel_evidence = PrPanelEvidence()
+                    # Resume, approval, ledger, and qualification accounting all
+                    # need this history, so the operator override cannot make an
+                    # undecodable ledger safe either; stop in both flag states.
+                    stop_pre_panel(
+                        undecodable_history_message(panel_history_error),
+                        round_number=round_number,
+                    )
                 else:
                     panel_evidence = _derive_pr_panel_evidence(
                         panel_history,
                         primary_reviewer=scheduler_contract.primary_reviewer,
                         required_reviewers=scheduler_contract.required_reviewers,
                     )
+                assert panel_evidence is not None
                 unqualified_blocking: list[PostedRoundRecord] = []
                 for resumed_name, resumed_candidate in list(resumed_by_name.items()):
                     if _pr_record_is_panel_qualified(
@@ -14622,6 +14634,24 @@ def run_pr_loop(
                     raise
                 if not (skip_reviewers_for_recovery or conflict_pending):
                     pending_automatic_fallback_reasons.clear()
+                if (
+                    scheduler_capabilities.requires_primary
+                    and panel_evidence is not None
+                    and panel_evidence.opened
+                    and scheduler_decision.phase == "full-board"
+                    and not scheduler_operator_force_full
+                    and not scheduler_force_full
+                ):
+                    # Post-panel fallback is monotonic: once an unsafe broad or
+                    # ambiguous transition reactivates the complete board after a
+                    # qualified opening, later heads keep it (source automatic)
+                    # instead of dropping back to owner-scoped remediation.
+                    scheduler_force_full = True
+                    log(
+                        config,
+                        f"Round {round_number}: post-panel full-board fallback raised the durable "
+                        "force-full latch (source: automatic): " + scheduler_decision.reason,
+                    )
                 scheduler_recorded_force_full, scheduler_recorded_force_full_source = (
                     _scheduler_recorded_force_full(
                         operator=scheduler_operator_force_full,

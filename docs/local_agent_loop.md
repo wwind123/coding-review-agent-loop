@@ -1342,9 +1342,11 @@ operator opening qualifies only records written after it, for every reviewer.
 
 **Post-panel fallback.** After a qualified opening, owner-scoped remediation and
 the conservative full board behave as before, and their audit reasons are
-prefixed `post-panel fallback:`. Automatic recovery reasons raise the
-monotonic durable latch, persisted with `scheduler_force_full_source:
-automatic`. On resume, automatic latches and legacy latches without a source are
+prefixed `post-panel fallback:`. A post-panel full-board decision (an unsafe
+broad, ambiguous, or out-of-scope transition) and every automatic recovery
+reason raise the monotonic durable latch, persisted with
+`scheduler_force_full_source: automatic`, so a later narrow head keeps the
+complete board. On resume, automatic latches and legacy latches without a source are
 restored only when they come after the qualified opening. A legacy latch that
 predates any qualified opening is ambiguous between operator intent and the
 pre-#840 escalation, so it is not honored. The audit reason says to rerun with
@@ -1356,9 +1358,13 @@ qualification, or merge step runs, when pre-panel safety cannot be established
 without the panel. That covers three cases: an active finding pending on a
 configured secondary (required reviewers minus the primary) with no qualified
 opening; an interrupted round's premature secondary review that is blocking or
-carries new items; and scheduler history that cannot be decoded. The diagnostic
+carries new items; and scheduler history that cannot be decoded. The last case
+is checked at startup and at every round boundary. It stops even with
+`--pr-review-force-full`, because resume, approval, ledger, and qualification
+accounting all depend on that history; restore the missing round-metadata
+records or sidecars (or remove the incomplete record) and rerun. The diagnostic
 never fires for Orchestrator, CI, machine, or human-requirement obligations.
-`--pr-review-force-full` is the escape hatch. It is durable for the run and
+For the first two cases `--pr-review-force-full` is the escape hatch. It is durable for the run and
 every resume, recorded with source `operator`, and itself a qualified opening.
 Under the override, a premature blocking secondary review is superseded. It is
 excluded from resume, approval, ledger, and ownership accounting. The operator
