@@ -10,6 +10,16 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+from _pytest.outcomes import Failed
+
+from _proc_probe import (
+    PUBLISH_SNIPPET,
+    kill_if_same_instance,
+    read_pid_record,
+    readiness_gate,
+    wait_group_gone,
+    wait_until_gone,
+)
 
 import coding_review_agent_loop.cli as cli_module
 import coding_review_agent_loop.containment as containment_module
@@ -545,11 +555,12 @@ def test_fake_systemd_memory_limit_terminates_descendant_tree(monkeypatch, tmp_p
     pid_file = tmp_path / "descendants.pid"
     child_code = "payload=bytearray(4 * 1024 * 1024); import time; time.sleep(30)"
     parent_code = (
-        "import pathlib, subprocess, sys, time; "
-        f"child_code={child_code!r}; "
-        "children=[subprocess.Popen([sys.executable, '-c', child_code]) for _ in range(2)]; "
-        "pathlib.Path(sys.argv[1]).write_text(','.join(str(child.pid) for child in children)); "
-        "time.sleep(30)"
+        PUBLISH_SNIPPET
+        + "import subprocess, sys, time\n"
+        f"child_code = {child_code!r}\n"
+        "children = [subprocess.Popen([sys.executable, '-c', child_code]) for _ in range(2)]\n"
+        "_publish(sys.argv[1], [child.pid for child in children])\n"
+        "time.sleep(30)\n"
     )
     command = [sys.executable, "-c", parent_code, str(pid_file)]
     events = []
@@ -594,41 +605,37 @@ def test_fake_systemd_memory_limit_terminates_descendant_tree(monkeypatch, tmp_p
         "coding_review_agent_loop.runner.InvocationHandle.prepare",
         lambda *_args, **_kwargs: scope,
     )
+    gate = readiness_gate(pid_file)
     result = run_foreground_test(
         command,
         cwd=tmp_path,
         timeout_seconds=1.0,
         containment_policy=policy,
         containment_role="coder",
+        process_started=gate,
     )
 
-    deadline = time.monotonic() + 2
-    while not pid_file.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert pid_file.exists()
-    child_pids = [int(value) for value in pid_file.read_text(encoding="ascii").split(",")]
-    assert result.outcome == "timed_out"
-    assert result.containment is not None
-    assert result.containment.resource_exhausted is True
-    assert result.containment.applicable_limit == "MemoryMax"
-    assert events == ["terminate:TERM", "confirm-empty", "close"]
+    records: list[tuple[int, str]] = []
+    try:
+        # The gate held the watchdog until the record existed, so a missing
+        # record here is a startup failure rather than a timing race.
+        gate.assert_ready()
+        assert pid_file.exists(), (
+            "the parent did not publish its descendant record within the gate cap"
+        )
+        records = read_pid_record(pid_file)
+        assert result.outcome == "timed_out"
+        assert result.containment is not None
+        assert result.containment.resource_exhausted is True
+        assert result.containment.applicable_limit == "MemoryMax"
+        assert events == ["terminate:TERM", "confirm-empty", "close"]
 
-    for child_pid in child_pids:
-        child_deadline = time.monotonic() + 2
-        while time.monotonic() < child_deadline:
-            try:
-                stat = Path(f"/proc/{child_pid}/stat").read_text(encoding="ascii")
-            except FileNotFoundError:
-                break
-            if stat.rsplit(")", 1)[-1].lstrip().startswith("Z "):
-                break
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.01)
-        else:
-            pytest.fail(f"descendant {child_pid} survived managed limit termination")
+        for child_pid, child_start in records:
+            if not wait_until_gone(child_pid, start_time=child_start):
+                pytest.fail(f"descendant {child_pid} survived managed limit termination")
+    finally:
+        for child_pid, child_start in records:
+            kill_if_same_instance(child_pid, child_start)
 
 
 def test_invocation_prepare_uses_supplied_manifest(monkeypatch, tmp_path):
@@ -814,37 +821,135 @@ def test_interrupt_waits_for_scope_empty_before_refusing_replacement(monkeypatch
 def test_timeout_terminates_descendant_process_group(tmp_path):
     pid_file = tmp_path / "descendant.pid"
     code = (
-        "import pathlib, subprocess, sys, time; "
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(30)"
+        PUBLISH_SNIPPET
+        + "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "_publish(sys.argv[1], [child.pid])\n"
+        "time.sleep(30)\n"
     )
+    gate = readiness_gate(pid_file)
     result = run_foreground_test(
         [sys.executable, "-c", code, str(pid_file)],
         cwd=tmp_path,
         timeout_seconds=0.5,
         containment_policy=default_policy(mode="off", cache_dir=tmp_path / "runtime"),
+        process_started=gate,
     )
-    assert result.outcome == "timed_out"
-    deadline = time.monotonic() + 2
-    while not pid_file.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert pid_file.exists(), "the descendant pid was not recorded before cleanup"
-    child_pid = int(pid_file.read_text(encoding="ascii"))
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        try:
-            status = Path(f"/proc/{child_pid}/stat").read_text(encoding="ascii")
-        except FileNotFoundError:
-            break
-        if status.rsplit(")", 1)[-1].lstrip().startswith("Z "):
-            break
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.01)
-    else:
-        pytest.fail(f"descendant {child_pid} survived process-group timeout")
+    records: list[tuple[int, str]] = []
+    try:
+        gate.assert_ready()
+        assert pid_file.exists(), "the descendant pid was not recorded before cleanup"
+        records = read_pid_record(pid_file)
+        assert result.outcome == "timed_out"
+        for child_pid, child_start in records:
+            if not wait_until_gone(child_pid, start_time=child_start):
+                pytest.fail(f"descendant {child_pid} survived process-group timeout")
+    finally:
+        for child_pid, child_start in records:
+            kill_if_same_instance(child_pid, child_start)
+
+
+def test_readiness_gate_holds_watchdog_until_descendant_record_published(tmp_path):
+    """Publication after the watchdog deadline still precedes termination."""
+    pid_file = tmp_path / "late.pid"
+    code = (
+        PUBLISH_SNIPPET
+        + "import os, sys, time\n"
+        "time.sleep(2.0)\n"
+        "_publish(sys.argv[1], [os.getpid()])\n"
+        "time.sleep(60)\n"
+    )
+    gate = readiness_gate(pid_file)
+    result = run_foreground_test(
+        [sys.executable, "-c", code, str(pid_file)],
+        cwd=tmp_path,
+        timeout_seconds=0.3,
+        containment_policy=default_policy(mode="off", cache_dir=tmp_path / "runtime"),
+        process_started=gate,
+    )
+    try:
+        gate.assert_ready()
+        assert gate.release_reason == "published"
+        # An unheld watchdog would kill the parent at 0.3s, long before it
+        # publishes at 2.0s, so a surviving record proves the gate held it.
+        assert pid_file.exists()
+        records = read_pid_record(pid_file)
+        assert [pid for pid, _ in records] == [gate.pid]
+        assert gate.waited_seconds >= 2.0
+        assert result.elapsed_seconds >= 2.0
+        assert result.outcome == "timed_out"
+        assert wait_until_gone(gate.pid, start_time=gate.start_time)
+    finally:
+        kill_if_same_instance(gate.pid, gate.start_time)
+
+
+def test_readiness_gate_cap_expiry_reports_startup_failure_and_cleans_up(tmp_path):
+    """A parent that never publishes yields a bounded, controlled readiness failure."""
+    pid_file = tmp_path / "never.pid"
+    observed = tmp_path / "observed.pid"
+    code = (
+        PUBLISH_SNIPPET
+        + "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "_publish(sys.argv[2], [child.pid])\n"
+        "time.sleep(30)\n"
+        "_publish(sys.argv[1], [child.pid])\n"
+    )
+    gate = readiness_gate(pid_file, cap=0.5)
+    started = time.monotonic()
+    result = run_foreground_test(
+        [sys.executable, "-c", code, str(pid_file), str(observed)],
+        cwd=tmp_path,
+        timeout_seconds=0.2,
+        containment_policy=default_policy(mode="off", cache_dir=tmp_path / "runtime"),
+        process_started=gate,
+    )
+    elapsed = time.monotonic() - started
+    descendants: list[tuple[int, str]] = []
+    try:
+        assert gate.ready is False
+        assert gate.release_reason == "cap-expired"
+        assert str(pid_file) in gate.failure_reason
+        assert "0.5s readiness cap" in gate.failure_reason
+        assert gate.cleanup_invocations == 1
+        assert elapsed < 20.0
+        assert result.outcome != "passed"
+        with pytest.raises(Failed, match="startup/readiness failed"):
+            gate.assert_ready()
+
+        # The parent claim is unconditional; the descendant claim holds only
+        # when the parent reached its separate observation record in time.
+        assert wait_until_gone(gate.pid, start_time=gate.start_time)
+        if observed.exists():
+            descendants = read_pid_record(observed)
+            for child_pid, child_start in descendants:
+                if not wait_until_gone(child_pid, start_time=child_start):
+                    pytest.fail(f"descendant {child_pid} survived readiness cleanup")
+        # Supplementary only: an orphaned zombie can hold the group id until
+        # init reaps it, so this bounded poll never stands alone as proof.
+        if not wait_group_gone(gate.pid, timeout=10.0):
+            pytest.fail(f"process group {gate.pid} lingered after readiness cleanup")
+    finally:
+        kill_if_same_instance(gate.pid, gate.start_time)
+        for child_pid, child_start in descendants:
+            kill_if_same_instance(child_pid, child_start)
+
+
+def test_production_proc_helpers_treat_process_lookup_error_as_gone(monkeypatch):
+    """Production /proc inspection never raises when the entry vanishes."""
+    real_read_text = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        if str(self).startswith("/proc/"):
+            raise ProcessLookupError(errno.ESRCH, "No such process")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(containment_module.Path, "read_text", read_text)
+    pid = os.getpid()
+    assert containment_module._start_identity(pid) == "dead"
+    # A vanished /proc entry falls through to os.kill, which still sees self.
+    assert containment_module._pid_alive(pid) is True
+    assert containment_module.cgroup_path_for_pid(pid) is None
 
 
 @pytest.mark.parametrize("use_pty", [False, True])
