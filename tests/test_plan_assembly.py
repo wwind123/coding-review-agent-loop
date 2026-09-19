@@ -156,6 +156,28 @@ def test_add_positions_split_and_noncontiguous_merge_are_patch_order_independent
     assert [row.row_id for row in merged.risk_test_matrix.rows] == ["row-a", "row-bd", "row-c"]
 
 
+def test_edited_rows_count_toward_final_add_positions() -> None:
+    # Regression for #850: an edit consumes and re-produces its row, so a tail add
+    # after edits must be in range for the full final matrix.
+    state = _state(_base([_row("row-a"), _row("row-b"), _row("row-c")]))
+    edit = {
+        "op": "matrix_edit",
+        "row_id": "row-a",
+        "row": _row("row-a", outcome="Changed."),
+        "rationale": "Edit A.",
+    }
+    add = {"op": "matrix_add", "row": _row("row-new"), "final_position": 3, "rationale": "Append."}
+    assembled, _ = assemble_authenticated_plan_revision(state, _patch(state, [edit, add]))
+    assert [row.row_id for row in assembled.risk_test_matrix.rows] == [
+        "row-a", "row-b", "row-c", "row-new"
+    ]
+    assert assembled.risk_test_matrix.rows[0].expected_outcome == "Changed."
+
+    out_of_range = {**add, "final_position": 4}
+    with pytest.raises(AgentLoopError, match="final_position 4 is out of range for the 4-row"):
+        assemble_authenticated_plan_revision(state, _patch(state, [edit, out_of_range]))
+
+
 def test_audits_are_normalized_and_metadata_keeps_precise_structural_entries() -> None:
     base = _base([_row("row-a"), _row("row-b")])
     state = _state(base)

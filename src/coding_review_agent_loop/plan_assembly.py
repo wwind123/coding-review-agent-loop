@@ -507,7 +507,9 @@ def _validate_matrix_operations(
 
     transformed_count = len(old.rows) - len(consumers)
     for operation in operations:
-        if operation.op == "matrix_split":
+        if operation.op == "matrix_edit":
+            transformed_count += 1
+        elif operation.op == "matrix_split":
             transformed_count += len(operation.target_rows)
         elif operation.op == "matrix_merge":
             transformed_count += 1
