@@ -10033,7 +10033,17 @@ def _run_plan_first_loop(
             ),
             repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
             ledger_incomplete=round_ledger_incomplete,
-            repair_resolved_history_item_ids=round_resolved_history_item_ids,
+            # The revision runs after this round's dispositions were applied, so
+            # its proof must come from the post-round carried set. The pre-round
+            # value still lists items this round resolved, which would leave the
+            # whitelist empty exactly when the planner echoes them (#874).
+            repair_resolved_history_item_ids=_round_resolved_history_item_ids(
+                prior_unresolved_items=unresolved_items,
+                comments=issue_context.comments,
+                flow="plan",
+                reconciliation_mode="aggregate",
+                same_status="same-plan",
+            ),
             operation_description="plan revision",
             plan_validation_failure_handler=(
                 None if semantic_revision else lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
