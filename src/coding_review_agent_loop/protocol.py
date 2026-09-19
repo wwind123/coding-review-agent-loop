@@ -3097,12 +3097,15 @@ def _optional_semantic_fact_string(value: object, *, context: str) -> str:
 def _optional_semantic_fact_list(value: object, *, context: str) -> tuple[str, ...]:
     """Normalize an absent/null/empty semantic fact list to ``()``.
 
-    Non-list values, non-string or blank items, and bound violations still
-    raise.
+    Non-list values, non-string or blank items, duplicate items, and bound
+    violations still raise.
     """
     if value is None:
         return ()
-    return _risk_bounded_string_list(value, context=context)
+    rendered = _risk_bounded_string_list(value, context=context)
+    if len(set(rendered)) != len(rendered):
+        raise AgentLoopError(f"{context} contains duplicate items.")
+    return rendered
 
 
 def _parse_semantic_risk_coverage_claims(
