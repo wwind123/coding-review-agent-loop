@@ -398,11 +398,38 @@ handoff. After authentication such a row is recorded as unverified with empty
 facts (never the approved row's planned text), carries an
 `incomplete-semantic-claim` diagnostic naming the missing fields, and triggers
 the single bounded correction continuation. A correction that is still
-incomplete leaves the row unverified; there is no second correction. Missing or
-invalid `row_id` and `execution_refs`, unknown or inadmissible selectors,
-unknown keys, and ill-typed or oversize facts still reject the envelope because
-they carry execution authority. Broader handoff atomicity for other envelope
-failures after a PR is pushed is owned by #827 and #828.
+incomplete leaves the row unverified; there is no second correction.
+
+`execution_refs` must be the opaque selectors printed by `agent-loop run-tests`
+in the same turn. Tests run directly, outside the wrapper, belong in `tests_run`
+only and cannot verify a row; with no selector, omit the claim rather than
+inventing one. Refs that cannot resolve to a current-turn handle are a claim
+defect, not an envelope defect (#859). Command strings, cross-turn or restored
+handles, and refs between 1,024 and 16,384 bytes are dropped before
+authentication. The claim keeps its facts and gains one bounded caveat naming
+the dropped refs (sanitized and truncated). After authentication each dropped
+ref yields an `unknown-execution-ref` diagnostic, the row is unverified with no
+citations, and the same single correction continuation runs. The same dropped
+command string may appear in several rows.
+
+These cases still reject the envelope, because they forge or corrupt execution
+authority, are unbounded input, or are owned elsewhere:
+
+- unknown keys, and ill-typed or oversize facts;
+- a missing, invalid, unapproved, or duplicate `row_id`;
+- a missing `execution_refs` key or an empty list (#855);
+- more than eight refs, non-string or blank refs, or a ref over the
+  16,384-byte hard cap;
+- an admissible selector chosen twice, or a colliding catalog;
+- an in-catalog selector that is not a passing parent-observed observation, or
+  whose supplied launch-integrity state is failing or unknown (wrapper
+  bootstrap, inner exec, and suite start must all be authoritative). It is a
+  real broker handle, so selecting it is an authority decision, not a format
+  defect;
+- legacy canonical evidence fields in a fresh response.
+
+Broader handoff atomicity for other envelope failures after a PR is pushed is
+owned by #827 and #828.
 
 Fix a GitHub issue:
 

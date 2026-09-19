@@ -480,6 +480,57 @@ def test_derived_matrix_evidence_cannot_resolve_a_cross_turn_selector_from_the_j
     assert any(diagnostic.code == "unknown-execution-ref" for diagnostic in result.diagnostics)
 
 
+@pytest.mark.parametrize("with_admissible", [False, True])
+def test_derived_matrix_evidence_turns_dropped_selectors_into_unknown_ref_diagnostics(
+    with_admissible: bool,
+) -> None:
+    """#859: parser-dropped refs derive a non-verified row with claim facts kept."""
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(
+        execution_ref="turn-current:observation-1", receipt_id="receipt-1"
+    )
+    command = "python3 -m pytest tests/test_round_transport.py -q"
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("turn-current:observation-1",) if with_admissible else (),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_risk_test_matrix.py::test_ordinary",),
+        workflow_path_claim="The claimed workflow path.",
+        outcome_assertions=("The claimed outcome.",),
+        forbidden_effect_assertions=("The claimed forbidden effect.",),
+        caveats=("Dropped execution_refs ...",),
+        dropped_execution_refs=(command, "x" * 2_000),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=(observation,),
+        execution_catalog=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    row = result.evidence.rows[0]
+    assert row.status == "stale/unverified"
+    assert row.evidence_citations == ()
+    assert row.workflow_path_claim == "The claimed workflow path."
+    assert row.outcome_assertions == ("The claimed outcome.",)
+    assert row.forbidden_effect_assertions == ("The claimed forbidden effect.",)
+    assert "A claimed execution selector was unknown or cross-turn." in row.caveats
+    unknown = [d for d in result.diagnostics if d.code == "unknown-execution-ref"]
+    assert len(unknown) == 2
+    assert command in unknown[0].message
+    assert len(unknown[1].message) < 300
+    # Dropped refs are not selectors, so they never reach the duplicate check
+    # or the orchestrator's non-actionable diagnostic set.
+    assert all(d.code not in {"missing-claim", "unsuperseded-journal-failure"} for d in unknown)
+
+
 def test_post_authentication_head_race_downgrades_correction_output(monkeypatch, tmp_path) -> None:
     matrix = parse_risk_test_matrix(_matrix())
     identity = risk_test_matrix_identity(matrix)
