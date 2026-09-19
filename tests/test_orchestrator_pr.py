@@ -12051,3 +12051,273 @@ def test_pr_coder_response_sidecars_use_neutral_wording(monkeypatch):
     for body in sidecars:
         assert body.startswith("Agent-loop attachment ")
         assert "review attachment" not in body and "plan attachment" not in body
+
+
+# ---------------------------------------------------------------------------
+# #862: resolved-history proof for incomplete-ledger disposition strips
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.protocol import ReviewItemDisposition as _Disp862
+from coding_review_agent_loop.protocol import UnresolvedReviewItem as _Item862
+from coding_review_agent_loop.round_state import (
+    PostedRoundMetadata as _Meta862,
+    PostedRoundRecord as _Record862,
+    _canonically_resolved_history_item_ids,
+)
+
+
+def _item862(item_id="item-1", reviewer="Codex", owners=(), status="blocking", **extra):
+    return _Item862(
+        item_id=item_id,
+        reviewer=reviewer,
+        source_round=1,
+        text="worker cleanup gap",
+        status=status,
+        resolution_owners=owners,
+        **extra,
+    )
+
+
+def _record862(
+    index,
+    *,
+    subject,
+    round_number,
+    role="reviewer",
+    agent="Codex",
+    prior_items=(),
+    dispositions=(),
+    new_items=(),
+    flow="pr",
+):
+    return _Record862(
+        index=index,
+        metadata=_Meta862(
+            flow=flow,
+            role=role,
+            agent=agent,
+            round_number=round_number,
+            subject=subject,
+            prior_items=tuple(prior_items),
+            dispositions=tuple(dispositions),
+            new_items=tuple(new_items),
+        ),
+        body="",
+    )
+
+
+def _raise_then_resolve_records(*, dispositions, prior=None):
+    item = prior or _item862()
+    return [
+        _record862(0, subject="h1", round_number=1, new_items=[item]),
+        _record862(
+            1, subject="h2", round_number=2, prior_items=[item], dispositions=dispositions
+        ),
+    ]
+
+
+@pytest.mark.parametrize("mode", ["aggregate", "owner-scoped"])
+def test_resolved_history_includes_single_owner_raise_then_resolve(mode):
+    records = _raise_then_resolve_records(
+        dispositions=[_Disp862("item-1", "Codex", "resolved")]
+    )
+    assert _canonically_resolved_history_item_ids(
+        records, reconciliation_mode=mode, same_status="same-pr"
+    ) == frozenset({"item-1"})
+
+
+@pytest.mark.parametrize("mode", ["aggregate", "owner-scoped"])
+@pytest.mark.parametrize(
+    "order",
+    [("blocking", "resolved"), ("resolved", "blocking")],
+)
+def test_resolved_history_excludes_same_round_conflict_in_both_orders(mode, order):
+    item = _item862()
+    records = [
+        _record862(0, subject="h1", round_number=1, new_items=[item]),
+        _record862(
+            1, subject="h2", round_number=2, agent="Codex", prior_items=[item],
+            dispositions=[_Disp862("item-1", "Codex", order[0], note="n")],
+        ),
+        _record862(
+            2, subject="h2", round_number=2, agent="Gemini", prior_items=[item],
+            dispositions=[_Disp862("item-1", "Gemini", order[1], note="n")],
+        ),
+    ]
+    assert "item-1" not in _canonically_resolved_history_item_ids(
+        records, reconciliation_mode=mode, same_status="same-pr"
+    )
+
+
+def test_resolved_history_excludes_owner_scoped_non_owner_only_resolution():
+    records = _raise_then_resolve_records(
+        prior=_item862(owners=("Codex", "Gemini")),
+        dispositions=[_Disp862("item-1", "Antigravity", "resolved")],
+    )
+    assert _canonically_resolved_history_item_ids(
+        records, reconciliation_mode="owner-scoped", same_status="same-pr"
+    ) == frozenset()
+
+
+def test_resolved_history_excludes_owner_scoped_partial_multi_owner_clearance():
+    records = _raise_then_resolve_records(
+        prior=_item862(owners=("Codex", "Gemini")),
+        dispositions=[_Disp862("item-1", "Codex", "resolved")],
+    )
+    assert _canonically_resolved_history_item_ids(
+        records, reconciliation_mode="owner-scoped", same_status="same-pr"
+    ) == frozenset()
+
+
+def test_resolved_history_excludes_item_reintroduced_after_resolution():
+    records = _raise_then_resolve_records(
+        dispositions=[_Disp862("item-1", "Codex", "resolved")]
+    )
+    records.append(
+        _record862(2, subject="h3", round_number=3, agent="Gemini", new_items=[_item862()])
+    )
+    assert _canonically_resolved_history_item_ids(
+        records, reconciliation_mode="aggregate", same_status="same-pr"
+    ) == frozenset()
+
+
+def test_resolved_history_excludes_item_recarried_after_resolution():
+    records = _raise_then_resolve_records(
+        dispositions=[_Disp862("item-1", "Codex", "resolved")]
+    )
+    records.append(
+        _record862(2, subject="h3", round_number=3, prior_items=[_item862()])
+    )
+    assert _canonically_resolved_history_item_ids(
+        records, reconciliation_mode="aggregate", same_status="same-pr"
+    ) == frozenset()
+
+
+def test_resolved_history_excludes_future_machine_other_flow_and_carried_items():
+    future = _raise_then_resolve_records(
+        prior=_item862("item-2"),
+        dispositions=[_Disp862("item-2", "Codex", "future")],
+    )
+    assert _canonically_resolved_history_item_ids(
+        future, reconciliation_mode="aggregate", same_status="same-pr"
+    ) == frozenset()
+
+    machine = _item862(
+        "item-3",
+        reviewer="GitHub managed exact-head CI",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="repair_required",
+        failed_head_sha="h1",
+    )
+    machine_records = _raise_then_resolve_records(
+        prior=machine,
+        dispositions=[_Disp862("item-3", "Codex", "resolved")],
+    )
+    assert _canonically_resolved_history_item_ids(
+        machine_records, reconciliation_mode="owner-scoped", same_status="same-pr"
+    ) == frozenset()
+
+    resolved = _raise_then_resolve_records(
+        dispositions=[_Disp862("item-1", "Codex", "resolved")]
+    )
+    # Other-flow comments never decode into this flow's records.
+    plan_records = orchestrator._extract_round_metadata_records(
+        [
+            SimpleNamespace(
+                body=orchestrator._attach_round_metadata(
+                    "plan review",
+                    dataclasses.replace(record.metadata, flow="plan"),
+                )
+            )
+            for record in resolved
+        ],
+        flow="pr",
+    )
+    assert plan_records == ()
+    assert _canonically_resolved_history_item_ids(
+        resolved,
+        reconciliation_mode="aggregate",
+        same_status="same-pr",
+        current_carried_ids=("item-1",),
+    ) == frozenset()
+
+
+def test_staged_secondary_audit_strips_resolved_primary_disposition_under_incomplete_ledger(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    ledger_flags = []
+    real_ledger_check = orchestrator._round_ledger_may_be_incomplete
+
+    def ledger_spy(**kwargs):
+        result = real_ledger_check(**kwargs)
+        ledger_flags.append(result)
+        return result
+
+    monkeypatch.setattr(orchestrator, "_round_ledger_may_be_incomplete", ledger_spy)
+    logged = []
+    real_log = orchestrator.log
+    monkeypatch.setattr(
+        orchestrator,
+        "log",
+        lambda config, message, *a, **k: (logged.append(message), real_log(config, message, *a, **k))[1],
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[{"text": "worker cleanup gap", "fix_scope": ["src/worker.py"]}],
+            ),
+            _staged_review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        # The secondary audit repeats the primary's already-cleared item.
+        gemini_outputs=[
+            _staged_review(
+                reviewer="Google Gemini",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    config = _staged_config(tmp_path)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    repair_mock.assert_not_called()
+    assert _agent_sequence(runner) == ["codex", "claude", "codex", "gemini", "agy"]
+    assert [phase for phase, _head in _audit_phases(runner)] == [
+        "primary", "primary", "secondary-audit",
+    ]
+    # The secondary-audit round is exactly the incomplete-ledger state.
+    assert ledger_flags[-1] is True
+    assert any(
+        "removed canonically resolved historical prior-item disposition ID(s) item-1 "
+        "despite incomplete ledger" in message
+        for message in logged
+    )
+    assert not any(
+        "deterministically removed unknown prior-item" in message for message in logged
+    )
+    # The stripped response keeps its approval and posts no disposition.
+    gemini_record = next(
+        record
+        for record in orchestrator._extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in runner.pr_payload.get("comments", [])],
+            flow="pr",
+        )
+        if record.metadata.agent == "Gemini" and record.metadata.role == "reviewer"
+    )
+    assert gemini_record.metadata.state == "approved"
+    assert gemini_record.metadata.dispositions == ()
+    assert gemini_record.metadata.new_items == ()

@@ -69,7 +69,7 @@ from .protocol import (
 )
 from .plan_assembly import decode_assembled_plan_sidecar, rendered_plan_identity
 from .review_scheduling import FORCE_FULL_SOURCES, ReviewSchedulingContract, SCHEDULER_PHASES
-from .unresolved_items import _apply_unresolved_item_dispositions
+from .unresolved_items import _apply_unresolved_item_dispositions, _is_machine_obligation
 
 
 @dataclass(frozen=True)
@@ -2368,6 +2368,68 @@ def _aggregate_record_dispositions(
         for disposition in record.metadata.dispositions:
             dispositions_by_item.setdefault(disposition.item_id, []).append(disposition)
     return dispositions_by_item
+
+
+def _canonically_resolved_history_item_ids(
+    records: Sequence[PostedRoundRecord],
+    *,
+    reconciliation_mode: str,
+    same_status: str,
+    current_carried_ids: Sequence[str] = (),
+) -> frozenset[str]:
+    """Return item IDs that recorded history proves were canonically cleared.
+
+    Round metadata is replayed group by group (subject, round number) through
+    the same reconciler that the live loop uses, so owner-scoped partial or
+    non-owner clearance keeps an item active exactly as it did live.  An item
+    counts as resolved only if the reconciler dropped it and every disposition
+    for it in the clearing round was ``resolved``; a later carry or
+    re-introduction makes it active again.  Machine obligations are never
+    returned.  The result is a whitelist for removing no-op ``resolved``
+    dispositions, so every ambiguity must exclude the ID.
+    """
+    groups: dict[tuple[str, int], list[PostedRoundRecord]] = {}
+    for record in records:
+        key = (record.metadata.subject, record.metadata.round_number)
+        groups.setdefault(key, []).append(record)
+    active: dict[str, UnresolvedReviewItem] = {}
+    resolved: set[str] = set()
+    for group in groups.values():
+        for record in group:
+            for item in record.metadata.prior_items:
+                active[item.item_id] = item
+                resolved.discard(item.item_id)
+        dispositions_by_item = _aggregate_record_dispositions(
+            [record for record in group if record.metadata.role == "reviewer"]
+        )
+        candidates = [
+            item for item in active.values() if item.item_id in dispositions_by_item
+        ]
+        if candidates:
+            kept, future = _apply_unresolved_item_dispositions(
+                candidates,
+                dispositions_by_item,
+                same_status=same_status,
+                retain_future=True,
+                reconciliation_mode=reconciliation_mode,
+            )
+            remaining_ids = {item.item_id for item in (*kept, *future)}
+            for item in candidates:
+                if item.item_id in remaining_ids:
+                    continue
+                del active[item.item_id]
+                if _is_machine_obligation(item):
+                    continue
+                if all(
+                    disposition.disposition == "resolved"
+                    for disposition in dispositions_by_item[item.item_id]
+                ):
+                    resolved.add(item.item_id)
+        for record in group:
+            for item in record.metadata.new_items:
+                active[item.item_id] = item
+                resolved.discard(item.item_id)
+    return frozenset(resolved - set(active) - set(current_carried_ids))
 
 
 def _recover_unrecorded_pr_head_advance(

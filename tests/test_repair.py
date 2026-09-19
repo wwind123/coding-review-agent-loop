@@ -3419,6 +3419,118 @@ def test_run_validated_agent_deterministic_strip_skipped_when_ledger_incomplete(
     repair_mock.assert_not_called()
     assert "item-1" in str(exc_info.value)
 
+# #862: incomplete-ledger strip is allowed only for proven resolved history.
+
+from coding_review_agent_loop.repair import unknown_dispositions_are_resolved_history
+
+
+def _pr_review_with_dispositions(dispositions):
+    return structured_pr_review(
+        state="approved",
+        summary="LGTM.",
+        prior_item_dispositions=dispositions,
+        reviewer="Google Gemini",
+    )
+
+
+def test_resolved_history_predicate_accepts_only_resolved_history_entries():
+    resolved = _pr_review_with_dispositions([{"item_id": "item-1", "disposition": "resolved"}])
+    assert unknown_dispositions_are_resolved_history(
+        resolved, unknown_ids=("item-1",), resolved_history_ids=("item-1",), expected_kind="pr_review"
+    )
+    mixed = _pr_review_with_dispositions([
+        {"item_id": "item-1", "disposition": "resolved"},
+        {"item_id": "item-9", "disposition": "resolved"},
+    ])
+    assert not unknown_dispositions_are_resolved_history(
+        mixed, unknown_ids=("item-1", "item-9"), resolved_history_ids=("item-1",), expected_kind="pr_review"
+    )
+    for active in ("blocking", "same-pr"):
+        text = _pr_review_with_dispositions(
+            [{"item_id": "item-1", "disposition": active, "note": "still broken"}]
+        )
+        assert not unknown_dispositions_are_resolved_history(
+            text, unknown_ids=("item-1",), resolved_history_ids=("item-1",), expected_kind="pr_review"
+        )
+    assert not unknown_dispositions_are_resolved_history(
+        "not json", unknown_ids=("item-1",), resolved_history_ids=("item-1",), expected_kind="pr_review"
+    )
+    assert not unknown_dispositions_are_resolved_history(
+        resolved, unknown_ids=("item-1",), resolved_history_ids=("item-1",), expected_kind="plan_review"
+    )
+    plan = structured_plan_review(
+        state="approved",
+        summary="Plan approved.",
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        reviewer="Google Gemini",
+    )
+    assert unknown_dispositions_are_resolved_history(
+        plan, unknown_ids=("item-1",), resolved_history_ids=("item-1",), expected_kind="plan_review"
+    )
+
+
+def _run_incomplete_ledger_pr_review(tmp_path, review, *, history_ids):
+    runner = FakeRunner(gemini_outputs=[review])
+    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        try:
+            return _run_validated_agent(
+                runner,
+                agent="gemini",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=lambda text: _validate_review_response(
+                    text,
+                    reviewer="Google Gemini",
+                    unresolved_items=(),
+                ),
+                use_repair=True,
+                repair_expected_kind="pr_review",
+                repair_allowed_prior_item_ids=(),
+                ledger_incomplete=True,
+                repair_resolved_history_item_ids=history_ids,
+            )
+        finally:
+            repair_mock.assert_not_called()
+
+
+def test_run_validated_agent_strips_resolved_history_despite_incomplete_ledger(tmp_path):
+    review = _pr_review_with_dispositions([{"item_id": "item-1", "disposition": "resolved"}])
+    response = _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+    payload, _ = json.JSONDecoder().raw_decode(response.text)
+    assert payload["prior_item_dispositions"] == []
+    assert payload["state"] == "approved"
+    assert payload["summary"] == "LGTM."
+
+
+def test_run_validated_agent_incomplete_ledger_unknown_id_absent_from_history_fails_closed(tmp_path):
+    review = _pr_review_with_dispositions([{"item_id": "item-9", "disposition": "resolved"}])
+    with pytest.raises(AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \[.*'item-9'\]"):
+        _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+
+
+@pytest.mark.parametrize("active", ["blocking", "same-pr"])
+def test_run_validated_agent_incomplete_ledger_active_history_disposition_fails_closed(tmp_path, active):
+    review = structured_pr_review(
+        state="blocking",
+        summary="Still broken.",
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": active, "note": "still broken"}],
+        reviewer="Google Gemini",
+    )
+    with pytest.raises(AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \['item-1'\]"):
+        _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+
+
+def test_run_validated_agent_incomplete_ledger_mixed_history_and_unknown_fails_closed(tmp_path):
+    review = _pr_review_with_dispositions([
+        {"item_id": "item-1", "disposition": "resolved"},
+        {"item_id": "item-9", "disposition": "resolved"},
+    ])
+    with pytest.raises(AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \[.*'item-9'\]"):
+        _run_incomplete_ledger_pr_review(tmp_path, review, history_ids=("item-1",))
+
+
 def test_run_validated_agent_recovers_plan_revision_human_ack_from_message_text(tmp_path):
     human_requirements = (
         HumanReviewRequirement(
