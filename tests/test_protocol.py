@@ -2263,17 +2263,22 @@ def test_semantic_matrix_claims_use_current_turn_execution_refs_only():
     assert parsed.risk_test_matrix_claims is not None
     assert parsed.risk_test_matrix_claims.claims[0].execution_refs == ("turn:observation-1",)
 
+    # #859: a cross-turn selector is dropped as a claim defect instead of
+    # rejecting the envelope; it is never kept as a selectable ref.
     payload["risk_test_matrix_claims"][0]["execution_refs"] = ["other-turn:observation-1"]
-    with pytest.raises(Exception, match="unknown or cross-turn"):
-        validate_structured_issue_implementation(
-            json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
-            delivered_risk_test_matrix_row_ids=["row-1"],
-            execution_catalog=[{
-                "execution_ref": "turn:observation-1",
-                "outcome": "passed",
-                "provenance": "parent-observed",
-            }],
-        )
+    parsed = validate_structured_issue_implementation(
+        json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+        delivered_risk_test_matrix_row_ids=["row-1"],
+        execution_catalog=[{
+            "execution_ref": "turn:observation-1",
+            "outcome": "passed",
+            "provenance": "parent-observed",
+        }],
+    )
+    assert parsed is not None and parsed.pr_number == 77
+    claim = parsed.risk_test_matrix_claims.claims[0]
+    assert claim.execution_refs == ()
+    assert claim.dropped_execution_refs == ("other-turn:observation-1",)
 
 
 _ADMISSIBLE_CATALOG = [{
@@ -2388,7 +2393,12 @@ def test_semantic_matrix_claim_empty_fact_normalizes_to_default(kind, field, val
         (lambda c: c.update(execution_refs=[]), "at least one selector"),
         (lambda c: c.pop("row_id"), "missing required field"),
         (lambda c: c.update(row_id="row-unknown"), "not an approved enforceable matrix row"),
-        (lambda c: c.update(execution_refs=["other-turn:observation-9"]), "unknown or cross-turn"),
+        (lambda c: c.update(execution_refs=["turn:observation-1", "turn:observation-1"]), "more than once"),
+        (lambda c: c.update(execution_refs=[f"cmd-{i}" for i in range(9)]), "8-item bound"),
+        (lambda c: c.update(execution_refs=[3]), "must be a string"),
+        (lambda c: c.update(execution_refs=["   "]), "non-empty string"),
+        (lambda c: c.update(execution_refs="turn:observation-1"), "must be a JSON array"),
+        (lambda c: c.update(execution_refs=["x" * 16_385]), "16384-byte bound"),
     ],
 )
 def test_semantic_matrix_claim_authority_defects_still_reject(kind, mutate, match):
@@ -2410,6 +2420,175 @@ def test_semantic_matrix_claim_inadmissible_selector_still_rejects(kind):
                 "outcome": "failed",
                 "provenance": "parent-observed",
             }],
+        )
+
+
+_COMMAND_REF = "python3 -m pytest tests/test_round_transport.py -q -p no:cacheprovider"
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_command_string_refs_are_dropped_not_fatal(kind):
+    """#859: command-string refs are a claim defect; the envelope still parses."""
+    claim = _complete_semantic_claim()
+    claim["execution_refs"] = [_COMMAND_REF, _COMMAND_REF]
+
+    parsed = _validate_claims_envelope(kind, [claim], catalog=[])
+
+    assert parsed is not None
+    if kind == "issue_implementation":
+        assert parsed.pr_number == 77
+    parsed_claim = parsed.risk_test_matrix_claims.claims[0]
+    assert parsed_claim.execution_refs == ()
+    assert parsed_claim.dropped_execution_refs == (_COMMAND_REF,)
+    assert parsed_claim.test_identifiers == ("test_protocol",)
+    assert parsed_claim.outcome_assertions == ("The test passed.",)
+    assert len(parsed_claim.caveats) == 1
+    assert _COMMAND_REF in parsed_claim.caveats[0]
+    assert "agent-loop run-tests" in parsed_claim.caveats[0]
+    payload = parsed_claim.to_payload()
+    assert payload["execution_refs"] == []
+    assert "dropped_execution_refs" not in payload
+
+
+def test_semantic_matrix_claims_mix_admissible_and_dropped_refs_across_rows():
+    long_ref = "y" * 1_025
+    claims = [
+        {"row_id": "row-1", "execution_refs": [_COMMAND_REF, "turn:observation-1", long_ref]},
+        {"row_id": "row-2", "execution_refs": [_COMMAND_REF]},
+    ]
+
+    parsed = _validate_claims_envelope(
+        "issue_implementation", claims, row_ids=("row-1", "row-2")
+    )
+
+    first, second = parsed.risk_test_matrix_claims.claims
+    assert first.execution_refs == ("turn:observation-1",)
+    assert first.dropped_execution_refs == (_COMMAND_REF, long_ref)
+    assert second.execution_refs == ()
+    assert second.dropped_execution_refs == (_COMMAND_REF,)
+    caveat = first.caveats[-1]
+    assert len(caveat.encode("utf-8")) <= 1_024
+    assert "y" * 120 + "\u2026" in caveat
+    assert long_ref not in caveat
+
+
+@pytest.mark.parametrize(
+    ("size", "in_catalog", "expected"),
+    [
+        (1_024, True, "kept"),
+        (1_024, False, "dropped"),
+        (1_025, True, "dropped"),
+        (16_384, False, "dropped"),
+        (16_385, False, "raised"),
+    ],
+)
+def test_semantic_matrix_claim_selector_size_boundaries_with_catalog(size, in_catalog, expected):
+    ref = "r" * size
+    catalog = [{"execution_ref": ref, "outcome": "passed", "provenance": "parent-observed"}] if in_catalog else []
+    claims = [{"row_id": "row-1", "execution_refs": [ref]}]
+
+    if expected == "raised":
+        with pytest.raises(AgentLoopError, match="16384-byte bound"):
+            _validate_claims_envelope("coder_followup", claims, catalog=catalog)
+        return
+    claim = _validate_claims_envelope(
+        "coder_followup", claims, catalog=catalog
+    ).risk_test_matrix_claims.claims[0]
+    if expected == "kept":
+        assert claim.execution_refs == (ref,)
+        assert claim.dropped_execution_refs == ()
+        assert claim.caveats == ()
+    else:
+        assert claim.execution_refs == ()
+        assert claim.dropped_execution_refs == (ref,)
+        assert len(claim.caveats[0].encode("utf-8")) <= 1_024
+
+
+def test_semantic_matrix_claim_dropped_ref_caveat_stays_bounded():
+    from coding_review_agent_loop.protocol import SEMANTIC_RISK_CLAIMS_MAX_CAVEATS
+
+    claim = _complete_semantic_claim()
+    claim["execution_refs"] = [f"{i}-" + "zé" * 3_000 for i in range(8)]
+    claim["caveats"] = [f"model caveat {i}" for i in range(SEMANTIC_RISK_CLAIMS_MAX_CAVEATS)]
+
+    parsed = _validate_claims_envelope("issue_implementation", [claim], catalog=[])
+
+    parsed_claim = parsed.risk_test_matrix_claims.claims[0]
+    assert len(parsed_claim.dropped_execution_refs) == 8
+    assert len(parsed_claim.caveats) == SEMANTIC_RISK_CLAIMS_MAX_CAVEATS
+    assert parsed_claim.caveats[:-1] == tuple(
+        f"model caveat {i}" for i in range(SEMANTIC_RISK_CLAIMS_MAX_CAVEATS - 1)
+    )
+    caveat = parsed_claim.caveats[-1]
+    assert len(caveat.encode("utf-8")) <= 1_024
+    assert "more)" in caveat
+
+
+def test_semantic_matrix_claim_dropped_ref_caveat_neutralizes_multiline_text():
+    claim = _complete_semantic_claim()
+    claim["execution_refs"] = ["pytest `tests/x.py`\n  -q"]
+
+    parsed = _validate_claims_envelope("issue_implementation", [claim], catalog=[])
+
+    caveat = parsed.risk_test_matrix_claims.claims[0].caveats[-1]
+    assert "\n" not in caveat
+    assert "`pytest 'tests/x.py' -q`" in caveat
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_launch_integrity_unknown_selector_still_rejects(kind):
+    with pytest.raises(AgentLoopError, match="launch-integrity"):
+        _validate_claims_envelope(
+            kind,
+            [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+            catalog=[{
+                "execution_ref": "turn:observation-1",
+                "outcome": "passed",
+                "provenance": "parent-observed",
+                "wrapper_bootstrap": "failed",
+            }],
+        )
+
+
+def test_semantic_matrix_claim_catalog_collision_still_rejects():
+    entry = {"execution_ref": "turn:observation-1", "outcome": "passed", "provenance": "parent-observed"}
+    with pytest.raises(AgentLoopError, match="colliding execution_ref"):
+        _validate_claims_envelope(
+            "issue_implementation",
+            [{"row_id": "row-1", "execution_refs": [_COMMAND_REF]}],
+            catalog=[entry, dict(entry)],
+        )
+
+
+def test_semantic_matrix_claim_duplicate_admissible_selector_across_rows_rejects():
+    with pytest.raises(AgentLoopError, match="more than once"):
+        _validate_claims_envelope(
+            "issue_implementation",
+            [
+                {"row_id": "row-1", "execution_refs": ["turn:observation-1"]},
+                {"row_id": "row-2", "execution_refs": ["turn:observation-1"]},
+            ],
+            row_ids=("row-1", "row-2"),
+        )
+
+
+def test_semantic_matrix_claims_without_catalog_keep_selectors_verbatim():
+    from coding_review_agent_loop.protocol import _parse_semantic_risk_coverage_claims
+
+    parsed = _parse_semantic_risk_coverage_claims(
+        [{"row_id": "row-1", "execution_refs": [_COMMAND_REF, "anything"]}],
+        context="claims",
+        expected_row_ids=["row-1"],
+    )
+    claim = parsed.claims[0]
+    assert claim.execution_refs == (_COMMAND_REF, "anything")
+    assert claim.dropped_execution_refs == ()
+    assert claim.caveats == ()
+    with pytest.raises(AgentLoopError, match="1024-byte bound"):
+        _parse_semantic_risk_coverage_claims(
+            [{"row_id": "row-1", "execution_refs": ["x" * 1_025]}],
+            context="claims",
+            expected_row_ids=["row-1"],
         )
 
 

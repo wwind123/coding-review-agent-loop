@@ -1287,6 +1287,190 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
         assert "semantic-correction-exhausted" in codes
 
 
+_COMMAND_STRING_REF = (
+    "python3 -m pytest tests/test_round_transport.py -q -p no:cacheprovider"
+)
+
+
+def _command_string_issue_implementation_text() -> str:
+    """The #859 shape: raw commands in execution_refs, no broker selector."""
+    raw = structured_issue_implementation(pr_number=77)
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["risk_test_matrix_claims"] = [{
+        "row_id": "implementation-derived-evidence",
+        "execution_refs": [_COMMAND_STRING_REF, "python3 -m pytest tests/ -q"],
+        "test_identifiers": ["tests/test_orchestrator_issue.py::test_workflow"],
+        "test_locations": ["tests/test_orchestrator_issue.py"],
+        "workflow_path_claim": "The issue implementation handoff reached post-head derivation.",
+        "outcome_assertions": ["The command-string claim was dropped."],
+        "forbidden_effect_assertions": ["The PR handoff was not discarded."],
+        "caveats": [],
+    }]
+    return json.dumps(payload) + raw[end:]
+
+
+@pytest.mark.parametrize("mode", ["corrected", "still-invalid"])
+def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverified(
+    tmp_path, monkeypatch, mode
+):
+    """#859: command-string execution_refs must not strand a tested PR.
+
+    The envelope parses with the refs dropped, the PR is authenticated and
+    handed off, implementation is not re-run, repair is never invoked, and at
+    most one post-authentication correction runs.
+    """
+    approved_plan, plan_context = _implementation_matrix_context()
+    current = _workflow_observation(
+        execution_ref="coder-turn:observation-1",
+        receipt_id="receipt-current-head",
+        head="abc123",
+    )
+    initial_text = _command_string_issue_implementation_text()
+    corrected_text = (
+        _semantic_issue_implementation_text(current.execution_ref)
+        if mode == "corrected"
+        else _command_string_issue_implementation_text()
+    )
+    # Real orchestrator validator with the live current-turn catalog.
+    initial_parsed = orchestrator_module._validate_issue_implementation_response(
+        initial_text,
+        human_requirements=(),
+        delivered_risk_test_matrix=plan_context.risk_test_matrix_payload,
+        delivered_risk_test_matrix_identity=plan_context.risk_test_matrix_identity,
+        require_risk_test_matrix_contract=True,
+        authoritative_test_observations=(current,),
+        delivered_risk_test_matrix_row_ids=plan_context.risk_test_matrix_expected_row_ids,
+        execution_catalog=(current,),
+    )
+    assert initial_parsed.pr_number == 77
+    initial_claim = initial_parsed.risk_test_matrix_claims.claims[0]
+    assert initial_claim.execution_refs == ()
+    assert initial_claim.dropped_execution_refs == (
+        _COMMAND_STRING_REF, "python3 -m pytest tests/ -q",
+    )
+    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "abc123"})
+    config = make_config(tmp_path, coder="claude")
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+        human_requirements=(),
+    )
+    coder_response = ValidatedAgentResponse(
+        text=initial_text,
+        session_id="coder-session",
+        marker_value=initial_parsed,
+        acquisition_test_turn_id="coder-turn",
+        acquisition_test_observations=(current,),
+    )
+    implementation_calls = []
+    recorded = []
+    correction_prompts = []
+    run_pr_calls = []
+
+    def fake_validated_agent(*_a, **_k):
+        implementation_calls.append(1)
+        return coder_response
+
+    real_handoff = orchestrator_module.post_issue_pr_handoff_comment
+
+    def recording_handoff(*args, **kwargs):
+        result = real_handoff(*args, **kwargs)
+        recorded.append(("issue-handoff", kwargs.get("pr_number")))
+        return result
+
+    def fake_correction(*_a, **kwargs):
+        assert kwargs.get("label") == "semantic-evidence-correction"
+        assert ("issue-handoff", 77) in recorded
+        correction_prompts.append(kwargs["prompt"])
+        return SimpleNamespace(text=corrected_text)
+
+    def forbidden_repair(*_a, **_k):
+        raise AssertionError("repair must not run for dropped execution_refs")
+
+    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", fake_validated_agent)
+    monkeypatch.setattr(orchestrator_module, "post_issue_pr_handoff_comment", recording_handoff)
+    monkeypatch.setattr(orchestrator_module, "run_agent_result", fake_correction)
+    monkeypatch.setattr(orchestrator_module, "attempt_repair", forbidden_repair)
+    monkeypatch.setattr(orchestrator_module, "execute_repair", forbidden_repair)
+    monkeypatch.setattr(
+        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "validate_assigned_head_advanced", lambda **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "run_pr_loop",
+        lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "reconcile_test_observations",
+        lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head="abc123",
+            tracked_digest="tree-current",
+            complete=True,
+            stable=True,
+            status_clean=True,
+        ),
+    )
+
+    result = orchestrator_module._implement_approved_issue(
+        runner,
+        issue_number=56,
+        approved_plan=approved_plan,
+        config=config,
+        memory=None,
+        issue_context=issue_context,
+        coder_session_id=None,
+        usage_context=orchestrator_module._new_usage_context(config),
+        approved_plan_context=plan_context,
+    )
+
+    assert result == 0
+    assert implementation_calls == [1]
+    assert len(correction_prompts) == 1
+    assert "unknown-execution-ref" in correction_prompts[0]
+    assert "Command strings and handles outside this catalog are dropped" in correction_prompts[0]
+    assert ("issue-handoff", 77) in recorded
+    assert any("AGENT_ISSUE_PR_HANDOFF" in comment for comment in runner.comments)
+    assert run_pr_calls and run_pr_calls[0]["pr_number"] == 77
+    raw_comments = [
+        item["body"] for item in runner.pr_payload.get("comments", [])
+        if isinstance(item, dict) and isinstance(item.get("body"), str)
+    ]
+    metadata = _metadata_from_public_comment(
+        next(comment for comment in raw_comments if "AGENT_LOOP_META: " in comment)
+    )
+    evidence_row = metadata.risk_test_matrix_evidence["rows"][0]
+    codes = [item["code"] for item in metadata.risk_test_matrix_diagnostics]
+    if mode == "corrected":
+        assert evidence_row["status"] == "verified"
+        assert "unknown-execution-ref" not in codes
+    else:
+        assert evidence_row["status"] == "stale/unverified"
+        assert evidence_row["evidence_citations"] == []
+        assert evidence_row["outcome_assertions"] == ["The command-string claim was dropped."]
+        assert any(_COMMAND_STRING_REF in caveat for caveat in evidence_row["caveats"])
+        assert "unknown-execution-ref" in codes
+        assert "semantic-correction-exhausted" in codes
+
+
 def _issue_context_with_blocked_requirement() -> IssueContext:
     return IssueContext(
         number=56,

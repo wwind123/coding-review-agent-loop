@@ -3980,3 +3980,38 @@ def test_semantic_claim_schema_is_shared_by_every_prompt_and_repair_surface():
         }],
     )
     assert parsed.claims[0].row_id == example["row_id"]
+
+
+def test_selector_guidance_forbids_command_strings_in_coder_and_correction_prompts():
+    """#859: execution_refs are run-tests selectors only; omit rather than invent."""
+    from types import SimpleNamespace as _Namespace
+
+    import coding_review_agent_loop.orchestrator as orchestrator_module
+    from coding_review_agent_loop.protocol import semantic_risk_claim_example_json
+
+    context = prompts_module.CoderHumanRequirementsPromptContext(
+        block="", surfaced_requirement_ids=(), requires_direct_discussion_ack=False
+    )
+    surfaces = {
+        "issue-implementation": prompts_module._structured_issue_implementation_guidance(
+            human_requirements_context=context, coder_signature="-- Coder"
+        ),
+        "coder-followup": prompts_module._structured_coder_followup_guidance(
+            reviewer_name="Reviewer", human_requirements_context=context, coder_signature="-- Coder"
+        ),
+        "correction": orchestrator_module._post_auth_correction_prompt(
+            _Namespace(kind="issue_implementation"),
+            matrix_row_ids=("row-1",),
+            diagnostics=(),
+            execution_catalog=(),
+        ),
+    }
+    for name, text in surfaces.items():
+        flat = " ".join(text.split())
+        assert "opaque selectors printed by `agent-loop run-tests`" in flat, name
+        assert "never command strings" in flat, name
+        assert "tests run outside the wrapper cannot verify a row" in flat, name
+        assert "omit the claim" in flat and "rather than inventing one" in flat, name
+        assert semantic_risk_claim_example_json() in text, name
+    correction = " ".join(surfaces["correction"].split())
+    assert "Command strings and handles outside this catalog are dropped" in correction

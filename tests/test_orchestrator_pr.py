@@ -2351,6 +2351,135 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
     assert any("The follow-up evidence path is covered." in comment for comment in runner.comments)
 
 
+def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
+    tmp_path, monkeypatch
+):
+    """#859 parity: a follow-up citing command strings is not rejected.
+
+    The advanced head is reconciled, the row derives as unverified with an
+    unknown-execution-ref diagnostic, exactly one correction runs, and repair
+    is never invoked.
+    """
+    plan_context = _followup_matrix_context()
+    current = _followup_observation(
+        execution_ref="coder-turn:observation-1",
+        receipt_id="receipt-current-head",
+        head="repaired-head",
+        timestamp="2026-01-01T00:00:01Z",
+    )
+    command_ref = "python3 -m pytest tests/test_orchestrator_pr.py -q"
+    command_text = _semantic_coder_followup_text(command_ref)
+    parsed = validate_structured_coder_followup(
+        command_text,
+        required_architecture_impact_contract=1,
+        delivered_risk_test_matrix=plan_context.risk_test_matrix_payload,
+        delivered_risk_test_matrix_identity=plan_context.risk_test_matrix_identity,
+        required_risk_test_matrix_contract=1,
+        delivered_risk_test_matrix_row_ids=("followup-derived-evidence",),
+        execution_catalog=(current,),
+    )
+    assert parsed is not None
+    assert parsed.risk_test_matrix_claims.claims[0].execution_refs == ()
+    assert parsed.risk_test_matrix_claims.claims[0].dropped_execution_refs == (command_ref,)
+    coder_response = ValidatedAgentResponse(
+        text=command_text,
+        session_id="coder-session",
+        marker_value=parsed,
+        acquisition_test_turn_id="coder-turn",
+        acquisition_test_observations=(current,),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="The follow-up path needs workflow coverage.",
+                blocking_items=["Exercise follow-up evidence derivation."],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="The follow-up evidence path is covered.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        pr_payload={"headRefOid": "predecessor-head"},
+        git_head="predecessor-head",
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
+    real_validated_agent = orchestrator._run_validated_agent
+
+    def fake_validated_agent(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = "repaired-head"
+            runner.git_head = "repaired-head"
+            return coder_response
+        return real_validated_agent(*args, **kwargs)
+
+    def forbidden_repair(*_a, **_k):
+        raise AssertionError("repair must not run for dropped execution_refs")
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
+    monkeypatch.setattr(orchestrator, "attempt_repair", forbidden_repair)
+    monkeypatch.setattr(orchestrator, "execute_repair", forbidden_repair)
+    monkeypatch.setattr(
+        orchestrator,
+        "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head=runner.pr_payload["headRefOid"],
+            tracked_digest="tree-current",
+            complete=True,
+            stable=True,
+            status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_read_assigned_workdir_head",
+        lambda *_args, **_kwargs: runner.git_head,
+    )
+    real_run_agent_result = orchestrator.run_agent_result
+    correction_prompts = []
+
+    def fake_correction(*_args, **kwargs):
+        if kwargs.get("label") != "semantic-evidence-correction":
+            return real_run_agent_result(*_args, **kwargs)
+        correction_prompts.append(kwargs["prompt"])
+        return SimpleNamespace(text=command_text)
+
+    monkeypatch.setattr(orchestrator, "run_agent_result", fake_correction)
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=config,
+        approved_plan_context=plan_context,
+    ) == 0
+
+    assert len(correction_prompts) == 1
+    assert "unknown-execution-ref" in correction_prompts[0]
+    coder_comments = [
+        item["body"] for item in runner.pr_payload["comments"]
+        if isinstance(item, dict)
+        and isinstance(item.get("body"), str)
+        and "AGENT_LOOP_META: " in item["body"]
+        and _decode_round_metadata(
+            item["body"].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+        ).role == "coder"
+    ]
+    assert coder_comments
+    metadata = _decode_round_metadata(
+        coder_comments[-1].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+    )
+    row = metadata.risk_test_matrix_evidence["rows"][0]
+    assert row["status"] == "stale/unverified"
+    assert row["evidence_citations"] == []
+    codes = [item["code"] for item in metadata.risk_test_matrix_diagnostics]
+    assert "unknown-execution-ref" in codes
+    assert "semantic-correction-exhausted" in codes
+    assert any("The follow-up evidence path is covered." in comment for comment in runner.comments)
+
+
 def test_run_pr_loop_replays_derived_followup_evidence_without_ephemeral_selectors(tmp_path):
     plan_context = _followup_matrix_context()
     carried_item = UnresolvedReviewItem(

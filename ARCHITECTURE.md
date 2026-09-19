@@ -163,7 +163,14 @@ head/tree, and retains failed, timed-out, stale, unbound, and restart-limited
 observations as non-verified caveats. Missing or partial claims therefore
 produce complete non-verified evidence rather than hiding the PR.
 
-Format and selector defects receive bounded semantic-only correction. Repair
+Format and selector defects receive bounded semantic-only correction. A
+selector outside the current-turn catalog (a command string, a cross-turn
+handle, or oversize text up to a hard cap) is a claim defect, not an envelope
+defect: it is dropped with a caveat before authentication and becomes an
+`unknown-execution-ref` diagnostic afterwards. Authority violations stay fatal:
+unknown keys, bad row IDs, empty selector lists, duplicate admissible
+selectors, catalog collisions, in-catalog non-passing selectors, and legacy
+canonical fields. Repair
 does not generate matrix identities, canonical rows, receipt IDs, mappings,
 statuses, or evidence envelopes. Derived evidence and diagnostics are the
 durable replay artifact; live execution selectors are not. Historical accepted

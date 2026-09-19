@@ -482,6 +482,12 @@ SEMANTIC_RISK_CLAIMS_MAX_ROWS = 24
 SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS = 8
 SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES = 1_024
 SEMANTIC_RISK_CLAIMS_MAX_CAVEATS = 16
+# Catalog-aware parsing drops selectors that cannot resolve to a current-turn
+# broker handle (#859).  Refs up to this hard cap are dropped as a claim
+# defect; anything larger is pathological input and still rejects.
+SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES = 16_384
+# Each dropped ref is named in the claim caveat by this bounded prefix.
+SEMANTIC_RISK_CLAIMS_DROPPED_REF_PREVIEW_CHARS = 120
 
 # Machine-owned claim-row schema shared by the parser, the fresh coder
 # prompts, the post-auth correction prompt, and repair.  Keeping one source
@@ -539,6 +545,11 @@ def semantic_risk_claim_schema_text() -> str:
         "Each `risk_test_matrix_claims` row uses exactly these keys: "
         + ", ".join(f"`{key}`" for key in SEMANTIC_RISK_CLAIM_KEYS)
         + ". `row_id` and a non-empty `execution_refs` list are mandatory. "
+        "`execution_refs` holds only the opaque selectors printed by "
+        "`agent-loop run-tests` in this turn, never command strings or test "
+        "identifiers; tests run outside the wrapper cannot verify a row (list "
+        "them in `tests_run` only), and with no selector you omit the claim, so "
+        "the row stays unverified, rather than inventing one. "
         "Every fact key ("
         + ", ".join(f"`{key}`" for key in SEMANTIC_RISK_CLAIM_FACT_KEYS)
         + ") must be present and non-empty for the row to verify; a missing, "
@@ -555,6 +566,12 @@ class SemanticRiskCoverageClaim:
     ``execution_refs`` are invocation-local selectors issued by the managed
     test broker.  They are intentionally not receipt IDs and are never
     persisted as evidence authority.
+
+    ``dropped_execution_refs`` records model-supplied refs that the
+    catalog-aware parser could not resolve to a current-turn handle (#859).
+    They are never selectable or citable; derivation turns each one into an
+    ``unknown-execution-ref`` diagnostic, and ``to_payload`` exposes them only
+    through the bounded caveat the parser added.
     """
 
     row_id: str
@@ -565,6 +582,7 @@ class SemanticRiskCoverageClaim:
     outcome_assertions: tuple[str, ...]
     forbidden_effect_assertions: tuple[str, ...]
     caveats: tuple[str, ...] = ()
+    dropped_execution_refs: tuple[str, ...] = ()
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -1764,6 +1782,16 @@ def derive_risk_test_matrix_evidence(
                 caveats.append(
                     "The semantic coverage claim did not provide all facts required for verified evidence."
                 )
+            for dropped_ref in claim.dropped_execution_refs:
+                # Dropped before authentication (#859): never selectable, so
+                # they stay out of ``selected`` and cannot yield citations.
+                valid_selected = False
+                diagnostics.append(PostAuthClaimDiagnostic(
+                    row.row_id, "unknown-execution-ref",
+                    f"Execution selector `{_dropped_ref_preview(dropped_ref)}` was not present "
+                    "in the authenticated turn catalog.",
+                ))
+                caveats.append("A claimed execution selector was unknown or cross-turn.")
             for execution_ref in claim.execution_refs:
                 observation = observation_by_ref.get(execution_ref)
                 if observation is None:
@@ -3108,6 +3136,60 @@ def _optional_semantic_fact_list(value: object, *, context: str) -> tuple[str, .
     return rendered
 
 
+def _semantic_execution_ref_list(value: object, *, context: str) -> tuple[str, ...]:
+    """Validate catalog-aware ``execution_refs`` structure without the field bound.
+
+    Refs over the 1,024-byte field bound must reach the parser's drop branch
+    (#859), so only the explicit hard cap rejects on size here.
+    """
+    rendered = _expect_string_list(value, context=context, item_context=context)
+    if len(rendered) > SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS:
+        raise AgentLoopError(
+            f"{context} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS}-item bound."
+        )
+    for index, item in enumerate(rendered):
+        if len(item.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES:
+            raise AgentLoopError(
+                f"{context}[{index}] exceeds the {SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES}-byte bound."
+            )
+    return rendered
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _dropped_ref_preview(ref: str) -> str:
+    """Render one dropped ref as sanitized, single-line, bounded text."""
+    flattened = " ".join(sanitize_historical_text(ref).replace("`", "'").split())
+    if len(flattened) <= SEMANTIC_RISK_CLAIMS_DROPPED_REF_PREVIEW_CHARS:
+        return flattened
+    return flattened[:SEMANTIC_RISK_CLAIMS_DROPPED_REF_PREVIEW_CHARS] + "\u2026"
+
+
+def _dropped_execution_refs_caveat(dropped_refs: Sequence[str]) -> str:
+    """Name dropped refs in one caveat within the semantic field bound."""
+    prefix = (
+        "Dropped execution_refs that are not current-turn `agent-loop run-tests` "
+        "selectors (they cannot verify this row): "
+    )
+    budget = SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES
+    parts: list[str] = []
+    for index, ref in enumerate(dropped_refs):
+        candidate = prefix + ", ".join((*parts, f"`{_dropped_ref_preview(ref)}`")) + "."
+        remaining = len(dropped_refs) - index - 1
+        suffix = f" (+{remaining} more)" if remaining else ""
+        if len((candidate + suffix).encode("utf-8")) > budget:
+            omitted = len(dropped_refs) - index
+            text = prefix + ", ".join(parts) + f"{', ' if parts else ''}(+{omitted} more)."
+            return _truncate_utf8(text, budget)
+        parts.append(f"`{_dropped_ref_preview(ref)}`")
+    return _truncate_utf8(prefix + ", ".join(parts) + ".", budget)
+
+
 def _parse_semantic_risk_coverage_claims(
     value: object,
     *,
@@ -3124,9 +3206,26 @@ def _parse_semantic_risk_coverage_claims(
     Missing, null, or empty semantic facts are accepted here and normalized
     to empty defaults: they are recoverable after authentication, where
     derivation records the row as unverified with an
-    ``incomplete-semantic-claim`` diagnostic.  Missing or invalid selectors
-    and row IDs, unknown keys, and ill-typed or oversize facts carry (or
-    corrupt) authority and still reject the whole envelope.
+    ``incomplete-semantic-claim`` diagnostic.
+
+    With a live catalog, selectors that cannot resolve to a current-turn
+    broker handle are a claim defect, not an envelope defect (#859).  Command
+    strings, cross-turn or restored handles, and refs between the 1,024-byte
+    field bound and the 16,384-byte hard cap are dropped in order, recorded
+    on ``dropped_execution_refs``, and named in one bounded caveat.  They
+    carry no authority because they cannot resolve to a receipt, so the PR
+    can still be authenticated and the row derives as unverified with an
+    ``unknown-execution-ref`` diagnostic.
+
+    Still fatal, because they forge or corrupt authority, are unbounded input,
+    or are owned elsewhere: unknown keys; invalid, unapproved, or duplicate
+    row IDs; a missing ``execution_refs`` key or an empty list (#855); more
+    than eight refs, non-string or blank refs, or refs over the hard cap;
+    duplicate admissible selectors; catalog collisions; in-catalog selectors
+    that are not passing parent-observed observations or have known failing
+    launch integrity; and ill-typed or oversize facts.  Without a catalog
+    (historical and unit callers) selectors are kept verbatim and the old
+    1,024-byte selector bound still rejects.
     """
     if not isinstance(value, list):
         raise AgentLoopError(f"{context} must be a JSON array.")
@@ -3166,25 +3265,39 @@ def _parse_semantic_risk_coverage_claims(
         if row_id in seen_rows:
             raise AgentLoopError(f"{context} contains duplicate claim for row `{row_id}`.")
         seen_rows.add(row_id)
-        refs = _risk_bounded_string_list(
-            payload["execution_refs"],
-            context=f"{claim_context}.execution_refs",
-            max_items=SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS,
-        )
-        if not refs:
+        if execution_catalog is None:
+            raw_refs = _risk_bounded_string_list(
+                payload["execution_refs"],
+                context=f"{claim_context}.execution_refs",
+                max_items=SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS,
+            )
+        else:
+            raw_refs = _semantic_execution_ref_list(
+                payload["execution_refs"],
+                context=f"{claim_context}.execution_refs",
+            )
+        if not raw_refs:
             raise AgentLoopError(f"{claim_context}.execution_refs must contain at least one selector.")
-        for ref in refs:
-            if len(ref.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES:
-                raise AgentLoopError(f"{claim_context}.execution_refs contains an oversized selector.")
+        admissible_refs: list[str] = []
+        dropped_refs: list[str] = []
+        for ref in raw_refs:
+            if execution_catalog is None:
+                if len(ref.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES:
+                    raise AgentLoopError(f"{claim_context}.execution_refs contains an oversized selector.")
+            elif (
+                len(ref.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES
+                or ref not in catalog_by_ref
+            ):
+                # Oversize refs are dropped before any catalog lookup.
+                if ref not in dropped_refs:
+                    dropped_refs.append(ref)
+                continue
             if ref in seen_refs:
                 raise AgentLoopError(
                     f"{context} selects execution_ref `{ref}` more than once or across conflicting rows."
                 )
             seen_refs.add(ref)
-            if execution_catalog is not None and ref not in catalog_by_ref:
-                raise AgentLoopError(
-                    f"{claim_context}.execution_refs contains unknown or cross-turn selector `{ref}`."
-                )
+            admissible_refs.append(ref)
             if execution_catalog is not None:
                 observation = catalog_by_ref[ref]
                 semantics, _rich = _observation_semantics(observation)
@@ -3213,9 +3326,19 @@ def _parse_semantic_risk_coverage_claims(
             payload.get("forbidden_effect_assertions"),
             context=f"{claim_context}.forbidden_effect_assertions",
         )
+        caveats = _risk_bounded_string_list(
+            payload.get("caveats", []),
+            context=f"{claim_context}.caveats",
+            max_items=SEMANTIC_RISK_CLAIMS_MAX_CAVEATS,
+        )
+        if dropped_refs:
+            caveats = (
+                *caveats[: SEMANTIC_RISK_CLAIMS_MAX_CAVEATS - 1],
+                _dropped_execution_refs_caveat(dropped_refs),
+            )
         claim = SemanticRiskCoverageClaim(
             row_id=row_id,
-            execution_refs=refs,
+            execution_refs=tuple(admissible_refs),
             test_identifiers=test_identifiers,
             test_locations=test_locations,
             workflow_path_claim=_optional_semantic_fact_string(
@@ -3224,11 +3347,8 @@ def _parse_semantic_risk_coverage_claims(
             ),
             outcome_assertions=outcome_assertions,
             forbidden_effect_assertions=forbidden_effect_assertions,
-            caveats=_risk_bounded_string_list(
-                payload.get("caveats", []),
-                context=f"{claim_context}.caveats",
-                max_items=SEMANTIC_RISK_CLAIMS_MAX_CAVEATS,
-            ),
+            caveats=caveats,
+            dropped_execution_refs=tuple(dropped_refs),
         )
         result.append(claim)
     return SemanticRiskCoverageClaims(tuple(result))

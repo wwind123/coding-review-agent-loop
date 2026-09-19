@@ -4241,7 +4241,9 @@ def _post_auth_correction_prompt(
         "identities, canonical rows, receipt IDs, citations, mappings, statuses, "
         "or envelope bookkeeping. Use only approved row IDs and handles in the "
         "closed catalog below; a missing claim is allowed when no admissible "
-        "execution exists. "
+        "execution exists. Command strings and handles outside this catalog "
+        "are dropped and leave the row unverified, so omit a claim that has no "
+        "admissible handle instead of inventing one. "
         + semantic_risk_claim_schema_text()
         + " If you cannot truthfully state a fact, leave it empty rather than "
         "inventing it; the row then stays unverified.\n\n"
