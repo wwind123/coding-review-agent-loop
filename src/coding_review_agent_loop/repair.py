@@ -21,7 +21,10 @@ from .agents.antigravity import AntigravityBackend
 from .agents.format_repair import run_cli_repair
 from .agents.base import STDIN_PROMPT_THRESHOLD_BYTES
 from .agents.gemini import _parse_gemini_payload
-from .config import DEFAULT_REASONING_EFFORT
+from .config import (
+    ANTIGRAVITY_TRANSIENT_MODEL_ACCESS_SIGNATURES,
+    DEFAULT_REASONING_EFFORT,
+)
 from .logging import agent_log_path
 from .runner import strip_ansi
 from .repair_preservation import validate_repair_preservation
@@ -1234,7 +1237,7 @@ _SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_fo
 RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
-    "fresh_contract_integrity", "semantic_patch_integrity",
+    "transient_provider_error", "fresh_contract_integrity", "semantic_patch_integrity",
 ]
 
 
@@ -1551,6 +1554,38 @@ def require_recoverable_fresh_risk_test_matrix_contract(
         ) from exc
 
 
+_REPAIR_TRANSIENT_RETRIES_PER_MODEL = 1
+
+
+def _looks_like_structured_response(output: str) -> bool:
+    """Return whether *output* carries a JSON object with a ``kind`` field."""
+    start = output.find("{")
+    if start < 0:
+        return False
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(output[start:])
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and "kind" in payload
+
+
+def _is_transient_model_access_failure(result: object | None, output: str) -> bool:
+    """Detect agy's transient model-access failure on its provider channel only.
+
+    A response-file artifact or a structured JSON response is model-authored
+    content and is never classified as transient, whatever text it quotes.
+    """
+    if result is None or getattr(result, "text_source", None) == "response_file":
+        return False
+    if _looks_like_structured_response(output):
+        return False
+    haystack = f"{getattr(result, 'raw_output', '') or ''}\n{output}".lower()
+    return any(
+        signature.lower() in haystack
+        for signature in ANTIGRAVITY_TRANSIENT_MODEL_ACCESS_SIGNATURES
+    )
+
+
 def execute_repair(
     raw: str,
     *,
@@ -1575,12 +1610,6 @@ def execute_repair(
         catalog_diagnostic = ""
     for index, model in enumerate(models):
         fallback_planned = index + 1 < len(models)
-        log_path: Path | None = None
-        output = ""
-        returncode: int | None = None
-        diagnostic = ""
-        cli_result = None
-        outcome: RepairOutcome
         if catalog is not None and model not in catalog:
             choices = ", ".join(sorted(catalog))
             diagnostic = _sanitize_diagnostic(
@@ -1602,160 +1631,186 @@ def execute_repair(
                     fallback_planned=fallback_planned,
                 )
             continue
-        try:
-            if config.repair_backend == "antigravity":
-                log_path = agent_log_path(config, "antigravity-repair", run_id=run_id)
-                result = AntigravityBackend().run_repair(
-                    runner,
-                    config,
-                    prompt,
-                    model=model,
-                    run_id=run_id,
-                    log_path=log_path,
-                )
-                output = result.text.strip()
-                returncode = result.returncode
-                log_path = result.log_path
-                diagnostic_source = result.raw_output
-            elif config.repair_backend in {"codex", "claude"}:
-                log_path = agent_log_path(config, f"{config.repair_backend}-repair", run_id=run_id)
-                cli_result = run_cli_repair(runner, config, prompt, model=model, log_path=log_path)
-                output = cli_result.text.strip()
-                returncode = cli_result.returncode
-                diagnostic_source = cli_result.raw_output
-            else:
-                log_path = agent_log_path(config, "gemini-repair", run_id=run_id)
-                oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
-                proc = subprocess.run(
-                    [
-                        config.gemini_cmd,
-                        "--model",
-                        model,
-                        "--skip-trust",
-                        "--prompt",
-                        _OVERSIZED_REPAIR_PROMPT_DIRECTIVE if oversized_prompt else prompt,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=config.repair_timeout_seconds,
-                    input=prompt if oversized_prompt else None,
-                )
-                returncode = proc.returncode
-                parsed, _, _, _, _ = _parse_gemini_payload(proc.stdout.strip())
-                output = parsed.strip()
-                diagnostic_source = f"{proc.stdout}\n{proc.stderr}"
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                log_path.write_text(diagnostic_source, encoding="utf-8")
-            if returncode is None:
+        for retry_index in range(_REPAIR_TRANSIENT_RETRIES_PER_MODEL + 1):
+            log_path: Path | None = None
+            output = ""
+            returncode: int | None = None
+            diagnostic = ""
+            cli_result = None
+            result = None
+            outcome: RepairOutcome
+            try:
+                if config.repair_backend == "antigravity":
+                    log_path = agent_log_path(config, "antigravity-repair", run_id=run_id)
+                    result = AntigravityBackend().run_repair(
+                        runner,
+                        config,
+                        prompt,
+                        model=model,
+                        run_id=run_id,
+                        log_path=log_path,
+                    )
+                    output = result.text.strip()
+                    returncode = result.returncode
+                    log_path = result.log_path
+                    diagnostic_source = result.raw_output
+                elif config.repair_backend in {"codex", "claude"}:
+                    log_path = agent_log_path(config, f"{config.repair_backend}-repair", run_id=run_id)
+                    cli_result = run_cli_repair(runner, config, prompt, model=model, log_path=log_path)
+                    output = cli_result.text.strip()
+                    returncode = cli_result.returncode
+                    diagnostic_source = cli_result.raw_output
+                else:
+                    log_path = agent_log_path(config, "gemini-repair", run_id=run_id)
+                    oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
+                    proc = subprocess.run(
+                        [
+                            config.gemini_cmd,
+                            "--model",
+                            model,
+                            "--skip-trust",
+                            "--prompt",
+                            _OVERSIZED_REPAIR_PROMPT_DIRECTIVE if oversized_prompt else prompt,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=config.repair_timeout_seconds,
+                        input=prompt if oversized_prompt else None,
+                    )
+                    returncode = proc.returncode
+                    parsed, _, _, _, _ = _parse_gemini_payload(proc.stdout.strip())
+                    output = parsed.strip()
+                    diagnostic_source = f"{proc.stdout}\n{proc.stderr}"
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_path.write_text(diagnostic_source, encoding="utf-8")
+                if returncode is None:
+                    outcome = "timeout"
+                elif returncode != 0:
+                    outcome = "nonzero_exit"
+                elif not output:
+                    outcome = "empty_output"
+                else:
+                    outcome = "succeeded"
+                diagnostic = _sanitize_diagnostic(diagnostic_source, config=config)
+            except subprocess.TimeoutExpired as exc:
                 outcome = "timeout"
-            elif returncode != 0:
-                outcome = "nonzero_exit"
-            elif not output:
-                outcome = "empty_output"
-            else:
-                outcome = "succeeded"
-            diagnostic = _sanitize_diagnostic(diagnostic_source, config=config)
-        except subprocess.TimeoutExpired as exc:
-            outcome = "timeout"
-            diagnostic = _sanitize_diagnostic(str(exc), config=config)
-            if log_path is not None:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                log_path.write_text(diagnostic + "\n", encoding="utf-8")
-        except Exception as exc:
-            outcome = "spawn_error"
-            diagnostic = _sanitize_diagnostic(str(exc), config=config)
-            if log_path is not None:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                log_path.write_text(diagnostic + "\n", encoding="utf-8")
+                diagnostic = _sanitize_diagnostic(str(exc), config=config)
+                if log_path is not None:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_path.write_text(diagnostic + "\n", encoding="utf-8")
+            except Exception as exc:
+                outcome = "spawn_error"
+                diagnostic = _sanitize_diagnostic(str(exc), config=config)
+                if log_path is not None:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_path.write_text(diagnostic + "\n", encoding="utf-8")
 
-        if config.repair_backend == "antigravity" and catalog is None and catalog_diagnostic:
-            diagnostic = (
-                _sanitize_diagnostic(
-                    "agy model catalog unavailable; attempting configured candidates directly: "
-                    + catalog_diagnostic,
-                    config=config,
+            if config.repair_backend == "antigravity" and catalog is None and catalog_diagnostic:
+                diagnostic = (
+                    _sanitize_diagnostic(
+                        "agy model catalog unavailable; attempting configured candidates directly: "
+                        + catalog_diagnostic,
+                        config=config,
+                    )
+                    + (f"\n{diagnostic}" if diagnostic else "")
                 )
-                + (f"\n{diagnostic}" if diagnostic else "")
-            )
 
-        attempt = RepairAttemptResult(
-            backend=config.repair_backend,
-            model=model,
-            prompt=prompt,
-            output=output,
-            returncode=returncode,
-            outcome=outcome,
-            diagnostic=diagnostic,
-            log_path=log_path,
-            fallback_planned=fallback_planned,
-        )
-        usage_record = None
-        if usage_context is not None:
-            usage_record = usage_context.add_record(
-                agent=config.repair_backend,
-                session_id=None,
-                returncode=returncode,
-                usage=(cli_result.usage if cli_result and cli_result.usage else estimate_usage(prompt, output)),
-                raw_backend_usage=cli_result.raw_usage if cli_result else None,
-                role="repair",
+            attempt = RepairAttemptResult(
+                backend=config.repair_backend,
                 model=model,
-                turn_role="repair",
-                configured_model=model,
-                configured_effort=(config.repair_reasoning_effort or DEFAULT_REASONING_EFFORT)
-                if config.repair_backend in {"codex", "claude"} else None,
-                observed_model=cli_result.observed_model if cli_result else None,
-                effort_source="repair_backend",
+                prompt=prompt,
+                output=output,
+                returncode=returncode,
                 outcome=outcome,
-                log_path=str(log_path) if log_path is not None else None,
+                diagnostic=diagnostic,
+                log_path=log_path,
                 fallback_planned=fallback_planned,
             )
-        # Antigravity's isolated repair result already prioritizes the
-        # invocation's response-file artifact.  A valid artifact is useful
-        # even if its CLI timed out or exited nonzero.
-        if output and (
-            outcome == "succeeded"
-            or (
-                config.repair_backend == "antigravity"
-                and outcome in {"nonzero_exit", "timeout"}
-                and result.text_source == "response_file"
-            )
-        ):
-            try:
-                validation_result = validate(output)
-                validate_repair_preservation(
-                    raw,
-                    output,
-                    unresolved_item_ids=prompt_kwargs.get("unresolved_item_ids"),
-                    surfaced_requirement_ids=prompt_kwargs.get("surfaced_requirement_ids"),
-                    reviewer_requirement_ids=prompt_kwargs.get("reviewer_requirement_ids"),
-                    allow_legacy_matrix_removal=bool(
-                        prompt_kwargs.get("reject_unsolicited_risk_test_matrix_contract")
-                    ),
+            usage_record = None
+            if usage_context is not None:
+                usage_record = usage_context.add_record(
+                    agent=config.repair_backend,
+                    session_id=None,
+                    returncode=returncode,
+                    usage=(cli_result.usage if cli_result and cli_result.usage else estimate_usage(prompt, output)),
+                    raw_backend_usage=cli_result.raw_usage if cli_result else None,
+                    role="repair",
+                    model=model,
+                    turn_role="repair",
+                    configured_model=model,
+                    configured_effort=(config.repair_reasoning_effort or DEFAULT_REASONING_EFFORT)
+                    if config.repair_backend in {"codex", "claude"} else None,
+                    observed_model=cli_result.observed_model if cli_result else None,
+                    effort_source="repair_backend",
+                    outcome=outcome,
+                    log_path=str(log_path) if log_path is not None else None,
+                    fallback_planned=fallback_planned,
                 )
-            except Exception as exc:
-                if outcome == "succeeded":
-                    attempt.outcome = "invalid_output"
-                validation_diagnostic = _sanitize_diagnostic(str(exc), config=config)
-                attempt.diagnostic = "\n".join(
-                    part for part in (attempt.diagnostic, validation_diagnostic) if part
+            # Antigravity's isolated repair result already prioritizes the
+            # invocation's response-file artifact.  A valid artifact is useful
+            # even if its CLI timed out or exited nonzero.
+            if output and (
+                outcome == "succeeded"
+                or (
+                    config.repair_backend == "antigravity"
+                    and outcome in {"nonzero_exit", "timeout"}
+                    and result is not None
+                    and result.text_source == "response_file"
                 )
-                if usage_record is not None:
-                    usage_record.outcome = attempt.outcome
-            else:
-                if outcome != "succeeded":
-                    attempt.outcome = (
-                        "accepted_timeout" if outcome == "timeout"
-                        else "accepted_nonzero_exit"
+            ):
+                try:
+                    validation_result = validate(output)
+                    validate_repair_preservation(
+                        raw,
+                        output,
+                        unresolved_item_ids=prompt_kwargs.get("unresolved_item_ids"),
+                        surfaced_requirement_ids=prompt_kwargs.get("surfaced_requirement_ids"),
+                        reviewer_requirement_ids=prompt_kwargs.get("reviewer_requirement_ids"),
+                        allow_legacy_matrix_removal=bool(
+                            prompt_kwargs.get("reject_unsolicited_risk_test_matrix_contract")
+                        ),
                     )
-                attempt.validation_result = validation_result
-                attempt.fallback_planned = False
+                except Exception as exc:
+                    if outcome == "succeeded":
+                        attempt.outcome = "invalid_output"
+                    validation_diagnostic = _sanitize_diagnostic(str(exc), config=config)
+                    attempt.diagnostic = "\n".join(
+                        part for part in (attempt.diagnostic, validation_diagnostic) if part
+                    )
+                    if usage_record is not None:
+                        usage_record.outcome = attempt.outcome
+                else:
+                    if outcome != "succeeded":
+                        attempt.outcome = (
+                            "accepted_timeout" if outcome == "timeout"
+                            else "accepted_nonzero_exit"
+                        )
+                    attempt.validation_result = validation_result
+                    attempt.fallback_planned = False
+                    if usage_record is not None:
+                        usage_record.validation_status = "validated"
+                        usage_record.outcome = attempt.outcome
+                        usage_record.fallback_planned = False
+                    attempts.append(attempt)
+                    return output, validation_result, attempts
+            # Only a failed antigravity attempt whose provider channel reports
+            # a model-access failure is transient; validated output, timeouts
+            # and model-authored candidates keep their existing outcome.
+            if (
+                config.repair_backend == "antigravity"
+                and attempt.outcome in {"invalid_output", "nonzero_exit", "empty_output"}
+                and _is_transient_model_access_failure(result, output)
+            ):
+                attempt.outcome = "transient_provider_error"
+                attempt.fallback_planned = (
+                    fallback_planned or retry_index < _REPAIR_TRANSIENT_RETRIES_PER_MODEL
+                )
                 if usage_record is not None:
-                    usage_record.validation_status = "validated"
                     usage_record.outcome = attempt.outcome
-                    usage_record.fallback_planned = False
-                attempts.append(attempt)
-                return output, validation_result, attempts
-        attempts.append(attempt)
+                    usage_record.fallback_planned = attempt.fallback_planned
+            attempts.append(attempt)
+            if attempt.outcome != "transient_provider_error":
+                break
     return None, None, attempts
 
 

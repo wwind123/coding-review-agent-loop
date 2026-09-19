@@ -1997,6 +1997,101 @@ def test_terminal_plan_repair_provider_failure_does_not_persist_stale_diagnostic
     assert runner.diagnostic_posts == []
 
 
+
+_TRANSIENT_REPAIR_SUGGESTION = (
+    "Suggestion: re-run the same command — the Antigravity repair model "
+    "reported a transient model-access failure; the round is resumable "
+    "and a retry may succeed."
+)
+
+
+def _repair_attempt(outcome, *, output="", returncode=0, model="Gemini 3.8 Flash (Medium)"):
+    return SimpleNamespace(
+        backend="antigravity",
+        model=model,
+        prompt="",
+        output=output,
+        returncode=returncode,
+        outcome=outcome,
+        diagnostic=(
+            "model-access validation errors" if outcome == "transient_provider_error" else ""
+        ),
+        log_path=None,
+        fallback_planned=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("chain", "expected_category"),
+    [
+        (["transient_provider_error", "transient_provider_error"], "repair-provider-failure"),
+        (
+            ["invalid_output", "transient_provider_error", "transient_provider_error"],
+            "repair-provider-failure",
+        ),
+        (["transient_provider_error", "timeout"], "timeout"),
+    ],
+)
+def test_terminal_transient_plan_repair_is_resumable_provider_failure(
+    tmp_path, monkeypatch, chain, expected_category
+):
+    """Issue #846: a chain ending in a transient agy failure is not deterministic."""
+    payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    payload.pop("architecture_impact")
+    candidate = (
+        json.dumps(payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    attempts = [
+        _repair_attempt(
+            outcome,
+            output=candidate if outcome == "invalid_output" else "",
+            returncode=None if outcome == "timeout" else 0,
+        )
+        for outcome in chain
+    ]
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *args, **kwargs: (None, None, attempts),
+    )
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [candidate]
+
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, agent_max_retries=0),
+            plan_first=True,
+        )
+
+    assert error.value.failure_category == expected_category
+    assert error.value.plan_validation_exhaustion is None
+    assert runner.diagnostic_posts == []
+    if expected_category == "repair-provider-failure":
+        assert _TRANSIENT_REPAIR_SUGGESTION in str(error.value)
+    else:
+        assert _TRANSIENT_REPAIR_SUGGESTION not in str(error.value)
+
+
+def test_repair_provider_failure_suggestion_matches_transient_reason_only():
+    reason = (
+        "plan_review is invalid; repair invocation failure: "
+        "antigravity/Gemini 3.8 Flash (Medium): transient_provider_error "
+        "(model-access validation errors)"
+    )
+    assert (
+        orchestrator_module._failure_suggestion("repair-provider-failure", reason, "Codex")
+        == _TRANSIENT_REPAIR_SUGGESTION
+    )
+    assert orchestrator_module._failure_suggestion(
+        "repair-provider-failure",
+        "repair invocation failure: antigravity/model: nonzero_exit (boom)",
+        "Codex",
+    ) == ""
+
+
 def _add_default_requirement_disposition(
     output: str,
     *,

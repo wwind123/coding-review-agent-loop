@@ -49,6 +49,7 @@ DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES: tuple[str, ...] = (
 # legacy antigravity_model nor an explicit antigravity_models chain is given. Named
 # for discoverability/symmetry with DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES.
 DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
+    "Gemini 3.8 Flash (High)",
     "Gemini 3.7 Flash (High)",
     "Gemini 3.6 Flash (High)",
     "Gemini 3.1 Pro (High)",
@@ -57,7 +58,16 @@ DEFAULT_MAX_ROUNDS = 10
 # `agy --print` otherwise defaults to five minutes, which is too short for
 # complex reviews and causes it to exit with "timeout waiting for response".
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
-DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3.7 Flash (Medium)",)
+DEFAULT_REPAIR_MODELS: tuple[str, ...] = (
+    "Gemini 3.8 Flash (Medium)",
+    "Gemini 3.7 Flash (Medium)",
+)
+# agy reports a transient model-access failure on its provider channel (stdout,
+# with no response artifact) with this text.  Matched case-insensitively; the
+# singular form also matches the plural "errors".
+ANTIGRAVITY_TRANSIENT_MODEL_ACCESS_SIGNATURES: tuple[str, ...] = (
+    "model-access validation error",
+)
 DEFAULT_REASONING_EFFORT = "medium"
 DEFAULT_SEMANTIC_FOLLOWUP_BACKEND: AgentName = "gemini"
 DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS = 30

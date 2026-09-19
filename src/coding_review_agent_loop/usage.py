@@ -100,7 +100,8 @@ class UsageCallRecord:
     observation_provenance: str | None = None
     outcome: Literal[
         "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
-        "unavailable_model", "accepted_nonzero_exit", "accepted_timeout", "self_update_interruption",
+        "unavailable_model", "accepted_nonzero_exit", "accepted_timeout", "transient_provider_error",
+        "self_update_interruption",
         "executable_replacement_interruption", "self_update_replay_refused_changed_workdir",
         "self_update_replay_refused_unavailable_workdir",
     ] | None = None
@@ -223,7 +224,8 @@ class RunUsageContext:
         observation_provenance: str | None = None,
         outcome: Literal[
             "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
-            "unavailable_model", "accepted_nonzero_exit", "accepted_timeout", "self_update_interruption",
+            "unavailable_model", "accepted_nonzero_exit", "accepted_timeout", "transient_provider_error",
+            "self_update_interruption",
             "executable_replacement_interruption", "self_update_replay_refused_changed_workdir",
             "self_update_replay_refused_unavailable_workdir",
         ] | None = None,

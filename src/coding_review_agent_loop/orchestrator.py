@@ -1865,6 +1865,14 @@ def _failure_suggestion(
                 "the round is resumable and a retry may succeed."
             )
         return "Suggestion: inspect the log above, fix the underlying issue, then re-run."
+    if category == "repair-provider-failure":
+        if "transient_provider_error" in reason:
+            return (
+                "Suggestion: re-run the same command — the Antigravity repair model "
+                "reported a transient model-access failure; the round is resumable "
+                "and a retry may succeed."
+            )
+        return ""
     return ""
 
 
@@ -3839,6 +3847,11 @@ def _run_validated_agent(
                             if terminal_repair.outcome == "timeout":
                                 last_failure_category = "timeout"
                             elif terminal_repair.outcome != "invalid_output":
+                                # Includes a terminal transient_provider_error
+                                # (agy model-access failure), even after
+                                # earlier invalid_output attempts: it is a
+                                # resumable provider failure, not a
+                                # deterministic plan-validation rejection.
                                 last_failure_category = "repair-provider-failure"
                     if repaired is not None:
                         if repaired_marker is None:

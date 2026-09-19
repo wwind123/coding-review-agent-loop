@@ -499,11 +499,25 @@ snapshot with bounded, spillable excerpts.
 | Antigravity | `agy` | Accepted as `agy` or `antigravity`; supports coder and reviewer roles. |
 | Gemini | `gemini` | Legacy, best-effort path for accounts that still have CLI access. |
 
-The default Antigravity model chain is `Gemini 3.7 Flash (High)`, then
-`Gemini 3.6 Flash (High)`, then `Gemini 3.1 Pro (High)` for eligible capacity
+The default Antigravity model chain is `Gemini 3.8 Flash (High)`, then
+`Gemini 3.7 Flash (High)`, then `Gemini 3.6 Flash (High)`, then `Gemini 3.1 Pro (High)` for eligible capacity
 failures. Override it with `--antigravity-model` or
 `--antigravity-models`. Antigravity turns are single-shot and its usage totals
 are estimated because `agy` does not expose token counts.
+
+Malformed structured responses get a format-repair pass. By default it uses
+Antigravity with the repair chain `Gemini 3.8 Flash (Medium)`, then
+`Gemini 3.7 Flash (Medium)`, followed by the Antigravity chain above. Use
+`--repair-backend` and repeatable `--repair-model` to change it. Models that
+`agy models` does not list are skipped. When `agy` reports a transient
+`model-access validation errors` failure on its own output (stdout with no
+response artifact and no structured JSON response), that repair model is
+retried once, and then the next model in the chain is tried. If the chain ends
+on that transient failure, the run stops with a resumable
+`repair-provider-failure` and a suggestion to re-run the same command. It is
+not reported as a deterministic plan-validation failure. A valid repaired
+response is always accepted, and model-authored text that only quotes the
+phrase is still treated as invalid output.
 
 Backend-specific authentication, model selection, fallback, timeout, and
 executable-replacement behavior are documented under
@@ -519,7 +533,7 @@ then the tool default. Use `--codex-reasoning-effort xhigh` (or the matching
 implementation option) for an explicit higher-effort Codex/Luna run. Claude
 accepts `low`, `medium`, `high`, `xhigh`, and `max` through `--claude-effort`.
 Antigravity's selected model already carries its tier, such as
-`Gemini 3.7 Flash (High)`, and is not rewritten by this setting. Startup logs,
+`Gemini 3.8 Flash (High)`, and is not rewritten by this setting. Startup logs,
 signatures, usage records, and new round metadata distinguish configured effort
 from verified runtime observations; older records retain unknown values.
 
