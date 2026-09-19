@@ -752,7 +752,10 @@ def build_parser() -> argparse.ArgumentParser:
                 "Force the full PR reviewer board and latch that decision for the remainder "
                 "of the run (recorded with source `operator`). Under primary-then-panel this "
                 "is the explicit way to authorize the secondary panel before the primary's "
-                "exact-head approval and to recover from the pre-panel safety diagnostic."
+                "exact-head approval and to recover from the pre-panel safety diagnostic for a "
+                "secondary-owned finding or a premature blocking secondary review. It cannot "
+                "recover undecodable scheduler history; restore the missing round-metadata "
+                "records instead."
             ),
         )
 
