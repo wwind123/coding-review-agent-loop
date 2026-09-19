@@ -457,6 +457,7 @@ from .round_state import (
     _deserialize_unresolved_item,
     _encode_round_metadata,
     _canonically_resolved_history_item_ids,
+    _live_round_resolved_item_ids,
     _extract_round_metadata_records,
     _latest_pr_approved_reviews_for_head,
     _max_unresolved_item_number_from_records,
@@ -7441,6 +7442,43 @@ def _round_resolved_history_item_ids(
     )
 
 
+def _post_round_resolved_history_item_ids(
+    *,
+    prior_unresolved_items: Sequence[UnresolvedReviewItem],
+    dispositions_by_item: Mapping[str, Sequence[ReviewItemDisposition]],
+    carried_items: Sequence[UnresolvedReviewItem],
+    comments: Sequence[object],
+    flow: str,
+    reconciliation_mode: str,
+    same_status: str,
+) -> tuple[str, ...]:
+    """Resolved-history proof for a turn that runs after this round's dispositions (#874).
+
+    The plan revision is issued at the end of a round, so a planner that echoes
+    an item the round just cleared needs that item in the whitelist.  The
+    recorded history alone cannot supply it: ``comments`` is the snapshot taken
+    before the review turns, and nothing refetches it when a reviewer
+    disposition is posted, so the replay never sees the clearing round.  The
+    round's own authenticated dispositions and post-round carried set do, and
+    both proofs apply the same canonical resolution rule, so their union stays
+    fail-closed.
+    """
+    carried_ids = tuple(item.item_id for item in carried_items)
+    recorded = _round_resolved_history_item_ids(
+        prior_unresolved_items=carried_items,
+        comments=comments,
+        flow=flow,
+        reconciliation_mode=reconciliation_mode,
+        same_status=same_status,
+    )
+    live = _live_round_resolved_item_ids(
+        prior_items=prior_unresolved_items,
+        dispositions_by_item=dispositions_by_item,
+        carried_item_ids=carried_ids,
+    )
+    return tuple(sorted(set(recorded) | live))
+
+
 def _infer_staged_parent_issue(issue_context: IssueContext) -> int | None:
     """Read only generated child-issue markers for direct staged safety checks."""
     candidates: set[int] = set()
@@ -10033,12 +10071,15 @@ def _run_plan_first_loop(
             ),
             repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
             ledger_incomplete=round_ledger_incomplete,
-            # The revision runs after this round's dispositions were applied, so
-            # its proof must come from the post-round carried set. The pre-round
-            # value still lists items this round resolved, which would leave the
-            # whitelist empty exactly when the planner echoes them (#874).
-            repair_resolved_history_item_ids=_round_resolved_history_item_ids(
-                prior_unresolved_items=unresolved_items,
+            # The revision runs after this round's dispositions were applied,
+            # so its proof must cover the items this round resolved. The
+            # pre-round value still carries them, and the pre-loop comment
+            # snapshot cannot replay the round that cleared them, so the proof
+            # also reads this round's in-process dispositions (#874).
+            repair_resolved_history_item_ids=_post_round_resolved_history_item_ids(
+                prior_unresolved_items=prior_unresolved_items,
+                dispositions_by_item=prior_dispositions,
+                carried_items=unresolved_items,
                 comments=issue_context.comments,
                 flow="plan",
                 reconciliation_mode="aggregate",

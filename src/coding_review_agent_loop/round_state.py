@@ -2432,6 +2432,38 @@ def _canonically_resolved_history_item_ids(
     return frozenset(resolved - set(active) - set(current_carried_ids))
 
 
+def _live_round_resolved_item_ids(
+    *,
+    prior_items: Sequence[UnresolvedReviewItem],
+    dispositions_by_item: Mapping[str, Sequence[ReviewItemDisposition]],
+    carried_item_ids: Sequence[str],
+) -> frozenset[str]:
+    """Return IDs the round still in progress canonically resolved (#874).
+
+    The posted-comment snapshot a loop holds is fetched before its review
+    turns, so replaying it through ``_canonically_resolved_history_item_ids``
+    can never see the round that is still running: the IDs it just cleared stay
+    active in that history and are excluded from the whitelist.  A turn that
+    runs after the round's dispositions were applied -- the plan revision --
+    therefore needs this in-process proof too.  The dispositions and the
+    post-round carried set are both authenticated in memory, and the rule is
+    the same one applied to recorded history: the reconciler dropped the item,
+    every disposition it received in this round was ``resolved``, and machine
+    obligations never count.
+    """
+    carried = set(carried_item_ids)
+    resolved: set[str] = set()
+    for item in prior_items:
+        if item.item_id in carried or _is_machine_obligation(item):
+            continue
+        dispositions = tuple(dispositions_by_item.get(item.item_id, ()))
+        if not dispositions:
+            continue
+        if all(disposition.disposition == "resolved" for disposition in dispositions):
+            resolved.add(item.item_id)
+    return frozenset(resolved)
+
+
 def _recover_unrecorded_pr_head_advance(
     records: Sequence[PostedRoundRecord],
     *,

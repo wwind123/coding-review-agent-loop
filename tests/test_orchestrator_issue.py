@@ -4416,6 +4416,185 @@ def test_round_resolved_history_ids_available_when_plan_ledger_is_complete():
     ) == ("item-1",)
 
 
+def test_post_round_resolved_history_ids_cover_the_round_still_in_progress():
+    # #874: the snapshot a round holds was fetched before its review turns, so
+    # it cannot record the dispositions that round just applied. The proof for
+    # the revision therefore also reads the round's in-process dispositions.
+    plan = "Current plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    blocking = UnresolvedReviewItem(
+        item_id="item-1", reviewer="OpenAI Codex", source_round=1,
+        text="Migration ordering is unspecified.", status="blocking",
+        source_status="blocking",
+    )
+    cleared = UnresolvedReviewItem(
+        item_id="item-2", reviewer="OpenAI Codex", source_round=1,
+        text="Rollback path is uncovered.", status="blocking",
+        source_status="blocking",
+    )
+    raised = _attach_round_metadata(
+        structured_plan_review(
+            state="blocking",
+            blocking_plan_issues=[blocking.text, cleared.text],
+        ),
+        PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Codex", round_number=1,
+            subject=_plan_subject(plan), new_items=(blocking, cleared), state="blocking",
+        ),
+    )
+    # Only round 1 is in the snapshot; round 2's reviewer comment is posted
+    # after it was fetched, exactly as the live loop sees it.
+    comments = [SimpleNamespace(body=raised)]
+    dispositions = {
+        "item-1": [ReviewItemDisposition("item-1", "OpenAI Codex", "blocking", "Still unspecified.")],
+        "item-2": [ReviewItemDisposition("item-2", "OpenAI Codex", "resolved")],
+    }
+
+    assert orchestrator_module._round_resolved_history_item_ids(
+        prior_unresolved_items=(blocking,),
+        comments=comments,
+        flow="plan",
+        reconciliation_mode="aggregate",
+        same_status="same-plan",
+    ) == ()
+    assert orchestrator_module._post_round_resolved_history_item_ids(
+        prior_unresolved_items=(blocking, cleared),
+        dispositions_by_item=dispositions,
+        carried_items=(blocking,),
+        comments=comments,
+        flow="plan",
+        reconciliation_mode="aggregate",
+        same_status="same-plan",
+    ) == ("item-2",)
+
+
+def test_post_round_resolved_history_ids_exclude_actively_disputed_and_carried_items():
+    # The whitelist stays fail-closed: a mixed verdict, a still-carried item and
+    # an undispositioned item never earn resolved-history proof.
+    carried = UnresolvedReviewItem(
+        item_id="item-1", reviewer="OpenAI Codex", source_round=1,
+        text="Still blocking.", status="blocking", source_status="blocking",
+    )
+    mixed = UnresolvedReviewItem(
+        item_id="item-2", reviewer="OpenAI Codex", source_round=1,
+        text="One reviewer still blocks.", status="blocking", source_status="blocking",
+    )
+    untouched = UnresolvedReviewItem(
+        item_id="item-3", reviewer="OpenAI Codex", source_round=1,
+        text="Nobody dispositioned this.", status="blocking", source_status="blocking",
+    )
+    dispositions = {
+        "item-1": [ReviewItemDisposition("item-1", "OpenAI Codex", "resolved")],
+        "item-2": [
+            ReviewItemDisposition("item-2", "OpenAI Codex", "resolved"),
+            ReviewItemDisposition("item-2", "Anthropic Claude", "blocking", "Not covered."),
+        ],
+    }
+
+    assert orchestrator_module._post_round_resolved_history_item_ids(
+        prior_unresolved_items=(carried, mixed, untouched),
+        dispositions_by_item=dispositions,
+        # item-1 survived reconciliation, so it is still carried.
+        carried_items=(carried,),
+        comments=[],
+        flow="plan",
+        reconciliation_mode="aggregate",
+        same_status="same-plan",
+    ) == ()
+
+
+def test_issue_loop_plan_revision_proof_covers_items_resolved_in_the_same_round(
+    tmp_path, monkeypatch
+):
+    # #874 orchestration regression: the initial issue context lacks the review
+    # record that resolves item-2, because that comment is posted during the
+    # round. The revision turn issued at the end of that round must still prove
+    # item-2 is resolved history.
+    revision_history_ids = []
+    revision_snapshot_sizes = []
+    snapshots = []
+    real_run_validated_agent = orchestrator_module._run_validated_agent
+
+    def run_validated_agent_spy(*args, **kwargs):
+        if kwargs.get("operation_description") == "plan revision":
+            revision_history_ids.append(
+                tuple(kwargs.get("repair_resolved_history_item_ids") or ())
+            )
+            revision_snapshot_sizes.append(
+                tuple(len(context.comments) for context in snapshots)
+            )
+        return real_run_validated_agent(*args, **kwargs)
+
+    monkeypatch.setattr(
+        orchestrator_module, "_run_validated_agent", run_validated_agent_spy
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def get_issue_context_spy(*args, **kwargs):
+        context = real_get_issue_context(*args, **kwargs)
+        snapshots.append(context)
+        return context
+
+    monkeypatch.setattr(
+        orchestrator_module, "get_issue_context", get_issue_context_spy
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_plan_state(
+                summary="Initial plan.", plan_steps=["Document migration ordering."]
+            ),
+            structured_plan_revision(
+                summary="Addressed both findings.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+            structured_plan_revision(
+                summary="Kept the still-blocking finding open.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                blocking_plan_issues=[
+                    "Document migration ordering.",
+                    "Cover the rollback path.",
+                ],
+            ),
+            structured_plan_review(
+                state="blocking",
+                summary="Rollback path is covered; migration ordering still is not.",
+                prior_plan_item_dispositions=[
+                    {
+                        "item_id": "item-1",
+                        "disposition": "blocking",
+                        "note": "Migration ordering is still unspecified.",
+                    },
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    # Both revisions saw only the empty pre-loop fetch, so the recorded history
+    # alone could not have supplied the item-2 proof.
+    assert revision_snapshot_sizes == [(0,), (0,)]
+    assert revision_history_ids[0] == ()
+    assert revision_history_ids[1] == ("item-2",)
+
+
 def test_issue_loop_plan_first_resumes_with_only_missing_reviewer_for_current_plan(tmp_path):
     current_plan = "Revised plan.\n- Add state reconstruction.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     coder_comment = _attach_round_metadata(
