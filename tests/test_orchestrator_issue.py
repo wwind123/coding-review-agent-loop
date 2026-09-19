@@ -4373,6 +4373,49 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
         for message in logged
     )
 
+def test_round_resolved_history_ids_available_when_plan_ledger_is_complete():
+    # #872 follow-up: a lossless semantic patch needs resolved-history proof in
+    # every ledger state, so the history is computed for complete rounds too.
+    old_plan = "Old plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    mid_plan = "Mid plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    old_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="OpenAI Codex",
+        source_round=1,
+        text="Old subject item.",
+        status="blocking",
+        source_status="blocking",
+    )
+    raised = _attach_round_metadata(
+        structured_plan_review(state="blocking", blocking_plan_issues=["Old subject item."]),
+        PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Codex", round_number=1,
+            subject=_plan_subject(old_plan), new_items=(old_item,), state="blocking",
+        ),
+    )
+    resolved = _attach_round_metadata(
+        structured_plan_review(
+            state="blocking",
+            prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ),
+        PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Codex", round_number=2,
+            subject=_plan_subject(mid_plan), prior_items=(old_item,),
+            dispositions=(ReviewItemDisposition("item-1", "OpenAI Codex", "resolved"),),
+            state="blocking",
+        ),
+    )
+    comments = [SimpleNamespace(body=raised), SimpleNamespace(body=resolved)]
+
+    assert orchestrator_module._round_resolved_history_item_ids(
+        prior_unresolved_items=(),
+        comments=comments,
+        flow="plan",
+        reconciliation_mode="aggregate",
+        same_status="same-plan",
+    ) == ("item-1",)
+
+
 def test_issue_loop_plan_first_resumes_with_only_missing_reviewer_for_current_plan(tmp_path):
     current_plan = "Revised plan.\n- Add state reconstruction.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     coder_comment = _attach_round_metadata(

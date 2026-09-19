@@ -4394,6 +4394,8 @@ def test_build_repair_prompt_includes_new_discuss_expected_kind_schemas(kind, fo
     assert field in prompt
 
 
+
+
 # --- #872: semantic plan_revision_patch disposition stripping -----------------
 
 from coding_review_agent_loop.orchestrator import _validate_plan_revision_patch_response
@@ -4414,6 +4416,42 @@ def _semantic_patch_text(dispositions):
         ],
     }
     return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+
+_SEMANTIC_PATCH_CARRIED_ITEM = UnresolvedReviewItem(
+    item_id="item-1",
+    reviewer="OpenAI Codex",
+    source_round=2,
+    text="The readiness gate must publish before the watchdog fires.",
+    status="blocking",
+)
+
+
+def _run_semantic_patch_revision(
+    tmp_path,
+    patch_text,
+    *,
+    history_ids=(),
+    ledger_incomplete=False,
+):
+    """Drive `_run_validated_agent` over a semantic patch; caller patches repair."""
+    runner = FakeRunner(claude_outputs=[patch_text])
+    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
+    return _run_validated_agent(
+        runner,
+        agent="claude",
+        config=config,
+        prompt="Revise the plan.",
+        marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+        validate=lambda text: _validate_plan_revision_patch_response(
+            text, unresolved_items=(_SEMANTIC_PATCH_CARRIED_ITEM,)
+        ),
+        use_repair=True,
+        repair_expected_kind="plan_revision_patch",
+        repair_allowed_prior_item_ids=("item-1",),
+        ledger_incomplete=ledger_incomplete,
+        repair_resolved_history_item_ids=history_ids,
+    )
 
 
 def test_strip_unknown_prior_item_dispositions_supports_semantic_patch():
@@ -4459,37 +4497,24 @@ def test_resolved_history_predicate_supports_semantic_patch():
     )
 
 
-def test_run_validated_agent_strips_resolved_echo_from_semantic_patch(tmp_path):
+@pytest.mark.parametrize("ledger_incomplete", [False, True])
+def test_run_validated_agent_strips_resolved_echo_from_semantic_patch(tmp_path, ledger_incomplete):
     # Regression for #872: the planner echoes items resolved in earlier rounds;
-    # repair cannot touch a patch, so the deterministic strip must apply.
-    carried = UnresolvedReviewItem(
-        item_id="item-1",
-        reviewer="OpenAI Codex",
-        source_round=2,
-        text="The readiness gate must publish before the watchdog fires.",
-        status="blocking",
-    )
+    # repair cannot touch a patch, so the deterministic strip must apply -- but
+    # only for IDs the authenticated round history proves resolved, in either
+    # ledger state.
     patch_text = _semantic_patch_text([
         {"item_id": "item-1", "disposition": "blocking", "note": "still open"},
         {"item_id": "item-2", "disposition": "resolved"},
         {"item_id": "item-3", "disposition": "resolved"},
     ])
-    runner = FakeRunner(claude_outputs=[patch_text])
-    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
     with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
-        response = _run_validated_agent(
-            runner,
-            agent="claude",
-            config=config,
-            prompt="Revise the plan.",
-            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-            validate=lambda text: _validate_plan_revision_patch_response(
-                text, unresolved_items=(carried,)
-            ),
-            use_repair=True,
-            repair_expected_kind="plan_revision_patch",
-            repair_allowed_prior_item_ids=("item-1",),
+        response = _run_semantic_patch_revision(
+            tmp_path,
+            patch_text,
+            history_ids=("item-2", "item-3"),
+            ledger_incomplete=ledger_incomplete,
         )
         repair_mock.assert_not_called()
 
@@ -4500,3 +4525,63 @@ def test_run_validated_agent_strips_resolved_echo_from_semantic_patch(tmp_path):
     assert payload["operations"] == [
         {"op": "replace", "field": "summary", "value": "Revised plan summary."}
     ]
+
+    # The accepted patch must be identical to the one the planner would have
+    # produced without the stray resolved-item entries.
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as clean_repair_mock:
+        clean_response = _run_semantic_patch_revision(
+            tmp_path,
+            _semantic_patch_text([
+                {"item_id": "item-1", "disposition": "blocking", "note": "still open"}
+            ]),
+            history_ids=("item-2", "item-3"),
+            ledger_incomplete=ledger_incomplete,
+        )
+        clean_repair_mock.assert_not_called()
+    clean_payload, _ = json.JSONDecoder().raw_decode(clean_response.text.lstrip())
+    assert payload == clean_payload
+
+
+@pytest.mark.parametrize("ledger_incomplete", [False, True])
+def test_run_validated_agent_semantic_patch_unknown_id_absent_from_history_fails_closed(
+    tmp_path, ledger_incomplete
+):
+    # A fabricated ID has no resolved history, so the strip must not fire even
+    # when the ledger is complete (#872 follow-up).
+    patch_text = _semantic_patch_text([
+        {"item_id": "item-1", "disposition": "blocking", "note": "still open"},
+        {"item_id": "item-9", "disposition": "resolved"},
+    ])
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=None
+    ) as repair_mock:
+        with pytest.raises(
+            AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \['item-9'\]"
+        ):
+            _run_semantic_patch_revision(
+                tmp_path,
+                patch_text,
+                history_ids=("item-2",),
+                ledger_incomplete=ledger_incomplete,
+            )
+        if ledger_incomplete:
+            repair_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("active", ["blocking", "same-plan"])
+def test_run_validated_agent_semantic_patch_active_disposition_fails_closed(tmp_path, active):
+    # An active disposition of a non-carried item is a real signal, never a
+    # no-op echo, so a complete ledger must keep it fatal.
+    patch_text = _semantic_patch_text([
+        {"item_id": "item-1", "disposition": "blocking", "note": "still open"},
+        {"item_id": "item-3", "disposition": active, "note": "still broken"},
+    ])
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None):
+        with pytest.raises(
+            AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \['item-3'\]"
+        ):
+            _run_semantic_patch_revision(
+                tmp_path, patch_text, history_ids=("item-2", "item-3")
+            )

@@ -2824,6 +2824,15 @@ def _capture_terminal_plan_repair_rejection(
     return None
 
 
+def _history_strip_reason(ledger_incomplete: bool) -> str:
+    """Log phrasing for why a history-proven strip was allowed."""
+    return (
+        "despite incomplete ledger"
+        if ledger_incomplete
+        else "under the lossless semantic-patch history proof"
+    )
+
+
 def _history_strip_allowed(
     text: str,
     exc: UnknownPriorItemDispositionError,
@@ -3556,6 +3565,13 @@ def _run_validated_agent(
                                 model_used=result.model_used,
                                 **_response_identity_fields(result),
                             )
+                # A semantic patch can only ever be recovered by the deterministic
+                # strip (repair must preserve it byte-for-byte), so it always has to
+                # prove that every removed ID is canonically resolved history (#872).
+                # An incomplete ledger demands the same proof for every kind (#862).
+                strip_requires_history_proof = (
+                    ledger_incomplete or repair_expected_kind == "plan_revision_patch"
+                )
                 normalized: str | None = None
                 if (
                     use_repair
@@ -3582,7 +3598,7 @@ def _run_validated_agent(
                             # Only apply when the original error was structural; when it was
                             # already UnknownPriorItemDispositionError, block 2 handles it.
                             normalized_history_strip = (
-                                ledger_incomplete
+                                strip_requires_history_proof
                                 and _history_strip_allowed(
                                     normalized,
                                     norm_exc,
@@ -3592,7 +3608,10 @@ def _run_validated_agent(
                             )
                             if (
                                 not isinstance(exc, UnknownPriorItemDispositionError)
-                                and (not ledger_incomplete or normalized_history_strip)
+                                and (
+                                    not strip_requires_history_proof
+                                    or normalized_history_strip
+                                )
                                 and repair_expected_kind in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}
                             ):
                                 stripped_from_normalized = strip_unknown_prior_item_dispositions(
@@ -3651,7 +3670,7 @@ def _run_validated_agent(
                                                 f"{agent_name}: combined envelope normalization and "
                                                 f"deterministic strip removed canonically resolved "
                                                 f"historical prior-item disposition ID(s) {removed} "
-                                                f"despite incomplete ledger; "
+                                                f"{_history_strip_reason(ledger_incomplete)}; "
                                                 f"allowed carried prior IDs: {allowed_str}",
                                             )
                                         else:
@@ -3690,7 +3709,7 @@ def _run_validated_agent(
                                 **_response_identity_fields(result),
                             )
                 history_strip = (
-                    ledger_incomplete
+                    strip_requires_history_proof
                     and isinstance(exc, UnknownPriorItemDispositionError)
                     and _history_strip_allowed(
                         text,
@@ -3704,7 +3723,7 @@ def _run_validated_agent(
                     and not public_text_is_transient
                     and not response_failure_is_unsupported
                     and isinstance(exc, UnknownPriorItemDispositionError)
-                    and (not ledger_incomplete or history_strip)
+                    and (not strip_requires_history_proof or history_strip)
                     and repair_expected_kind in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}
                 ):
                     stripped_text = strip_unknown_prior_item_dispositions(
@@ -3761,8 +3780,9 @@ def _run_validated_agent(
                                 log(
                                     config,
                                     f"{agent_name}: removed canonically resolved historical "
-                                    f"prior-item disposition ID(s) {removed} despite incomplete "
-                                    f"ledger; allowed carried prior IDs: {allowed_str}",
+                                    f"prior-item disposition ID(s) {removed} "
+                                    f"{_history_strip_reason(ledger_incomplete)}; "
+                                    f"allowed carried prior IDs: {allowed_str}",
                                 )
                             else:
                                 log(
@@ -7391,7 +7411,6 @@ def _round_ledger_may_be_incomplete(
 
 def _round_resolved_history_item_ids(
     *,
-    ledger_incomplete: bool,
     prior_unresolved_items: Sequence[UnresolvedReviewItem],
     comments: Sequence[object],
     flow: str,
@@ -7400,13 +7419,12 @@ def _round_resolved_history_item_ids(
 ) -> tuple[str, ...]:
     """IDs whose recorded history proves canonical resolution (#862).
 
-    Only needed when the round ledger may be incomplete: it lets the
-    deterministic strip remove a reviewer's no-op ``resolved`` disposition of
-    an item cleared in an earlier round.  Undecodable metadata yields no
-    history, so recovery stays fail-closed.
+    It lets the deterministic strip remove a reviewer's no-op ``resolved``
+    disposition of an item cleared in an earlier round.  Computed for every
+    round, not only incomplete-ledger ones, because a lossless semantic patch
+    needs the same proof even when the ledger is complete (#872).  Undecodable
+    metadata yields no history, so recovery stays fail-closed.
     """
-    if not ledger_incomplete:
-        return ()
     try:
         records = _extract_round_metadata_records(comments, flow=flow)
     except AgentLoopError:
@@ -8775,7 +8793,6 @@ def _run_plan_first_loop(
             current_subject=current_plan_subject,
         )
         round_resolved_history_item_ids = _round_resolved_history_item_ids(
-            ledger_incomplete=round_ledger_incomplete,
             prior_unresolved_items=prior_unresolved_items,
             comments=issue_context.comments,
             flow="plan",
@@ -14257,7 +14274,6 @@ def run_pr_loop(
                 current_subject=current_pr_subject,
             )
             round_resolved_history_item_ids = _round_resolved_history_item_ids(
-                ledger_incomplete=round_ledger_incomplete,
                 prior_unresolved_items=prior_unresolved_items,
                 comments=pr_comments,
                 flow="pr",
