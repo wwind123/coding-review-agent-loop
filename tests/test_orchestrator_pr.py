@@ -9967,6 +9967,17 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
             invocation_applied_label=True,
         ),
     )
+    posted_comment_calls = []
+    original_run = runner.run
+
+    def capture_posted_comment(args, *, cwd, **kwargs):
+        command = [str(arg) for arg in args]
+        if command[:4] == ["gh", "pr", "comment", "55"]:
+            body_path = Path(command[command.index("--body-file") + 1])
+            posted_comment_calls.append((command, body_path.read_text(encoding="utf-8")))
+        return original_run(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(runner, "run", capture_posted_comment)
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
 
     with pytest.raises(
@@ -9984,29 +9995,20 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
         "repos/OWNER/REPO/issues/55/labels/agent-loop-managed",
     ]
     commands = [command for command, _cwd in runner.commands]
-    comment_commands = [
-        (index, command)
-        for index, command in enumerate(commands)
-        if command[:4] == ["gh", "pr", "comment", "55"]
-    ]
     release_index = commands.index(release_command)
-    human_decision_comments = [
-        comment
-        for comment in runner.pr_payload["comments"]
-        if "## Human decision required" in comment["body"]
+    human_decision_comment_calls = [
+        (command, body)
+        for command, body in posted_comment_calls
+        if "## Human decision required" in body
     ]
-    assert len(human_decision_comments) == 1
-    human_decision_comment = human_decision_comments[0]["body"]
-    human_decision_comment_ordinal = next(
-        ordinal
-        for ordinal, comment in enumerate(runner.pr_payload["comments"])
-        if comment is human_decision_comments[0]
-    )
-    comment_index, comment_command = comment_commands[human_decision_comment_ordinal]
+    assert len(human_decision_comment_calls) == 1
+    comment_command, human_decision_comment = human_decision_comment_calls[0]
+    assert comment_command[:4] == ["gh", "pr", "comment", "55"]
     assert "--body-file" in comment_command
     assert "Reviewer did not resolve 1 disputed item(s)" in human_decision_comment
     assert "Update/evidence: Codex: I checked and the pricing is still wrong." in human_decision_comment
     assert "-- Human Reviewer" in human_decision_comment
+    comment_index = commands.index(comment_command)
     assert comment_index < release_index
 
 
