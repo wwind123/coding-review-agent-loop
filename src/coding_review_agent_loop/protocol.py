@@ -550,6 +550,8 @@ def semantic_risk_claim_schema_text() -> str:
         "identifiers; tests run outside the wrapper cannot verify a row (list "
         "them in `tests_run` only), and with no selector you omit the claim, so "
         "the row stays unverified, rather than inventing one. "
+        "One selector may appear in several rows when that run executed each "
+        "row's tests; list a selector at most once within a row. "
         "Every fact key ("
         + ", ".join(f"`{key}`" for key in SEMANTIC_RISK_CLAIM_FACT_KEYS)
         + ") must be present and non-empty for the row to verify; a missing, "
@@ -1711,7 +1713,6 @@ def derive_risk_test_matrix_evidence(
         if row.applicability in {"applicable", "required"}
     }
     claim_by_row: dict[str, SemanticRiskCoverageClaim] = {}
-    selected_refs: set[str] = set()
     for claim in claim_values:
         if not isinstance(claim, SemanticRiskCoverageClaim):
             raise AgentLoopError("semantic risk coverage contains an invalid claim type")
@@ -1724,12 +1725,12 @@ def derive_risk_test_matrix_evidence(
                 f"semantic risk coverage contains duplicate claim for row `{claim.row_id}`"
             )
         claim_by_row[claim.row_id] = claim
-        for execution_ref in claim.execution_refs:
-            if execution_ref in selected_refs:
-                raise AgentLoopError(
-                    f"semantic risk coverage selects execution_ref `{execution_ref}` more than once"
-                )
-            selected_refs.add(execution_ref)
+        # A shared run may evidence several rows (#865); only reject repeats
+        # within one row's selection.
+        if len(set(claim.execution_refs)) != len(claim.execution_refs):
+            raise AgentLoopError(
+                f"semantic risk coverage for row `{claim.row_id}` selects an execution_ref more than once"
+            )
     diagnostics: list[PostAuthClaimDiagnostic] = []
     # A canonical evidence builder is a post-authentication operation. Keep
     # these parameters optional for historical/unit callers, but never let an
@@ -3221,7 +3222,10 @@ def _parse_semantic_risk_coverage_claims(
     or are owned elsewhere: unknown keys; invalid, unapproved, or duplicate
     row IDs; a missing ``execution_refs`` key or an empty list (#855); more
     than eight refs, non-string or blank refs, or refs over the hard cap;
-    duplicate admissible selectors; catalog collisions; in-catalog selectors
+    an admissible selector repeated within one row (#865: the same
+    admissible selector may be cited by several rows, because one wrapper
+    run routinely covers several rows and each row still verifies on its own
+    facts); catalog collisions; in-catalog selectors
     that are not passing parent-observed observations, or whose supplied
     launch-integrity state is failing or unknown (any of wrapper bootstrap,
     inner exec, or suite start not authoritative) -- these are real broker
@@ -3250,7 +3254,6 @@ def _parse_semantic_risk_coverage_claims(
             catalog_by_ref[execution_ref] = observation
     result: list[SemanticRiskCoverageClaim] = []
     seen_rows: set[str] = set()
-    seen_refs: set[str] = set()
     for index, raw_claim in enumerate(value):
         claim_context = f"{context}[{index}]"
         payload = _expect_object(raw_claim, context=claim_context)
@@ -3283,6 +3286,9 @@ def _parse_semantic_risk_coverage_claims(
             raise AgentLoopError(f"{claim_context}.execution_refs must contain at least one selector.")
         admissible_refs: list[str] = []
         dropped_refs: list[str] = []
+        # One passing run may cover several rows (#865), so selectors are
+        # unique within a claim, not across claims.
+        seen_refs: set[str] = set()
         for ref in raw_refs:
             if execution_catalog is None:
                 if len(ref.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES:
@@ -3297,7 +3303,7 @@ def _parse_semantic_risk_coverage_claims(
                 continue
             if ref in seen_refs:
                 raise AgentLoopError(
-                    f"{context} selects execution_ref `{ref}` more than once or across conflicting rows."
+                    f"{claim_context}.execution_refs selects `{ref}` more than once."
                 )
             seen_refs.add(ref)
             admissible_refs.append(ref)

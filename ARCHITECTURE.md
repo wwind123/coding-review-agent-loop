@@ -167,9 +167,11 @@ Format and selector defects receive bounded semantic-only correction. A
 selector outside the current-turn catalog (a command string, a cross-turn
 handle, or oversize text up to a hard cap) is a claim defect, not an envelope
 defect: it is dropped with a caveat before authentication and becomes an
-`unknown-execution-ref` diagnostic afterwards. Authority violations stay fatal:
-unknown keys, bad row IDs, empty selector lists, duplicate admissible
-selectors, catalog collisions, in-catalog selectors that are non-passing or
+`unknown-execution-ref` diagnostic afterwards. One admissible selector may be
+cited by several rows, since one wrapper run routinely covers several rows;
+each row still verifies only on its own facts. Authority violations stay fatal:
+unknown keys, bad row IDs, empty selector lists, an admissible selector
+repeated within one row, catalog collisions, in-catalog selectors that are non-passing or
 whose launch integrity is failing or unknown (real broker handles, so
 selecting one is an authority decision), and legacy canonical fields. Repair
 does not generate matrix identities, canonical rows, receipt IDs, mappings,

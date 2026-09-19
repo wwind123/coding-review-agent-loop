@@ -2581,15 +2581,35 @@ def test_semantic_matrix_claim_catalog_collision_still_rejects():
         )
 
 
-def test_semantic_matrix_claim_duplicate_admissible_selector_across_rows_rejects():
-    with pytest.raises(AgentLoopError, match="more than once"):
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claims_share_one_admissible_selector_across_rows(kind):
+    # Regression for #865: one wrapper run covering several rows is valid
+    # evidence for each of them and must not reject the envelope.
+    catalog = [
+        *_ADMISSIBLE_CATALOG,
+        {"execution_ref": "turn:observation-2", "outcome": "passed", "provenance": "parent-observed"},
+    ]
+    parsed = _validate_claims_envelope(
+        kind,
+        [
+            {"row_id": "row-1", "execution_refs": ["turn:observation-1"]},
+            {"row_id": "row-2", "execution_refs": ["turn:observation-1", "turn:observation-2"]},
+        ],
+        row_ids=("row-1", "row-2"),
+        catalog=catalog,
+    )
+
+    first, second = parsed.risk_test_matrix_claims.claims
+    assert first.execution_refs == ("turn:observation-1",)
+    assert second.execution_refs == ("turn:observation-1", "turn:observation-2")
+
+
+def test_semantic_matrix_claim_duplicate_selector_within_one_row_rejects():
+    with pytest.raises(AgentLoopError, match=r"\[0\]\.execution_refs selects .* more than once"):
         _validate_claims_envelope(
             "issue_implementation",
-            [
-                {"row_id": "row-1", "execution_refs": ["turn:observation-1"]},
-                {"row_id": "row-2", "execution_refs": ["turn:observation-1"]},
-            ],
-            row_ids=("row-1", "row-2"),
+            [{"row_id": "row-1", "execution_refs": ["turn:observation-1", "turn:observation-1"]}],
+            row_ids=("row-1",),
         )
 
 

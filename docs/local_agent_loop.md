@@ -412,6 +412,11 @@ ref yields an `unknown-execution-ref` diagnostic, the row is unverified with no
 citations, and the same single correction continuation runs. The same dropped
 command string may appear in several rows.
 
+One admissible selector may also appear in several rows (#865): a single
+wrapper run commonly executes the tests for more than one row, and each row is
+still verified only on its own semantic facts and the shared passing receipt.
+Within one row a selector may be listed at most once.
+
 These cases still reject the envelope, because they forge or corrupt execution
 authority, are unbounded input, or are owned elsewhere:
 
@@ -420,7 +425,7 @@ authority, are unbounded input, or are owned elsewhere:
 - a missing `execution_refs` key or an empty list (#855);
 - more than eight refs, non-string or blank refs, or a ref over the
   16,384-byte hard cap;
-- an admissible selector chosen twice, or a colliding catalog;
+- an admissible selector listed twice within one row, or a colliding catalog;
 - an in-catalog selector that is not a passing parent-observed observation, or
   whose supplied launch-integrity state is failing or unknown (wrapper
   bootstrap, inner exec, and suite start must all be authoritative). It is a

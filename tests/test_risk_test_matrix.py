@@ -147,6 +147,45 @@ def test_derived_matrix_evidence_is_complete_and_selector_citations_are_tool_own
     assert "execution_ref" not in result.evidence.to_payload()["rows"][0]["evidence_citations"][0]
 
 
+def test_one_shared_selector_verifies_every_row_it_covers() -> None:
+    # Regression for #865: a single passing wrapper run may evidence several rows.
+    matrix = parse_risk_test_matrix({
+        **_matrix(),
+        "rows": [_row("row-first"), _row("row-second")],
+    })
+    observation = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-1")
+    claims = SemanticRiskCoverageClaims(tuple(
+        SemanticRiskCoverageClaim(
+            row_id=row_id,
+            execution_refs=("invocation:observation-1",),
+            test_identifiers=(f"test_{row_id}",),
+            test_locations=(f"tests/test_protocol.py::test_{row_id}",),
+            workflow_path_claim="The shared run covered this workflow path.",
+            outcome_assertions=("The row's test passed.",),
+            forbidden_effect_assertions=("No unauthorized evidence was accepted.",),
+        )
+        for row_id in ("row-first", "row-second")
+    ))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert [row.status for row in result.evidence.rows] == ["verified", "verified"]
+    assert [row.evidence_citations[0].receipt_id for row in result.evidence.rows] == [
+        "receipt-1", "receipt-1"
+    ]
+    assert not result.diagnostics
+
+
 @pytest.mark.parametrize(
     "field",
     [
