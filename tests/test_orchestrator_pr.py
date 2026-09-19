@@ -11325,6 +11325,76 @@ def test_840_operator_override_supersedes_blocking_premature_completion(tmp_path
     assert operator_records
 
 
+@pytest.mark.parametrize("operator", [False, True])
+def test_840_stale_identity_premature_blocking_completion_is_not_silently_dropped(tmp_path, operator):
+    """Row premature-blocking-completion-operator-recovery with a stale resume identity.
+
+    A signed requirement surfaced after the premature blocking review makes
+    that record ineligible for resume.  It must still reach the diagnostic
+    (without the flag) or the audited, context-preserving supersession (with
+    it) instead of being dropped before panel classification.
+    """
+    runner = _seed_premature_full_board_round(
+        tmp_path,
+        gemini_output=_staged_review(
+            reviewer="Google Gemini",
+            state="blocking",
+            blocking_items=[{"text": "premature cache race", "fix_scope": ["src/worker.py"]}],
+        ),
+    )
+    runner.pr_payload["comments"].append(
+        {
+            "author": {"login": "maintainer"},
+            "createdAt": "2026-05-18T10:00:00Z",
+            "url": "https://github.com/OWNER/REPO/pull/77#issuecomment-840",
+            "body": "Keep the worker cleanup idempotent.\n\n-- Human Reviewer",
+        }
+    )
+    premature = next(
+        record
+        for record in orchestrator._extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
+        )
+        if record.metadata.agent == "Gemini"
+    )
+    from coding_review_agent_loop.github import _parse_pr_human_requirements
+
+    requirements = _parse_pr_human_requirements(runner.pr_payload)
+    assert requirements
+    assert not orchestrator._resumed_pr_reviewer_matches_requirements(premature, requirements)
+    seeded_agents = len(_agent_sequence(runner))
+    seeded = len(runner.comments)
+
+    if not operator:
+        with pytest.raises(orchestrator.PrePanelSafetyError, match="--pr-review-force-full"):
+            run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
+        assert len(_agent_sequence(runner)) == seeded_agents
+        new_comments = runner.comments[seeded:]
+        assert len(new_comments) == 1
+        assert new_comments[0].startswith("PR review scheduling diagnostic (round 1): pre-panel safety")
+        assert "Gemini (round 1, head abc123, state blocking; items: item-1)" in new_comments[0]
+        return
+
+    runner.codex_outputs.append(_staged_review(reviewer="OpenAI Codex", resolved=True))
+    runner.gemini_outputs.append(_staged_review(reviewer="Google Gemini", resolved=True))
+    runner.antigravity_outputs.append(_staged_review(reviewer="Antigravity", resolved=True))
+
+    assert run_pr_loop(
+        runner, pr_number=77, config=_staged_config(tmp_path, pr_review_force_full=True)
+    ) == 0
+
+    assert sorted(_agent_sequence(runner)[seeded_agents:]) == ["agy", "codex", "gemini"]
+    opening = _comment_index(runner, lambda c: c.startswith("PR review scheduling audit:"), start=seeded)
+    opening_text = runner.comments[opening]
+    assert "force-full: True (source: operator)" in opening_text
+    assert "Superseded premature panel reviews" in opening_text
+    assert "Gemini (round 1, head abc123, state blocking; items: item-1)" in opening_text
+    assert _comment_index(runner, lambda c: "Google Gemini review" in c, start=seeded) > opening
+    gemini_prompt = [command[-1] for command, _cwd in runner.commands if command[:1] == ["gemini"]][-1]
+    assert "Superseded pre-panel review context (non-authoritative; context only):" in gemini_prompt
+    assert "- Earlier claim: premature cache race" in gemini_prompt
+
+
 def test_840_operator_force_full_is_durable_across_resume(tmp_path):
     """Row operator-force-full: the latch survives a resume that omits the flag."""
     runner = FakeRunner(

@@ -14100,9 +14100,13 @@ def run_pr_loop(
                 human_requirements
             )
             approved_review_outputs: list[tuple[str, str]] = []
-            resumed_by_name = {
+            completed_by_name = {
                 record.metadata.agent: record
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
+            }
+            resumed_by_name = {
+                name: record
+                for name, record in completed_by_name.items()
                 if _resumed_pr_reviewer_matches_requirements(
                     record,
                     human_requirements,
@@ -14140,7 +14144,12 @@ def run_pr_loop(
                     )
                 assert panel_evidence is not None
                 unqualified_blocking: list[PostedRoundRecord] = []
-                for resumed_name, resumed_candidate in list(resumed_by_name.items()):
+                # Classify every completed review of the interrupted round, not
+                # only the resume-eligible ones: a premature blocking review
+                # whose requirement, plan, or acquisition identity is now stale
+                # must still reach the diagnostic or the audited supersession
+                # rather than being dropped silently.
+                for resumed_name, resumed_candidate in completed_by_name.items():
                     if _pr_record_is_panel_qualified(
                         resumed_candidate,
                         panel_evidence,
@@ -14150,7 +14159,7 @@ def run_pr_loop(
                         continue
                     # Not resumed, not a summary, not an approval, never early
                     # published: the reviewer needs a fresh post-opening turn.
-                    del resumed_by_name[resumed_name]
+                    resumed_by_name.pop(resumed_name, None)
                     if (
                         resumed_candidate.metadata.state == "approved"
                         and not resumed_candidate.metadata.new_items
