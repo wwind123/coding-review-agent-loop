@@ -154,6 +154,87 @@ def _sidecar(payload: Mapping[str, object]) -> TrustedBody:
     )
 
 
+# Visible sidecar labels (#842).  The label is a pure function of trusted
+# orchestrator vocabulary so retries reproduce byte-identical bodies; it sits
+# outside the unchanged hidden marker and never enters the payload.
+_SIDECAR_LABEL_MAX_CHARS = 300
+_SIDECAR_KIND_WORDING = {
+    "plan": ("plan attachment", "plan comment"),
+    "plan-review": ("plan review attachment", "plan review comment"),
+    "review": ("review attachment", "review comment"),
+    "round": ("attachment", "agent-loop comment"),
+}
+_REVIEW_FLOWS = frozenset(
+    {
+        "pr",
+        "managed-pr",
+        "approved",
+        "approved-plan-implementation",
+        "direct",
+        "issue-implementation",
+    }
+)
+
+
+def _sidecar_kind(metadata: Mapping[str, object] | None) -> str:
+    """Map authenticated round metadata to label wording; unknown -> neutral."""
+    if not isinstance(metadata, Mapping):
+        return "round"
+    flow = metadata.get("flow")
+    role = metadata.get("role")
+    if not isinstance(flow, str) or not isinstance(role, str):
+        return "round"
+    if flow == "plan" and role == "coder":
+        return "plan"
+    if flow == "plan" and role == "reviewer":
+        return "plan-review"
+    if flow in _REVIEW_FLOWS and role == "reviewer":
+        return "review"
+    return "round"
+
+
+def _sidecar_label(*, kind: str, field: str, position: int, total: int) -> str:
+    attachment, target = _SIDECAR_KIND_WORDING.get(kind, _SIDECAR_KIND_WORDING["round"])
+    if field not in _SPILL_FIELDS:
+        field = "metadata"
+    label = (
+        f"Agent-loop {attachment} {position}/{total} "
+        f"(machine-readable overflow: {field}). "
+        f"Not an agent response; see the following {target}."
+    )
+    if len(label) > _SIDECAR_LABEL_MAX_CHARS or not label.isascii():
+        raise AgentLoopError("Round transport sidecar label exceeds its budget.")
+    return label
+
+
+def _sidecar_field(sidecar: TrustedBody) -> str:
+    match = ROUND_TRANSPORT_SIDECAR_RE.search(str(sidecar))
+    try:
+        field = json.loads(_unb64(match.group("payload")).decode())["field"] if match else ""
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        field = ""
+    return field if isinstance(field, str) else ""
+
+
+def _label_sidecars(
+    sidecars: Sequence[TrustedBody], kind: str
+) -> list[TrustedBody]:
+    """Prefix each marker-only sidecar with its label, numbered in posting order."""
+    total = len(sidecars)
+    labeled = []
+    for position, sidecar in enumerate(sidecars, start=1):
+        label = _sidecar_label(
+            kind=kind, field=_sidecar_field(sidecar), position=position, total=total
+        )
+        labeled.append(
+            TrustedBody.canonical(
+                f"{label}\n\n{sidecar}",
+                expected_tokens=("AGENT_LOOP_SIDECAR",),
+            )
+        )
+    return labeled
+
+
 def _prepare_execution_recommendation_transport(
     body_text: str,
 ) -> tuple[str, list[TrustedBody], tuple[int, int, str] | None]:
@@ -616,7 +697,7 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
                 raise AgentLoopError(
                     f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters after execution sidecar spill."
                 )
-            return (*sidecars, trusted_anchor)
+            return (*_label_sidecars(sidecars, "round"), trusted_anchor)
         # Preserve the caller's authorization when no transport rewrite was
         # needed. Re-scanning this same text would authorize markers that the
         # caller did not authorize at composition time.
@@ -625,6 +706,7 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
     # Resume reads the last marker when a legacy comment contains more than one.
     match = matches[-1]
     payload = decode_mapping(match.group("payload"))
+    kind = _sidecar_kind(payload)
     sidecars = list(sidecars)
     anchor_id = hashlib.sha256(body_text.encode()).hexdigest()[:24]
 
@@ -693,6 +775,7 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
                 )
             )
 
+    sidecars = _label_sidecars(sidecars, kind)
     anchor = render_anchor(payload)
     if len(anchor) > MAX_GITHUB_BODY_CHARS:
         raise AgentLoopError(

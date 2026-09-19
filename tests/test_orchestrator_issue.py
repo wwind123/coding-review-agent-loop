@@ -69,7 +69,7 @@ from coding_review_agent_loop.prompts import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
 )
 import coding_review_agent_loop.test_runtime as runtime
-from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE
+from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE, TrustedBody
 from coding_review_agent_loop.protocol import (
     EXECUTION_DISPOSITION_DIRECT,
     EXECUTION_DISPOSITION_PLANNING,
@@ -7525,3 +7525,164 @@ def test_task_and_pr_followup_salvage_scopes_post_no_github_comment(tmp_path):
 
     assert runner.comments == []
     assert runner.issue_comments == []
+
+
+# --- Visible sidecar labels at the issue posting seams (#842) ----------------
+
+
+class _SidecarPostingRunner:
+    """Record posted bodies; echo REST bodies back (optionally altered)."""
+
+    def __init__(self, *, alter_sidecar_label: bool = False) -> None:
+        self.bodies: list[str] = []
+        self.alter_sidecar_label = alter_sidecar_label
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        from pathlib import Path
+
+        if "--body-file" in args:
+            self.bodies.append(Path(args[args.index("--body-file") + 1]).read_text())
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        assert input_text is not None
+        body = json.loads(input_text)["body"]
+        self.bodies.append(body)
+        returned = body
+        if self.alter_sidecar_label and "AGENT_LOOP_SIDECAR" in body:
+            returned = body.replace("Agent-loop plan attachment", "Agent-loop attachment", 1)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "id": len(self.bodies),
+                    "body": returned,
+                    "created_at": "2026-09-19T00:00:00Z",
+                    "user": {"login": "agent-bot", "id": 7},
+                }
+            ),
+            stderr="",
+        )
+
+
+def _sidecar_seam_config():
+    return SimpleNamespace(quiet=True, dry_run=False, gh_cmd="gh", repo="owner/repo")
+
+
+def _oversized_round_body(flow: str, role: str) -> TrustedBody:
+    import base64
+    import os
+
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+
+    large = base64.urlsafe_b64encode(os.urandom(70_000)).decode("ascii")
+    field = "canonical_plan" if flow == "plan" and role == "coder" else "canonical_reviewer_response"
+    text = _attach_round_metadata(
+        "Visible round response",
+        PostedRoundMetadata(
+            flow=flow,
+            role=role,
+            agent="codex",
+            round_number=1,
+            subject="sidecar-label-seam",
+            **{field: large},
+        ),
+    )
+    return TrustedBody.canonical(text, expected_tokens=("AGENT_LOOP_META",))
+
+
+def test_verified_plan_round_posts_labeled_sidecars_and_accepts_exact_readback(monkeypatch):
+    import coding_review_agent_loop.github as github_module
+    from coding_review_agent_loop.round_transport import is_round_transport_sidecar
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    runner = _SidecarPostingRunner()
+
+    posted = github_module.post_verified_trusted_issue_round_comment(
+        runner,
+        config=_sidecar_seam_config(),
+        issue_number=842,
+        body=_oversized_round_body("plan", "coder"),
+        expected_author_login="agent-bot",
+        expected_author_id=7,
+    )
+
+    sidecars = runner.bodies[:-1]
+    assert sidecars
+    for position, body in enumerate(sidecars, start=1):
+        assert is_round_transport_sidecar(body)
+        assert body.startswith(f"Agent-loop plan attachment {position}/{len(sidecars)} ")
+        assert "see the following plan comment." in body
+    assert posted.body == runner.bodies[-1]
+    assert not is_round_transport_sidecar(posted.body)
+
+
+def test_verified_plan_round_rejects_readback_with_altered_sidecar_label(monkeypatch):
+    import coding_review_agent_loop.github as github_module
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    runner = _SidecarPostingRunner(alter_sidecar_label=True)
+
+    with pytest.raises(AgentLoopError, match="returned a different body"):
+        github_module.post_verified_trusted_issue_round_comment(
+            runner,
+            config=_sidecar_seam_config(),
+            issue_number=842,
+            body=_oversized_round_body("plan", "coder"),
+            expected_author_login="agent-bot",
+            expected_author_id=7,
+        )
+    assert len(runner.bodies) == 1
+
+
+@pytest.mark.parametrize("role", ["debater", "summary"])
+def test_discuss_round_sidecars_posted_to_issue_use_neutral_wording(monkeypatch, role):
+    import coding_review_agent_loop.github as github_module
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    runner = _SidecarPostingRunner()
+
+    github_module.post_issue_comment(
+        runner,
+        config=_sidecar_seam_config(),
+        issue_number=842,
+        body=_oversized_round_body("discuss", role),
+    )
+
+    sidecars = runner.bodies[:-1]
+    assert sidecars
+    for body in sidecars:
+        assert body.startswith("Agent-loop attachment ")
+        assert "see the following agent-loop comment." in body
+        assert "plan attachment" not in body and "review attachment" not in body
+
+
+def test_rest_recovery_merges_labeled_sidecars_missing_from_projection(monkeypatch):
+    import coding_review_agent_loop.github as github_module
+    from coding_review_agent_loop.round_transport import prepare_round_comment
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    prepared = [str(item) for item in prepare_round_comment(_oversized_round_body("plan", "coder"))]
+    sidecars = prepared[:-1]
+    projection = tuple(
+        IssueComment(author="human", created_at=f"2026-09-19T00:{index // 60:02d}:{index % 60:02d}Z", body=f"note {index}")
+        for index in range(100)
+    )
+    rest_page_1 = [
+        {"id": index + 1, "body": comment.body, "created_at": comment.created_at, "user": {"login": "human", "id": 3}}
+        for index, comment in enumerate(projection)
+    ]
+    rest_page_2 = [
+        {"id": 1000 + index, "body": body, "created_at": "2026-09-19T01:00:00Z", "user": {"login": "agent-bot", "id": 7}}
+        for index, body in enumerate(sidecars)
+    ]
+
+    class _RestRunner:
+        def run(self, args, *, cwd, input_text=None, check=True, env=None):
+            page = rest_page_1 if args[-1].endswith("page=1") else rest_page_2
+            return SimpleNamespace(returncode=0, stdout=json.dumps(page), stderr="")
+
+    merged = github_module._merge_issue_comment_transport_identity(
+        _RestRunner(), config=_sidecar_seam_config(), issue_number=842, comments=projection
+    )
+
+    recovered = [comment for comment in merged if comment.comment_id and comment.comment_id >= 1000]
+    assert [comment.body for comment in recovered] == sidecars

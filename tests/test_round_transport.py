@@ -1456,3 +1456,288 @@ def test_scheduler_force_full_source_roundtrips_and_fails_closed() -> None:
     assert legacy_decoded.scheduler_metadata_status == "valid"
     assert legacy_decoded.scheduler_force_full is True
     assert legacy_decoded.scheduler_force_full_source is None
+
+
+# --- Visible sidecar labels (#842) -------------------------------------------
+
+
+def _sidecar_payload(body: object) -> dict[str, object]:
+    match = transport.ROUND_TRANSPORT_SIDECAR_RE.search(str(body))
+    assert match is not None
+    return json.loads(base64.urlsafe_b64decode(match.group("payload")))
+
+
+def _marker_only(body: object) -> str:
+    match = transport.ROUND_TRANSPORT_SIDECAR_RE.search(str(body))
+    assert match is not None
+    return match.group(0)
+
+
+def _label_line(body: object) -> str:
+    text = str(body)
+    label, separator, marker = text.partition("\n\n")
+    assert separator and marker == _marker_only(text)
+    return label
+
+
+def _recommendation_marker(rationale_chars: int = 50_000) -> str:
+    recommendation = {
+        "strategy": "one-shot",
+        "rationale": _random_text(rationale_chars),
+        "staging_feasibility": "inseparable",
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(recommendation, separators=(",", ":"), sort_keys=True).encode()
+    ).decode()
+    return f"<!-- AGENT_EXECUTION_RECOMMENDATION: {encoded} -->"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "kind"),
+    [
+        ({"flow": "plan", "role": "coder"}, "plan"),
+        ({"flow": "plan", "role": "reviewer"}, "plan-review"),
+        ({"flow": "pr", "role": "reviewer"}, "review"),
+        ({"flow": "managed-pr", "role": "reviewer"}, "review"),
+        ({"flow": "approved", "role": "reviewer"}, "review"),
+        ({"flow": "approved-plan-implementation", "role": "reviewer"}, "review"),
+        ({"flow": "direct", "role": "reviewer"}, "review"),
+        ({"flow": "issue-implementation", "role": "reviewer"}, "review"),
+        ({"flow": "discuss", "role": "debater"}, "round"),
+        ({"flow": "discuss", "role": "summary"}, "round"),
+        ({"flow": "discuss", "role": "reviewer"}, "round"),
+        ({"flow": "pr", "role": "coder"}, "round"),
+        ({"flow": "pr", "role": "repair"}, "round"),
+        ({"flow": "pr", "role": "test-gate"}, "round"),
+        ({"flow": "plan", "role": "analyzer"}, "round"),
+        ({"flow": "future-flow", "role": "reviewer"}, "round"),
+        ({"flow": "plan"}, "round"),
+        ({"role": "reviewer"}, "round"),
+        ({"flow": ["plan"], "role": "coder"}, "round"),
+        ({}, "round"),
+        (None, "round"),
+    ],
+)
+def test_sidecar_kind_uses_explicit_flow_role_allow_list(metadata, kind) -> None:
+    assert transport._sidecar_kind(metadata) == kind
+
+
+def test_sidecar_label_is_bounded_ascii_and_free_of_reserved_markers() -> None:
+    from coding_review_agent_loop.protocol_markers import scan_reserved_markers
+
+    for kind in ("plan", "plan-review", "review", "round", "unexpected"):
+        for field in (*transport._SPILL_FIELDS, "not-a-spill-field", ""):
+            label = transport._sidecar_label(kind=kind, field=field, position=12, total=34)
+            assert label.isascii()
+            assert len(label) <= transport._SIDECAR_LABEL_MAX_CHARS
+            assert "<!--" not in label and "-->" not in label
+            assert not scan_reserved_markers(label)
+            assert "12/34" in label
+    assert transport._sidecar_label(
+        kind="plan", field="canonical_plan", position=2, total=5
+    ) == (
+        "Agent-loop plan attachment 2/5 (machine-readable overflow: canonical_plan). "
+        "Not an agent response; see the following plan comment."
+    )
+    assert "overflow: metadata)" in transport._sidecar_label(
+        kind="plan", field="attacker <b>text</b>", position=1, total=1
+    )
+
+
+def test_fresh_multi_source_plan_sidecars_are_labeled_in_posting_order() -> None:
+    _matrix_payload, matrix_encoded = _risk_test_matrix_marker_payload()
+    metadata = {
+        "flow": "plan",
+        "role": "coder",
+        "canonical_plan": _random_text(60_000),
+    }
+    body = _comment(
+        metadata,
+        body=(
+            "Visible plan\n"
+            + _recommendation_marker()
+            + "\n"
+            + f"<!-- AGENT_RISK_TEST_MATRIX: {matrix_encoded} -->"
+        ),
+    )
+
+    prepared = transport.prepare_round_comment(body)
+    sidecars, anchor = prepared[:-1], prepared[-1]
+
+    fields = [_sidecar_payload(item)["field"] for item in sidecars]
+    assert "execution_recommendation" in fields
+    assert "risk_test_matrix_marker" in fields
+    assert "canonical_plan" in fields
+    total = len(sidecars)
+    for position, sidecar in enumerate(sidecars, start=1):
+        label = _label_line(sidecar)
+        field = _sidecar_payload(sidecar)["field"]
+        assert label == (
+            f"Agent-loop plan attachment {position}/{total} "
+            f"(machine-readable overflow: {field}). "
+            "Not an agent response; see the following plan comment."
+        )
+        assert len(transport.ROUND_TRANSPORT_SIDECAR_RE.findall(str(sidecar))) == 1
+        assert len(str(sidecar)) <= transport.MAX_GITHUB_BODY_CHARS
+        assert sidecar.segments[-1][1] == "AGENT_LOOP_SIDECAR"
+        assert [token for _text, token in sidecar.segments if token] == ["AGENT_LOOP_SIDECAR"]
+        sidecar.validate_for_surface("issue_comment")
+    # The anchor carries no sidecar label and remains the final comment.
+    assert not transport.is_round_transport_sidecar(str(anchor))
+    assert "attachment" not in str(anchor).split("\n", 1)[0]
+    hydrated, missing = transport.hydrate_mapping(_anchor_payload(anchor), prepared)
+    assert missing == set()
+    assert hydrated["canonical_plan"] == metadata["canonical_plan"]
+
+
+def test_labeling_does_not_change_sidecar_payloads_or_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "flow": "plan",
+        "role": "coder",
+        "canonical_plan": _random_text(50_000),
+        "canonical_reviewer_response": _random_text(50_000),
+    }
+    body = _comment(payload, body="Visible\n" + _recommendation_marker())
+
+    labeled = transport.prepare_round_comment(body)
+    monkeypatch.setattr(transport, "_label_sidecars", lambda sidecars, kind: list(sidecars))
+    unlabeled = transport.prepare_round_comment(body)
+
+    assert len(labeled) == len(unlabeled)
+    assert str(labeled[-1]) == str(unlabeled[-1])
+    for new, old in zip(labeled[:-1], unlabeled[:-1]):
+        assert _marker_only(new) == str(old)
+        assert str(new).endswith(str(old))
+
+
+def test_payloads_are_identical_across_label_kinds() -> None:
+    value = _random_text(46_000)
+    markers_by_kind = {}
+    for flow, role in (("plan", "coder"), ("plan", "reviewer"), ("pr", "reviewer"), ("discuss", "debater")):
+        prepared = transport.prepare_round_comment(
+            _comment({"flow": flow, "role": role, "canonical_reviewer_response": value})
+        )
+        markers_by_kind[(flow, role)] = [
+            _sidecar_payload(item) for item in prepared[:-1]
+        ]
+    # Payloads differ only in the anchor id derived from the carrier text; the
+    # carried data, digests, and counts are the same and carry no kind field.
+    reference = markers_by_kind[("plan", "coder")]
+    for items in markers_by_kind.values():
+        assert [
+            {key: item[key] for key in item if key != "anchor"} for item in items
+        ] == [{key: item[key] for key in item if key != "anchor"} for item in reference]
+        assert all("kind" not in item for item in items)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "attachment", "target"),
+    [
+        ({"flow": "plan", "role": "reviewer"}, "plan review attachment", "plan review comment"),
+        ({"flow": "pr", "role": "reviewer"}, "review attachment", "review comment"),
+        ({"flow": "discuss", "role": "debater"}, "attachment", "agent-loop comment"),
+        ({"flow": "discuss", "role": "summary"}, "attachment", "agent-loop comment"),
+        ({"flow": "pr", "role": "coder"}, "attachment", "agent-loop comment"),
+        ({"flow": "unknown-flow", "role": "reviewer"}, "attachment", "agent-loop comment"),
+        ({}, "attachment", "agent-loop comment"),
+    ],
+)
+def test_round_sidecar_wording_follows_round_metadata(metadata, attachment, target) -> None:
+    prepared = transport.prepare_round_comment(
+        _comment({**metadata, "canonical_reviewer_response": _random_text(46_000)})
+    )
+
+    assert len(prepared) > 1
+    for sidecar in prepared[:-1]:
+        label = _label_line(sidecar)
+        assert label.startswith(f"Agent-loop {attachment} ")
+        assert label.endswith(f"see the following {target}.")
+
+
+def test_sidecar_only_carrier_without_round_metadata_gets_neutral_wording() -> None:
+    body = "Visible plan\n" + _recommendation_marker()
+
+    prepared = transport.prepare_round_comment(body)
+
+    assert len(prepared) > 1
+    assert not transport.ROUND_RESUME_MARKER_RE.search(str(prepared[-1]))
+    for position, sidecar in enumerate(prepared[:-1], start=1):
+        assert _label_line(sidecar) == (
+            f"Agent-loop attachment {position}/{len(prepared) - 1} "
+            "(machine-readable overflow: execution_recommendation). "
+            "Not an agent response; see the following agent-loop comment."
+        )
+
+
+def test_repeated_preparation_yields_byte_identical_sidecar_bodies() -> None:
+    body = _comment(
+        {"flow": "plan", "role": "coder", "canonical_plan": _random_text(90_000)},
+        body="Visible\n" + _recommendation_marker(),
+    )
+
+    first = transport.prepare_round_comment(body)
+    second = transport.prepare_round_comment(body)
+
+    assert [str(item) for item in first] == [str(item) for item in second]
+    assert [item.segments for item in first] == [item.segments for item in second]
+
+
+def test_full_part_labeled_sidecar_fits_github_body_budget() -> None:
+    prepared = transport.prepare_round_comment(
+        _comment({"flow": "pr", "role": "reviewer", "canonical_reviewer_response": _random_text(120_000)})
+    )
+
+    full_parts = [
+        item for item in prepared[:-1]
+        if len(str(_sidecar_payload(item)["data"])) == transport._PART_CHARS
+    ]
+    assert full_parts
+    for item in full_parts:
+        assert len(str(item)) <= transport.MAX_GITHUB_BODY_CHARS
+
+
+def test_hydrate_accepts_historical_labeled_and_mixed_sidecars() -> None:
+    payload = {"flow": "plan", "role": "coder", "canonical_plan": _random_text(90_000)}
+    prepared = transport.prepare_round_comment(_comment(payload))
+    sidecars, anchor = prepared[:-1], prepared[-1]
+    assert len(sidecars) >= 2
+    anchor_payload = _anchor_payload(anchor)
+    labeled = [str(item) for item in sidecars]
+    historical = [_marker_only(item) for item in sidecars]
+    mixed = [historical[0], *labeled[1:]]
+
+    for bodies in (labeled, historical, mixed):
+        assert all(transport.is_round_transport_sidecar(body) for body in bodies)
+        hydrated, missing = transport.hydrate_mapping(anchor_payload, [*bodies, str(anchor)])
+        assert missing == set()
+        assert hydrated["canonical_plan"] == payload["canonical_plan"]
+
+
+def test_interrupted_publication_duplicates_hydrate_and_missing_part_reported() -> None:
+    payload = {"flow": "plan", "role": "coder", "canonical_plan": _random_text(90_000)}
+    body = _comment(payload)
+    first_attempt = transport.prepare_round_comment(body)
+    retry = transport.prepare_round_comment(body)
+    sidecars, anchor = retry[:-1], retry[-1]
+    anchor_payload = _anchor_payload(anchor)
+    assert len(sidecars) >= 2
+    assert [str(item) for item in first_attempt] == [str(item) for item in retry]
+
+    # The interrupted attempt posted part 1 (labeled) and an older run left a
+    # marker-only copy of the same part; the retry then posted everything.
+    history = [
+        str(first_attempt[0]),
+        _marker_only(first_attempt[0]),
+        *map(str, sidecars),
+        str(anchor),
+    ]
+    hydrated, missing = transport.hydrate_mapping(anchor_payload, history)
+    assert missing == set()
+    assert hydrated["canonical_plan"] == payload["canonical_plan"]
+
+    incomplete = [str(first_attempt[0]), _marker_only(first_attempt[0]), str(anchor)]
+    hydrated, missing = transport.hydrate_mapping(anchor_payload, incomplete)
+    assert missing == {"canonical_plan"}
+    assert hydrated["canonical_plan"] is None

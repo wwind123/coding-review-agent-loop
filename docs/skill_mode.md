@@ -450,9 +450,15 @@ configured_reviewers=...)`, and outputs a JSON descriptor:
 ```
 
 Oversized metadata is split into `AGENT_LOOP_SIDECAR` comments posted before its
-anchor. These are protocol transport records rather than agent replies; retain
-them. If resume reports missing sidecars, restore them or remove the incomplete
-anchor and rerun.
+anchor. These are protocol transport records carrying machine-readable overflow
+data for the following agent-loop comment, not independent agent replies;
+retain them. Each one shows a short visible label such as
+`Agent-loop plan attachment 2/5 (machine-readable overflow: canonical_plan)`,
+naming plan, plan review, or review when the round metadata establishes it and
+neutral `Agent-loop attachment` wording otherwise, so GitHub no longer renders
+it as an empty comment. Older sidecars without the label remain valid. If
+resume reports missing sidecars, restore them or remove the incomplete anchor
+and rerun.
 
 The skill then skips already-completed reviewer turns and resumes from where
 the last session ended.
