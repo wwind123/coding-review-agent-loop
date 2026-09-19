@@ -579,3 +579,36 @@ def test_semantic_round_metadata_rejects_response_form_kind_mismatch(
 
     with pytest.raises(AgentLoopError, match="does not match canonical plan kind"):
         _decode_round_metadata_mapping(wrong_payload)
+
+
+def test_stored_patch_provenance_round_trips_as_json(tmp_path) -> None:
+    # Regression for #879: to_payload() emits tuples, but provenance is
+    # re-parsed with the wire parsers on every restart.
+    base = _base([_row("row-a")])
+    state = _state(base)
+    architecture_impact = {
+        "status": "changed",
+        "rationale": "The revision adds a publication seam.",
+        "affected_components": ["round_state.py"],
+        "dependencies": [],
+        "execution_data_flows": ["plan round -> metadata"],
+        "persistence": ["round metadata"],
+        "public_contracts": [],
+        "security_boundaries": [],
+        "canonical_document_action": "update",
+        "canonical_document_path": "ARCHITECTURE.md",
+        "canonical_document_rationale": "Record the new seam.",
+    }
+    patch = _patch(
+        state,
+        [{"op": "replace", "field": "architecture_impact", "value": architecture_impact}],
+    )
+
+    _assembled, sidecar = assemble_authenticated_plan_revision(state, patch)
+
+    assert sidecar.raw_patch is not None
+    assert sidecar.raw_patch == json.loads(json.dumps(sidecar.raw_patch))
+    reparsed = parse_plan_revision_patch(sidecar.raw_patch)
+    assert reparsed.base_state_identity == state.state_identity
+    replaced = reparsed.operations[0].value
+    assert replaced.execution_data_flows == ("plan round -> metadata",)
