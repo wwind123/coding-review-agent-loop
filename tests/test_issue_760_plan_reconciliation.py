@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_loop_helpers import make_config
-from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.errors import AgentLoopError, HumanDecisionRequiredError
 from coding_review_agent_loop.github import PullRequestMetadata
 from coding_review_agent_loop.prompts import (
     approved_plan_reconciliation_guidance,
@@ -331,7 +331,7 @@ def test_fixture_scenarios_use_their_review_finding_and_existing_orchestration_r
             retain_future=False,
         )
         assert future == []
-        with pytest.raises(AgentLoopError, match="Human review required"):
+        with pytest.raises(HumanDecisionRequiredError, match="Human decision required"):
             _raise_if_maintained_disputed_items(remaining, prior_items=(item,))
         assert expected["orchestration"] == "maintained_dispute_requires_human"
         return

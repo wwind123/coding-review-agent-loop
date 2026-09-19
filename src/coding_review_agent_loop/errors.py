@@ -13,6 +13,12 @@ class AgentLoopError(RuntimeError):
     """Raised for expected orchestration failures."""
 
 
+class HumanDecisionRequiredError(AgentLoopError):
+    """The run reached a deliberate operator decision boundary."""
+
+    EXIT_CODE = 4
+
+
 class FreshContractIntegrityError(AgentLoopError):
     """A fresh plan cannot be format-repaired without recoverable v1 data."""
 

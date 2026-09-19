@@ -17,7 +17,7 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_pr_review_comment,
     render_risk_test_matrix_section,
 )
-from coding_review_agent_loop.errors import QuotaResetExceededError
+from coding_review_agent_loop.errors import HumanDecisionRequiredError, QuotaResetExceededError
 from coding_review_agent_loop.followups import (
     MAX_APPROVED_FOLLOWUP_ISSUES,
     PlanApprovedFollowupSource,
@@ -70,6 +70,7 @@ from coding_review_agent_loop.orchestrator import (
     _ensure_finalization_ready,
     _latest_pr_architecture_observation,
     _latest_pr_approved_reviews_for_head,
+    _preserve_issue_created_managed_suppression,
 )
 from coding_review_agent_loop.prompts import (
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
@@ -102,6 +103,29 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_pr_review,
 )
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+def test_interrupted_tool_created_managed_pr_retains_suppression(origin):
+    contract = ManagedCiContract(origin=origin, issue_created_pr=origin == "issue-created")
+
+    assert _preserve_issue_created_managed_suppression(
+        contract,
+        active_exception=AgentLoopError("malformed coder handoff"),
+    )
+    assert not _preserve_issue_created_managed_suppression(
+        contract,
+        active_exception=None,
+    )
+
+
+def test_interrupted_existing_pr_adoption_does_not_claim_durable_suppression():
+    contract = ManagedCiContract(adopted_existing_pr=True)
+
+    assert not _preserve_issue_created_managed_suppression(
+        contract,
+        active_exception=AgentLoopError("review failed"),
+    )
 
 
 def test_latest_pr_architecture_observation_uses_new_checkpoint_once():
@@ -9902,8 +9926,10 @@ def test_pr_loop_dispute_resolved_when_reviewer_reconsiders(tmp_path):
     assert "Official docs confirm $1.50/1M tokens is correct." in followup_body
 
 
-def test_pr_loop_escalates_to_human_when_reviewer_rejects_dispute(tmp_path):
-    """Coder disputes a blocking item; reviewer still blocks after seeing evidence → escalate."""
+def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
+    tmp_path, monkeypatch
+):
+    """Human-decision escalation releases an invocation-owned adoption label."""
     runner = FakeRunner(
         claude_outputs=[
             structured_coder_followup(
@@ -9933,15 +9959,57 @@ def test_pr_loop_escalates_to_human_when_reviewer_rejects_dispute(tmp_path):
             ),
         ],
     )
+    monkeypatch.setattr(
+        orchestrator,
+        "activate_managed_ci",
+        lambda *_args, **_kwargs: ManagedCiContract(
+            adopted_existing_pr=True,
+            invocation_applied_label=True,
+        ),
+    )
+    posted_comment_calls = []
+    original_run = runner.run
+
+    def capture_posted_comment(args, *, cwd, **kwargs):
+        command = [str(arg) for arg in args]
+        if command[:4] == ["gh", "pr", "comment", "55"]:
+            body_path = Path(command[command.index("--body-file") + 1])
+            posted_comment_calls.append((command, body_path.read_text(encoding="utf-8")))
+        return original_run(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(runner, "run", capture_posted_comment)
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
 
     with pytest.raises(
-        AgentLoopError,
+        HumanDecisionRequiredError,
         match="Reviewer did not resolve 1 disputed item",
     ) as excinfo:
         run_pr_loop(runner, pr_number=55, config=config)
 
     assert "Update/evidence: Codex: I checked and the pricing is still wrong." in str(excinfo.value)
+    release_command = [
+        "gh",
+        "api",
+        "--method",
+        "DELETE",
+        "repos/OWNER/REPO/issues/55/labels/agent-loop-managed",
+    ]
+    commands = [command for command, _cwd in runner.commands]
+    release_index = commands.index(release_command)
+    human_decision_comment_calls = [
+        (command, body)
+        for command, body in posted_comment_calls
+        if "## Human decision required" in body
+    ]
+    assert len(human_decision_comment_calls) == 1
+    comment_command, human_decision_comment = human_decision_comment_calls[0]
+    assert comment_command[:4] == ["gh", "pr", "comment", "55"]
+    assert "--body-file" in comment_command
+    assert "Reviewer did not resolve 1 disputed item(s)" in human_decision_comment
+    assert "Update/evidence: Codex: I checked and the pricing is still wrong." in human_decision_comment
+    assert "-- Human Reviewer" in human_decision_comment
+    comment_index = commands.index(comment_command)
+    assert comment_index < release_index
 
 
 def test_pr_loop_escalates_when_reviewer_downgrades_disputed_item_to_same_pr(tmp_path):

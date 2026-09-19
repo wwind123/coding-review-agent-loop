@@ -371,6 +371,14 @@ separately from an eligible human, bot, or GitHub App identity. GitHub's own
 merge protections remain in force in addition to agent-loop's reviewer and CI
 gates.
 
+When a coder and reviewer maintain an evidence-backed disagreement after the
+reviewer's reconsideration turn, agent-loop posts a **Human decision required**
+comment and exits with status `4`. This is an intentional operator boundary,
+not an orchestration failure. Respond on the PR with the decision and required
+action in a comment ending with `-- Human Reviewer`, then resume the PR. An
+issue-created managed PR keeps its suppression label while waiting, so ordinary
+CI is not released before approval.
+
 ## Current Limitations
 
 - Run only one active `agent-loop` invocation per repository per machine. The
