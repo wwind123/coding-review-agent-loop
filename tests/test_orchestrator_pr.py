@@ -2320,7 +2320,9 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
         item["code"] == expected_diagnostic
         for item in metadata.risk_test_matrix_diagnostics
     )
-    assert "execution_ref" not in coder_comments[-1]
+    assert metadata.raw_structured_coder_response is not None
+    assert "execution_ref" not in metadata.raw_structured_coder_response
+    assert "risk_test_matrix_claims" not in metadata.raw_structured_coder_response
     assert any("follow-up" in comment.lower() for comment in runner.comments)
     assert any("The follow-up evidence path is covered." in comment for comment in runner.comments)
 
@@ -2335,10 +2337,7 @@ def test_run_pr_loop_replays_derived_followup_evidence_without_ephemeral_selecto
         status="blocking",
         source_status="blocking",
     )
-    raw_coder = structured_coder_followup(
-        addressed_items=["item-1"],
-        summary="The follow-up was completed.",
-    )
+    raw_coder = _semantic_coder_followup_text("coder-turn:observation-2")
     parsed_coder = validate_structured_coder_followup(raw_coder)
     assert parsed_coder is not None
     evidence = {
@@ -2380,6 +2379,12 @@ def test_run_pr_loop_replays_derived_followup_evidence_without_ephemeral_selecto
             risk_test_matrix_evidence=evidence,
         ),
     )
+    persisted_coder_metadata = _decode_round_metadata(
+        coder_comment.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+    )
+    assert persisted_coder_metadata.raw_structured_coder_response is not None
+    assert "execution_ref" not in persisted_coder_metadata.raw_structured_coder_response
+    assert "risk_test_matrix_claims" not in persisted_coder_metadata.raw_structured_coder_response
     review_raw = structured_pr_review(
         state="blocking",
         summary="The persisted evidence needs one more review.",
@@ -2436,7 +2441,13 @@ def test_run_pr_loop_replays_derived_followup_evidence_without_ephemeral_selecto
     assert '"risk_test_matrix_evidence"' in reviewer_prompt
     assert "receipt-current-head" in reviewer_prompt
     assert "coder-turn:observation-2" not in reviewer_prompt
-    assert "coder-turn:observation-2" not in runner.pr_payload["comments"][0]["body"]
+    replayed_coder_metadata = _decode_round_metadata(
+        runner.pr_payload["comments"][0]["body"].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+    )
+    assert replayed_coder_metadata.risk_test_matrix_evidence == evidence
+    assert replayed_coder_metadata.raw_structured_coder_response is not None
+    assert "coder-turn:observation-2" not in replayed_coder_metadata.raw_structured_coder_response
+    assert "execution_ref" not in replayed_coder_metadata.raw_structured_coder_response
     assert any(
         "The persisted evidence is available to the reviewer." in comment
         for comment in runner.comments

@@ -1994,8 +1994,9 @@ class TestBrokerServer:
 
         The returned object is the exact observation submitted to the journal,
         including its minted selector.  Keep that newest observation retained
-        so a completed managed test cannot be paired with an older journal
-        entry when the bounded catalog is saturated.
+        when it is a managed observation so a completed test cannot be paired
+        with an older journal entry when the bounded catalog is saturated.
+        Telemetry-only capture failures may be evicted immediately.
         """
         if observation.execution_ref is None:
             observation = replace(
@@ -2004,11 +2005,20 @@ class TestBrokerServer:
             )
         self._journal.append(observation)
         while len(self._journal) > MAX_PRIVATE_OBSERVATIONS:
-            prior_rows = self._journal[:-1]
+            # A completed managed observation must remain addressable long
+            # enough for its caller to receive the selector minted above.
+            # Telemetry-only capture failures do not have that requirement;
+            # when the journal is saturated they must not evict measured
+            # failures merely because they are newest.
+            candidate_rows = (
+                self._journal[:-1]
+                if observation.provenance != "telemetry-unverified"
+                else self._journal
+            )
             discard = next(
                 (
                     index
-                    for index, row in enumerate(prior_rows)
+                    for index, row in enumerate(candidate_rows)
                     if row.provenance == "telemetry-unverified"
                 ),
                 None,
@@ -2017,7 +2027,7 @@ class TestBrokerServer:
                 discard = next(
                     (
                         index
-                        for index, row in enumerate(prior_rows)
+                        for index, row in enumerate(candidate_rows)
                         if not row.is_failure
                     ),
                     0,

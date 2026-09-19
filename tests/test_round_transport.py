@@ -53,6 +53,29 @@ def _anchor_payload(anchor: str) -> dict[str, object]:
 
 
 def test_derived_matrix_evidence_round_trip_is_durable_and_idempotent() -> None:
+    raw_coder = json.dumps({
+        "schema_version": 1,
+        "kind": "coder_followup",
+        "state": "blocking",
+        "summary": "The follow-up was completed.",
+        "addressed_items": [],
+        "remaining_items": [],
+        "human_requirements": {
+            "addressed_ids": [],
+            "checked_discussion_directly": False,
+        },
+        "human_requirement_dispositions": [],
+        "risk_test_matrix_claims": [{
+            "row_id": "implementation-derived-evidence",
+            "execution_refs": ["coder-turn:observation-7"],
+            "test_identifiers": ["tests/test_orchestrator_pr.py::test_workflow"],
+            "test_locations": ["tests/test_orchestrator_pr.py"],
+            "workflow_path_claim": "The follow-up reached the authenticated head.",
+            "outcome_assertions": ["The selected observation passed."],
+            "forbidden_effect_assertions": ["The PR handoff was retained."],
+            "caveats": [],
+        }],
+    }) + "\n<!-- AGENT_STATE: blocking -->\n-- Claude"
     metadata = PostedRoundMetadata(
         flow="pr",
         role="coder",
@@ -81,6 +104,7 @@ def test_derived_matrix_evidence_round_trip_is_durable_and_idempotent() -> None:
                 "message": "No semantic coverage claim was supplied.",
             },
         ),
+        raw_structured_coder_response=raw_coder,
     )
 
     encoded = _encode_round_metadata(metadata)
@@ -88,6 +112,9 @@ def test_derived_matrix_evidence_round_trip_is_durable_and_idempotent() -> None:
     decoded = _decode_round_metadata(encoded)
     assert decoded.risk_test_matrix_evidence == metadata.risk_test_matrix_evidence
     assert decoded.risk_test_matrix_diagnostics == metadata.risk_test_matrix_diagnostics
+    assert decoded.raw_structured_coder_response is not None
+    assert "execution_ref" not in decoded.raw_structured_coder_response
+    assert "risk_test_matrix_claims" not in decoded.raw_structured_coder_response
     assert _encode_round_metadata(decoded) == encoded
 
     first_body = _attach_round_metadata("derived handoff", metadata)

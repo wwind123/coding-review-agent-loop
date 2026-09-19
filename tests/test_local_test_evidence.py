@@ -731,6 +731,44 @@ def test_saturated_journal_returns_selector_for_newly_retained_pass(monkeypatch,
     assert server.journal[-1].execution_ref == retained.execution_ref
 
 
+def test_saturated_journal_telemetry_does_not_evict_measured_failures(monkeypatch, tmp_path):
+    registry = EnvironmentIdentityRegistry()
+    server = BrokerServer(
+        root=tmp_path,
+        turn_id="turn-saturated-telemetry",
+        execute=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(evidence_module, "MAX_PRIVATE_OBSERVATIONS", 2)
+
+    first_failure = _observation(
+        outcome="failed",
+        timestamp="2026-09-18T00:00:00+00:00",
+        receipt_id="failure-1",
+        registry=registry,
+    )
+    second_failure = _observation(
+        outcome="failed",
+        timestamp="2026-09-18T00:01:00+00:00",
+        receipt_id="failure-2",
+        registry=registry,
+    )
+    telemetry = _observation(
+        outcome="incomplete",
+        timestamp="2026-09-18T00:02:00+00:00",
+        receipt_id="telemetry-1",
+        registry=registry,
+        provenance="telemetry-unverified",
+    )
+
+    with server._journal_lock:
+        server._append_journal_locked(first_failure)
+        server._append_journal_locked(second_failure)
+        retained = server._append_journal_locked(telemetry)
+
+    assert retained is None
+    assert [row.receipt_id for row in server.journal] == ["failure-1", "failure-2"]
+
+
 def test_broker_context_failure_returns_error_and_records_incomplete(monkeypatch, tmp_path):
     import coding_review_agent_loop.containment as containment_module
     from coding_review_agent_loop.errors import AgentLoopError
