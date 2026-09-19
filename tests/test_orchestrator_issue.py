@@ -4288,6 +4288,90 @@ def test_issue_loop_plan_first_uses_full_context_when_plan_ledger_incomplete(tmp
     captured = capsys.readouterr()
     assert "Planning round 2: Codex reviewing issue #56 (context mode: full (ledger incomplete))" in captured.err
 
+def test_862_plan_review_resolved_history_item_is_stripped_despite_incomplete_ledger(
+    tmp_path, capsys
+):
+    from coding_review_agent_loop.protocol import ReviewItemDisposition
+
+    first_plan = "First plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    second_plan = "Second plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    latest_plan = "Latest plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    old_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Codex",
+        source_round=1,
+        text="Earlier plan gap.",
+        status="blocking",
+        source_status="blocking",
+    )
+    raised = _attach_round_metadata(
+        structured_plan_review(state="blocking", blocking_plan_issues=["Earlier plan gap."]),
+        PostedRoundMetadata(
+            flow="plan",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject=_plan_subject(first_plan),
+            new_items=(old_item,),
+            state="blocking",
+        ),
+    )
+    cleared = _attach_round_metadata(
+        structured_plan_review(
+            state="approved",
+            prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ),
+        PostedRoundMetadata(
+            flow="plan",
+            role="reviewer",
+            agent="Codex",
+            round_number=2,
+            subject=_plan_subject(second_plan),
+            prior_items=(old_item,),
+            dispositions=(
+                ReviewItemDisposition(item_id="item-1", reviewer="Codex", disposition="resolved"),
+            ),
+            state="approved",
+        ),
+    )
+    latest_coder_comment = _attach_round_metadata(
+        latest_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=3,
+            subject=_plan_subject(latest_plan),
+            prior_items=(),
+        ),
+    )
+    runner = FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": raised},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:05:00Z", "body": cleared},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:10:00Z", "body": latest_coder_comment},
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer=("codex",), quiet=False)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    repair_mock.assert_not_called()
+    captured = capsys.readouterr()
+    assert "(context mode: full (ledger incomplete))" in captured.err
+    assert (
+        "removed canonically resolved historical prior-item disposition ID(s) item-1 "
+        "despite incomplete ledger"
+    ) in captured.err
+
+
 def test_issue_loop_plan_first_resumes_with_only_missing_reviewer_for_current_plan(tmp_path):
     current_plan = "Revised plan.\n- Add state reconstruction.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     coder_comment = _attach_round_metadata(

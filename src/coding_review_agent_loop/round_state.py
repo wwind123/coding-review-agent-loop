@@ -2370,6 +2370,68 @@ def _aggregate_record_dispositions(
     return dispositions_by_item
 
 
+def _canonically_resolved_history_item_ids(
+    records: Sequence[PostedRoundRecord],
+    *,
+    reconciliation_mode: str,
+    same_status: str,
+    carried_item_ids: Sequence[str] = (),
+) -> frozenset[str]:
+    """Return item IDs that round-metadata history proves were canonically cleared.
+
+    History is replayed round group by round group, keyed by (subject,
+    round_number) in first-appearance order, through the same reconciler the
+    live loop uses.  An ID counts as resolved only when the reconciler removed
+    it from the active ledger and every disposition recorded for it in that
+    round group was ``resolved``.  Any later carry (``prior_items``) or
+    re-introduction (``new_items``) makes it active again, and machine
+    obligations are never reported.  The result is used only to prove that a
+    reviewer's ``resolved`` disposition of a non-carried ID is a no-op.
+    """
+    groups: dict[tuple[str, int], list[PostedRoundRecord]] = {}
+    for record in records:
+        key = (record.metadata.subject, record.metadata.round_number)
+        groups.setdefault(key, []).append(record)
+    active: dict[str, UnresolvedReviewItem] = {}
+    resolved: set[str] = set()
+    for group in groups.values():
+        for record in group:
+            for item in record.metadata.prior_items:
+                active[item.item_id] = item
+                resolved.discard(item.item_id)
+        reviewer_records = [record for record in group if record.metadata.role == "reviewer"]
+        dispositions_by_item = _aggregate_record_dispositions(reviewer_records)
+        candidates = [
+            item for item in active.values() if item.item_id in dispositions_by_item
+        ]
+        if candidates:
+            kept, future = _apply_unresolved_item_dispositions(
+                candidates,
+                dispositions_by_item,
+                same_status=same_status,
+                retain_future=True,
+                reconciliation_mode=reconciliation_mode,
+            )
+            remaining = {item.item_id: item for item in (*kept, *future)}
+            for item in candidates:
+                if item.item_id in remaining:
+                    active[item.item_id] = remaining[item.item_id]
+                    continue
+                del active[item.item_id]
+                if item.is_machine_obligation:
+                    continue
+                if all(
+                    disposition.disposition == "resolved"
+                    for disposition in dispositions_by_item[item.item_id]
+                ):
+                    resolved.add(item.item_id)
+        for record in group:
+            for item in record.metadata.new_items:
+                active[item.item_id] = item
+                resolved.discard(item.item_id)
+    return frozenset(resolved - set(active) - set(carried_item_ids))
+
+
 def _recover_unrecorded_pr_head_advance(
     records: Sequence[PostedRoundRecord],
     *,

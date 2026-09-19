@@ -1833,6 +1833,9 @@ eligible for dispositions in this round. If same-round findings from other
 reviewers appear elsewhere in the issue discussion, treat them as
 informational only and do not disposition them until a later round carries
 them forward explicitly.
+Plan items resolved in earlier rounds are closed: do not include them in
+`prior_plan_item_dispositions`. When no prior unresolved plan items are listed,
+that array must be empty.
 When prior items are present, evaluate each displayed Original claim rather
 than replacing its meaning. Narrower evidence for the same defect may remain
 on that ID. If you accept the original predicate but discover a materially
@@ -2549,6 +2552,9 @@ eligible for dispositions in this round. If same-round findings from other
 reviewers appear elsewhere in the issue discussion, treat them as
 informational only and do not disposition them until a later round carries
 them forward explicitly.
+Plan items resolved in earlier rounds are closed: do not include them in
+`prior_plan_item_dispositions`. When no prior unresolved plan items are listed,
+that array must be empty.
 {unresolved_items_guidance}
 Signed human issue requirements are approval-critical issue constraints for this
 plan review.
@@ -3481,6 +3487,10 @@ are eligible for dispositions in this round. If same-round findings from
 other reviewers appear elsewhere in the PR discussion, treat them as
 informational only and do not disposition them until a later round carries
 them forward explicitly.
+Items resolved in earlier rounds (for example a primary reviewer's finding that
+was already cleared before a secondary audit) are closed: do not include them in
+`prior_item_dispositions`. When no prior unresolved items are listed, that array
+must be empty.
 Item IDs visible only in `issue_context`, issue history, or planning comments
 are informational only. This includes planning-stage `item-*` IDs and approved
 plan future follow-ups, which are tracked separately. Do not include those IDs
@@ -3865,7 +3875,9 @@ the panel early. After that approval, every configured secondary reviewer
 receives an independent review of the complete
 base-to-head diff and the approved-plan/human-requirement context. Secondary
 reviewers must reach their own conclusions; do not merely validate, repeat, or
-triage findings attributed to the primary. A remediation round rechecks every
+triage findings attributed to the primary. Report secondary-audit concerns as
+your own new findings; never disposition primary findings that were already
+cleared, since resolved items are closed. A remediation round rechecks every
 active finding owner together with the primary, then performs an independent
 exact-head sweep for every secondary still missing approval. After the panel
 has opened, any mutation, ambiguous ownership/scope/history, reviewer failure,
@@ -4048,6 +4060,10 @@ are eligible for dispositions in this round. If same-round findings from
 other reviewers appear elsewhere in the PR discussion, treat them as
 informational only and do not disposition them until a later round carries
 them forward explicitly.
+Items resolved in earlier rounds (for example a primary reviewer's finding that
+was already cleared before a secondary audit) are closed: do not include them in
+`prior_item_dispositions`. When no prior unresolved items are listed, that array
+must be empty.
 Item IDs visible only in `issue_context`, issue history, or planning comments
 are informational only. This includes planning-stage `item-*` IDs and approved
 plan future follow-ups, which are tracked separately. Do not include those IDs

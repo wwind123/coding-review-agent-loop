@@ -109,6 +109,55 @@ def strip_unknown_prior_item_dispositions(
     return json_str + tail
 
 
+def unknown_dispositions_are_resolved_history(
+    raw: str,
+    *,
+    unknown_ids: Sequence[str],
+    resolved_history_ids: Sequence[str] | frozenset[str],
+    expected_kind: str | None,
+) -> bool:
+    """Return True when every unknown disposition is a no-op on resolved history.
+
+    This proves that stripping is safe even when the carried ledger may be
+    incomplete: each unknown ID must be one the round-metadata history shows
+    was canonically resolved, and every entry for it must say ``resolved``.
+    Any active disposition, unproven ID, or unparseable shape returns False.
+    """
+    if expected_kind not in {"pr_review", "plan_review", "plan_revision"}:
+        return False
+    unknown = frozenset(unknown_ids)
+    if not unknown or not unknown <= frozenset(resolved_history_ids):
+        return False
+    disposition_field = (
+        "prior_item_dispositions"
+        if expected_kind == "pr_review"
+        else "prior_plan_item_dispositions"
+    )
+    stripped = raw.lstrip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        payload, _json_end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict) or payload.get("kind") != expected_kind:
+        return False
+    dispositions = payload.get(disposition_field)
+    if not isinstance(dispositions, list):
+        return False
+    seen: set[str] = set()
+    for entry in dispositions:
+        if not isinstance(entry, dict):
+            return False
+        item_id = entry.get("item_id")
+        if item_id not in unknown:
+            continue
+        if entry.get("disposition") != "resolved":
+            return False
+        seen.add(item_id)
+    return seen == unknown
+
+
 def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> str | None:
     """Trim envelope-only trailing material without changing structured JSON."""
     if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "plan_revision_patch", "coder_followup", "issue_implementation", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:

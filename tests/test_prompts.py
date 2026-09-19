@@ -4015,3 +4015,41 @@ def test_selector_guidance_forbids_command_strings_in_coder_and_correction_promp
         assert semantic_risk_claim_example_json() in text, name
     correction = " ".join(surfaces["correction"].split())
     assert "Command strings and handles outside this catalog are dropped" in correction
+
+
+def test_862_review_prompts_forbid_dispositioning_previously_resolved_items(tmp_path):
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+    )
+    pr_prompts = [
+        build_review_prompt(77, 3, config, reviewer="gemini"),
+        build_review_prompt(77, 3, config, reviewer="gemini", compact_context=True),
+    ]
+    for prompt in pr_prompts:
+        normalized = " ".join(prompt.split())
+        assert (
+            "Items resolved in earlier rounds (for example a primary reviewer's finding "
+            "that was already cleared before a secondary audit) are closed: do not include "
+            "them in `prior_item_dispositions`. When no prior unresolved items are listed, "
+            "that array must be empty."
+        ) in normalized
+        assert "<!-- AGENT_" not in prompt.split("Items resolved in earlier rounds")[1][:400]
+    plan_prompts = [
+        build_plan_review_prompt(56, 3, "Plan.", config, reviewer="codex"),
+        build_plan_review_prompt(56, 3, "Plan.", config, reviewer="codex", compact_context=True),
+    ]
+    for prompt in plan_prompts:
+        normalized = " ".join(prompt.split())
+        assert (
+            "Plan items resolved in earlier rounds are closed: do not include them in "
+            "`prior_plan_item_dispositions`. When no prior unresolved plan items are "
+            "listed, that array must be empty."
+        ) in normalized
+    scheduling = " ".join(prompts_module._pr_review_scheduling_guidance(config).split())
+    assert (
+        "Report secondary-audit concerns as your own new findings; never disposition "
+        "primary findings that were already cleared, since resolved items are closed."
+    ) in scheduling
