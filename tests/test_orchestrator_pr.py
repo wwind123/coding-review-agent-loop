@@ -11656,7 +11656,7 @@ def test_840_legacy_latch_after_qualified_opening_is_honored(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("operator", [False, True])
-def test_840_undecodable_history_stops_with_diagnostic_unless_operator(tmp_path, monkeypatch, operator):
+def test_840_round_boundary_undecodable_history_stops_with_diagnostic(tmp_path, monkeypatch, operator):
     """Row prepanel-unsafe-stop: panel state is unknowable when history cannot be decoded."""
     state = {"broken": False}
     original_extract = orchestrator._extract_round_metadata_records
