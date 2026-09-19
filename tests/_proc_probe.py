@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import time
 from pathlib import Path
 
 import pytest
-
-from coding_review_agent_loop.runner import _terminate_process_group
 
 #: Process states that mean the instance is no longer running.
 DEAD_STATES = frozenset({"Z", "X", "x"})
@@ -147,6 +146,41 @@ def read_pid_record(path: Path | str) -> list[tuple[int, str]]:
     return entries
 
 
+def terminate_process_tree(
+    proc, *, term_grace: float = 2.0, kill_grace: float = 2.0
+) -> None:
+    """Bounded TERM/KILL escalation driven by survival of the whole group.
+
+    ``runner._terminate_process_group`` escalates on the direct child alone: if
+    the parent exits on SIGTERM while a descendant ignores it, the group is
+    never SIGKILLed and the descendant is orphaned.  Escalation here is decided
+    by whether any member of the group is still alive, after the direct child
+    has been reaped so its own zombie cannot masquerade as a survivor.
+    """
+    pgid = proc.pid
+    _signal_group(pgid, signal.SIGTERM)
+    reaped = True
+    try:
+        proc.wait(timeout=term_grace)
+    except subprocess.TimeoutExpired:
+        # A leader still holding the group is itself proof the group survived.
+        reaped = False
+    if not reaped or not wait_group_gone(pgid, timeout=term_grace):
+        _signal_group(pgid, signal.SIGKILL)
+        wait_group_gone(pgid, timeout=kill_grace)
+    try:
+        proc.wait(timeout=kill_grace)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _signal_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 class ReadinessGate:
     """``process_started`` hook that holds the watchdog until startup published.
 
@@ -162,7 +196,7 @@ class ReadinessGate:
         self.path = Path(path)
         self.cap = cap
         self.poll = poll
-        self._cleanup = cleanup if cleanup is not None else _terminate_process_group
+        self._cleanup = cleanup if cleanup is not None else terminate_process_tree
         self.pid: int | None = None
         self.start_time: str | None = None
         self.ready = False

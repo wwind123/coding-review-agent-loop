@@ -15,6 +15,7 @@ from _proc_probe import (
     PUBLISH_SNIPPET,
     ReadinessGate,
     kill_if_same_instance,
+    terminate_process_tree,
     proc_start_time,
     proc_state,
     read_pid_record,
@@ -233,3 +234,69 @@ def test_kill_if_same_instance_kills_a_real_child():
     finally:
         child.kill()
         child.wait()
+
+
+# A process that ignores SIGTERM only does so once its handler is installed, so
+# every escalation test waits for the process to publish a readiness marker
+# before signalling; otherwise SIGTERM would win the startup race and the test
+# would never exercise the SIGKILL escalation it is meant to prove.
+_IGNORE_TERM_AND_WAIT = (
+    "import signal, sys, time; "
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "open(sys.argv[1], 'w').close(); "
+    "time.sleep(60)"
+)
+
+
+def _wait_for_marker(path, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists(), f"{path} was never published"
+
+
+def test_terminate_process_tree_escalates_for_a_sigterm_ignoring_leader(tmp_path):
+    """Escalation follows group survival, not just the direct child's exit."""
+    ready = tmp_path / "leader.ready"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _IGNORE_TERM_AND_WAIT, str(ready)], start_new_session=True
+    )
+    start_time = proc_start_time(proc.pid)
+    try:
+        _wait_for_marker(ready)
+        terminate_process_tree(proc)
+        assert wait_until_gone(proc.pid, start_time=start_time, timeout=10.0) is True
+    finally:
+        kill_if_same_instance(proc.pid, start_time)
+        proc.wait()
+
+
+def test_terminate_process_tree_kills_a_sigterm_ignoring_descendant(tmp_path):
+    """A descendant that ignores SIGTERM dies even when the leader obeys it."""
+    observed = tmp_path / "descendant.pid"
+    ready = tmp_path / "descendant.ready"
+    code = (
+        PUBLISH_SNIPPET
+        + "import subprocess, sys, time\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {_IGNORE_TERM_AND_WAIT!r}, sys.argv[2]])\n"
+        "import pathlib\n"
+        "while not pathlib.Path(sys.argv[2]).exists():\n"
+        "    time.sleep(0.01)\n"
+        "_publish(sys.argv[1], [child.pid])\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(observed), str(ready)], start_new_session=True
+    )
+    descendants = []
+    try:
+        _wait_for_marker(observed)
+        descendants = read_pid_record(observed)
+        terminate_process_tree(proc)
+        for child_pid, child_start in descendants:
+            assert wait_until_gone(child_pid, start_time=child_start, timeout=10.0) is True
+    finally:
+        for child_pid, child_start in descendants:
+            kill_if_same_instance(child_pid, child_start)
+        proc.kill()
+        proc.wait()

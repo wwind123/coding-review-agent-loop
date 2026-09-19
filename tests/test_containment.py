@@ -935,6 +935,65 @@ def test_readiness_gate_cap_expiry_reports_startup_failure_and_cleans_up(tmp_pat
             kill_if_same_instance(child_pid, child_start)
 
 
+def test_readiness_gate_cap_expiry_kills_a_sigterm_ignoring_descendant(tmp_path):
+    """Cap-expiry cleanup escalates to SIGKILL when a descendant ignores TERM."""
+    pid_file = tmp_path / "never.pid"
+    observed = tmp_path / "observed.pid"
+    # The descendant only ignores SIGTERM once its handler is installed, so the
+    # parent waits for its readiness marker before publishing the record the
+    # test reads; otherwise SIGTERM would win the startup race and the SIGKILL
+    # escalation would never be exercised.
+    child_code = (
+        "import signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "open(sys.argv[1], 'w').close(); "
+        "time.sleep(60)"
+    )
+    ready = tmp_path / "descendant.ready"
+    code = (
+        PUBLISH_SNIPPET
+        + "import pathlib, subprocess, sys, time\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[3]])\n"
+        "while not pathlib.Path(sys.argv[3]).exists():\n"
+        "    time.sleep(0.01)\n"
+        "_publish(sys.argv[2], [child.pid])\n"
+        "time.sleep(30)\n"
+        "_publish(sys.argv[1], [child.pid])\n"
+    )
+    gate = readiness_gate(pid_file, cap=3.0)
+    started = time.monotonic()
+    result = run_foreground_test(
+        [sys.executable, "-c", code, str(pid_file), str(observed), str(ready)],
+        cwd=tmp_path,
+        timeout_seconds=0.2,
+        containment_policy=default_policy(mode="off", cache_dir=tmp_path / "runtime"),
+        process_started=gate,
+    )
+    elapsed = time.monotonic() - started
+    descendants: list[tuple[int, str]] = []
+    try:
+        assert gate.ready is False
+        assert gate.release_reason == "cap-expired"
+        assert gate.cleanup_invocations == 1
+        assert elapsed < 30.0
+        assert result.outcome != "passed"
+        assert wait_until_gone(gate.pid, start_time=gate.start_time)
+        # The parent obeys SIGTERM, so only group-driven escalation can reach a
+        # descendant that ignores it.  The claim stays conditional on the
+        # separately published record, which the cap does not guarantee.
+        if observed.exists():
+            descendants = read_pid_record(observed)
+            for child_pid, child_start in descendants:
+                if not wait_until_gone(child_pid, start_time=child_start):
+                    pytest.fail(
+                        f"SIGTERM-ignoring descendant {child_pid} survived readiness cleanup"
+                    )
+    finally:
+        kill_if_same_instance(gate.pid, gate.start_time)
+        for child_pid, child_start in descendants:
+            kill_if_same_instance(child_pid, child_start)
+
+
 def test_production_proc_helpers_treat_process_lookup_error_as_gone(monkeypatch):
     """Production /proc inspection never raises when the entry vanishes."""
     real_read_text = Path.read_text
