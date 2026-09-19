@@ -9976,13 +9976,27 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
         run_pr_loop(runner, pr_number=55, config=config)
 
     assert "Update/evidence: Codex: I checked and the pricing is still wrong." in str(excinfo.value)
-    assert [
+    release_command = [
         "gh",
         "api",
         "--method",
         "DELETE",
         "repos/OWNER/REPO/issues/55/labels/agent-loop-managed",
-    ] in [command for command, _cwd in runner.commands]
+    ]
+    commands = [command for command, _cwd in runner.commands]
+    comment_index = next(
+        index
+        for index, command in enumerate(commands)
+        if command[:4] == ["gh", "pr", "comment", "55"]
+    )
+    release_index = commands.index(release_command)
+    human_decision_comment = next(
+        comment for comment in runner.comments if "## Human decision required" in comment
+    )
+    assert "Reviewer did not resolve 1 disputed item(s)" in human_decision_comment
+    assert "Update/evidence: Codex: I checked and the pricing is still wrong." in human_decision_comment
+    assert "-- Human Reviewer" in human_decision_comment
+    assert comment_index < release_index
 
 
 def test_pr_loop_escalates_when_reviewer_downgrades_disputed_item_to_same_pr(tmp_path):
