@@ -505,6 +505,20 @@ failures. Override it with `--antigravity-model` or
 `--antigravity-models`. Antigravity turns are single-shot and its usage totals
 are estimated because `agy` does not expose token counts.
 
+Malformed structured responses get a format-repair pass. By default it uses
+Antigravity with the repair chain `Gemini 3.8 Flash (Medium)`, then
+`Gemini 3.7 Flash (Medium)`, followed by the Antigravity chain above. Use
+`--repair-backend` and repeatable `--repair-model` to change it. Models that
+`agy models` does not list are skipped. When `agy` reports a transient
+`model-access validation errors` failure on its own output (stdout with no
+response artifact and no structured JSON response), that repair model is
+retried once, and then the next model in the chain is tried. If the chain ends
+on that transient failure, the run stops with a resumable
+`repair-provider-failure` and a suggestion to re-run the same command. It is
+not reported as a deterministic plan-validation failure. A valid repaired
+response is always accepted, and model-authored text that only quotes the
+phrase is still treated as invalid output.
+
 Backend-specific authentication, model selection, fallback, timeout, and
 executable-replacement behavior are documented under
 [Agent backends](docs/local_agent_loop.md#agent-backends).
