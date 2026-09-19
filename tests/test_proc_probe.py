@@ -93,7 +93,17 @@ def test_read_pid_record_parses_and_rejects_malformed(tmp_path):
     good.write_text("12:34,56:78", encoding="ascii")
     assert read_pid_record(good) == [(12, "34"), (56, "78")]
 
-    for contents in ["123:", "12,", "", "abc:12", ":12"]:
+    for contents in [
+        "123:",
+        "12,",
+        "",
+        "abc:12",
+        ":12",
+        "12:not-a-starttime",
+        "12:34:56",
+        "12:3 4",
+        "12:34,56",
+    ]:
         bad = tmp_path / "bad"
         bad.write_text(contents, encoding="ascii")
         with pytest.raises(AssertionError, match="malformed pid:starttime record"):

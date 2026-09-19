@@ -133,14 +133,20 @@ def kill_if_same_instance(
 
 
 def read_pid_record(path: Path | str) -> list[tuple[int, str]]:
-    """Parse a comma-separated ``pid:starttime`` record into typed entries."""
+    """Parse a comma-separated ``pid:starttime`` record into typed entries.
+
+    Both halves must be numeric and there must be exactly one separator.  A
+    non-numeric start time would never equal a real /proc starttime, so a
+    caller comparing it would treat a live descendant as PID-reused and report
+    a survivor as already gone.
+    """
     raw = Path(path).read_text(encoding="ascii")
     entries: list[tuple[int, str]] = []
     for chunk in raw.split(","):
-        pid_text, separator, start_time = chunk.strip().partition(":")
-        if not separator or not start_time.strip() or not pid_text.strip().isdigit():
+        parts = [part.strip() for part in chunk.strip().split(":")]
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
             raise AssertionError(f"malformed pid:starttime record {raw!r} at {path}")
-        entries.append((int(pid_text), start_time.strip()))
+        entries.append((int(parts[0]), parts[1]))
     if not entries:
         raise AssertionError(f"malformed pid:starttime record {raw!r} at {path}")
     return entries

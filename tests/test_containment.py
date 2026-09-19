@@ -960,14 +960,27 @@ def test_readiness_gate_cap_expiry_kills_a_sigterm_ignoring_descendant(tmp_path)
         "time.sleep(30)\n"
         "_publish(sys.argv[1], [child.pid])\n"
     )
-    gate = readiness_gate(pid_file, cap=3.0)
+    gate = readiness_gate(pid_file, cap=0.5)
+
+    def started_hook(proc):
+        # Synchronize descendant readiness before the gate's cap starts, so the
+        # cap can only expire after the SIGTERM-ignoring descendant exists and
+        # its identity is published.  This dedicated regression therefore always
+        # exercises the repaired escalation, never a parent-only path.
+        publish_deadline = time.monotonic() + 20.0
+        while not observed.exists() and time.monotonic() < publish_deadline:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.01)
+        gate(proc)
+
     started = time.monotonic()
     result = run_foreground_test(
         [sys.executable, "-c", code, str(pid_file), str(observed), str(ready)],
         cwd=tmp_path,
         timeout_seconds=0.2,
         containment_policy=default_policy(mode="off", cache_dir=tmp_path / "runtime"),
-        process_started=gate,
+        process_started=started_hook,
     )
     elapsed = time.monotonic() - started
     descendants: list[tuple[int, str]] = []
@@ -979,15 +992,20 @@ def test_readiness_gate_cap_expiry_kills_a_sigterm_ignoring_descendant(tmp_path)
         assert result.outcome != "passed"
         assert wait_until_gone(gate.pid, start_time=gate.start_time)
         # The parent obeys SIGTERM, so only group-driven escalation can reach a
-        # descendant that ignores it.  The claim stays conditional on the
-        # separately published record, which the cap does not guarantee.
-        if observed.exists():
-            descendants = read_pid_record(observed)
-            for child_pid, child_start in descendants:
-                if not wait_until_gone(child_pid, start_time=child_start):
-                    pytest.fail(
-                        f"SIGTERM-ignoring descendant {child_pid} survived readiness cleanup"
-                    )
+        # descendant that ignores it.  Publication was synchronized before the
+        # cap started, so the record is required and its identity is proved gone
+        # unconditionally; the general cap-expiry test keeps the conditional,
+        # no-startup-assumption form.
+        assert observed.exists(), (
+            "the descendant identity was not published before the readiness cap started"
+        )
+        descendants = read_pid_record(observed)
+        assert descendants, "the descendant record parsed to no identities"
+        for child_pid, child_start in descendants:
+            if not wait_until_gone(child_pid, start_time=child_start):
+                pytest.fail(
+                    f"SIGTERM-ignoring descendant {child_pid} survived readiness cleanup"
+                )
     finally:
         kill_if_same_instance(gate.pid, gate.start_time)
         for child_pid, child_start in descendants:
