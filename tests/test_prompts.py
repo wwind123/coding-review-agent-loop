@@ -3839,6 +3839,45 @@ def test_build_issue_prompt_carries_explicit_managed_creation_contract(tmp_path)
     assert "agent-loop will dispatch exact-head qualification after review." in plan_prompt
 
 
+def test_review_prompts_forbid_dispositioning_previously_resolved_items(tmp_path):
+    # #862: a secondary audit must not disposition a primary finding that an
+    # earlier round already cleared.
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+    )
+    pr_prompts = [
+        build_review_prompt(77, 3, config, reviewer="gemini"),
+        build_review_prompt(77, 3, config, reviewer="gemini", compact_context=True),
+    ]
+    for prompt in pr_prompts:
+        flat = " ".join(prompt.split())
+        assert (
+            "Items resolved in earlier rounds (for example a primary reviewer's finding "
+            "already cleared before a secondary audit) are closed: never include them in "
+            "`prior_item_dispositions`." in flat
+        )
+        assert "When no prior unresolved items are listed, that array must be empty." in flat
+    full_flat = " ".join(pr_prompts[0].split())
+    assert (
+        "Report your own concerns as new findings; do not disposition primary findings "
+        "that were already cleared." in full_flat
+    )
+    plan_prompts = [
+        build_plan_review_prompt(56, 3, "Plan.", config, reviewer="codex"),
+        build_plan_review_prompt(56, 3, "Plan.", config, reviewer="codex", compact_context=True),
+    ]
+    for prompt in plan_prompts:
+        flat = " ".join(prompt.split())
+        assert (
+            "Plan items resolved in earlier rounds (including items raised on an earlier "
+            "plan revision) are closed: never include them in `prior_plan_item_dispositions`."
+            in flat
+        )
+
+
 def test_primary_then_panel_review_prompt_demands_independent_complete_diff_audit(tmp_path):
     config = make_config(
         tmp_path,

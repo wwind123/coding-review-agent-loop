@@ -4288,6 +4288,91 @@ def test_issue_loop_plan_first_uses_full_context_when_plan_ledger_incomplete(tmp
     captured = capsys.readouterr()
     assert "Planning round 2: Codex reviewing issue #56 (context mode: full (ledger incomplete))" in captured.err
 
+def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomplete_ledger(
+    tmp_path, monkeypatch
+):
+    # #862 plan-flow analog: an earlier plan subject raised and resolved
+    # item-1, the carried set is empty, and the reviewer repeats item-1 as
+    # resolved.  The no-op entry is stripped instead of failing the run.
+    old_plan = "Old plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    mid_plan = "Mid plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    new_plan = "New plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    old_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="OpenAI Codex",
+        source_round=1,
+        text="Old subject item.",
+        status="blocking",
+        source_status="blocking",
+    )
+    raised = _attach_round_metadata(
+        structured_plan_review(state="blocking", blocking_plan_issues=["Old subject item."]),
+        PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Codex", round_number=1,
+            subject=_plan_subject(old_plan), new_items=(old_item,), state="blocking",
+        ),
+    )
+    resolved = _attach_round_metadata(
+        structured_plan_review(
+            state="blocking",
+            prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ),
+        PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Codex", round_number=2,
+            subject=_plan_subject(mid_plan), prior_items=(old_item,),
+            dispositions=(ReviewItemDisposition("item-1", "OpenAI Codex", "resolved"),),
+            state="blocking",
+        ),
+    )
+    latest_coder_comment = _attach_round_metadata(
+        new_plan,
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=3,
+            subject=_plan_subject(new_plan), prior_items=(),
+        ),
+    )
+    ledger_flags = []
+    real_ledger_check = orchestrator_module._round_ledger_may_be_incomplete
+
+    def ledger_spy(**kwargs):
+        result = real_ledger_check(**kwargs)
+        ledger_flags.append(result)
+        return result
+
+    monkeypatch.setattr(orchestrator_module, "_round_ledger_may_be_incomplete", ledger_spy)
+    logged = []
+    real_log = orchestrator_module.log
+    monkeypatch.setattr(
+        orchestrator_module,
+        "log",
+        lambda config, message, *a, **k: (logged.append(message), real_log(config, message, *a, **k))[1],
+    )
+    runner = FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": raised},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:05:00Z", "body": resolved},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:10:00Z", "body": latest_coder_comment},
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer=("codex",))
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    repair_mock.assert_not_called()
+    assert ledger_flags and ledger_flags[0] is True
+    assert any(
+        "removed canonically resolved historical prior-item disposition ID(s) item-1 "
+        "despite incomplete ledger" in message
+        for message in logged
+    )
+
 def test_issue_loop_plan_first_resumes_with_only_missing_reviewer_for_current_plan(tmp_path):
     current_plan = "Revised plan.\n- Add state reconstruction.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     coder_comment = _attach_round_metadata(

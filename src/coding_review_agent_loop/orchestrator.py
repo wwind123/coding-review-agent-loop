@@ -325,6 +325,7 @@ from .repair import (
     attempt_repair,
     execute_repair,
     strip_unknown_prior_item_dispositions,
+    unknown_dispositions_are_resolved_history,
     require_recoverable_fresh_execution_contract,
     require_recoverable_fresh_risk_test_matrix_contract,
 )
@@ -455,6 +456,7 @@ from .round_state import (
     _deserialize_disposition,
     _deserialize_unresolved_item,
     _encode_round_metadata,
+    _canonically_resolved_history_item_ids,
     _extract_round_metadata_records,
     _latest_pr_approved_reviews_for_head,
     _max_unresolved_item_number_from_records,
@@ -2822,6 +2824,24 @@ def _capture_terminal_plan_repair_rejection(
     return None
 
 
+def _history_strip_allowed(
+    text: str,
+    exc: UnknownPriorItemDispositionError,
+    *,
+    resolved_history_item_ids: Sequence[str] | None,
+    expected_kind: str | None,
+) -> bool:
+    """Whether an incomplete-ledger strip removes only no-op historical entries (#862)."""
+    if not resolved_history_item_ids:
+        return False
+    return unknown_dispositions_are_resolved_history(
+        text,
+        unknown_ids=exc.unknown_ids,
+        resolved_history_ids=resolved_history_item_ids,
+        expected_kind=expected_kind,
+    )
+
+
 def _run_validated_agent(
     runner: Runner,
     *,
@@ -2843,6 +2863,7 @@ def _run_validated_agent(
     reject_unsolicited_risk_test_matrix_contract: bool = False,
     repair_allowed_prior_item_ids: Sequence[str] | None = None,
     ledger_incomplete: bool = False,
+    repair_resolved_history_item_ids: Sequence[str] | None = None,
     role: str | None = None,
     label: str | None = None,
     timeout_seconds: float | None = None,
@@ -3560,9 +3581,18 @@ def _run_validated_agent(
                             # so both defects are resolved in one deterministic pass.
                             # Only apply when the original error was structural; when it was
                             # already UnknownPriorItemDispositionError, block 2 handles it.
+                            normalized_history_strip = (
+                                ledger_incomplete
+                                and _history_strip_allowed(
+                                    normalized,
+                                    norm_exc,
+                                    resolved_history_item_ids=repair_resolved_history_item_ids,
+                                    expected_kind=repair_expected_kind,
+                                )
+                            )
                             if (
                                 not isinstance(exc, UnknownPriorItemDispositionError)
-                                and not ledger_incomplete
+                                and (not ledger_incomplete or normalized_history_strip)
                                 and repair_expected_kind in {"pr_review", "plan_review", "plan_revision"}
                             ):
                                 stripped_from_normalized = strip_unknown_prior_item_dispositions(
@@ -3615,13 +3645,23 @@ def _run_validated_agent(
                                     else:
                                         removed = ", ".join(sorted(norm_exc.unknown_ids))
                                         allowed_str = ", ".join(sorted(norm_exc.allowed_ids)) or "(none)"
-                                        log(
-                                            config,
-                                            f"{agent_name}: combined envelope normalization and "
-                                            f"deterministic strip recovered malformed response; "
-                                            f"removed prior-item ID(s) {removed}; "
-                                            f"allowed carried prior IDs: {allowed_str}",
-                                        )
+                                        if normalized_history_strip:
+                                            log(
+                                                config,
+                                                f"{agent_name}: combined envelope normalization and "
+                                                f"deterministic strip removed canonically resolved "
+                                                f"historical prior-item disposition ID(s) {removed} "
+                                                f"despite incomplete ledger; "
+                                                f"allowed carried prior IDs: {allowed_str}",
+                                            )
+                                        else:
+                                            log(
+                                                config,
+                                                f"{agent_name}: combined envelope normalization and "
+                                                f"deterministic strip recovered malformed response; "
+                                                f"removed prior-item ID(s) {removed}; "
+                                                f"allowed carried prior IDs: {allowed_str}",
+                                            )
                                         if usage_record is not None:
                                             usage_record.validation_status = "validated"
                                         return ValidatedAgentResponse(
@@ -3649,12 +3689,22 @@ def _run_validated_agent(
                                 model_used=result.model_used,
                                 **_response_identity_fields(result),
                             )
+                history_strip = (
+                    ledger_incomplete
+                    and isinstance(exc, UnknownPriorItemDispositionError)
+                    and _history_strip_allowed(
+                        text,
+                        exc,
+                        resolved_history_item_ids=repair_resolved_history_item_ids,
+                        expected_kind=repair_expected_kind,
+                    )
+                )
                 if (
                     use_repair
                     and not public_text_is_transient
                     and not response_failure_is_unsupported
                     and isinstance(exc, UnknownPriorItemDispositionError)
-                    and not ledger_incomplete
+                    and (not ledger_incomplete or history_strip)
                     and repair_expected_kind in {"pr_review", "plan_review", "plan_revision"}
                 ):
                     stripped_text = strip_unknown_prior_item_dispositions(
@@ -3707,11 +3757,19 @@ def _run_validated_agent(
                         else:
                             removed = ", ".join(sorted(exc.unknown_ids))
                             allowed_str = ", ".join(sorted(exc.allowed_ids)) or "(none)"
-                            log(
-                                config,
-                                f"{agent_name}: deterministically removed unknown prior-item "
-                                f"disposition ID(s) {removed}; allowed carried prior IDs: {allowed_str}",
-                            )
+                            if history_strip:
+                                log(
+                                    config,
+                                    f"{agent_name}: removed canonically resolved historical "
+                                    f"prior-item disposition ID(s) {removed} despite incomplete "
+                                    f"ledger; allowed carried prior IDs: {allowed_str}",
+                                )
+                            else:
+                                log(
+                                    config,
+                                    f"{agent_name}: deterministically removed unknown prior-item "
+                                    f"disposition ID(s) {removed}; allowed carried prior IDs: {allowed_str}",
+                                )
                             if usage_record is not None:
                                 usage_record.validation_status = "validated"
                             return ValidatedAgentResponse(
@@ -7331,6 +7389,40 @@ def _round_ledger_may_be_incomplete(
     return same_subject_incomplete or cross_subject_incomplete
 
 
+def _round_resolved_history_item_ids(
+    *,
+    ledger_incomplete: bool,
+    prior_unresolved_items: Sequence[UnresolvedReviewItem],
+    comments: Sequence[object],
+    flow: str,
+    reconciliation_mode: str,
+    same_status: str,
+) -> tuple[str, ...]:
+    """IDs whose recorded history proves canonical resolution (#862).
+
+    Only needed when the round ledger may be incomplete: it lets the
+    deterministic strip remove a reviewer's no-op ``resolved`` disposition of
+    an item cleared in an earlier round.  Undecodable metadata yields no
+    history, so recovery stays fail-closed.
+    """
+    if not ledger_incomplete:
+        return ()
+    try:
+        records = _extract_round_metadata_records(comments, flow=flow)
+    except AgentLoopError:
+        return ()
+    return tuple(
+        sorted(
+            _canonically_resolved_history_item_ids(
+                records,
+                reconciliation_mode=reconciliation_mode,
+                same_status=same_status,
+                current_carried_ids=tuple(item.item_id for item in prior_unresolved_items),
+            )
+        )
+    )
+
+
 def _infer_staged_parent_issue(issue_context: IssueContext) -> int | None:
     """Read only generated child-issue markers for direct staged safety checks."""
     candidates: set[int] = set()
@@ -8682,6 +8774,14 @@ def _run_plan_first_loop(
             flow="plan",
             current_subject=current_plan_subject,
         )
+        round_resolved_history_item_ids = _round_resolved_history_item_ids(
+            ledger_incomplete=round_ledger_incomplete,
+            prior_unresolved_items=prior_unresolved_items,
+            comments=issue_context.comments,
+            flow="plan",
+            reconciliation_mode="aggregate",
+            same_status="same-plan",
+        )
         use_compact_context = (
             config.planning_context_mode == "compact"
             and round_number >= 2
@@ -8823,6 +8923,7 @@ def _run_plan_first_loop(
                                 item.item_id for item in prior_unresolved_items
                             ),
                             ledger_incomplete=round_ledger_incomplete,
+                            repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
                             operation_description="plan review",
                         )
@@ -8962,6 +9063,7 @@ def _run_plan_first_loop(
                     ),
                     repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
                     ledger_incomplete=round_ledger_incomplete,
+                    repair_resolved_history_item_ids=round_resolved_history_item_ids,
                     role="reviewer",
                     operation_description="plan review",
                 )
@@ -14153,6 +14255,18 @@ def run_pr_loop(
                 flow="pr",
                 current_subject=current_pr_subject,
             )
+            round_resolved_history_item_ids = _round_resolved_history_item_ids(
+                ledger_incomplete=round_ledger_incomplete,
+                prior_unresolved_items=prior_unresolved_items,
+                comments=pr_comments,
+                flow="pr",
+                reconciliation_mode=(
+                    "owner-scoped"
+                    if scheduler_capabilities.owner_scoped_reconciliation
+                    else "aggregate"
+                ),
+                same_status="same-pr",
+            )
             use_compact_pr_context = (
                 config.pr_review_context_mode == "compact"
                 and round_number >= 2
@@ -15088,6 +15202,7 @@ def run_pr_loop(
                                         item.item_id for item in prior_unresolved_items
                                     ),
                                     ledger_incomplete=round_ledger_incomplete,
+                                    repair_resolved_history_item_ids=round_resolved_history_item_ids,
                                     role="reviewer",
                                     operation_description="PR review",
                                 )
@@ -15351,6 +15466,7 @@ def run_pr_loop(
                                 item.item_id for item in prior_unresolved_items
                             ),
                             ledger_incomplete=round_ledger_incomplete,
+                            repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
                             operation_description="PR review",
                         )
