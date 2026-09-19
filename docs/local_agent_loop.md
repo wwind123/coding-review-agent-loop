@@ -927,9 +927,17 @@ silently.
 `AGENT_LOOP_META` uses a `v1_` prefix followed by zlib-compressed URL-safe
 base64 data (legacy plain-base64 markers remain readable). If metadata cannot
 fit in one GitHub comment, the loop posts `AGENT_LOOP_SIDECAR` transport comments
-before the metadata-bearing anchor. Keep those sidecars with the anchor: resume
-fails loudly if one is missing or corrupt, at which point restore the sidecars
-or remove the incomplete anchor and rerun.
+before the metadata-bearing anchor. Sidecars carry machine-readable overflow
+data for the following agent-loop comment; they are not independent agent
+responses. Each sidecar starts with a deterministic visible label giving its
+position and total, for example `Agent-loop review attachment 1/3
+(machine-readable overflow: canonical_reviewer_response)`. The label says plan,
+plan review, or review only when the round metadata's flow and role establish
+it, and uses neutral `agent-loop attachment` wording otherwise. The hidden
+marker and its payload are unchanged, and older marker-only sidecars (which
+GitHub renders as "No description provided.") remain valid. Keep those
+sidecars with the anchor: resume fails loudly if one is missing or corrupt, at
+which point restore the sidecars or remove the incomplete anchor and rerun.
 
 Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
 require multiple reviewers:

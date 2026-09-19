@@ -11846,3 +11846,79 @@ def test_840_startup_undecodable_history_keeps_legacy_error_for_other_policies(t
         run_pr_loop(runner, pr_number=77, config=config)
     assert not isinstance(raised.value, orchestrator.PrePanelSafetyError)
     assert not _scheduling_diagnostics(runner)
+
+
+# --- Visible sidecar labels on the PR posting seam (#842) --------------------
+
+
+def _oversized_pr_round_body(role: str):
+    import os
+
+    from coding_review_agent_loop.protocol_markers import TrustedBody
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+
+    text = _attach_round_metadata(
+        "Visible PR round response",
+        PostedRoundMetadata(
+            flow="pr",
+            role=role,
+            agent="claude",
+            round_number=2,
+            subject="sidecar-label-pr-seam",
+            canonical_reviewer_response=base64.urlsafe_b64encode(os.urandom(70_000)).decode("ascii"),
+        ),
+    )
+    return TrustedBody.canonical(text, expected_tokens=("AGENT_LOOP_META",))
+
+
+def _post_oversized_pr_round(monkeypatch, role: str) -> list[str]:
+    import coding_review_agent_loop.github as github_module
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    posted: list[str] = []
+
+    class _Runner:
+        def run(self, args, *, cwd, input_text=None, check=True, env=None):
+            posted.append(Path(args[args.index("--body-file") + 1]).read_text())
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    github_module.post_pr_comment(
+        _Runner(),
+        config=SimpleNamespace(quiet=True, dry_run=False, gh_cmd="gh", repo="owner/repo"),
+        pr_number=857,
+        body=_oversized_pr_round_body(role),
+    )
+    return posted
+
+
+def test_pr_reviewer_round_sidecars_use_review_wording_before_anchor(monkeypatch):
+    from coding_review_agent_loop.round_transport import (
+        ROUND_RESUME_MARKER_RE,
+        ROUND_TRANSPORT_SIDECAR_RE,
+        is_round_transport_sidecar,
+    )
+
+    posted = _post_oversized_pr_round(monkeypatch, "reviewer")
+
+    sidecars, anchor = posted[:-1], posted[-1]
+    assert sidecars
+    for position, body in enumerate(sidecars, start=1):
+        assert body.startswith(f"Agent-loop review attachment {position}/{len(sidecars)} ")
+        assert body.endswith(ROUND_TRANSPORT_SIDECAR_RE.search(body).group(0))
+        assert "see the following review comment." in body
+        payload = json.loads(
+            base64.urlsafe_b64decode(ROUND_TRANSPORT_SIDECAR_RE.search(body).group("payload"))
+        )
+        assert "kind" not in payload
+    assert not is_round_transport_sidecar(anchor)
+    assert ROUND_RESUME_MARKER_RE.search(anchor)
+
+
+def test_pr_coder_response_sidecars_use_neutral_wording(monkeypatch):
+    posted = _post_oversized_pr_round(monkeypatch, "coder")
+
+    sidecars = posted[:-1]
+    assert sidecars
+    for body in sidecars:
+        assert body.startswith("Agent-loop agent-loop attachment ")
+        assert "review attachment" not in body and "plan attachment" not in body
