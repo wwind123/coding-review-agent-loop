@@ -70,6 +70,7 @@ from coding_review_agent_loop.orchestrator import (
     _ensure_finalization_ready,
     _latest_pr_architecture_observation,
     _latest_pr_approved_reviews_for_head,
+    _preserve_issue_created_managed_suppression,
 )
 from coding_review_agent_loop.prompts import (
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
@@ -102,6 +103,29 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_pr_review,
 )
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+def test_interrupted_tool_created_managed_pr_retains_suppression(origin):
+    contract = ManagedCiContract(origin=origin, issue_created_pr=origin == "issue-created")
+
+    assert _preserve_issue_created_managed_suppression(
+        contract,
+        active_exception=AgentLoopError("malformed coder handoff"),
+    )
+    assert not _preserve_issue_created_managed_suppression(
+        contract,
+        active_exception=None,
+    )
+
+
+def test_interrupted_existing_pr_adoption_does_not_claim_durable_suppression():
+    contract = ManagedCiContract(adopted_existing_pr=True)
+
+    assert not _preserve_issue_created_managed_suppression(
+        contract,
+        active_exception=AgentLoopError("review failed"),
+    )
 
 
 def test_latest_pr_architecture_observation_uses_new_checkpoint_once():

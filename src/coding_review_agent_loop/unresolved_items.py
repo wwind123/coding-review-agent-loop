@@ -8,6 +8,7 @@ from dataclasses import replace
 
 from .errors import (
     AgentLoopError,
+    HumanDecisionRequiredError,
     IssueImplementationConflictError,
     UnknownPriorItemDispositionError,
 )
@@ -378,9 +379,9 @@ def _raise_if_maintained_disputed_items(
         )
         for item in disputed_still_blocking
     )
-    raise AgentLoopError(
+    raise HumanDecisionRequiredError(
         f"Reviewer did not resolve {len(disputed_still_blocking)} disputed item(s) "
-        "after seeing coder counter-evidence. Human review required to resolve the "
+        "after seeing coder counter-evidence. Human decision required to resolve the "
         f"disagreement.\n\nDisputed items still unresolved:\n{item_summaries}"
     )
 

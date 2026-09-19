@@ -33,7 +33,7 @@ from .config import (
     resolve_base_branch,
     reviewers,
 )
-from .errors import AgentLoopError, QuotaResetExceededError
+from .errors import AgentLoopError, HumanDecisionRequiredError, QuotaResetExceededError
 from .managed_ci import (
     PREFLIGHT_INDETERMINATE,
     PREFLIGHT_KNOWN_NOT_READY,
@@ -1600,6 +1600,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 discuss_max_rounds=getattr(args, "discuss_max_rounds", 2),
             )
         parser.error(f"unknown command: {args.command}")
+    except HumanDecisionRequiredError as exc:
+        print(f"agent-loop: HUMAN DECISION REQUIRED\n{exc}", file=sys.stderr)
+        return HumanDecisionRequiredError.EXIT_CODE
     except QuotaResetExceededError as exc:
         print(f"agent-loop: {exc}", file=sys.stderr)
         return QuotaResetExceededError.EXIT_CODE

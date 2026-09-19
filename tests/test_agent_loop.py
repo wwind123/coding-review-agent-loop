@@ -33,6 +33,7 @@ from coding_review_agent_loop.cli import (
 )
 from coding_review_agent_loop.comment_rendering import normalize_freeform_signature
 from coding_review_agent_loop.containment import ContainmentEvidence
+from coding_review_agent_loop.errors import HumanDecisionRequiredError
 from coding_review_agent_loop.config import (
     default_agent_memory_dir,
     default_agent_workdir,
@@ -1544,6 +1545,19 @@ def test_config_records_explicit_managed_ci_without_implying_auto_merge(tmp_path
 def test_explicit_managed_ci_requires_trusted_actor_before_agent_preflight(capsys):
     assert main(["pr", "77", "--repo", "OWNER/REPO", "--managed-ci"]) == 1
     assert "--managed-ci requires --managed-ci-trusted-actor" in capsys.readouterr().err
+
+
+def test_cli_distinguishes_human_decision_from_generic_failure(capsys):
+    with patch.object(
+        cli_module,
+        "run_pr_loop",
+        side_effect=HumanDecisionRequiredError("Reviewer positions conflict."),
+    ):
+        assert main(["pr", "77", "--repo", "OWNER/REPO"]) == 4
+
+    stderr = capsys.readouterr().err
+    assert "HUMAN DECISION REQUIRED" in stderr
+    assert "Reviewer positions conflict." in stderr
 
 
 @pytest.mark.parametrize(

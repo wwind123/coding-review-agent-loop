@@ -82,6 +82,7 @@ from .errors import (
     AgentLoopError,
     DeterministicPlanValidationExhaustion,
     FreshContractIntegrityError,
+    HumanDecisionRequiredError,
     IssueImplementationConflictError,
     QuotaResetExceededError,
     UnknownPriorItemDispositionError,
@@ -172,6 +173,7 @@ from .managed_ci import (
     AuthenticatedIssueCreatedHandoff,
     FINAL_CONTEXT,
     MANAGED_LABEL,
+    ManagedCiContract,
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
     activate_managed_ci,
@@ -12481,6 +12483,23 @@ def _fresh_pr_qualification_snapshot(
     return context, requirement_ids, fresh_approved_plan_context, config
 
 
+def _preserve_issue_created_managed_suppression(
+    contract: ManagedCiContract | None,
+    *,
+    active_exception: BaseException | None,
+) -> bool:
+    """Keep tool-created PRs suppressed when orchestration is interrupted."""
+
+    return bool(
+        active_exception is not None
+        and contract is not None
+        and (
+            contract.issue_created_pr
+            or contract.origin in {"issue-created", "source-managed"}
+        )
+    )
+
+
 def run_pr_loop(
     runner: Runner,
     *,
@@ -12504,6 +12523,7 @@ def run_pr_loop(
     ordinary_recovery: OrdinaryRecoveryCapability | None = None
     ordinary_recovery_selected = False
     managed_ci_qualified = False
+    human_decision_required = False
     managed_pr_recovered = False
     authenticated_managed_resume: AuthenticatedManagedResume | None = None
     try:
@@ -15700,10 +15720,28 @@ def run_pr_loop(
             must_fix_items = list(item_partitions["coder_blockers"])
 
             if must_fix_items:
-                _raise_if_maintained_disputed_items(
-                    must_fix_items,
-                    prior_items=prior_unresolved_items,
-                )
+                try:
+                    _raise_if_maintained_disputed_items(
+                        must_fix_items,
+                        prior_items=prior_unresolved_items,
+                    )
+                except HumanDecisionRequiredError as exc:
+                    human_decision_required = True
+                    post_pr_comment(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        body=(
+                            "## Human decision required\n\n"
+                            f"{exc}\n\n"
+                            "Post a PR comment that states the decision and required action, "
+                            "and end it with the standalone signature `-- Human Reviewer`. "
+                            "Then rerun this PR; no coder, CI, qualification, or merge was "
+                            "started from this decision boundary.\n\n"
+                            "-- coding-review-agent-loop"
+                        ),
+                    )
+                    raise
                 if selective_policy:
                     unavailable_names = {
                         agent_display_name(reviewer)
@@ -17692,9 +17730,22 @@ def run_pr_loop(
         )
     finally:
         cleanup_failure: AgentLoopError | None = None
+        active_exception = sys.exc_info()[1]
+        preserve_issue_created_suppression = _preserve_issue_created_managed_suppression(
+            managed_ci,
+            active_exception=active_exception,
+        )
+        if preserve_issue_created_suppression:
+            log(
+                config,
+                f"PR #{pr_number}: retaining `{MANAGED_LABEL}` after interrupted managed run; "
+                "resume the exact PR after correcting the reported condition",
+            )
         if (
             managed_ci is not None
             and not managed_ci_qualified
+            and not human_decision_required
+            and not preserve_issue_created_suppression
         ):
             should_release = (
                 managed_ci.adopted_existing_pr
@@ -17717,7 +17768,6 @@ def run_pr_loop(
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)
         if cleanup_failure is not None:
-            active_exception = sys.exc_info()[1]
             if active_exception is not None:
                 # Preserve the original failure while making cleanup failure
                 # visible in its traceback. Usage accounting above must run
