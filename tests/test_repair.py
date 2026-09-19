@@ -4392,3 +4392,111 @@ def test_build_repair_prompt_includes_new_discuss_expected_kind_schemas(kind, fo
     assert f"You MUST repair this response as `{kind}`." in prompt
     assert format_name in prompt
     assert field in prompt
+
+
+# --- #872: semantic plan_revision_patch disposition stripping -----------------
+
+from coding_review_agent_loop.orchestrator import _validate_plan_revision_patch_response
+
+
+def _semantic_patch_text(dispositions):
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Address the remaining reviewer finding.",
+        "prior_plan_item_dispositions": dispositions,
+        "base_round_number": 2,
+        "base_state_identity": "a" * 64,
+        "operations": [
+            {"op": "replace", "field": "summary", "value": "Revised plan summary."}
+        ],
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def test_strip_unknown_prior_item_dispositions_supports_semantic_patch():
+    raw = _semantic_patch_text([
+        {"item_id": "item-1", "disposition": "blocking", "note": "still open"},
+        {"item_id": "item-3", "disposition": "resolved"},
+    ])
+
+    result = strip_unknown_prior_item_dispositions(
+        raw, allowed_ids=frozenset({"item-1"}), expected_kind="plan_revision_patch"
+    )
+
+    assert result is not None
+    payload, json_end = json.JSONDecoder().raw_decode(result.lstrip())
+    assert payload["prior_plan_item_dispositions"] == [
+        {"item_id": "item-1", "disposition": "blocking", "note": "still open"}
+    ]
+    # The patch's semantic operations and base binding must survive untouched.
+    assert payload["operations"] == [
+        {"op": "replace", "field": "summary", "value": "Revised plan summary."}
+    ]
+    assert payload["base_round_number"] == 2
+    assert payload["base_state_identity"] == "a" * 64
+    trailing = result.lstrip()[json_end:]
+    assert "<!-- AGENT_PLAN_STATE: blocking -->" in trailing
+    assert "-- Anthropic Claude" in trailing
+
+
+def test_resolved_history_predicate_supports_semantic_patch():
+    raw = _semantic_patch_text([{"item_id": "item-3", "disposition": "resolved"}])
+
+    assert unknown_dispositions_are_resolved_history(
+        raw,
+        unknown_ids=("item-3",),
+        resolved_history_ids=("item-2", "item-3"),
+        expected_kind="plan_revision_patch",
+    )
+    assert not unknown_dispositions_are_resolved_history(
+        _semantic_patch_text([{"item_id": "item-3", "disposition": "blocking", "note": "n"}]),
+        unknown_ids=("item-3",),
+        resolved_history_ids=("item-3",),
+        expected_kind="plan_revision_patch",
+    )
+
+
+def test_run_validated_agent_strips_resolved_echo_from_semantic_patch(tmp_path):
+    # Regression for #872: the planner echoes items resolved in earlier rounds;
+    # repair cannot touch a patch, so the deterministic strip must apply.
+    carried = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="OpenAI Codex",
+        source_round=2,
+        text="The readiness gate must publish before the watchdog fires.",
+        status="blocking",
+    )
+    patch_text = _semantic_patch_text([
+        {"item_id": "item-1", "disposition": "blocking", "note": "still open"},
+        {"item_id": "item-2", "disposition": "resolved"},
+        {"item_id": "item-3", "disposition": "resolved"},
+    ])
+    runner = FakeRunner(claude_outputs=[patch_text])
+    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Revise the plan.",
+            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            validate=lambda text: _validate_plan_revision_patch_response(
+                text, unresolved_items=(carried,)
+            ),
+            use_repair=True,
+            repair_expected_kind="plan_revision_patch",
+            repair_allowed_prior_item_ids=("item-1",),
+        )
+        repair_mock.assert_not_called()
+
+    payload, _ = json.JSONDecoder().raw_decode(response.text.lstrip())
+    assert payload["prior_plan_item_dispositions"] == [
+        {"item_id": "item-1", "disposition": "blocking", "note": "still open"}
+    ]
+    assert payload["operations"] == [
+        {"op": "replace", "field": "summary", "value": "Revised plan summary."}
+    ]

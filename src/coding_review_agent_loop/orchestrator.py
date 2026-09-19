@@ -3593,7 +3593,7 @@ def _run_validated_agent(
                             if (
                                 not isinstance(exc, UnknownPriorItemDispositionError)
                                 and (not ledger_incomplete or normalized_history_strip)
-                                and repair_expected_kind in {"pr_review", "plan_review", "plan_revision"}
+                                and repair_expected_kind in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}
                             ):
                                 stripped_from_normalized = strip_unknown_prior_item_dispositions(
                                     normalized,
@@ -3705,7 +3705,7 @@ def _run_validated_agent(
                     and not response_failure_is_unsupported
                     and isinstance(exc, UnknownPriorItemDispositionError)
                     and (not ledger_incomplete or history_strip)
-                    and repair_expected_kind in {"pr_review", "plan_review", "plan_revision"}
+                    and repair_expected_kind in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}
                 ):
                     stripped_text = strip_unknown_prior_item_dispositions(
                         text,
@@ -10016,6 +10016,7 @@ def _run_plan_first_loop(
             ),
             repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
             ledger_incomplete=round_ledger_incomplete,
+            repair_resolved_history_item_ids=round_resolved_history_item_ids,
             operation_description="plan revision",
             plan_validation_failure_handler=(
                 None if semantic_revision else lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(

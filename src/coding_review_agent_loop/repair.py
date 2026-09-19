@@ -76,7 +76,7 @@ def strip_unknown_prior_item_dispositions(
     or None when the input cannot be parsed or nothing needs to be removed.
     The caller must re-validate the returned text before using it.
     """
-    if expected_kind not in {"pr_review", "plan_review", "plan_revision"}:
+    if expected_kind not in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}:
         return None
     disposition_field = (
         "prior_item_dispositions"
@@ -124,7 +124,7 @@ def unknown_dispositions_are_resolved_history(
     Any other shape (active disposition, unparseable text, wrong kind, an ID
     outside history) returns False so the caller keeps failing closed.
     """
-    if expected_kind not in {"pr_review", "plan_review", "plan_revision"}:
+    if expected_kind not in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}:
         return False
     unknown = frozenset(unknown_ids)
     if not unknown or not unknown <= frozenset(resolved_history_ids):
