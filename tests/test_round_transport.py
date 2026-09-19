@@ -1392,3 +1392,67 @@ def test_staged_scheduler_phase_fields_roundtrip_and_fail_closed_when_contradict
         }
     )
     assert partial.scheduler_metadata_status == "invalid"
+
+
+def test_scheduler_force_full_source_roundtrips_and_fails_closed() -> None:
+    """#840: the force-full audit source is optional, strict, and legacy-safe."""
+    contract = ReviewSchedulingContract(
+        required_reviewers=("Codex", "Gemini"),
+        policy="primary-then-panel",
+        primary_reviewer="Codex",
+        broad_rules=("src/**",),
+    )
+    base = dict(
+        flow="pr",
+        role="summary",
+        agent="Orchestrator",
+        round_number=2,
+        subject="newhead123",
+        scheduler_contract=contract.as_dict(),
+        scheduler_previous_sha="oldhead123",
+        scheduler_current_sha="newhead123",
+        scheduler_obligation_digest="0123456789abcdef",
+        scheduler_selected_reviewers=("Codex", "Gemini"),
+        scheduler_reasons=("operator force-full",),
+        scheduler_final_sweep=False,
+        scheduler_calls_avoided=0,
+        scheduler_phase="full-board",
+        scheduler_primary_reviewer="Codex",
+    )
+    for source in ("operator", "automatic"):
+        metadata = PostedRoundMetadata(
+            **base, scheduler_force_full=True, scheduler_force_full_source=source
+        )
+        payload = transport.decode_mapping(_encode_round_metadata(metadata))
+        assert payload["scheduler_force_full_source"] == source
+        decoded = _decode_round_metadata_mapping(payload)
+        assert decoded.scheduler_metadata_status == "valid"
+        assert decoded.scheduler_force_full is True
+        assert decoded.scheduler_force_full_source == source
+        assert _decode_round_metadata_mapping(payload) == decoded
+
+    unlatched = PostedRoundMetadata(**base, scheduler_force_full=False)
+    payload = transport.decode_mapping(_encode_round_metadata(unlatched))
+    # The optional key is omitted when unset, preserving the legacy shape.
+    assert "scheduler_force_full_source" not in payload
+    assert _decode_round_metadata_mapping(payload).scheduler_force_full_source is None
+
+    # An unknown source, or a source without an active latch, is invalid
+    # scheduler metadata rather than silently trusted.
+    for bad_payload in (
+        {**payload, "scheduler_force_full": True, "scheduler_force_full_source": "human"},
+        {**payload, "scheduler_force_full": True, "scheduler_force_full_source": 1},
+        {**payload, "scheduler_force_full": False, "scheduler_force_full_source": "operator"},
+    ):
+        decoded = _decode_round_metadata_mapping(bad_payload)
+        assert decoded.scheduler_metadata_status == "invalid"
+        assert decoded.scheduler_force_full_source is None
+    with pytest.raises(ValueError, match="force-full source"):
+        PostedRoundMetadata(**base, scheduler_force_full=False, scheduler_force_full_source="operator")
+
+    # Legacy latched records without a source still decode as valid metadata.
+    legacy = {**payload, "scheduler_force_full": True}
+    legacy_decoded = _decode_round_metadata_mapping(legacy)
+    assert legacy_decoded.scheduler_metadata_status == "valid"
+    assert legacy_decoded.scheduler_force_full is True
+    assert legacy_decoded.scheduler_force_full_source is None

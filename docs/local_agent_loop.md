@@ -1278,7 +1278,8 @@ state, phase/primary/owner identities, exact-head approval evidence, and
 cumulative scheduler-policy calls avoided. Derived approvals and
 obligations continue to come from reviewer records and the canonical ledger.
 Missing, malformed, contradictory, or legacy scheduler metadata selects the
-full board. A changed reviewer set, policy, or broad-rule digest stops rather
+full board (under `primary-then-panel` before a qualified panel opening it
+instead re-invokes only the primary; see below). A changed reviewer set, policy, or broad-rule digest stops rather
 than weakening an in-flight run. Issue-mode implementation handoffs carry the
 same PR policy; planning and discussion scheduling are intentionally outside
 this feature.
@@ -1302,21 +1303,87 @@ The scheduler phases are `primary`, `secondary-audit`, `remediation`,
 4. `final-secondary-sweep`: owner/primary clearance is followed by a mandatory
    complete-diff sweep of every secondary without qualifying approval on the
    new head, before any CI or merge gate.
-5. `full-board`: any active finding whose change is broad, out of scope,
-   non-textual, missing scope, disputed, or unreconstructible, any head change
-   after panel evidence exists, a secondary-owned finding with no panel phase
-   evidence, or the force-full latch selects the complete board.
+5. `full-board`: after a qualified panel opening, any active finding whose
+   change is broad, out of scope, non-textual, missing scope, disputed, or
+   unreconstructible, any unsafe head change, or the automatic latch selects
+   the complete board. The operator force-full latch selects it in any phase.
 
-Whether the panel has been opened is reconstructed from the durable phase
-checkpoint in the latest valid scheduler record; the checkpoint never grants
-an approval and cannot bypass the primary gate. A secondary that has never
-reviewed is not a "returning" reviewer: its first invocation always receives
-the complete diff, so only reviewers with a prior record need reconstructible
-span history. `--pr-review-force-full` is a monotonic durable latch. For this
-policy, a full board raised by scheduler-metadata recovery (legacy records
-without phase authority, malformed or contradictory records, or a missing
-same-head checkpoint) also raises the durable latch and is persisted in every
-later round record, so a resumed run keeps selecting the complete board.
+**Strict pre-panel fallback.** Until the primary first approves an exact head,
+the phase is strictly primary-only. The same uncertainties that would reopen the
+board after the panel instead re-invoke only the primary with full context:
+broad or out-of-scope changes, missing or ambiguous scope, and scope-less
+Orchestrator/CI/machine obligations. So do automatic recovery reasons: an invalid
+or stale qualification checkpoint, an architecture identity change,
+obligation-digest drift, and scheduler-metadata recovery for legacy,
+phase-less, malformed, or subject-contradictory records. These reasons apply to
+the current decision only. They are recorded with `scheduler_force_full: false`,
+and the audit reason is prefixed `strict pre-panel fallback:`. A strict
+fallback turn is a complete current-head review, and an older-head primary
+approval is never carried. When the primary holds the exact-head approval, the
+panel opens (`secondary-audit`) for every available secondary lacking a
+qualified approval. It opens even if a CI or machine obligation remains; the
+reason lists those obligations, and the later coder repair follows post-panel
+rules.
+
+**Qualified panel evidence.** Whether the panel has opened is derived from
+comment-ordered history, never from a phase checkpoint alone. A qualified
+opening is either a scheduler record with `scheduler_force_full: true` and
+`scheduler_force_full_source: operator`, or a `secondary-audit` record for head
+S that lists the primary as approved and is preceded by the primary's approved
+review of S. Every record after the first qualified opening is post-panel
+state. Anything that only looks like a panel before it is an unqualified
+premature-panel artifact and is ignored (the audit notes it): secondary
+reviews, `full-board`/`remediation` checkpoints, and automatic or legacy
+unattributed force-full latches. A secondary approval counts toward carried
+approvals, resume, and the exact-head barrier only when its record comes after
+the first qualified opening. Premature secondary approvals are therefore neither
+resumed nor carried, and they never shrink the first `secondary-audit`. An
+operator opening qualifies only records written after it, for every reviewer.
+
+**Post-panel fallback.** After a qualified opening, owner-scoped remediation and
+the conservative full board behave as before, and their audit reasons are
+prefixed `post-panel fallback:`. A post-panel full-board decision (an unsafe
+broad, ambiguous, or out-of-scope transition) and every automatic recovery
+reason raise the monotonic durable latch, persisted with
+`scheduler_force_full_source: automatic`, so a later narrow head keeps the
+complete board. On resume, automatic latches and legacy latches without a source are
+restored only when they come after the qualified opening. A legacy latch that
+predates any qualified opening is ambiguous between operator intent and the
+pre-#840 escalation, so it is not honored. The audit reason says to rerun with
+`--pr-review-force-full` to restore the complete board.
+
+**Diagnostic stop and operator override.** The run stops with a plain
+`PR review scheduling diagnostic` comment, and no reviewer, coder, CI,
+qualification, or merge step runs, when pre-panel safety cannot be established
+without the panel. That covers three cases: an active finding pending on a
+configured secondary (required reviewers minus the primary) with no qualified
+opening; an interrupted round's premature secondary review that is blocking or
+carries new items; and scheduler history that cannot be decoded. The last case
+is checked at startup and at every round boundary. It stops even with
+`--pr-review-force-full`, because resume, approval, ledger, and qualification
+accounting all depend on that history; restore the missing round-metadata
+records or sidecars (or remove the incomplete record) and rerun. The diagnostic
+never fires for Orchestrator, CI, machine, or human-requirement obligations.
+For the first two cases `--pr-review-force-full` is the escape hatch. It is durable for the run and
+every resume, recorded with source `operator`, and itself a qualified opening.
+Under the override, a premature blocking secondary review is superseded. It is
+excluded from resume, approval, ledger, and ownership accounting. The operator
+opening's audit comment lists it by reviewer, round, head, and item IDs. The
+same secondary is then freshly invoked with its earlier claims supplied only in
+a non-authoritative "superseded pre-panel review context" prompt block. Only the
+post-opening review establishes findings, ownership, and approval.
+
+**Quota versus safety.** Pre-panel uncertainty costs one extra primary turn
+rather than N secondary turns. No safety is lost, because the panel's first
+invocation is always a complete, independent base-to-head review, and every
+configured reviewer must still approve the exact final head. Post-panel
+uncertainty stays conservative. The diagnostic stop trades availability for
+quota in rare contradictory-history cases, and the operator override restores
+the full board.
+
+A secondary that has never reviewed is not a "returning" reviewer: its first
+invocation always receives the complete diff, so only reviewers with a prior
+record need reconstructible span history.
 Any failure, timeout, unavailability, incomplete output, or head mutation
 remains blocking and invalidates nonmatching approvals; the settled results of
 healthy parallel reviewers are recorded while the failed reviewer stays

@@ -3788,21 +3788,83 @@ follow-ups for compatibility, but prefer `### Future follow-ups`.
 """
 
 
+SUPERSEDED_PREPANEL_CONTEXT_MAX_CLAIMS = 12
+SUPERSEDED_PREPANEL_CONTEXT_MAX_CHARS = 600
+
+
+@dataclass(frozen=True)
+class SupersededPrepanelReview:
+    """A premature pre-panel review replaced under the operator override (#840)."""
+
+    reviewer: str
+    round_number: int
+    head_sha: str
+    state: str
+    summary: str = ""
+    claims: tuple[str, ...] = ()
+    item_ids: tuple[str, ...] = ()
+
+
+def _bounded_context_text(text: str) -> str:
+    value = " ".join(sanitize_historical_text(text).split())
+    if len(value) > SUPERSEDED_PREPANEL_CONTEXT_MAX_CHARS:
+        value = value[: SUPERSEDED_PREPANEL_CONTEXT_MAX_CHARS - 3].rstrip() + "..."
+    return value
+
+
+def superseded_prepanel_review_context_block(
+    review: SupersededPrepanelReview | None,
+) -> str:
+    """Render the reviewer's own superseded premature review as context only."""
+    if review is None:
+        return ""
+    lines = [
+        "",
+        "Superseded pre-panel review context (non-authoritative; context only):",
+        f"Your earlier {review.state or 'unknown'} review of head {review.head_sha} in round "
+        f"{review.round_number} was recorded before any qualified panel opening. The operator "
+        "override superseded it: it is not a finding, not a disposition, not an approval, and "
+        "none of its claims entered the unresolved-item ledger"
+        + (f" (superseded item IDs: {', '.join(review.item_ids)})" if review.item_ids else "")
+        + ".",
+        "Review the current head independently. Re-raise any concern below that still holds "
+        "as a new finding of this review, or leave it out. Do not disposition these claims "
+        "as prior items.",
+    ]
+    if review.summary.strip():
+        lines.append(f"- Earlier summary: {_bounded_context_text(review.summary)}")
+    for claim in review.claims[:SUPERSEDED_PREPANEL_CONTEXT_MAX_CLAIMS]:
+        lines.append(f"- Earlier claim: {_bounded_context_text(claim)}")
+    if len(review.claims) > SUPERSEDED_PREPANEL_CONTEXT_MAX_CLAIMS:
+        lines.append(
+            f"- ({len(review.claims) - SUPERSEDED_PREPANEL_CONTEXT_MAX_CLAIMS} more earlier "
+            "claims omitted)"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _pr_review_scheduling_guidance(config: AgentLoopConfig) -> str:
     if config.pr_review_policy == "primary-then-panel":
         primary = config.primary_reviewer or "(missing; configuration is invalid)"
         return f"""PR review scheduling is using the opt-in `primary-then-panel` policy.
 `{primary}` is the configured primary reviewer. The primary must approve the exact
-current head before the secondary panel starts. After that approval, every
-configured secondary reviewer receives an independent review of the complete
+current head before the secondary panel starts. Before that first approval the
+pre-panel phase is strictly primary-only: a broad change, missing or ambiguous
+fix scope, recovery ambiguity, or scheduler-metadata uncertainty re-invokes only
+the primary with full context (a strict pre-panel fallback) instead of spending
+the panel early. After that approval, every configured secondary reviewer
+receives an independent review of the complete
 base-to-head diff and the approved-plan/human-requirement context. Secondary
 reviewers must reach their own conclusions; do not merely validate, repeat, or
 triage findings attributed to the primary. A remediation round rechecks every
 active finding owner together with the primary, then performs an independent
-exact-head sweep for every secondary still missing approval. Any mutation,
-ambiguous ownership/scope/history, reviewer failure, or unavailable reviewer is
-conservative: stale approval is not approval and the required barrier remains
-blocking. The operator's force-full option is durable for the rest of the run.
+exact-head sweep for every secondary still missing approval. After the panel
+has opened, any mutation, ambiguous ownership/scope/history, reviewer failure,
+or unavailable reviewer is conservative (a post-panel owner or full-board
+fallback): stale approval is not approval and the required barrier remains
+blocking. A secondary approval counts only when recorded after the qualified
+panel opening. The operator's force-full option authorizes the complete board
+before primary approval and is durable for the rest of the run.
 """
     if config.pr_review_policy != "selective-intermediate":
         return (
@@ -3851,8 +3913,12 @@ def build_review_prompt(
     parent_issue_context: IssueContext | None = None,
     coder_followup_context: str = "",
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    superseded_prepanel_review_context: SupersededPrepanelReview | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
+    coder_followup_context = coder_followup_context + superseded_prepanel_review_context_block(
+        superseded_prepanel_review_context
+    )
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
     reviewer_group = format_agent_list(reviewers(config))

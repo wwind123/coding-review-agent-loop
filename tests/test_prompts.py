@@ -3835,10 +3835,65 @@ def test_primary_then_panel_review_prompt_demands_independent_complete_diff_audi
         assert "do not merely validate, repeat, or\ntriage findings attributed to the primary" in prompt
         assert "exact-head sweep for every secondary still missing approval" in prompt
         assert "stale approval is not approval" in prompt
-        assert "force-full option is durable" in prompt
+        flat = " ".join(prompt.split())
+        # #840: the pre-panel phase is strictly primary-only, and the guidance
+        # distinguishes that fallback from the post-panel owner/full-board one.
+        assert "the pre-panel phase is strictly primary-only" in flat
+        assert "re-invokes only the primary with full context (a strict pre-panel fallback)" in flat
+        assert "(a post-panel owner or full-board fallback)" in flat
+        assert "A secondary approval counts only when recorded after the qualified panel opening" in flat
+        assert (
+            "force-full option authorizes the complete board before primary approval and is "
+            "durable for the rest of the run"
+        ) in flat
         assert "scheduler-enabled PR policies" in prompt
+        assert "Superseded pre-panel review context" not in prompt
     default_prompt = build_review_prompt(
         77, 2, make_config(tmp_path, reviewer=("codex", "gemini")), reviewer="codex"
     )
     assert "compatibility `all-reviewers` policy" in default_prompt
     assert "primary-then-panel" not in default_prompt
+
+
+def test_superseded_prepanel_review_context_block_is_non_authoritative(tmp_path):
+    from coding_review_agent_loop.prompts import (
+        SupersededPrepanelReview,
+        superseded_prepanel_review_context_block,
+    )
+
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+    )
+    superseded = SupersededPrepanelReview(
+        reviewer="Gemini",
+        round_number=3,
+        head_sha="abc123",
+        state="blocking",
+        summary="Gemini premature summary",
+        claims=("premature cache race", "x" * 2000),
+        item_ids=("item-4",),
+    )
+    assert superseded_prepanel_review_context_block(None) == ""
+    for compact in (False, True):
+        prompt = build_review_prompt(
+            77,
+            3,
+            config,
+            reviewer="gemini",
+            compact_context=compact,
+            superseded_prepanel_review_context=superseded,
+        )
+        flat = " ".join(prompt.split())
+        assert "Superseded pre-panel review context (non-authoritative; context only):" in prompt
+        assert "not a finding, not a disposition, not an approval" in flat
+        assert "none of its claims entered the unresolved-item ledger (superseded item IDs: item-4)" in flat
+        assert "Re-raise any concern below that still holds as a new finding of this review" in flat
+        assert "- Earlier claim: premature cache race" in prompt
+        assert "- Earlier summary: Gemini premature summary" in prompt
+        # Claims are bounded.
+        assert "x" * 700 not in prompt
+    plain = build_review_prompt(77, 3, config, reviewer="gemini")
+    assert "Superseded pre-panel review context" not in plain

@@ -68,7 +68,7 @@ from .protocol import (
     parse_plan_revision_patch,
 )
 from .plan_assembly import decode_assembled_plan_sidecar, rendered_plan_identity
-from .review_scheduling import ReviewSchedulingContract, SCHEDULER_PHASES
+from .review_scheduling import FORCE_FULL_SOURCES, ReviewSchedulingContract, SCHEDULER_PHASES
 from .unresolved_items import _apply_unresolved_item_dispositions
 
 
@@ -177,6 +177,10 @@ class PostedRoundMetadata:
     scheduler_approved_reviewers: tuple[str, ...] = ()
     scheduler_active_owners: tuple[str, ...] = ()
     scheduler_scope_digest: str | None = None
+    # Who raised ``scheduler_force_full`` (#840): ``operator`` for the explicit
+    # override, ``automatic`` for a post-panel recovery latch.  Null when the
+    # latch is off; legacy latched records without it remain valid metadata.
+    scheduler_force_full_source: str | None = None
     # This is an in-memory decode-quality signal, deliberately not serialized.
     # ``absent`` is the legacy-compatible state; ``invalid`` means scheduler
     # fields were present but could not be reconstructed safely.
@@ -215,6 +219,11 @@ class PostedRoundMetadata:
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
+        if self.scheduler_force_full_source is not None and (
+            self.scheduler_force_full_source not in FORCE_FULL_SOURCES
+            or self.scheduler_force_full is not True
+        ):
+            raise ValueError("scheduler force-full source requires an active force-full latch")
         if self.execution_strategy_contract_version not in (None, 1):
             raise ValueError("invalid execution strategy contract version")
         if self.response_form is not None and (
@@ -284,6 +293,7 @@ class PostedRoundMetadata:
                 self.scheduler_approved_reviewers,
                 self.scheduler_active_owners,
                 self.scheduler_scope_digest,
+                self.scheduler_force_full_source,
             )
         ):
             object.__setattr__(self, "scheduler_metadata_status", "valid")
@@ -1300,6 +1310,7 @@ _SCHEDULER_AUXILIARY_KEYS = frozenset(
         "scheduler_approved_reviewers",
         "scheduler_active_owners",
         "scheduler_scope_digest",
+        "scheduler_force_full_source",
     }
 )
 
@@ -1394,6 +1405,13 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
             not isinstance(scope_digest, str) or not re.fullmatch(r"[0-9a-f]{16}", scope_digest)
         ):
             raise ValueError("invalid scheduler scope digest")
+        force_full_source = payload.get("scheduler_force_full_source")
+        if force_full_source is not None and (
+            not isinstance(force_full_source, str)
+            or force_full_source not in FORCE_FULL_SOURCES
+            or force_full is not True
+        ):
+            raise ValueError("invalid scheduler force-full source")
     except (AgentLoopError, TypeError, ValueError, KeyError):
         return {"scheduler_metadata_status": "invalid"}
     return {
@@ -1412,6 +1430,7 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
         "scheduler_approved_reviewers": tuple(approved),
         "scheduler_active_owners": tuple(owners),
         "scheduler_scope_digest": scope_digest,
+        "scheduler_force_full_source": force_full_source,
         "scheduler_metadata_status": "valid",
     }
 
@@ -1668,6 +1687,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "scheduler_approved_reviewers": list(metadata.scheduler_approved_reviewers),
         "scheduler_active_owners": list(metadata.scheduler_active_owners),
         "scheduler_scope_digest": metadata.scheduler_scope_digest,
+        "scheduler_force_full_source": metadata.scheduler_force_full_source,
     }
     if any(value not in (None, (), []) for value in scheduler_values.values()):
         # Phase-aware fields are optional: omit empty ones so records written
