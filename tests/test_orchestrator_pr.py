@@ -17,7 +17,7 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_pr_review_comment,
     render_risk_test_matrix_section,
 )
-from coding_review_agent_loop.errors import QuotaResetExceededError
+from coding_review_agent_loop.errors import HumanDecisionRequiredError, QuotaResetExceededError
 from coding_review_agent_loop.followups import (
     MAX_APPROVED_FOLLOWUP_ISSUES,
     PlanApprovedFollowupSource,
@@ -9926,8 +9926,10 @@ def test_pr_loop_dispute_resolved_when_reviewer_reconsiders(tmp_path):
     assert "Official docs confirm $1.50/1M tokens is correct." in followup_body
 
 
-def test_pr_loop_escalates_to_human_when_reviewer_rejects_dispute(tmp_path):
-    """Coder disputes a blocking item; reviewer still blocks after seeing evidence → escalate."""
+def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
+    tmp_path, monkeypatch
+):
+    """Human-decision escalation releases an invocation-owned adoption label."""
     runner = FakeRunner(
         claude_outputs=[
             structured_coder_followup(
@@ -9957,15 +9959,30 @@ def test_pr_loop_escalates_to_human_when_reviewer_rejects_dispute(tmp_path):
             ),
         ],
     )
+    monkeypatch.setattr(
+        orchestrator,
+        "activate_managed_ci",
+        lambda *_args, **_kwargs: ManagedCiContract(
+            adopted_existing_pr=True,
+            invocation_applied_label=True,
+        ),
+    )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
 
     with pytest.raises(
-        AgentLoopError,
+        HumanDecisionRequiredError,
         match="Reviewer did not resolve 1 disputed item",
     ) as excinfo:
         run_pr_loop(runner, pr_number=55, config=config)
 
     assert "Update/evidence: Codex: I checked and the pricing is still wrong." in str(excinfo.value)
+    assert [
+        "gh",
+        "api",
+        "--method",
+        "DELETE",
+        "repos/OWNER/REPO/issues/55/labels/agent-loop-managed",
+    ] in [command for command, _cwd in runner.commands]
 
 
 def test_pr_loop_escalates_when_reviewer_downgrades_disputed_item_to_same_pr(tmp_path):

@@ -12523,7 +12523,6 @@ def run_pr_loop(
     ordinary_recovery: OrdinaryRecoveryCapability | None = None
     ordinary_recovery_selected = False
     managed_ci_qualified = False
-    human_decision_required = False
     managed_pr_recovered = False
     authenticated_managed_resume: AuthenticatedManagedResume | None = None
     try:
@@ -15726,7 +15725,6 @@ def run_pr_loop(
                         prior_items=prior_unresolved_items,
                     )
                 except HumanDecisionRequiredError as exc:
-                    human_decision_required = True
                     post_pr_comment(
                         runner,
                         config=config,
@@ -17744,7 +17742,6 @@ def run_pr_loop(
         if (
             managed_ci is not None
             and not managed_ci_qualified
-            and not human_decision_required
             and not preserve_issue_created_suppression
         ):
             should_release = (
