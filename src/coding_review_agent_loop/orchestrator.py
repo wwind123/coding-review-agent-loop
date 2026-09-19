@@ -222,6 +222,7 @@ from .prompts import (
     build_plan_revision_prompt,
     build_merge_conflict_prompt,
     build_review_prompt,
+    SupersededPrepanelReview,
     build_same_pr_followup_prompt,
     build_task_clarification_prompt,
     build_task_prompt,
@@ -484,7 +485,9 @@ from .plan_assembly import (
 )
 from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
 from .review_scheduling import (
+    PANEL_OPENED_PHASES,
     GitChange,
+    PrePanelSafetyError,
     ReviewObligation,
     ReviewSchedulingContract,
     SchedulerSnapshot,
@@ -492,6 +495,7 @@ from .review_scheduling import (
     classify_transition,
     make_contract,
     policy_capabilities,
+    pre_panel_safety_message,
     select_reviewers,
 )
 from .unresolved_items import (
@@ -11771,6 +11775,170 @@ def _persist_qualification_checkpoint(
     )
 
 
+@dataclass(frozen=True)
+class PrPanelEvidence:
+    """Qualified panel-opening evidence for ``primary-then-panel`` (#840).
+
+    ``opening_index`` is the comment index of the first qualified panel
+    opening.  Every record after it is post-panel state.  Anything that merely
+    looks like a panel before it (secondary reviews, full-board or other
+    panel-phase checkpoints, unattributed/automatic force-full latches) is an
+    unqualified premature-panel artifact and is never panel evidence.
+    """
+
+    opening_index: int | None = None
+    opening_source: str | None = None
+    unqualified_artifacts: tuple[str, ...] = ()
+    prepanel_latch: bool = False
+    post_opening_automatic_latch: bool = False
+
+    @property
+    def opened(self) -> bool:
+        return self.opening_index is not None
+
+
+def _derive_pr_panel_evidence(
+    records: Sequence[PostedRoundRecord],
+    *,
+    primary_reviewer: str | None,
+    required_reviewers: Sequence[str],
+) -> PrPanelEvidence:
+    """Derive the first qualified panel opening from comment-ordered history.
+
+    A qualified opening is either an operator-sourced force-full record, or a
+    ``secondary-audit`` scheduler record for subject S that lists the primary
+    as approved and is preceded by the primary's own approved review of S.
+    """
+    secondaries = set(required_reviewers) - {primary_reviewer}
+    primary_approved_subjects: set[str] = set()
+    artifacts: list[str] = []
+    prepanel_latch = False
+    opening: PostedRoundRecord | None = None
+    opening_source: str | None = None
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        valid = metadata.scheduler_metadata_status == "valid"
+        if valid and metadata.scheduler_force_full and metadata.scheduler_force_full_source == "operator":
+            opening, opening_source = record, "operator"
+            break
+        if (
+            valid
+            and primary_reviewer is not None
+            and metadata.scheduler_phase == "secondary-audit"
+            and primary_reviewer in metadata.scheduler_approved_reviewers
+            and metadata.subject in primary_approved_subjects
+        ):
+            opening, opening_source = record, "primary-approval"
+            break
+        if (
+            metadata.role == "reviewer"
+            and metadata.agent == primary_reviewer
+            and metadata.state == "approved"
+            and metadata.subject
+        ):
+            primary_approved_subjects.add(metadata.subject)
+        if metadata.role == "reviewer" and metadata.agent in secondaries:
+            artifacts.append(
+                f"{metadata.agent} review (round {metadata.round_number}, head {metadata.subject})"
+            )
+        elif valid and metadata.scheduler_phase in PANEL_OPENED_PHASES:
+            artifacts.append(
+                f"{metadata.scheduler_phase} scheduler record (round {metadata.round_number}, "
+                f"head {metadata.subject})"
+            )
+        if valid and metadata.scheduler_force_full:
+            prepanel_latch = True
+    post_opening_latch = bool(
+        opening is not None
+        and any(
+            record.index > opening.index
+            and record.metadata.scheduler_metadata_status == "valid"
+            and record.metadata.scheduler_force_full
+            and record.metadata.scheduler_force_full_source != "operator"
+            for record in records
+        )
+    )
+    return PrPanelEvidence(
+        opening_index=opening.index if opening is not None else None,
+        opening_source=opening_source,
+        unqualified_artifacts=tuple(dict.fromkeys(artifacts)),
+        prepanel_latch=prepanel_latch,
+        post_opening_automatic_latch=post_opening_latch,
+    )
+
+
+def _pr_record_is_panel_qualified(
+    record: PostedRoundRecord,
+    evidence: PrPanelEvidence,
+    *,
+    primary_reviewer: str | None,
+    operator_force_full: bool,
+) -> bool:
+    """Return whether a reviewer record may count under the staged policy.
+
+    Secondary records count only after the first qualified panel opening.  The
+    primary is never premature under a primary-approval opening, but an
+    operator-sourced opening (recorded, or being established by this round's
+    operator flag) qualifies only records written after it.
+    """
+    if evidence.opening_index is not None and record.index > evidence.opening_index:
+        return True
+    if record.metadata.agent != primary_reviewer:
+        return False
+    if evidence.opening_source == "operator":
+        return False
+    return not (evidence.opening_index is None and operator_force_full)
+
+
+def _describe_superseded_prepanel_review(record: PostedRoundRecord) -> str:
+    metadata = record.metadata
+    item_ids = ", ".join(item.item_id for item in metadata.new_items) or "no numbered items"
+    return (
+        f"{metadata.agent} (round {metadata.round_number}, head {metadata.subject}, "
+        f"state {metadata.state or 'unknown'}; items: {item_ids})"
+    )
+
+
+def _superseded_prepanel_review(record: PostedRoundRecord | None) -> SupersededPrepanelReview | None:
+    """Build the non-authoritative prompt context for a superseded review."""
+    if record is None:
+        return None
+    metadata = record.metadata
+    reviewer = metadata.agent or "reviewer"
+    claims: list[str] = [item.text for item in metadata.new_items if item.text]
+    source_text = metadata.canonical_reviewer_response or record.body
+    if not claims:
+        parsed: ParsedReview | None = None
+        try:
+            if metadata.canonical_reviewer_response is not None:
+                parsed = parse_structured_pr_review(source_text, reviewer=reviewer)
+            if parsed is None:
+                parsed = parse_review(source_text, reviewer=reviewer)
+        except AgentLoopError:
+            parsed = None
+        if parsed is not None:
+            claims.extend(item.text for item in parsed.blocking_items if item.text)
+            claims.extend(item.text for item in parsed.followups.same_pr if item.text)
+    return SupersededPrepanelReview(
+        reviewer=reviewer,
+        round_number=metadata.round_number,
+        head_sha=metadata.subject or "(unknown)",
+        state=metadata.state or "unknown",
+        summary=review_freeform_summary_text(record.body),
+        claims=tuple(claims),
+        item_ids=tuple(item.item_id for item in metadata.new_items),
+    )
+
+
+def _scheduler_recorded_force_full(*, operator: bool, automatic: bool) -> tuple[bool, str | None]:
+    """Return the persisted force-full latch and its audit source (#840)."""
+    if operator:
+        return True, "operator"
+    if automatic:
+        return True, "automatic"
+    return False, None
+
+
 def _latest_pr_reviewer_records(
     records: Sequence[PostedRoundRecord],
     configured_reviewers: Sequence[AgentName],
@@ -13543,7 +13711,17 @@ def run_pr_loop(
                 invocation.resolved_effort,
                 reviewer,
             )
-        scheduler_force_full = bool(config.pr_review_force_full)
+        # Two separate full-board latches (#840).  The operator latch is the
+        # explicit ``--pr-review-force-full`` authorization (or a persisted
+        # operator-sourced record); it is durable for the run and every resume.
+        # ``scheduler_force_full`` is the automatic recovery latch.  Under the
+        # staged policy it is restored and raised only after a qualified panel
+        # opening; before one, automatic fallbacks re-invoke only the primary.
+        scheduler_operator_force_full = bool(config.pr_review_force_full)
+        scheduler_force_full = False
+        # Automatic fallback reasons raised outside the scheduler block.  The
+        # staged policy consumes them per decision; other policies latch.
+        pending_automatic_fallback_reasons: list[str] = []
         scheduler_calls_avoided = 0
         final_sweep_pending = False
         # A scheduler contract written by an earlier run is immutable. Missing
@@ -13556,11 +13734,42 @@ def run_pr_loop(
                     "policy, and broad-path rules must remain immutable."
                 )
             if record.metadata.scheduler_force_full:
-                scheduler_force_full = True
+                if record.metadata.scheduler_force_full_source == "operator":
+                    scheduler_operator_force_full = True
+                elif not scheduler_capabilities.requires_primary:
+                    scheduler_force_full = True
             if record.metadata.scheduler_calls_avoided is not None:
                 scheduler_calls_avoided = max(
                     scheduler_calls_avoided, record.metadata.scheduler_calls_avoided
                 )
+        def request_automatic_scheduler_fallback(reason: str) -> None:
+            """Record an automatic full-board request (#840).
+
+            Non-staged policies keep the historical durable latch.  The staged
+            policy defers the decision to the scheduler block, which latches
+            only after a qualified panel opening and otherwise re-invokes just
+            the primary with full context.
+            """
+            nonlocal scheduler_force_full
+            if scheduler_capabilities.requires_primary:
+                if reason not in pending_automatic_fallback_reasons:
+                    pending_automatic_fallback_reasons.append(reason)
+            else:
+                scheduler_force_full = True
+
+        def stop_pre_panel(message: str, *, round_number: int) -> None:
+            """Log and post the pre-panel diagnostic, then stop before any reviewer."""
+            log(config, f"Round {round_number}: {message}")
+            # Plain audit text only: no round metadata that could later be
+            # mistaken for a scheduler checkpoint or a panel opening.
+            post_pr_comment(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                body=f"PR review scheduling diagnostic (round {round_number}): {message}",
+            )
+            raise PrePanelSafetyError(message)
+
         unresolved_items: list[UnresolvedReviewItem] = []
         pr_compact_prior_summaries: list[str] = []
         latest_coder_output: str | None = None
@@ -13627,10 +13836,12 @@ def run_pr_loop(
                     qualification_checkpoint = QualificationCheckpoint.invalid(
                         "checkpoint budget is outside the configured bound"
                     )
-                    scheduler_force_full = True
+                    request_automatic_scheduler_fallback(
+                        "qualification checkpoint budget is outside the configured bound"
+                    )
                     final_sweep_pending = True
             else:
-                scheduler_force_full = True
+                request_automatic_scheduler_fallback("qualification checkpoint is invalid")
                 final_sweep_pending = True
         # The two independent one-shot watcher allowances below can extend the
         # effective ceiling by two rounds in one invocation. Keep the static
@@ -13701,7 +13912,9 @@ def run_pr_loop(
                     qualification_checkpoint = QualificationCheckpoint.invalid(
                         "checkpoint no longer matches the live qualification inputs"
                     )
-                    scheduler_force_full = True
+                    request_automatic_scheduler_fallback(
+                        "qualification checkpoint no longer matches the live inputs"
+                    )
                     final_sweep_pending = True
             if issue_context is not None and not (
                 round_number == start_round_number and issue_context_refreshed
@@ -13751,7 +13964,7 @@ def run_pr_loop(
                     # persistence of that review makes this transition
                     # exact-once on resume.
                     final_sweep_pending = True
-                    scheduler_force_full = True
+                    request_automatic_scheduler_fallback("architecture identity changed")
                 config = round_architecture_config
             followup_source_context = _pr_followup_source_context(
                 config=config,
@@ -13803,7 +14016,7 @@ def run_pr_loop(
                     qualification_checkpoint = QualificationCheckpoint.invalid(
                         "qualification inputs changed during resume"
                     )
-                    scheduler_force_full = True
+                    request_automatic_scheduler_fallback("qualification inputs changed during resume")
                     final_sweep_pending = True
             current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
             unresolved_items = _reconcile_human_requirements_ack_item(
@@ -13888,6 +14101,74 @@ def run_pr_loop(
                     ),
                 )
             }
+            # Staged-policy panel evidence (#840).  Derived from comment-ordered
+            # history before any resume, approval, or scheduling decision uses
+            # reviewer records, so premature secondary work cannot count.
+            panel_evidence: PrPanelEvidence | None = None
+            superseded_prepanel_reviews: dict[str, PostedRoundRecord] = {}
+            if scheduler_capabilities.requires_primary:
+                try:
+                    panel_history = _extract_round_metadata_records(pr_comments, flow="pr")
+                except AgentLoopError:
+                    panel_history = None
+                if panel_history is None:
+                    if not scheduler_operator_force_full:
+                        stop_pre_panel(
+                            pre_panel_safety_message(
+                                "the PR scheduler history could not be decoded, so panel state "
+                                "is unknowable,"
+                            ),
+                            round_number=round_number,
+                        )
+                    panel_evidence = PrPanelEvidence()
+                else:
+                    panel_evidence = _derive_pr_panel_evidence(
+                        panel_history,
+                        primary_reviewer=scheduler_contract.primary_reviewer,
+                        required_reviewers=scheduler_contract.required_reviewers,
+                    )
+                unqualified_blocking: list[PostedRoundRecord] = []
+                for resumed_name, resumed_candidate in list(resumed_by_name.items()):
+                    if _pr_record_is_panel_qualified(
+                        resumed_candidate,
+                        panel_evidence,
+                        primary_reviewer=scheduler_contract.primary_reviewer,
+                        operator_force_full=scheduler_operator_force_full,
+                    ):
+                        continue
+                    # Not resumed, not a summary, not an approval, never early
+                    # published: the reviewer needs a fresh post-opening turn.
+                    del resumed_by_name[resumed_name]
+                    if (
+                        resumed_candidate.metadata.state == "approved"
+                        and not resumed_candidate.metadata.new_items
+                    ):
+                        log(
+                            config,
+                            f"Round {round_number}: ignoring {resumed_name}'s review recorded before "
+                            "any qualified panel opening; it gets a fresh post-opening turn",
+                        )
+                    elif scheduler_operator_force_full:
+                        # Superseded, not consumed or discarded: excluded from
+                        # the ledger and ownership, listed in the operator
+                        # opening record, and replayed only as non-authoritative
+                        # context for the reviewer's fresh turn.
+                        superseded_prepanel_reviews[resumed_name] = resumed_candidate
+                    else:
+                        unqualified_blocking.append(resumed_candidate)
+                if unqualified_blocking:
+                    stop_pre_panel(
+                        pre_panel_safety_message(
+                            "premature panel review(s) "
+                            + "; ".join(
+                                _describe_superseded_prepanel_review(record)
+                                for record in unqualified_blocking
+                            )
+                            + " were recorded before any qualified panel opening and are "
+                            "blocking or carry new items,"
+                        ),
+                        round_number=round_number,
+                    )
             # Summaries are review-level context, not new findings or substitutes
             # for an item's immutable claim. Seed from saved reviews for recovery.
             reviewer_summaries = {
@@ -13913,6 +14194,21 @@ def run_pr_loop(
                     reviewer_acquisition_contract if selective_policy else None
                 ),
             )
+            if panel_evidence is not None:
+                # Causal approval eligibility: a secondary approval counts only
+                # when recorded after the first qualified panel opening, so a
+                # premature approval never opens the panel, shrinks the first
+                # audit, is carried, or satisfies the exact-head barrier.
+                unchanged_head_approvals = {
+                    name: record
+                    for name, record in unchanged_head_approvals.items()
+                    if _pr_record_is_panel_qualified(
+                        record,
+                        panel_evidence,
+                        primary_reviewer=scheduler_contract.primary_reviewer,
+                        operator_force_full=scheduler_operator_force_full,
+                    )
+                }
             checkpoint_expected_plan_digest = (
                 approved_plan_context.plan_hash
                 if approved_plan_context is not None
@@ -13966,7 +14262,9 @@ def run_pr_loop(
                 qualification_checkpoint = QualificationCheckpoint.invalid(
                     "qualification checkpoint review identities are incomplete or stale"
                 )
-                scheduler_force_full = True
+                request_automatic_scheduler_fallback(
+                    "qualification checkpoint review identities are incomplete or stale"
+                )
                 final_sweep_pending = True
             skip_reviewers_for_recovery = bool(
                 current_resume is not None
@@ -13999,12 +14297,14 @@ def run_pr_loop(
             latest_reviewer_records: dict[str, PostedRoundRecord] = {}
             external_recovery_full_board = skip_reviewers_for_recovery
             scheduler_metadata_recovery_full_board = False
+            metadata_recovery_reasons: list[str] = []
             if selective_policy:
                 try:
                     historical_records = _extract_round_metadata_records(pr_comments, flow="pr")
                 except AgentLoopError:
                     historical_records = ()
                     scheduler_metadata_recovery_full_board = True
+                    metadata_recovery_reasons.append("scheduler history could not be decoded")
                 latest_reviewer_records = _latest_pr_reviewer_records(
                     historical_records, configured_reviewers
                 )
@@ -14024,8 +14324,10 @@ def run_pr_loop(
                 ):
                     # Under selective-intermediate this recovery override
                     # applies to the current decision only; the staged policy
-                    # additionally latches it durably below.
+                    # latches it durably below only after a qualified panel
+                    # opening (#840).
                     scheduler_metadata_recovery_full_board = True
+                    metadata_recovery_reasons.append("latest scheduler metadata is missing or invalid")
                 current_scheduler_records = [
                     record
                     for record in current_head_records
@@ -14035,11 +14337,13 @@ def run_pr_loop(
                     # Do not infer a same-head selective decision from legacy
                     # reviewer/coder records without a scheduler checkpoint.
                     scheduler_metadata_recovery_full_board = True
+                    metadata_recovery_reasons.append("current-head records lack scheduler metadata")
                 if any(
                     record.metadata.scheduler_metadata_status == "invalid"
                     for record in current_head_records
                 ):
                     scheduler_metadata_recovery_full_board = True
+                    metadata_recovery_reasons.append("current-head scheduler metadata is invalid")
                 if scheduler_contract.primary_reviewer is not None and any(
                     record.metadata.scheduler_metadata_status == "valid"
                     and (
@@ -14053,6 +14357,7 @@ def run_pr_loop(
                     # primary policy. It remains compatible data, but cannot
                     # authorize a reduced primary/panel selection.
                     scheduler_metadata_recovery_full_board = True
+                    metadata_recovery_reasons.append("scheduler metadata lacks phase authority")
                 if any(
                     record.metadata.scheduler_metadata_status == "valid"
                     and record.metadata.scheduler_current_sha != record.metadata.subject
@@ -14062,19 +14367,12 @@ def run_pr_loop(
                     # enclosing audit record's subject. Never derive a
                     # previous transition from that state.
                     scheduler_metadata_recovery_full_board = True
-                if (
-                    scheduler_metadata_recovery_full_board
-                    and scheduler_capabilities.recovery_latches_force_full
-                    and not scheduler_force_full
-                ):
-                    # Recovery-raised full-board scheduling is a monotonic
-                    # durable latch for the staged policy: it is persisted in
-                    # every later round record and survives resume.
-                    scheduler_force_full = True
-                    log(
-                        config,
-                        f"Round {round_number}: scheduler metadata recovery raised the durable "
-                        "force-full latch; the complete board is selected for the rest of the run",
+                    metadata_recovery_reasons.append("a scheduler checkpoint contradicts its record subject")
+                automatic_fallback_reasons: list[str] = list(pending_automatic_fallback_reasons)
+                if scheduler_metadata_recovery_full_board and scheduler_capabilities.recovery_latches_force_full:
+                    automatic_fallback_reasons.extend(
+                        f"scheduler metadata recovery: {reason}"
+                        for reason in dict.fromkeys(metadata_recovery_reasons)
                     )
                 # The durable phase checkpoint is the latest valid scheduler
                 # record that carries phase authority.  It only reports whether
@@ -14161,11 +14459,20 @@ def run_pr_loop(
                     persisted_digest != current_obligation_digest
                     for persisted_digest in persisted_obligation_digests
                 ):
-                    scheduler_force_full = True
+                    if scheduler_capabilities.requires_primary:
+                        automatic_fallback_reasons.append(
+                            "scheduler obligation digest changed during recovery"
+                        )
+                    else:
+                        scheduler_force_full = True
                     log(
                         config,
                         f"Round {round_number}: scheduler obligation digest changed during recovery; "
-                        "forcing the full reviewer board",
+                        + (
+                            "requesting an automatic full-board fallback"
+                            if scheduler_capabilities.requires_primary
+                            else "forcing the full reviewer board"
+                        ),
                     )
                 active_scopes = tuple(
                     sorted({path for obligation in obligations for path in (obligation.scope or ())})
@@ -14178,7 +14485,11 @@ def run_pr_loop(
                 elif scheduler_metadata_recovery_full_board:
                     classification = TransitionClassification(
                         "broad",
-                        "scheduler metadata is missing or invalid; full board required",
+                        (
+                            "scheduler metadata is missing or invalid"
+                            if scheduler_capabilities.requires_primary
+                            else "scheduler metadata is missing or invalid; full board required"
+                        ),
                     )
                 elif scheduler_previous_sha is None:
                     classification = TransitionClassification("broad", "initial candidate requires the full board")
@@ -14233,24 +14544,101 @@ def run_pr_loop(
                             "a returning reviewer's history could not be reconstructed",
                             tuple(sorted(unreconstructible_history)),
                         )
+                scheduler_fallback_notes: tuple[str, ...] = ()
+                if scheduler_capabilities.requires_primary:
+                    assert panel_evidence is not None
+                    if panel_evidence.opened:
+                        # Post-panel: keep the conservative monotonic latch,
+                        # restored only from automatic/legacy records after the
+                        # qualified opening and raised by any automatic reason.
+                        if panel_evidence.post_opening_automatic_latch:
+                            scheduler_force_full = True
+                        if automatic_fallback_reasons and not scheduler_force_full:
+                            scheduler_force_full = True
+                            log(
+                                config,
+                                f"Round {round_number}: post-panel automatic fallback raised the durable "
+                                "force-full latch (source: automatic); the complete board is selected "
+                                "for the rest of the run: " + "; ".join(automatic_fallback_reasons),
+                            )
+                        scheduler_fallback_notes = tuple(automatic_fallback_reasons)
+                        snapshot_force_full = scheduler_force_full
+                    else:
+                        # Strict pre-panel: automatic reasons apply to this
+                        # decision only and re-invoke just the primary with full
+                        # context; nothing is latched.
+                        notes = list(automatic_fallback_reasons)
+                        if panel_evidence.prepanel_latch and not scheduler_operator_force_full:
+                            notes.append(
+                                "an unattributed or automatic force-full latch recorded before any "
+                                "qualified panel opening was not honored; rerun with "
+                                "--pr-review-force-full to restore the complete board"
+                            )
+                        if panel_evidence.unqualified_artifacts and not scheduler_operator_force_full:
+                            notes.append(
+                                "unqualified pre-approval panel history was ignored: "
+                                + ", ".join(panel_evidence.unqualified_artifacts[:6])
+                                + (" ..." if len(panel_evidence.unqualified_artifacts) > 6 else "")
+                            )
+                        scheduler_fallback_notes = tuple(notes)
+                        snapshot_force_full = bool(automatic_fallback_reasons)
+                        if automatic_fallback_reasons:
+                            log(
+                                config,
+                                f"Round {round_number}: automatic fallback before any qualified panel "
+                                "opening applies to this decision only (no latch): "
+                                + "; ".join(automatic_fallback_reasons),
+                            )
+                else:
+                    snapshot_force_full = (
+                        scheduler_force_full
+                        or scheduler_operator_force_full
+                        or scheduler_metadata_recovery_full_board
+                    )
                 scheduler_snapshot = SchedulerSnapshot(
                     previous_sha=scheduler_previous_sha,
                     current_sha=current_pr_subject,
                     contract=scheduler_contract,
                     obligations=obligations,
-                    force_full=(scheduler_force_full or scheduler_metadata_recovery_full_board),
+                    force_full=snapshot_force_full,
                     phase=scheduler_checkpoint_phase,
+                    operator_force_full=scheduler_operator_force_full,
+                    panel_evidence=bool(panel_evidence is not None and panel_evidence.opened),
+                    fallback_reasons=scheduler_fallback_notes,
                 )
-                scheduler_decision = select_reviewers(
-                    scheduler_snapshot,
-                    classification,
-                    qualifying_approvals=tuple(unchanged_head_approvals),
-                    unavailable_reviewers=tuple(
-                        agent_display_name(reviewer) for reviewer in unavailable_reviewer_failures
-                    ),
-                    final_sweep=final_sweep,
-                    phase=scheduler_checkpoint_phase,
+                try:
+                    scheduler_decision = select_reviewers(
+                        scheduler_snapshot,
+                        classification,
+                        qualifying_approvals=tuple(unchanged_head_approvals),
+                        unavailable_reviewers=tuple(
+                            agent_display_name(reviewer) for reviewer in unavailable_reviewer_failures
+                        ),
+                        final_sweep=final_sweep,
+                        phase=scheduler_checkpoint_phase,
+                    )
+                except PrePanelSafetyError as exc:
+                    stop_pre_panel(str(exc), round_number=round_number)
+                    raise
+                if not (skip_reviewers_for_recovery or conflict_pending):
+                    pending_automatic_fallback_reasons.clear()
+                scheduler_recorded_force_full, scheduler_recorded_force_full_source = (
+                    _scheduler_recorded_force_full(
+                        operator=scheduler_operator_force_full,
+                        automatic=scheduler_force_full,
+                    )
                 )
+                superseded_audit_text = ""
+                if superseded_prepanel_reviews:
+                    superseded_audit_text = (
+                        " Superseded premature panel reviews (not resumed, not approvals, not "
+                        "ledger items; replayed only as non-authoritative context): "
+                        + "; ".join(
+                            _describe_superseded_prepanel_review(record)
+                            for record in superseded_prepanel_reviews.values()
+                        )
+                        + "."
+                    )
                 scheduler_diff_context = (
                     "\nScheduler audit record: the orchestrator classified the transition as "
                     f"{classification.kind} ({classification.reason}). Previous reviewed SHA: "
@@ -14260,6 +14648,7 @@ def run_pr_loop(
                     f"Selected phase: {scheduler_decision.phase}; primary: "
                     f"{scheduler_contract.primary_reviewer or '(none)'}; active owners: "
                     f"{', '.join(scheduler_decision.active_owners) or '(none)'}. "
+                    f"Scheduling reason: {scheduler_decision.reason}. "
                     "Inspect the complete base-to-head diff independently; this summary is not a substitute.\n"
                 )
                 scheduler_calls_avoided += scheduler_decision.calls_avoided
@@ -14271,8 +14660,10 @@ def run_pr_loop(
                     f"{scheduler_decision.phase} {scheduler_decision.reason}; "
                     f"selected={', '.join(scheduler_decision.selected_reviewers) or 'none'}; "
                     f"paused={', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}; "
-                    f"force_full={scheduler_force_full}; checkpoint_phase="
-                    f"{scheduler_checkpoint_phase or 'none'}; head={current_pr_subject}; "
+                    f"force_full={scheduler_recorded_force_full} "
+                    f"(source: {scheduler_recorded_force_full_source or 'none'}); "
+                    f"panel_evidence={bool(panel_evidence is not None and panel_evidence.opened)}; "
+                    f"checkpoint_phase={scheduler_checkpoint_phase or 'none'}; head={current_pr_subject}; "
                     f"primary={scheduler_contract.primary_reviewer or 'none'}; active_owners="
                     f"{', '.join(scheduler_decision.active_owners) or 'none'}",
                 )
@@ -14288,8 +14679,10 @@ def run_pr_loop(
                             f"head: {current_pr_subject}; primary: "
                             f"{scheduler_contract.primary_reviewer or '(none)'}; active owners: "
                             f"{', '.join(scheduler_decision.active_owners) or '(none)'}; "
-                            f"force-full: {scheduler_force_full}; scheduler-policy calls avoided cumulatively: "
-                            f"{scheduler_calls_avoided}.",
+                            f"force-full: {scheduler_recorded_force_full} "
+                            f"(source: {scheduler_recorded_force_full_source or 'none'}); "
+                            "scheduler-policy calls avoided cumulatively: "
+                            f"{scheduler_calls_avoided}.{superseded_audit_text}",
                             PostedRoundMetadata(
                                 flow="pr", role="summary", agent="Orchestrator",
                                 round_number=round_number, subject=current_pr_subject,
@@ -14304,7 +14697,8 @@ def run_pr_loop(
                                 scheduler_paused_reviewers=scheduler_decision.paused_reviewers,
                                 scheduler_reasons=(scheduler_decision.reason, classification.reason),
                                 scheduler_final_sweep=final_sweep,
-                                scheduler_force_full=scheduler_force_full,
+                                scheduler_force_full=scheduler_recorded_force_full,
+                                scheduler_force_full_source=scheduler_recorded_force_full_source,
                                 scheduler_calls_avoided=scheduler_calls_avoided,
                                 scheduler_phase=scheduler_decision.phase,
                                 scheduler_primary_reviewer=scheduler_contract.primary_reviewer,
@@ -14323,6 +14717,8 @@ def run_pr_loop(
                 scheduler_diff_context = ""
                 selected_reviewer_names = {agent_display_name(reviewer) for reviewer in configured_reviewers}
                 final_sweep = False
+                scheduler_recorded_force_full, scheduler_recorded_force_full_source = False, None
+                superseded_audit_text = ""
             skip_reviewers_this_round = skip_reviewers_for_recovery or conflict_pending
 
             pr_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -14403,7 +14799,10 @@ def run_pr_loop(
                                 if selective_policy and scheduler_decision is not None else ()
                             ),
                             scheduler_final_sweep=(final_sweep if selective_policy else None),
-                            scheduler_force_full=(scheduler_force_full if selective_policy else None),
+                            scheduler_force_full=(scheduler_recorded_force_full if selective_policy else None),
+                            scheduler_force_full_source=(
+                                scheduler_recorded_force_full_source if selective_policy else None
+                            ),
                             scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
                             scheduler_phase=(scheduler_decision.phase if selective_policy and scheduler_decision is not None else None),
                             scheduler_primary_reviewer=(scheduler_contract.primary_reviewer if selective_policy else None),
@@ -14533,6 +14932,9 @@ def run_pr_loop(
                                 ),
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
+                                superseded_prepanel_review_context=_superseded_prepanel_review(
+                                    superseded_prepanel_reviews.get(agent_display_name(reviewer))
+                                ),
                             )
                             for reviewer in launchable_pr_reviewers
                         }
@@ -14816,6 +15218,9 @@ def run_pr_loop(
                                 ),
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
+                                superseded_prepanel_review_context=_superseded_prepanel_review(
+                                    superseded_prepanel_reviews.get(reviewer_name)
+                                ),
                             ),
                             session_id=(
                                 None
@@ -15107,7 +15512,8 @@ def run_pr_loop(
                         f"Historical approvals remain exact-head-bound; scheduler-policy calls avoided "
                         f"cumulatively: {scheduler_calls_avoided}. Phase: "
                         f"{scheduler_decision.phase if scheduler_decision is not None else 'full-board'}; "
-                        f"force-full: {scheduler_force_full}.",
+                        f"force-full: {scheduler_recorded_force_full} "
+                        f"(source: {scheduler_recorded_force_full_source or 'none'}).",
                         PostedRoundMetadata(
                             flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
                             subject=current_pr_subject, prior_items=prior_unresolved_items,
@@ -15133,7 +15539,10 @@ def run_pr_loop(
                                 if selective_policy and scheduler_decision is not None else ()
                             ),
                             scheduler_final_sweep=(final_sweep if selective_policy else None),
-                            scheduler_force_full=(scheduler_force_full if selective_policy else None),
+                            scheduler_force_full=(scheduler_recorded_force_full if selective_policy else None),
+                            scheduler_force_full_source=(
+                                scheduler_recorded_force_full_source if selective_policy else None
+                            ),
                             scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
                             scheduler_phase=(scheduler_decision.phase if selective_policy and scheduler_decision is not None else None),
                             scheduler_primary_reviewer=(scheduler_contract.primary_reviewer if selective_policy else None),
@@ -17172,7 +17581,10 @@ def run_pr_loop(
                     )
                 ) if selective_policy else (),
                 scheduler_final_sweep=(final_sweep if selective_policy else None),
-                scheduler_force_full=(scheduler_force_full if selective_policy else None),
+                scheduler_force_full=(scheduler_recorded_force_full if selective_policy else None),
+                scheduler_force_full_source=(
+                    scheduler_recorded_force_full_source if selective_policy else None
+                ),
                 scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
                 scheduler_phase=(scheduler_decision.phase if selective_policy and scheduler_decision is not None else None),
                 scheduler_primary_reviewer=(scheduler_contract.primary_reviewer if selective_policy else None),

@@ -591,14 +591,49 @@ base-to-head diff from a common snapshot in the `secondary-audit` phase;
 secondary prompts are independent and are not finding-check prompts. A scoped
 secondary fix enters `remediation`, which rechecks every active finding owner
 and the primary, then performs a complete exact-head `final-secondary-sweep`
-for every secondary missing approval. Any active finding with a broad,
-ambiguous, out-of-scope, or unreconstructible change, and any head change after
-panel evidence exists, selects the complete board and never treats missing
-input as approval. `--pr-review-force-full` is a durable run latch; a full
-board raised by scheduler-metadata recovery (legacy, malformed, or
-contradictory records) latches the same way for the rest of the run. Public
-audit comments and logs name the phase, exact head, primary, active owners,
-force-full state, and policy-neutral cumulative calls avoided. The policy is
+for every secondary missing approval.
+
+Before the primary's first exact-head approval the phase is strictly
+primary-only. A broad or out-of-scope change, missing or ambiguous fix scope,
+recovery ambiguity (a stale qualification checkpoint, an architecture identity
+change, obligation-digest drift), or legacy/malformed/contradictory scheduler
+metadata re-invokes only the primary with full context. The audit reason starts
+with `strict pre-panel fallback:` and nothing is latched. Secondaries are never
+treated as finding owners before their first legitimate panel invocation. The
+panel is opened only by a *qualified panel opening*: a `secondary-audit` record
+preceded by the primary's approval of the same exact head, or an
+operator-attributed force-full record. Secondary reviews, `full-board`
+checkpoints, and unattributed force-full latches written before such an opening
+(for example by the pre-#840 automatic escalation) are premature-panel
+artifacts. They are ignored, and a secondary approval counts only when it was
+recorded after the qualified opening.
+
+After the panel has opened, the existing conservative rules apply, with audit
+reasons prefixed `post-panel fallback:`. An active finding with a broad,
+ambiguous, out-of-scope, or unreconstructible change, and any unsafe head change,
+selects the complete board. An automatic recovery reason raises a durable latch
+recorded with source `automatic`, and missing input is never treated as
+approval.
+
+If safety cannot be established without the panel, the run stops with a
+`PR review scheduling diagnostic` instead of silently spending it. That happens
+when a finding is pending on a configured secondary, a premature secondary
+review in an interrupted round is blocking, or the history cannot be decoded,
+and there is no qualified opening. No reviewer runs. Rerun with
+`--pr-review-force-full` to authorize the complete board. That operator latch
+is durable, is recorded with source `operator`, and is itself a qualified
+opening. Under the override, a premature blocking secondary review is
+superseded rather than consumed: it is listed in the operator audit comment,
+excluded from the ledger and approvals, and replayed to that reviewer only as
+non-authoritative context for its fresh review.
+
+The tradeoff is deliberate. Pre-panel uncertainty costs one extra primary turn
+instead of N secondary turns. Safety is kept because the panel's first
+invocation is always a complete, independent review of the whole diff, and
+every configured reviewer must still approve the exact final head. Public audit
+comments and logs name the phase, exact head, primary, active owners,
+force-full state and source (`operator`, `automatic`, or `none`), and
+policy-neutral cumulative calls avoided. The policy is
 opt-in and does not change the default or the CI/merge gates. Use
 `review-evaluation` with frozen local artifacts to compare latency/cost against
 independent severity-weighted coverage before any proposal to change the

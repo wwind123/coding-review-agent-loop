@@ -277,11 +277,17 @@ primary reviewer and a non-empty secondary panel. It keeps the primary as the
 only normal reviewer until exact-head approval, then dispatches an independent
 complete-diff audit to all secondaries from one frozen snapshot. Scoped
 remediation rechecks finding owners plus the primary before a mandatory exact-
-head secondary sweep; unsafe scope/history with active findings, head changes
-after panel evidence, and the durable force-full latch use the complete board.
-Whether the panel has opened is reconstructed from the latest valid durable
-phase checkpoint, which never grants approval. For this policy, a full board
-raised by scheduler-metadata recovery also raises the durable latch. Phase,
+head secondary sweep. Before the first exact-head primary approval the phase is
+strictly primary-only: broad or ambiguous changes and every automatic recovery
+reason re-invoke just the primary with full context (`strict pre-panel
+fallback:`) and latch nothing. The panel opens only at a qualified panel
+opening derived from comment order: a `secondary-audit` record preceded by the
+primary's approval of the same head, or an operator-sourced force-full record.
+Secondary approvals count only after that opening. After it, unsafe
+scope/history, head changes, and the durable automatic latch use the complete
+board (`post-panel fallback:`). A pre-panel state that cannot be made safe
+without the panel stops with a diagnostic, and `--pr-review-force-full` (source
+`operator`) is the explicit override. Phase,
 owner, selection, approval-head, and scheduler-policy call-accounting metadata
 are optional extensions to the legacy scheduler core, so old records remain
 decodable and grant no staged phase authority.

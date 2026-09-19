@@ -8,7 +8,11 @@ from agent_loop_helpers import FakeRunner, make_config
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.cli import build_parser
 from coding_review_agent_loop.review_scheduling import (
+    OPERATOR_FORCE_FULL_REASON,
+    POST_PANEL_PREFIX,
+    STRICT_PRE_PANEL_PREFIX,
     GitChange,
+    PrePanelSafetyError,
     ReviewObligation,
     ReviewSchedulingContract,
     SchedulerSnapshot,
@@ -945,7 +949,17 @@ def _obligation(item_id="item-1", owners=("Gemini",), scope=("src/worker.py",)):
     )
 
 
-def _snapshot(*, obligations=(), phase=None, previous="a" * 40, current="b" * 40, force_full=False):
+def _snapshot(
+    *,
+    obligations=(),
+    phase=None,
+    previous="a" * 40,
+    current="b" * 40,
+    force_full=False,
+    operator_force_full=False,
+    panel_evidence=False,
+    fallback_reasons=(),
+):
     return SchedulerSnapshot(
         previous_sha=previous,
         current_sha=current,
@@ -953,6 +967,9 @@ def _snapshot(*, obligations=(), phase=None, previous="a" * 40, current="b" * 40
         obligations=obligations,
         force_full=force_full,
         phase=phase,
+        operator_force_full=operator_force_full,
+        panel_evidence=panel_evidence,
+        fallback_reasons=fallback_reasons,
     )
 
 
@@ -1028,6 +1045,8 @@ def test_primary_blocking_loop_keeps_only_primary_until_exact_head_approval():
     assert initial.phase == "primary"
     assert initial.calls_avoided == 2
     assert dict(initial.paused_reviewers)["Gemini"].startswith("primary phase")
+    # The first review is not a fallback: no strict pre-panel prefix.
+    assert not initial.reason.startswith(STRICT_PRE_PANEL_PREFIX)
 
     # Primary blocked, coder made a narrow fix: still the primary phase, not remediation.
     recheck = select_reviewers(
@@ -1053,10 +1072,17 @@ def test_primary_approval_opens_independent_secondary_audit_not_final_sweep():
     assert audit.selected_reviewers == ("Gemini", "Antigravity")
     assert audit.phase == "secondary-audit"
     assert audit.calls_avoided == 0
-    # An explicit caller phase can never bypass the primary gate.
+    # An explicit caller phase can never bypass the primary gate, and without
+    # qualified panel evidence a panel-phase checkpoint does not open the panel.
     gated = select_reviewers(_snapshot(phase="secondary-audit"), NARROW, phase="secondary-audit")
     assert gated.selected_reviewers == ("Codex",)
-    assert gated.phase == "remediation"
+    assert gated.phase == "primary"
+    # With panel evidence the same state is post-panel remediation.
+    post_panel = select_reviewers(
+        _snapshot(phase="secondary-audit", panel_evidence=True), NARROW, phase="secondary-audit"
+    )
+    assert post_panel.selected_reviewers == ("Codex",)
+    assert post_panel.phase == "remediation"
 
 
 def test_scoped_remediation_selects_all_owners_and_primary_then_sweeps_missing():
@@ -1067,15 +1093,22 @@ def test_scoped_remediation_selects_all_owners_and_primary_then_sweeps_missing()
                 _obligation("item-2", owners=("Antigravity",), scope=("src/api.py",)),
             ),
             phase="secondary-audit",
+            panel_evidence=True,
         ),
         NARROW,
     )
     assert remediation.selected_reviewers == ("Codex", "Gemini", "Antigravity")
     assert remediation.phase == "remediation"
     assert remediation.active_owners == ("Antigravity", "Gemini")
+    assert remediation.reason.startswith(POST_PANEL_PREFIX)
 
     single_owner = select_reviewers(
-        _snapshot(obligations=(_obligation(owners=("Gemini",)),), phase="secondary-audit"), NARROW
+        _snapshot(
+            obligations=(_obligation(owners=("Gemini",)),),
+            phase="secondary-audit",
+            panel_evidence=True,
+        ),
+        NARROW,
     )
     assert single_owner.selected_reviewers == ("Codex", "Gemini")
     assert single_owner.calls_avoided == 1
@@ -1083,7 +1116,7 @@ def test_scoped_remediation_selects_all_owners_and_primary_then_sweeps_missing()
 
     # Owners and primary cleared: every secondary lacking exact-head approval sweeps.
     sweep = select_reviewers(
-        _snapshot(previous="b" * 40, phase="remediation"),
+        _snapshot(previous="b" * 40, phase="remediation", panel_evidence=True),
         TransitionClassification("narrow", "same exact candidate head"),
         qualifying_approvals=("Codex", "Gemini"),
         final_sweep=True,
@@ -1094,7 +1127,7 @@ def test_scoped_remediation_selects_all_owners_and_primary_then_sweeps_missing()
 
     # A primary that failed during remediation stays outstanding before the sweep.
     primary_outstanding = select_reviewers(
-        _snapshot(previous="b" * 40, phase="remediation"),
+        _snapshot(previous="b" * 40, phase="remediation", panel_evidence=True),
         TransitionClassification("narrow", "same exact candidate head"),
         qualifying_approvals=("Gemini",),
         final_sweep=True,
@@ -1103,46 +1136,162 @@ def test_scoped_remediation_selects_all_owners_and_primary_then_sweeps_missing()
     assert primary_outstanding.phase == "remediation"
 
 
-@pytest.mark.parametrize(
-    "classification",
-    [
-        TransitionClassification("broad", "diff path outside obligation scopes"),
-        TransitionClassification("broad", "the active obligation ledger is not reconstructible"),
-        TransitionClassification("broad", "a returning reviewer's history could not be reconstructed"),
-        TransitionClassification("broad", "binary or mode change"),
-    ],
-)
+UNSAFE_CLASSIFICATIONS = [
+    TransitionClassification("broad", "diff path outside obligation scopes"),
+    TransitionClassification("broad", "the active obligation ledger is not reconstructible"),
+    TransitionClassification("broad", "a returning reviewer's history could not be reconstructed"),
+    TransitionClassification("broad", "binary or mode change"),
+]
+
+
+@pytest.mark.parametrize("classification", UNSAFE_CLASSIFICATIONS)
 @pytest.mark.parametrize("phase", ["primary", "secondary-audit", "remediation", "final-secondary-sweep"])
-def test_unsafe_remediation_with_active_findings_selects_complete_board(classification, phase):
+def test_unsafe_remediation_after_panel_evidence_selects_complete_board(classification, phase):
     decision = select_reviewers(
-        _snapshot(obligations=(_obligation(owners=("Gemini",)),), phase=phase), classification
+        _snapshot(obligations=(_obligation(owners=("Gemini",)),), phase=phase, panel_evidence=True),
+        classification,
     )
     assert decision.selected_reviewers == ("Codex", "Gemini", "Antigravity")
     assert decision.phase == "full-board"
     assert decision.paused_reviewers == ()
     assert decision.calls_avoided == 0
+    assert decision.reason == f"{POST_PANEL_PREFIX}full board required: {classification.reason}"
+
+
+@pytest.mark.parametrize("classification", UNSAFE_CLASSIFICATIONS)
+@pytest.mark.parametrize("phase", [None, "primary", "full-board", "secondary-audit", "remediation"])
+def test_broad_or_ambiguous_change_before_primary_approval_reinvokes_only_primary(classification, phase):
+    # Row prepanel-broad-change: primary-owned findings, broad transition, no
+    # qualified panel evidence (a pre-#840 panel-phase checkpoint is not one).
+    decision = select_reviewers(
+        _snapshot(obligations=(_obligation(owners=("Codex",)),), phase=phase), classification
+    )
+    assert decision.selected_reviewers == ("Codex",)
+    assert decision.phase == "primary"
+    assert decision.reason == (
+        f"{STRICT_PRE_PANEL_PREFIX}{classification.reason}; primary re-invoked with full context"
+    )
+    assert decision.calls_avoided == 2
+    assert all(reason.startswith("primary phase") for _name, reason in decision.paused_reviewers)
+
+
+def test_missing_fix_scope_before_primary_approval_reinvokes_only_primary():
+    # Row prepanel-ambiguous-scope: the primary's finding carries no scope.
+    scopeless = _obligation(owners=("Codex",), scope=None)
+    ambiguous = classify_transition(
+        "a" * 40,
+        "b" * 40,
+        [GitChange("src/worker.py")],
+        scopes=None,
+        broad_rules=(".github/**",),
+        obligations=(scopeless,),
+    )
+    assert ambiguous.broad
+    decision = select_reviewers(_snapshot(obligations=(scopeless,)), ambiguous)
+    assert decision.selected_reviewers == ("Codex",)
+    assert decision.phase == "primary"
+    assert decision.reason.startswith(STRICT_PRE_PANEL_PREFIX)
+    assert ambiguous.reason in decision.reason
+    # Even when the observed change is narrow, a scope-less obligation is a
+    # strict pre-panel fallback rather than an ordinary primary recheck.
+    narrow_scopeless = select_reviewers(_snapshot(obligations=(scopeless,)), NARROW)
+    assert narrow_scopeless.selected_reviewers == ("Codex",)
+    assert "no valid exact fix scope" in narrow_scopeless.reason
+
+
+def test_automatic_fallback_before_panel_is_primary_only_and_after_panel_is_full_board():
+    reasons = ("scheduler metadata recovery: current-head scheduler metadata is invalid",)
+    before = select_reviewers(
+        _snapshot(force_full=True, fallback_reasons=reasons, phase="primary"),
+        TransitionClassification("broad", "scheduler metadata is missing or invalid"),
+    )
+    assert before.selected_reviewers == ("Codex",)
+    assert before.phase == "primary"
+    assert before.reason.startswith(STRICT_PRE_PANEL_PREFIX + reasons[0])
+    assert before.reason.endswith("primary re-invoked with full context")
+    # A panel-phase checkpoint without qualified evidence changes nothing.
+    checkpoint_only = select_reviewers(
+        _snapshot(force_full=True, phase="full-board"), NARROW
+    )
+    assert checkpoint_only.selected_reviewers == ("Codex",)
+    assert checkpoint_only.reason.startswith(STRICT_PRE_PANEL_PREFIX)
+
+    after = select_reviewers(
+        _snapshot(force_full=True, fallback_reasons=reasons, panel_evidence=True), NARROW
+    )
+    assert after.selected_reviewers == ("Codex", "Gemini", "Antigravity")
+    assert after.phase == "full-board"
+    assert after.reason.startswith(POST_PANEL_PREFIX + "force-full latch")
 
 
 def test_broad_head_change_after_panel_evidence_selects_complete_board():
-    decision = select_reviewers(_snapshot(phase="final-secondary-sweep"), BROAD)
+    decision = select_reviewers(
+        _snapshot(phase="final-secondary-sweep", panel_evidence=True), BROAD
+    )
     assert decision.selected_reviewers == ("Codex", "Gemini", "Antigravity")
     assert decision.phase == "full-board"
-    # Contradictory history: a secondary-owned finding without panel evidence.
-    contradictory = select_reviewers(
-        _snapshot(obligations=(_obligation(owners=("Gemini",)),), phase="primary"), NARROW
-    )
-    assert contradictory.selected_reviewers == ("Codex", "Gemini", "Antigravity")
-    assert contradictory.phase == "full-board"
+    assert decision.reason.startswith(POST_PANEL_PREFIX + "full board required after panel evidence")
     with pytest.raises(AgentLoopError, match="phase checkpoint"):
         select_reviewers(_snapshot(phase="bogus"), NARROW)
 
 
-def test_force_full_latch_overrides_primary_phase_and_unavailable_is_not_approval():
-    forced = select_reviewers(_snapshot(previous=None, force_full=True), BROAD)
+def test_secondary_owned_finding_before_panel_stops_with_diagnostic_unless_operator():
+    # Row prepanel-unsafe-stop.
+    snapshot = _snapshot(
+        obligations=(
+            _obligation("item-3", owners=("Gemini",)),
+            _obligation("item-1", owners=("Codex",)),
+        ),
+        phase="full-board",
+    )
+    for classification in (NARROW, BROAD):
+        with pytest.raises(PrePanelSafetyError) as raised:
+            select_reviewers(snapshot, classification, qualifying_approvals=("Codex",))
+        message = str(raised.value)
+        assert message.startswith("pre-panel safety cannot be established")
+        assert "item-3" in message and "item-1" not in message
+        assert "Gemini" in message
+        assert "--pr-review-force-full" in message
+        assert isinstance(raised.value, AgentLoopError)
+    forced = select_reviewers(dataclasses.replace(snapshot, operator_force_full=True), NARROW)
     assert forced.selected_reviewers == ("Codex", "Gemini", "Antigravity")
     assert forced.phase == "full-board"
-    assert forced.reason == "force-full latch"
+    assert forced.reason == OPERATOR_FORCE_FULL_REASON
+    # After a qualified panel opening the same ownership is ordinary remediation.
+    post_panel = select_reviewers(dataclasses.replace(snapshot, panel_evidence=True), NARROW)
+    assert post_panel.phase == "remediation"
 
+
+@pytest.mark.parametrize("owner", ["Orchestrator", "machine-ci", "unknown-reviewer"])
+def test_non_reviewer_obligation_before_panel_is_primary_only_without_diagnostic(owner):
+    # Row prepanel-machine-obligation: CI/machine/Orchestrator owners are never
+    # secondary owners and never trigger the diagnostic stop.
+    machine = ReviewObligation(
+        item_id="item-9",
+        status="blocking",
+        scope=None,
+        resolution_owners=(owner,),
+        pending_owners=(owner,),
+    )
+    decision = select_reviewers(_snapshot(obligations=(machine,)), NARROW)
+    assert decision.selected_reviewers == ("Codex",)
+    assert decision.phase == "primary"
+    assert decision.reason.startswith(STRICT_PRE_PANEL_PREFIX)
+    assert "no valid exact fix scope" in decision.reason
+
+    # Row prepanel-primary-approved-with-machine-obligation: the primary's
+    # exact-head approval opens the panel while the obligation remains.
+    audit = select_reviewers(
+        _snapshot(obligations=(machine,)), BROAD, qualifying_approvals=("Codex",)
+    )
+    assert audit.selected_reviewers == ("Gemini", "Antigravity")
+    assert audit.phase == "secondary-audit"
+    assert "non-reviewer obligations remain: item-9" in audit.reason
+    assert "post-panel rules" in audit.reason
+
+
+def test_prepanel_empty_selection_invariant():
+    # Only an unavailable primary empties a primary-phase selection.
     missing_primary = select_reviewers(
         _snapshot(previous=None, phase="primary"),
         BROAD,
@@ -1151,9 +1300,27 @@ def test_force_full_latch_overrides_primary_phase_and_unavailable_is_not_approva
     assert missing_primary.selected_reviewers == ()
     assert missing_primary.phase == "primary"
     assert "unavailable" in dict(missing_primary.paused_reviewers)["Codex"]
+    # Branch (iii) is empty only when every secondary is unavailable; it never
+    # shrinks merely because the caller dropped premature approvals.
+    all_unavailable = select_reviewers(
+        _snapshot(), NARROW,
+        qualifying_approvals=("Codex",),
+        unavailable_reviewers=("Gemini", "Antigravity"),
+    )
+    assert all_unavailable.selected_reviewers == ()
+    assert all_unavailable.phase == "secondary-audit"
+    first_audit = select_reviewers(_snapshot(), NARROW, qualifying_approvals=("Codex",))
+    assert first_audit.selected_reviewers == ("Gemini", "Antigravity")
+
+
+def test_operator_force_full_overrides_primary_phase_and_unavailable_is_not_approval():
+    forced = select_reviewers(_snapshot(previous=None, operator_force_full=True), BROAD)
+    assert forced.selected_reviewers == ("Codex", "Gemini", "Antigravity")
+    assert forced.phase == "full-board"
+    assert forced.reason == OPERATOR_FORCE_FULL_REASON
 
     partial_sweep = select_reviewers(
-        _snapshot(previous="b" * 40, phase="secondary-audit"),
+        _snapshot(previous="b" * 40, phase="secondary-audit", panel_evidence=True),
         TransitionClassification("narrow", "same exact candidate head"),
         qualifying_approvals=("Codex", "Gemini"),
         unavailable_reviewers=("Antigravity",),
@@ -1257,3 +1424,163 @@ def test_staged_pr_scheduler_options_validate_together(tmp_path):
     default = make_config(tmp_path, reviewer=("codex", "gemini"))
     assert default.pr_review_policy == "all-reviewers"
     assert default.primary_reviewer is None
+
+
+# ---------------------------------------------------------------------------
+# #840: qualified panel evidence and causal approval eligibility
+# ---------------------------------------------------------------------------
+
+
+def _staged_record(index, *, role="summary", agent="Orchestrator", subject="h1", state=None,
+                   phase=None, approved=(), force_full=False, source=None, new_items=()):
+    contract = _primary_contract()
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role=role,
+        agent=agent,
+        round_number=1,
+        subject=subject,
+        state=state,
+        new_items=tuple(new_items),
+        scheduler_contract=contract.as_dict(),
+        scheduler_previous_sha=None,
+        scheduler_current_sha=subject,
+        scheduler_obligation_digest="0" * 16,
+        scheduler_selected_reviewers=contract.required_reviewers,
+        scheduler_reasons=("test",),
+        scheduler_final_sweep=False,
+        scheduler_force_full=force_full,
+        scheduler_force_full_source=source,
+        scheduler_calls_avoided=0,
+        scheduler_phase=phase,
+        scheduler_primary_reviewer="Codex",
+        scheduler_approved_reviewers=tuple(approved),
+    )
+    return orchestrator.PostedRoundRecord(index=index, metadata=metadata, body="")
+
+
+def _evidence(records):
+    return orchestrator._derive_pr_panel_evidence(
+        records, primary_reviewer="Codex", required_reviewers=("Codex", "Gemini", "Antigravity")
+    )
+
+
+def test_panel_evidence_requires_operator_source_or_prior_same_subject_primary_approval():
+    primary_approval = _staged_record(1, role="reviewer", agent="Codex", state="approved", phase="primary")
+    audit = _staged_record(2, phase="secondary-audit", approved=("Codex",))
+    qualified = _evidence([primary_approval, audit])
+    assert qualified.opened and qualified.opening_index == 2
+    assert qualified.opening_source == "primary-approval"
+
+    operator = _evidence([_staged_record(0, phase="full-board", force_full=True, source="operator")])
+    assert operator.opened and operator.opening_source == "operator"
+
+    # A secondary-audit record whose primary approval is for another subject,
+    # or appears later in comment order, is not an opening.
+    other_subject = _staged_record(1, role="reviewer", agent="Codex", subject="h0", state="approved")
+    assert not _evidence([other_subject, audit]).opened
+    later_approval = _staged_record(3, role="reviewer", agent="Codex", state="approved")
+    assert not _evidence([audit, later_approval]).opened
+    # The record must also list the primary as approved.
+    assert not _evidence([primary_approval, _staged_record(2, phase="secondary-audit")]).opened
+
+
+def test_premature_panel_artifacts_and_legacy_latches_are_not_panel_evidence():
+    premature = [
+        _staged_record(0, phase="full-board", force_full=True),  # legacy unattributed latch
+        _staged_record(1, role="reviewer", agent="Gemini", state="approved", phase="full-board"),
+        _staged_record(2, phase="remediation", force_full=True, source="automatic"),
+    ]
+    evidence = _evidence(premature)
+    assert not evidence.opened
+    assert evidence.prepanel_latch
+    assert not evidence.post_opening_automatic_latch
+    assert any("Gemini review" in artifact for artifact in evidence.unqualified_artifacts)
+    assert any("full-board scheduler record" in artifact for artifact in evidence.unqualified_artifacts)
+
+    # A legacy latch after a qualified opening is restored as automatic.
+    opened = _evidence(
+        [
+            _staged_record(1, role="reviewer", agent="Codex", state="approved", phase="primary"),
+            _staged_record(2, phase="secondary-audit", approved=("Codex",)),
+            _staged_record(3, phase="full-board", force_full=True),
+        ]
+    )
+    assert opened.opened and opened.post_opening_automatic_latch and not opened.prepanel_latch
+
+
+def test_secondary_approval_counts_only_after_qualified_opening():
+    primary_approval = _staged_record(1, role="reviewer", agent="Codex", state="approved")
+    premature_secondary = _staged_record(0, role="reviewer", agent="Gemini", state="approved")
+    audit = _staged_record(2, phase="secondary-audit", approved=("Codex",))
+    post_secondary = _staged_record(3, role="reviewer", agent="Gemini", state="approved")
+    evidence = _evidence([premature_secondary, primary_approval, audit, post_secondary])
+
+    def qualified(record, *, operator=False, current=evidence):
+        return orchestrator._pr_record_is_panel_qualified(
+            record, current, primary_reviewer="Codex", operator_force_full=operator
+        )
+
+    assert not qualified(premature_secondary)
+    assert qualified(post_secondary)
+    # The primary is never premature under a primary-approval opening.
+    assert qualified(primary_approval)
+    # Without any opening, secondaries never qualify and the primary does.
+    none = _evidence([premature_secondary, primary_approval])
+    assert not qualified(premature_secondary, current=none)
+    assert qualified(primary_approval, current=none)
+    # An operator opening (being established, or recorded) qualifies only
+    # records written after it, for every reviewer.
+    assert not qualified(primary_approval, operator=True, current=none)
+    operator_opening = _evidence(
+        [primary_approval, _staged_record(2, phase="full-board", force_full=True, source="operator")]
+    )
+    assert not qualified(primary_approval, current=operator_opening)
+    assert qualified(post_secondary, current=operator_opening)
+
+
+def test_superseded_prepanel_review_context_is_built_from_the_record():
+    item = _next_unresolved_item(
+        item_number=4, reviewer="Gemini", source_round=1, text="premature cache race",
+        status="blocking", fix_scope=("src/worker.py",),
+    )
+    record = _staged_record(5, role="reviewer", agent="Gemini", state="blocking", new_items=(item,))
+    superseded = orchestrator._superseded_prepanel_review(record)
+    assert superseded.reviewer == "Gemini"
+    assert superseded.claims == ("premature cache race",)
+    assert superseded.item_ids == ("item-4",)
+    assert orchestrator._superseded_prepanel_review(None) is None
+    assert "Gemini (round 1, head h1, state blocking; items: item-4)" == (
+        orchestrator._describe_superseded_prepanel_review(record)
+    )
+
+
+def test_non_staged_policies_ignore_pre_panel_rules():
+    # Row other-policies-unchanged: no diagnostic, same decisions and reasons.
+    secondary_owned = (_obligation(owners=("Claude",)),)
+    snapshot = SchedulerSnapshot(
+        previous_sha="a" * 40,
+        current_sha="b" * 40,
+        contract=_contract(),
+        obligations=secondary_owned,
+    )
+    narrow = select_reviewers(snapshot, NARROW)
+    assert narrow.selected_reviewers == ("Claude",)
+    assert narrow.reason == "narrow transition: pending resolution owners and co-owners"
+    broad = select_reviewers(snapshot, BROAD)
+    assert broad.reason == f"full board required: {BROAD.reason}"
+    for forced in (
+        dataclasses.replace(snapshot, force_full=True),
+        dataclasses.replace(snapshot, operator_force_full=True),
+    ):
+        decision = select_reviewers(forced, NARROW)
+        assert decision.selected_reviewers == ("Claude", "Codex", "Antigravity")
+        assert decision.reason == "force-full latch"
+    compat = SchedulerSnapshot(
+        previous_sha="a" * 40,
+        current_sha="b" * 40,
+        contract=ReviewSchedulingContract(required_reviewers=("Claude", "Codex")),
+        obligations=secondary_owned,
+        operator_force_full=True,
+    )
+    assert select_reviewers(compat, NARROW).reason == "compatibility policy"

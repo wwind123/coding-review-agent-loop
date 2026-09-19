@@ -2123,7 +2123,7 @@ def test_staged_policy_public_audit_comments_identify_phase_and_neutral_accounti
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     audits = [comment for comment in runner.comments if comment.startswith("PR review scheduling audit:")]
     assert len(audits) == 2
-    assert "phase: primary; head: abc123; primary: Codex; active owners: (none); force-full: False" in audits[0]
+    assert "phase: primary; head: abc123; primary: Codex; active owners: (none); force-full: False (source: none)" in audits[0]
     assert "selected Codex; paused Gemini" in audits[0]
     assert "phase: secondary-audit; head: abc123; primary: Codex" in audits[1]
     assert "selected Gemini; paused Codex" in audits[1]
@@ -2131,7 +2131,7 @@ def test_staged_policy_public_audit_comments_identify_phase_and_neutral_accounti
         assert "selective-only calls avoided" not in comment
     assert any("scheduler-policy calls avoided cumulatively: 1." in comment for comment in audits)
     reconciliations = [c for c in runner.comments if "reconciliation: settled reviewers" in c]
-    assert any("Phase: primary; force-full: False." in c for c in reconciliations)
-    assert any("Phase: secondary-audit; force-full: False." in c for c in reconciliations)
+    assert any("Phase: primary; force-full: False (source: none)." in c for c in reconciliations)
+    assert any("Phase: secondary-audit; force-full: False (source: none)." in c for c in reconciliations)
     for comment in runner.comments:
         assert "AGENT_ROUND" not in comment.split("<!--")[0]
