@@ -147,6 +147,51 @@ def test_derived_matrix_evidence_is_complete_and_selector_citations_are_tool_own
     assert "execution_ref" not in result.evidence.to_payload()["rows"][0]["evidence_citations"][0]
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "test_identifiers",
+        "test_locations",
+        "outcome_assertions",
+        "forbidden_effect_assertions",
+    ],
+)
+def test_builder_downgrades_incomplete_semantic_facts(field) -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(
+        execution_ref="invocation:observation-1", receipt_id="receipt-1"
+    )
+    values = {
+        "test_identifiers": ("test_ordinary",),
+        "test_locations": ("tests/test_risk_test_matrix.py::test_ordinary",),
+        "workflow_path_claim": "The workflow path ran.",
+        "outcome_assertions": ("The selected test passed.",),
+        "forbidden_effect_assertions": ("No stale head was merged.",),
+    }
+    values[field] = ()
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        **values,
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert result.evidence.rows[0].status == "stale/unverified"
+    assert not result.evidence.rows[0].evidence_citations
+    assert any(diagnostic.code == "incomplete-semantic-claim" for diagnostic in result.diagnostics)
+
+
 def test_derived_matrix_evidence_preserves_unsuperseded_failure_caveat() -> None:
     matrix = parse_risk_test_matrix(_matrix())
     passing = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-pass")

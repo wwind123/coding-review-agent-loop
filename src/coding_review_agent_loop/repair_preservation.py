@@ -492,6 +492,24 @@ def validate_repair_preservation(
                 ):
                     if field in source_claim:
                         require(field in candidate, f"risk_test_matrix_claims.{field}")
+                        if field == "execution_refs":
+                            # The schema/catalog validator decides which
+                            # selectors are invalid. Permit repair to remove
+                            # those selectors, including one copy of a
+                            # duplicate, but never let it add or replace a
+                            # selector that was absent from the source claim.
+                            source_refs = source_claim[field]
+                            target_refs = candidate[field]
+                            require(isinstance(source_refs, list), f"risk_test_matrix_claims.{field}")
+                            require(isinstance(target_refs, list), f"risk_test_matrix_claims.{field}")
+                            remaining_refs = list(source_refs)
+                            for target_ref in target_refs:
+                                require(
+                                    target_ref in remaining_refs,
+                                    f"risk_test_matrix_claims.{field}",
+                                )
+                                remaining_refs.remove(target_ref)
+                            continue
                         source_fragments = _fragments(source_claim[field])
                         target_fragments = _fragments(candidate[field])
                         require(

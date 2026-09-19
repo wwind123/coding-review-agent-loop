@@ -226,6 +226,28 @@ def test_fresh_coder_repair_may_remove_legacy_canonical_evidence():
     check(source, repaired)
 
 
+def test_semantic_repair_may_remove_invalid_selector_and_keep_valid_facts():
+    source = {
+        "kind": "coder_followup",
+        "risk_test_matrix_claims": [{
+            "row_id": "row-1",
+            "execution_refs": ["turn:valid", "other-turn:invalid"],
+            "test_identifiers": ["tests/test_protocol.py::test_valid"],
+            "test_locations": ["tests/test_protocol.py"],
+            "workflow_path_claim": "The current workflow path ran.",
+            "outcome_assertions": ["The selected test passed."],
+            "forbidden_effect_assertions": ["No unauthorized effect occurred."],
+        }],
+    }
+    repaired = deepcopy(source)
+    repaired["risk_test_matrix_claims"][0]["execution_refs"] = ["turn:valid"]
+
+    # The repaired response keeps the valid selector and all semantic facts;
+    # the current-turn catalog validator will reject the removed cross-turn
+    # selector separately.
+    check(source, repaired)
+
+
 def test_fresh_coder_repair_cannot_invent_canonical_evidence():
     source = {
         "schema_version": 1,

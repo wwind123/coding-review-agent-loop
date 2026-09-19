@@ -2278,6 +2278,58 @@ def test_semantic_matrix_claims_use_current_turn_execution_refs_only():
 
 @pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
 @pytest.mark.parametrize(
+    "field",
+    [
+        "test_identifiers",
+        "test_locations",
+        "outcome_assertions",
+        "forbidden_effect_assertions",
+    ],
+)
+def test_semantic_matrix_claims_require_facts_for_verified_coverage(kind, field):
+    claim = {
+        "row_id": "row-1",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": ["test_protocol"],
+        "test_locations": ["tests/test_protocol.py"],
+        "workflow_path_claim": "The implementation path ran.",
+        "outcome_assertions": ["The test passed."],
+        "forbidden_effect_assertions": ["No evidence was invented."],
+    }
+    claim[field] = []
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "state": "blocking",
+        "summary": "Implemented the change.",
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "risk_test_matrix_claims": [claim],
+    }
+    validator = (
+        validate_structured_issue_implementation
+        if kind == "issue_implementation"
+        else validate_structured_coder_followup
+    )
+    if kind == "issue_implementation":
+        payload["pr_number"] = 77
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+
+    with pytest.raises(AgentLoopError, match=field):
+        validator(
+            json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            delivered_risk_test_matrix_row_ids=["row-1"],
+            execution_catalog=[{
+                "execution_ref": "turn:observation-1",
+                "outcome": "passed",
+                "provenance": "parent-observed",
+            }],
+        )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("wrapper_bootstrap", "failed"),

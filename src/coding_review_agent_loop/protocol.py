@@ -960,8 +960,16 @@ def _risk_bounded_string(value: object, *, context: str, max_bytes: int = RISK_M
     return rendered
 
 
-def _risk_bounded_string_list(value: object, *, context: str, max_items: int = RISK_MATRIX_MAX_LIST_ITEMS) -> tuple[str, ...]:
+def _risk_bounded_string_list(
+    value: object,
+    *,
+    context: str,
+    max_items: int = RISK_MATRIX_MAX_LIST_ITEMS,
+    min_items: int = 0,
+) -> tuple[str, ...]:
     rendered = _expect_string_list(value, context=context, item_context=context)
+    if len(rendered) < min_items:
+        raise AgentLoopError(f"{context} must contain at least {min_items} item(s).")
     if len(rendered) > max_items:
         raise AgentLoopError(f"{context} exceeds the {max_items}-item bound.")
     for index, item in enumerate(rendered):
@@ -1675,6 +1683,29 @@ def derive_risk_test_matrix_evidence(
             diagnostics.append(PostAuthClaimDiagnostic(row.row_id, "missing-claim", "No semantic row claim was supplied."))
         else:
             candidate_citations: list[TestObservationCitation] = []
+            missing_semantic_facts = [
+                field_name
+                for field_name, value in (
+                    ("test_identifiers", claim.test_identifiers),
+                    ("test_locations", claim.test_locations),
+                    ("workflow_path_claim", claim.workflow_path_claim),
+                    ("outcome_assertions", claim.outcome_assertions),
+                    ("forbidden_effect_assertions", claim.forbidden_effect_assertions),
+                )
+                if not value
+            ]
+            if missing_semantic_facts:
+                valid_selected = False
+                diagnostics.append(PostAuthClaimDiagnostic(
+                    row.row_id,
+                    "incomplete-semantic-claim",
+                    "Semantic coverage is missing required facts: "
+                    + ", ".join(missing_semantic_facts)
+                    + ".",
+                ))
+                caveats.append(
+                    "The semantic coverage claim did not provide all facts required for verified evidence."
+                )
             for execution_ref in claim.execution_refs:
                 observation = observation_by_ref.get(execution_ref)
                 if observation is None:
@@ -3074,17 +3105,24 @@ def _parse_semantic_risk_coverage_claims(
                         "launch-integrity state and cannot be selected before authentication."
                     )
         test_identifiers = _risk_bounded_string_list(
-            payload["test_identifiers"], context=f"{claim_context}.test_identifiers"
+            payload["test_identifiers"],
+            context=f"{claim_context}.test_identifiers",
+            min_items=1,
         )
         test_locations = _risk_bounded_string_list(
-            payload["test_locations"], context=f"{claim_context}.test_locations"
+            payload["test_locations"],
+            context=f"{claim_context}.test_locations",
+            min_items=1,
         )
         outcome_assertions = _risk_bounded_string_list(
-            payload["outcome_assertions"], context=f"{claim_context}.outcome_assertions"
+            payload["outcome_assertions"],
+            context=f"{claim_context}.outcome_assertions",
+            min_items=1,
         )
         forbidden_effect_assertions = _risk_bounded_string_list(
             payload["forbidden_effect_assertions"],
             context=f"{claim_context}.forbidden_effect_assertions",
+            min_items=1,
         )
         claim = SemanticRiskCoverageClaim(
             row_id=row_id,
