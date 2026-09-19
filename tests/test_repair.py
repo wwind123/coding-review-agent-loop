@@ -4585,3 +4585,79 @@ def test_run_validated_agent_semantic_patch_active_disposition_fails_closed(tmp_
             _run_semantic_patch_revision(
                 tmp_path, patch_text, history_ids=("item-2", "item-3")
             )
+
+
+def _plan_history_comments_with_resolved_items():
+    """Round-1 findings plus a round-2 review that resolves item-2 only."""
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop.protocol import ReviewItemDisposition
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
+
+    blocking = UnresolvedReviewItem(
+        item_id="item-1", reviewer="OpenAI Codex", source_round=1,
+        text="Blocking finding.", status="blocking",
+    )
+    same_plan = UnresolvedReviewItem(
+        item_id="item-2", reviewer="Anthropic Claude", source_round=1,
+        text="Same-plan follow-up.", status="same-plan",
+    )
+    round_one = _attach_round_metadata(
+        "Round 1 summary.",
+        PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=1,
+            subject="subject-one", new_items=(blocking, same_plan),
+        ),
+    )
+    round_two = _attach_round_metadata(
+        "Round 2 review.",
+        PostedRoundMetadata(
+            flow="plan", role="reviewer", agent="Codex", round_number=2,
+            subject="subject-two", prior_items=(blocking, same_plan),
+            dispositions=(
+                ReviewItemDisposition(item_id="item-1", reviewer="OpenAI Codex", disposition="blocking", note="still open"),
+                ReviewItemDisposition(item_id="item-2", reviewer="OpenAI Codex", disposition="resolved"),
+            ),
+        ),
+    )
+    return [SimpleNamespace(body=round_one), SimpleNamespace(body=round_two)]
+
+def test_round_resolved_history_uses_post_round_carried_set():
+    """#874: items this round resolved must leave the carried set before the revision.
+
+    The pre-round value still lists them, so the whitelist the semantic-patch
+    strip depends on comes back empty exactly when the planner echoes them.
+    """
+    from coding_review_agent_loop.orchestrator import _round_resolved_history_item_ids
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    records_comments = _plan_history_comments_with_resolved_items()
+    pre_round_carried = (
+        UnresolvedReviewItem(item_id="item-1", reviewer="OpenAI Codex", source_round=1,
+                             text="Blocking finding.", status="blocking"),
+        UnresolvedReviewItem(item_id="item-2", reviewer="Anthropic Claude", source_round=1,
+                             text="Same-plan follow-up.", status="same-plan"),
+    )
+    post_round_carried = pre_round_carried[:1]
+
+    assert _extract_round_metadata_records(records_comments, flow="plan")
+    pre = _round_resolved_history_item_ids(
+        prior_unresolved_items=pre_round_carried,
+        comments=records_comments,
+        flow="plan",
+        reconciliation_mode="aggregate",
+        same_status="same-plan",
+    )
+    post = _round_resolved_history_item_ids(
+        prior_unresolved_items=post_round_carried,
+        comments=records_comments,
+        flow="plan",
+        reconciliation_mode="aggregate",
+        same_status="same-plan",
+    )
+
+    assert "item-2" not in pre
+    assert "item-2" in post
