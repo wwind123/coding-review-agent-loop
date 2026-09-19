@@ -1674,6 +1674,7 @@ def derive_risk_test_matrix_evidence(
             caveats.append("No semantic coverage claim was supplied for this enforceable row.")
             diagnostics.append(PostAuthClaimDiagnostic(row.row_id, "missing-claim", "No semantic row claim was supplied."))
         else:
+            candidate_citations: list[TestObservationCitation] = []
             for execution_ref in claim.execution_refs:
                 observation = observation_by_ref.get(execution_ref)
                 if observation is None:
@@ -1685,9 +1686,11 @@ def derive_risk_test_matrix_evidence(
                     caveats.append("A claimed execution selector was unknown or cross-turn.")
                     continue
                 selected.append(observation)
+                selected_observation_valid = True
                 semantics, _rich = _observation_semantics(observation)
                 if invocation_id is not None and _observation_value(observation, "turn_id") != invocation_id:
                     valid_selected = False
+                    selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
                         row.row_id, "cross-turn-execution-ref",
                         f"Execution selector `{execution_ref}` was not bound to the current invocation.",
@@ -1695,30 +1698,35 @@ def derive_risk_test_matrix_evidence(
                 attribution = _observation_attribution(observation)
                 if checkout_head_mismatch:
                     valid_selected = False
+                    selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
                         row.row_id, "checkout-head-mismatch",
                         "The assigned checkout was not authenticated at the exact current PR head.",
                     ))
                 if checkout_tree_unavailable:
                     valid_selected = False
+                    selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
                         row.row_id, "checkout-tree-unavailable",
                         "The assigned checkout was not authenticated as a stable clean tracked tree.",
                     ))
                 if current_head is not None and attribution.get("head") not in {None, current_head}:
                     valid_selected = False
+                    selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
                         row.row_id, "head-mismatch",
                         f"Execution selector `{execution_ref}` was attributed to a different head.",
                     ))
                 if current_tree_digest is not None and attribution.get("tracked_digest") not in {None, current_tree_digest}:
                     valid_selected = False
+                    selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
                         row.row_id, "tree-mismatch",
                         f"Execution selector `{execution_ref}` was attributed to a different tracked tree.",
                     ))
                 if not _authoritative_receipt_passes(observation, claim="current-result"):
                     valid_selected = False
+                    selected_observation_valid = False
                     expected = _receipt_expected_status(observation, claim="current-result") or "stale/unverified"
                     diagnostics.append(PostAuthClaimDiagnostic(
                         row.row_id, "inadmissible-execution",
@@ -1728,17 +1736,25 @@ def derive_risk_test_matrix_evidence(
                     receipt_id = _observation_value(observation, "receipt_id")
                     if not isinstance(receipt_id, str) or not receipt_id.strip():
                         valid_selected = False
+                        selected_observation_valid = False
                         diagnostics.append(PostAuthClaimDiagnostic(
                             row.row_id, "missing-receipt", "An admissible execution had no tool-owned receipt ID."
                         ))
                     else:
-                        citations.append(TestObservationCitation(
-                            command=_observation_command_text(observation),
-                            receipt_id=receipt_id,
-                            claim="current-result",
-                        ))
+                        if selected_observation_valid:
+                            candidate_citations.append(TestObservationCitation(
+                                command=_observation_command_text(observation),
+                                receipt_id=receipt_id,
+                                claim="current-result",
+                            ))
             if not selected:
                 valid_selected = False
+            # A row is verified only when every selected observation is
+            # admissible.  Do not leak a citation for an otherwise passing
+            # subset when any selected execution failed invocation, checkout,
+            # head, tree, launch, or receipt authority checks.
+            if valid_selected:
+                citations.extend(candidate_citations)
             status = "verified" if valid_selected and citations else "stale/unverified"
             if not valid_selected:
                 caveats.append("One or more selected executions failed post-authentication authority checks.")

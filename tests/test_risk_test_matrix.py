@@ -285,6 +285,7 @@ def test_derived_matrix_evidence_rejects_a_matching_tree_from_the_wrong_checkout
 
     assert result.evidence.rows[0].status == "stale/unverified"
     assert any(diagnostic.code == "checkout-head-mismatch" for diagnostic in result.diagnostics)
+    assert result.evidence.rows[0].evidence_citations == ()
 
 
 def test_derived_matrix_evidence_requires_explicit_post_authentication_proof() -> None:

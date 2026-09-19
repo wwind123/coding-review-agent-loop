@@ -1989,8 +1989,14 @@ class TestBrokerServer:
                 self._execution_refs.add(candidate)
                 return candidate
 
-    def _append_journal_locked(self, observation: LocalTestObservation) -> None:
-        """Append within the bound while retaining measured failures longest."""
+    def _append_journal_locked(self, observation: LocalTestObservation) -> LocalTestObservation | None:
+        """Append within the bound while retaining measured failures longest.
+
+        The returned object is the exact observation submitted to the journal,
+        including its minted selector.  Keep that newest observation retained
+        so a completed managed test cannot be paired with an older journal
+        entry when the bounded catalog is saturated.
+        """
         if observation.execution_ref is None:
             observation = replace(
                 observation,
@@ -1998,10 +2004,11 @@ class TestBrokerServer:
             )
         self._journal.append(observation)
         while len(self._journal) > MAX_PRIVATE_OBSERVATIONS:
+            prior_rows = self._journal[:-1]
             discard = next(
                 (
                     index
-                    for index, row in enumerate(self._journal)
+                    for index, row in enumerate(prior_rows)
                     if row.provenance == "telemetry-unverified"
                 ),
                 None,
@@ -2010,12 +2017,15 @@ class TestBrokerServer:
                 discard = next(
                     (
                         index
-                        for index, row in enumerate(self._journal)
+                        for index, row in enumerate(prior_rows)
                         if not row.is_failure
                     ),
                     0,
                 )
             del self._journal[discard]
+        return observation if any(
+            row.execution_ref == observation.execution_ref for row in self._journal
+        ) else None
 
     def _execute_request(self, request: Mapping[str, object], connection: socket.socket) -> dict[str, object]:
         from .containment import open_confined_cwd
@@ -2131,8 +2141,8 @@ class TestBrokerServer:
                 suite_start=suite_start,
             )
             with self._journal_lock:
-                self._append_journal_locked(observation)
-                execution_ref = self._journal[-1].execution_ref
+                retained = self._append_journal_locked(observation)
+                execution_ref = retained.execution_ref if retained is not None else None
         return {
             "type": "result",
             "receipt_id": receipt_id,
