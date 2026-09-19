@@ -49,6 +49,7 @@ from coding_review_agent_loop.protocol import (
     parse_agent_unavailable,
     parse_approved_followups,
     parse_human_requirements_acknowledgement,
+    parse_historical_structured_issue_implementation,
     parse_pr_review,
     parse_plan_item_dispositions,
     parse_plan_review,
@@ -2226,6 +2227,209 @@ def test_validate_structured_coder_followup_accepts_v1_payload():
     assert parsed.human_requirements.addressed_ids == ("Requirement 1",)
     assert parsed.addressed_item_notes == {}
     assert parsed.remaining_item_notes == {}
+
+
+def test_semantic_matrix_claims_use_current_turn_execution_refs_only():
+    payload = {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "Implemented the change.",
+        "pr_number": 77,
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "risk_test_matrix_claims": [{
+            "row_id": "row-1",
+            "execution_refs": ["turn:observation-1"],
+            "test_identifiers": ["test_protocol"],
+            "test_locations": ["tests/test_protocol.py"],
+            "workflow_path_claim": "The implementation path ran.",
+            "outcome_assertions": ["The test passed."],
+            "forbidden_effect_assertions": ["No evidence was invented."],
+            "caveats": [],
+        }],
+    }
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    parsed = validate_structured_issue_implementation(
+        text,
+        delivered_risk_test_matrix_row_ids=["row-1"],
+        execution_catalog=[{
+            "execution_ref": "turn:observation-1",
+            "outcome": "passed",
+            "provenance": "parent-observed",
+        }],
+    )
+    assert parsed is not None
+    assert parsed.risk_test_matrix_claims is not None
+    assert parsed.risk_test_matrix_claims.claims[0].execution_refs == ("turn:observation-1",)
+
+    payload["risk_test_matrix_claims"][0]["execution_refs"] = ["other-turn:observation-1"]
+    with pytest.raises(Exception, match="unknown or cross-turn"):
+        validate_structured_issue_implementation(
+            json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            delivered_risk_test_matrix_row_ids=["row-1"],
+            execution_catalog=[{
+                "execution_ref": "turn:observation-1",
+                "outcome": "passed",
+                "provenance": "parent-observed",
+            }],
+        )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "test_identifiers",
+        "test_locations",
+        "outcome_assertions",
+        "forbidden_effect_assertions",
+    ],
+)
+def test_semantic_matrix_claims_require_facts_for_verified_coverage(kind, field):
+    claim = {
+        "row_id": "row-1",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": ["test_protocol"],
+        "test_locations": ["tests/test_protocol.py"],
+        "workflow_path_claim": "The implementation path ran.",
+        "outcome_assertions": ["The test passed."],
+        "forbidden_effect_assertions": ["No evidence was invented."],
+    }
+    claim[field] = []
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "state": "blocking",
+        "summary": "Implemented the change.",
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "risk_test_matrix_claims": [claim],
+    }
+    validator = (
+        validate_structured_issue_implementation
+        if kind == "issue_implementation"
+        else validate_structured_coder_followup
+    )
+    if kind == "issue_implementation":
+        payload["pr_number"] = 77
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+
+    with pytest.raises(AgentLoopError, match=field):
+        validator(
+            json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            delivered_risk_test_matrix_row_ids=["row-1"],
+            execution_catalog=[{
+                "execution_ref": "turn:observation-1",
+                "outcome": "passed",
+                "provenance": "parent-observed",
+            }],
+        )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("wrapper_bootstrap", "failed"),
+        ("inner_exec", "failed"),
+        ("suite_start", "not-started"),
+    ],
+)
+def test_semantic_matrix_claims_reject_known_launch_integrity_failures_before_auth(
+    kind, field, value
+):
+    claim = {
+        "row_id": "row-1",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": ["test_protocol"],
+        "test_locations": ["tests/test_protocol.py"],
+        "workflow_path_claim": "The implementation path ran.",
+        "outcome_assertions": ["The test passed."],
+        "forbidden_effect_assertions": ["No evidence was invented."],
+    }
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "state": "blocking",
+        "summary": "Implemented the change.",
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "risk_test_matrix_claims": [claim],
+    }
+    if kind == "issue_implementation":
+        payload["pr_number"] = 77
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    launch_state = {
+        "wrapper_bootstrap": "verified",
+        "inner_exec": "started",
+        "suite_start": "verified",
+    }
+    launch_state[field] = value
+
+    validator = (
+        validate_structured_issue_implementation
+        if kind == "issue_implementation"
+        else validate_structured_coder_followup
+    )
+    with pytest.raises(AgentLoopError, match="launch-integrity"):
+        validator(
+            text,
+            delivered_risk_test_matrix_row_ids=["row-1"],
+            execution_catalog=[{
+                "execution_ref": "turn:observation-1",
+                "outcome": "passed",
+                "provenance": "parent-observed",
+                **launch_state,
+            }],
+        )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_fresh_coder_contract_rejects_model_authored_canonical_matrix_evidence(kind):
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "state": "blocking",
+        "summary": "The implementation is complete.",
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "risk_test_matrix_evidence": {
+            "matrix_identity": "a" * 64,
+            "rows": [],
+        },
+    }
+    if kind == "issue_implementation":
+        payload["pr_number"] = 77
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+
+    validator = (
+        validate_structured_issue_implementation
+        if kind == "issue_implementation"
+        else validate_structured_coder_followup
+    )
+    with pytest.raises(AgentLoopError, match="risk_test_matrix_evidence"):
+        validator(text)
+
+
+def test_historical_issue_implementation_parser_keeps_accepted_canonical_evidence_readable():
+    payload = _issue_implementation_text(pr_number=77)
+    raw, end = json.JSONDecoder().raw_decode(payload.lstrip())
+    raw["risk_test_matrix_evidence"] = {
+        "matrix_identity": "a" * 64,
+        "rows": [],
+    }
+    historical = json.dumps(raw) + payload.lstrip()[end:]
+
+    parsed = parse_historical_structured_issue_implementation(historical)
+
+    assert parsed is not None
+    assert parsed.risk_test_matrix_evidence is not None
 
 
 def test_validate_structured_coder_followup_accepts_exact_test_observation_shape():

@@ -147,6 +147,25 @@ def run_agent_result(
         prompt,
         **kwargs,
     )
+    # Capture the coder's broker turn immediately. A later semantic repair
+    # runs with containment role ``repair`` and creates a fresh broker turn;
+    # that repair turn must not replace the handles issued by this response.
+    acquisition_turn_id = None
+    acquisition_observations: tuple[object, ...] = ()
+    if role == "coder":
+        acquisition_turn_id = getattr(runner, "latest_test_turn_id", None)
+        current_observations = getattr(runner, "current_test_turn_observations", None)
+        if callable(current_observations):
+            acquisition_observations = tuple(current_observations())
+    result = replace(
+        result,
+        test_turn_id=(
+            acquisition_turn_id
+            if isinstance(acquisition_turn_id, str) and acquisition_turn_id
+            else None
+        ),
+        test_turn_observations=acquisition_observations,
+    )
     # Resolve identity at the common backend boundary so direct library calls,
     # retries, and session resumes carry the same metadata as CLI turns.
     if (

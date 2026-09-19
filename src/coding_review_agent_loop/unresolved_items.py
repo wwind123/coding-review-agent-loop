@@ -28,6 +28,8 @@ from .protocol import (
     parse_plan_review,
     parse_pr_review,
     parse_human_requirements_acknowledgement,
+    parse_historical_structured_coder_followup,
+    parse_historical_structured_issue_implementation,
     validate_human_requirements_acknowledgement,
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
@@ -534,7 +536,7 @@ def _reconcile_human_requirements_ack_item(
     structured_implementation: StructuredIssueImplementation | None = None
     structured_followup: StructuredCoderFollowup | None = None
     try:
-        structured_implementation = validate_structured_issue_implementation(coder_output)
+        structured_implementation = parse_historical_structured_issue_implementation(coder_output)
     except IssueImplementationConflictError as exc:
         structured_implementation = exc.payload
     except AgentLoopError:
@@ -542,7 +544,7 @@ def _reconcile_human_requirements_ack_item(
 
     if structured_implementation is None:
         try:
-            structured_followup = validate_structured_coder_followup(coder_output)
+            structured_followup = parse_historical_structured_coder_followup(coder_output)
         except AgentLoopError:
             structured_followup = None
 
@@ -765,6 +767,7 @@ def _validate_coder_followup_response(
     required_risk_test_matrix_contract: int = 0,
     authoritative_test_observations=None,
     delivered_risk_test_matrix_row_ids=None,
+    execution_catalog=None,
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -775,6 +778,7 @@ def _validate_coder_followup_response(
         required_risk_test_matrix_contract=required_risk_test_matrix_contract,
         authoritative_test_observations=authoritative_test_observations,
         delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
+        execution_catalog=execution_catalog,
     )
     if structured_followup is not None:
         _validate_structured_coder_followup_items(

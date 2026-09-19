@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -12,12 +13,18 @@ from coding_review_agent_loop.comment_rendering import (
     render_public_agent_comment,
     render_risk_test_matrix_section,
 )
+import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.local_test_evidence import LocalTestObservation, TreeAttribution
 from coding_review_agent_loop.protocol import (
     RiskTestMatrixChange,
+    SemanticRiskCoverageClaim,
+    SemanticRiskCoverageClaims,
+    derive_risk_test_matrix_evidence,
     parse_risk_test_matrix,
     parse_risk_test_matrix_evidence,
     risk_test_matrix_identity,
+    validate_structured_coder_followup,
     validate_structured_plan_state,
     validate_risk_test_matrix_revision,
 )
@@ -35,6 +42,7 @@ from coding_review_agent_loop.round_transport import (
     prepare_round_comment,
     risk_test_matrix_section_boundary,
 )
+from agent_loop_helpers import structured_coder_followup
 
 
 def _row(row_id: str = "row-ordinary") -> dict[str, object]:
@@ -69,6 +77,452 @@ def _not_applicable() -> dict[str, object]:
         "important_exclusions": [],
         "not_applicable_rationale": "This is a local formatting-only change with no stateful entry path.",
     }
+
+
+def _derived_observation(
+    *,
+    execution_ref: str,
+    receipt_id: str,
+    outcome: str = "passed",
+    turn_id: str = "turn-current",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        execution_ref=execution_ref,
+        receipt_id=receipt_id,
+        command=("python3", "-m", "pytest", "tests/test_protocol.py", "-q"),
+        normalized_command="python3 -m pytest tests/test_protocol.py -q",
+        outcome=outcome,
+        provenance="parent-observed",
+        turn_id=turn_id,
+        attribution={
+            "state": "current-head",
+            "head": "head-current",
+            "tracked_digest": "tree-current",
+            "stable": True,
+            "untracked_input": False,
+            "caveats": [],
+        },
+        environment_state="not-compared",
+        superseded_by=None,
+        caveats=(),
+        wrapper_bootstrap="verified",
+        inner_exec="started",
+        suite_start="verified",
+    )
+
+
+def test_derived_matrix_evidence_is_complete_and_selector_citations_are_tool_owned() -> None:
+    matrix = parse_risk_test_matrix({
+        **_matrix(),
+        "rows": [_row("row-first"), _row("row-second")],
+    })
+    observation = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-1")
+    claims = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-first",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=("test_first",),
+        test_locations=("tests/test_protocol.py::test_first",),
+        workflow_path_claim="The first workflow path ran.",
+        outcome_assertions=("The first test passed.",),
+        forbidden_effect_assertions=("No unauthorized evidence was accepted.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+    assert result.evidence.rows[0].status == "verified"
+    assert result.evidence.rows[0].evidence_citations[0].receipt_id == "receipt-1"
+    assert result.evidence.rows[1].status == "missing"
+    assert result.diagnostics[0].code == "missing-claim"
+    assert "execution_ref" not in result.evidence.to_payload()["rows"][0]["evidence_citations"][0]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "test_identifiers",
+        "test_locations",
+        "outcome_assertions",
+        "forbidden_effect_assertions",
+    ],
+)
+def test_builder_downgrades_incomplete_semantic_facts(field) -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(
+        execution_ref="invocation:observation-1", receipt_id="receipt-1"
+    )
+    values = {
+        "test_identifiers": ("test_ordinary",),
+        "test_locations": ("tests/test_risk_test_matrix.py::test_ordinary",),
+        "workflow_path_claim": "The workflow path ran.",
+        "outcome_assertions": ("The selected test passed.",),
+        "forbidden_effect_assertions": ("No stale head was merged.",),
+    }
+    values[field] = ()
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        **values,
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert result.evidence.rows[0].status == "stale/unverified"
+    assert not result.evidence.rows[0].evidence_citations
+    assert any(diagnostic.code == "incomplete-semantic-claim" for diagnostic in result.diagnostics)
+
+
+def test_derived_matrix_evidence_preserves_unsuperseded_failure_caveat() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    passing = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-pass")
+    failed = _derived_observation(
+        execution_ref="invocation:observation-2",
+        receipt_id="receipt-fail",
+        outcome="failed",
+    )
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_protocol.py::test_ordinary",),
+        workflow_path_claim="The workflow path ran.",
+        outcome_assertions=("The selected test passed.",),
+        forbidden_effect_assertions=("No stale head was merged.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=(passing, failed),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    row = result.evidence.rows[0]
+    assert row.status == "incomplete"
+    assert any("unsuperseded" in caveat for caveat in row.caveats)
+    assert any(diagnostic.code == "unsuperseded-journal-failure" for diagnostic in result.diagnostics)
+
+
+def test_orchestrator_derivation_ignores_prior_turn_failure(monkeypatch, tmp_path) -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    plan_context = make_approved_plan_context(
+        None,
+        expected_hash="a" * 16,
+        expected_subject="b" * 64,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    prior_failure = _derived_observation(
+        execution_ref="old-turn:observation-1",
+        receipt_id="receipt-old-failure",
+        outcome="failed",
+        turn_id="turn-old",
+    )
+    current_pass = _derived_observation(
+        execution_ref="current-turn:observation-1",
+        receipt_id="receipt-current-pass",
+        turn_id="turn-current",
+    )
+    parsed = validate_structured_coder_followup(structured_coder_followup())
+    parsed = dataclasses.replace(parsed, risk_test_matrix_claims=SemanticRiskCoverageClaims((
+        SemanticRiskCoverageClaim(
+            row_id="row-ordinary",
+            execution_refs=("current-turn:observation-1",),
+            test_identifiers=("test_ordinary",),
+            test_locations=("tests/test_risk_test_matrix.py::test_ordinary",),
+            workflow_path_claim="The current coder turn ran the workflow.",
+            outcome_assertions=("The selected test passed.",),
+            forbidden_effect_assertions=("No stale head was merged.",),
+        ),
+    )))
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "stable_tracked_tree_snapshot",
+        lambda _cwd: SimpleNamespace(
+            head="head-current", tracked_digest="tree-current", complete=True,
+            stable=True, status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "reconcile_test_observations",
+        lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
+    )
+    runner = SimpleNamespace(
+        local_test_observations=lambda: (prior_failure, current_pass),
+    )
+
+    derived, result = orchestrator_module._derive_authenticated_risk_evidence_for_coder(
+        parsed,
+        approved_plan_context=plan_context,
+        runner=runner,
+        assigned_workdir=tmp_path,
+        head_sha="head-current",
+        invocation_id="turn-current",
+        _closed_execution_catalog=(current_pass,),
+    )
+
+    assert result is not None
+    assert derived.risk_test_matrix_evidence.rows[0].status == "verified"
+    assert not any(
+        diagnostic.code == "unsuperseded-journal-failure"
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_derived_matrix_evidence_rejects_a_matching_tree_from_the_wrong_checkout_head() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(
+        execution_ref="invocation:observation-1",
+        receipt_id="receipt-1",
+    )
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_protocol.py::test_ordinary",),
+        workflow_path_claim="The workflow path ran.",
+        outcome_assertions=("The selected test passed.",),
+        forbidden_effect_assertions=("No stale head was merged.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-other",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert result.evidence.rows[0].status == "stale/unverified"
+    assert any(diagnostic.code == "checkout-head-mismatch" for diagnostic in result.diagnostics)
+    assert result.evidence.rows[0].evidence_citations == ()
+
+
+def test_derived_matrix_evidence_requires_explicit_post_authentication_proof() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(
+        execution_ref="invocation:observation-1",
+        receipt_id="receipt-1",
+    )
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_risk_test_matrix.py::test_ordinary",),
+        workflow_path_claim="The workflow path ran.",
+        outcome_assertions=("The selected test passed.",),
+        forbidden_effect_assertions=("No stale head was merged.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert result.evidence.rows[0].status == "stale/unverified"
+    assert any(diagnostic.code == "checkout-head-mismatch" for diagnostic in result.diagnostics)
+    assert any(diagnostic.code == "checkout-tree-unavailable" for diagnostic in result.diagnostics)
+
+
+def test_current_turn_catalog_filters_a_misbehaving_cumulative_provider() -> None:
+    old = SimpleNamespace(turn_id="turn-old", execution_ref="old:observation-1")
+    current = SimpleNamespace(turn_id="turn-current", execution_ref="current:observation-1")
+    runner = SimpleNamespace(
+        latest_test_turn_id="turn-current",
+        current_test_turn_observations=lambda: (old, current),
+    )
+
+    assert orchestrator_module._current_test_turn_observations(runner) == (current,)
+
+
+def test_derived_matrix_evidence_cannot_resolve_a_cross_turn_selector_from_the_journal() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    old_observation = _derived_observation(
+        execution_ref="old-turn:observation-1",
+        receipt_id="receipt-old",
+        turn_id="turn-old",
+    )
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("old-turn:observation-1",),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_risk_test_matrix.py::test_ordinary",),
+        workflow_path_claim="The workflow path ran.",
+        outcome_assertions=("The selected test passed.",),
+        forbidden_effect_assertions=("No stale head was merged.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        # The bounded journal may retain this observation, but the current
+        # closed catalog is empty, so its selector must remain unresolved.
+        observations=(old_observation,),
+        execution_catalog=(),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert result.evidence.rows[0].status == "stale/unverified"
+    assert any(diagnostic.code == "unknown-execution-ref" for diagnostic in result.diagnostics)
+
+
+def test_post_authentication_head_race_downgrades_correction_output(monkeypatch, tmp_path) -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        None,
+        expected_hash="a" * 16,
+        expected_subject="b" * 64,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    observation = LocalTestObservation(
+        command=("python3", "-m", "pytest", "tests/test_protocol.py", "-q"),
+        outcome="passed",
+        provenance="parent-observed",
+        receipt_id="receipt-1",
+        execution_ref="turn-current:observation-1",
+        turn_id="turn-current",
+        normalized_command="python3 -m pytest tests/test_protocol.py -q",
+        attribution=TreeAttribution(
+            state="current-head",
+            head="head-current",
+            tracked_digest="tree-current",
+            stable=True,
+        ),
+        environment_state="not-compared",
+        wrapper_bootstrap="verified",
+        inner_exec="started",
+        suite_start="verified",
+    )
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("turn-current:observation-1",),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_risk_test_matrix.py::test_ordinary",),
+        workflow_path_claim="The workflow path ran.",
+        outcome_assertions=("The selected test passed.",),
+        forbidden_effect_assertions=("No stale head was merged.",),
+    ),))
+    from coding_review_agent_loop.protocol import (
+        StructuredHumanRequirementsPayload,
+        StructuredIssueImplementation,
+    )
+
+    parsed = StructuredIssueImplementation(
+        schema_version=1,
+        kind="issue_implementation",
+        state="blocking",
+        summary="The implementation is complete.",
+        pr_number=77,
+        human_requirements=StructuredHumanRequirementsPayload((), False),
+        human_requirement_dispositions=(),
+        risk_test_matrix_claims=claim,
+    )
+    corrected_payload = {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "The implementation is complete.",
+        "pr_number": 77,
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "risk_test_matrix_claims": [claim.claims[0].to_payload()],
+    }
+
+    class FakeRunner:
+        latest_test_turn_id = "turn-current"
+
+        def local_test_observations(self):
+            return (observation,)
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head="head-other",
+            tracked_digest="tree-current",
+            complete=True,
+            stable=True,
+            status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "run_agent_result",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text=json.dumps(corrected_payload)
+            + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+        ),
+    )
+
+    corrected, result = orchestrator_module._derive_authenticated_risk_evidence_for_coder(
+        parsed,
+        approved_plan_context=context,
+        runner=FakeRunner(),
+        assigned_workdir=tmp_path,
+        head_sha="head-current",
+        config=SimpleNamespace(coder="codex", coder_test_command_timeout_seconds=1),
+        session_id="coder-session",
+        reauthenticate_head=lambda: "head-new",
+    )
+
+    assert result is not None
+    assert result.evidence.rows[0].status != "verified"
+    assert result.evidence.rows[0].evidence_citations == ()
+    assert any(
+        diagnostic.code == "head-changed-during-correction"
+        for diagnostic in result.diagnostics
+    )
+    assert corrected.risk_test_matrix_evidence == result.evidence
 
 
 def test_m780_01_matrix_is_bounded_and_rendered_from_structured_payload() -> None:

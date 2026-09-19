@@ -207,6 +207,66 @@ def test_repair_preserves_matrix_evidence_status_and_caveats():
         check(source, changed)
 
 
+def test_fresh_coder_repair_may_remove_legacy_canonical_evidence():
+    source = {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "The implementation is complete.",
+        "pr_number": 77,
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "risk_test_matrix_evidence": {"matrix_identity": "a" * 64, "rows": []},
+    }
+    repaired = deepcopy(source)
+    repaired.pop("risk_test_matrix_evidence")
+
+    # Preservation keeps valid coder-owned facts, but does not force a fresh
+    # semantic repair to carry an orchestrator-owned legacy field forward.
+    check(source, repaired)
+
+
+def test_semantic_repair_may_remove_invalid_selector_and_keep_valid_facts():
+    source = {
+        "kind": "coder_followup",
+        "risk_test_matrix_claims": [{
+            "row_id": "row-1",
+            "execution_refs": ["turn:valid", "other-turn:invalid"],
+            "test_identifiers": ["tests/test_protocol.py::test_valid"],
+            "test_locations": ["tests/test_protocol.py"],
+            "workflow_path_claim": "The current workflow path ran.",
+            "outcome_assertions": ["The selected test passed."],
+            "forbidden_effect_assertions": ["No unauthorized effect occurred."],
+        }],
+    }
+    repaired = deepcopy(source)
+    repaired["risk_test_matrix_claims"][0]["execution_refs"] = ["turn:valid"]
+
+    # The repaired response keeps the valid selector and all semantic facts;
+    # the current-turn catalog validator will reject the removed cross-turn
+    # selector separately.
+    check(source, repaired)
+
+
+def test_fresh_coder_repair_cannot_invent_canonical_evidence():
+    source = {
+        "schema_version": 1,
+        "kind": "coder_followup",
+        "state": "blocking",
+        "summary": "The implementation is complete.",
+        "addressed_items": [],
+        "remaining_items": [],
+    }
+    target = deepcopy(source)
+    target["risk_test_matrix_evidence"] = {
+        "matrix_identity": "a" * 64,
+        "rows": [],
+    }
+
+    with pytest.raises(AgentLoopError, match="cannot invent risk_test_matrix_evidence"):
+        check(source, target)
+
+
 def test_repair_preserves_architecture_impact_fields():
     source = {
         "kind": "task_result",

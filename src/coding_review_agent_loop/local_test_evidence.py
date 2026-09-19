@@ -316,6 +316,9 @@ class LocalTestObservation:
     provenance: str
     scope: EvidenceScope = field(default_factory=EvidenceScope)
     receipt_id: str | None = None
+    # Invocation-local selector. It is intentionally omitted from the durable
+    # public projection; only the live broker/catalog may resolve it.
+    execution_ref: str | None = field(default=None, repr=False, compare=False)
     turn_id: str | None = None
     timestamp: str = ""
     cwd: str | None = None
@@ -394,6 +397,13 @@ class LocalTestObservation:
     def to_dict(self) -> dict[str, object]:
         return self.public_projection()
 
+    def live_projection(self) -> dict[str, object]:
+        """Return the bounded live catalog view, including the ephemeral selector."""
+        projection = self.public_projection()
+        if self.execution_ref:
+            projection["execution_ref"] = _safe_text(self.execution_ref, MAX_SAFE_IDENTIFIER_BYTES)
+        return projection
+
 
 def _coerce_command(value: object) -> tuple[str, ...]:
     if isinstance(value, str):
@@ -452,6 +462,10 @@ def observation_from_mapping(
         provenance=str(value.get("provenance", default_provenance)),
         scope=EvidenceScope.from_value(value.get("scope")),
         receipt_id=str(value["receipt_id"]) if value.get("receipt_id") is not None else None,
+        execution_ref=(
+            str(value["execution_ref"])
+            if value.get("execution_ref") is not None else None
+        ),
         turn_id=str(value["turn_id"]) if value.get("turn_id") is not None else None,
         timestamp=_timestamp(value.get("timestamp")),
         cwd=str(value["cwd"]) if value.get("cwd") is not None else None,
@@ -634,6 +648,10 @@ def reconcile_test_observations(
 
     # Compare live observations with the clean eventual tree at handoff. This
     # lets a stable pre-commit test become attributable after the coder commits.
+    snapshot_head_matches = (
+        current_head is None
+        or current_snapshot is not None and current_snapshot.head == current_head
+    )
     if (
         current_snapshot is not None
         and current_snapshot.complete
@@ -647,7 +665,13 @@ def reconcile_test_observations(
             attribution = row.attribution
             if attribution.stable is not True or not attribution.tracked_digest:
                 continue
-            if attribution.tracked_digest == current_snapshot.tracked_digest:
+            if not snapshot_head_matches:
+                rows[index] = replace(
+                    row,
+                    attribution=replace(attribution, state="stale"),
+                    caveats=(*row.caveats, "assigned checkout HEAD differs from the authenticated PR head"),
+                )
+            elif attribution.tracked_digest == current_snapshot.tracked_digest:
                 state = (
                     "untracked-input-unverified"
                     if attribution.untracked_input
@@ -1045,6 +1069,9 @@ def decode_bounded_evidence(value: object) -> LocalTestEvidence | None:
             # No persisted value can reconstitute the process-private canonical
             # bytes needed for equality. Every restored row degrades visibly.
             environment_state=environment_comparison_for_restart(),
+            # Execution selectors are invocation-local and must never become
+            # durable receipt authority after a restart.
+            execution_ref=None,
         )
         for row in rows
         if isinstance(row, Mapping)
@@ -1523,6 +1550,32 @@ class BrokerProtocolError(AgentLoopError):
     """A malformed, unauthenticated, or bounded-out broker request."""
 
 
+class ExecutionReferenceRegistry:
+    """Keep invocation-local execution namespaces unique for one runner.
+
+    A selector is ephemeral, but its authority remains live for as long as a
+    runner retains the corresponding turn catalog. Namespace registration is
+    therefore deliberately monotonic: a later broker cannot reuse a namespace
+    from an earlier turn, even after that broker has stopped and its journal
+    has been copied into the runner's retained observations.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._namespaces: set[str] = set()
+
+    def reserve_namespace(self, namespace: str) -> None:
+        namespace = str(namespace)
+        if not namespace or len(namespace.encode("utf-8", errors="replace")) > 256:
+            raise BrokerProtocolError("execution namespace is empty or oversized")
+        with self._lock:
+            if namespace in self._namespaces:
+                raise BrokerProtocolError(
+                    "execution namespace collides with a retained test turn"
+                )
+            self._namespaces.add(namespace)
+
+
 def _json_no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -1641,6 +1694,7 @@ def _validate_broker_request(
 @dataclass(frozen=True)
 class BrokerRunResult:
     receipt_id: str
+    execution_ref: str | None
     outcome: str
     returncode: int | None
     elapsed_seconds: float
@@ -1667,6 +1721,8 @@ class TestBrokerServer:
         *,
         root: Path,
         turn_id: str | None = None,
+        execution_namespace: str | None = None,
+        execution_reference_registry: ExecutionReferenceRegistry | None = None,
         timeout_ceiling: float = 1800,
         containment_policy: object | None = None,
         execute: Any | None = None,
@@ -1695,6 +1751,13 @@ class TestBrokerServer:
         self._receipts: dict[str, _ReplayReservation] = {}
         self._journal_lock = Lock()
         self._environment_registry = environment_registry or EnvironmentIdentityRegistry()
+        self._execution_namespace = execution_namespace or (uuid.uuid4().hex + uuid.uuid4().hex)
+        self._execution_reference_registry = (
+            execution_reference_registry or ExecutionReferenceRegistry()
+        )
+        self._execution_reference_registry.reserve_namespace(self._execution_namespace)
+        self._next_execution_ordinal = 0
+        self._execution_refs: set[str] = set()
         self._parent_containment_handle: Any | None = None
         self._process_started: Any | None = None
         self._process_finished: Any | None = None
@@ -1797,6 +1860,11 @@ class TestBrokerServer:
 
     def snapshot_journal(self) -> tuple[LocalTestObservation, ...]:
         return self.journal
+
+    def live_execution_catalog(self) -> tuple[dict[str, object], ...]:
+        """Return selectors for the current turn without making them durable."""
+        with self._journal_lock:
+            return tuple(item.live_projection() for item in self._journal)
 
     def _serve(self) -> None:
         server = self._socket
@@ -1912,14 +1980,45 @@ class TestBrokerServer:
         with self._journal_lock:
             self._append_journal_locked(observation)
 
-    def _append_journal_locked(self, observation: LocalTestObservation) -> None:
-        """Append within the bound while retaining measured failures longest."""
+    def _new_execution_ref_locked(self) -> str:
+        """Mint a collision-checked opaque selector for one observation."""
+        while True:
+            self._next_execution_ordinal += 1
+            candidate = f"{self._execution_namespace}:observation-{self._next_execution_ordinal}"
+            if candidate not in self._execution_refs:
+                self._execution_refs.add(candidate)
+                return candidate
+
+    def _append_journal_locked(self, observation: LocalTestObservation) -> LocalTestObservation | None:
+        """Append within the bound while retaining measured failures longest.
+
+        The returned object is the exact observation submitted to the journal,
+        including its minted selector.  Keep that newest observation retained
+        when it is a managed observation so a completed test cannot be paired
+        with an older journal entry when the bounded catalog is saturated.
+        Telemetry-only capture failures may be evicted immediately.
+        """
+        if observation.execution_ref is None:
+            observation = replace(
+                observation,
+                execution_ref=self._new_execution_ref_locked(),
+            )
         self._journal.append(observation)
         while len(self._journal) > MAX_PRIVATE_OBSERVATIONS:
+            # A completed managed observation must remain addressable long
+            # enough for its caller to receive the selector minted above.
+            # Telemetry-only capture failures do not have that requirement;
+            # when the journal is saturated they must not evict measured
+            # failures merely because they are newest.
+            candidate_rows = (
+                self._journal[:-1]
+                if observation.provenance != "telemetry-unverified"
+                else self._journal
+            )
             discard = next(
                 (
                     index
-                    for index, row in enumerate(self._journal)
+                    for index, row in enumerate(candidate_rows)
                     if row.provenance == "telemetry-unverified"
                 ),
                 None,
@@ -1928,12 +2027,15 @@ class TestBrokerServer:
                 discard = next(
                     (
                         index
-                        for index, row in enumerate(self._journal)
+                        for index, row in enumerate(candidate_rows)
                         if not row.is_failure
                     ),
                     0,
                 )
             del self._journal[discard]
+        return observation if any(
+            row.execution_ref == observation.execution_ref for row in self._journal
+        ) else None
 
     def _execute_request(self, request: Mapping[str, object], connection: socket.socket) -> dict[str, object]:
         from .containment import open_confined_cwd
@@ -2025,6 +2127,7 @@ class TestBrokerServer:
         # Keep the shared registry private to the broker process; the bytes are
         # not present in the journal's public projection.
         receipt_id = uuid.uuid4().hex
+        execution_ref: str | None = None
         suite_start = str(getattr(result, "suite_start", "unknown"))
         if suite_start != "not-started" and str(getattr(result, "outcome", "")) != "overlap-rejected":
             observation = LocalTestObservation(
@@ -2048,10 +2151,12 @@ class TestBrokerServer:
                 suite_start=suite_start,
             )
             with self._journal_lock:
-                self._append_journal_locked(observation)
+                retained = self._append_journal_locked(observation)
+                execution_ref = retained.execution_ref if retained is not None else None
         return {
             "type": "result",
             "receipt_id": receipt_id,
+            "execution_ref": execution_ref,
             "outcome": str(result.outcome),
             "returncode": result.returncode,
             "elapsed_seconds": float(result.elapsed_seconds),
@@ -2126,6 +2231,10 @@ class TestBrokerClient:
                     raise BrokerProtocolError("unknown broker response")
                 return BrokerRunResult(
                     receipt_id=str(response.get("receipt_id", "")),
+                    execution_ref=(
+                        str(response["execution_ref"])
+                        if response.get("execution_ref") is not None else None
+                    ),
                     outcome=str(response.get("outcome", "incomplete")),
                     returncode=(int(response["returncode"]) if isinstance(response.get("returncode"), int) else None),
                     elapsed_seconds=float(response.get("elapsed_seconds", 0.0)),

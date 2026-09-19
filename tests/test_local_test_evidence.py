@@ -14,7 +14,9 @@ import pytest
 
 from coding_review_agent_loop.local_test_evidence import (
     ENVIRONMENT_EXCLUSIONS,
+    BrokerProtocolError,
     EvidenceScope,
+    ExecutionReferenceRegistry,
     EnvironmentIdentityRegistry,
     LocalTestObservation,
     TestBrokerClient as BrokerClient,
@@ -33,6 +35,7 @@ from coding_review_agent_loop.local_test_evidence import (
     redact_test_command,
 )
 from coding_review_agent_loop.containment import open_confined_cwd
+from coding_review_agent_loop.runner import Runner
 import coding_review_agent_loop.local_test_evidence as evidence_module
 
 
@@ -179,6 +182,44 @@ def test_legacy_tests_run_uses_shell_parsing_and_marks_capture_limits(tmp_path):
     assert rows[2].outcome == "incomplete"
     assert all(row.provenance == "self-reported" for row in rows)
     assert all("capture" in " ".join(row.caveats) for row in rows[1:])
+
+
+def test_runner_rejects_execution_namespace_reuse_across_retained_turns(tmp_path, monkeypatch):
+    """A reused namespace cannot make an old selector valid in a new turn."""
+    monkeypatch.setattr(
+        evidence_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fixed-namespace"),
+    )
+    runner = Runner()
+
+    first_broker, first_turn = runner._start_test_broker(
+        cwd=tmp_path, role="coder", env=None
+    )
+    assert first_broker is not None
+    assert first_turn is not None
+    first_namespace = first_broker._execution_namespace
+    runner._finish_test_broker(first_broker, first_turn)
+
+    second_broker, second_turn = runner._start_test_broker(
+        cwd=tmp_path, role="coder", env=None
+    )
+
+    assert second_broker is None
+    assert second_turn is not None
+    assert second_turn != first_turn
+    assert runner._execution_reference_registry._namespaces == {first_namespace}
+    assert all(
+        observation.execution_ref is None
+        for observation in runner.current_test_turn_observations()
+    )
+
+
+def test_execution_reference_registry_rejects_duplicate_namespace():
+    registry = ExecutionReferenceRegistry()
+    registry.reserve_namespace("turn-a")
+    with pytest.raises(BrokerProtocolError, match="collides with a retained test turn"):
+        registry.reserve_namespace("turn-a")
 
 
 def test_environment_identity_uses_exact_exclusions_and_keeps_other_variables():
@@ -452,6 +493,16 @@ def test_broker_authenticates_turn_and_forwards_only_snapshot_environment(tmp_pa
             cwd=tmp_path,
         )
         assert result.outcome == "passed"
+        repeat = BrokerClient(environment).run(
+            [sys.executable, "-c", "pass"],
+            timeout_seconds=5,
+            cwd=tmp_path,
+        )
+        assert result.execution_ref and repeat.execution_ref
+        assert result.execution_ref != repeat.execution_ref
+        assert {
+            row["execution_ref"] for row in server.live_execution_catalog()
+        } == {result.execution_ref, repeat.execution_ref}
         forwarded = observed["environment"]
         assert isinstance(forwarded, dict)
         assert forwarded["AGENT_LOOP_INVOCATION_ID"] == "turn-761"
@@ -638,6 +689,84 @@ def test_broker_capacity_rejects_new_nonce_but_retains_old_replay(monkeypatch, t
         assert _raw_broker_request(server, first_request) == first_response
     finally:
         server.stop()
+
+
+def test_saturated_journal_returns_selector_for_newly_retained_pass(monkeypatch, tmp_path):
+    registry = EnvironmentIdentityRegistry()
+    server = BrokerServer(
+        root=tmp_path,
+        turn_id="turn-saturated-journal",
+        execute=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(evidence_module, "MAX_PRIVATE_OBSERVATIONS", 2)
+
+    first_failure = _observation(
+        outcome="failed",
+        timestamp="2026-09-18T00:00:00+00:00",
+        receipt_id="failure-1",
+        registry=registry,
+    )
+    second_failure = _observation(
+        outcome="failed",
+        timestamp="2026-09-18T00:01:00+00:00",
+        receipt_id="failure-2",
+        registry=registry,
+    )
+    passing = _observation(
+        outcome="passed",
+        timestamp="2026-09-18T00:02:00+00:00",
+        receipt_id="pass-new",
+        registry=registry,
+    )
+
+    with server._journal_lock:
+        server._append_journal_locked(first_failure)
+        server._append_journal_locked(second_failure)
+        retained = server._append_journal_locked(passing)
+
+    assert retained is not None
+    assert retained.receipt_id == "pass-new"
+    assert retained.execution_ref is not None
+    assert retained in server.journal
+    assert server.journal[-1].execution_ref == retained.execution_ref
+
+
+def test_saturated_journal_telemetry_does_not_evict_measured_failures(monkeypatch, tmp_path):
+    registry = EnvironmentIdentityRegistry()
+    server = BrokerServer(
+        root=tmp_path,
+        turn_id="turn-saturated-telemetry",
+        execute=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(evidence_module, "MAX_PRIVATE_OBSERVATIONS", 2)
+
+    first_failure = _observation(
+        outcome="failed",
+        timestamp="2026-09-18T00:00:00+00:00",
+        receipt_id="failure-1",
+        registry=registry,
+    )
+    second_failure = _observation(
+        outcome="failed",
+        timestamp="2026-09-18T00:01:00+00:00",
+        receipt_id="failure-2",
+        registry=registry,
+    )
+    telemetry = _observation(
+        outcome="incomplete",
+        timestamp="2026-09-18T00:02:00+00:00",
+        receipt_id="telemetry-1",
+        registry=registry,
+        provenance="telemetry-unverified",
+    )
+
+    with server._journal_lock:
+        server._append_journal_locked(first_failure)
+        server._append_journal_locked(second_failure)
+        retained = server._append_journal_locked(telemetry)
+
+    assert retained is None
+    assert [row.receipt_id for row in server.journal] == ["failure-1", "failure-2"]
 
 
 def test_broker_context_failure_returns_error_and_records_incomplete(monkeypatch, tmp_path):

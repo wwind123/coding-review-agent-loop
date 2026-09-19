@@ -13,6 +13,7 @@ import time
 import zoneinfo
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import ContextVar
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 from typing import Literal
@@ -263,6 +264,8 @@ from .protocol import (
     ReviewItemDisposition,
     StructuredCoderFollowup,
     StructuredIssueImplementation,
+    DerivedRiskEvidenceResult,
+    PostAuthClaimDiagnostic,
     StructuredPlanState,
     StructuredPlanRevision,
     PlanRevisionPatch,
@@ -287,11 +290,14 @@ from .protocol import (
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
     validate_structured_issue_implementation,
+    parse_historical_structured_coder_followup,
+    parse_historical_structured_issue_implementation,
     validate_structured_plan_state,
     validate_structured_plan_revision,
     validate_structured_plan_revision_patch,
     validate_risk_test_matrix_revision,
     validate_structured_task_result,
+    derive_risk_test_matrix_evidence,
     risk_test_matrix_identity,
     validate_structured_discuss_agenda,
     parse_structured_discuss_final_synthesis,
@@ -322,6 +328,20 @@ from .repair_preservation import (
     validate_repair_preservation,
 )
 from .runner import Runner
+
+
+# Validation may invoke format repair, whose runner intentionally starts a new
+# broker turn. Keep the acquisition snapshot in a context-local seam so the
+# existing validators continue to receive the coder turn while repair runs.
+_VALIDATION_TEST_TURN_CONTEXT: ContextVar[
+    tuple[Runner, str | None, tuple[object, ...]] | None
+] = ContextVar("validation_test_turn_context", default=None)
+
+
+from .local_test_evidence import (
+    reconcile_test_observations,
+    stable_tracked_tree_snapshot,
+)
 from .salvage import (
     SalvageArtifacts,
     SalvageContext,
@@ -857,18 +877,35 @@ class ValidatedAgentResponse:
     observation_provenance: str | None = None
     acquisition_outcome: Literal["success", "accepted_nonzero_exit", "accepted_timeout"] = "success"
     acquisition_returncode: int | None = None
+    # Ephemeral coder acquisition authority. These values survive format
+    # repair in memory but are intentionally excluded from durable metadata.
+    acquisition_test_turn_id: str | None = None
+    acquisition_test_observations: tuple[object, ...] = ()
 
 
-def _response_identity_fields(result: AgentResult) -> dict[str, object]:
+def _response_identity_fields(
+    result: AgentResult | object,
+    *,
+    acquisition_result: AgentResult | object | None = None,
+) -> dict[str, object]:
+    acquisition = acquisition_result if acquisition_result is not None else result
     return {
-        "provider": result.provider,
-        "role": result.role,
-        "configured_model": result.configured_model,
-        "configured_effort": result.configured_effort,
-        "effort_source": result.effort_source,
-        "observed_model": result.observed_model,
-        "observed_effort": result.observed_effort,
-        "observation_provenance": result.observation_provenance,
+        "provider": getattr(result, "provider", None),
+        "role": getattr(result, "role", None),
+        "configured_model": getattr(result, "configured_model", None),
+        "configured_effort": getattr(result, "configured_effort", None),
+        "effort_source": getattr(result, "effort_source", None),
+        "observed_model": getattr(result, "observed_model", None),
+        "observed_effort": getattr(result, "observed_effort", None),
+        "observation_provenance": getattr(result, "observation_provenance", None),
+        "acquisition_test_turn_id": getattr(
+            acquisition, "test_turn_id", getattr(acquisition, "acquisition_test_turn_id", None)
+        ),
+        "acquisition_test_observations": getattr(
+            acquisition,
+            "test_turn_observations",
+            getattr(acquisition, "acquisition_test_observations", ()),
+        ),
     }
 
 
@@ -876,6 +913,8 @@ def _metadata_identity_fields(response: object) -> dict[str, object]:
     """Identity fields safe to expand into PostedRoundMetadata."""
     fields = _response_identity_fields(response)  # type: ignore[arg-type]
     fields.pop("role", None)
+    fields.pop("acquisition_test_turn_id", None)
+    fields.pop("acquisition_test_observations", None)
     return fields
 
 
@@ -2470,6 +2509,7 @@ def _attempt_claude_completion_recovery(
     role: str | None,
     label: str | None,
     timeout_seconds: float | None,
+    acquisition_result: AgentResult | None = None,
 ) -> _CompletionRecoveryOutcome:
     """One bounded ``claude --resume`` completion-recovery pass (#588).
 
@@ -2599,7 +2639,9 @@ def _attempt_claude_completion_recovery(
                     text=recovery_artifact, session_id=recovery_result.session_id,
                     marker_value=marker_value, usage=recovery_usage,
                     model_used=recovery_result.model_used,
-                    **_response_identity_fields(recovery_result),
+                    **_response_identity_fields(
+                        recovery_result, acquisition_result=acquisition_result
+                    ),
                     acquisition_outcome=accepted_outcome,
                     acquisition_returncode=recovery_result.returncode,
                 ),
@@ -2704,7 +2746,9 @@ def _attempt_claude_completion_recovery(
             marker_value=marker_value,
             usage=recovery_usage,
             model_used=recovery_result.model_used,
-            **_response_identity_fields(recovery_result),
+            **_response_identity_fields(
+                recovery_result, acquisition_result=acquisition_result
+            ),
         ),
         result=recovery_result,
         error="",
@@ -2797,10 +2841,27 @@ def _run_validated_agent(
     # the validation seam so every artifact recovery and repair path receives
     # the same provenance check before it can be accepted.
     response_validator = validate
+    validation_acquisition: AgentResult | None = None
 
     def validate(text: str) -> object:
         TrustedBody.current_untrusted_visible(text)
-        return response_validator(text)
+        token = None
+        if (
+            validation_acquisition is not None
+            and validation_acquisition.test_turn_id is not None
+        ):
+            token = _VALIDATION_TEST_TURN_CONTEXT.set(
+                (
+                    runner,
+                    validation_acquisition.test_turn_id,
+                    validation_acquisition.test_turn_observations,
+                )
+            )
+        try:
+            return response_validator(text)
+        finally:
+            if token is not None:
+                _VALIDATION_TEST_TURN_CONTEXT.reset(token)
 
     agent_name = agent_display_name(agent)
     operation_description = operation_description or _operation_description_from_context(
@@ -2909,6 +2970,10 @@ def _run_validated_agent(
             timeout_seconds=next_timeout_seconds,
             **invocation_kwargs,
         )
+        # Keep this acquisition result fixed through every validation and
+        # repair callback for the current response. Repair itself may replace
+        # runner.latest_test_turn_id, but it cannot replace this snapshot.
+        validation_acquisition = result
         # The bounded deadline belongs only to the interrupted invocation and
         # its dedicated replay. A later ordinary retry has its normal budget.
         if is_executable_replacement_replay:
@@ -3313,6 +3378,7 @@ def _run_validated_agent(
                         role=role,
                         label=label,
                         timeout_seconds=timeout_seconds,
+                        acquisition_result=validation_acquisition,
                     )
                     if recovery_outcome.validated is not None:
                         return recovery_outcome.validated
@@ -4028,6 +4094,7 @@ def _validate_issue_implementation_response(
     require_risk_test_matrix_contract: bool = False,
     authoritative_test_observations=None,
     delivered_risk_test_matrix_row_ids=None,
+    execution_catalog=None,
 ) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
@@ -4041,6 +4108,7 @@ def _validate_issue_implementation_response(
             required_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
             authoritative_test_observations=authoritative_test_observations,
             delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
+            execution_catalog=execution_catalog,
         )
     except IssueImplementationConflictError as exc:
         parsed = exc.payload
@@ -4056,6 +4124,352 @@ def _validate_issue_implementation_response(
         )
     _validate_issue_implementation_contract(parsed, human_requirements=human_requirements)
     return parsed
+
+
+def _current_test_turn_observations(runner: Runner) -> tuple[object, ...]:
+    """Return the closed invocation-local catalog, never the cumulative journal."""
+    validation_context = _VALIDATION_TEST_TURN_CONTEXT.get()
+    if validation_context is not None and validation_context[0] is runner:
+        return validation_context[2]
+    turn_id = getattr(runner, "latest_test_turn_id", None)
+    if not isinstance(turn_id, str) or not turn_id:
+        return ()
+    current = getattr(runner, "current_test_turn_observations", None)
+    if callable(current):
+        observations = tuple(current())
+    else:
+        observations = tuple(runner.local_test_observations())
+
+    def observation_turn_id(observation: object) -> object:
+        if isinstance(observation, Mapping):
+            return observation.get("turn_id")
+        return getattr(observation, "turn_id", None)
+
+    return tuple(
+        observation for observation in observations
+        if observation_turn_id(observation) == turn_id
+    )
+
+
+def _safe_execution_handle_catalog(observations: Sequence[object]) -> tuple[dict[str, object], ...]:
+    """Project correction context without exposing receipt authority."""
+    catalog: list[dict[str, object]] = []
+    for observation in observations:
+        execution_ref = getattr(observation, "execution_ref", None)
+        if not isinstance(execution_ref, str) or not execution_ref:
+            continue
+        attribution = getattr(observation, "attribution", None)
+        if isinstance(attribution, Mapping):
+            attribution_state = attribution.get("state")
+        else:
+            attribution_state = getattr(attribution, "state", None)
+        caveats = getattr(observation, "caveats", ())
+        catalog.append({
+            "execution_ref": execution_ref,
+            "outcome": getattr(observation, "outcome", "unknown"),
+            "provenance": getattr(observation, "provenance", "unknown"),
+            "attribution_state": attribution_state or "unknown",
+            "caveats": [str(item) for item in tuple(caveats)[:4]],
+        })
+    return tuple(catalog)
+
+
+def _post_auth_correction_prompt(
+    parsed: StructuredIssueImplementation | StructuredCoderFollowup,
+    *,
+    matrix_row_ids: Sequence[str],
+    diagnostics: Sequence[PostAuthClaimDiagnostic],
+    execution_catalog: Sequence[Mapping[str, object]],
+) -> str:
+    return (
+        "The orchestrator authenticated the PR, then found a bounded semantic "
+        "coverage defect. This is a claims-only correction in the same coder "
+        "session; do not change code, PR identity, reviewer-item classifications, "
+        "human-requirement fields, summary, or any other coder-owned fact. Return "
+        "the same structured response kind and correct only "
+        "`risk_test_matrix_claims`. Do not emit canonical evidence, matrix "
+        "identities, canonical rows, receipt IDs, citations, mappings, statuses, "
+        "or envelope bookkeeping. Use only approved row IDs and handles in the "
+        "closed catalog below; a missing claim is allowed when no admissible "
+        "execution exists.\n\n"
+        f"Response kind: {parsed.kind}\n"
+        f"Approved enforceable row IDs: {json.dumps(list(matrix_row_ids))}\n"
+        f"Post-authentication diagnostics: {json.dumps([item.to_payload() for item in diagnostics])}\n"
+        f"Closed execution-handle catalog: {json.dumps(list(execution_catalog))}\n"
+    )
+
+
+def _parse_fresh_correction_claims(
+    text: str,
+    original: StructuredIssueImplementation | StructuredCoderFollowup,
+    *,
+    row_ids: Sequence[str],
+    execution_catalog: Sequence[object],
+) -> StructuredIssueImplementation | StructuredCoderFollowup | None:
+    if isinstance(original, StructuredIssueImplementation):
+        candidate = validate_structured_issue_implementation(
+            text,
+            delivered_risk_test_matrix_row_ids=row_ids,
+            execution_catalog=execution_catalog,
+        )
+    else:
+        candidate = validate_structured_coder_followup(
+            text,
+            delivered_risk_test_matrix_row_ids=row_ids,
+            execution_catalog=execution_catalog,
+        )
+    if candidate is None or candidate.kind != original.kind:
+        return None
+    # The correction continuation is not a second coder handoff. Preserve all
+    # coder-owned facts from the authenticated response and accept only its
+    # newly validated semantic claim set.
+    return dataclasses_replace(
+        original,
+        risk_test_matrix_claims=candidate.risk_test_matrix_claims,
+        risk_test_matrix_evidence=None,
+        risk_test_matrix_diagnostics=(),
+    )
+
+
+def _derive_authenticated_risk_evidence_for_coder(
+    parsed: StructuredIssueImplementation | StructuredCoderFollowup,
+    *,
+    approved_plan_context: ApprovedPlanContext | None,
+    runner: Runner,
+    assigned_workdir: Path,
+    head_sha: str | None,
+    predecessor_head: str | None = None,
+    config: AgentLoopConfig | None = None,
+    session_id: str | None = None,
+    reauthenticate_head: Callable[[], str | None] | None = None,
+    invocation_id: str | None = None,
+    assigned_worktree_head: str | None = None,
+    _closed_execution_catalog: Sequence[object] | None = None,
+    _journal_observations: Sequence[object] | None = None,
+    _correction_attempted: bool = False,
+) -> tuple[StructuredIssueImplementation | StructuredCoderFollowup, DerivedRiskEvidenceResult | None]:
+    """Attach canonical evidence only after the PR head is authenticated.
+
+    The broker catalog and the evidence journal have different trust roles.
+    The journal can retain bounded history for aggregate failure handling, but
+    semantic selectors must resolve only through the closed catalog belonging
+    to the response being acquired.  The private correction arguments make
+    that boundary stable across the one permitted post-authentication repair
+    continuation, whose own broker observations must not silently become
+    selectors for the original response.
+    """
+    if approved_plan_context is None or not approved_plan_context.matrix_available:
+        return parsed, None
+    matrix_payload = approved_plan_context.risk_test_matrix_payload
+    identity = approved_plan_context.risk_test_matrix_identity
+    if matrix_payload is None or identity is None:
+        return parsed, None
+    bound_invocation_id = invocation_id or runner.latest_test_turn_id
+    closed_catalog = (
+        tuple(_closed_execution_catalog)
+        if _closed_execution_catalog is not None
+        else _current_test_turn_observations(runner)
+    )
+    journal_observations = (
+        tuple(_journal_observations)
+        if _journal_observations is not None
+        else tuple(
+            observation
+            for observation in runner.local_test_observations()
+            if bound_invocation_id is None
+            or (
+                observation.get("turn_id")
+                if isinstance(observation, Mapping)
+                else getattr(observation, "turn_id", None)
+            ) == bound_invocation_id
+        )
+    )
+    try:
+        snapshot = stable_tracked_tree_snapshot(assigned_workdir)
+    except Exception:
+        snapshot = None
+    reconciled = reconcile_test_observations(
+        journal_observations,
+        current_head=head_sha,
+        current_snapshot=snapshot,
+        cwd=assigned_workdir,
+    )
+    reconciled_catalog = reconcile_test_observations(
+        closed_catalog,
+        current_head=head_sha,
+        current_snapshot=snapshot,
+        cwd=assigned_workdir,
+    )
+    # Authentication is conjunctive: the remote PR metadata and the assigned
+    # checkout must identify the same clean, stable tree.  In particular, a
+    # checkout that is merely newer than the pre-turn snapshot is not enough.
+    authenticated_checkout_head = snapshot.head if snapshot is not None else None
+    authenticated_tree_clean = bool(
+        snapshot is not None
+        and snapshot.complete
+        and snapshot.stable is True
+        and snapshot.status_clean is True
+        and authenticated_checkout_head is not None
+        and authenticated_checkout_head == head_sha
+        and (
+            assigned_worktree_head is None
+            or assigned_worktree_head == authenticated_checkout_head
+        )
+    )
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix_payload,
+        claims=parsed.risk_test_matrix_claims,
+        observations=reconciled.observations,
+        execution_catalog=reconciled_catalog.observations,
+        invocation_id=bound_invocation_id,
+        current_head=head_sha,
+        current_tree_digest=(snapshot.tracked_digest if snapshot is not None else None),
+        authenticated_checkout_head=authenticated_checkout_head,
+        authenticated_tree_clean=authenticated_tree_clean,
+        predecessor_head=predecessor_head,
+        expected_identity=identity,
+    )
+    actionable = tuple(
+        diagnostic for diagnostic in result.diagnostics
+        if diagnostic.code != "missing-claim"
+        and diagnostic.code != "unsuperseded-journal-failure"
+    )
+    if (
+        actionable
+        and not _correction_attempted
+        and config is not None
+        and session_id
+        and reauthenticate_head is not None
+    ):
+        # Keep the original response's closed catalog even though the
+        # correction invocation itself gets a fresh broker turn.  A repair
+        # response may correct selectors, but it cannot mint new execution
+        # authority or turn an unrelated correction observation into evidence.
+        catalog = closed_catalog
+        prompt = _post_auth_correction_prompt(
+            parsed,
+            matrix_row_ids=approved_plan_context.risk_test_matrix_expected_row_ids,
+            diagnostics=actionable,
+            execution_catalog=_safe_execution_handle_catalog(catalog),
+        )
+        try:
+            correction_result = run_agent_result(
+                runner,
+                agent=config.coder,
+                config=config,
+                prompt=prompt,
+                session_id=session_id,
+                role="coder",
+                label="semantic-evidence-correction",
+                timeout_seconds=config.coder_test_command_timeout_seconds,
+            )
+            corrected = _parse_fresh_correction_claims(
+                correction_result.text,
+                parsed,
+                row_ids=approved_plan_context.risk_test_matrix_expected_row_ids,
+                execution_catalog=catalog,
+            )
+        except Exception as exc:
+            corrected = None
+            correction_error = f"semantic correction unavailable: {type(exc).__name__}"
+        else:
+            correction_error = None
+        if corrected is not None:
+            corrected_head = reauthenticate_head()
+            if corrected_head == head_sha:
+                corrected_parsed, corrected_result = _derive_authenticated_risk_evidence_for_coder(
+                    corrected,
+                    approved_plan_context=approved_plan_context,
+                    runner=runner,
+                    assigned_workdir=assigned_workdir,
+                    head_sha=head_sha,
+                    predecessor_head=predecessor_head,
+                    invocation_id=bound_invocation_id,
+                    _closed_execution_catalog=closed_catalog,
+                    _journal_observations=journal_observations,
+                    _correction_attempted=True,
+                )
+                if corrected_result is not None and any(
+                    diagnostic.code not in {"missing-claim", "unsuperseded-journal-failure"}
+                    for diagnostic in corrected_result.diagnostics
+                ):
+                    exhausted = PostAuthClaimDiagnostic(
+                        actionable[0].row_id if actionable else "risk-test-matrix",
+                        "semantic-correction-exhausted",
+                        "The bounded semantic correction did not produce fully admissible post-authentication claims.",
+                    )
+                    corrected_result = dataclasses_replace(
+                        corrected_result,
+                        diagnostics=tuple((*corrected_result.diagnostics, exhausted)),
+                    )
+                    corrected_parsed = dataclasses_replace(
+                        corrected_parsed,
+                        risk_test_matrix_evidence=corrected_result.evidence,
+                        risk_test_matrix_diagnostics=corrected_result.diagnostics,
+                    )
+                return corrected_parsed, corrected_result
+            if corrected_head is not None:
+                raced_parsed, raced_result = _derive_authenticated_risk_evidence_for_coder(
+                    corrected,
+                    approved_plan_context=approved_plan_context,
+                    runner=runner,
+                    assigned_workdir=assigned_workdir,
+                    head_sha=corrected_head,
+                    predecessor_head=predecessor_head,
+                    invocation_id=bound_invocation_id,
+                    _closed_execution_catalog=closed_catalog,
+                    _journal_observations=journal_observations,
+                    _correction_attempted=True,
+                )
+                if raced_result is not None:
+                    # A remote-head race terminates correction.  Even if the
+                    # assigned checkout happened to move with the remote
+                    # between the two reads, claims acquired before the race
+                    # cannot be promoted to verified evidence for that new
+                    # head in this handoff.
+                    raced_rows = tuple(
+                        dataclasses_replace(
+                            row,
+                            status=("stale/unverified" if row.status == "verified" else row.status),
+                            evidence_citations=(),
+                            caveats=tuple((*row.caveats, "head changed during bounded semantic correction")),
+                        )
+                        for row in raced_result.evidence.rows
+                    )
+                    raced_evidence = dataclasses_replace(
+                        raced_result.evidence,
+                        rows=raced_rows,
+                    )
+                    raced_result = dataclasses_replace(
+                        raced_result,
+                        evidence=raced_evidence,
+                        diagnostics=tuple((*raced_result.diagnostics, PostAuthClaimDiagnostic(
+                            actionable[0].row_id if actionable else "risk-test-matrix",
+                            "head-changed-during-correction",
+                            "The authenticated PR head changed during semantic correction; evidence was rebuilt for the new head.",
+                        ))),
+                    )
+                    raced_parsed = dataclasses_replace(
+                        raced_parsed,
+                        risk_test_matrix_evidence=raced_result.evidence,
+                        risk_test_matrix_diagnostics=raced_result.diagnostics,
+                    )
+                return raced_parsed, raced_result
+            correction_error = "semantic correction was discarded because the authenticated PR head changed"
+        diagnostic = PostAuthClaimDiagnostic(
+            actionable[0].row_id if actionable else "risk-test-matrix",
+            "semantic-correction-exhausted",
+            correction_error or "The bounded semantic correction did not produce a valid claim set.",
+        )
+        result = dataclasses_replace(
+            result,
+            diagnostics=tuple((*result.diagnostics, diagnostic)),
+        )
+    return dataclasses_replace(
+        parsed,
+        risk_test_matrix_evidence=result.evidence,
+        risk_test_matrix_diagnostics=result.diagnostics,
+    ), result
 
 
 def _post_no_pr_implementation_terminal_comment(
@@ -7176,7 +7590,8 @@ def _implement_approved_issue(
             require_risk_test_matrix_contract=(
                 approved_plan_context is not None and approved_plan_context.matrix_available
             ),
-            authoritative_test_observations=runner.local_test_observations(),
+            authoritative_test_observations=_current_test_turn_observations(runner),
+            execution_catalog=_current_test_turn_observations(runner),
             delivered_risk_test_matrix_row_ids=(
                 approved_plan_context.risk_test_matrix_expected_row_ids
                 if approved_plan_context is not None and approved_plan_context.matrix_available
@@ -7385,6 +7800,21 @@ def _implement_approved_issue(
                 if execution_identity is not None else None
             ),
         )
+    implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
+        implementation_result,
+        approved_plan_context=approved_plan_context,
+        runner=runner,
+        assigned_workdir=active_workdir(implementation_config),
+        head_sha=initial_pr_context.metadata.head_sha,
+        config=implementation_config,
+        session_id=coder_response.session_id,
+        invocation_id=coder_response.acquisition_test_turn_id,
+        _closed_execution_catalog=coder_response.acquisition_test_observations,
+        _journal_observations=coder_response.acquisition_test_observations,
+        reauthenticate_head=lambda: get_pr_review_context(
+            runner, config=implementation_config, pr_number=pr_number
+        ).metadata.head_sha,
+    )
     initial_local_test_evidence = runner.render_local_test_evidence(
         current_head=initial_pr_context.metadata.head_sha,
         legacy_tests_run=implementation_result.tests_run,
@@ -7398,7 +7828,7 @@ def _implement_approved_issue(
             config=implementation_config,
             model_used=coder_response.model_used,
             local_test_evidence=initial_local_test_evidence,
-            current_test_turn_id=runner.latest_test_turn_id,
+            current_test_turn_id=coder_response.acquisition_test_turn_id,
         ),
         PostedRoundMetadata(
             flow="pr",
@@ -7409,6 +7839,15 @@ def _implement_approved_issue(
             prior_items=(),
             raw_structured_coder_response=coder_output,
             local_test_evidence=initial_local_test_evidence,
+            risk_test_matrix_evidence=(
+                implementation_result.risk_test_matrix_evidence.to_payload()
+                if implementation_result.risk_test_matrix_evidence is not None
+                else None
+            ),
+            risk_test_matrix_diagnostics=tuple(
+                diagnostic.to_payload()
+                for diagnostic in implementation_result.risk_test_matrix_diagnostics
+            ),
             model_used=coder_response.model_used,
             **_metadata_identity_fields(coder_response),
             **_architecture_metadata_fields(
@@ -10326,6 +10765,21 @@ def run_issue_loop(
             plan_hash=None,
             expected_closing_issue_ids=closing_contract.issue_ids,
         )
+        implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
+            implementation_result,
+            approved_plan_context=None,
+            runner=runner,
+            assigned_workdir=active_workdir(config),
+            head_sha=initial_pr_metadata.head_sha,
+            config=config,
+            session_id=coder_response.session_id,
+            invocation_id=coder_response.acquisition_test_turn_id,
+            _closed_execution_catalog=coder_response.acquisition_test_observations,
+            _journal_observations=coder_response.acquisition_test_observations,
+            reauthenticate_head=lambda: get_pr_review_context(
+                runner, config=config, pr_number=pr_number
+            ).metadata.head_sha,
+        )
         initial_local_test_evidence = runner.render_local_test_evidence(
             current_head=initial_pr_metadata.head_sha,
             legacy_tests_run=implementation_result.tests_run,
@@ -10339,7 +10793,7 @@ def run_issue_loop(
                 config=config,
                 model_used=coder_response.model_used,
                 local_test_evidence=initial_local_test_evidence,
-                current_test_turn_id=runner.latest_test_turn_id,
+                current_test_turn_id=coder_response.acquisition_test_turn_id,
             ),
             PostedRoundMetadata(
                 flow="pr",
@@ -10350,6 +10804,15 @@ def run_issue_loop(
                 prior_items=(),
                 raw_structured_coder_response=coder_output,
                 local_test_evidence=initial_local_test_evidence,
+                risk_test_matrix_evidence=(
+                    implementation_result.risk_test_matrix_evidence.to_payload()
+                    if implementation_result.risk_test_matrix_evidence is not None
+                    else None
+                ),
+                risk_test_matrix_diagnostics=tuple(
+                    diagnostic.to_payload()
+                    for diagnostic in implementation_result.risk_test_matrix_diagnostics
+                ),
                 model_used=coder_response.model_used,
                 **_metadata_identity_fields(coder_response),
                 acquisition_outcome=coder_response.acquisition_outcome,
@@ -10572,7 +11035,7 @@ def _coder_followup_review_context(
     summary = _extract_structured_coder_summary(text)
     tests = _extract_structured_coder_tests_run(text)
     try:
-        parsed = validate_structured_coder_followup(text)
+        parsed = parse_historical_structured_coder_followup(text)
     except AgentLoopError:
         parsed = None
     payload: dict[str, object] = {
@@ -10580,6 +11043,15 @@ def _coder_followup_review_context(
         "tests_run": tests,
         "local_test_evidence": metadata.local_test_evidence,
     }
+    # Reviewers receive the orchestrator-derived authority carried by the
+    # same round metadata as the public comment. Do not reconstruct it from
+    # the coder's fresh response or from the cumulative local journal.
+    if metadata.risk_test_matrix_evidence is not None:
+        payload["risk_test_matrix_evidence"] = metadata.risk_test_matrix_evidence
+    if metadata.risk_test_matrix_diagnostics:
+        payload["risk_test_matrix_diagnostics"] = [
+            dict(item) for item in metadata.risk_test_matrix_diagnostics
+        ]
     if isinstance(parsed, StructuredCoderFollowup):
         payload.update(
             addressed_items=parsed.addressed_items,
@@ -10631,14 +11103,14 @@ def _extract_structured_coder_summary(text: str | None) -> str | None:
         return None
     try:
         try:
-            implementation = validate_structured_issue_implementation(text)
+            implementation = parse_historical_structured_issue_implementation(text)
         except IssueImplementationConflictError as exc:
             implementation = exc.payload
         except AgentLoopError:
             implementation = None
         if isinstance(implementation, StructuredIssueImplementation):
             return implementation.summary
-        parsed = validate_structured_coder_followup(text)
+        parsed = parse_historical_structured_coder_followup(text)
         return parsed.summary if parsed else None
     except AgentLoopError:
         return None
@@ -10649,14 +11121,14 @@ def _extract_structured_coder_tests_run(text: str | None) -> tuple[str, ...] | N
         return None
     try:
         try:
-            implementation = validate_structured_issue_implementation(text)
+            implementation = parse_historical_structured_issue_implementation(text)
         except IssueImplementationConflictError as exc:
             implementation = exc.payload
         except AgentLoopError:
             implementation = None
         if isinstance(implementation, StructuredIssueImplementation):
             return implementation.tests_run
-        parsed = validate_structured_coder_followup(text)
+        parsed = parse_historical_structured_coder_followup(text)
         return parsed.tests_run if parsed else None
     except AgentLoopError:
         return None
@@ -16487,7 +16959,8 @@ def run_pr_loop(
                         1 if approved_plan_context is not None and approved_plan_context.matrix_available
                         else 0
                     ),
-                    authoritative_test_observations=runner.local_test_observations(),
+                    authoritative_test_observations=_current_test_turn_observations(runner),
+                    execution_catalog=_current_test_turn_observations(runner),
                     delivered_risk_test_matrix_row_ids=(
                         approved_plan_context.risk_test_matrix_expected_row_ids
                         if approved_plan_context is not None and approved_plan_context.matrix_available
@@ -16565,6 +17038,37 @@ def run_pr_loop(
                 unresolved_items,
                 current_head_sha=updated_pr_context.metadata.head_sha,
             )
+            # Reconcile the coder's assigned checkout with the freshly fetched
+            # PR head before deriving any canonical evidence. The builder also
+            # takes an independent stable snapshot, so a mismatch is retained
+            # as non-verified evidence rather than discarding the PR handoff.
+            assigned_worktree_head_after_followup = _read_assigned_workdir_head(
+                runner, config
+            )
+            if isinstance(coder_response.marker_value, StructuredCoderFollowup):
+                derived_followup, _followup_derived_risk_evidence = (
+                    _derive_authenticated_risk_evidence_for_coder(
+                        coder_response.marker_value,
+                        approved_plan_context=approved_plan_context,
+                        runner=runner,
+                        assigned_workdir=active_workdir(config),
+                        head_sha=updated_pr_context.metadata.head_sha,
+                        predecessor_head=pr_metadata.head_sha,
+                        config=config,
+                        session_id=coder_response.session_id,
+                        invocation_id=coder_response.acquisition_test_turn_id,
+                        _closed_execution_catalog=coder_response.acquisition_test_observations,
+                        _journal_observations=coder_response.acquisition_test_observations,
+                        assigned_worktree_head=assigned_worktree_head_after_followup,
+                        reauthenticate_head=lambda: get_pr_review_context(
+                            runner, config=config, pr_number=pr_number
+                        ).metadata.head_sha,
+                    )
+                )
+                coder_response = dataclasses_replace(
+                    coder_response,
+                    marker_value=derived_followup,
+                )
             local_test_evidence = runner.render_local_test_evidence(
                 current_head=updated_pr_context.metadata.head_sha,
                 legacy_tests_run=(
@@ -16588,7 +17092,7 @@ def run_pr_loop(
                     config=config,
                     model_used=coder_response.model_used,
                     local_test_evidence=local_test_evidence,
-                    current_test_turn_id=runner.latest_test_turn_id,
+                    current_test_turn_id=coder_response.acquisition_test_turn_id,
                 )
 
             qualification_checkpoint = _machine_obligation_checkpoint(
@@ -16619,6 +17123,20 @@ def run_pr_loop(
                 prior_items=tuple(unresolved_items),
                 raw_structured_coder_response=raw_structured_coder_response,
                 local_test_evidence=local_test_evidence,
+                risk_test_matrix_evidence=(
+                    coder_response.marker_value.risk_test_matrix_evidence.to_payload()
+                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                    and coder_response.marker_value.risk_test_matrix_evidence is not None
+                    else None
+                ),
+                risk_test_matrix_diagnostics=(
+                    tuple(
+                        diagnostic.to_payload()
+                        for diagnostic in coder_response.marker_value.risk_test_matrix_diagnostics
+                    )
+                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                    else ()
+                ),
                 compact_prior_summaries=tuple(pr_compact_prior_summaries),
                 model_used=coder_response.model_used,
                 acquisition_outcome=coder_response.acquisition_outcome,

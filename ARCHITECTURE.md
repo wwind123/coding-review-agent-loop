@@ -63,14 +63,14 @@ Source paths below are relative to
 | Agent-facing context | `prompts.py`, `memory.py` | Render issue/plan/human/feedback context and advisory repository orientation. |
 | Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
-| Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; perform bounded format repair and reject content-loss or semantic rewrites. |
+| Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head. |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. |
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
 | Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. |
-| Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `logging.py` | Record test observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success. |
+| Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `logging.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success. |
 
 `orchestrator.py` is still a large integration module. The table describes
 existing ownership, not a completed decomposition into independently deployed
@@ -144,6 +144,31 @@ matrix terminates after one planner response. That fail-fast path retains the
 original validator diagnostic and candidate provenance and reuses the durable
 planning-validation diagnostic handler; the rejected response is never stored
 as canonical plan state.
+
+Implementation and coder-follow-up responses own semantic facts only. Their
+`risk_test_matrix_claims` name approved row IDs, invocation-local broker
+`execution_ref` selectors, actual test identifiers and locations, workflow and
+outcome assertions, forbidden-effect assertions, and bounded caveats. A
+selector is an ephemeral lookup key, never a receipt citation; repeated
+commands receive distinct keys and restored keys cannot be reused after a
+restart.
+
+The orchestrator owns canonical `risk_test_matrix_evidence`. After it
+authenticates the reported PR and exact eventual tracked tree (and, for a
+follow-up, reconciles the advanced PR head), one shared typed builder resolves
+the closed current-turn catalog and complete local journal. It emits every
+enforceable approved row exactly once in approved order, cites only
+authoritative passing observations bound to the invocation and authenticated
+head/tree, and retains failed, timed-out, stale, unbound, and restart-limited
+observations as non-verified caveats. Missing or partial claims therefore
+produce complete non-verified evidence rather than hiding the PR.
+
+Format and selector defects receive bounded semantic-only correction. Repair
+does not generate matrix identities, canonical rows, receipt IDs, mappings,
+statuses, or evidence envelopes. Derived evidence and diagnostics are the
+durable replay artifact; live execution selectors are not. Historical accepted
+canonical evidence remains readable for resume, while a fresh response that
+contains legacy canonical fields cannot make those fields authoritative.
 
 Decomposition into child phases and materialization of split proposals are
 distinct workflows, with typed topology and durable checkpoints. They are not

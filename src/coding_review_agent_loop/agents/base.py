@@ -66,6 +66,11 @@ class AgentResult:
     self_update_replay_refusal_kind: str | None = None
     self_update_replay_refusal_detail: str | None = None
     containment: ContainmentEvidence | None = None
+    # The coder acquisition turn is an ephemeral authority boundary. The
+    # orchestrator snapshots it before format repair can mint a newer broker
+    # turn, and uses the snapshot for validation and evidence derivation.
+    test_turn_id: str | None = None
+    test_turn_observations: tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
         if self.containment is None and self.command_result is not None:

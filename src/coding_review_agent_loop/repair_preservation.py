@@ -466,10 +466,73 @@ def validate_repair_preservation(
             for entry in source_observations:
                 if isinstance(entry, dict):
                     require(entry in target_observations, "test_observations")
+        if "risk_test_matrix_claims" in source:
+            source_claims = source.get("risk_test_matrix_claims")
+            target_claims = target.get("risk_test_matrix_claims")
+            require(isinstance(source_claims, list), "risk_test_matrix_claims")
+            require(isinstance(target_claims, list), "risk_test_matrix_claims")
+            # Claims remain semantic, but a repair may remove an invalid row or
+            # selector after the validator names the defect. Preserve every
+            # substantive selector/fact from claims that are retained.
+            for source_claim in source_claims:
+                if not isinstance(source_claim, dict):
+                    continue
+                source_row = source_claim.get("row_id")
+                target_matches = [
+                    candidate for candidate in target_claims
+                    if isinstance(candidate, dict) and candidate.get("row_id") == source_row
+                ]
+                if not target_matches:
+                    continue
+                candidate = target_matches[0]
+                for field in (
+                    "execution_refs", "test_identifiers", "test_locations",
+                    "workflow_path_claim", "outcome_assertions",
+                    "forbidden_effect_assertions",
+                ):
+                    if field in source_claim:
+                        require(field in candidate, f"risk_test_matrix_claims.{field}")
+                        if field == "execution_refs":
+                            # The schema/catalog validator decides which
+                            # selectors are invalid. Permit repair to remove
+                            # those selectors, including one copy of a
+                            # duplicate, but never let it add or replace a
+                            # selector that was absent from the source claim.
+                            source_refs = source_claim[field]
+                            target_refs = candidate[field]
+                            require(isinstance(source_refs, list), f"risk_test_matrix_claims.{field}")
+                            require(isinstance(target_refs, list), f"risk_test_matrix_claims.{field}")
+                            remaining_refs = list(source_refs)
+                            for target_ref in target_refs:
+                                require(
+                                    target_ref in remaining_refs,
+                                    f"risk_test_matrix_claims.{field}",
+                                )
+                                remaining_refs.remove(target_ref)
+                            continue
+                        source_fragments = _fragments(source_claim[field])
+                        target_fragments = _fragments(candidate[field])
+                        require(
+                            all(fragment in target_fragments for fragment in source_fragments),
+                            f"risk_test_matrix_claims.{field}",
+                        )
         if "risk_test_matrix_evidence" in source:
-            require(
-                target.get("risk_test_matrix_evidence") == source.get("risk_test_matrix_evidence"),
-                "risk_test_matrix_evidence",
+            # Canonical evidence is orchestrator-owned. Fresh semantic repair
+            # may remove this legacy field, but historical compatibility still
+            # permits an exact unchanged copy in a replayed response. Never
+            # permit a model to rewrite it into a different canonical record.
+            if "risk_test_matrix_evidence" in target:
+                require(
+                    target["risk_test_matrix_evidence"]
+                    == source["risk_test_matrix_evidence"],
+                    "risk_test_matrix_evidence",
+                )
+        elif "risk_test_matrix_evidence" in target:
+            # A fresh repair may remove a legacy canonical field that was
+            # present in its source, but it may never synthesize that field
+            # when the source did not contain it.
+            raise AgentLoopError(
+                "repair cannot invent risk_test_matrix_evidence for a fresh coder response"
             )
 
     if source["kind"] == "coder_followup":

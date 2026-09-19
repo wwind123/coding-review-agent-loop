@@ -154,6 +154,10 @@ class PostedRoundMetadata:
     # Canonical bounded local-test evidence. Raw environments and identity
     # bytes are never persisted in this field.
     local_test_evidence: str | None = None
+    # Orchestrator-derived matrix evidence and bounded post-auth diagnostics.
+    # Execution handles are deliberately absent from this durable payload.
+    risk_test_matrix_evidence: dict | None = None
+    risk_test_matrix_diagnostics: tuple[dict, ...] = ()
     # Optional selective-intermediate scheduler audit fields. They are omitted
     # from legacy encodings unless a scheduler checkpoint actually wrote them.
     scheduler_contract: dict | None = None
@@ -1536,6 +1540,36 @@ def _canonical_matrix_boundary_matches(text: str, identity: str) -> bool:
         return False
 
 
+def _sanitize_durable_coder_response(raw: str | None) -> str | None:
+    """Remove invocation-local semantic selectors before durable persistence.
+
+    ``risk_test_matrix_claims`` is a fresh-turn acquisition contract. Its
+    execution handles are only meaningful in the closed broker catalog for
+    that invocation and must never be restored as if they were receipt
+    authority. The derived evidence and diagnostics are persisted in their
+    dedicated metadata fields, so dropping the ephemeral claim set from the
+    historical raw response preserves useful resume context without making a
+    later invocation selector-capable.
+    """
+    if not raw:
+        return raw
+    normalized = raw.lstrip()
+    try:
+        payload, end = json.JSONDecoder().raw_decode(normalized)
+    except (TypeError, json.JSONDecodeError):
+        return raw
+    if not isinstance(payload, dict) or payload.get("kind") not in {
+        "issue_implementation",
+        "coder_followup",
+    }:
+        return raw
+    if "risk_test_matrix_claims" not in payload:
+        return raw
+    payload = dict(payload)
+    payload.pop("risk_test_matrix_claims", None)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + normalized[end:]
+
+
 def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
     payload = {
         "flow": metadata.flow,
@@ -1549,7 +1583,9 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "new_items": [_serialize_unresolved_item(item) for item in metadata.new_items],
         "state": metadata.state,
         "canonical_plan": metadata.canonical_plan,
-        "raw_structured_coder_response": metadata.raw_structured_coder_response,
+        "raw_structured_coder_response": _sanitize_durable_coder_response(
+            metadata.raw_structured_coder_response
+        ),
         "approved_plan_hash": metadata.approved_plan_hash,
         "approved_plan_subject": metadata.approved_plan_subject,
         "architecture_identity": metadata.architecture_identity,
@@ -1586,6 +1622,10 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             canonicalize_bounded_evidence(metadata.local_test_evidence)
             if metadata.local_test_evidence is not None else None
         ),
+        "risk_test_matrix_evidence": metadata.risk_test_matrix_evidence,
+        "risk_test_matrix_diagnostics": [
+            dict(item) for item in metadata.risk_test_matrix_diagnostics
+        ],
     }
     semantic_values = {
         "response_form": metadata.response_form,
@@ -1853,6 +1893,16 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             ),
             local_test_evidence=(
                 canonicalize_bounded_evidence(payload.get("local_test_evidence"))
+            ),
+            risk_test_matrix_evidence=(
+                payload.get("risk_test_matrix_evidence")
+                if isinstance(payload.get("risk_test_matrix_evidence"), dict)
+                else None
+            ),
+            risk_test_matrix_diagnostics=tuple(
+                dict(item)
+                for item in payload.get("risk_test_matrix_diagnostics", [])
+                if isinstance(item, dict)
             ),
             qualification_checkpoint=(
                 QualificationCheckpoint.from_mapping(payload["qualification_checkpoint"])

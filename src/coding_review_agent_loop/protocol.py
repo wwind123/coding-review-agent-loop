@@ -465,11 +465,69 @@ HUMAN_REQUIREMENT_DISPOSITION_VALUES = frozenset(
 
 @dataclass(frozen=True)
 class TestObservationCitation:
-    """A coder-authored citation for a broker or parent test receipt."""
+    """A historical/display citation for a broker or parent test receipt.
+
+    Fresh risk-matrix evidence is never selected with this type.  It remains
+    readable for already-published comments and for the ordinary test-report
+    display channel, while the deterministic builder creates authoritative
+    citations from invocation-local execution handles.
+    """
 
     command: str
     receipt_id: str
     claim: str
+
+
+SEMANTIC_RISK_CLAIMS_MAX_ROWS = 24
+SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS = 8
+SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES = 1_024
+SEMANTIC_RISK_CLAIMS_MAX_CAVEATS = 16
+
+
+@dataclass(frozen=True)
+class SemanticRiskCoverageClaim:
+    """Model-authored semantic coverage for one approved matrix row.
+
+    ``execution_refs`` are invocation-local selectors issued by the managed
+    test broker.  They are intentionally not receipt IDs and are never
+    persisted as evidence authority.
+    """
+
+    row_id: str
+    execution_refs: tuple[str, ...]
+    test_identifiers: tuple[str, ...]
+    test_locations: tuple[str, ...]
+    workflow_path_claim: str
+    outcome_assertions: tuple[str, ...]
+    forbidden_effect_assertions: tuple[str, ...]
+    caveats: tuple[str, ...] = ()
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "row_id": sanitize_historical_text(self.row_id),
+            "execution_refs": [sanitize_historical_text(item) for item in self.execution_refs],
+            "test_identifiers": [sanitize_historical_text(item) for item in self.test_identifiers],
+            "test_locations": [sanitize_historical_text(item) for item in self.test_locations],
+            "workflow_path_claim": sanitize_historical_text(self.workflow_path_claim),
+            "outcome_assertions": [sanitize_historical_text(item) for item in self.outcome_assertions],
+            "forbidden_effect_assertions": [sanitize_historical_text(item) for item in self.forbidden_effect_assertions],
+            "caveats": [sanitize_historical_text(item) for item in self.caveats],
+        }
+
+
+@dataclass(frozen=True)
+class SemanticRiskCoverageClaims:
+    """Bounded shared semantic-claims carrier for both coder response kinds."""
+
+    claims: tuple[SemanticRiskCoverageClaim, ...] = ()
+
+    @property
+    def rows(self) -> tuple[SemanticRiskCoverageClaim, ...]:
+        """Compatibility/readability alias for callers treating claims as rows."""
+        return self.claims
+
+    def to_payload(self) -> list[dict[str, object]]:
+        return [claim.to_payload() for claim in self.claims]
 
 
 @dataclass(frozen=True)
@@ -489,7 +547,12 @@ class StructuredCoderFollowup:
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
     test_observations: tuple[TestObservationCitation, ...] = ()
     architecture_impact: ArchitectureImpact | None = None
+    # Fresh turns own only semantic coverage claims. The old canonical field is
+    # retained below for historical response parsing and is ignored by the
+    # deterministic builder.
+    risk_test_matrix_claims: SemanticRiskCoverageClaims | None = None
     risk_test_matrix_evidence: "RiskTestMatrixEvidence | None" = None
+    risk_test_matrix_diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -506,7 +569,9 @@ class StructuredIssueImplementation:
     tests_run: tuple[str, ...] | None = None
     test_observations: tuple[TestObservationCitation, ...] = ()
     architecture_impact: ArchitectureImpact | None = None
+    risk_test_matrix_claims: SemanticRiskCoverageClaims | None = None
     risk_test_matrix_evidence: "RiskTestMatrixEvidence | None" = None
+    risk_test_matrix_diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -895,8 +960,16 @@ def _risk_bounded_string(value: object, *, context: str, max_bytes: int = RISK_M
     return rendered
 
 
-def _risk_bounded_string_list(value: object, *, context: str, max_items: int = RISK_MATRIX_MAX_LIST_ITEMS) -> tuple[str, ...]:
+def _risk_bounded_string_list(
+    value: object,
+    *,
+    context: str,
+    max_items: int = RISK_MATRIX_MAX_LIST_ITEMS,
+    min_items: int = 0,
+) -> tuple[str, ...]:
     rendered = _expect_string_list(value, context=context, item_context=context)
+    if len(rendered) < min_items:
+        raise AgentLoopError(f"{context} must contain at least {min_items} item(s).")
     if len(rendered) > max_items:
         raise AgentLoopError(f"{context} exceeds the {max_items}-item bound.")
     for index, item in enumerate(rendered):
@@ -1399,11 +1472,357 @@ class RiskTestMatrixEvidenceRow:
     evidence_citations: tuple[TestObservationCitation, ...]
     caveats: tuple[str, ...] = ()
 
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "row_id": sanitize_historical_text(self.row_id),
+            "status": sanitize_historical_text(self.status),
+            "test_identifiers": [sanitize_historical_text(item) for item in self.test_identifiers],
+            "test_locations": [sanitize_historical_text(item) for item in self.test_locations],
+            "workflow_path_claim": sanitize_historical_text(self.workflow_path_claim),
+            "outcome_assertions": [sanitize_historical_text(item) for item in self.outcome_assertions],
+            "forbidden_effect_assertions": [sanitize_historical_text(item) for item in self.forbidden_effect_assertions],
+            "evidence_citations": [
+                {"command": sanitize_historical_text(item.command),
+                 "receipt_id": sanitize_historical_text(item.receipt_id),
+                 "claim": sanitize_historical_text(item.claim)}
+                for item in self.evidence_citations
+            ],
+            "caveats": [sanitize_historical_text(item) for item in self.caveats],
+        }
+
 
 @dataclass(frozen=True)
 class RiskTestMatrixEvidence:
     matrix_identity: str
     rows: tuple[RiskTestMatrixEvidenceRow, ...]
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "matrix_identity": sanitize_historical_text(self.matrix_identity),
+            "rows": [row.to_payload() for row in self.rows],
+        }
+
+
+@dataclass(frozen=True)
+class PostAuthClaimDiagnostic:
+    """Bounded diagnostic emitted after PR/head authentication."""
+
+    row_id: str
+    code: str
+    message: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "row_id": sanitize_historical_text(self.row_id),
+            "code": sanitize_historical_text(self.code),
+            "message": sanitize_historical_text(self.message),
+        }
+
+
+@dataclass(frozen=True)
+class DerivedRiskEvidenceResult:
+    """Complete canonical evidence plus non-terminal post-auth diagnostics."""
+
+    evidence: RiskTestMatrixEvidence
+    diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
+
+    @property
+    def risk_test_matrix_evidence(self) -> RiskTestMatrixEvidence:
+        return self.evidence
+
+
+def _observation_value(observation: object, name: str, default: object = None) -> object:
+    if isinstance(observation, Mapping):
+        return observation.get(name, default)
+    return getattr(observation, name, default)
+
+
+def _observation_attribution(observation: object) -> Mapping[str, object]:
+    value = _observation_value(observation, "attribution")
+    if value is None:
+        value = _observation_value(observation, "tree")
+    if isinstance(value, Mapping):
+        return value
+    if value is None:
+        return {}
+    return {
+        name: getattr(value, name, None)
+        for name in ("state", "head", "tracked_digest", "stable", "untracked_input", "caveats")
+    }
+
+
+def _observation_command_text(observation: object) -> str:
+    command = _observation_value(observation, "command")
+    if isinstance(command, (tuple, list)) and all(isinstance(item, str) for item in command):
+        return shlex.join(command)
+    normalized = _observation_value(observation, "normalized_command")
+    if isinstance(normalized, str) and normalized.strip():
+        return normalized.strip()
+    return str(command or "local test execution")
+
+
+def _claims_value(
+    claims: SemanticRiskCoverageClaims | Sequence[SemanticRiskCoverageClaim] | None,
+) -> tuple[SemanticRiskCoverageClaim, ...]:
+    if claims is None:
+        return ()
+    if isinstance(claims, SemanticRiskCoverageClaims):
+        return claims.claims
+    return tuple(claims)
+
+
+def derive_risk_test_matrix_evidence(
+    *,
+    matrix: RiskTestMatrix | Mapping[str, object],
+    claims: SemanticRiskCoverageClaims | Sequence[SemanticRiskCoverageClaim] | None,
+    observations: Sequence[object],
+    execution_catalog: Sequence[object] | None = None,
+    invocation_id: str | None = None,
+    current_head: str | None = None,
+    current_tree_digest: str | None = None,
+    authenticated_checkout_head: str | None = None,
+    authenticated_tree_clean: bool | None = None,
+    predecessor_head: str | None = None,
+    expected_identity: str | None = None,
+) -> DerivedRiskEvidenceResult:
+    """Derive canonical evidence from trusted matrix/journal/head inputs.
+
+    Model claims can select only live execution handles.  Receipt IDs,
+    canonical rows, statuses, ordering, and mappings are all produced here.
+    Any post-authentication mismatch produces complete non-verified evidence
+    and a bounded diagnostic, preserving the authenticated handoff.
+    """
+    parsed_matrix = parse_risk_test_matrix(matrix)
+    identity = expected_identity or risk_test_matrix_identity(parsed_matrix)
+    if not re.fullmatch(r"[0-9a-f]{64}", identity):
+        raise AgentLoopError("derived risk evidence matrix identity must be a SHA-256 digest")
+    # ``observations`` is the authoritative journal used to derive aggregate
+    # failure status.  Selector resolution is deliberately a separate input:
+    # a cumulative journal may retain observations from earlier coder turns,
+    # but a fresh semantic claim may select only the closed catalog for the
+    # current turn.  Keeping these inputs distinct prevents a historical
+    # execution_ref from becoming a valid citation merely because it remains
+    # inside the bounded journal.
+    selector_observations = (
+        tuple(execution_catalog)
+        if execution_catalog is not None
+        else tuple(observations)
+    )
+    observation_by_ref: dict[str, object] = {}
+    for observation in selector_observations:
+        execution_ref = _semantic_execution_ref(observation)
+        if execution_ref is None:
+            continue
+        if execution_ref in observation_by_ref:
+            raise AgentLoopError(
+                f"execution catalog contains colliding execution_ref `{execution_ref}`"
+            )
+        observation_by_ref[execution_ref] = observation
+
+    claim_values = _claims_value(claims)
+    if len(claim_values) > SEMANTIC_RISK_CLAIMS_MAX_ROWS:
+        raise AgentLoopError(
+            f"semantic risk coverage exceeds the {SEMANTIC_RISK_CLAIMS_MAX_ROWS}-row bound"
+        )
+    enforceable_row_ids = {
+        row.row_id for row in parsed_matrix.rows
+        if row.applicability in {"applicable", "required"}
+    }
+    claim_by_row: dict[str, SemanticRiskCoverageClaim] = {}
+    selected_refs: set[str] = set()
+    for claim in claim_values:
+        if not isinstance(claim, SemanticRiskCoverageClaim):
+            raise AgentLoopError("semantic risk coverage contains an invalid claim type")
+        if claim.row_id not in enforceable_row_ids:
+            raise AgentLoopError(
+                f"semantic risk coverage names unknown or non-enforceable row `{claim.row_id}`"
+            )
+        if claim.row_id in claim_by_row:
+            raise AgentLoopError(
+                f"semantic risk coverage contains duplicate claim for row `{claim.row_id}`"
+            )
+        claim_by_row[claim.row_id] = claim
+        for execution_ref in claim.execution_refs:
+            if execution_ref in selected_refs:
+                raise AgentLoopError(
+                    f"semantic risk coverage selects execution_ref `{execution_ref}` more than once"
+                )
+            selected_refs.add(execution_ref)
+    diagnostics: list[PostAuthClaimDiagnostic] = []
+    # A canonical evidence builder is a post-authentication operation. Keep
+    # these parameters optional for historical/unit callers, but never let an
+    # omitted authentication proof upgrade a selected receipt to ``verified``.
+    # Matching the receipt's recorded tree is insufficient when the assigned
+    # checkout is on another commit.
+    checkout_head_mismatch = (
+        current_head is None
+        or authenticated_checkout_head != current_head
+        or (predecessor_head is not None and authenticated_checkout_head == predecessor_head)
+    )
+    checkout_tree_unavailable = authenticated_tree_clean is not True
+    unsuperseded_failures = [
+        observation for observation in observations
+        if _observation_value(observation, "provenance") == "parent-observed"
+        and _observation_value(observation, "outcome") in {
+            "failed", "timed_out", "interrupted", "incomplete", "launch-failed"
+        }
+        and not _observation_value(observation, "superseded_by")
+    ]
+    result_rows: list[RiskTestMatrixEvidenceRow] = []
+    for row in parsed_matrix.rows:
+        if row.applicability not in {"applicable", "required"}:
+            continue
+        claim = claim_by_row.get(row.row_id)
+        caveats: list[str] = list(claim.caveats if claim is not None else ())
+        citations: list[TestObservationCitation] = []
+        valid_selected = True
+        selected: list[object] = []
+        if claim is None:
+            status = "missing"
+            caveats.append("No semantic coverage claim was supplied for this enforceable row.")
+            diagnostics.append(PostAuthClaimDiagnostic(row.row_id, "missing-claim", "No semantic row claim was supplied."))
+        else:
+            candidate_citations: list[TestObservationCitation] = []
+            missing_semantic_facts = [
+                field_name
+                for field_name, value in (
+                    ("test_identifiers", claim.test_identifiers),
+                    ("test_locations", claim.test_locations),
+                    ("workflow_path_claim", claim.workflow_path_claim),
+                    ("outcome_assertions", claim.outcome_assertions),
+                    ("forbidden_effect_assertions", claim.forbidden_effect_assertions),
+                )
+                if not value
+            ]
+            if missing_semantic_facts:
+                valid_selected = False
+                diagnostics.append(PostAuthClaimDiagnostic(
+                    row.row_id,
+                    "incomplete-semantic-claim",
+                    "Semantic coverage is missing required facts: "
+                    + ", ".join(missing_semantic_facts)
+                    + ".",
+                ))
+                caveats.append(
+                    "The semantic coverage claim did not provide all facts required for verified evidence."
+                )
+            for execution_ref in claim.execution_refs:
+                observation = observation_by_ref.get(execution_ref)
+                if observation is None:
+                    valid_selected = False
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "unknown-execution-ref",
+                        f"Execution selector `{execution_ref}` was not present in the authenticated turn catalog.",
+                    ))
+                    caveats.append("A claimed execution selector was unknown or cross-turn.")
+                    continue
+                selected.append(observation)
+                selected_observation_valid = True
+                semantics, _rich = _observation_semantics(observation)
+                if invocation_id is not None and _observation_value(observation, "turn_id") != invocation_id:
+                    valid_selected = False
+                    selected_observation_valid = False
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "cross-turn-execution-ref",
+                        f"Execution selector `{execution_ref}` was not bound to the current invocation.",
+                    ))
+                attribution = _observation_attribution(observation)
+                if checkout_head_mismatch:
+                    valid_selected = False
+                    selected_observation_valid = False
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "checkout-head-mismatch",
+                        "The assigned checkout was not authenticated at the exact current PR head.",
+                    ))
+                if checkout_tree_unavailable:
+                    valid_selected = False
+                    selected_observation_valid = False
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "checkout-tree-unavailable",
+                        "The assigned checkout was not authenticated as a stable clean tracked tree.",
+                    ))
+                if current_head is not None and attribution.get("head") not in {None, current_head}:
+                    valid_selected = False
+                    selected_observation_valid = False
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "head-mismatch",
+                        f"Execution selector `{execution_ref}` was attributed to a different head.",
+                    ))
+                if current_tree_digest is not None and attribution.get("tracked_digest") not in {None, current_tree_digest}:
+                    valid_selected = False
+                    selected_observation_valid = False
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "tree-mismatch",
+                        f"Execution selector `{execution_ref}` was attributed to a different tracked tree.",
+                    ))
+                if not _authoritative_receipt_passes(observation, claim="current-result"):
+                    valid_selected = False
+                    selected_observation_valid = False
+                    expected = _receipt_expected_status(observation, claim="current-result") or "stale/unverified"
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "inadmissible-execution",
+                        f"Execution selector `{execution_ref}` is not an admissible passing receipt ({expected}).",
+                    ))
+                else:
+                    receipt_id = _observation_value(observation, "receipt_id")
+                    if not isinstance(receipt_id, str) or not receipt_id.strip():
+                        valid_selected = False
+                        selected_observation_valid = False
+                        diagnostics.append(PostAuthClaimDiagnostic(
+                            row.row_id, "missing-receipt", "An admissible execution had no tool-owned receipt ID."
+                        ))
+                    else:
+                        if selected_observation_valid:
+                            candidate_citations.append(TestObservationCitation(
+                                command=_observation_command_text(observation),
+                                receipt_id=receipt_id,
+                                claim="current-result",
+                            ))
+            if not selected:
+                valid_selected = False
+            # A row is verified only when every selected observation is
+            # admissible.  Do not leak a citation for an otherwise passing
+            # subset when any selected execution failed invocation, checkout,
+            # head, tree, launch, or receipt authority checks.
+            if valid_selected:
+                citations.extend(candidate_citations)
+            status = "verified" if valid_selected and citations else "stale/unverified"
+            if not valid_selected:
+                caveats.append("One or more selected executions failed post-authentication authority checks.")
+            if valid_selected and unsuperseded_failures:
+                status = "incomplete"
+                caveats.append("An unsuperseded authoritative failure or timeout remains in the complete test journal.")
+                diagnostics.append(PostAuthClaimDiagnostic(
+                    row.row_id, "unsuperseded-journal-failure",
+                    "A passing subset cannot erase an unsuperseded authoritative journal failure or timeout.",
+                ))
+        # Canonical assertions fall back to the approved row when no semantic
+        # claim is available, so every enforceable row remains explicit.
+        test_identifiers = claim.test_identifiers if claim is not None else ()
+        test_locations = claim.test_locations if claim is not None else ()
+        workflow_path = claim.workflow_path_claim if claim is not None else row.entry_path_or_mode
+        outcome_assertions = claim.outcome_assertions if claim is not None else (row.expected_outcome,)
+        forbidden_assertions = claim.forbidden_effect_assertions if claim is not None else row.forbidden_side_effects
+        result_rows.append(RiskTestMatrixEvidenceRow(
+            row_id=row.row_id,
+            status=status,
+            test_identifiers=test_identifiers,
+            test_locations=test_locations,
+            workflow_path_claim=workflow_path,
+            outcome_assertions=outcome_assertions,
+            forbidden_effect_assertions=forbidden_assertions,
+            evidence_citations=tuple(citations),
+            caveats=tuple(dict.fromkeys(caveats)),
+        ))
+    return DerivedRiskEvidenceResult(
+        evidence=RiskTestMatrixEvidence(identity, tuple(result_rows)),
+        diagnostics=tuple(diagnostics),
+    )
+
+
+# Public aliases used by integrations and tests that describe the operation as
+# either building or deriving the canonical object.
+build_risk_test_matrix_evidence = derive_risk_test_matrix_evidence
 
 
 def _parse_risk_evidence_citations(value: object, *, context: str) -> tuple[TestObservationCitation, ...]:
@@ -1725,6 +2144,40 @@ def _authoritative_receipt_passes(
             "stale", "untracked", "environment", "changed", "mismatch", "supersed",
             "timeout", "timed out", "incomplete", "unknown", "disagreement",
         )
+    )
+
+
+def _known_launch_integrity_passes(observation: object) -> bool:
+    """Reject explicit broker launch failures before PR/head authentication.
+
+    Head and tree attribution are intentionally checked by the post-authentication
+    builder. Launch-boundary states, however, are known as soon as the broker
+    closes the current turn and must not be deferred into that phase. Older
+    lightweight projections may omit these fields, so absence remains a
+    compatibility case rather than being treated as a known failure.
+    """
+    launch_fields = ("wrapper_bootstrap", "inner_exec", "suite_start")
+    if isinstance(observation, Mapping):
+        supplied = any(field in observation for field in launch_fields)
+    else:
+        supplied = any(hasattr(observation, field) for field in launch_fields)
+        if not supplied:
+            projected = getattr(observation, "public_projection", None)
+            if callable(projected):
+                try:
+                    value = projected()
+                except Exception:  # pragma: no cover - defensive provider boundary
+                    value = None
+                supplied = isinstance(value, Mapping) and any(
+                    field in value for field in launch_fields
+                )
+    if not supplied:
+        return True
+    semantics, _rich = _observation_semantics(observation)
+    return (
+        semantics["wrapper_bootstrap"] == "verified"
+        and semantics["inner_exec"] == "started"
+        and semantics["suite_start"] == "verified"
     )
 
 
@@ -2556,6 +3009,139 @@ def _expect_test_observations(
             )
         )
     return tuple(result)
+
+
+def _semantic_execution_ref(observation: object) -> str | None:
+    if isinstance(observation, Mapping):
+        value = observation.get("execution_ref")
+    else:
+        value = getattr(observation, "execution_ref", None)
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _parse_semantic_risk_coverage_claims(
+    value: object,
+    *,
+    context: str,
+    expected_row_ids: Sequence[str] | None = None,
+    execution_catalog: Sequence[object] | None = None,
+) -> SemanticRiskCoverageClaims:
+    """Parse the bounded, model-owned side of risk evidence.
+
+    This parser deliberately has no receipt-ID or canonical-row fields.  When
+    a live catalog is supplied, selectors are checked against that one
+    invocation before the PR/head authentication phase begins.
+    """
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    if len(value) > SEMANTIC_RISK_CLAIMS_MAX_ROWS:
+        raise AgentLoopError(
+            f"{context} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_ROWS}-row bound."
+        )
+    allowed_rows = set(expected_row_ids or ())
+    catalog_by_ref: dict[str, object] = {}
+    if execution_catalog is not None:
+        for observation in execution_catalog:
+            execution_ref = _semantic_execution_ref(observation)
+            if execution_ref is None:
+                continue
+            if execution_ref in catalog_by_ref:
+                raise AgentLoopError(
+                    f"{context} cannot validate a colliding execution_ref `{execution_ref}`."
+                )
+            catalog_by_ref[execution_ref] = observation
+    result: list[SemanticRiskCoverageClaim] = []
+    seen_rows: set[str] = set()
+    seen_refs: set[str] = set()
+    for index, raw_claim in enumerate(value):
+        claim_context = f"{context}[{index}]"
+        payload = _expect_object(raw_claim, context=claim_context)
+        _expect_exact_keys(
+            payload,
+            context=claim_context,
+            required={
+                "row_id", "execution_refs", "test_identifiers", "test_locations",
+                "workflow_path_claim", "outcome_assertions", "forbidden_effect_assertions",
+            },
+            optional={"caveats"},
+        )
+        row_id = _validate_risk_row_id(payload["row_id"], context=f"{claim_context}.row_id")
+        if allowed_rows and row_id not in allowed_rows:
+            raise AgentLoopError(
+                f"{claim_context}.row_id `{row_id}` is not an approved enforceable matrix row."
+            )
+        if row_id in seen_rows:
+            raise AgentLoopError(f"{context} contains duplicate claim for row `{row_id}`.")
+        seen_rows.add(row_id)
+        refs = _risk_bounded_string_list(
+            payload["execution_refs"],
+            context=f"{claim_context}.execution_refs",
+            max_items=SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS,
+        )
+        if not refs:
+            raise AgentLoopError(f"{claim_context}.execution_refs must contain at least one selector.")
+        for ref in refs:
+            if len(ref.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES:
+                raise AgentLoopError(f"{claim_context}.execution_refs contains an oversized selector.")
+            if ref in seen_refs:
+                raise AgentLoopError(
+                    f"{context} selects execution_ref `{ref}` more than once or across conflicting rows."
+                )
+            seen_refs.add(ref)
+            if execution_catalog is not None and ref not in catalog_by_ref:
+                raise AgentLoopError(
+                    f"{claim_context}.execution_refs contains unknown or cross-turn selector `{ref}`."
+                )
+            if execution_catalog is not None:
+                observation = catalog_by_ref[ref]
+                semantics, _rich = _observation_semantics(observation)
+                if semantics["outcome"] != "passed" or semantics["provenance"] != "parent-observed":
+                    raise AgentLoopError(
+                        f"{claim_context}.execution_refs selector `{ref}` is not an admissible passing observation."
+                    )
+                if not _known_launch_integrity_passes(observation):
+                    raise AgentLoopError(
+                        f"{claim_context}.execution_refs selector `{ref}` has known non-authoritative "
+                        "launch-integrity state and cannot be selected before authentication."
+                    )
+        test_identifiers = _risk_bounded_string_list(
+            payload["test_identifiers"],
+            context=f"{claim_context}.test_identifiers",
+            min_items=1,
+        )
+        test_locations = _risk_bounded_string_list(
+            payload["test_locations"],
+            context=f"{claim_context}.test_locations",
+            min_items=1,
+        )
+        outcome_assertions = _risk_bounded_string_list(
+            payload["outcome_assertions"],
+            context=f"{claim_context}.outcome_assertions",
+            min_items=1,
+        )
+        forbidden_effect_assertions = _risk_bounded_string_list(
+            payload["forbidden_effect_assertions"],
+            context=f"{claim_context}.forbidden_effect_assertions",
+            min_items=1,
+        )
+        claim = SemanticRiskCoverageClaim(
+            row_id=row_id,
+            execution_refs=refs,
+            test_identifiers=test_identifiers,
+            test_locations=test_locations,
+            workflow_path_claim=_risk_bounded_string(
+                payload["workflow_path_claim"], context=f"{claim_context}.workflow_path_claim"
+            ),
+            outcome_assertions=outcome_assertions,
+            forbidden_effect_assertions=forbidden_effect_assertions,
+            caveats=_risk_bounded_string_list(
+                payload.get("caveats", []),
+                context=f"{claim_context}.caveats",
+                max_items=SEMANTIC_RISK_CLAIMS_MAX_CAVEATS,
+            ),
+        )
+        result.append(claim)
+    return SemanticRiskCoverageClaims(tuple(result))
 
 
 def _expect_optional_string_list(
@@ -3867,6 +4453,8 @@ def validate_structured_coder_followup(
     required_risk_test_matrix_contract: int = 0,
     authoritative_test_observations: Sequence[object] | None = None,
     delivered_risk_test_matrix_row_ids: Sequence[str] | None = None,
+    execution_catalog: Sequence[object] | None = None,
+    allow_historical_canonical_evidence: bool = False,
 ) -> StructuredCoderFollowup | None:
     payload = _extract_structured_coder_followup_payload(text)
     if payload is None:
@@ -3875,6 +4463,18 @@ def validate_structured_coder_followup(
     kind = payload.get("kind")
     if isinstance(kind, str) and kind != "coder_followup":
         raise AgentLoopError("Structured response kind mismatch: expected `coder_followup`.")
+    optional_fields = {
+        "addressed_item_notes",
+        "remaining_item_notes",
+        "tests_run",
+        "test_observations",
+        "risk_test_matrix_claims",
+        "disputed_items",
+        "dispute_evidence",
+        "architecture_impact",
+    }
+    if allow_historical_canonical_evidence:
+        optional_fields.add("risk_test_matrix_evidence")
     _expect_exact_keys(
         payload,
         context="coder_followup",
@@ -3888,16 +4488,7 @@ def validate_structured_coder_followup(
             "human_requirements",
             "human_requirement_dispositions",
         },
-        optional={
-            "addressed_item_notes",
-            "remaining_item_notes",
-            "tests_run",
-            "test_observations",
-            "risk_test_matrix_evidence",
-            "disputed_items",
-            "dispute_evidence",
-            "architecture_impact",
-        },
+        optional=optional_fields,
     )
     human_requirements_payload = _expect_object(
         payload["human_requirements"],
@@ -3926,8 +4517,16 @@ def validate_structured_coder_followup(
         payload.get("test_observations", []),
         context="coder_followup.test_observations",
     )
+    risk_claims = None
+    if "risk_test_matrix_claims" in payload:
+        risk_claims = _parse_semantic_risk_coverage_claims(
+            payload["risk_test_matrix_claims"],
+            context="coder_followup.risk_test_matrix_claims",
+            expected_row_ids=delivered_risk_test_matrix_row_ids,
+            execution_catalog=execution_catalog,
+        )
     risk_evidence = None
-    if "risk_test_matrix_evidence" in payload:
+    if allow_historical_canonical_evidence and "risk_test_matrix_evidence" in payload:
         risk_evidence = parse_risk_test_matrix_evidence(
             payload["risk_test_matrix_evidence"],
             matrix=delivered_risk_test_matrix,
@@ -3936,8 +4535,9 @@ def validate_structured_coder_followup(
             expected_row_ids=delivered_risk_test_matrix_row_ids,
             context="coder_followup.risk_test_matrix_evidence",
         )
-    elif required_risk_test_matrix_contract and delivered_risk_test_matrix is not None and parse_risk_test_matrix(delivered_risk_test_matrix).is_applicable:
-        raise AgentLoopError("coder_followup must include risk_test_matrix_evidence for the delivered matrix.")
+    # A missing semantic claim set is recoverable after PR authentication: the
+    # builder will emit complete non-verified rows.  Do not make absence hide a
+    # PR or force a repair model to invent authority.
     architecture_impact = (
         _parse_architecture_impact(payload["architecture_impact"], context="coder_followup.architecture_impact")
         if "architecture_impact" in payload else None
@@ -4021,6 +4621,7 @@ def validate_structured_coder_followup(
         dispute_evidence=dispute_evidence,
         test_observations=test_observations,
         architecture_impact=architecture_impact,
+        risk_test_matrix_claims=risk_claims,
         risk_test_matrix_evidence=risk_evidence,
     )
 
@@ -4034,6 +4635,8 @@ def validate_structured_issue_implementation(
     required_risk_test_matrix_contract: int = 0,
     authoritative_test_observations: Sequence[object] | None = None,
     delivered_risk_test_matrix_row_ids: Sequence[str] | None = None,
+    execution_catalog: Sequence[object] | None = None,
+    allow_historical_canonical_evidence: bool = False,
 ) -> StructuredIssueImplementation | None:
     """Parse and validate the strict issue-implementation result envelope.
 
@@ -4049,6 +4652,12 @@ def validate_structured_issue_implementation(
         raise AgentLoopError(
             "Structured response kind mismatch: expected `issue_implementation`."
         )
+    optional_fields = {
+        "tests_run", "test_observations", "architecture_impact",
+        "risk_test_matrix_claims",
+    }
+    if allow_historical_canonical_evidence:
+        optional_fields.add("risk_test_matrix_evidence")
     _expect_exact_keys(
         payload,
         context="issue_implementation",
@@ -4061,7 +4670,7 @@ def validate_structured_issue_implementation(
             "human_requirements",
             "human_requirement_dispositions",
         },
-        optional={"tests_run", "test_observations", "architecture_impact", "risk_test_matrix_evidence"},
+        optional=optional_fields,
     )
     state = _expect_non_empty_string(payload["state"], context="issue_implementation.state")
     if state != "blocking":
@@ -4104,8 +4713,16 @@ def validate_structured_issue_implementation(
         payload.get("test_observations", []),
         context="issue_implementation.test_observations",
     )
+    risk_claims = None
+    if "risk_test_matrix_claims" in payload:
+        risk_claims = _parse_semantic_risk_coverage_claims(
+            payload["risk_test_matrix_claims"],
+            context="issue_implementation.risk_test_matrix_claims",
+            expected_row_ids=delivered_risk_test_matrix_row_ids,
+            execution_catalog=execution_catalog,
+        )
     risk_evidence = None
-    if "risk_test_matrix_evidence" in payload:
+    if allow_historical_canonical_evidence and "risk_test_matrix_evidence" in payload:
         risk_evidence = parse_risk_test_matrix_evidence(
             payload["risk_test_matrix_evidence"],
             matrix=delivered_risk_test_matrix,
@@ -4114,8 +4731,8 @@ def validate_structured_issue_implementation(
             expected_row_ids=delivered_risk_test_matrix_row_ids,
             context="issue_implementation.risk_test_matrix_evidence",
         )
-    elif required_risk_test_matrix_contract and delivered_risk_test_matrix is not None and parse_risk_test_matrix(delivered_risk_test_matrix).is_applicable:
-        raise AgentLoopError("issue_implementation must include risk_test_matrix_evidence for the delivered matrix.")
+    # Missing claims remain a bounded, complete non-verified result at the
+    # post-head builder boundary; they are not a reason to discard a PR.
     architecture_impact = (
         _parse_architecture_impact(
             payload["architecture_impact"], context="issue_implementation.architecture_impact"
@@ -4147,6 +4764,7 @@ def validate_structured_issue_implementation(
         tests_run=tests_run,
         test_observations=test_observations,
         architecture_impact=architecture_impact,
+        risk_test_matrix_claims=risk_claims,
         risk_test_matrix_evidence=risk_evidence,
     )
     # Keep this semantic contradiction visible to callers as a dedicated error
@@ -4158,6 +4776,26 @@ def validate_structured_issue_implementation(
     ):
         raise IssueImplementationConflictError(parsed)
     return parsed
+
+
+def parse_historical_structured_coder_followup(
+    text: str,
+    **kwargs: object,
+) -> StructuredCoderFollowup | None:
+    """Read an already-persisted follow-up without making it a fresh contract."""
+    return validate_structured_coder_followup(
+        text, allow_historical_canonical_evidence=True, **kwargs
+    )
+
+
+def parse_historical_structured_issue_implementation(
+    text: str,
+    **kwargs: object,
+) -> StructuredIssueImplementation | None:
+    """Read an already-persisted implementation without making it a fresh contract."""
+    return validate_structured_issue_implementation(
+        text, allow_historical_canonical_evidence=True, **kwargs
+    )
 
 
 def validate_structured_task_result(
