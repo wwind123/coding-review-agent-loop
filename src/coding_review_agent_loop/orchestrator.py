@@ -318,6 +318,7 @@ from .protocol import parse_review
 from .repair import (
     RepairAttemptResult,
     attempt_envelope_normalization,
+    attempt_semantic_patch_disposition_normalization,
     attempt_repair,
     execute_repair,
     strip_unknown_prior_item_dispositions,
@@ -3495,6 +3496,34 @@ def _run_validated_agent(
                             model_used=result.model_used,
                             **_response_identity_fields(result),
                         )
+                if (
+                    use_repair
+                    and not public_text_is_transient
+                    and not response_failure_is_unsupported
+                    and repair_expected_kind == "plan_revision_patch"
+                ):
+                    disposition_normalized = attempt_semantic_patch_disposition_normalization(text)
+                    if disposition_normalized is not None:
+                        try:
+                            marker_value = validate(disposition_normalized)
+                        except AgentLoopError:
+                            pass
+                        else:
+                            log(
+                                config,
+                                f"{agent_name}: deterministic semantic-patch disposition "
+                                "normalization recovered malformed response",
+                            )
+                            if usage_record is not None:
+                                usage_record.validation_status = "validated"
+                            return ValidatedAgentResponse(
+                                text=disposition_normalized,
+                                session_id=result.session_id,
+                                marker_value=marker_value,
+                                usage=usage,
+                                model_used=result.model_used,
+                                **_response_identity_fields(result),
+                            )
                 normalized: str | None = None
                 if (
                     use_repair

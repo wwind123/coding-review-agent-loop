@@ -7,17 +7,19 @@ from coding_review_agent_loop.repair import (
     _OVERSIZED_REPAIR_PROMPT_DIRECTIVE,
     _build_repair_prompt,
     attempt_envelope_normalization,
+    attempt_semantic_patch_disposition_normalization,
     attempt_repair,
     execute_repair,
     require_recoverable_fresh_execution_contract,
     require_recoverable_fresh_risk_test_matrix_contract,
 )
-from coding_review_agent_loop.errors import FreshContractIntegrityError
+from coding_review_agent_loop.errors import AgentLoopError, FreshContractIntegrityError
 from coding_review_agent_loop.orchestrator import _run_structured_repair
 from coding_review_agent_loop.protocol import (
     RISK_TEST_MATRIX_CHANGE_KEYS,
     RISK_TEST_MATRIX_REQUIRED_KEYS,
     RISK_TEST_MATRIX_ROW_KEYS,
+    parse_plan_revision_patch,
     validate_human_requirement_dispositions,
     validate_structured_discuss_answer,
     validate_structured_coder_followup,
@@ -111,6 +113,73 @@ def test_semantic_patch_repair_rejects_malformed_source_before_model_call(raw):
     assert parsed is None
     assert attempts[-1].outcome == "semantic_patch_integrity"
     repair_mock.assert_not_called()
+
+
+def test_semantic_patch_disposition_normalization_renames_rationale_losslessly():
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Address the carried finding.",
+        "prior_plan_item_dispositions": [{
+            "item_id": "item-1",
+            "disposition": "resolved",
+            "rationale": "The revised step covers the original finding.",
+        }],
+        "base_round_number": 1,
+        "base_state_identity": "a" * 64,
+        "operations": [{"op": "replace", "field": "summary", "value": "Revised plan."}],
+    }
+    tail = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+
+    normalized = attempt_semantic_patch_disposition_normalization(json.dumps(payload) + tail)
+
+    assert normalized is not None
+    normalized_payload = json.loads(normalized.split("\n", 1)[0])
+    assert normalized_payload["prior_plan_item_dispositions"] == [{
+        "item_id": "item-1",
+        "disposition": "resolved",
+        "note": "The revised step covers the original finding.",
+    }]
+    assert normalized.endswith(tail)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"item_id": "item-1", "rationale": "No semantic disposition was selected."},
+        {
+            "item_id": "item-1",
+            "disposition": "resolved",
+            "note": "Canonical note.",
+            "rationale": "Ambiguous duplicate.",
+        },
+    ],
+)
+def test_semantic_patch_disposition_normalization_does_not_invent_or_overwrite(entry):
+    raw = json.dumps({
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Address the carried finding.",
+        "prior_plan_item_dispositions": [entry],
+        "base_round_number": 1,
+        "base_state_identity": "a" * 64,
+        "operations": [{"op": "replace", "field": "summary", "value": "Revised plan."}],
+    })
+
+    normalized = attempt_semantic_patch_disposition_normalization(raw)
+
+    if "disposition" not in entry:
+        assert normalized is not None
+        normalized_payload = json.loads(normalized)
+        assert "disposition" not in normalized_payload["prior_plan_item_dispositions"][0]
+        with pytest.raises(AgentLoopError, match="missing required field.*disposition"):
+            parse_plan_revision_patch(normalized_payload)
+    else:
+        assert normalized is None
 
 
 @pytest.mark.parametrize("missing", ["risk_test_matrix_contract_version", "risk_test_matrix", "risk_test_matrix_changes"])
