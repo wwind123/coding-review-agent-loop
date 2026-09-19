@@ -171,3 +171,31 @@ def test_repair_options_reach_config(tmp_path, backend, mode):
     assert config.repair_models == ("first", "second")
     assert config.repair_reasoning_effort == "high"
     assert config.repair_timeout_seconds == 180
+
+
+def test_default_repair_and_antigravity_chains_use_current_flash_generation(tmp_path, capsys):
+    from coding_review_agent_loop.config import (
+        DEFAULT_ANTIGRAVITY_MODELS,
+        DEFAULT_REPAIR_MODELS,
+    )
+
+    assert DEFAULT_REPAIR_MODELS == ("Gemini 3.8 Flash (Medium)", "Gemini 3.7 Flash (Medium)")
+    assert DEFAULT_ANTIGRAVITY_MODELS == (
+        "Gemini 3.8 Flash (High)",
+        "Gemini 3.7 Flash (High)",
+        "Gemini 3.6 Flash (High)",
+        "Gemini 3.1 Pro (High)",
+    )
+    args = build_parser().parse_args([
+        "issue", "1", "--repo", "OWNER/REPO",
+        "--subprocess-log-dir", str(tmp_path / "logs"),
+    ])
+    config = config_from_args(args, FakeRunner())
+    assert config.repair_backend == "antigravity"
+    assert config.repair_models == DEFAULT_REPAIR_MODELS
+    assert config.antigravity_models == DEFAULT_ANTIGRAVITY_MODELS
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["issue", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "Gemini 3.8 Flash (Medium) -> Gemini 3.7 Flash (Medium)" in help_text
+    assert "only; required" not in help_text

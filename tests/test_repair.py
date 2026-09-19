@@ -1471,6 +1471,224 @@ def test_antigravity_repair_attempts_directly_when_catalog_fails(tmp_path, monke
     assert sum("models" in command for command, _ in runner.commands) == 1
 
 
+
+_MODEL_ACCESS_FAILURE = "Error: model-access validation errors (retry later)"
+_VALID_REPAIR = "VALID repaired response"
+
+
+def _accept_valid_repair(text):
+    if text.startswith("VALID"):
+        return text
+    raise AgentLoopError("invalid repaired output")
+
+
+def _transient_repair(tmp_path, monkeypatch, *, outputs, public_response_outputs=None,
+                      repair_models=("ModelA",), antigravity_models=("ModelB",),
+                      catalog="Available models:\nModelA\nModelB\n", usage_context=None):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    runner = FakeRunner(
+        antigravity_catalog_outputs=[(catalog, 0)],
+        antigravity_outputs=list(outputs),
+        public_response_outputs=public_response_outputs,
+    )
+    config = make_config(
+        tmp_path, repair_models=repair_models, antigravity_models=antigravity_models
+    )
+    repaired, _, attempts = execute_repair(
+        "malformed", runner=runner, config=config, run_id="transient",
+        usage_context=usage_context, validate=_accept_valid_repair,
+        expected_kind="pr_review",
+    )
+    invocations = [cmd for cmd, _ in runner.commands if cmd[:1] == ["agy"] and "models" not in cmd]
+    return repaired, attempts, invocations
+
+
+def test_antigravity_transient_model_access_failure_retries_same_model(tmp_path, monkeypatch):
+    repaired, attempts, invocations = _transient_repair(
+        tmp_path, monkeypatch, outputs=[(_MODEL_ACCESS_FAILURE, 0), (_VALID_REPAIR, 0)]
+    )
+    assert repaired == _VALID_REPAIR
+    assert [(a.model, a.outcome) for a in attempts] == [
+        ("ModelA", "transient_provider_error"), ("ModelA", "succeeded"),
+    ]
+    assert len(invocations) == 2
+
+
+def test_antigravity_repeated_transient_failure_falls_back_to_next_model(tmp_path, monkeypatch):
+    from coding_review_agent_loop.usage import RunUsageContext
+
+    usage = RunUsageContext("transient", tmp_path / "usage.json")
+    repaired, attempts, _ = _transient_repair(
+        tmp_path, monkeypatch,
+        outputs=[(_MODEL_ACCESS_FAILURE, 0), (_MODEL_ACCESS_FAILURE.upper(), 0), (_VALID_REPAIR, 0)],
+        usage_context=usage,
+    )
+    assert repaired == _VALID_REPAIR
+    assert [a.model for a in attempts] == ["ModelA", "ModelA", "ModelB"]
+    assert [a.outcome for a in attempts] == [
+        "transient_provider_error", "transient_provider_error", "succeeded",
+    ]
+    assert [a.fallback_planned for a in attempts] == [True, True, False]
+    assert [r.outcome for r in usage.records] == [
+        "transient_provider_error", "transient_provider_error", "succeeded",
+    ]
+    assert [r.fallback_planned for r in usage.records] == [True, True, False]
+
+
+def test_antigravity_transient_failure_on_last_model_is_retried_once_then_fails(
+    tmp_path, monkeypatch
+):
+    from coding_review_agent_loop.usage import RunUsageContext
+
+    usage = RunUsageContext("transient", tmp_path / "usage.json")
+    repaired, attempts, invocations = _transient_repair(
+        tmp_path, monkeypatch,
+        outputs=[(_MODEL_ACCESS_FAILURE, 0), (_MODEL_ACCESS_FAILURE, 0)],
+        antigravity_models=("ModelA",), catalog="Available models:\nModelA\n",
+        usage_context=usage,
+    )
+    assert repaired is None
+    assert [a.outcome for a in attempts] == ["transient_provider_error"] * 2
+    assert [a.fallback_planned for a in attempts] == [True, False]
+    assert [r.fallback_planned for r in usage.records] == [True, False]
+    assert len(invocations) == 2
+
+
+def test_antigravity_transient_nonzero_exit_without_artifact_is_retried(tmp_path, monkeypatch):
+    repaired, attempts, _ = _transient_repair(
+        tmp_path, monkeypatch, outputs=[(_MODEL_ACCESS_FAILURE, 1), (_VALID_REPAIR, 0)]
+    )
+    assert repaired == _VALID_REPAIR
+    assert [(a.model, a.outcome) for a in attempts] == [
+        ("ModelA", "transient_provider_error"), ("ModelA", "succeeded"),
+    ]
+    assert attempts[0].returncode == 1
+
+
+def test_antigravity_empty_public_output_with_signature_is_transient(tmp_path, monkeypatch):
+    repaired, attempts, _ = _transient_repair(
+        tmp_path, monkeypatch,
+        outputs=[(_MODEL_ACCESS_FAILURE + "\n" + PUBLIC_RESPONSE_MARKER, 0), (_VALID_REPAIR, 0)],
+    )
+    assert repaired == _VALID_REPAIR
+    assert [a.outcome for a in attempts] == ["transient_provider_error", "succeeded"]
+
+
+def test_antigravity_ordinary_invalid_output_is_not_retried(tmp_path, monkeypatch):
+    repaired, attempts, _ = _transient_repair(
+        tmp_path, monkeypatch, outputs=[('{"kind": "pr_review", broken', 0), (_VALID_REPAIR, 0)]
+    )
+    assert repaired == _VALID_REPAIR
+    assert [(a.model, a.outcome) for a in attempts] == [
+        ("ModelA", "invalid_output"), ("ModelB", "succeeded"),
+    ]
+
+
+def test_antigravity_valid_output_quoting_signature_is_accepted(tmp_path, monkeypatch):
+    quoted = f"{_VALID_REPAIR}: the reviewer quoted {_MODEL_ACCESS_FAILURE}"
+    repaired, attempts, invocations = _transient_repair(
+        tmp_path, monkeypatch, outputs=[(quoted, 0)]
+    )
+    assert repaired == quoted
+    assert [a.outcome for a in attempts] == ["succeeded"]
+    assert len(invocations) == 1
+
+
+def test_antigravity_catalog_missing_model_is_skipped_without_retry(tmp_path, monkeypatch):
+    repaired, attempts, invocations = _transient_repair(
+        tmp_path, monkeypatch, outputs=[(_VALID_REPAIR, 0)],
+        catalog="Available models:\nModelB\n",
+    )
+    assert repaired == _VALID_REPAIR
+    assert [(a.model, a.outcome) for a in attempts] == [
+        ("ModelA", "unavailable_model"), ("ModelB", "succeeded"),
+    ]
+    assert len(invocations) == 1
+
+
+def test_antigravity_valid_artifact_after_nonzero_exit_with_signature_is_accepted(
+    tmp_path, monkeypatch
+):
+    repaired, attempts, invocations = _transient_repair(
+        tmp_path, monkeypatch, outputs=[(_MODEL_ACCESS_FAILURE, 1)],
+        public_response_outputs=[{"text": _VALID_REPAIR}],
+    )
+    assert repaired == _VALID_REPAIR
+    assert [a.outcome for a in attempts] == ["accepted_nonzero_exit"]
+    assert attempts[0].fallback_planned is False
+    assert len(invocations) == 1
+
+
+def test_antigravity_invalid_response_file_candidate_quoting_signature_stays_invalid(
+    tmp_path, monkeypatch
+):
+    candidate = json.dumps(
+        {"kind": "plan_review", "summary": f"Upstream said {_MODEL_ACCESS_FAILURE}"}
+    )
+    repaired, attempts, _ = _transient_repair(
+        tmp_path, monkeypatch, outputs=[(_MODEL_ACCESS_FAILURE, 0), (_VALID_REPAIR, 0)],
+        public_response_outputs=[{"text": candidate}],
+    )
+    assert repaired == _VALID_REPAIR
+    assert [(a.model, a.outcome) for a in attempts] == [
+        ("ModelA", "invalid_output"), ("ModelB", "succeeded"),
+    ]
+    assert attempts[0].output == candidate
+
+
+def test_antigravity_invalid_stdout_structured_candidate_quoting_signature_stays_invalid(
+    tmp_path, monkeypatch
+):
+    candidate = json.dumps(
+        {"kind": "plan_review", "summary": f"Upstream said {_MODEL_ACCESS_FAILURE}"}
+    )
+    repaired, attempts, _ = _transient_repair(
+        tmp_path, monkeypatch, outputs=[(candidate, 0)], antigravity_models=("ModelA",),
+        catalog="Available models:\nModelA\n",
+    )
+    assert repaired is None
+    assert [a.outcome for a in attempts] == ["invalid_output"]
+    assert attempts[0].output == candidate
+
+
+def test_antigravity_timeout_with_signature_is_not_transient(tmp_path, monkeypatch):
+    repaired, attempts, _ = _transient_repair(
+        tmp_path, monkeypatch, outputs=[(_MODEL_ACCESS_FAILURE, None), (_VALID_REPAIR, 0)]
+    )
+    assert repaired == _VALID_REPAIR
+    assert [(a.model, a.outcome) for a in attempts] == [
+        ("ModelA", "timeout"), ("ModelB", "succeeded"),
+    ]
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude"])
+def test_cli_repair_backends_do_not_apply_antigravity_transient_signature(
+    tmp_path, monkeypatch, backend
+):
+    import coding_review_agent_loop.repair as repair_module
+
+    calls = []
+
+    def fake_cli_repair(runner, config, prompt, *, model, log_path):
+        calls.append(model)
+        return SimpleNamespace(
+            text=_MODEL_ACCESS_FAILURE, returncode=0, raw_output=_MODEL_ACCESS_FAILURE,
+            usage=None, raw_usage=None, observed_model=None, text_source="stdout",
+        )
+
+    monkeypatch.setattr(repair_module, "run_cli_repair", fake_cli_repair)
+    config = make_config(tmp_path, repair_backend=backend, repair_models=("model-x",))
+    repaired, _, attempts = execute_repair(
+        "malformed", runner=FakeRunner(), config=config, run_id="cli",
+        usage_context=None, validate=_accept_valid_repair, expected_kind="pr_review",
+    )
+    assert repaired is None
+    assert [a.outcome for a in attempts] == ["invalid_output"]
+    assert calls == ["model-x"]
+
+
 def test_runner_pty_timeout_is_opt_in_and_retains_combined_log(tmp_path):
     log_path = tmp_path / "logs" / "timeout.log"
     result = Runner().run_with_log(

@@ -1955,9 +1955,9 @@ class TestRunExternalRetries:
         assert exit_code == 0
         assert calls["n"] == 3
         assert calls["models"] == [
+            ("Gemini 3.8 Flash (High)",),
+            ("Gemini 3.8 Flash (High)",),
             ("Gemini 3.7 Flash (High)",),
-            ("Gemini 3.7 Flash (High)",),
-            ("Gemini 3.6 Flash (High)",),
         ]
         assert sleeps == [1]
         assert Path(output_path).read_text(encoding="utf-8") == "final review body"
@@ -6900,7 +6900,7 @@ class TestAntigravitySkill:
         [
             (
                 (),
-                ("Gemini 3.7 Flash (High)", "Gemini 3.6 Flash (High)", "Gemini 3.1 Pro (High)"),
+                ("Gemini 3.8 Flash (High)", "Gemini 3.7 Flash (High)", "Gemini 3.6 Flash (High)", "Gemini 3.1 Pro (High)"),
                 ("quota", "rate limit", "too many requests", "resource exhausted", "RESOURCE_EXHAUSTED", "429", "high traffic", "try again in a minute", "overload", "no capacity", "temporarily at capacity"),
             ),
             (("--model", "Model X"), ("Model X",), ("quota", "rate limit", "too many requests", "resource exhausted", "RESOURCE_EXHAUSTED", "429", "high traffic", "try again in a minute", "overload", "no capacity", "temporarily at capacity")),
@@ -6911,7 +6911,7 @@ class TestAntigravitySkill:
             ),
             (
                 ("--antigravity-quota-signatures", "Quota Hit", "429"),
-                ("Gemini 3.7 Flash (High)", "Gemini 3.6 Flash (High)", "Gemini 3.1 Pro (High)"),
+                ("Gemini 3.8 Flash (High)", "Gemini 3.7 Flash (High)", "Gemini 3.6 Flash (High)", "Gemini 3.1 Pro (High)"),
                 ("Quota Hit", "429"),
             ),
         ],

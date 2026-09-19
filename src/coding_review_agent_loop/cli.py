@@ -253,7 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help=(
                 "Repair model to try. Repeat to configure an explicit fallback chain "
-                f"(default: {DEFAULT_REPAIR_MODELS[0]} only; required for Codex/Claude)."
+                f"(default: {' -> '.join(DEFAULT_REPAIR_MODELS)}; required for Codex/Claude)."
             ),
         )
         subparser.add_argument(

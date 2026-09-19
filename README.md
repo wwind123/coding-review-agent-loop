@@ -499,8 +499,8 @@ snapshot with bounded, spillable excerpts.
 | Antigravity | `agy` | Accepted as `agy` or `antigravity`; supports coder and reviewer roles. |
 | Gemini | `gemini` | Legacy, best-effort path for accounts that still have CLI access. |
 
-The default Antigravity model chain is `Gemini 3.7 Flash (High)`, then
-`Gemini 3.6 Flash (High)`, then `Gemini 3.1 Pro (High)` for eligible capacity
+The default Antigravity model chain is `Gemini 3.8 Flash (High)`, then
+`Gemini 3.7 Flash (High)`, then `Gemini 3.6 Flash (High)`, then `Gemini 3.1 Pro (High)` for eligible capacity
 failures. Override it with `--antigravity-model` or
 `--antigravity-models`. Antigravity turns are single-shot and its usage totals
 are estimated because `agy` does not expose token counts.
@@ -519,7 +519,7 @@ then the tool default. Use `--codex-reasoning-effort xhigh` (or the matching
 implementation option) for an explicit higher-effort Codex/Luna run. Claude
 accepts `low`, `medium`, `high`, `xhigh`, and `max` through `--claude-effort`.
 Antigravity's selected model already carries its tier, such as
-`Gemini 3.7 Flash (High)`, and is not rewritten by this setting. Startup logs,
+`Gemini 3.8 Flash (High)`, and is not rewritten by this setting. Startup logs,
 signatures, usage records, and new round metadata distinguish configured effort
 from verified runtime observations; older records retain unknown values.
 

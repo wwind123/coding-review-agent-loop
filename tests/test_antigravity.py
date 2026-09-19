@@ -429,6 +429,7 @@ def test_config_from_args_antigravity_defaults(tmp_path):
     assert config.antigravity_cmd == "agy"
     assert config.antigravity_model is None
     assert config.antigravity_models == (
+        "Gemini 3.8 Flash (High)",
         "Gemini 3.7 Flash (High)",
         "Gemini 3.6 Flash (High)",
         "Gemini 3.1 Pro (High)",
