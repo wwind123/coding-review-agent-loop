@@ -9984,15 +9984,26 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
         "repos/OWNER/REPO/issues/55/labels/agent-loop-managed",
     ]
     commands = [command for command, _cwd in runner.commands]
-    comment_index = next(
-        index
+    comment_commands = [
+        (index, command)
         for index, command in enumerate(commands)
         if command[:4] == ["gh", "pr", "comment", "55"]
-    )
+    ]
     release_index = commands.index(release_command)
-    human_decision_comment = next(
-        comment for comment in runner.comments if "## Human decision required" in comment
+    human_decision_comments = [
+        comment
+        for comment in runner.pr_payload["comments"]
+        if "## Human decision required" in comment["body"]
+    ]
+    assert len(human_decision_comments) == 1
+    human_decision_comment = human_decision_comments[0]["body"]
+    human_decision_comment_ordinal = next(
+        ordinal
+        for ordinal, comment in enumerate(runner.pr_payload["comments"])
+        if comment is human_decision_comments[0]
     )
+    comment_index, comment_command = comment_commands[human_decision_comment_ordinal]
+    assert "--body-file" in comment_command
     assert "Reviewer did not resolve 1 disputed item(s)" in human_decision_comment
     assert "Update/evidence: Codex: I checked and the pricing is still wrong." in human_decision_comment
     assert "-- Human Reviewer" in human_decision_comment
