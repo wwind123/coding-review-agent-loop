@@ -7650,7 +7650,7 @@ def test_discuss_round_sidecars_posted_to_issue_use_neutral_wording(monkeypatch,
     sidecars = runner.bodies[:-1]
     assert sidecars
     for body in sidecars:
-        assert body.startswith("Agent-loop agent-loop attachment ")
+        assert body.startswith("Agent-loop attachment ")
         assert "see the following agent-loop comment." in body
         assert "plan attachment" not in body and "review attachment" not in body
 

@@ -1637,11 +1637,11 @@ def test_payloads_are_identical_across_label_kinds() -> None:
     [
         ({"flow": "plan", "role": "reviewer"}, "plan review attachment", "plan review comment"),
         ({"flow": "pr", "role": "reviewer"}, "review attachment", "review comment"),
-        ({"flow": "discuss", "role": "debater"}, "agent-loop attachment", "agent-loop comment"),
-        ({"flow": "discuss", "role": "summary"}, "agent-loop attachment", "agent-loop comment"),
-        ({"flow": "pr", "role": "coder"}, "agent-loop attachment", "agent-loop comment"),
-        ({"flow": "unknown-flow", "role": "reviewer"}, "agent-loop attachment", "agent-loop comment"),
-        ({}, "agent-loop attachment", "agent-loop comment"),
+        ({"flow": "discuss", "role": "debater"}, "attachment", "agent-loop comment"),
+        ({"flow": "discuss", "role": "summary"}, "attachment", "agent-loop comment"),
+        ({"flow": "pr", "role": "coder"}, "attachment", "agent-loop comment"),
+        ({"flow": "unknown-flow", "role": "reviewer"}, "attachment", "agent-loop comment"),
+        ({}, "attachment", "agent-loop comment"),
     ],
 )
 def test_round_sidecar_wording_follows_round_metadata(metadata, attachment, target) -> None:
@@ -1665,7 +1665,7 @@ def test_sidecar_only_carrier_without_round_metadata_gets_neutral_wording() -> N
     assert not transport.ROUND_RESUME_MARKER_RE.search(str(prepared[-1]))
     for position, sidecar in enumerate(prepared[:-1], start=1):
         assert _label_line(sidecar) == (
-            f"Agent-loop agent-loop attachment {position}/{len(prepared) - 1} "
+            f"Agent-loop attachment {position}/{len(prepared) - 1} "
             "(machine-readable overflow: execution_recommendation). "
             "Not an agent response; see the following agent-loop comment."
         )

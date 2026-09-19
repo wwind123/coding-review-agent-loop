@@ -162,7 +162,7 @@ _SIDECAR_KIND_WORDING = {
     "plan": ("plan attachment", "plan comment"),
     "plan-review": ("plan review attachment", "plan review comment"),
     "review": ("review attachment", "review comment"),
-    "round": ("agent-loop attachment", "agent-loop comment"),
+    "round": ("attachment", "agent-loop comment"),
 }
 _REVIEW_FLOWS = frozenset(
     {

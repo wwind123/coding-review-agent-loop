@@ -933,7 +933,7 @@ responses. Each sidecar starts with a deterministic visible label giving its
 position and total, for example `Agent-loop review attachment 1/3
 (machine-readable overflow: canonical_reviewer_response)`. The label says plan,
 plan review, or review only when the round metadata's flow and role establish
-it, and uses neutral `agent-loop attachment` wording otherwise. The hidden
+it, and uses neutral `Agent-loop attachment` wording otherwise. The hidden
 marker and its payload are unchanged, and older marker-only sidecars (which
 GitHub renders as "No description provided.") remain valid. Keep those
 sidecars with the anchor: resume fails loudly if one is missing or corrupt, at

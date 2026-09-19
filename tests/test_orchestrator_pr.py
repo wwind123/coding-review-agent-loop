@@ -11920,5 +11920,5 @@ def test_pr_coder_response_sidecars_use_neutral_wording(monkeypatch):
     sidecars = posted[:-1]
     assert sidecars
     for body in sidecars:
-        assert body.startswith("Agent-loop agent-loop attachment ")
+        assert body.startswith("Agent-loop attachment ")
         assert "review attachment" not in body and "plan attachment" not in body
