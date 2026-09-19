@@ -2795,13 +2795,20 @@ once. Use complete replacement values for whole-field `replace` operations and
 complete rows for matrix operations. Never write derived fields such as
 schema versions, identities, ordering, sidecars, or audits.
 
+Each `prior_plan_item_dispositions` entry must use exactly these keys:
+`item_id`, `disposition`, and optional `note`. Valid `disposition` values are
+`resolved`, `blocking`, `same-plan`, and `future`. Use `note` for explanatory
+text; do not use `rationale` or omit `disposition`.
+
 {{
   "schema_version": 1,
   "kind": "plan_revision_patch",
   "semantic_patch_contract_version": 1,
   "state": "blocking",
   "summary": "Changed the plan decisions required by the blocking review.",
-  "prior_plan_item_dispositions": [],
+  "prior_plan_item_dispositions": [
+    {{"item_id": "item-1", "disposition": "resolved", "note": "The revised plan addresses the original finding."}}
+  ],
   "base_round_number": {base_round_number},
   "base_state_identity": "{base_state_identity}",
   "operations": [

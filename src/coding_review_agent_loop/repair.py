@@ -205,6 +205,49 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
     parts.append(signature)
     return "\n".join(parts)
 
+
+def attempt_semantic_patch_disposition_normalization(raw: str) -> str | None:
+    """Rename the lossless ``rationale`` disposition alias to ``note``.
+
+    This is deliberately narrower than model repair: it neither selects nor
+    changes a disposition, and it refuses ambiguous rows that contain both
+    names. The strict semantic-patch parser remains authoritative afterward.
+    """
+    stripped = raw.lstrip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        payload, json_end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("kind") != "plan_revision_patch":
+        return None
+    dispositions = payload.get("prior_plan_item_dispositions")
+    if not isinstance(dispositions, list):
+        return None
+
+    normalized_dispositions: list[object] = []
+    changed = False
+    for entry in dispositions:
+        if not isinstance(entry, dict):
+            return None
+        normalized_entry = dict(entry)
+        if "rationale" in normalized_entry:
+            if "note" in normalized_entry:
+                return None
+            rationale = normalized_entry.pop("rationale")
+            if not isinstance(rationale, str) or not rationale.strip():
+                return None
+            normalized_entry["note"] = rationale
+            changed = True
+        normalized_dispositions.append(normalized_entry)
+    if not changed:
+        return None
+
+    normalized_payload = {**payload, "prior_plan_item_dispositions": normalized_dispositions}
+    tail = stripped[json_end:]
+    return json.dumps(normalized_payload, ensure_ascii=False) + tail
+
 # v13 prompt — adds repair guidance for human-requirements marker, active approved dispositions,
 # blocking+future dispositions, approved+current-plan future_followups, and same-round confusion:
 #   - _reviewer_human_requirements_instruction for pr_review/plan_review missing HUMAN_REQUIREMENTS_RESOLVED

@@ -3030,7 +3030,11 @@ def test_issue_loop_activates_semantic_revision_from_fresh_authenticated_base(tm
         "state": "blocking",
         "summary": "Apply the reviewed semantic decision.",
         "prior_plan_item_dispositions": [
-            {"item_id": "item-1", "disposition": "resolved"}
+            {
+                "item_id": "item-1",
+                "disposition": "resolved",
+                "rationale": "The revised plan addresses the original finding.",
+            }
         ],
         "base_round_number": 1,
         "base_state_identity": base.state_identity,
@@ -3073,7 +3077,14 @@ def test_issue_loop_activates_semantic_revision_from_fresh_authenticated_base(tm
     metadata = _decode_round_metadata(match.group("payload"))
     assert metadata.response_form == "semantic-patch-v1"
     assert metadata.base_state_identity == base.state_identity
-    assert metadata.raw_patch_provenance == patch
+    assert metadata.raw_patch_provenance == {
+        **patch,
+        "prior_plan_item_dispositions": [{
+            "item_id": "item-1",
+            "disposition": "resolved",
+            "note": "The revised plan addresses the original finding.",
+        }],
+    }
     assert metadata.assembled_plan_sidecar is not None
     assert "Revised semantic plan." in runner.comments[2]
 

@@ -281,6 +281,24 @@ def test_legacy_plan_revision_prompt_does_not_invent_matrix_generation(tmp_path)
     assert "do not duplicate it" in fresh
 
 
+def test_semantic_plan_revision_prompt_renders_exact_disposition_contract(tmp_path):
+    prompt = build_plan_revision_prompt(
+        1187,
+        2,
+        "Authenticated prior plan.",
+        "Blocking review.",
+        make_config(tmp_path),
+        response_form="semantic-patch-v1",
+        base_round_number=1,
+        base_state_identity="a" * 64,
+    )
+
+    assert '"item_id": "item-1"' in prompt
+    assert '"disposition": "resolved"' in prompt
+    assert '"note": "The revised plan addresses the original finding."' in prompt
+    assert "do not use `rationale` or omit `disposition`" in prompt
+
+
 def test_plan_review_prompts_expose_complete_one_shot_and_staged_recommendations(tmp_path):
     config = make_config(tmp_path)
     one_shot = validate_structured_plan_state(
