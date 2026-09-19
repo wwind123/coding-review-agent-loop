@@ -421,9 +421,11 @@ authority, are unbounded input, or are owned elsewhere:
 - more than eight refs, non-string or blank refs, or a ref over the
   16,384-byte hard cap;
 - an admissible selector chosen twice, or a colliding catalog;
-- an in-catalog selector that is not a passing parent-observed observation or
-  has known failing launch integrity (a real broker handle, so selecting it is
-  an authority decision);
+- an in-catalog selector that is not a passing parent-observed observation, or
+  whose supplied launch-integrity state is failing or unknown (wrapper
+  bootstrap, inner exec, and suite start must all be authoritative). It is a
+  real broker handle, so selecting it is an authority decision, not a format
+  defect;
 - legacy canonical evidence fields in a fresh response.
 
 Broader handoff atomicity for other envelope failures after a PR is pushed is

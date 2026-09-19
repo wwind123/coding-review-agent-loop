@@ -169,8 +169,9 @@ handle, or oversize text up to a hard cap) is a claim defect, not an envelope
 defect: it is dropped with a caveat before authentication and becomes an
 `unknown-execution-ref` diagnostic afterwards. Authority violations stay fatal:
 unknown keys, bad row IDs, empty selector lists, duplicate admissible
-selectors, catalog collisions, in-catalog non-passing selectors, and legacy
-canonical fields. Repair
+selectors, catalog collisions, in-catalog selectors that are non-passing or
+whose launch integrity is failing or unknown (real broker handles, so
+selecting one is an authority decision), and legacy canonical fields. Repair
 does not generate matrix identities, canonical rows, receipt IDs, mappings,
 statuses, or evidence envelopes. Derived evidence and diagnostics are the
 durable replay artifact; live execution selectors are not. Historical accepted

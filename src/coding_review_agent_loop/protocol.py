@@ -3222,8 +3222,11 @@ def _parse_semantic_risk_coverage_claims(
     row IDs; a missing ``execution_refs`` key or an empty list (#855); more
     than eight refs, non-string or blank refs, or refs over the hard cap;
     duplicate admissible selectors; catalog collisions; in-catalog selectors
-    that are not passing parent-observed observations or have known failing
-    launch integrity; and ill-typed or oversize facts.  Without a catalog
+    that are not passing parent-observed observations, or whose supplied
+    launch-integrity state is failing or unknown (any of wrapper bootstrap,
+    inner exec, or suite start not authoritative) -- these are real broker
+    handles, so selecting one is an authority decision, not a format defect;
+    and ill-typed or oversize facts.  Without a catalog
     (historical and unit callers) selectors are kept verbatim and the old
     1,024-byte selector bound still rejects.
     """

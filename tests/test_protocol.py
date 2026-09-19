@@ -2536,7 +2536,28 @@ def test_semantic_matrix_claim_dropped_ref_caveat_neutralizes_multiline_text():
 
 
 @pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
-def test_semantic_matrix_claim_launch_integrity_unknown_selector_still_rejects(kind):
+@pytest.mark.parametrize(
+    "launch_state",
+    [
+        # Explicit failure.
+        {"wrapper_bootstrap": "failed", "inner_exec": "started", "suite_start": "verified"},
+        # Unknown or incomplete states: not authoritative, so still fatal.
+        {"wrapper_bootstrap": "unknown", "inner_exec": "started", "suite_start": "verified"},
+        {"wrapper_bootstrap": "verified", "inner_exec": "unknown", "suite_start": "verified"},
+        {"wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "unknown"},
+        # A partially supplied launch-integrity tuple leaves the rest unknown.
+        {"wrapper_bootstrap": "verified"},
+        {"suite_start": "verified"},
+    ],
+)
+def test_semantic_matrix_claim_launch_integrity_failing_or_unknown_selector_still_rejects(
+    kind, launch_state
+):
+    """#859: an in-catalog selector without authoritative launch integrity is fatal.
+
+    It is a real broker handle, so selecting it is an authority decision and
+    must not be downgraded to a dropped ref.
+    """
     with pytest.raises(AgentLoopError, match="launch-integrity"):
         _validate_claims_envelope(
             kind,
@@ -2545,7 +2566,7 @@ def test_semantic_matrix_claim_launch_integrity_unknown_selector_still_rejects(k
                 "execution_ref": "turn:observation-1",
                 "outcome": "passed",
                 "provenance": "parent-observed",
-                "wrapper_bootstrap": "failed",
+                **launch_state,
             }],
         )
 
