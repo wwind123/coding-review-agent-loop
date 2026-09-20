@@ -517,6 +517,24 @@ def sanitize_historical_text(text: str) -> str:
     return safe
 
 
+def historical_replacement_labels(text: str) -> tuple[str, ...]:
+    """Safe labels for every span `sanitize_historical_text` would replace.
+
+    Provenance checks need the SAME occurrence set the stripping path uses, not
+    the non-overlapping scan: a malformed name-bearing-line fallback spans a
+    whole line and can hide another reserved token inside it, which
+    :func:`scan_reserved_markers` never reports separately while the historical
+    pass neutralizes both.  Returning one label per replaced span keeps identity
+    and occurrence count aligned with what stripping removes.
+    """
+    if not isinstance(text, str):
+        raise TypeError("historical text must be a string")
+    return tuple(
+        occurrence.definition.safe_label
+        for occurrence in _historical_replacement_occurrences(text)
+    )
+
+
 def historical_text_fragments(text: str) -> tuple[str, ...]:
     """Return substantive text outside spans that historical repair may replace.
 

@@ -13,8 +13,8 @@ from .protocol import (
 )
 from .protocol_markers import (
     RESERVED_MARKER_REGISTRY,
+    historical_replacement_labels,
     historical_text_fragments,
-    scan_reserved_markers,
 )
 
 
@@ -246,11 +246,16 @@ def _authorized_neutralization_labels(value: object) -> Counter:
     replaces EACH source marker with ITS OWN authorized safe label, so an empty
     result means the entry is not marker-only, a different family is unsupported,
     and two occurrences may not collapse into one (#871).
+
+    Occurrences come from the registry's historical replacement spans — the same
+    set the stripping pass uses — rather than the non-overlapping scan, so a
+    malformed name-bearing-line fallback cannot hide a second reserved token on
+    its own line and let the repair drop that occurrence unnoticed.
     """
     counts: Counter = Counter()
     for text in _raw_string_values(value):
-        for occurrence in scan_reserved_markers(text):
-            counts[_normalized_label(occurrence.definition.safe_label)] += 1
+        for label in historical_replacement_labels(text):
+            counts[_normalized_label(label)] += 1
     return counts
 
 

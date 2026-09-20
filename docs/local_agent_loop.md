@@ -3136,8 +3136,10 @@ no prose is a candidate only when it really was nothing but a reserved marker, a
 then it corresponds solely to its own authorized neutralization: the target must
 represent the COMPLETE source marker multiset, each occurrence either kept
 verbatim or replaced by that occurrence's own safe label, compared by marker
-identity and occurrence count rather than by the empty string that stripping any
-marker leaves behind, so an unrelated family, a dropped occurrence, a duplicated
+identity and occurrence count over the registry's historical replacement spans —
+the same occurrence set the stripping pass uses, so a malformed name-bearing-line
+fallback cannot hide a second reserved token on its line — rather than by the
+empty string that stripping any marker leaves behind, so an unrelated family, a dropped occurrence, a duplicated
 one, and leftover prose are all refused. Every other exempt-only target is refused,
 whichever candidate it is matched against: schema vocabulary, the stop list and
 every registry safe label are exempt, so `blocking`, an unrelated marker or its

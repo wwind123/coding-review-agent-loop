@@ -1814,6 +1814,59 @@ def test_repeated_same_family_markers_keep_their_cardinality(builder, bucket):
         ))
 
 
+# A malformed name-bearing-line fallback spans its whole line, so the
+# non-overlapping scanner reports one occurrence while the historical stripping
+# pass neutralizes BOTH mentions.
+_OVERLAPPING_MARKERS = "AGENT_SPLIT_UNFILED_WARNING AGENT_APPROVED_FOLLOWUPS"
+_SPLIT_WARNING_LABEL = "[protocol split-warning record]"
+_APPROVED_FOLLOWUPS_LABEL = "[protocol APPROVED_FOLLOWUPS record]"
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("neutralized", [
+    f"{_SPLIT_WARNING_LABEL} {_APPROVED_FOLLOWUPS_LABEL}",
+    _OVERLAPPING_MARKERS,
+])
+def test_overlapping_malformed_markers_accept_a_complete_neutralization(
+    builder, bucket, neutralized
+):
+    # Issue #871 round 12, item-10: provenance is counted from the registry's
+    # historical replacement spans, the same set the stripping pass uses, so a
+    # malformed fallback that hides a second reserved token on its line reports
+    # both occurrences. A complete neutralization stays accepted.
+    source = builder(
+        state="blocking", summary="Findings.", **{bucket: [_OVERLAPPING_MARKERS]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [neutralized]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("lossy", [
+    _SPLIT_WARNING_LABEL,
+    _APPROVED_FOLLOWUPS_LABEL,
+])
+def test_overlapping_malformed_markers_reject_a_dropped_occurrence(
+    builder, bucket, lossy
+):
+    # Counting the non-overlapping scan saw only the outer family, so a repaired
+    # finding naming one label satisfied the Counter equality while the hidden
+    # occurrence was silently dropped.
+    source = builder(
+        state="blocking", summary="Findings.", **{bucket: [_OVERLAPPING_MARKERS]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [lossy]},
+    ))
+
+
 @pytest.mark.parametrize(
     ("builder", "bucket"),
     [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
