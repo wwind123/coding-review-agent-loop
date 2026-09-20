@@ -203,6 +203,15 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
             "gemini_args": (),
             "antigravity_args": (),
             "dry_run": False,
+            # This classification turn schedules no reviews, so panel-scheduling
+            # fields are reset to their defaults rather than inherited.  The
+            # single-reviewer board above is otherwise coupled to reviewer-count
+            # validation: ``primary-then-panel`` requires two reviewers, and a
+            # lingering primary reviewer is rejected under any other policy, so
+            # the three fields must be neutralized together.
+            "pr_review_policy": "all-reviewers",
+            "primary_reviewer": None,
+            "pr_review_force_full": False,
         }
         if backend == "claude":
             values["claude_model"] = model
