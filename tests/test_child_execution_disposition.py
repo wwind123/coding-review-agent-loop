@@ -11,6 +11,24 @@ from agent_loop_helpers import (
     structured_v1_plan_state,
 )
 import coding_review_agent_loop.orchestrator as orchestrator
+from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
+
+
+def _staged_outcome(created, approved_plan, *, mode="implement-by-phase"):
+    """Build the staged outcome the current-phase dispatcher consumes."""
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+
+    return StagedTopologyOutcome(
+        created=tuple(created),
+        stage_ids=tuple(
+            getattr(item.phase, "stage_id", None) or str(index)
+            for index, item in enumerate(created, start=1)
+        ),
+        automations=tuple(item.phase.automation for item in created),
+        plan_hash=approved_plan_hash(approved_plan),
+        mode=mode,
+        topology_source="approved-plan-v1",
+    )
 from coding_review_agent_loop.decomposition import (
     ChildDispositionOverride,
     CreatedPhaseIssue,
@@ -430,16 +448,17 @@ def test_rtm_human_first_stage_workflow_stops_without_handoff_and_other_override
         identity=lambda: {"recommendation_sha256": "digest"},
         child_stages=(human_phase, agent_phase),
     )
-    result = orchestrator._dispatch_first_decomposition_phase(
+    result = orchestrator._dispatch_current_decomposition_phase(
         FakeRunner(), config=make_config(tmp_path), memory=None,
         usage_context=SimpleNamespace(), issue_number=55,
-        current_plan=approved_plan, plan_subject="subject", created=created,
+        current_plan=approved_plan, plan_subject="subject",
+        outcome=_staged_outcome(created, approved_plan),
         recommendation=recommendation,
         approved_plan_context=SimpleNamespace(matrix_available=False),
         issue_context=parent, mode="implement-by-phase", coder_session_id=None,
     )
     assert result == 0
-    assert "first phase requires human work" in capsys.readouterr().out
+    assert "requires human work" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("override_location", ["parent", "child"])
@@ -488,10 +507,11 @@ def test_rtm_human_first_stage_workflow_rejects_override_without_handoff(
     )
 
     with pytest.raises(AgentLoopError, match="Human-owned stages"):
-        orchestrator._dispatch_first_decomposition_phase(
+        orchestrator._dispatch_current_decomposition_phase(
             FakeRunner(), config=make_config(tmp_path), memory=None,
             usage_context=SimpleNamespace(), issue_number=55,
-            current_plan=approved_plan, plan_subject="subject", created=created,
+            current_plan=approved_plan, plan_subject="subject",
+            outcome=_staged_outcome(created, approved_plan),
             recommendation=recommendation,
             approved_plan_context=SimpleNamespace(matrix_available=False),
             issue_context=parent, mode="implement-by-phase", coder_session_id=None,

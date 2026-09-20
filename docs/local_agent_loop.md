@@ -557,13 +557,23 @@ The modes are:
   approved plan's remainder; its primary scope remains owned by the parent.
 - `implement-one-shot`: keep the existing post-approval implementation handoff.
   This is also what `--implement-after-approval` selects for compatibility.
-- `implement-by-phase`: create/link every phase issue, implement only the first
-  `agent-pr` child issue, then stop after that PR review loop. The parent issue
-  records a one-time handoff only after an accepted positive implementation PR;
-  null-PR and rejected-conflict results stop without a handoff. Parent reruns
-  after that handoff do not re-run the child and should be resumed directly with
-  `agent-loop issue <child>`. Older decomposition summaries without this marker
-  are treated as not yet handed off, so the first child handoff is recorded once.
+- `implement-by-phase`: create/link every phase issue, then implement the
+  *current* phase - the first phase that is not yet complete - and stop after
+  that PR review loop. A parent rerun advances: once a phase's child issue is
+  closed and its canonical implementation PR is merged, the next rerun
+  dispatches the following phase with its own `phase_index` and handoff record.
+  While a phase's child is still open the rerun names it and prints the exact
+  command to resume it. Once every phase is complete the rerun reports a
+  terminal state instead - one line per stage, plus any retained-parent and
+  final-integration obligations - and dispatches nothing. Completion evidence
+  is authenticated: a closed child whose PR evidence is missing, unreadable or
+  unmerged, an open child whose canonical PR is merged or closed, and a handoff
+  recorded for a later phase while an earlier one is incomplete all stop the run
+  with a diagnostic rather than skipping or re-dispatching a phase. A
+  `human-action` or `manual-close` phase completes when its child issue is
+  closed: that closure is the operator's attestation that the required work and
+  remark are done. Older decomposition summaries without a handoff marker are
+  treated as not yet handed off, so the first child handoff is recorded once.
 - `auto`: after approval, resolve a fresh reviewed recommendation to
   `implement-one-shot` or `implement-by-phase`. A legacy-undecided plan is
   refused, and the CLI rejects `--materialize-split-issues` and `--split-stage`
@@ -582,7 +592,7 @@ At the approval boundary, routing follows this matrix:
 | `plan-only` | Stop without execution | Stop without execution | Stop without execution |
 | `implement-one-shot` | Implement one shot | Reject before mutation | Use the historical explicit path only |
 | `decompose-only` | Reject before mutation | Decompose and stop | Use the historical explicit path only |
-| `implement-by-phase` | Reject before mutation | Create topology and dispatch only the first eligible phase | Use the historical explicit path only |
+| `implement-by-phase` | Reject before mutation | Create topology and dispatch the current (first incomplete) phase | Use the historical explicit path only |
 | `auto` | Resolve to `implement-one-shot` | Resolve to `implement-by-phase` | Stop and request a reviewed revision |
 
 For a non-dry run, read-only recovery and expected-closing validation complete
@@ -820,8 +830,9 @@ phase is expected to be implemented through a child issue and PR.
 `human-action` and `manual-close` phases are still created as child issues, but
 their titles, bodies, and parent summary call out that a human must perform the
 work or checkpoint, add the required remark/update, and close the issue. If
-`implement-by-phase` sees a human-only first phase, it stops instead of
-recording an implementation handoff.
+`implement-by-phase` selects a human-owned phase whose child issue is still
+open, it stops instead of recording an implementation handoff; closing that
+child is the attestation that lets a later rerun advance to the next phase.
 
 Flat child topology allows 15 children by default; override it with
 `--flat-child-limit`. The count is shared by decomposition and split
@@ -834,9 +845,10 @@ duplicate phase titles, invalid automation classes, unknown dependencies,
 self-dependencies, and forward dependencies; `depends_on` may reference only
 earlier phase titles. Parent decomposition metadata
 (`AGENT_PLAN_DECOMPOSITION`) and phase handoff metadata
-(`AGENT_PLAN_PHASE_IMPLEMENTATION`) make reruns idempotent. If a parent issue
-has already handed off an `implement-by-phase` child, rerun the child issue
-directly instead of expecting the parent to restart it.
+(`AGENT_PLAN_PHASE_IMPLEMENTATION`) make reruns idempotent. While an
+`implement-by-phase` child is still open, rerun that child issue directly
+instead of expecting the parent to restart it; once it is closed with a merged
+PR, rerun the parent to advance to the next phase.
 
 Implement a free-form task:
 
@@ -1762,7 +1774,7 @@ before any write. Pick the row that matches your situation:
 | Situation | Correct mechanism |
 | --- | --- |
 | Approved detailed staged plan with phase contracts | `--plan-execution-mode decompose-only` |
-| Same plan, but implement only the first phase now | `--plan-execution-mode implement-by-phase` |
+| Same plan, but implement the current phase now (rerun the parent to advance) | `--plan-execution-mode implement-by-phase` |
 | Approved plan you want implemented as a single PR, no phase breakdown | `--plan-execution-mode implement-one-shot` (or `--implement-after-approval`) |
 | Approved plan whose reviewed recommendation should choose the topology | `--plan-execution-mode auto` |
 | Plan review only, no implementation, no detailed child issues | `--plan-execution-mode plan-only` (the default) |
@@ -1806,11 +1818,14 @@ What each mechanism produces and where the run stops:
   file follow-ups or children, create handoffs, invoke a coder, or open/update a
   PR. A later non-dry run performs the persistence-first path once.
 - **`implement-by-phase`**: creates every phase child issue, records a
-  one-time `AGENT_PLAN_PHASE_IMPLEMENTATION` handoff, then implements only the
-  first `agent-pr` phase and stops after that phase's PR review loop. If the
-  first phase is `human-action` or `manual-close`, it stops after creating the
-  child issues without implementing anything. Resume the remaining phases with
-  `agent-loop issue <child>`, not by rerunning the parent.
+  per-phase `AGENT_PLAN_PHASE_IMPLEMENTATION` handoff, then implements the
+  current (first incomplete) `agent-pr` phase and stops after that phase's PR
+  review loop. Rerunning the parent advances to the next phase once the current
+  phase's child is closed with a merged PR, and reports a terminal delivery
+  report once every phase is complete. If the selected phase is `human-action`
+  or `manual-close` and its child is still open, the run stops without
+  implementing anything. Resume an in-progress child with
+  `agent-loop issue <child>`; rerun the parent to move on to the next phase.
 - **`--materialize-split-issues`**: files one linked child issue for discuss
   `split` proposals or plan-only/one-shot deferred work. Use
   `external_dependencies` for existing `#N`, issue URL, or

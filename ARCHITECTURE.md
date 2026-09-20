@@ -245,9 +245,39 @@ fail closed before mutation. A typed resolved action drives follow-ups,
 topology, handoffs, and dispatch; dry-run reports that action without
 persistence or GitHub writes. The durable decision is written before any
 follow-up, child, handoff, coder, or PR mutation, and staged execution is
-bounded to the first eligible `agent-pr` child while the parent remains open.
+bounded to one `agent-pr` child per run while the parent remains open.
 Repair may preserve a complete v1 source, but cannot synthesize missing
 recommendation data.
+
+Staged decomposition returns an explicit topology outcome - the materialized
+children, one resolved stage identity and automation per index, the run's own
+approved-plan hash and mode, and the recorded retained-parent and
+final-integration obligations - because the dispatcher cannot otherwise obtain
+stage identity or obligations on the adopted and legacy paths, where a
+recovered decomposition summary is the only source. A parent advancement state
+machine consumes that outcome. Phase handoff records are first filtered to the
+outcome's own plan hash and mode, then reconciled against the child mapping:
+a missing or repeated child number, a record whose child or stage disagrees
+with its index, a duplicate record for one index, a record for a human-owned
+phase or an out-of-range index, and an ordered-prefix violation - a record for
+a phase later than the first incomplete one - each stop the run before any
+child state is read. Phases are then authenticated in order against live state
+and resolution stops at the first incomplete phase. An `agent-pr` phase is
+complete only when its child issue is CLOSED and its canonical issue-to-PR
+handoff names a MERGED pull request, authenticated by the same identity, URL
+and closing-contract checks that resume applies; an open child with a merged or
+closed canonical PR, and a closed child with absent, unreadable or unmerged PR
+evidence, both fail closed. A `human-action` or `manual-close` phase is
+complete on closure of its child issue alone - that closure is the operator
+attestation, and no PR evidence is read for it. The first incomplete phase is
+dispatched through the existing child-dispatch seam with its real phase index;
+an in-progress phase instead yields a runnable resume command for its still-open
+child; and a fully complete topology yields a terminal report that distinguishes
+agent-delivered stages from human-attested ones and names any operator-owned
+retained-parent and final-integration work. Final-integration work is never
+implemented automatically and the delivered parent is never closed
+automatically. Dry run resolves no child state and issues no child GitHub
+reads.
 
 Each fresh staged child also carries a reviewed execution disposition. The
 planner chooses `direct-implementation`, `requires-child-planning`, or the

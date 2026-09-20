@@ -1684,9 +1684,17 @@ def _parse_pr_human_requirements(data: dict[str, object]) -> tuple[HumanReviewRe
     return deduplicate_human_requirements(requirements)
 
 
-def validate_open_issue(runner: Runner, *, config: AgentLoopConfig, issue_number: int) -> None:
-    if config.dry_run:
-        return
+def _read_issue_state_projection(
+    runner: Runner, *, config: AgentLoopConfig, issue_number: int
+) -> dict:
+    """Read the shared `{number,state,is_pr,url}` issue projection, fail-closed.
+
+    `validate_open_issue` and `get_issue_state` both authenticate a live issue
+    state through this single reader so the two cannot drift: a nonzero `gh`
+    exit, a non-object payload, an absent or non-string `state`, a number
+    mismatch, or a payload that resolves to a pull request is an error rather
+    than an implicitly open or closed issue.
+    """
     result = runner.run(
         [
             config.gh_cmd,
@@ -1697,11 +1705,61 @@ def validate_open_issue(runner: Runner, *, config: AgentLoopConfig, issue_number
         ],
         cwd=active_workdir(config),
     )
-    data = json.loads(result.stdout or "{}")
+    if result.returncode != 0:
+        raise AgentLoopError(
+            f"Unable to read issue #{issue_number} from {config.repo}: "
+            f"`gh` exited {result.returncode}."
+        )
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(
+            f"Unable to read issue #{issue_number} from {config.repo}: "
+            f"GitHub CLI output is not JSON ({exc})."
+        ) from exc
+    if not isinstance(data, dict):
+        raise AgentLoopError(
+            f"Unable to read issue #{issue_number} from {config.repo}: "
+            "GitHub CLI output is not a JSON object."
+        )
     if data.get("is_pr"):
         raise AgentLoopError(
             f"#{issue_number} is a pull request, not an issue. Use `agent-loop pr {issue_number}`."
         )
+    number = data.get("number")
+    if number is not None and number != issue_number:
+        raise AgentLoopError(
+            f"GitHub returned issue #{number} for requested issue #{issue_number}."
+        )
+    state = data.get("state")
+    if not isinstance(state, str) or not state.strip():
+        raise AgentLoopError(
+            f"Unable to determine the state of issue #{issue_number} in {config.repo}."
+        )
+    return data
+
+
+def get_issue_state(runner: Runner, *, config: AgentLoopConfig, issue_number: int) -> str:
+    """Return the live issue state normalized to `OPEN` or `CLOSED`.
+
+    Any other value is an error: a staged parent authenticates phase
+    completion from this state, so an unrecognized value must stop the run
+    rather than be interpreted as either open or closed.
+    """
+    data = _read_issue_state_projection(runner, config=config, issue_number=issue_number)
+    state = str(data["state"]).strip().upper()
+    if state not in {"OPEN", "CLOSED"}:
+        raise AgentLoopError(
+            f"Issue #{issue_number} in {config.repo} reported unexpected state "
+            f"{data['state']!r}; expected `open` or `closed`."
+        )
+    return state
+
+
+def validate_open_issue(runner: Runner, *, config: AgentLoopConfig, issue_number: int) -> None:
+    if config.dry_run:
+        return
+    data = _read_issue_state_projection(runner, config=config, issue_number=issue_number)
     if data.get("state") != "open":
         raise AgentLoopError(
             f"Issue #{issue_number} is {data.get('state', 'not open')}; provide an open issue number."
