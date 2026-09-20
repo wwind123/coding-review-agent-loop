@@ -1770,6 +1770,11 @@ def test_plan_validation_decoder_accepts_only_the_two_canonical_forms() -> None:
         f"Unrelated operator prose.\n\n{historical}",
         f"{labeled}\n\nUnrelated trailing prose.",
         labeled.replace("Agent-loop", "Agent-loop (edited)", 1),
+        # Surrounding whitespace would be a third carrier form.
+        f" {historical}",
+        f"{historical}\n",
+        f"\n{labeled}",
+        f"{labeled}  ",
     ):
         with pytest.raises(AgentLoopError, match="exact canonical record"):
             decode_plan_validation_diagnostic_body(rejected)

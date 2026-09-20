@@ -6186,3 +6186,109 @@ def test_unverified_qualification_audit_raises_and_adopts_no_head(tmp_path):
         )
 
     assert contract.audit_comment_id is None
+
+
+def _resume_activation_runner(runner_class):
+    """Build a PR-mode resume fixture carrying a durable issue authorization."""
+    resume_metadata = replace(metadata(), head_branch="agent-loop/managed-643")
+    runner = runner_class(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"state": "open", "draft": True, "body": resume_metadata.body},
+        issue_events=[label_event()],
+        intent_comments=[{
+            "id": 41,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": str(format_issue_created_authorization_comment(
+                ManagedCiIssueAuthorization(
+                    kind="creation", repository="OWNER/REPO", issue_number=643,
+                    pr_number=7, base_ref="main", head_sha="abc123",
+                    actor_login="agent-loop", actor_id=1, protection="voluntary",
+                    waiver="allow-unprotected-managed-ci", nonce="nonce-643",
+                    label_event_id=101,
+                )
+            )),
+        }],
+    )
+    return runner, resume_metadata
+
+
+def _activate_resume(runner, *, config, resume_metadata):
+    handoff = recover_issue_created_handoff(
+        runner, config=config, pr_number=7, metadata=resume_metadata, issue_number=643
+    )
+    assert handoff is not None
+    return activate_managed_ci(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=resume_metadata,
+        managed_resume=AuthenticatedManagedResume(
+            origin="issue-created",
+            lifecycle=handoff.lifecycle,
+            issue_created_handoff=handoff,
+        ),
+    )
+
+
+def _resume_config(tmp_path):
+    return make_config(
+        tmp_path,
+        auto_merge=True,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+
+def test_resume_audit_names_its_record_and_still_parses(tmp_path):
+    runner, resume_metadata = _resume_activation_runner(V2ManagedRunner)
+
+    contract = _activate_resume(
+        runner, config=_resume_config(tmp_path), resume_metadata=resume_metadata
+    )
+
+    assert contract is not None and contract.activation_path == "managed"
+    audit = runner.audit_comments[contract.audit_comment_id]["body"]
+    assert audit.startswith("Agent-loop managed-CI resume provenance audit record")
+    assert f"\n{UNPROTECTED_OVERRIDE_TRAILER} " in audit
+    record = parse_managed_ci_override_record(
+        audit, surface=PR_COMMENT_SURFACE, schema="audit", required=True
+    )
+    assert record is not None and record.nonce == contract.audit_nonce
+
+
+class AlteredResumeAuditLabelRunner(AlteredAuditLabelRunner):
+    """Alter only the resume-provenance audit label on its way back."""
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        body = self._form_value(list(args), "body") or ""
+        if not body.startswith("Agent-loop managed-CI resume provenance audit record"):
+            return V2ManagedRunner._run_locked(
+                self, args, cwd=cwd, check=check, input_text=input_text
+            )
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def test_unverified_resume_audit_falls_back_to_ordinary_recovery(tmp_path):
+    runner, resume_metadata = _resume_activation_runner(AlteredResumeAuditLabelRunner)
+
+    # The resume branch takes the same ordinary-CI fallback it already takes
+    # when the audit cannot be recorded: it releases the managed label and
+    # refuses to qualify, instead of activating on an unverified audit.
+    with pytest.raises(AgentLoopError, match="resume audit could not be recorded and verified"):
+        _activate_resume(
+            runner, config=_resume_config(tmp_path), resume_metadata=resume_metadata
+        )
+
+    # The server-side comment may exist, but no managed contract adopted it.
+    assert any(
+        command[:5] == [
+            "gh", "api", "--method", "DELETE",
+            f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+        ]
+        for command, _cwd in runner.commands
+    )
+    assert not any(
+        command[:4] == ["gh", "pr", "merge", "7"] for command, _cwd in runner.commands
+    )

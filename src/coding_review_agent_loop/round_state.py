@@ -865,8 +865,10 @@ def decode_plan_validation_diagnostic_body(
     # Exactly two canonical carrier forms are accepted: the historical bare
     # marker, and the marker introduced by its own regenerated label.  Any other
     # surrounding text is still rejected.
+    # The comparison is against the unmodified body: surrounding whitespace
+    # would be a third carrier form, and only these two are canonical.
     labeled = f"{_plan_validation_diagnostic_label(payload)}\n\n{marker}"
-    if body.strip() not in {marker, labeled}:
+    if body not in {marker, labeled}:
         raise AgentLoopError("Plan-validation diagnostic is not an exact canonical record.")
     return payload
 
