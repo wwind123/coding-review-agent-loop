@@ -905,3 +905,140 @@ def test_m780_12_separately_planned_child_requires_parent_row_and_uses_child_pro
     assert "Row row-stage-one" in prompt
     assert "[enforceable]" in prompt
     assert "Row child-local" in prompt
+
+
+def oversized_fresh_staged_plan():
+    """A fresh staged plan whose retained-parent excerpt cannot be published whole."""
+    plan = fresh_staged_plan()
+    payload, end = json.JSONDecoder().raw_decode(plan)
+    payload["summary"] = "Fresh staged parent plan. " + "retained detail " * 6000
+    return json.dumps(payload) + plan[end:]
+
+
+def test_rerun_preflight_reconciles_a_published_shortened_retained_excerpt(
+    tmp_path, monkeypatch
+):
+    """#907: a summary published for a large plan carries a shortened excerpt.
+
+    The scope recomputed from the approved plan on a rerun always carries the
+    full text, so a plain equality check would wedge exactly the parents the
+    bounding makes publishable.
+    """
+    from coding_review_agent_loop.decomposition import (
+        EXECUTION_TOPOLOGY_SOURCE, _decode_metadata,
+    )
+    from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
+
+    plan = oversized_fresh_staged_plan()
+    plan_hash = approved_plan_hash(plan)
+    payload, _end = json.JSONDecoder().raw_decode(plan)
+    recommendation = parse_execution_recommendation_payload(
+        payload["execution_recommendation"], context="test recommendation"
+    )
+    normalized, retained = normalize_execution_recommendation(
+        recommendation, approved_plan=plan, plan_subject=_plan_subject(plan)
+    )
+    created = (
+        CreatedPhaseIssue(normalized.phases[0], "https://github.com/OWNER/REPO/issues/56", 56),
+        CreatedPhaseIssue(normalized.phases[1], "https://github.com/OWNER/REPO/issues/57", 57),
+    )
+    summary = format_decomposition_parent_summary(
+        parent_issue=55,
+        mode="implement-by-phase",
+        plan_hash=plan_hash,
+        created=created,
+        topology_source=EXECUTION_TOPOLOGY_SOURCE,
+        retained_parent_scope=retained,
+        final_integration_work=normalized.final_integration_work,
+        strategy=normalized.strategy,
+        execution_strategy_contract_version=normalized.execution_strategy_contract_version,
+        recommendation_digest=normalized.recommendation_digest,
+        plan_subject=_plan_subject(plan),
+    )
+    from coding_review_agent_loop.decomposition import DECOMPOSITION_MARKER_RE
+
+    recorded = _decode_metadata(
+        DECOMPOSITION_MARKER_RE.search(summary).group("payload")
+    ).retained_parent_scope
+    # The published record really does carry a shortened excerpt.
+    assert recorded is not None
+    assert len(recorded.excerpt) < len(retained.excerpt)
+
+    parent = IssueContext(
+        number=55,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Body",
+        url="https://github.com/OWNER/REPO/issues/55",
+        comments=(comment(plan_record(plan)), comment(summary)),
+    )
+    monkeypatch.setattr(
+        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator, "create_decomposition_child_issues",
+        lambda *_args, **_kwargs: created,
+    )
+
+    assert orchestrator._preflight_fresh_staged_topology(
+        FakeRunner(), issue_number=55, approved_plan=plan,
+        config=make_config(tmp_path), issue_context=parent,
+        mode="implement-by-phase", normalized_topology=(normalized, retained),
+    ) == created
+
+
+def test_rerun_preflight_still_rejects_a_foreign_retained_excerpt(tmp_path, monkeypatch):
+    """A recorded excerpt that is not an opening of the approved plan still fails."""
+    from coding_review_agent_loop.decomposition import EXECUTION_TOPOLOGY_SOURCE
+
+    plan = oversized_fresh_staged_plan()
+    plan_hash = approved_plan_hash(plan)
+    payload, _end = json.JSONDecoder().raw_decode(plan)
+    from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
+
+    recommendation = parse_execution_recommendation_payload(
+        payload["execution_recommendation"], context="test recommendation"
+    )
+    normalized, retained = normalize_execution_recommendation(
+        recommendation, approved_plan=plan, plan_subject=_plan_subject(plan)
+    )
+    created = (
+        CreatedPhaseIssue(normalized.phases[0], "https://github.com/OWNER/REPO/issues/56", 56),
+        CreatedPhaseIssue(normalized.phases[1], "https://github.com/OWNER/REPO/issues/57", 57),
+    )
+    foreign = dataclasses.replace(retained, excerpt="A different approved plan's scope.")
+    summary = format_decomposition_parent_summary(
+        parent_issue=55,
+        mode="implement-by-phase",
+        plan_hash=plan_hash,
+        created=created,
+        topology_source=EXECUTION_TOPOLOGY_SOURCE,
+        retained_parent_scope=foreign,
+        final_integration_work=normalized.final_integration_work,
+        strategy=normalized.strategy,
+        execution_strategy_contract_version=normalized.execution_strategy_contract_version,
+        recommendation_digest=normalized.recommendation_digest,
+        plan_subject=_plan_subject(plan),
+    )
+    parent = IssueContext(
+        number=55,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Body",
+        url="https://github.com/OWNER/REPO/issues/55",
+        comments=(comment(plan_record(plan)), comment(summary)),
+    )
+    monkeypatch.setattr(
+        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator, "create_decomposition_child_issues",
+        lambda *_args, **_kwargs: created,
+    )
+
+    with pytest.raises(AgentLoopError, match="disagrees with the approved normalized topology"):
+        orchestrator._preflight_fresh_staged_topology(
+            FakeRunner(), issue_number=55, approved_plan=plan,
+            config=make_config(tmp_path), issue_context=parent,
+            mode="implement-by-phase", normalized_topology=(normalized, retained),
+        )

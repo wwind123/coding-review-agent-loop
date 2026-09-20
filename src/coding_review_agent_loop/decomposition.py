@@ -2650,6 +2650,52 @@ def _render_decomposition_parent_summary(
     return "\n".join(lines)
 
 
+def retained_parent_excerpt_section(excerpt: str, *, parent_issue: int) -> BoundedSection:
+    """Describe the retained-parent excerpt as a shortenable body section.
+
+    Both the renderer that shortens the excerpt and the recovery check that
+    reconciles an already-published one build the section here, so the pointer
+    notice they look for is the same string (#907).
+    """
+    return BoundedSection(
+        name="retained parent scope excerpt",
+        text=excerpt,
+        pointer=(
+            f"issue #{parent_issue}'s canonical plan comment and its "
+            "machine-readable attachments"
+        ),
+    )
+
+
+def retained_parent_scope_matches(
+    recorded: RetainedParentScope | None,
+    expected: RetainedParentScope | None,
+    *,
+    parent_issue: int,
+) -> bool:
+    """Compare a published retained-parent scope against a recomputed one.
+
+    A summary published for a large plan carries a shortened excerpt, while the
+    scope recomputed from the approved plan on a rerun always carries the full
+    text.  Plain equality would then wedge exactly the runs the bounding makes
+    publishable, so the excerpt is reconciled through the same bounded-section
+    rules the child issue bodies use; every other field must still match
+    exactly (#907).
+    """
+    if recorded is None or expected is None:
+        return recorded == expected
+    if dataclasses.replace(recorded, excerpt="") != dataclasses.replace(expected, excerpt=""):
+        return False
+    if recorded.excerpt == expected.excerpt:
+        return True
+    if not expected.excerpt:
+        return False
+    return bounded_text_present(
+        recorded.excerpt,
+        retained_parent_excerpt_section(expected.excerpt, parent_issue=parent_issue),
+    )
+
+
 def format_decomposition_parent_summary(
     *,
     parent_issue: int,
@@ -2694,13 +2740,8 @@ def format_decomposition_parent_summary(
         return body
     if retained_parent_scope is None or not retained_parent_scope.excerpt:
         raise AgentLoopError(_parent_summary_overflow(parent_issue, body, excerpt_chars=None))
-    section = BoundedSection(
-        name="retained parent scope excerpt",
-        text=retained_parent_scope.excerpt,
-        pointer=(
-            f"issue #{parent_issue}'s canonical plan comment and its "
-            "machine-readable attachments"
-        ),
+    section = retained_parent_excerpt_section(
+        retained_parent_scope.excerpt, parent_issue=parent_issue
     )
 
     def render_budget(budget: int) -> str:

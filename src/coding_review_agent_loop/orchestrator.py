@@ -74,6 +74,7 @@ from .decomposition import (
     collect_child_disposition_overrides,
     phase_direct_readiness_problems,
     reconcile_handoff_disposition,
+    retained_parent_scope_matches,
 )
 from .protocol import EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING
 from .child_topology import NeedsHumanDecision, NestedTopologyDecision
@@ -6828,7 +6829,11 @@ def _preflight_fresh_staged_topology(
             != decomposition.execution_strategy_contract_version
             or existing_summary.final_integration_work
             != decomposition.final_integration_work
-            or existing_summary.retained_parent_scope != retained_parent_scope
+            or not retained_parent_scope_matches(
+                existing_summary.retained_parent_scope,
+                retained_parent_scope,
+                parent_issue=issue_number,
+            )
         ):
             raise AgentLoopError(
                 "Fresh staged execution summary disagrees with the approved normalized topology; "

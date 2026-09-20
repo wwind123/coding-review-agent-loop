@@ -35,6 +35,8 @@ from coding_review_agent_loop.decomposition import (
     find_existing_decomposition,
     find_existing_topology_checkpoint,
     format_decomposition_parent_summary,
+    retained_parent_excerpt_section,
+    retained_parent_scope_matches,
     format_execution_decision,
     format_phase_implementation_handoff_comment,
     format_topology_checkpoint,
@@ -45,6 +47,7 @@ from coding_review_agent_loop.decomposition import (
     normalize_execution_recommendation,
     find_existing_execution_decision,
 )
+from coding_review_agent_loop.issue_body_limits import shortened_section
 from coding_review_agent_loop.protocol import (
     EXECUTION_DISPOSITION_DIRECT,
     EXECUTION_DISPOSITION_PLANNING,
@@ -2105,3 +2108,44 @@ def test_parent_summary_overflow_names_the_surface_when_nothing_can_be_cut():
     message = str(excinfo.value)
     assert "Decomposition parent summary for issue #841" in message
     assert str(MAX_GITHUB_BODY_CHARS) in message
+
+
+def test_retained_parent_scope_matches_only_reconciles_the_excerpt():
+    """#907: every field but the excerpt must still match exactly."""
+    expected = RetainedParentScope(
+        plan_subject="s" * 32,
+        plan_hash="a" * 16,
+        excerpt="The approved plan's retained scope.\nSecond line of detail.",
+        status="required",
+        deliverables=("Deliver the retained scope.",),
+    )
+    section = retained_parent_excerpt_section(expected.excerpt, parent_issue=841)
+
+    assert retained_parent_scope_matches(expected, expected, parent_issue=841)
+    assert retained_parent_scope_matches(None, None, parent_issue=841)
+    assert not retained_parent_scope_matches(None, expected, parent_issue=841)
+    shortened = dataclasses.replace(
+        expected, excerpt=shortened_section(section, budget=len(expected.excerpt) // 2)
+    )
+    assert shortened.excerpt != expected.excerpt
+    assert retained_parent_scope_matches(shortened, expected, parent_issue=841)
+    # A shortened excerpt recorded under a different parent points elsewhere.
+    assert not retained_parent_scope_matches(
+        dataclasses.replace(
+            expected,
+            excerpt=shortened_section(
+                retained_parent_excerpt_section(expected.excerpt, parent_issue=999),
+                budget=len(expected.excerpt) // 2,
+            ),
+        ),
+        expected,
+        parent_issue=841,
+    )
+    assert not retained_parent_scope_matches(
+        dataclasses.replace(shortened, status="none"), expected, parent_issue=841
+    )
+    assert not retained_parent_scope_matches(
+        dataclasses.replace(expected, excerpt="A different plan's scope."),
+        expected,
+        parent_issue=841,
+    )
