@@ -1694,6 +1694,50 @@ def test_empty_source_finding_cannot_become_an_exempt_only_finding(
     ("builder", "bucket"),
     [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
 )
+@pytest.mark.parametrize("unsupported", [
+    "blocking",
+    "[protocol SPLIT_CHILD record]",
+    "it is in the plan",
+])
+def test_marker_only_source_finding_only_accepts_its_own_label(
+    builder, bucket, unsupported
+):
+    # Issue #871 round 9, item-10: the neutralization exception is for replacing
+    # a source marker with ITS OWN authorized safe label. Accepting any
+    # exempt-only target instead let a marker-only source finding correspond to
+    # schema vocabulary (`blocking`), an unrelated registry safe label, or
+    # stop-word-only prose, and the source blocking state then grounded that
+    # fabricated ledger finding.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [unsupported]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_marker_only_source_finding_accepts_the_marker_kept_verbatim(builder, bucket):
+    # Leaving the marker in place is lossless, so it stays legal alongside the
+    # authorized neutralization.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
 def test_marker_only_source_finding_is_still_neutralizable_in_both_kinds(builder, bucket):
     # The neutralization exception stays open for a finding that really was
     # nothing but a reserved marker.

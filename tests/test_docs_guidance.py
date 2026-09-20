@@ -442,11 +442,15 @@ def test_docs_describe_reviewer_repair_admission_and_grounding():
     # security boundary cannot be handed both claims, so the superseded wording
     # is asserted absent while the implemented rule is asserted present.
     normalized = " ".join(doc.split())
-    assert "a genuinely empty entry such as `{}` is dropped" in normalized
+    assert "genuinely empty entry such as `{}` is dropped" in normalized
     assert (
         "A declared source finding that carries no prose is a candidate only "
         "when it really was nothing but a reserved marker" in normalized
     )
+    assert (
+        "it corresponds solely to its own authorized neutralization" in normalized
+    )
+    assert "Every other exempt-only target is refused" in normalized
     assert "An empty or marker-only source finding" not in normalized
     assert (
         "a lead-in line before the first bullet is list structure that is "
