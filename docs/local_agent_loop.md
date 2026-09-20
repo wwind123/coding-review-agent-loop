@@ -3084,7 +3084,12 @@ JSON object is mechanically recoverable from it and that object either declares
 the expected reviewer kind or, when it carries no `kind`, carries a field unique
 to that review schema (`blocking_plan_issues`, `same_plan_followups`, or
 `prior_plan_item_dispositions` for a plan review; `blocking_items`,
-`same_pr_followups`, or `prior_item_dispositions` for a PR review). Fields shared
+`same_pr_followups`, or `prior_item_dispositions` for a PR review). The
+kind-unique-field fallback applies only to a source that carries no `kind` key at
+all: a `kind` that is present but is not exactly the expected reviewer kind —
+including an empty string, a null, or any non-string value — is refused, and the
+grounding check below fails closed on the same rule rather than on a string-only
+comparison. Fields shared
 with other schemas — `summary`, `state`, `schema_version`, `future_followups`,
 `human_requirement_dispositions`, `architecture_impact` — are never admission
 evidence, so narration, tool-use diagnostics, a bare protocol state footer, an
@@ -3121,7 +3126,11 @@ apostrophe forms — so deleting, adding, or substituting `not`, `isn't`, or
 `only` is rejected even though subset coverage alone would accept it. The
 verdict is grounded against the source rather than against what survives into
 the target: a repaired `blocking` needs an unambiguous source blocking state, a
-preserved source finding, or an active carried disposition; a repaired
+preserved source finding, or a carried disposition that is active in the source
+*and* preserved as active in the target — a disposition completed from the repair
+context's allowed IDs, or one re-stated out of a source `future`, is supplied by
+the orchestrator or by the target's own state and can never be that state's own
+support; a repaired
 `approved` needs an unambiguous approved source state *and* a source that itself
 carries no current-scope finding and no active disposition, so demoting a
 current-scope finding into `future_followups` can never manufacture an approval.

@@ -1577,11 +1577,15 @@ def require_recoverable_review_substance(raw: str, *, expected_kind: str) -> Non
             f"Reviewer repair refused: the `{expected_kind}` source carries no "
             "mechanically recoverable review payload, only narration or diagnostics."
         )
-    kind = payload.get("kind")
-    if isinstance(kind, str) and kind.strip():
+    if "kind" in payload:
+        # The kind-unique-field fallback below is authorized only for a source
+        # that carries NO `kind` at all.  A present-but-invalid kind — an empty
+        # string, null, or any non-string — is not the expected reviewer kind
+        # and must be refused rather than fall through to the fallback.
+        kind = payload["kind"]
         if kind != expected_kind:
             raise ReviewSubstanceIntegrityError(
-                f"Reviewer repair refused: the source declares kind `{kind}`, not the "
+                f"Reviewer repair refused: the source declares kind {kind!r}, not the "
                 f"expected `{expected_kind}`."
             )
         return

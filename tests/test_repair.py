@@ -4738,6 +4738,22 @@ def test_explicit_wrong_kind_source_is_refused():
         require_recoverable_review_substance(source, expected_kind="pr_review")
 
 
+@pytest.mark.parametrize("invalid_kind", ["", "   ", None, 7, ["pr_review"], {}])
+def test_present_but_invalid_explicit_kind_is_refused(invalid_kind):
+    # Issue #871 round 1, item-2: the kind-unique-field fallback is authorized
+    # only for a source with NO `kind`. A present-but-invalid kind must be
+    # refused before any repair backend call, even when the payload also
+    # carries a kind-unique review field.
+    source = json.dumps({
+        "kind": invalid_kind,
+        "state": "blocking",
+        "summary": "Review incomplete.",
+        "blocking_items": ["The retry loop is open."],
+    })
+    with pytest.raises(ReviewSubstanceIntegrityError, match="declares kind"):
+        require_recoverable_review_substance(source, expected_kind="pr_review")
+
+
 def test_kindless_generic_payload_is_refused():
     source = json.dumps({
         "state": "blocking",

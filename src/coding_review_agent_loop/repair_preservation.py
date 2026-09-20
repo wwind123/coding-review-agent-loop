@@ -294,9 +294,11 @@ def _validate_review_grounding(
     if not isinstance(source, dict):
         reject("the source carries no mechanically recoverable review payload")
         return
-    source_kind = source.get("kind")
-    if isinstance(source_kind, str) and source_kind != target_kind:
-        reject(f"the source payload declares kind `{source_kind}`")
+    if "kind" in source and source["kind"] != target_kind:
+        # A present-but-invalid source kind (empty string, null, any non-string)
+        # is not the repaired kind either, so it fails closed exactly like an
+        # explicit mismatch instead of slipping past a string-only comparison.
+        reject(f"the source payload declares kind {source['kind']!r}")
 
     source_tokens = set(_content_tokens(raw))
 
@@ -399,7 +401,13 @@ def _validate_review_grounding(
 
     allowed_ids = set(allowed_prior_item_ids or ())
     target_disposition_entries = target.get(disposition_field)
-    target_has_active_disposition = False
+    # Only an active target disposition that PRESERVES an active SOURCE
+    # disposition can ground a blocking verdict.  A disposition completed from
+    # `allowed_prior_item_ids`, or one promoted out of a source `future`, is
+    # supplied by the repair context or by the target's own state and is not
+    # reviewer-authored evidence of open work; counting it would let an
+    # approved, finding-free source be repaired into a blocking review.
+    target_preserves_active_source_disposition = False
     if isinstance(target_disposition_entries, list):
         for entry in target_disposition_entries:
             if not isinstance(entry, dict):
@@ -407,8 +415,6 @@ def _validate_review_grounding(
             item_id = entry.get("item_id")
             disposition = entry.get("disposition")
             note = entry.get("note")
-            if disposition in active_values:
-                target_has_active_disposition = True
             source_entry = source_dispositions.get(item_id)
             if source_entry is None:
                 # Completion of a carried ID supplied by the repair context.
@@ -436,6 +442,8 @@ def _validate_review_grounding(
             source_disposition = _normalized_disposition(source_entry.get("disposition"))
             source_note = source_entry.get("note")
             source_entry_text = _joined_text(source_entry)
+            if disposition in active_values and source_disposition in active_values:
+                target_preserves_active_source_disposition = True
             if disposition != source_disposition:
                 authorized_resolution = (
                     disposition == "resolved"
@@ -487,7 +495,7 @@ def _validate_review_grounding(
         if not (
             source_state == "blocking"
             or target_matched_current
-            or target_has_active_disposition
+            or target_preserves_active_source_disposition
         ):
             reject(
                 "`state: blocking` is supported by no source blocking state, preserved "

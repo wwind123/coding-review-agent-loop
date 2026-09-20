@@ -740,7 +740,17 @@ def test_unparseable_json_uses_prompt_and_existing_validator_only():
 
 
 def test_invalid_source_kind_can_be_corrected_by_context_validator():
-    check({"kind": ["plan_review"]}, {"kind": "plan_review"})
+    # Non-reviewer kinds keep deferring an invalid source kind to the caller's
+    # schema/context validator.
+    check({"kind": ["coder_followup"]}, {"kind": "coder_followup"})
+
+
+def test_present_but_invalid_source_kind_fails_closed_for_a_reviewer_target():
+    # Issue #871: a reviewer target may never be grounded against a payload
+    # whose `kind` is present but is not that reviewer kind, whatever its type.
+    for invalid_kind in (["plan_review"], "", None, 7):
+        with pytest.raises(AgentLoopError, match="grounding"):
+            check({"kind": invalid_kind}, {"kind": "plan_review"})
 
 
 def test_leading_marker_and_footer_do_not_disable_checks():
@@ -1168,3 +1178,73 @@ def test_coverage_predicate_is_negation_safe():
     assert not _rp.coverage_predicate("not handled by the current plan")
     assert not _rp.coverage_predicate("This isn't already covered.")
     assert not _rp.coverage_predicate("The plan already covers this, but it is still open.")
+
+
+def test_context_completed_active_id_cannot_ground_a_blocking_verdict():
+    # Issue #871 round 1, item-1: an ID completed from the repair context is
+    # supplied by the orchestrator, not authored by the reviewer, so it is not
+    # evidence of open work and may never manufacture a blocking verdict from a
+    # source that carries no blocking state, finding, or active disposition.
+    source = _pr_review(
+        state="approved",
+        summary="The diff is correct.",
+        blocking_items=[],
+        prior_item_dispositions=[],
+    )
+    with pytest.raises(AgentLoopError, match="state: blocking"):
+        validate_repair_preservation(
+            json.dumps(source),
+            json.dumps(_pr_review(
+                state="blocking",
+                summary="The diff is correct.",
+                blocking_items=[],
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "blocking"}],
+            )),
+            allowed_prior_item_ids=("item-2",),
+        )
+
+
+def test_future_to_active_promotion_cannot_ground_a_blocking_verdict():
+    # The source `future` disposition is not open current-scope work, and the
+    # schema-mandated re-statement is authorized only because the target is
+    # blocking, so it can never be that blocking state's own support.
+    source = _plan_review(
+        state="approved",
+        summary="Plan is sound.",
+        blocking_plan_issues=[],
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "future", "note": "Deferred work."},
+        ],
+    )
+    with pytest.raises(AgentLoopError, match="state: blocking"):
+        check(source, _plan_review(
+            state="blocking",
+            summary="Plan is sound.",
+            blocking_plan_issues=[],
+            prior_plan_item_dispositions=[
+                {"item_id": "item-1", "disposition": "blocking", "note": "Deferred work."},
+            ],
+        ))
+
+
+def test_preserved_active_source_disposition_still_grounds_a_blocking_verdict():
+    source = _pr_review(
+        state="approved",
+        summary="The diff is correct.",
+        blocking_items=[],
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "The leak is open."},
+        ],
+    )
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(_pr_review(
+            state="blocking",
+            summary="The diff is correct.",
+            blocking_items=[],
+            prior_item_dispositions=[
+                {"item_id": "item-1", "disposition": "blocking", "note": "The leak is open."},
+            ],
+        )),
+        allowed_prior_item_ids=("item-1",),
+    )
