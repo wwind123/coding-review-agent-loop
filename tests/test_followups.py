@@ -498,3 +498,12 @@ def test_oversized_approved_plan_summary_is_shortened_to_fit(tmp_path):
     assert body.startswith("Planning complete for issue #871.")
     assert PLAN_SUMMARY_TRUNCATION_NOTICE in body
     assert "AGENT_PLAN_APPROVED_FOLLOWUPS" in body
+
+
+def test_plan_summary_truncation_notice_uses_descriptive_wording():
+    """The visible notice must not name a reserved marker token (#814)."""
+    from coding_review_agent_loop.followups import PLAN_SUMMARY_TRUNCATION_NOTICE
+    from coding_review_agent_loop.protocol_markers import MARKER_BY_TOKEN
+
+    for token in MARKER_BY_TOKEN:
+        assert token not in PLAN_SUMMARY_TRUNCATION_NOTICE

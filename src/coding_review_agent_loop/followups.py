@@ -1397,7 +1397,7 @@ _PLAN_SUMMARY_SAFETY_MARGIN = 1_000
 
 PLAN_SUMMARY_TRUNCATION_NOTICE = (
     "[The approved plan is shown in full in this issue's canonical plan comment and its "
-    "AGENT_LOOP_SIDECAR attachments; only its opening is repeated here because the complete "
+    "bounded transport sidecars; only its opening is repeated here because the complete "
     "text does not fit in one GitHub comment.]"
 )
 
