@@ -474,3 +474,19 @@ def test_docs_describe_reviewer_repair_admission_and_grounding():
     assert "Reviewer repair is refused fail-closed" in architecture
     assert "a refusal is a reviewer unavailability, never a synthesized verdict" in architecture
     assert "proposal to evaluate, never an" in architecture
+
+
+def test_docs_describe_conflict_round_continuity_exception():
+    # #829: the conflict-resolution round advances the head with no reviewer,
+    # so both the canonical and operator contracts must name that transition.
+    arch_text = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    doc_text = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
+    assert "merge-conflict resolution round" in arch_text
+    assert "tool-owned merge-conflict obligation" in arch_text
+    assert "outside the coder's classifiable item namespace" in arch_text
+    assert "resume reauthenticates the same shape" in arch_text
+    assert "merge-conflict resolution round is the single exception" in doc_text
+    assert "tool-owned merge-conflict obligation instead of a review pair" in doc_text
+    for text in (arch_text, doc_text):
+        assert "still fails closed" in text
+        assert "approve the exact final head before qualification or merge" in text

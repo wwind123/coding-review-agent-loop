@@ -437,6 +437,22 @@ operator to fresh authorization. PR bodies, branches, labels, draft state,
 commits, and coder-authored comments remain corroboration only; they are not
 authority or a persistence substitute.
 
+The merge-conflict resolution round is the one automatic transition that has no
+reviewer to correlate. When the live head conflicts with the base branch the
+orchestrator skips reviewers by construction and routes the round to the coder,
+so no blocking reviewer record for the predecessor head can ever exist. That
+head advance is authorized instead by the tool-owned merge-conflict obligation:
+exactly one coder round metadata record for the new exact head and the
+immediately following round, authored by the bound actor, newer than the
+predecessor authorization, carrying the orchestrator-minted machine-authority
+merge-conflict obligation in its round items. That obligation is minted by the
+tool and sits outside the coder's classifiable item namespace, so an agent
+response cannot introduce it. The continuity comment binds that single record,
+and resume reauthenticates the same shape rather than a reviewer pair that never
+existed. A head advance carrying neither an ordered blocking-review/coder pair
+nor that obligation still fails closed, and every reviewer must still approve
+the exact final head before qualification or merge.
+
 ## State and Recovery
 
 There is no application database or always-running server. State is split
