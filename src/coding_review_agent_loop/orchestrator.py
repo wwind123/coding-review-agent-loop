@@ -12868,20 +12868,27 @@ def _recover_managed_ci_approved_plan(
 
     A staged decomposition child carries only its issue-to-PR handoff record;
     the approved plan round lives on the authoritative parent issue named by
-    the child's authenticated fresh-phase identity.  When the child yields no
-    record carrying ``expected_hash`` at all, fall back to the in-process
-    parent comments, exactly as the ordinary PR-mode recovery path does.
+    the child's authenticated fresh-phase identity.  The fallback predicate is
+    exactly what the recovery model reports: the child recovery is unavailable
+    *and* ``has_matching_candidate`` is False, i.e. no candidate survived.
+    Only then are the in-process parent comments consulted, as the ordinary
+    PR-mode recovery path does.
 
-    The guard is deliberately hash-only.  No ``expected_subject`` is passed
-    here, so a legacy free-form child record whose hash matches the handoff
-    but whose derived metadata subject differs leaves
-    ``has_matching_candidate`` False and still permits the parent lookup; the
-    canonical handoff plan hash remains the sole binding on whatever the
-    parent yields.  Divergent hash-matching child records set
-    ``has_matching_candidate`` True and keep failing closed: the parent is
-    never consulted in that case.  The parent identity is only ever the
-    in-process context supplied by the staged-child dispatch; nothing is
-    inferred from PR body text or from the handoff record's own fields.
+    That predicate is deliberately broader than "the child carries no record
+    with ``expected_hash``".  No ``expected_subject`` is passed here, but
+    ``recover_approved_plan_context`` still derives a required subject for a
+    legacy free-form record from its own metadata, so such a record can carry
+    the handoff hash, be rejected on that derived subject, and still leave
+    ``has_matching_candidate`` False.  The fallback is permitted in that case:
+    the subject-rejected record is never adopted, and the canonical handoff
+    plan hash remains the sole binding on whatever the parent yields.
+
+    Only divergent accepted candidates — several records matching the hash
+    that disagree on the plan text — set ``has_matching_candidate`` True, and
+    those keep failing closed: the parent is never consulted.  The parent
+    identity is only ever the in-process context supplied by the staged-child
+    dispatch; nothing is inferred from PR body text or from the handoff
+    record's own fields.
     """
 
     candidate = recover_approved_plan_context(

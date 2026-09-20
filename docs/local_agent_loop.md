@@ -2309,22 +2309,7 @@ branch, selected base, live exact head, expected issue association, an
 actor-owned managed-label history, and the canonical approved-plan scope when
 one applies. PR mode fetches the issue and its canonical plan comments from
 GitHub and requires a server-observed issue timeline association to the PR;
-PR-body closing text is corroboration, not authority.
-
-Both managed-CI recovery branches — the fresh authorization above and the
-ordinary same-PR resume — refresh the child issue snapshot and the
-authoritative in-process parent issue snapshot before reading either one's
-comments, so a caller-supplied snapshot that predates plan approval cannot
-defeat recovery. A staged decomposition child normally carries only its
-issue-to-PR handoff record, with the approved plan round living on its parent
-issue. When the child yields no record at all carrying the handoff plan hash,
-the canonical plan may therefore be recovered from that refreshed parent
-snapshot. The fallback is hash-only and reaches the parent solely because the
-child's authenticated fresh-phase identity named it: divergent child records
-that do match the handoff hash still fail closed without consulting the
-parent, and the handoff plan hash remains the only binding on whatever the
-parent yields. Documentation never excuses an implementation defect; the
-source remains authoritative. Identical retries reuse
+PR-body closing text is corroboration, not authority. Identical retries reuse
 an existing valid creation, fresh, or continuity authorization at that exact
 head instead of publishing a competing grant; conflicting records,
 ambiguous provenance, or changed live state fail closed before labels,
@@ -2334,6 +2319,28 @@ and the PR tuple, managed-label event, and authorization-comment set are read
 again immediately before publication. Managed issue recovery from a legacy
 association does not backfill a canonical handoff for a response whose report
 was rejected; authorization and coder evidence remain separate checkpoints.
+
+Both managed-CI recovery branches — the fresh authorization above and the
+ordinary same-PR resume — refresh the child issue snapshot and the
+authoritative in-process parent issue snapshot before reading either one's
+comments, so a caller-supplied snapshot that predates plan approval cannot
+defeat recovery. A staged decomposition child normally carries only its
+issue-to-PR handoff record, with the approved plan round living on its parent
+issue, so when the child recovery is unavailable and reports no matching
+candidate the canonical plan may be recovered from that refreshed parent
+snapshot. That predicate is exactly what the recovery model reports, and it is
+broader than "the child has no record with the handoff hash": a legacy
+free-form child record that does carry the hash but is rejected on its own
+derived plan subject also leaves no surviving candidate, and the fallback is
+deliberately permitted in that case because the subject-rejected record is
+never adopted and the handoff plan hash still has to match whatever the parent
+yields. Only divergent accepted child records — several records that match the
+hash but disagree on the plan text — report a matching candidate, and those
+keep failing closed without consulting the parent. The fallback is hash-only,
+passes no expected subject, and reaches the parent solely because the child's
+authenticated fresh-phase identity named it; the handoff plan hash remains the
+only binding. Documentation never excuses an implementation defect; the source
+remains authoritative.
 
 For a strictly protected base, no unprotected authorization record is needed
 and `--managed-ci-fresh` is not a valid remedy. If the response was rejected
