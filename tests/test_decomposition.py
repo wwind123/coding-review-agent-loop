@@ -1903,3 +1903,72 @@ def test_oversized_parent_excerpt_is_shortened_so_the_child_publishes():
     assert "Run the focused tests." in body
     assert "canonical plan comment" in body
     assert "Parent plan line 0:" in body
+
+
+def test_fresh_child_recovery_adopts_children_whose_excerpt_was_shortened(tmp_path):
+    """#902: an interrupted staged run over a huge plan stays resumable.
+
+    The published children carry a shortened parent-plan excerpt, so the fresh
+    recovery content check must compare against the bounded excerpt the body
+    actually carries rather than the unbounded parent context.
+    """
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    plan = "\n".join(f"Approved plan line {index}: " + "context " * 30 for index in range(3_000))
+    assert len(plan) > MAX_GITHUB_BODY_CHARS
+    topology = _fresh_recovery_topology(plan)
+    candidates = [
+        _fresh_child_issue(phase, plan, 100 + index)
+        for index, phase in enumerate(topology.phases, start=1)
+    ]
+    for candidate in candidates:
+        body = candidate["body"]
+        assert isinstance(body, str)
+        assert len(body) <= MAX_GITHUB_BODY_CHARS
+        assert "canonical plan comment" in body
+    runner = FakeRunner(search_issues_payload=candidates)
+
+    recovered = create_decomposition_child_issues(
+        runner,
+        config=make_config(tmp_path),
+        parent_issue=56,
+        approved_plan=plan,
+        decomposition=topology,
+        topology_source="approved-plan-v1",
+        issue_comments=(),
+        mode="implement-by-phase",
+        strategy="staged",
+        execution_strategy_contract_version=1,
+        recommendation_digest="recommendation-digest",
+        preflight_only=True,
+    )
+
+    assert [item.origin for item in recovered] == ["adopted", "adopted"]
+
+
+def test_fresh_child_recovery_still_rejects_a_foreign_parent_excerpt(tmp_path):
+    """#902: bounded matching must not accept a different plan's excerpt."""
+    from coding_review_agent_loop.decomposition import _fresh_phase_content_matches
+    from coding_review_agent_loop.github import FoundIssue
+
+    plan = "\n".join(f"Approved plan line {index}: " + "context " * 30 for index in range(3_000))
+    topology = _fresh_recovery_topology(plan)
+    phase = topology.phases[0]
+    candidate = _fresh_child_issue(phase, plan, 101)
+    foreign = candidate["body"].replace("Approved plan line 0:", "Unrelated plan line 0:", 1)
+
+    assert _fresh_phase_content_matches(
+        FoundIssue(
+            number=101,
+            title=candidate["title"],
+            url=candidate["url"],
+            body=candidate["body"],
+        ),
+        parent_issue=56,
+        phase=phase,
+    )
+    assert not _fresh_phase_content_matches(
+        FoundIssue(number=101, title=candidate["title"], url=candidate["url"], body=foreign),
+        parent_issue=56,
+        phase=phase,
+    )

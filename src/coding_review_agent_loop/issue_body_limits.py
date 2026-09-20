@@ -64,6 +64,34 @@ def shortened_section(section: BoundedSection, *, budget: int) -> str:
     return f"{section.text[:keep].rstrip()}\n\n{notice}"
 
 
+def bounded_text_present(body: str, section: BoundedSection, *, after: str | None = None) -> bool:
+    """Report whether ``body`` carries ``section`` in full or shortened form.
+
+    Recovery checks compare a reviewed section against an already-published
+    body.  That body may have been shortened by :func:`fit_github_body`, so a
+    retained opening followed by this section's pointer notice counts as a
+    match; ``after`` is the heading the section directly follows, which keeps
+    the comparison anchored to the right span (#902).
+    """
+    if not section.text or section.text in body:
+        return True
+    notice = _notice(section)
+    end = body.find(notice)
+    if end < 0:
+        return False
+    start = 0
+    if after is not None:
+        anchor = body.find(after)
+        if anchor < 0 or anchor > end:
+            return False
+        start = anchor + len(after)
+    retained = body[start:end].strip()
+    if not retained:
+        # The section was elided down to its pointer; nothing to compare.
+        return True
+    return section.text.startswith(retained) or section.text.lstrip().startswith(retained)
+
+
 def _located_sections(
     body: str, sections: Sequence[BoundedSection]
 ) -> list[tuple[int, BoundedSection]]:

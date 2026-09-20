@@ -45,7 +45,7 @@ from .protocol import (
     sanitize_architecture_impact,
     validate_direct_readiness,
 )
-from .issue_body_limits import BoundedSection, fit_github_body
+from .issue_body_limits import BoundedSection, bounded_text_present, fit_github_body
 from .round_transport import MAX_GITHUB_BODY_CHARS
 
 AUTOMATION_CLASSES = set(EXECUTION_AUTOMATION_CLASSES)
@@ -1337,7 +1337,7 @@ def format_phase_issue_body(
         [
             f"Child phase issue for parent #{parent_issue}: {parent_url}",
             "",
-            "## Approved parent-plan excerpt for this phase",
+            PARENT_EXCERPT_HEADING,
             parent_excerpt,
             "",
             "## Scope",
@@ -1411,17 +1411,27 @@ def format_phase_issue_body(
     # and the identity intact, and point at the parent's canonical plan (#902).
     return fit_github_body(
         body,
-        sections=(
-            BoundedSection(
-                name="approved parent-plan excerpt",
-                text=parent_excerpt,
-                pointer=(
-                    f"issue #{parent_issue}'s canonical plan comment and its "
-                    "machine-readable attachments"
-                ),
-            ),
-        ),
+        sections=(_parent_excerpt_section(parent_excerpt, parent_issue=parent_issue),),
         surface=f"Child phase issue body for parent #{parent_issue}",
+    )
+
+
+PARENT_EXCERPT_HEADING = "## Approved parent-plan excerpt for this phase"
+
+
+def _parent_excerpt_section(excerpt: str, *, parent_issue: int) -> BoundedSection:
+    """Describe the inherited plan excerpt embedded in a child phase body.
+
+    The renderer and the fresh-recovery content check share this description so
+    a published body that was shortened still matches its reviewed phase.
+    """
+    return BoundedSection(
+        name="approved parent-plan excerpt",
+        text=excerpt,
+        pointer=(
+            f"issue #{parent_issue}'s canonical plan comment and its "
+            "machine-readable attachments"
+        ),
     )
 
 
@@ -1466,10 +1476,14 @@ def _fresh_phase_content_matches(
     body = candidate.body
     if not isinstance(body, str):
         return False
+    excerpt = _parent_excerpt_section(
+        sanitize_historical_text(phase.parent_context), parent_issue=parent_issue
+    )
+    if not bounded_text_present(body, excerpt, after=PARENT_EXCERPT_HEADING):
+        return False
     fragments = [
         f"Child phase issue for parent #{parent_issue}:",
-        "## Approved parent-plan excerpt for this phase",
-        sanitize_historical_text(phase.parent_context),
+        PARENT_EXCERPT_HEADING,
         "## Scope",
         phase.scope,
         "## Non-goals",
