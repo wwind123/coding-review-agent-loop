@@ -1864,3 +1864,42 @@ def test_phase_implementation_handoff_rejects_malformed_marker():
             phase_index=1,
             child_issue_number=99,
         )
+
+
+def test_oversized_parent_excerpt_is_shortened_so_the_child_publishes():
+    """#902: a plan large enough to deserve staging must not block its children.
+
+    Issue #841 planned three stages and then died with
+    'GitHub issue body exceeds 60000 characters' while creating child issues.
+    """
+    from coding_review_agent_loop.decomposition import format_phase_issue_body
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    huge_context = "\n".join(
+        f"Parent plan line {index}: " + "context " * 30 for index in range(3_000)
+    )
+    assert len(huge_context) > MAX_GITHUB_BODY_CHARS
+    phase = PlanPhase(
+        title="Stage one",
+        scope="Implement the reviewed stage contract.",
+        non_goals="No rollout.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low.",
+        validation="Run the focused tests.",
+        parent_context=huge_context,
+        automation="agent-pr",
+        depends_on=(),
+    )
+
+    body = format_phase_issue_body(
+        repo="OWNER/REPO", parent_issue=841, approved_plan=huge_context, phase=phase,
+        created_so_far=(),
+    )
+
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "Child phase issue for parent #841" in body
+    # The stage contract survives; only the inherited excerpt is cut.
+    assert "Implement the reviewed stage contract." in body
+    assert "Run the focused tests." in body
+    assert "canonical plan comment" in body
+    assert "Parent plan line 0:" in body
