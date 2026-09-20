@@ -1894,6 +1894,65 @@ def test_direct_pr_resolves_single_linked_issue_context_for_reviewer(tmp_path):
     assert "Human requirements" in prompt
 
 
+def test_pr_review_runs_when_pr_and_issue_text_name_a_reserved_token(tmp_path, capsys):
+    """Issue #891: naming a record in PR or issue prose must not abort the run.
+
+    Both surfaces carry the token here, and the run must review normally with
+    the token defanged in the reviewer prompt.
+    """
+    token = "AGENT_PLAN_APPROVED_FOLLOWUPS"
+    label = "[protocol PLAN_APPROVED_FOLLOWUPS record]"
+    # A `well-formed-only` entry has no bare-name fallback in the scanner, so
+    # cover one on the title surfaces too.
+    strict_token = "AGENT_ISSUE_PR_HANDOFF"
+    strict_label = "[protocol ISSUE_PR_HANDOFF record]"
+    runner = FakeRunner(
+        codex_outputs=[
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+        issue_payload={
+            "number": 56,
+            "title": f"Reserved {strict_token} label",
+            "body": f"The planner writes {token} when it approves follow-ups.",
+        },
+        issue_comments=[
+            {
+                "author": {"login": "maintainer"},
+                "createdAt": "2026-09-19T00:00:00Z",
+                "body": f"The {token} name also appears in a comment.",
+            }
+        ],
+        pr_payload={
+            "title": f"Rename the {strict_token} label",
+            "body": f"Fixes #56\n\nThis PR renames the {token} record label.",
+        },
+    )
+    config = make_config(tmp_path, quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert token not in prompt
+    assert strict_token not in prompt
+    assert label in prompt
+    assert f"- Title: Rename the {strict_label} label" in prompt
+    # Surrounding prose survives, so the reviewer still sees the request.
+    assert "when it approves follow-ups." in prompt
+    assert "name also appears in a comment." in prompt
+    # The run says which surfaces named the tokens, titles included, and that
+    # they grant no authority.
+    logged = capsys.readouterr().err
+    assert (
+        f"Issue #56 text names reserved protocol marker(s) {strict_token}, {token}"
+        in logged
+    )
+    assert (
+        f"Pull request #77 text names reserved protocol marker(s) {strict_token}, {token}"
+        in logged
+    )
+    assert logged.count("They carry no authority.") == 2
+
+
 def test_plain_pr_recovery_accepts_loop_created_managed_pr_body(tmp_path):
     encoded = base64.urlsafe_b64encode(
         json.dumps(

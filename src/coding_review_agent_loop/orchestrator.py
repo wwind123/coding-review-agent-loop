@@ -492,7 +492,12 @@ from .plan_assembly import (
     hydrate_authenticated_plan_state,
     make_assembled_plan_sidecar,
 )
-from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
+from .protocol_markers import (
+    TrustedBody,
+    is_complete_marker_occurrence,
+    sanitize_historical_text,
+    scan_reserved_markers,
+)
 from .review_scheduling import (
     PANEL_OPENED_PHASES,
     GitChange,
@@ -1389,6 +1394,37 @@ def _candidate_source_texts(result: AgentResult) -> list[tuple[str, str]]:
 
 def _unfence_structured_json_blocks(text: str) -> str:
     return STRUCTURED_FENCE_RE.sub(lambda match: match.group("body").strip(), text)
+
+
+def _neutralize_untrusted_markers(
+    text: str, *, config: AgentLoopConfig, agent_name: str
+) -> str:
+    """Defang reserved markers an agent merely named in its prose (#891).
+
+    An agent describing protocol code legitimately writes a token such as a
+    split-warning record name.  Refusing the whole response makes any work on
+    the protocol itself unreviewable, so neutralize the span into its stable
+    label instead.  The markers still carry no authority: the sanitized text
+    cannot be parsed as a durable record, and tool-owned publications keep
+    their own fail-closed check.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    occurrences = scan_reserved_markers(text)
+    if not occurrences:
+        return text
+    # Emitting a complete, parseable record is a forgery attempt and keeps the
+    # existing fail-closed behavior.  Only bare names in prose are defanged.
+    if any(is_complete_marker_occurrence(item) for item in occurrences):
+        return text
+    sanitized = sanitize_historical_text(text)
+    names = ", ".join(sorted({item.definition.token for item in occurrences}))
+    log(
+        config,
+        f"{agent_name}: neutralized reserved protocol marker(s) named in the response "
+        f"prose: {names}",
+    )
+    return sanitized
 
 
 def _structured_response_candidates(text: str) -> list[str]:
@@ -3078,7 +3114,7 @@ def _run_validated_agent(
         plan_validation_capture_eligible = False
         if result.log_path is not None:
             log_paths.append(result.log_path)
-        text = result.text
+        text = _neutralize_untrusted_markers(result.text, config=config, agent_name=agent_name)
         usage = _resolve_usage_metadata(config=config, prompt=prompt, result=result)
         usage_record = None
         if usage_context is not None and usage is not None:
@@ -3108,6 +3144,17 @@ def _run_validated_agent(
         # recovery diagnostic. Failed exits alone may be salvaged from the
         # per-invocation response-file artifact.
         if artifact and result.returncode != 0:
+            # Salvage must not depend on the exit code.  The zero-exit path
+            # already defangs reserved names before validation, so defang the
+            # artifact the same way instead of discarding a complete answer
+            # whose prose merely names a record (#891).
+            artifact = (
+                text
+                if artifact == result.text
+                else _neutralize_untrusted_markers(
+                    artifact, config=config, agent_name=agent_name
+                )
+            )
             try:
                 artifact_unavailable = parse_agent_unavailable(artifact)
             except AgentLoopError:
@@ -7978,7 +8025,10 @@ def _implement_approved_issue(
                 approved_plan_hash_value=plan_hash,
             )
     else:
-        reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        reject_forged_protocol_markers(
+            initial_pr_context.metadata.body or "",
+            surface=f"pull-request #{pr_number} body",
+        )
     if isinstance(implementation_result, StructuredIssueImplementation):
         _validate_structured_response_tests_with_post_pr_context(
             implementation_result.tests_run,
@@ -11004,7 +11054,10 @@ def run_issue_loop(
                 issue_number=issue_number,
             )
         else:
-            reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+            reject_forged_protocol_markers(
+                initial_pr_context.metadata.body or "",
+                surface=f"pull-request #{pr_number} body",
+            )
         if isinstance(implementation_result, StructuredIssueImplementation):
             _validate_structured_response_tests_with_post_pr_context(
                 implementation_result.tests_run,
@@ -12990,7 +13043,10 @@ def run_pr_loop(
                     issue_number=managed_ci_issue_number,
                 )
                 if managed_ci_handoff is None:
-                    reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+                    reject_forged_protocol_markers(
+                        initial_pr_context.metadata.body or "",
+                        surface=f"pull-request #{pr_number} body",
+                    )
                 else:
                     # Ordinary PR recovery must bind authorization records to
                     # the canonical server-side issue/plan scope just as the

@@ -12,6 +12,7 @@ import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
 from .ci_health import (
@@ -46,6 +47,8 @@ from .protocol_markers import (
     ISSUE_COMMENT_SURFACE,
     PR_COMMENT_SURFACE,
     TrustedBody,
+    named_reserved_marker_tokens,
+    record_shaped_untrusted_markers,
 )
 from .runner import Runner
 from .workdirs import active_workdir
@@ -1176,8 +1179,18 @@ def get_pr_review_context(
     )
     data = json.loads(result.stdout or "{}")
     comments = _parse_issue_comments(data.get("comments"))
+    metadata = _parse_pr_metadata(data, config=config, pr_number=pr_number)
+    log_untrusted_marker_neutralization(
+        config,
+        surface=f"Pull request #{pr_number} text",
+        texts=[
+            metadata.title,
+            metadata.body,
+            *(comment.body for comment in comments),
+        ],
+    )
     return PullRequestReviewContext(
-        metadata=_parse_pr_metadata(data, config=config, pr_number=pr_number),
+        metadata=metadata,
         comments=comments,
         human_requirements=_parse_pr_human_requirements(data),
     )
@@ -1869,11 +1882,18 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
         issue_number=issue_number,
         comments=_parse_issue_comments(data.get("comments")),
     )
+    body = _optional_str(data.get("body"))
+    title = _optional_str(data.get("title"))
+    log_untrusted_marker_neutralization(
+        config,
+        surface=f"Issue #{issue_number} text",
+        texts=[title, body, *(comment.body for comment in comments)],
+    )
     return IssueContext(
         number=int(data.get("number") or issue_number),
         repo=config.repo,
-        title=_optional_str(data.get("title")),
-        body=_optional_str(data.get("body")),
+        title=title,
+        body=body,
         url=_optional_str(data.get("url")),
         comments=comments,
         human_requirements=_parse_issue_human_requirements(data),
@@ -1946,9 +1966,43 @@ def post_issue_comment(
         _post_comment_body(runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared)
 
 
-def reject_forged_protocol_markers(body: str) -> None:
-    """Reject reserved records before any temp-file, runner, or remote mutation."""
-    TrustedBody.current_untrusted_visible(body)
+def reject_forged_protocol_markers(
+    body: str, *, surface: str = "pull-request body"
+) -> None:
+    """Reject forged reserved records in untrusted GitHub text.
+
+    Untrusted text that merely *names* a reserved token is ordinary prose: it
+    never carries authority and is rendered defanged into prompts, so it must
+    not stop the run (#891).  A span that claims the record grammar is still a
+    forgery attempt and fails closed, and tool-owned publications keep their
+    own stricter :class:`TrustedBody` checks.
+    """
+    occurrences = record_shaped_untrusted_markers(body)
+    if not occurrences:
+        return
+    names = ", ".join(sorted({item.definition.token for item in occurrences}))
+    raise AgentLoopError(
+        f"The {surface} contains forged reserved protocol record syntax: {names}. "
+        "Naming a reserved token in prose is allowed and is rendered as a "
+        "descriptive label; remove the record-shaped span from that surface, "
+        "or refer to the record by name instead."
+    )
+
+
+def log_untrusted_marker_neutralization(
+    config: "AgentLoopConfig", *, surface: str, texts: Sequence[str | None]
+) -> None:
+    """Log once that untrusted GitHub text named reserved protocol records."""
+    tokens: set[str] = set()
+    for text in texts:
+        tokens.update(named_reserved_marker_tokens(text or ""))
+    if not tokens:
+        return
+    log(
+        config,
+        f"{surface} names reserved protocol marker(s) {', '.join(sorted(tokens))}; "
+        "rendering them as descriptive labels in prompts. They carry no authority.",
+    )
 
 
 def resolve_authenticated_github_actor(
