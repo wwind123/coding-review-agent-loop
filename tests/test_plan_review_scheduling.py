@@ -341,6 +341,63 @@ def test_matrix_retire_operation_is_broad():
     assert "matrix_retire" in classification.reason
 
 
+def test_defaulted_cross_cutting_identities_are_broad_not_narrow():
+    """Two unobserved identity sets compare equal; that is not evidence."""
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(),
+        previous_contracts=PlanCrossCuttingContracts(),
+        current_contracts=PlanCrossCuttingContracts(),
+    )
+    assert classification.broad
+    assert "could not be observed" in classification.reason
+    for name in (
+        "execution_recommendation_identity",
+        "human_requirement_disposition_digest",
+        "architecture_impact_status",
+    ):
+        assert name in classification.reason
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "execution_recommendation_identity",
+        "human_requirement_disposition_digest",
+        "architecture_impact_status",
+    ],
+)
+def test_one_unobserved_identity_on_either_side_is_broad(missing):
+    incomplete = _contracts(**{missing: None})
+    assert incomplete.missing_identities == (missing,)
+    assert not incomplete.complete
+    for previous, current in ((incomplete, _contracts()), (_contracts(), incomplete)):
+        classification = classify_plan_transition(
+            _key(),
+            _key(plan="plan-2"),
+            _revision(),
+            previous_contracts=previous,
+            current_contracts=current,
+        )
+        assert classification.broad
+        assert missing in classification.reason
+
+
+def test_an_empty_closing_issue_set_is_a_complete_declaration():
+    contracts = _contracts(additional_closing_issue_ids=())
+    assert contracts.complete
+    assert contracts.missing_identities == ()
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(),
+        previous_contracts=contracts,
+        current_contracts=contracts,
+    )
+    assert classification.narrow
+
+
 def test_unreconstructible_ledger_is_broad():
     classification = classify_plan_transition(
         _key(), _key(), ledger_reconstructible=False
@@ -453,6 +510,42 @@ def test_broad_revision_after_the_panel_selects_the_complete_board():
     assert decision.selected_reviewers == BOARD
     assert decision.phase == "full-board"
     assert decision.reason.startswith(POST_PANEL_PREFIX)
+    assert decision.latches_force_full
+
+
+def test_post_panel_broad_latch_survives_a_later_narrow_transition():
+    """The post-panel broad board must not narrow back on the next transition."""
+    broad = select_plan_reviewers(
+        PlanSchedulerSnapshot(
+            contract=_contract(),
+            previous_key=_key(),
+            current_key=_key(plan="plan-2"),
+            panel_evidence=True,
+        ),
+        PlanTransitionClassification("broad", "cross-cutting plan contract(s) changed"),
+    )
+    assert broad.selected_reviewers == BOARD
+    assert broad.latches_force_full
+
+    # A stage-2 consumer persists the advertised latch and replays it on the
+    # next round, whose revision is a clean narrow remediation with an active
+    # secondary-owned finding that would otherwise select owners plus primary.
+    latched = PlanSchedulerSnapshot(
+        contract=_contract(),
+        previous_key=_key(plan="plan-2"),
+        current_key=_key(plan="plan-3"),
+        panel_evidence=True,
+        force_full=broad.latches_force_full,
+        force_full_source="automatic",
+        obligations=(_obligation(owners=("Claude",)),),
+    )
+    following = select_plan_reviewers(
+        latched, PlanTransitionClassification("narrow", "narrow plan remediation")
+    )
+    assert following.selected_reviewers == BOARD
+    assert following.phase == "full-board"
+    assert following.latches_force_full
+    assert following.reason.startswith(POST_PANEL_PREFIX)
 
 
 def test_final_exact_plan_sweep_selects_every_reviewer_missing_an_approval():

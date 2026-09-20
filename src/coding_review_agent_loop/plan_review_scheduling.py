@@ -399,6 +399,29 @@ class PlanCrossCuttingContracts:
             )
         object.__setattr__(self, "additional_closing_issue_ids", tuple(sorted(set(ids))))
 
+    # ``additional_closing_issue_ids`` is deliberately excluded: an empty
+    # closing-issue set is a real, complete declaration.  The other three are
+    # identities that must be observed, never defaulted, or two incomplete
+    # objects would compare equal and pass an unauthenticated revision as
+    # narrow.
+    REQUIRED_IDENTITY_FIELDS = (
+        "execution_recommendation_identity",
+        "human_requirement_disposition_digest",
+        "architecture_impact_status",
+    )
+
+    @property
+    def missing_identities(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in self.REQUIRED_IDENTITY_FIELDS
+            if getattr(self, name) is None
+        )
+
+    @property
+    def complete(self) -> bool:
+        return not self.missing_identities
+
     def differences(self, other: "PlanCrossCuttingContracts") -> tuple[str, ...]:
         names = (
             "execution_recommendation_identity",
@@ -690,6 +713,20 @@ def classify_plan_transition(
         return PlanTransitionClassification(
             "broad", "the cross-cutting plan contract identities are unavailable"
         )
+    unobserved = tuple(
+        sorted(
+            set(previous_contracts.missing_identities)
+            | set(current_contracts.missing_identities)
+        )
+    )
+    if unobserved:
+        # Never compare two defaulted objects for equality: an unobserved
+        # identity is not evidence that the contract is unchanged.
+        return PlanTransitionClassification(
+            "broad",
+            "the cross-cutting plan contract identity/identities "
+            f"{', '.join(unobserved)} could not be observed on both sides",
+        )
     changed = previous_contracts.differences(current_contracts)
     if changed:
         return PlanTransitionClassification(
@@ -912,9 +949,12 @@ def select_plan_reviewers(
         elif classification.broad:
             # Any cross-cutting contract change, full-state rewrite, unbindable
             # sidecar, or unreconstructible ledger reactivates the complete
-            # board once the panel has opened.
+            # board once the panel has opened, and raises the durable automatic
+            # latch so the run cannot narrow back to owner-scoped remediation on
+            # the next transition.
             selected = available_required
             selected_phase = "full-board"
+            latches_force_full = True
             reason = (
                 f"{POST_PANEL_PREFIX}full plan board required after panel evidence: "
                 f"{classification.reason}"
