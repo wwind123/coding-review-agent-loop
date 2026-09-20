@@ -1,6 +1,7 @@
 import base64
 import dataclasses
 import json
+import re
 
 import pytest
 
@@ -2014,3 +2015,93 @@ def test_oversized_retained_excerpt_is_shortened_in_the_parent_summary():
     assert "https://example/issues/904" in body
     assert "Retained scope line 0:" in body
     assert "canonical plan comment" in body
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        pytest.param("保留された親スコープの詳細な説明文です。", id="cjk"),
+        pytest.param('He said "\\\\path\\to\\file" — \U0001f9ea test\t', id="escape-heavy"),
+    ],
+)
+def test_non_ascii_retained_excerpt_is_shortened_in_the_parent_summary(unit):
+    """#907: the excerpt budget must measure the rendered body, not characters.
+
+    `_encode_json_payload` serializes with `ensure_ascii=True`, so a CJK
+    character costs a six-character escape (an emoji, a surrogate pair) before
+    base64 expands it again.  A character-ratio budget retains far more text
+    than the body can hold and the summary still overflows.
+    """
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    huge_excerpt = "\n".join(f"{index}: {unit * 20}" for index in range(3_000))
+    assert len(huge_excerpt) > MAX_GITHUB_BODY_CHARS
+    phase = PlanPhase(
+        title="Stage one",
+        scope="Implement the reviewed stage contract.",
+        non_goals="No rollout.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low.",
+        validation="Run the focused tests.",
+        parent_context="Approved parent plan.",
+        automation="agent-pr",
+        depends_on=(),
+    )
+
+    body = format_decomposition_parent_summary(
+        parent_issue=841,
+        mode="implement-by-phase",
+        plan_hash="a" * 16,
+        created=(
+            CreatedPhaseIssue(
+                phase=phase, issue_url="https://example/issues/904", issue_number=904
+            ),
+        ),
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="b" * 64, plan_hash="a" * 16, excerpt=huge_excerpt,
+        ),
+    )
+
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "Approved plan decomposed for issue #841." in body
+    assert "https://example/issues/904" in body
+    assert "canonical plan comment" in body
+    # The embedded record still decodes, and carries the same shortened excerpt.
+    encoded = re.search(r"<!-- AGENT_PLAN_DECOMPOSITION: (\S+) -->", body).group(1)
+    metadata = _decode_metadata(encoded)
+    assert metadata.retained_parent_scope is not None
+    assert metadata.retained_parent_scope.excerpt in body
+    assert len(metadata.retained_parent_scope.excerpt) < len(huge_excerpt)
+
+
+def test_parent_summary_overflow_names_the_surface_when_nothing_can_be_cut():
+    """A summary whose fixed sections overflow raises a precise diagnostic."""
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    phase = PlanPhase(
+        title="T" * 400,
+        scope="Implement the reviewed stage contract.",
+        non_goals="No rollout.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low.",
+        validation="Run the focused tests.",
+        parent_context="Approved parent plan.",
+        automation="agent-pr",
+        depends_on=(),
+    )
+    created = tuple(
+        CreatedPhaseIssue(phase=phase, issue_url=f"https://example/issues/{n}", issue_number=n)
+        for n in range(1, 120)
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        format_decomposition_parent_summary(
+            parent_issue=841,
+            mode="implement-by-phase",
+            plan_hash="a" * 16,
+            created=created,
+        )
+
+    message = str(excinfo.value)
+    assert "Decomposition parent summary for issue #841" in message
+    assert str(MAX_GITHUB_BODY_CHARS) in message
