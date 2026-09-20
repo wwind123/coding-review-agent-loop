@@ -306,11 +306,15 @@ def resolve_staged_phase_progress(
 ) -> tuple[PhaseProgress, ...]:
     """Resolve per-phase progress for a staged parent, in topology order.
 
-    Phases are resolved in order and resolution stops at the first phase that
-    is not complete: a later phase has nothing to contribute to the selection
-    and reading its child state would cost a GitHub call for no decision.  The
-    ordered-prefix invariant is still enforced across every later phase from
-    the recorded comments alone.
+    Selection stops at the first phase that is not complete: a later agent
+    phase has nothing to contribute to it, and reading its child state would
+    cost a GitHub call for no decision.  A later *human-owned* phase is still
+    resolved live, because an operator may have closed its child ahead of its
+    turn and that attestation belongs in the status lines - it simply confers
+    no authority to skip the earlier phase.  Those reads are skipped entirely
+    when no phase handoff exists for this topology, so a first run performs no
+    child-state lookup at all.  The ordered-prefix invariant is enforced across
+    every later phase from the recorded comments alone.
     """
     handoffs = _filter_outcome_handoffs(
         find_phase_implementation_handoffs_for_parent(
@@ -319,6 +323,8 @@ def resolve_staged_phase_progress(
         outcome=outcome,
     )
     by_index = _reconcile(outcome, handoffs, parent_issue=parent_issue)
+    # A first run has dispatched nothing, so it reads no child state at all.
+    dispatched_before = bool(by_index)
 
     progress: list[PhaseProgress] = []
     settled = False
@@ -338,6 +344,26 @@ def resolve_staged_phase_progress(
                     "or resuming either phase: finish or repair the earlier phase, or remove "
                     "the out-of-order handoff record, then rerun the parent."
                 )
+            later_state: str | None = None
+            later_status = STATUS_NOT_DISPATCHED
+            if (
+                automation != AGENT_AUTOMATION
+                and dispatched_before
+                and created.issue_number is not None
+            ):
+                # Report a human stage the operator already attested, without
+                # reading PR evidence and without letting it advance selection.
+                later_state = _read_child_issue_state(
+                    runner,
+                    config=config,
+                    parent_issue=parent_issue,
+                    phase_index=index,
+                    stage_id=stage_id,
+                    child_issue_number=created.issue_number,
+                )
+                later_status = (
+                    STATUS_COMPLETE if later_state == "CLOSED" else STATUS_HUMAN_PENDING
+                )
             progress.append(
                 PhaseProgress(
                     phase_index=index,
@@ -346,10 +372,10 @@ def resolve_staged_phase_progress(
                     created=created,
                     handoff=None,
                     child_issue_number=created.issue_number,
-                    child_state=None,
+                    child_state=later_state,
                     pr_number=None,
                     pr_state=None,
-                    status=STATUS_NOT_DISPATCHED,
+                    status=later_status,
                 )
             )
             continue

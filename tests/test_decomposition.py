@@ -2856,3 +2856,43 @@ def test_staged_progress_wraps_a_raw_parsing_failure_with_phase_context(monkeypa
     assert "Issue #56 could not authenticate phase 1 (`1`) from child issue #99" in message
     assert "Expecting value" in message
     assert isinstance(failure.value.__cause__, ValueError)
+
+
+def test_later_closed_human_stage_is_reported_while_an_earlier_phase_is_open(tmp_path, capsys):
+    """A human stage closed ahead of its turn renders as attested, not pending.
+
+    The earlier agent phase is still the selected, resumable one: the operator
+    keeps its hint, and the closed human stage confers no authority to skip it.
+    """
+    plan, created, summary = staged_legacy_plan_records(
+        stage_count=3, automations=("agent-pr", "human-action", "agent-pr")
+    )
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+        phase_handoff_comment(plan, created, 1),
+    ]
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={99: [], 100: [], 101: []},
+        issue_payloads_by_number={
+            99: {"state": "open"}, 100: {"state": "closed"}, 101: {"state": "open"},
+        },
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    output = capsys.readouterr().out
+    assert "1: in progress (#99)" in output
+    assert "2: complete (#100, human attestation)" in output
+    assert "2: pending" not in output
+    # The still-open earlier phase remains the resume target.
+    assert "resume directly with `agent-loop issue 99`" in output
+    # No PR evidence is read for the human stage, and phase 3 stays unread.
+    assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in runner.commands)
+    assert not any(
+        cmd[:2] == ["gh", "api"] and cmd[2].endswith("/issues/101")
+        for cmd, _cwd in runner.commands
+    )
+    assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
