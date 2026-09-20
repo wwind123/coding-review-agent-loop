@@ -7948,7 +7948,10 @@ def _implement_approved_issue(
                 approved_plan_hash_value=plan_hash,
             )
     else:
-        reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        reject_forged_protocol_markers(
+            initial_pr_context.metadata.body or "",
+            surface=f"pull-request #{pr_number} body",
+        )
     if isinstance(implementation_result, StructuredIssueImplementation):
         _validate_structured_response_tests_with_post_pr_context(
             implementation_result.tests_run,
@@ -10974,7 +10977,10 @@ def run_issue_loop(
                 issue_number=issue_number,
             )
         else:
-            reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+            reject_forged_protocol_markers(
+                initial_pr_context.metadata.body or "",
+                surface=f"pull-request #{pr_number} body",
+            )
         if isinstance(implementation_result, StructuredIssueImplementation):
             _validate_structured_response_tests_with_post_pr_context(
                 implementation_result.tests_run,
@@ -12960,7 +12966,10 @@ def run_pr_loop(
                     issue_number=managed_ci_issue_number,
                 )
                 if managed_ci_handoff is None:
-                    reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+                    reject_forged_protocol_markers(
+                        initial_pr_context.metadata.body or "",
+                        surface=f"pull-request #{pr_number} body",
+                    )
                 else:
                     # Ordinary PR recovery must bind authorization records to
                     # the canonical server-side issue/plan scope just as the

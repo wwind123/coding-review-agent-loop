@@ -4054,3 +4054,59 @@ def test_selector_guidance_forbids_command_strings_in_coder_and_correction_promp
         assert semantic_risk_claim_example_json() in text, name
     correction = " ".join(surfaces["correction"].split())
     assert "Command strings and handles outside this catalog are dropped" in correction
+
+
+# Issue #891: untrusted GitHub text that merely names a reserved protocol
+# record is ordinary prose. It must reach prompts defanged instead of stopping
+# the run, because the work that legitimately names a record is work on the
+# protocol itself.
+
+PLAN_FOLLOWUPS_TOKEN = "AGENT_PLAN_APPROVED_FOLLOWUPS"
+PLAN_FOLLOWUPS_LABEL = "[protocol PLAN_APPROVED_FOLLOWUPS record]"
+
+
+def _marker_naming_issue_context():
+    return IssueContext(
+        number=891,
+        repo="OWNER/REPO",
+        title=f"{PLAN_FOLLOWUPS_TOKEN} label is wrong",
+        body=f"The planner writes {PLAN_FOLLOWUPS_TOKEN} when it approves follow-ups.",
+        url="https://github.com/OWNER/REPO/issues/891",
+        comments=(
+            IssueComment(
+                author="human-user",
+                created_at="2026-09-19T00:00:00Z",
+                body=f"Agreed, and {PLAN_FOLLOWUPS_TOKEN} is also named in the PR body.",
+            ),
+        ),
+    )
+
+
+def test_issue_context_neutralizes_reserved_token_named_in_body_title_and_comment():
+    rendered = prompts_module.format_issue_context(_marker_naming_issue_context())
+
+    assert PLAN_FOLLOWUPS_TOKEN not in rendered
+    assert rendered.count(PLAN_FOLLOWUPS_LABEL) == 3
+    # Surrounding prose is preserved, so the planner still sees the request.
+    assert "when it approves follow-ups." in rendered
+    assert "is also named in the PR body." in rendered
+
+
+def test_compact_issue_context_neutralizes_reserved_token_named_in_body():
+    rendered = prompts_module._compact_issue_context_block(_marker_naming_issue_context())
+
+    assert PLAN_FOLLOWUPS_TOKEN not in rendered
+    assert PLAN_FOLLOWUPS_LABEL in rendered
+    assert "when it approves follow-ups." in rendered
+
+
+def test_compact_pr_review_context_neutralizes_tokens_in_pr_and_linked_issue_bodies():
+    rendered = prompts_module._compact_pr_review_issue_context_block(
+        _marker_naming_issue_context(),
+        f"This PR renames the {PLAN_FOLLOWUPS_TOKEN} record label.",
+    )
+
+    assert PLAN_FOLLOWUPS_TOKEN not in rendered
+    assert rendered.count(PLAN_FOLLOWUPS_LABEL) == 3
+    assert "record label." in rendered
+    assert "when it approves follow-ups." in rendered

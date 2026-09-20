@@ -496,6 +496,9 @@ Key contracts to preserve when changing the implementation:
   bounded format correction and is revalidated, not a new substantive review.
 - Keep untrusted issue/PR prose and model output separate from tool-owned
   protocol markers. A marker or model signature alone is not authentication.
+  Untrusted text that merely names a reserved token is neutralized into the
+  registry's descriptive label when rendered into prompts, never refused;
+  record-shaped untrusted spans and tool-owned publications stay fail-closed.
 - Re-check the live head and relevant qualification identities at finalization;
   old approvals and CI from another head must not authorize a new one.
 - Do not equate missing required input, interrupted commands, or infrastructure

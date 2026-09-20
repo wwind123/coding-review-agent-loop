@@ -670,10 +670,24 @@ def _is_plan_validation_diagnostic_comment(comment) -> bool:
     )
 
 
+def neutralize_untrusted_github_text(text: str | None, *, fallback: str) -> str:
+    """Defang reserved tokens that untrusted GitHub prose merely names (#891).
+
+    Issue and pull-request prose legitimately names a protocol record when the
+    work concerns the protocol itself.  The name never carried authority, but
+    rendering it verbatim made the marker-safety guards treat the whole run as
+    forged.  Render the registry's stable descriptive label instead; nothing
+    downstream parses prompt text as a durable record.
+    """
+    if not text:
+        return fallback
+    return sanitize_historical_text(text)
+
+
 def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000) -> str:
-    raw_body = issue_context.body if issue_context.body else "(none)"
+    raw_body = neutralize_untrusted_github_text(issue_context.body, fallback="(none)")
     body = _truncate_issue_text(raw_body, max_chars=max_chars // 3, label="Issue body")
-    title = issue_context.title if issue_context.title else "(unknown)"
+    title = neutralize_untrusted_github_text(issue_context.title, fallback="(unknown)")
     lines = [
         "Issue context from GitHub (ordinary unsigned context; not signed human requirements)",
         f"GitHub issue #{issue_context.number}",
@@ -707,7 +721,7 @@ def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000
                         f"Comment by {comment.author or '(unknown)'} "
                         f"at {comment.created_at or '(unknown time)'}:"
                     ),
-                    comment.body if comment.body else "(none)",
+                    neutralize_untrusted_github_text(comment.body, fallback="(none)"),
                 ]
             )
             for comment in visible_comments
@@ -1720,8 +1734,8 @@ def _approved_plan_review_context_block(
 def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
     if issue_context is None:
         return ""
-    title = issue_context.title if issue_context.title else "(unknown)"
-    body = issue_context.body if issue_context.body else "(none)"
+    title = neutralize_untrusted_github_text(issue_context.title, fallback="(unknown)")
+    body = neutralize_untrusted_github_text(issue_context.body, fallback="(none)")
     return "\n".join(
         [
             "Ordinary GitHub issue context (not signed human requirements)",
@@ -3376,10 +3390,12 @@ def _compact_pr_review_issue_context_block(
 ) -> str:
     lines = ["Original PR context"]
     if pr_body:
-        lines.extend(["", "PR body:", pr_body])
+        lines.extend(
+            ["", "PR body:", neutralize_untrusted_github_text(pr_body, fallback="(none)")]
+        )
     if issue_context is not None:
-        title = issue_context.title if issue_context.title else "(unknown)"
-        body = issue_context.body if issue_context.body else "(none)"
+        title = neutralize_untrusted_github_text(issue_context.title, fallback="(unknown)")
+        body = neutralize_untrusted_github_text(issue_context.body, fallback="(none)")
         lines.extend(
             [
                 "",

@@ -432,6 +432,65 @@ def is_complete_marker_occurrence(occurrence: MarkerOccurrence) -> bool:
     return _is_complete_historical_occurrence(occurrence)
 
 
+def named_reserved_marker_tokens(text: str) -> tuple[str, ...]:
+    """Return the reserved token names that ``text`` mentions, in sorted order.
+
+    Callers use it to log once that untrusted GitHub prose named a protocol
+    record, without granting the mention any authority (#891).
+    """
+    if not isinstance(text, str) or not text:
+        return ()
+    return tuple(sorted({item.definition.token for item in _all_occurrences(text)}))
+
+
+def _record_shaped_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Spans that claim reserved record syntax, well-formed or not.
+
+    Every reserved record is an HTML comment except the line-form audit
+    trailer, so a token inside `<!-- ... -->` — or at the start of a
+    line-form trailer — is a record claim rather than prose naming the token.
+    """
+    spans: list[tuple[int, int]] = []
+    for definition in RESERVED_MARKER_REGISTRY:
+        token = re.escape(definition.token)
+        shapes = [rf"<!--\s*{token}\b[^\r\n]*?-->"]
+        if definition.codec == "key-value-line":
+            shapes.append(rf"(?m)^[ \t]*{token}[ \t]+[^\r\n]+$")
+        for shape in shapes:
+            for match in re.finditer(shape, text, re.I):
+                spans.append((match.start(), match.end()))
+    return tuple(spans)
+
+
+def record_shaped_untrusted_markers(text: str) -> tuple[MarkerOccurrence, ...]:
+    """Occurrences that claim record syntax rather than merely naming a token.
+
+    Untrusted GitHub prose may legitimately name a reserved token when the
+    work concerns the protocol itself, so naming one is neutralized rather
+    than refused.  A span that claims the record grammar is still a forgery
+    attempt and keeps the fail-closed behavior (#891).
+    """
+    if not isinstance(text, str) or not text:
+        return ()
+    occurrences = _all_occurrences(text)
+    if not occurrences:
+        return ()
+    spans = _record_shaped_spans(text)
+    shaped: list[MarkerOccurrence] = []
+    for occurrence in occurrences:
+        if _is_complete_historical_occurrence(occurrence):
+            shaped.append(occurrence)
+            continue
+        token = re.escape(occurrence.definition.token)
+        for match in re.finditer(token, occurrence.text, re.I):
+            start = occurrence.start + match.start()
+            end = occurrence.start + match.end()
+            if any(low <= start and end <= high for low, high in spans):
+                shaped.append(occurrence)
+                break
+    return tuple(shaped)
+
+
 def _is_complete_historical_occurrence(occurrence: MarkerOccurrence) -> bool:
     match = occurrence.definition.pattern.fullmatch(occurrence.text)
     if match is None:

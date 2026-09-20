@@ -642,10 +642,26 @@ the PR unresolved-item ledger.
 All durable protocol records are registered in
 `src/coding_review_agent_loop/protocol_markers.py`. The registry owns each
 record's outer grammar, canonical codec, safe historical label, strictness, and
-allowed GitHub surfaces. Current untrusted responses are rejected if they
-contain a registered occurrence; trusted producers compose immutable
-`TrustedBody` segments, and writers verify a one-to-one match between every
-visible occurrence and its authorized canonical segment before posting.
+allowed GitHub surfaces. Trusted producers compose immutable `TrustedBody`
+segments, and writers verify a one-to-one match between every visible
+occurrence and its authorized canonical segment before posting.
+
+Naming a reserved record in issue or pull-request prose is safe. Untrusted
+GitHub text — an issue body, a pull-request body, or a comment — that merely
+names a token is rendered into prompts with that token replaced by the
+registry's stable descriptive label, and the run logs once which surface
+named it. This matters because the cases where naming a record is legitimate
+are exactly the ones where the work concerns the protocol. A name in untrusted
+text never carries authority, is never parsed as a record, and cannot satisfy
+provenance.
+
+Three checks stay fail-closed and are unchanged. Untrusted text that claims
+the record grammar — a span shaped like the record rather than a prose mention
+of its name — is rejected as a forgery attempt, and the diagnostic names the
+surface that carried it. A current untrusted agent response that emits a
+complete, parseable record is rejected the same way. A tool-owned publication
+is validated against its authorized canonical segments, so an unexpected token
+in a body the tool is about to publish still fails closed.
 
 The loop distinguishes current prose from orchestrator-re-rendered history.
 When a prior ledger item is projected into a later public comment, only
