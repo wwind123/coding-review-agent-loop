@@ -60,6 +60,7 @@ from coding_review_agent_loop.orchestrator import (
     _decode_round_metadata,
     _infer_staged_parent_issue,
     _plan_subject,
+    _resume_plan_round,
     _strip_round_metadata,
 )
 from coding_review_agent_loop.prompts import (
@@ -78,6 +79,7 @@ from coding_review_agent_loop.protocol import (
     PlanReviewItems,
     ReviewItemDisposition,
     UnresolvedReviewItem,
+    parse_plan_revision_patch,
     validate_structured_plan_state,
     validate_structured_issue_implementation,
     risk_test_matrix_prompt_examples,
@@ -3548,6 +3550,98 @@ def test_issue_loop_activates_semantic_revision_from_fresh_authenticated_base(tm
     }
     assert metadata.assembled_plan_sidecar is not None
     assert "Revised semantic plan." in runner.comments[2]
+
+
+
+def test_semantic_revision_replacing_architecture_impact_records_and_resumes(tmp_path):
+    """#879: an architecture_impact replacement must round-trip its provenance."""
+    fresh = structured_v1_plan_state()
+    parsed = validate_structured_plan_state(fresh)
+    base = AuthenticatedPlanState.from_plan(parsed, round_number=1)
+    architecture_impact = {
+        "status": "changed",
+        "rationale": "The revision adds a publication seam.",
+        "affected_components": ["round_state.py"],
+        "dependencies": [],
+        "execution_data_flows": ["plan round -> metadata"],
+        "persistence": ["round metadata"],
+        "public_contracts": [],
+        "security_boundaries": [],
+        "canonical_document_action": "update",
+        "canonical_document_path": "ARCHITECTURE.md",
+        "canonical_document_rationale": "Record the new seam.",
+    }
+    patch = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Apply the reviewed semantic decision.",
+        "prior_plan_item_dispositions": [
+            {"item_id": "item-1", "disposition": "resolved"}
+        ],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {
+                "op": "replace",
+                "field": "architecture_impact",
+                "value": architecture_impact,
+            }
+        ],
+    }
+    patch_text = (
+        json.dumps(patch)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = FakeRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking", blocking_plan_issues=["Review the plan."]
+            ),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+    )
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(tmp_path, max_rounds=3, plan_execution_mode="plan-only"),
+        plan_first=True,
+    ) == 0
+
+    raw_comment = runner.issue_comments[2]["body"]
+    match = re.search(
+        r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+        raw_comment,
+    )
+    assert match is not None
+    metadata = _decode_round_metadata(match.group("payload"))
+    assert metadata.response_form == "semantic-patch-v1"
+    assert metadata.raw_patch_provenance is not None
+    # The stored provenance must be JSON, and must equal a freshly
+    # re-serialized patch: restart compares exactly these two values.
+    assert metadata.raw_patch_provenance == json.loads(
+        json.dumps(metadata.raw_patch_provenance)
+    )
+    reparsed = parse_plan_revision_patch(metadata.raw_patch_provenance)
+    assert reparsed.to_payload() == metadata.raw_patch_provenance
+
+    # The recorded round must resume without tripping the integrity check.
+    resumed = _resume_plan_round(
+        [
+            type("Comment", (), {"body": comment["body"]})()
+            for comment in runner.issue_comments[:3]
+        ],
+        configured_reviewers=("codex",),
+    )
+    assert resumed is not None
 
 
 def test_semantic_revision_inherits_signed_requirement_dispositions(tmp_path):
@@ -8177,3 +8271,27 @@ def test_rest_recovery_merges_labeled_sidecars_missing_from_projection(monkeypat
 
     recovered = [comment for comment in merged if comment.comment_id and comment.comment_id >= 1000]
     assert [comment.body for comment in recovered] == sidecars
+
+
+def test_plan_round_metadata_failure_raises_diagnosed_error(tmp_path, monkeypatch):
+    """#879: a contradictory metadata record must not escape as a bare ValueError."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    real_metadata = orchestrator_module.PostedRoundMetadata
+
+    def _exploding(**kwargs):
+        if kwargs.get("flow") == "plan" and kwargs.get("role") == "coder":
+            raise ValueError("semantic patch metadata is incomplete")
+        return real_metadata(**kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "PostedRoundMetadata", _exploding)
+
+    with pytest.raises(AgentLoopError) as error:
+        run_issue_loop(
+            runner, issue_number=56, config=make_config(tmp_path), plan_first=True
+        )
+
+    assert "Could not record the plan round metadata" in str(error.value)
+    assert "semantic patch metadata is incomplete" in str(error.value)

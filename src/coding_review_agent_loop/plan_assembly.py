@@ -14,7 +14,6 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
 
 from .errors import AgentLoopError
 from .protocol import (
@@ -103,20 +102,6 @@ def _architecture_payload(value: ArchitectureImpact | None) -> dict[str, object]
         "canonical_document_rationale": value.canonical_document_rationale,
         "uncertainty": list(value.uncertainty),
     }
-
-
-def _json_normalized(value: Any) -> Any:
-    """Return ``value`` with tuples rendered as JSON arrays.
-
-    Structured payloads keep tuples for immutability, but stored provenance is
-    re-parsed with the ordinary wire parsers, which reject a tuple where a JSON
-    array is required (#879).
-    """
-    if isinstance(value, Mapping):
-        return {key: _json_normalized(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_normalized(item) for item in value]
-    return value
 
 
 def _dispositions_payload(values: Sequence[object]) -> list[dict[str, object]]:
@@ -753,9 +738,10 @@ def assemble_authenticated_plan_revision(
         round_number=result_round_number,
         response_form="semantic-patch-v1",
         # Provenance is re-parsed as a wire payload on every restart, and the
-        # parsers require JSON arrays. ``to_payload`` emits tuples for nested
-        # lists such as architecture_impact, so normalize before storing (#879).
-        raw_patch=_json_normalized(parsed_patch.to_payload()),
+        # stored copy is compared for equality against a freshly re-serialized
+        # patch.  ``PlanRevisionPatch.to_payload`` is the single normalizer:
+        # it emits JSON arrays, so both sides stay byte-comparable (#879).
+        raw_patch=parsed_patch.to_payload(),
     )
     return assembled, sidecar
 

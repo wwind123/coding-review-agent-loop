@@ -8686,9 +8686,8 @@ def _run_plan_first_loop(
                 rendered_plan=canonical_plan,
             )
             current_response_form = "fresh-plan-state"
-        plan_round_body = _attach_round_metadata(
-            public_plan_output,
-            PostedRoundMetadata(
+        try:
+            plan_round_metadata = PostedRoundMetadata(
                     flow="plan",
                     role="coder",
                     agent=coder_name,
@@ -8759,7 +8758,14 @@ def _run_plan_first_loop(
                         if current_plan_sidecar is not None else None
                     ),
             )
-        )
+        except ValueError as exc:
+            # A contradictory metadata record must not escape as a bare
+            # dataclass ValueError with no diagnostic (#879).
+            raise AgentLoopError(
+                "Could not record the plan round metadata for round 1 "
+                f"(response form {current_response_form or 'free-form'}): {exc}"
+            ) from exc
+        plan_round_body = _attach_round_metadata(public_plan_output, plan_round_metadata)
         if _post_plan_coder_round_comment(
             runner,
             config=config,
@@ -10198,9 +10204,8 @@ def _run_plan_first_loop(
             else None
         )
         coder_session_id = plan_response.session_id
-        plan_round_body = _attach_round_metadata(
-            public_comment,
-            PostedRoundMetadata(
+        try:
+            plan_round_metadata = PostedRoundMetadata(
                     flow="plan",
                     role="coder",
                     agent=coder_name,
@@ -10285,7 +10290,15 @@ def _run_plan_first_loop(
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
             )
-        )
+        except ValueError as exc:
+            # A contradictory metadata record must not escape as a bare
+            # dataclass ValueError with no diagnostic (#879).
+            raise AgentLoopError(
+                "Could not record the plan round metadata for round "
+                f"{round_number + 1} (response form "
+                f"{current_response_form or 'free-form'}): {exc}"
+            ) from exc
+        plan_round_body = _attach_round_metadata(public_comment, plan_round_metadata)
         if _post_plan_coder_round_comment(
             runner,
             config=config,
