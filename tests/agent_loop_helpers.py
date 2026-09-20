@@ -265,6 +265,8 @@ class FakeRunner(Runner):
         issue_payloads_by_number=None,
         issue_comments_by_number=None,
         pr_payloads_by_number=None,
+        malformed_issue_view_numbers=None,
+        malformed_pr_view_numbers=None,
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -311,6 +313,14 @@ class FakeRunner(Runner):
         self.pr_payloads_by_number = {
             int(number): dict(payload)
             for number, payload in (pr_payloads_by_number or {}).items()
+        }
+        # Unreadable `gh ... view --json` output for a specific number, so a
+        # caller's fail-closed boundary can be exercised (#918).
+        self.malformed_issue_view_numbers = {
+            int(number) for number in (malformed_issue_view_numbers or ())
+        }
+        self.malformed_pr_view_numbers = {
+            int(number) for number in (malformed_pr_view_numbers or ())
         }
         self.pr_check_runs_payload = pr_check_runs_payload or {
             "check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]
@@ -1088,6 +1098,9 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
 
         if cmd[:3] == ["gh", "pr", "view"]:
+            requested_pr = self._requested_number(cmd[3] if len(cmd) > 3 else None)
+            if requested_pr in self.malformed_pr_view_numbers:
+                return CommandResult(cmd, cwd_path, "not json at all", "", 0)
             payload = self._pr_payload_for(cmd[3] if len(cmd) > 3 else None)
             if "--jq" in cmd and ".headRefOid" in cmd:
                 return CommandResult(
@@ -1115,6 +1128,8 @@ class FakeRunner(Runner):
 
         if cmd[:3] == ["gh", "issue", "view"]:
             number = self._requested_number(cmd[3] if len(cmd) > 3 else None)
+            if number in self.malformed_issue_view_numbers:
+                return CommandResult(cmd, cwd_path, "not json at all", "", 0)
             source = self._issue_payload_for(number)
             payload = {
                 "number": source.get("number", 56),

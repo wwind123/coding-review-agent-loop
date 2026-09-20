@@ -213,6 +213,16 @@ def _phase_read_context(
             "Repair that child's issue state or its canonical issue-to-PR handoff "
             "record, then rerun the parent."
         ) from exc
+    except (ValueError, TypeError, AttributeError, KeyError) as exc:
+        # Defence in depth: the GitHub readers translate unreadable payloads to
+        # AgentLoopError, but a residual parsing failure must still name the
+        # blocked parent and stage rather than escaping as a bare decode error.
+        raise AgentLoopError(
+            f"Issue #{parent_issue} could not authenticate phase {phase_index} "
+            f"(`{stage_id}`) from child issue #{child_issue_number}: {exc} "
+            "Repair that child's issue state or its canonical issue-to-PR handoff "
+            "record, then rerun the parent."
+        ) from exc
 
 
 def _read_child_issue_state(

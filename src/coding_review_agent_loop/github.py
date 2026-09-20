@@ -696,7 +696,7 @@ def get_pr_state(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> 
     )
     if result.returncode != 0:
         raise AgentLoopError(f"Unable to determine state of PR #{pr_number}.")
-    data = json.loads(result.stdout or "{}")
+    data = _load_json_object(result, description=f"the state of PR #{pr_number}")
     state = _optional_str(data.get("state"))
     if not state:
         raise AgentLoopError(f"Unable to determine state of PR #{pr_number}.")
@@ -1177,7 +1177,7 @@ def get_pr_review_context(
         ],
         cwd=cwd or active_workdir(config),
     )
-    data = json.loads(result.stdout or "{}")
+    data = _load_json_object(result, description=f"pull request #{pr_number}")
     comments = _parse_issue_comments(data.get("comments"))
     metadata = _parse_pr_metadata(data, config=config, pr_number=pr_number)
     log_untrusted_marker_neutralization(
@@ -1684,6 +1684,27 @@ def _parse_pr_human_requirements(data: dict[str, object]) -> tuple[HumanReviewRe
     return deduplicate_human_requirements(requirements)
 
 
+def _load_json_object(result, *, description: str) -> dict:
+    """Decode a `gh --json` projection, failing closed on unreadable output.
+
+    `json.loads` raises `JSONDecodeError`, and a non-object payload raises an
+    attribute error on the first `.get`.  Neither is an `AgentLoopError`, so a
+    caller that wraps GitHub reads with its own context would otherwise let an
+    unreadable payload escape unlabelled (#918).
+    """
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(
+            f"Unable to read {description}: GitHub CLI output is not JSON ({exc})."
+        ) from exc
+    if not isinstance(data, dict):
+        raise AgentLoopError(
+            f"Unable to read {description}: GitHub CLI output is not a JSON object."
+        )
+    return data
+
+
 def _read_issue_state_projection(
     runner: Runner, *, config: AgentLoopConfig, issue_number: int
 ) -> dict:
@@ -1713,18 +1734,9 @@ def _read_issue_state_projection(
             f"Unable to read issue #{issue_number} from {config.repo}: "
             f"`gh` exited {result.returncode}."
         )
-    try:
-        data = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise AgentLoopError(
-            f"Unable to read issue #{issue_number} from {config.repo}: "
-            f"GitHub CLI output is not JSON ({exc})."
-        ) from exc
-    if not isinstance(data, dict):
-        raise AgentLoopError(
-            f"Unable to read issue #{issue_number} from {config.repo}: "
-            "GitHub CLI output is not a JSON object."
-        )
+    data = _load_json_object(
+        result, description=f"issue #{issue_number} from {config.repo}"
+    )
     if data.get("is_pr"):
         raise AgentLoopError(
             f"#{issue_number} is a pull request, not an issue. Use `agent-loop pr {issue_number}`."
@@ -1936,7 +1948,7 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
         ],
         cwd=active_workdir(config),
     )
-    data = json.loads(result.stdout or "{}")
+    data = _load_json_object(result, description=f"issue #{issue_number}")
     comments = _merge_issue_comment_transport_identity(
         runner,
         config=config,

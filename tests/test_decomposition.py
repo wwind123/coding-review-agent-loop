@@ -2792,3 +2792,67 @@ def test_legacy_rerun_reports_recorded_summary_obligations(tmp_path, capsys):
     assert "Wire the recorded stages together." in output
     assert "remains open pending that operator-owned parent work" in output
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("surface", ["child-context", "pr-evidence"])
+def test_staged_parent_names_the_phase_when_a_child_payload_is_unreadable(tmp_path, surface):
+    """Unreadable child-context or PR-evidence output still names the phase.
+
+    `gh ... view --json` output that is not JSON raises inside the GitHub
+    readers, which is where it is translated to an `AgentLoopError`; the
+    progress boundary then attaches the parent, phase, stage and child.
+    """
+    plan, created, summary = staged_legacy_plan_records()
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+        phase_handoff_comment(plan, created, 1),
+    ]
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={99: [child_pr_handoff_comment(99, 912)]},
+        issue_payloads_by_number={99: {"state": "closed"}},
+        pr_payloads_by_number={912: pr_payload_for_state(912, "MERGED")},
+        malformed_issue_view_numbers=(99,) if surface == "child-context" else (),
+        malformed_pr_view_numbers=(912,) if surface == "pr-evidence" else (),
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    with pytest.raises(AgentLoopError) as failure:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    message = str(failure.value)
+    assert "Issue #56 could not authenticate phase 1 (`1`) from child issue #99" in message
+    assert "then rerun the parent" in message
+    # The underlying unreadable-payload cause survives.
+    assert "GitHub CLI output is not JSON" in message
+    assert failure.value.__cause__ is not None
+    assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+def test_staged_progress_wraps_a_raw_parsing_failure_with_phase_context(monkeypatch, tmp_path):
+    """The boundary's defence-in-depth layer labels a non-AgentLoopError too."""
+    created = (
+        CreatedPhaseIssue(phase=_recorded("One"), issue_url=None, issue_number=99),
+    )
+
+    def _raise(*_args, **_kwargs):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(
+        phase_progress_module, "find_phase_implementation_handoffs_for_parent",
+        lambda *_args, **_kwargs: (_handoff(1, 99),),
+    )
+    monkeypatch.setattr(phase_progress_module, "get_issue_state", _raise)
+
+    with pytest.raises(AgentLoopError) as failure:
+        resolve_staged_phase_progress(
+            _ExplodingRunner(),
+            config=make_config(tmp_path),
+            parent_issue=56,
+            parent_comments=(),
+            outcome=_outcome(created),
+        )
+    message = str(failure.value)
+    assert "Issue #56 could not authenticate phase 1 (`1`) from child issue #99" in message
+    assert "Expecting value" in message
+    assert isinstance(failure.value.__cause__, ValueError)
