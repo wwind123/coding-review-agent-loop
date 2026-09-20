@@ -423,6 +423,15 @@ def scan_reserved_markers(text: str) -> tuple[MarkerOccurrence, ...]:
     return _all_occurrences(text)
 
 
+def is_complete_marker_occurrence(occurrence: MarkerOccurrence) -> bool:
+    """Whether this span is a complete, parseable record rather than a mention.
+
+    Callers use it to separate an agent naming a token in prose, which is safe
+    to neutralize, from an attempt to emit a durable record (#891).
+    """
+    return _is_complete_historical_occurrence(occurrence)
+
+
 def _is_complete_historical_occurrence(occurrence: MarkerOccurrence) -> bool:
     match = occurrence.definition.pattern.fullmatch(occurrence.text)
     if match is None:

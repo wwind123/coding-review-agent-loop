@@ -490,7 +490,12 @@ from .plan_assembly import (
     hydrate_authenticated_plan_state,
     make_assembled_plan_sidecar,
 )
-from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
+from .protocol_markers import (
+    TrustedBody,
+    is_complete_marker_occurrence,
+    sanitize_historical_text,
+    scan_reserved_markers,
+)
 from .review_scheduling import (
     PANEL_OPENED_PHASES,
     GitChange,
@@ -1372,6 +1377,37 @@ def _candidate_source_texts(result: AgentResult) -> list[tuple[str, str]]:
 
 def _unfence_structured_json_blocks(text: str) -> str:
     return STRUCTURED_FENCE_RE.sub(lambda match: match.group("body").strip(), text)
+
+
+def _neutralize_untrusted_markers(
+    text: str, *, config: AgentLoopConfig, agent_name: str
+) -> str:
+    """Defang reserved markers an agent merely named in its prose (#891).
+
+    An agent describing protocol code legitimately writes a token such as a
+    split-warning record name.  Refusing the whole response makes any work on
+    the protocol itself unreviewable, so neutralize the span into its stable
+    label instead.  The markers still carry no authority: the sanitized text
+    cannot be parsed as a durable record, and tool-owned publications keep
+    their own fail-closed check.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    occurrences = scan_reserved_markers(text)
+    if not occurrences:
+        return text
+    # Emitting a complete, parseable record is a forgery attempt and keeps the
+    # existing fail-closed behavior.  Only bare names in prose are defanged.
+    if any(is_complete_marker_occurrence(item) for item in occurrences):
+        return text
+    sanitized = sanitize_historical_text(text)
+    names = ", ".join(sorted({item.definition.token for item in occurrences}))
+    log(
+        config,
+        f"{agent_name}: neutralized reserved protocol marker(s) named in the response "
+        f"prose: {names}",
+    )
+    return sanitized
 
 
 def _structured_response_candidates(text: str) -> list[str]:
@@ -3035,7 +3071,7 @@ def _run_validated_agent(
         plan_validation_capture_eligible = False
         if result.log_path is not None:
             log_paths.append(result.log_path)
-        text = result.text
+        text = _neutralize_untrusted_markers(result.text, config=config, agent_name=agent_name)
         usage = _resolve_usage_metadata(config=config, prompt=prompt, result=result)
         usage_record = None
         if usage_context is not None and usage is not None:
@@ -3101,7 +3137,9 @@ def _run_validated_agent(
             else:
                 # Let the existing agent-unavailable policy handle the valid
                 # envelope, even when the command itself failed.
-                text = artifact
+                text = _neutralize_untrusted_markers(
+                    artifact, config=config, agent_name=agent_name
+                )
 
         containment = result.containment
         target_exec_retryable = False
