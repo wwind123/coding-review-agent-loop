@@ -1434,3 +1434,109 @@ def test_freeform_fallback_candidate_accepts_equal_modifier_counts(builder, buck
             **{bucket: ["This path is not exploitable without the retry loop."]},
         )),
     )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_one_trailing_prose_finding_cannot_support_two_repaired_findings(builder, bucket):
+    # Issue #871 round 5, item-6: the freeform candidate list must represent one
+    # concern exactly once. Emitting both a line and the paragraph containing it
+    # gave a single trailing statement two equivalent candidates, so repair could
+    # duplicate it into two findings, match each copy injectively, and clear the
+    # inflated cardinality ceiling.
+    source = _trailing_prose_source(
+        builder, bucket, "The retry loop never terminates on a truncated response."
+    )
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking",
+                summary="Findings.",
+                **{bucket: [
+                    "The retry loop never terminates on a truncated response.",
+                    "The retry loop never terminates on a truncated response.",
+                ]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_a_wrapped_trailing_paragraph_is_one_candidate(builder, bucket):
+    # A multi-line paragraph is wrapped prose, so it joins into a single
+    # candidate and cannot support two findings either.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\nThe retry loop never terminates\non a truncated response.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: ["The retry loop never terminates on a truncated response."]},
+        )),
+    )
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking",
+                summary="Findings.",
+                **{bucket: [
+                    "The retry loop never terminates on a truncated response.",
+                    "The retry loop never terminates on a truncated response.",
+                ]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_protocol_footer_and_signature_are_not_finding_candidates(builder, bucket):
+    # The footer and signature are tool-owned structural records, so they may
+    # not stand in as reviewer prose for a repaired finding.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking", summary="Findings.", **{bucket: ["OpenAI Codex"]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_two_distinct_trailing_bullets_support_two_findings(builder, bucket):
+    # Two genuinely distinct bulleted concerns still yield two candidates.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\n- The retry loop never terminates on a truncated response.\n"
+        + "- The socket leak is unbounded under backpressure.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: [
+                "The retry loop never terminates on a truncated response.",
+                "The socket leak is unbounded under backpressure.",
+            ]},
+        )),
+    )

@@ -3124,6 +3124,10 @@ that sits *outside* the recovered JSON object: the object's own fields are
 structured data, and `summary` in particular is not a finding, so splitting the
 serialized payload into prose segments would let an approved source's summary be
 copied into a current-scope finding and then ground an inverted blocking verdict.
+Those freeform candidates are non-overlapping — a paragraph contributes either its
+individual bulleted lines or its joined prose, never both — so one trailing
+reviewer statement cannot be matched twice and raise the ceiling, and protocol
+footer and signature lines are structural records rather than candidates.
 An empty or marker-only source finding
 carries no prose and is therefore not a wildcard: it corresponds only to a
 target finding that is itself empty after the exempt sets are removed, which is

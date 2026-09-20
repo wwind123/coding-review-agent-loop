@@ -213,17 +213,45 @@ def _joined_text(value: object) -> str:
     return " ".join(fragment for fragment in _fragments(value) if fragment)
 
 
-def _prose_segments(text: str) -> list[str]:
-    segments: list[str] = []
+_PROTOCOL_RECORD_LINE_RE = re.compile(r"\A(?:<!--.*-->|--\s+\S.*)\Z", re.DOTALL)
+_LIST_ITEM_RE = re.compile(r"\A[-*\u2022]\s+(?P<body>.*)\Z", re.DOTALL)
+
+
+def _freeform_finding_candidates(text: str) -> list[str]:
+    """Non-overlapping reviewer-prose candidates drawn from freeform text.
+
+    Each concern must appear exactly once. A paragraph contributes EITHER its
+    individual lines (when it is a bulleted block) OR its joined prose, never
+    both: emitting a line and then the paragraph containing it would give one
+    trailing reviewer statement two equivalent candidates, which would let
+    repair duplicate it into two findings, match each copy injectively, and
+    raise the correspondence ceiling (#871).
+
+    Protocol footer and signature lines are tool-owned structural records, not
+    reviewer prose, so they are never candidates.
+    """
+    candidates: list[str] = []
     for block in re.split(r"\n\s*\n", text):
-        for line in block.splitlines():
-            stripped = line.strip().lstrip("-*\u2022 ").strip()
-            if stripped:
-                segments.append(stripped)
-        joined = " ".join(block.split())
+        lines = [line.strip() for line in block.splitlines()]
+        lines = [
+            line for line in lines
+            if line and not _PROTOCOL_RECORD_LINE_RE.match(line)
+        ]
+        if not lines:
+            continue
+        if any(_LIST_ITEM_RE.match(line) for line in lines):
+            # A bulleted block states one concern per line, so each line is its
+            # own candidate and the joined block is not emitted as well.
+            for line in lines:
+                match = _LIST_ITEM_RE.match(line)
+                body = (match.group("body") if match else line).strip()
+                if body:
+                    candidates.append(body)
+            continue
+        joined = " ".join(" ".join(lines).split())
         if joined:
-            segments.append(joined)
-    return segments
+            candidates.append(joined)
+    return candidates
 
 
 def coverage_predicate(text: str) -> bool:
@@ -329,7 +357,7 @@ def _validate_review_grounding(
         # not a finding. Splitting the serialized payload into prose segments
         # would let an approved source's summary be copied into a current-scope
         # blocking finding and then ground the inverted verdict (#871).
-        source_candidates = _prose_segments(_payload_and_trailing(raw)[1])
+        source_candidates = _freeform_finding_candidates(_payload_and_trailing(raw)[1])
 
     target_findings: list[tuple[str, str]] = []
     for name in buckets:
