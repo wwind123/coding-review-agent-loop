@@ -2896,3 +2896,42 @@ def test_later_closed_human_stage_is_reported_while_an_earlier_phase_is_open(tmp
     )
     assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+def test_human_first_topology_reports_a_later_closed_human_stage(tmp_path, capsys):
+    """A later human stage is resolved even when no phase handoff exists.
+
+    A human stage never carries a phase handoff, so its attestation cannot be
+    conditioned on one: here phase 1 is human and still open, phase 2 is human
+    and already closed, and the parent carries no handoff at all.
+    """
+    plan, created, summary = staged_legacy_plan_records(
+        stage_count=3, automations=("human-action", "human-action", "agent-pr")
+    )
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+    ]
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_payloads_by_number={
+            99: {"state": "open"}, 100: {"state": "closed"}, 101: {"state": "open"},
+        },
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    output = capsys.readouterr().out
+    assert "1: pending human work (#99)" in output
+    assert "2: complete (#100, human attestation)" in output
+    assert "2: pending" not in output
+    # Phase 1 is still the selected phase and stops the run.
+    assert "phase 1 (`1`) requires human work (human-action) on child issue #99" in output
+    # No PR evidence for a human stage, and the later agent phase stays unread.
+    assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in runner.commands)
+    assert not any(
+        cmd[:2] == ["gh", "api"] and cmd[2].endswith("/issues/101")
+        for cmd, _cwd in runner.commands
+    )
+    assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)

@@ -261,8 +261,14 @@ a missing or repeated child number, a record whose child or stage disagrees
 with its index, a duplicate record for one index, a record for a human-owned
 phase or an out-of-range index, and an ordered-prefix violation - a record for
 a phase later than the first incomplete one - each stop the run before any
-child state is read. Phases are then authenticated in order against live state
-and resolution stops at the first incomplete phase. An `agent-pr` phase is
+child state is read. Phases are then authenticated in order against live state.
+Selection stops at the first incomplete phase, and so does resolution of later
+`agent-pr` phases: with no recorded handoff there is nothing to authenticate,
+so no child state or PR evidence is read for them. A later human-owned phase is
+still resolved from its child issue state, because a human stage never carries
+a phase handoff and closure is its only durable signal; a child an operator
+closed ahead of its turn is reported as attested and still confers no authority
+to skip the earlier phase. An `agent-pr` phase is
 complete only when its child issue is CLOSED and its canonical issue-to-PR
 handoff names a MERGED pull request, authenticated by the same identity, URL
 and closing-contract checks that resume applies; an open child with a merged or
