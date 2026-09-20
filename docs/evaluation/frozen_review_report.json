@@ -1,5 +1,400 @@
 {
-  "artifact_sha256": "1de66ffcc3d2a7c3897a5f87708333090bd682b143cbc3a372c479b648a38b94",
+  "artifact_sha256": "e128065a580570acfc8a5e0156c9a696cb7719cec509936414a2a52b6eaca7bc",
+  "flows": {
+    "plan": {
+      "policies": {
+        "all-reviewers": {
+          "marginal_findings_beyond_primary": {
+            "status": "verified",
+            "value": {
+              "Anthropic Claude": [
+                "historical-plan-all-001:plan-untested-fallback"
+              ]
+            }
+          },
+          "metrics": {
+            "calls_avoided": {
+              "status": "verified",
+              "value": 0
+            },
+            "ci_failures": {
+              "status": "verified",
+              "value": 0
+            },
+            "coder_followup_rounds": {
+              "status": "verified",
+              "value": 2
+            },
+            "disagreements": {
+              "status": "verified",
+              "value": 1
+            },
+            "elapsed_seconds": {
+              "status": "verified",
+              "value": 300
+            },
+            "escaped_defects": {
+              "status": "verified",
+              "value": 1
+            },
+            "estimated_cost": {
+              "status": "verified",
+              "value": 2.1
+            },
+            "false_positives": {
+              "status": "verified",
+              "value": 0
+            },
+            "review_rounds": {
+              "status": "verified",
+              "value": 3
+            },
+            "reviewer_calls": {
+              "status": "verified",
+              "value": 6
+            },
+            "tokens": {
+              "status": "verified",
+              "value": 21000
+            },
+            "withdrawals": {
+              "status": "verified",
+              "value": 0
+            }
+          },
+          "primary_to_panel_approval_regressions": {
+            "reason": "approval-round measurement absent for runs: historical-plan-all-001",
+            "status": "unavailable",
+            "value": null
+          },
+          "run_count": 1,
+          "severity_weighted_marginal_findings": {
+            "status": "verified",
+            "value": {
+              "Anthropic Claude": 3
+            }
+          },
+          "status": "verified",
+          "valid_unique_findings": {
+            "status": "verified",
+            "value": 2
+          }
+        },
+        "primary-then-panel": {
+          "marginal_findings_beyond_primary": {
+            "status": "verified",
+            "value": {
+              "Anthropic Claude": [
+                "historical-plan-primary-panel-001:plan-untested-fallback"
+              ]
+            }
+          },
+          "metrics": {
+            "calls_avoided": {
+              "status": "verified",
+              "value": 3
+            },
+            "ci_failures": {
+              "status": "verified",
+              "value": 0
+            },
+            "coder_followup_rounds": {
+              "status": "verified",
+              "value": 2
+            },
+            "disagreements": {
+              "status": "verified",
+              "value": 1
+            },
+            "elapsed_seconds": {
+              "status": "verified",
+              "value": 260
+            },
+            "escaped_defects": {
+              "reason": "measurement absent or without verified provenance for runs: historical-plan-primary-panel-001",
+              "status": "unavailable",
+              "value": null
+            },
+            "estimated_cost": {
+              "status": "verified",
+              "value": 1.6
+            },
+            "false_positives": {
+              "status": "verified",
+              "value": 0
+            },
+            "review_rounds": {
+              "status": "verified",
+              "value": 3
+            },
+            "reviewer_calls": {
+              "status": "verified",
+              "value": 4
+            },
+            "tokens": {
+              "status": "verified",
+              "value": 16000
+            },
+            "withdrawals": {
+              "status": "verified",
+              "value": 0
+            }
+          },
+          "primary_to_panel_approval_regressions": {
+            "status": "verified",
+            "value": [
+              1
+            ]
+          },
+          "run_count": 1,
+          "severity_weighted_marginal_findings": {
+            "status": "verified",
+            "value": {
+              "Anthropic Claude": 3
+            }
+          },
+          "status": "verified",
+          "valid_unique_findings": {
+            "status": "verified",
+            "value": 2
+          }
+        }
+      },
+      "run_count": 2,
+      "title": "Frozen plan review policy evaluation"
+    },
+    "pr": {
+      "policies": {
+        "all-reviewers": {
+          "marginal_findings_beyond_primary": {
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "metrics": {
+            "calls_avoided": {
+              "status": "verified",
+              "value": 0
+            },
+            "ci_failures": {
+              "status": "verified",
+              "value": 0
+            },
+            "coder_followup_rounds": {
+              "status": "verified",
+              "value": 1
+            },
+            "disagreements": {
+              "status": "verified",
+              "value": 1
+            },
+            "elapsed_seconds": {
+              "status": "verified",
+              "value": 180
+            },
+            "escaped_defects": {
+              "status": "verified",
+              "value": 0
+            },
+            "estimated_cost": {
+              "status": "verified",
+              "value": 1.2
+            },
+            "false_positives": {
+              "status": "verified",
+              "value": 0
+            },
+            "review_rounds": {
+              "status": "verified",
+              "value": 2
+            },
+            "reviewer_calls": {
+              "status": "verified",
+              "value": 4
+            },
+            "tokens": {
+              "status": "verified",
+              "value": 12000
+            },
+            "withdrawals": {
+              "status": "verified",
+              "value": 0
+            }
+          },
+          "primary_to_panel_approval_regressions": {
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "run_count": 1,
+          "severity_weighted_marginal_findings": {
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "status": "verified",
+          "valid_unique_findings": {
+            "status": "verified",
+            "value": 2
+          }
+        },
+        "primary-then-panel": {
+          "marginal_findings_beyond_primary": {
+            "status": "verified",
+            "value": {
+              "Anthropic Claude": [
+                "historical-primary-panel-001:finding-escape"
+              ]
+            }
+          },
+          "metrics": {
+            "calls_avoided": {
+              "status": "verified",
+              "value": 1
+            },
+            "ci_failures": {
+              "status": "verified",
+              "value": 0
+            },
+            "coder_followup_rounds": {
+              "status": "verified",
+              "value": 1
+            },
+            "disagreements": {
+              "status": "verified",
+              "value": 1
+            },
+            "elapsed_seconds": {
+              "status": "verified",
+              "value": 150
+            },
+            "escaped_defects": {
+              "status": "verified",
+              "value": 0
+            },
+            "estimated_cost": {
+              "status": "verified",
+              "value": 0.95
+            },
+            "false_positives": {
+              "status": "verified",
+              "value": 0
+            },
+            "review_rounds": {
+              "status": "verified",
+              "value": 2
+            },
+            "reviewer_calls": {
+              "status": "verified",
+              "value": 3
+            },
+            "tokens": {
+              "status": "verified",
+              "value": 9500
+            },
+            "withdrawals": {
+              "status": "verified",
+              "value": 0
+            }
+          },
+          "primary_to_panel_approval_regressions": {
+            "status": "verified",
+            "value": [
+              1
+            ]
+          },
+          "run_count": 1,
+          "severity_weighted_marginal_findings": {
+            "status": "verified",
+            "value": {
+              "Anthropic Claude": 5
+            }
+          },
+          "status": "verified",
+          "valid_unique_findings": {
+            "status": "verified",
+            "value": 2
+          }
+        },
+        "selective-intermediate": {
+          "marginal_findings_beyond_primary": {
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "metrics": {
+            "calls_avoided": {
+              "status": "verified",
+              "value": 1
+            },
+            "ci_failures": {
+              "status": "verified",
+              "value": 0
+            },
+            "coder_followup_rounds": {
+              "status": "verified",
+              "value": 1
+            },
+            "disagreements": {
+              "status": "verified",
+              "value": 1
+            },
+            "elapsed_seconds": {
+              "status": "verified",
+              "value": 140
+            },
+            "escaped_defects": {
+              "reason": "measurement absent or without verified provenance for runs: historical-selective-001",
+              "status": "unavailable",
+              "value": null
+            },
+            "estimated_cost": {
+              "status": "verified",
+              "value": 0.9
+            },
+            "false_positives": {
+              "status": "verified",
+              "value": 0
+            },
+            "review_rounds": {
+              "status": "verified",
+              "value": 2
+            },
+            "reviewer_calls": {
+              "status": "verified",
+              "value": 3
+            },
+            "tokens": {
+              "status": "verified",
+              "value": 9000
+            },
+            "withdrawals": {
+              "status": "verified",
+              "value": 0
+            }
+          },
+          "primary_to_panel_approval_regressions": {
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "run_count": 1,
+          "severity_weighted_marginal_findings": {
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "status": "verified",
+          "valid_unique_findings": {
+            "status": "verified",
+            "value": 2
+          }
+        }
+      },
+      "run_count": 3,
+      "title": "Frozen PR review policy evaluation"
+    }
+  },
   "kind": "frozen_review_policy_evaluation",
   "policies": {
     "all-reviewers": {

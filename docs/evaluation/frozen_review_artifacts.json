@@ -3,6 +3,7 @@
   "runs": [
     {
       "run_id": "historical-all-001",
+      "flow": "pr",
       "policy": "all-reviewers",
       "findings": [
         {
@@ -47,6 +48,7 @@
     },
     {
       "run_id": "historical-selective-001",
+      "flow": "pr",
       "policy": "selective-intermediate",
       "findings": [
         {
@@ -97,6 +99,7 @@
     },
     {
       "run_id": "historical-primary-panel-001",
+      "flow": "pr",
       "policy": "primary-then-panel",
       "primary_reviewer": "OpenAI Codex",
       "primary_approval_round": 1,
@@ -140,6 +143,134 @@
       "label_provenance": {
         "source": "frozen-fixture:maintainer-triage",
         "verified": true
+      }
+    },
+    {
+      "run_id": "historical-plan-all-001",
+      "flow": "plan",
+      "policy": "all-reviewers",
+      "primary_reviewer": "OpenAI Codex",
+      "findings": [
+        {
+          "id": "plan-missing-migration-step",
+          "severity": "high",
+          "contributors": [
+            "OpenAI Codex"
+          ],
+          "valid": true
+        },
+        {
+          "id": "plan-untested-fallback",
+          "severity": "medium",
+          "contributors": [
+            "Anthropic Claude"
+          ],
+          "valid": true
+        }
+      ],
+      "metrics": {
+        "review_rounds": 3,
+        "coder_followup_rounds": 2,
+        "reviewer_calls": 6,
+        "tokens": 21000,
+        "elapsed_seconds": 300,
+        "estimated_cost": 2.1,
+        "ci_failures": 0,
+        "escaped_defects": 1,
+        "false_positives": 0,
+        "withdrawals": 0,
+        "disagreements": 1,
+        "calls_avoided": 0
+      },
+      "provenance": {
+        "source": "frozen-fixture:agent-loop-plan-round-log",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "frozen-fixture:maintainer-triage",
+        "verified": true
+      }
+    },
+    {
+      "run_id": "historical-plan-primary-panel-001",
+      "flow": "plan",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "OpenAI Codex",
+      "primary_approval_round": 2,
+      "panel_approval_round": 3,
+      "findings": [
+        {
+          "id": "plan-missing-migration-step",
+          "severity": "high",
+          "contributors": [
+            "OpenAI Codex"
+          ],
+          "valid": true
+        },
+        {
+          "id": "plan-untested-fallback",
+          "severity": "medium",
+          "contributors": [
+            "Anthropic Claude"
+          ],
+          "valid": true
+        }
+      ],
+      "rounds": [
+        {
+          "required_reviewers": [
+            "OpenAI Codex",
+            "Anthropic Claude"
+          ],
+          "selected_reviewers": [
+            "OpenAI Codex"
+          ]
+        },
+        {
+          "required_reviewers": [
+            "OpenAI Codex",
+            "Anthropic Claude"
+          ],
+          "selected_reviewers": [
+            "OpenAI Codex"
+          ]
+        },
+        {
+          "required_reviewers": [
+            "OpenAI Codex",
+            "Anthropic Claude"
+          ],
+          "selected_reviewers": [
+            "Anthropic Claude"
+          ]
+        }
+      ],
+      "metrics": {
+        "review_rounds": 3,
+        "coder_followup_rounds": 2,
+        "reviewer_calls": 4,
+        "tokens": 16000,
+        "elapsed_seconds": 260,
+        "estimated_cost": 1.6,
+        "ci_failures": 0,
+        "false_positives": 0,
+        "withdrawals": 0,
+        "disagreements": 1,
+        "calls_avoided": 3
+      },
+      "provenance": {
+        "source": "frozen-fixture:agent-loop-plan-round-log",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "frozen-fixture:maintainer-triage",
+        "verified": true
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "frozen-fixture:unmeasured",
+          "verified": false
+        }
       }
     }
   ]

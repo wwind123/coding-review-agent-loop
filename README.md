@@ -710,7 +710,11 @@ raise `--max-rounds` when enabling it. `--plan-review-force-full` authorizes the
 complete plan board and recovers the two ownership-ambiguity diagnostics; it
 cannot recover an unreadable planning history. Omitting the flags keeps today's
 full-board planning behavior unchanged, and discussion-mode and child-planning
-cycles always stay full-board. See
+cycles always stay full-board. `review-evaluation` reports planning runs in
+their own `plan` flow, separately from the PR rows, so staged and full-board
+planning can be compared on calls, tokens, latency, overlap, severity-weighted
+marginal findings, and escaped plan defects before any proposal to change the
+default. See
 [staged issue plan review](docs/local_agent_loop.md#staged-issue-plan-review).
 
 ## Safety and Permissions

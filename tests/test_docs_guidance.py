@@ -548,3 +548,25 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     # Carried approvals and the exclusions.
     assert "HUMAN_REQUIREMENTS_RESOLVED" in text
     assert "Discussion-mode scheduling and the child-planning cycle always invoke the full" in text
+
+
+def test_docs_document_the_flow_aware_planning_policy_evaluation():
+    text = LOCAL_AGENT_LOOP_DOC.read_text()
+    architecture = ARCHITECTURE.read_text()
+    readme = README.read_text()
+
+    # The flow dimension, its backward-compatible default, and per-flow
+    # uniqueness, aggregation, and titling.
+    assert "`flow` is `pr` or `plan` and defaults to `pr` only when the key is absent" in text
+    assert "is rejected rather\nthan assigned to the PR rows" in text
+    assert "`(flow, policy, run_id)`" in text
+    assert "Frozen plan review policy evaluation" in text
+    assert "`selective-intermediate` is PR-only" in text
+    assert "validated\n`flow` (`pr` or `plan`; only an absent key defaults to `pr`" in architecture
+    assert "`(flow, policy, run_id)`" in architecture
+    # The stale "no flow dimension today" caveat is replaced by the comparison
+    # the planning rows now support, with its provenance limit stated.
+    assert "no flow dimension today" not in text
+    assert "escaped plan defects are reported in\nthe `plan` flow" in text
+    assert "`unavailable` with a reason rather than borrowed" in text
+    assert "own `plan` flow" in readme

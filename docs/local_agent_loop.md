@@ -1496,8 +1496,8 @@ agent-loop review-evaluation docs/evaluation/frozen_review_artifacts.json \
   --format text
 ```
 
-Each run in the artifact carries `policy`, `run_id`, `findings`, optional
-`metrics`, `rounds`, `primary_reviewer`, and approval-round fields, plus
+Each run in the artifact carries `flow`, `policy`, `run_id`, `findings`,
+optional `metrics`, `rounds`, `primary_reviewer`, and approval-round fields, plus
 provenance: a run-level `provenance` object (`{"source": ..., "verified":
 true}`) covering metrics, round snapshots, and approval rounds; a
 `label_provenance` object covering the finding `valid` labels; and optional
@@ -1516,10 +1516,29 @@ rejected at load time and by direct evaluation, so a valid finding is never
 silently dropped from unique, marginal, or severity-weighted coverage while the
 row still reports `verified`. Finding IDs are namespaced
 by run, so identical IDs across runs never collide; two records with the same
-`policy` and `run_id` are rejected so distinct findings can never be collapsed
-into one. Marginal-beyond-primary rows are `not-applicable` for policies whose
+`flow`, `policy`, and `run_id` are rejected so distinct findings can never be
+collapsed into one.
+
+`flow` is `pr` or `plan` and defaults to `pr` only when the key is absent, so
+PR-only artifacts written before the flow dimension keep loading unchanged and
+produce byte-identical PR rows. An explicitly present `"flow": null` is a
+labeled run whose label is missing, not a legacy record, and is rejected rather
+than assigned to the PR rows. Run identity is unique per `(flow, policy, run_id)`,
+and aggregation and report titling are per flow. The text report prints a
+section titled `Frozen PR review policy evaluation` and one titled
+`Frozen plan review policy evaluation`, and the JSON report carries
+`flows.pr` and `flows.plan`
+(with the historical `policies` key still naming the PR rows). PR review and
+issue plan review share the `all-reviewers` and `primary-then-panel` policy
+names, so this separation is what keeps a planning run's calls, tokens,
+latency, reviewer overlap, findings, and escaped plan defects out of the PR
+rows and the reverse. `selective-intermediate` is PR-only and is rejected on a
+planning run rather than producing an always-empty planning row. Marginal-beyond-primary rows are `not-applicable` for policies whose
 runs declare no primary; a historical full-board run may declare a hypothetical
-`primary_reviewer` to measure what the other reviewers would have added. Runs
+`primary_reviewer` to measure what the other reviewers would have added; the
+frozen full-board planning run does exactly that, so reviewer overlap and
+severity-weighted marginal findings are comparable across both planning
+policies. Runs
 using `primary-then-panel` must declare their primary. Primary-to-panel
 approval regressions are a whole-policy measurement: if any primary-bearing run
 lacks either approval-round endpoint or verified run provenance, the row is
@@ -1722,11 +1741,17 @@ planning configuration and the semantic-dedupe isolated provider configuration
 both reset the planning policy, primary, and force-full fields. PR-flow
 scheduling, qualification, managed CI, branch protection, and merge behavior are
 unchanged. The staged planning policy remains non-default until a flow-separated
-frozen evaluation justifies the latency and cost tradeoff. That evaluation is
-not available yet: `review-evaluation` has no flow dimension today and reports
-PR policy rows only, so it cannot compare staged planning against full-board
-planning. Separating planning rows from PR rows by flow is a prerequisite that a
-later stage must deliver before the default can change.
+frozen evaluation justifies the latency and cost tradeoff. That comparison is
+now available: `review-evaluation` carries a `flow` dimension, and
+`docs/evaluation/frozen_review_artifacts.json` contains full-board and staged
+planning runs whose calls, tokens, latency, reviewer overlap, unique and
+severity-weighted marginal findings, and escaped plan defects are reported in
+the `plan` flow, separately from the PR rows. A measurement the frozen run
+never recorded, such as escaped plan defects on the staged run or the
+full-board run's absent primary-to-panel transition, is reported as
+`unavailable` with a reason rather than borrowed from the other run, so
+changing the default still needs runs whose provenance covers the measurement
+the decision rests on.
 
 ### Phased decomposition versus split materialization
 

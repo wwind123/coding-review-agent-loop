@@ -6,6 +6,9 @@ import pytest
 from coding_review_agent_loop.cli import main as cli_main
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.review_evaluation import (
+    FLOW_POLICIES,
+    FLOWS,
+    PLAN_POLICIES,
     POLICIES,
     evaluate_frozen_artifacts,
     load_frozen_artifacts,
@@ -434,11 +437,271 @@ def test_checked_in_fixture_report_is_reproducible_and_cli_never_touches_github(
     assert report["policies"]["primary-then-panel"]["metrics"]["calls_avoided"] == {
         "value": 1, "status": "verified",
     }
+    # The fixture carries both planning policies, reported separately from PR.
+    plan = report["flows"]["plan"]["policies"]
+    assert set(plan) == set(PLAN_POLICIES)
+    assert plan["all-reviewers"]["metrics"]["reviewer_calls"] == {"value": 6, "status": "verified"}
+    assert plan["all-reviewers"]["metrics"]["escaped_defects"] == {"value": 1, "status": "verified"}
+    assert plan["primary-then-panel"]["metrics"]["reviewer_calls"] == {"value": 4, "status": "verified"}
+    assert plan["primary-then-panel"]["metrics"]["tokens"] == {"value": 16000, "status": "verified"}
+    assert plan["primary-then-panel"]["metrics"]["elapsed_seconds"] == {"value": 260, "status": "verified"}
+    assert plan["primary-then-panel"]["metrics"]["calls_avoided"] == {"value": 3, "status": "verified"}
+    # Escaped plan defects were never measured for the staged run; the row says
+    # so instead of borrowing the full-board figure.
+    assert plan["primary-then-panel"]["metrics"]["escaped_defects"]["status"] == "unavailable"
+    # Reviewer overlap and severity-weighted marginal findings are reported for
+    # both planning policies, so staged planning can be compared against the
+    # full-board baseline rather than against a not-applicable row.
+    for policy in PLAN_POLICIES:
+        assert plan[policy]["marginal_findings_beyond_primary"]["status"] == "verified"
+        assert plan[policy]["severity_weighted_marginal_findings"] == {
+            "status": "verified", "value": {"Anthropic Claude": 3},
+        }
+    assert plan["all-reviewers"]["marginal_findings_beyond_primary"]["value"] == {
+        "Anthropic Claude": ["historical-plan-all-001:plan-untested-fallback"],
+    }
+    assert plan["primary-then-panel"]["marginal_findings_beyond_primary"]["value"] == {
+        "Anthropic Claude": ["historical-plan-primary-panel-001:plan-untested-fallback"],
+    }
+    assert plan["primary-then-panel"]["primary_to_panel_approval_regressions"] == {
+        "value": [1], "status": "verified",
+    }
+    # The full-board planning run has no primary-to-panel transition to
+    # measure, so that row is unavailable naming the run rather than estimated.
+    regressions = plan["all-reviewers"]["primary_to_panel_approval_regressions"]
+    assert regressions["status"] == "unavailable"
+    assert "historical-plan-all-001" in regressions["reason"]
 
     output = tmp_path / "report.json"
     assert cli_main(["review-evaluation", str(FIXTURE_ARTIFACTS), "--output", str(output)]) == 0
     assert json.loads(output.read_text(encoding="utf-8")) == expected
     assert cli_main(["evaluate-reviews", str(FIXTURE_ARTIFACTS), "--format", "text"]) == 0
-    assert "Frozen PR review policy evaluation" in capsys.readouterr().out
+    rendered = capsys.readouterr().out
+    assert "Frozen PR review policy evaluation" in rendered
+    assert "Frozen plan review policy evaluation" in rendered
     assert not any(command[:1] == ["gh"] for command in [])
     assert cli_main(["review-evaluation", str(tmp_path / "missing.json")]) == 1
+
+
+def _write(tmp_path, runs, name="runs.json"):
+    path = tmp_path / name
+    path.write_text(json.dumps({"schema_version": 1, "runs": runs}), encoding="utf-8")
+    return path
+
+
+def _plan_run(**overrides):
+    return _run(flow="plan", **overrides)
+
+
+def test_runs_default_to_the_pr_flow_and_reject_an_unknown_flow(tmp_path):
+    loaded = load_frozen_artifacts(_write(tmp_path, [_run()]))
+    assert [run["flow"] for run in loaded["runs"]] == ["pr"]
+
+    path = _write(tmp_path, [_run(flow="issue")])
+    with pytest.raises(AgentLoopError, match="unsupported flow"):
+        load_frozen_artifacts(path)
+    for bad in ("", "   ", 3, [], {}):
+        with pytest.raises(AgentLoopError, match="flow"):
+            load_frozen_artifacts(_write(tmp_path, [_run(flow=bad)]))
+
+
+def test_legacy_pr_only_artifact_without_flow_produces_byte_identical_pr_rows(tmp_path):
+    legacy_runs = [
+        {key: value for key, value in _run(run_id="legacy").items()},
+        {key: value for key, value in _run(run_id="legacy-full", policy="all-reviewers").items()},
+    ]
+    legacy = evaluate_frozen_artifacts(load_frozen_artifacts(_write(tmp_path, legacy_runs)))
+    labeled_runs = [dict(run, flow="pr") for run in legacy_runs]
+    labeled = evaluate_frozen_artifacts(load_frozen_artifacts(_write(tmp_path, labeled_runs, "labeled.json")))
+    assert legacy["flows"]["pr"]["policies"] == labeled["flows"]["pr"]["policies"]
+    # The historical ``policies`` key keeps naming the PR rows exactly.
+    assert legacy["policies"] == legacy["flows"]["pr"]["policies"]
+    assert legacy["flows"]["plan"]["run_count"] == 0
+    for policy in PLAN_POLICIES:
+        assert legacy["flows"]["plan"]["policies"][policy]["run_count"] == 0
+        assert legacy["flows"]["plan"]["policies"][policy]["status"] == "unavailable"
+
+
+def test_planning_runs_never_contaminate_pr_rows_and_pr_runs_never_contaminate_planning_rows(tmp_path):
+    pr_only = evaluate_frozen_artifacts(
+        load_frozen_artifacts(_write(tmp_path, [_run(run_id="shared")], "pr.json"))
+    )
+    plan_only = evaluate_frozen_artifacts(
+        load_frozen_artifacts(_write(tmp_path, [_plan_run(run_id="shared", metrics={"reviewer_calls": 99})], "plan.json"))
+    )
+    # The same policy name and the same run ID in both flows.
+    mixed = evaluate_frozen_artifacts(
+        load_frozen_artifacts(
+            _write(
+                tmp_path,
+                [_run(run_id="shared"), _plan_run(run_id="shared", metrics={"reviewer_calls": 99})],
+                "mixed.json",
+            )
+        )
+    )
+    assert mixed["flows"]["pr"]["policies"] == pr_only["flows"]["pr"]["policies"]
+    assert mixed["flows"]["plan"]["policies"] == plan_only["flows"]["plan"]["policies"]
+    pr_row = mixed["flows"]["pr"]["policies"]["primary-then-panel"]
+    plan_row = mixed["flows"]["plan"]["policies"]["primary-then-panel"]
+    assert pr_row["run_count"] == 1 and plan_row["run_count"] == 1
+    # Calls, findings, and every other measurement stay unpooled.
+    assert pr_row["metrics"]["reviewer_calls"] == {"value": 3, "status": "verified"}
+    assert plan_row["metrics"]["reviewer_calls"] == {"value": 99, "status": "verified"}
+    assert pr_row["valid_unique_findings"] == {"value": 2, "status": "verified"}
+    assert plan_row["valid_unique_findings"] == {"value": 2, "status": "verified"}
+    assert pr_row["marginal_findings_beyond_primary"]["value"] == {"secondary": ["shared:panel-finding"]}
+    assert plan_row["marginal_findings_beyond_primary"]["value"] == {"secondary": ["shared:panel-finding"]}
+
+
+def test_run_identity_uniqueness_is_per_flow_and_policy(tmp_path):
+    # The same ID in two flows is two namespaces, not a duplicate.
+    both_flows = load_frozen_artifacts(
+        _write(tmp_path, [_run(run_id="r"), _plan_run(run_id="r")], "both.json")
+    )
+    assert [(run["flow"], run["run_id"]) for run in both_flows["runs"]] == [("pr", "r"), ("plan", "r")]
+
+    duplicate = _write(tmp_path, [_plan_run(run_id="r"), _plan_run(run_id="r")], "dup.json")
+    with pytest.raises(AgentLoopError, match="repeat run ID 'r' for policy 'primary-then-panel' in flow 'plan'"):
+        load_frozen_artifacts(duplicate)
+    with pytest.raises(AgentLoopError, match="repeat run ID"):
+        evaluate_frozen_artifacts(
+            {"schema_version": 1, "runs": [_plan_run(run_id="r"), _plan_run(run_id="r")]}
+        )
+
+
+def test_a_pr_only_policy_is_rejected_on_a_planning_run(tmp_path):
+    assert FLOW_POLICIES["plan"] == PLAN_POLICIES
+    assert set(FLOWS) == {"pr", "plan"}
+    with pytest.raises(AgentLoopError, match="unsupported policy 'selective-intermediate' for flow 'plan'"):
+        load_frozen_artifacts(
+            _write(tmp_path, [_plan_run(policy="selective-intermediate", primary_reviewer=None)], "bad.json")
+        )
+    # The same policy stays valid on the PR flow.
+    assert load_frozen_artifacts(
+        _write(tmp_path, [_run(policy="selective-intermediate", primary_reviewer=None)], "ok.json")
+    )["runs"][0]["policy"] == "selective-intermediate"
+
+
+def test_text_report_titles_and_aggregates_each_flow_separately():
+    rendered = render_evaluation_report(
+        evaluate_frozen_artifacts(
+            {"schema_version": 1, "runs": [_run(), _plan_run(run_id="p1", metrics={"reviewer_calls": 99})]}
+        ),
+        human=True,
+    )
+    pr_section, plan_section = rendered.split("Frozen plan review policy evaluation")
+    assert pr_section.startswith("Frozen PR review policy evaluation")
+    # Only the PR flow reports the PR-only policy.
+    assert "selective-intermediate" in pr_section
+    assert "selective-intermediate" not in plan_section
+    assert "reviewer_calls: 3" in pr_section
+    assert "reviewer_calls: 99" in plan_section
+    assert "reviewer_calls: 99" not in pr_section
+
+
+@pytest.mark.parametrize("flow", ["issue", "PR-flow", "", "   ", 0, [], {}, 3, True])
+def test_direct_evaluation_rejects_a_malformed_flow_instead_of_dropping_or_defaulting(flow):
+    # Direct evaluation of an unvalidated artifact is an exercised public path.
+    # An unknown flow must not silently drop the run from every report, and a
+    # falsy wrong-typed flow must not be coerced into the pr default.
+    run = _run(run_id="odd-flow", flow=flow)
+    with pytest.raises(AgentLoopError, match="flow"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [run]})
+
+
+def test_only_an_absent_flow_key_defaults_to_pr_and_an_explicit_null_is_rejected(tmp_path):
+    # The compatibility exception covers legacy PR artifacts that carry no
+    # flow key at all. An explicit null is a labeled run missing its label, so
+    # assigning it to pr could let a planning run contaminate the PR rows.
+    absent = _run(run_id="absent-flow")
+    assert "flow" not in absent
+    report = evaluate_frozen_artifacts({"schema_version": 1, "runs": [absent]})
+    assert report["flows"]["pr"]["run_count"] == 1
+    assert report["flows"]["plan"]["run_count"] == 0
+    assert report["flows"]["pr"]["policies"]["primary-then-panel"]["run_count"] == 1
+    assert load_frozen_artifacts(_write(tmp_path, [absent]))["runs"][0]["flow"] == "pr"
+
+    explicit_null = _run(run_id="null-flow", flow=None)
+    for artifacts in (
+        {"schema_version": 1, "runs": [explicit_null]},
+        {"schema_version": 1, "runs": [_run(), explicit_null]},
+    ):
+        with pytest.raises(AgentLoopError, match="explicit null flow"):
+            evaluate_frozen_artifacts(artifacts)
+    with pytest.raises(AgentLoopError, match="explicit null flow"):
+        load_frozen_artifacts(_write(tmp_path, [explicit_null], "null.json"))
+
+
+def test_direct_evaluation_normalizes_flow_case_and_surrounding_space():
+    report = evaluate_frozen_artifacts(
+        {"schema_version": 1, "runs": [_run(run_id="cased", flow=" Plan ")]}
+    )
+    assert report["flows"]["plan"]["run_count"] == 1
+    assert report["flows"]["pr"]["run_count"] == 0
+    # A duplicate identity is still caught after normalization.
+    with pytest.raises(AgentLoopError, match="repeat run ID 'cased'"):
+        evaluate_frozen_artifacts(
+            {
+                "schema_version": 1,
+                "runs": [_run(run_id="cased", flow="plan"), _run(run_id="cased", flow=" PLAN ")],
+            }
+        )
+
+
+def test_direct_evaluation_rejects_a_policy_foreign_to_its_flow_instead_of_dropping_it():
+    # A policy string valid in the pr flow must not be silently unassignable in
+    # the plan flow: counting the run in flows.plan.run_count while no plan
+    # policy row holds it would hide its calls, tokens, latency, findings, and
+    # escaped defects from every report.
+    with pytest.raises(AgentLoopError, match="unsupported policy 'selective-intermediate' for flow 'plan'"):
+        evaluate_frozen_artifacts(
+            {
+                "schema_version": 1,
+                "runs": [
+                    _plan_run(
+                        run_id="foreign-policy",
+                        policy="selective-intermediate",
+                        primary_reviewer=None,
+                    )
+                ],
+            }
+        )
+    with pytest.raises(AgentLoopError, match="policy"):
+        evaluate_frozen_artifacts(
+            {"schema_version": 1, "runs": [_plan_run(run_id="blank-policy", policy="   ")]}
+        )
+    # The same policy stays valid on the pr flow through the direct path.
+    pr_report = evaluate_frozen_artifacts(
+        {
+            "schema_version": 1,
+            "runs": [_run(run_id="pr-selective", policy="selective-intermediate", primary_reviewer=None)],
+        }
+    )
+    assert pr_report["flows"]["pr"]["policies"]["selective-intermediate"]["run_count"] == 1
+
+
+@pytest.mark.parametrize("entry", ["oops", 3, None, ["run"], True])
+def test_direct_evaluation_rejects_a_non_object_run_instead_of_dropping_it(entry):
+    # The loading path already fails closed on a non-object run; the direct
+    # path must too, or the entry contributes to no flow run_count, no policy
+    # row, and no diagnostic.
+    with pytest.raises(AgentLoopError, match="must be an object"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [_run(), entry]})
+
+
+def test_every_counted_run_belongs_to_exactly_one_policy_row_of_its_flow():
+    report = evaluate_frozen_artifacts(
+        {
+            "schema_version": 1,
+            "runs": [
+                _run(run_id="pr-staged"),
+                _run(run_id="pr-full", policy="all-reviewers", primary_reviewer=None),
+                _plan_run(run_id="plan-staged"),
+                _plan_run(run_id="plan-full", policy="all-reviewers", primary_reviewer=None),
+            ],
+        }
+    )
+    for flow in FLOWS:
+        row = report["flows"][flow]
+        counted = sum(policy_row["run_count"] for policy_row in row["policies"].values())
+        assert counted == row["run_count"]
