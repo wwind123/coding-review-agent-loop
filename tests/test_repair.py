@@ -631,8 +631,9 @@ def test_attempt_repair_calls_cli_and_returns_text():
     mock_result.returncode = 0
     mock_result.stdout = repaired
 
+    source = malformed_pr_review_source(state="approved", summary="OK")
     with patch("coding_review_agent_loop.repair.subprocess.run", return_value=mock_result) as mock_run:
-        result = attempt_repair("malformed review", "gemini")
+        result = attempt_repair(source, "gemini")
 
     assert result == repaired
     mock_run.assert_called_once()
@@ -643,7 +644,7 @@ def test_attempt_repair_calls_cli_and_returns_text():
     assert "gemini-3.1-flash-lite" in cmd
     assert "--prompt" in cmd
     prompt_idx = cmd.index("--prompt")
-    assert "malformed review" in cmd[prompt_idx + 1]
+    assert source in cmd[prompt_idx + 1]
     assert call_args.kwargs["input"] is None
 
 
@@ -938,7 +939,9 @@ def test_attempt_repair_handles_json_wrapped_cli_output():
     mock_result.stdout = json_wrapped
 
     with patch("coding_review_agent_loop.repair.subprocess.run", return_value=mock_result):
-        result = attempt_repair("malformed review", "gemini")
+        result = attempt_repair(
+            malformed_pr_review_source(state="approved", summary="OK"), "gemini"
+        )
 
     assert result == repaired_text
 
@@ -981,7 +984,7 @@ def test_execute_repair_defaults_to_isolated_antigravity_and_records_usage(
     )
     usage = RunUsageContext("run-1", tmp_path / "usage.json")
     repaired, marker, attempts = execute_repair(
-        "malformed",
+        malformed_pr_review_source(state="approved"),
         runner=RepairRunner(antigravity_outputs=[(valid, 0)]),
         config=config,
         run_id="run-1",
@@ -1021,7 +1024,7 @@ def test_execute_repair_explicit_chain_falls_back_after_failure_and_invalid_outp
     )
     usage = RunUsageContext("run-2", tmp_path / "usage.json")
     repaired, _, attempts = execute_repair(
-        "malformed",
+        malformed_pr_review_source(state="approved"),
         runner=FakeRunner(antigravity_outputs=[("not structured", 0), (valid, 0)]),
         config=config,
         run_id="run-2",
@@ -1257,7 +1260,7 @@ def test_execute_repair_records_antigravity_failure_outcomes(
         agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json"
     )
     repaired, _, attempts = execute_repair(
-        "malformed",
+        malformed_pr_review_source(state="approved"),
         runner=FakeRunner(antigravity_outputs=[(output, returncode)]),
         config=make_config(tmp_path),
         run_id="run-3",
@@ -1304,7 +1307,7 @@ def test_execute_repair_records_spawn_error_with_log_path(tmp_path, monkeypatch)
             raise AgentLoopError("agy executable missing")
 
     repaired, _, attempts = execute_repair(
-        "malformed",
+        malformed_pr_review_source(state="approved"),
         runner=SpawnErrorRunner(),
         config=make_config(tmp_path),
         run_id="run-spawn",
@@ -1327,7 +1330,7 @@ def test_execute_repair_uses_configured_legacy_gemini_override(tmp_path):
     )
     with patch("coding_review_agent_loop.repair.subprocess.run", return_value=proc) as run:
         repaired, _, attempts = execute_repair(
-            "malformed",
+            malformed_pr_review_source(state="approved"),
             runner=FakeRunner(),
             config=config,
             run_id="run-4",
@@ -1350,7 +1353,7 @@ def test_execute_repair_sends_oversized_gemini_prompt_to_stdin(tmp_path, monkeyp
     valid = structured_pr_review(state="approved", reviewer="Google Gemini")
     proc = MagicMock(returncode=0, stdout=valid, stderr="")
     config = make_config(tmp_path, repair_backend="gemini")
-    raw = "large malformed response " * 20
+    raw = malformed_pr_review_source(state="approved") + "\n" + "trailing prose " * 20
 
     with patch("coding_review_agent_loop.repair.subprocess.run", return_value=proc) as run:
         repaired, _, attempts = execute_repair(
@@ -1393,7 +1396,7 @@ def test_antigravity_repair_validates_once_and_falls_back_to_catalog_chain(tmp_p
         antigravity_models=("ModelB", "ModelC"),
     )
     repaired, _, attempts = execute_repair(
-        "malformed", runner=runner, config=config, run_id="catalog",
+        malformed_pr_review_source(state="approved"), runner=runner, config=config, run_id="catalog",
         usage_context=None,
         validate=lambda text: parse_structured_pr_review(text, reviewer="Google Antigravity"),
         expected_kind="pr_review",
@@ -1428,7 +1431,7 @@ def test_antigravity_repair_accepts_agy_1_1_22_two_column_catalog(tmp_path, monk
     )
 
     repaired, _, attempts = execute_repair(
-        "malformed",
+        malformed_pr_review_source(state="approved"),
         runner=runner,
         config=config,
         run_id="catalog-1-1-22",
@@ -1497,7 +1500,7 @@ def _transient_repair(tmp_path, monkeypatch, *, outputs, public_response_outputs
         tmp_path, repair_models=repair_models, antigravity_models=antigravity_models
     )
     repaired, _, attempts = execute_repair(
-        "malformed", runner=runner, config=config, run_id="transient",
+        malformed_pr_review_source(state="approved"), runner=runner, config=config, run_id="transient",
         usage_context=usage_context, validate=_accept_valid_repair,
         expected_kind="pr_review",
     )
@@ -1681,7 +1684,7 @@ def test_cli_repair_backends_do_not_apply_antigravity_transient_signature(
     monkeypatch.setattr(repair_module, "run_cli_repair", fake_cli_repair)
     config = make_config(tmp_path, repair_backend=backend, repair_models=("model-x",))
     repaired, _, attempts = execute_repair(
-        "malformed", runner=FakeRunner(), config=config, run_id="cli",
+        malformed_pr_review_source(state="approved"), runner=FakeRunner(), config=config, run_id="cli",
         usage_context=None, validate=_accept_valid_repair, expected_kind="pr_review",
     )
     assert repaired is None
@@ -1713,10 +1716,8 @@ def test_runner_pty_timeout_is_opt_in_and_retains_combined_log(tmp_path):
 
 def test_run_pr_loop_uses_repair_pass_on_format_failure(tmp_path):
     """Repair pass is invoked when schema validation fails; repaired output is used."""
-    malformed_review = (
-        "Looks good overall.\n\n"
-        "AGENT_STATE: approved\n"
-        "-- OpenAI Codex"
+    malformed_review = malformed_pr_review_source(
+        state="approved", summary="Looks good overall."
     )
     repaired_review = (
         '{"schema_version":1,"kind":"pr_review","state":"approved","summary":"Looks good overall.",'
@@ -1794,7 +1795,11 @@ def test_run_validated_agent_envelope_normalization_semantic_defect_uses_repair(
         )
         + "\n\n<!-- AGENT_STATE: approved -->"
     )
-    repaired_review = structured_pr_review(state="approved", reviewer="Google Gemini")
+    repaired_review = structured_pr_review(
+        state="blocking",
+        reviewer="Google Gemini",
+        blocking_items=["This is semantically inconsistent."],
+    )
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
     normalized_review = attempt_envelope_normalization(malformed_review, expected_kind="pr_review")
@@ -1825,9 +1830,21 @@ def test_run_validated_agent_envelope_normalization_semantic_defect_uses_repair(
     )
 
 def test_run_validated_agent_attempt_repair_uses_envelope_normalized(tmp_path, monkeypatch):
-    raw_text = structured_pr_review(state="blocking", reviewer="Google Gemini") + "\ngarbage"
-    normalized_text = structured_pr_review(state="blocking", reviewer="Google Gemini")
-    repaired_text = structured_pr_review(state="approved", reviewer="Google Gemini")
+    raw_text = structured_pr_review(
+        state="blocking",
+        reviewer="Google Gemini",
+        blocking_items=[{"title": "Fix the leak", "detail": "The pool is never closed."}],
+    ) + "\ngarbage"
+    normalized_text = structured_pr_review(
+        state="blocking",
+        reviewer="Google Gemini",
+        blocking_items=[{"title": "Fix the leak", "detail": "The pool is never closed."}],
+    )
+    repaired_text = structured_pr_review(
+        state="blocking",
+        reviewer="Google Gemini",
+        blocking_items=["Fix the leak: The pool is never closed."],
+    )
 
     monkeypatch.setattr(
         "coding_review_agent_loop.orchestrator.attempt_envelope_normalization",
@@ -1862,8 +1879,16 @@ def test_run_validated_agent_attempt_repair_uses_envelope_normalized(tmp_path, m
     assert repair_inputs == [normalized_text]
 
 def test_run_validated_agent_attempt_repair_falls_back_to_text_when_no_normalization(tmp_path, monkeypatch):
-    raw_text = structured_pr_review(state="blocking", reviewer="Google Gemini")
-    repaired_text = structured_pr_review(state="approved", reviewer="Google Gemini")
+    raw_text = structured_pr_review(
+        state="blocking",
+        reviewer="Google Gemini",
+        blocking_items=[{"title": "Fix the leak", "detail": "The pool is never closed."}],
+    )
+    repaired_text = structured_pr_review(
+        state="blocking",
+        reviewer="Google Gemini",
+        blocking_items=["Fix the leak: The pool is never closed."],
+    )
 
     monkeypatch.setattr(
         "coding_review_agent_loop.orchestrator.attempt_envelope_normalization",
@@ -2132,17 +2157,20 @@ def test_run_validated_agent_combined_strip_path_ack_recovery(tmp_path, monkeypa
 
 def test_run_pr_loop_repairs_format_failure_with_5xx_source_line_reference(tmp_path):
     """A 500-series source line reference must not make deterministic format errors transient."""
-    malformed_review = (
-        "Looks good overall.\n\n"
-        "Note: orchestrator.py:577-581 currently falls back to parse_plan_state(text).\n"
-        "AGENT_STATE: approved\n"
-        "-- OpenAI Codex"
+    malformed_review = malformed_pr_review_source(
+        state="approved",
+        summary=(
+            "Looks good overall. Note: orchestrator.py:577-581 currently falls back "
+            "to parse_plan_state(text)."
+        ),
     )
-    repaired_review = (
-        '{"schema_version":1,"kind":"pr_review","state":"approved","summary":"Looks good overall.",'
-        '"blocking_items":[],"same_pr_followups":[],"future_followups":[],'
-        '"prior_item_dispositions":[]}'
-        "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+    repaired_review = structured_pr_review(
+        state="approved",
+        summary=(
+            "Looks good overall. Note: orchestrator.py:577-581 currently falls back "
+            "to parse_plan_state(text)."
+        ),
+        reviewer="OpenAI Codex",
     )
     runner = FakeRunner(
         codex_outputs=[malformed_review],
@@ -2621,13 +2649,17 @@ def test_pr_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_pat
     """When repair returns valid blocking, treat as reviewer blocking — no synthetic item."""
     approved_without_marker = structured_pr_review(
         state="approved",
+        summary="The absolute URL missing from the redirect is a defect.",
+        # Issue #871: the reviewer's own finding, so the repaired blocking item
+        # preserves it instead of promoting the summary into a fabricated one.
+        blocking_items=["The absolute URL missing from the redirect is a defect."],
         reviewer="OpenAI Codex",
         human_requirements_resolved=False,
     )
     repaired_blocking = structured_pr_review(
         state="blocking",
-        summary="Requirement 1 not satisfied: absolute URL missing.",
-        blocking_items=["Requirement 1 not satisfied: absolute URL missing."],
+        summary="The absolute URL missing from the redirect is a defect.",
+        blocking_items=["The absolute URL missing from the redirect is a defect."],
         reviewer="OpenAI Codex",
     )
     # Round 2: coder addresses item-1 (the repaired blocking item) + acks human requirements
@@ -2673,6 +2705,7 @@ def test_pr_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_pat
     assert not any("Orchestrator" in p and "acknowledging the signed human requirements" in p
                    for p in claude_prompts), \
         "Synthetic orchestrator item must not appear when repair returned valid blocking"
+
 
 def test_pr_loop_repair_missing_hr_marker_failure_uses_synthetic(tmp_path):
     """When repair fails (returns None), synthetic blocking item is injected."""
@@ -2747,14 +2780,18 @@ def test_plan_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_p
         state="approved",
         reviewer="OpenAI Codex",
         human_requirements_resolved=False,
+        summary="The plan changes the public API.",
+        # Issue #871: the reviewer's own finding, so the repaired blocking issue
+        # preserves it instead of promoting the summary into a fabricated one.
+        blocking_plan_issues=["The plan changes the public API."],
         human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
     )
     repaired_blocking = structured_plan_review(
         state="blocking",
-        summary="Requirement 1 not satisfied: plan changes the public API.",
-        blocking_plan_issues=["Requirement 1 not satisfied: plan changes the public API."],
+        summary="The plan changes the public API.",
+        blocking_plan_issues=["The plan changes the public API."],
         reviewer="OpenAI Codex",
-        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "blocked", "evidence": "The plan changes the public API."}],
+        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
     )
     revision = structured_plan_revision(
         summary="Revised plan preserving the public API.",
@@ -2885,7 +2922,7 @@ def test_repair_blocking_formerly_future_prior_item_explicit_disposition():
         state="blocking",
         summary="Fix the memory leak.",
         blocking_items=["Fix the memory leak"],
-        prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "blocking"}],
         reviewer="Reviewer",
     )
     mock_result = MagicMock()
@@ -2950,11 +2987,13 @@ def test_pr_loop_repair_blocking_records_same_pr_followups(tmp_path):
     """When repair returns blocking with same_pr_followups, those are recorded as same-pr items."""
     approved_without_marker = structured_pr_review(
         state="approved",
+        summary="Fix the error message formatting.",
         reviewer="OpenAI Codex",
         human_requirements_resolved=False,
     )
     repaired_blocking = structured_pr_review(
         state="blocking",
+        summary="Fix the error message formatting.",
         same_pr_followups=["Fix the error message formatting."],
         reviewer="OpenAI Codex",
     )
@@ -3002,13 +3041,18 @@ def test_plan_loop_repair_blocking_records_same_plan_followups(tmp_path):
         state="approved",
         reviewer="OpenAI Codex",
         human_requirements_resolved=False,
+        summary="Add a regression test for the parser edge case.",
+        # Issue #871: the reviewer's own followup, so the repaired same-plan
+        # entry preserves it instead of promoting the summary into a new finding.
+        same_plan_followups=["Add a regression test for the parser edge case."],
         human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
     )
     repaired_blocking = structured_plan_review(
         state="blocking",
+        summary="Add a regression test for the parser edge case.",
         same_plan_followups=["Add a regression test for the parser edge case."],
         reviewer="OpenAI Codex",
-        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "blocked", "evidence": "A parser regression test is required."}],
+        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
     )
     revision = structured_plan_revision(
         summary="Revised plan with regression test.",
@@ -3314,13 +3358,13 @@ def test_run_validated_agent_deterministic_strip_falls_through_to_repair_on_seco
     )
     malformed_review = structured_pr_review(
         state="approved",
-        summary="LGTM.",
+        summary="LGTM. item-2 is already covered by the current PR.",
         prior_item_dispositions=[{"item_id": "item-9", "disposition": "resolved"}],
         reviewer="Google Gemini",
     )
     repaired_review = structured_pr_review(
         state="approved",
-        summary="LGTM.",
+        summary="LGTM. item-2 is already covered by the current PR.",
         prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
         reviewer="Google Gemini",
     )
@@ -4661,6 +4705,177 @@ def test_round_resolved_history_uses_post_round_carried_set():
 
     assert "item-2" not in pre
     assert "item-2" in post
+
+
+# --- Issue #871: reviewer repair admission gate ------------------------------
+
+import re as _re
+
+from coding_review_agent_loop.errors import ReviewSubstanceIntegrityError
+from coding_review_agent_loop.repair import (
+    _REPAIR_PROMPT as _REPAIR_PROMPT_TEXT,
+    require_recoverable_review_substance,
+)
+from coding_review_agent_loop.repair_preservation import DISPOSITION_VALUE_ALIASES
+
+
+NARRATION_ONLY_REVIEWER_OUTPUT = (
+    "I have launched the test command for tests/test_test_runtime.py in the "
+    "background and will wait for it to complete.\n"
+    "root agent idle; waiting up to 5s for 1 background task(s)\n"
+    "terminating 1 background task(s) on exit"
+)
+
+
+@pytest.mark.parametrize("expected_kind", ["plan_review", "pr_review"])
+def test_narration_only_reviewer_source_is_refused(expected_kind):
+    with pytest.raises(ReviewSubstanceIntegrityError, match="no mechanically recoverable"):
+        require_recoverable_review_substance(
+            NARRATION_ONLY_REVIEWER_OUTPUT, expected_kind=expected_kind
+        )
+
+
+def test_narration_plus_bare_state_footer_is_refused():
+    source = NARRATION_ONLY_REVIEWER_OUTPUT + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Reviewer"
+    with pytest.raises(ReviewSubstanceIntegrityError):
+        require_recoverable_review_substance(source, expected_kind="plan_review")
+
+
+def test_explicit_wrong_kind_source_is_refused():
+    source = json.dumps({"kind": "coder_followup", "state": "approved", "summary": "Done."})
+    with pytest.raises(ReviewSubstanceIntegrityError, match="declares kind"):
+        require_recoverable_review_substance(source, expected_kind="pr_review")
+
+
+@pytest.mark.parametrize("invalid_kind", ["", "   ", None, 7, ["pr_review"], {}])
+def test_present_but_invalid_explicit_kind_is_refused(invalid_kind):
+    # Issue #871 round 1, item-2: the kind-unique-field fallback is authorized
+    # only for a source with NO `kind`. A present-but-invalid kind must be
+    # refused before any repair backend call, even when the payload also
+    # carries a kind-unique review field.
+    source = json.dumps({
+        "kind": invalid_kind,
+        "state": "blocking",
+        "summary": "Review incomplete.",
+        "blocking_items": ["The retry loop is open."],
+    })
+    with pytest.raises(ReviewSubstanceIntegrityError, match="declares kind"):
+        require_recoverable_review_substance(source, expected_kind="pr_review")
+
+
+def test_kindless_generic_payload_is_refused():
+    source = json.dumps({
+        "state": "blocking",
+        "summary": "Review incomplete.",
+        "future_followups": [],
+        "schema_version": 1,
+    })
+    with pytest.raises(ReviewSubstanceIntegrityError, match="no field unique"):
+        require_recoverable_review_substance(source, expected_kind="plan_review")
+
+
+def test_kindless_payload_with_a_kind_unique_field_is_admitted():
+    require_recoverable_review_substance(
+        json.dumps({"state": "blocking", "blocking_plan_issues": ["The retry loop is open."]}),
+        expected_kind="plan_review",
+    )
+    require_recoverable_review_substance(
+        json.dumps({"state": "blocking", "prior_item_dispositions": []}),
+        expected_kind="pr_review",
+    )
+
+
+def test_substantive_malformed_reviewer_source_is_admitted():
+    body = json.dumps({"kind": "pr_review", "state": "blocking",
+                       "blocking_items": ["Fix the leak."]})
+    # Fenced JSON, and a footer-less payload in the wrong bucket, both carry
+    # recoverable review substance and must still repair as they do today.
+    require_recoverable_review_substance(f"```json\n{body}\n```", expected_kind="pr_review")
+    require_recoverable_review_substance(body, expected_kind="pr_review")
+    require_recoverable_review_substance(
+        malformed_pr_review_source(state="blocking", blocking_items=["Fix the leak."]),
+        expected_kind="pr_review",
+    )
+
+
+def test_gate_refuses_before_any_repair_backend_call(tmp_path):
+    called = []
+
+    def fake_repair(raw, gemini_cmd, **kwargs):
+        called.append(raw)
+        return structured_plan_review(
+            state="blocking",
+            summary="Plan review incomplete: the test command was terminated.",
+            blocking_plan_issues=["Plan review incomplete: the test command was terminated."],
+            reviewer="Google Antigravity",
+        )
+
+    config = make_config(tmp_path)
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+        repaired, parsed, attempts = orchestrator._run_structured_repair(
+            NARRATION_ONLY_REVIEWER_OUTPUT,
+            runner=None,
+            config=config,
+            usage_context=None,
+            validate=lambda text: text,
+            repair_kwargs={"expected_kind": "plan_review"},
+        )
+
+    assert called == []
+    assert repaired is None and parsed is None
+    assert [attempt.outcome for attempt in attempts] == ["review_substance_integrity"]
+    assert attempts[0].backend == "none"
+
+
+def test_legacy_attempt_repair_hook_runs_reviewer_grounding(tmp_path):
+    source = malformed_pr_review_source(
+        state="blocking",
+        summary="Fix the leak in the pool handler.",
+        blocking_items=["Fix the leak in the pool handler."],
+        reviewer="Google Gemini",
+    )
+    fabricated = structured_pr_review(
+        state="blocking",
+        summary="Fix the leak in the pool handler.",
+        blocking_items=[
+            "Fix the leak in the pool handler.",
+            "PR review incomplete: the test command was terminated.",
+        ],
+        prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+        reviewer="Google Gemini",
+    )
+    config = make_config(tmp_path)
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair",
+               lambda raw, gemini_cmd, **kwargs: fabricated):
+        repaired, parsed, attempts = orchestrator._run_structured_repair(
+            source,
+            runner=None,
+            config=config,
+            usage_context=None,
+            validate=lambda text: text,
+            repair_kwargs={
+                "expected_kind": "pr_review",
+                "allowed_prior_item_ids": ("item-2",),
+            },
+        )
+
+    assert parsed is None
+    assert [attempt.outcome for attempt in attempts] == ["invalid_output"]
+    assert "grounding" in attempts[0].diagnostic
+
+
+def test_repair_prompt_alias_lines_match_the_guard_table():
+    block = _re.search(
+        r"### Invalid enum values:(?P<body>.*?)(?=\n##|\n### )",
+        _REPAIR_PROMPT_TEXT,
+        _re.DOTALL,
+    )
+    assert block is not None, "the repair prompt no longer carries an alias block"
+    pairs = dict(
+        _re.findall(r'"([^"]+)"\s*→\s*"([^"]+)"', block.group("body"))
+    )
+    assert pairs, "the alias block no longer lists normalization pairs"
+    assert pairs == DISPOSITION_VALUE_ALIASES
 
 
 def test_run_validated_agent_neutralizes_markers_named_in_response_prose(tmp_path):

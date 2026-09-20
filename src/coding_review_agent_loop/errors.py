@@ -23,6 +23,16 @@ class FreshContractIntegrityError(AgentLoopError):
     """A fresh plan cannot be format-repaired without recoverable v1 data."""
 
 
+class ReviewSubstanceIntegrityError(AgentLoopError):
+    """A reviewer turn carries no recoverable review payload to repair.
+
+    Repair is lossless format recovery.  When a reviewer response is narration,
+    diagnostics, or a bare protocol state footer, there is no verdict or finding
+    for a repair model to recover, and synthesizing one would post a fabricated
+    review on the reviewer's behalf.  Refuse instead, fail-closed.
+    """
+
+
 class UnknownPriorItemDispositionError(AgentLoopError):
     """Raised when an agent dispositions a non-carried prior item ID."""
 

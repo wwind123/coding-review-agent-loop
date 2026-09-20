@@ -740,7 +740,17 @@ def test_unparseable_json_uses_prompt_and_existing_validator_only():
 
 
 def test_invalid_source_kind_can_be_corrected_by_context_validator():
-    check({"kind": ["plan_review"]}, {"kind": "plan_review"})
+    # Non-reviewer kinds keep deferring an invalid source kind to the caller's
+    # schema/context validator.
+    check({"kind": ["coder_followup"]}, {"kind": "coder_followup"})
+
+
+def test_present_but_invalid_source_kind_fails_closed_for_a_reviewer_target():
+    # Issue #871: a reviewer target may never be grounded against a payload
+    # whose `kind` is present but is not that reviewer kind, whatever its type.
+    for invalid_kind in (["plan_review"], "", None, 7):
+        with pytest.raises(AgentLoopError, match="grounding"):
+            check({"kind": invalid_kind}, {"kind": "plan_review"})
 
 
 def test_leading_marker_and_footer_do_not_disable_checks():
@@ -797,3 +807,1138 @@ def test_no_reviewer_ids_become_signed_requirements():
               "evidence": "No signed human requirements were surfaced."}],
             context="coder_followup",
         )
+
+
+# --- Issue #871: reviewer repair grounding ----------------------------------
+
+from coding_review_agent_loop import repair_preservation as _rp
+
+
+def _plan_review(**fields):
+    payload = {"kind": "plan_review", "state": "blocking", "summary": "Findings."}
+    payload.update(fields)
+    return payload
+
+
+def _pr_review(**fields):
+    payload = {"kind": "pr_review", "state": "blocking", "summary": "Findings."}
+    payload.update(fields)
+    return payload
+
+
+def rejects(source, target, match="grounding"):
+    with pytest.raises(AgentLoopError, match=match):
+        check(source, target)
+
+
+def test_unsupported_blocking_finding_is_rejected():
+    source = _plan_review(blocking_plan_issues=["The retry loop never terminates."])
+    rejects(source, _plan_review(blocking_plan_issues=[
+        "The retry loop never terminates.",
+        "Plan review incomplete: the test command was terminated.",
+    ]))
+
+
+def test_unsupported_verdict_without_any_source_finding_is_rejected():
+    source = _plan_review(state="approved", summary="Plan is sound.", blocking_plan_issues=[])
+    rejects(source, _plan_review(
+        state="blocking",
+        summary="Plan is sound.",
+        blocking_plan_issues=["Plan review incomplete: the test command was terminated."],
+    ))
+
+
+def test_synthesized_approval_is_rejected_in_both_directions():
+    rejects(
+        _pr_review(state="blocking", blocking_items=["The pool is never closed."]),
+        _pr_review(state="approved", summary="Findings.", blocking_items=[]),
+    )
+    rejects(
+        _pr_review(state="unknown", summary="Findings."),
+        _pr_review(state="approved", summary="Findings."),
+    )
+
+
+def test_approval_by_demotion_into_the_future_bucket_is_rejected():
+    source = _pr_review(state="approved", blocking_items=["The pool is never closed."])
+    rejects(source, _pr_review(
+        state="approved",
+        blocking_items=[],
+        future_followups=["The pool is never closed."],
+    ))
+
+
+def test_approval_with_an_active_source_disposition_is_rejected():
+    source = _pr_review(
+        state="approved",
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "same-pr", "note": "Open."}],
+    )
+    rejects(source, _pr_review(state="approved", prior_item_dispositions=[]))
+
+
+def test_synthesized_future_followup_is_rejected():
+    source = _plan_review(blocking_plan_issues=["The retry loop never terminates."])
+    rejects(source, _plan_review(
+        blocking_plan_issues=["The retry loop never terminates."],
+        future_followups=["Consider adding a metrics dashboard."],
+    ))
+
+
+def test_repaired_finding_count_may_not_exceed_the_source_total():
+    source = _pr_review(blocking_items=["Fix the leak in the pool handler."])
+    rejects(source, _pr_review(blocking_items=[
+        "Fix the leak in the pool handler.",
+        "Fix the leak in the pool handler.",
+    ]))
+
+
+def test_two_repaired_findings_may_not_share_one_source_finding():
+    source = _pr_review(blocking_items=[
+        "Fix the leak in the pool handler.",
+        "Close the socket on error.",
+    ])
+    rejects(source, _pr_review(blocking_items=[
+        "Fix the leak in the pool handler.",
+        "Fix the leak.",
+    ]))
+
+
+@pytest.mark.parametrize("builder,bucket", [(_plan_review, "blocking_plan_issues"),
+                                            (_pr_review, "blocking_items")])
+def test_deleted_negation_inverts_a_matched_finding(builder, bucket):
+    source = builder(**{bucket: ["This path is not exploitable."]})
+    rejects(source, builder(**{bucket: ["This path is exploitable."]}))
+
+
+@pytest.mark.parametrize("apostrophe", ["'", "’"])
+def test_deleted_contracted_negation_inverts_a_matched_finding(apostrophe):
+    source = _pr_review(blocking_items=[f"This path isn{apostrophe}t exploitable."])
+    rejects(source, _pr_review(blocking_items=["This path is exploitable."]))
+
+
+def test_added_negation_inverts_a_matched_finding():
+    source = _pr_review(blocking_items=["This path is exploitable."])
+    rejects(source, _pr_review(blocking_items=["This path is not exploitable."]))
+
+
+def test_deleted_limiting_qualifier_inverts_a_matched_finding():
+    source = _plan_review(blocking_plan_issues=["The bug reproduces only on the retry path."])
+    rejects(source, _plan_review(
+        blocking_plan_issues=["The bug reproduces on the retry path."]
+    ))
+
+
+def test_in_place_contraction_expansion_keeps_equal_modifier_counts():
+    # The outer lossless check still pins the reviewer's literal wording; the
+    # grounding rule must not additionally read an expansion as an inversion.
+    assert (
+        _rp._modifier_counts("This path isn't exploitable.")
+        == _rp._modifier_counts("This path is not exploitable.")
+    )
+    assert (
+        _rp._modifier_counts("This path is exploitable.")
+        != _rp._modifier_counts("This path is not exploitable.")
+    )
+
+
+def test_documented_title_and_detail_concatenation_is_accepted():
+    detail = "Wire the capability getter; add a two-round test; no mutation on 503."
+    source = _plan_review(blocking_plan_issues=[
+        {"id": "item-1", "title": "Add coverage", "detail": detail},
+    ])
+    check(source, _plan_review(blocking_plan_issues=["Add coverage: " + detail]))
+
+
+def test_schema_supplied_summary_is_accepted():
+    source = _plan_review(
+        summary="",
+        blocking_plan_issues=["The retry loop never terminates."],
+    )
+    check(source, _plan_review(
+        summary="The retry loop never terminates.",
+        blocking_plan_issues=["The retry loop never terminates."],
+    ))
+
+
+def test_marker_neutralization_label_is_accepted():
+    source = _pr_review(
+        blocking_items=["The body embeds <!-- AGENT_LOOP_META: v1_abc --> verbatim."]
+    )
+    check(source, _pr_review(
+        blocking_items=["The body embeds [protocol LOOP_META record] verbatim."]
+    ))
+
+
+def test_worked_example_12_promotion_to_blocking_is_accepted():
+    source = _plan_review(
+        state="approved",
+        summary="Plan is sound.",
+        future_followups=["The migration must run before the backfill."],
+    )
+    check(source, _plan_review(
+        state="blocking",
+        summary="Plan is sound.",
+        blocking_plan_issues=["The migration must run before the backfill."],
+        future_followups=[],
+    ))
+
+
+def test_promotion_from_an_active_disposition_is_accepted():
+    source = _pr_review(
+        state="approved",
+        summary="Findings.",
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "same-pr", "note": "Still open."},
+        ],
+    )
+    check(source, _pr_review(
+        state="blocking",
+        summary="Findings.",
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "same-pr", "note": "Still open."},
+        ],
+    ))
+
+
+def test_absent_source_payload_fails_closed_for_a_reviewer_target():
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            "I launched the test command in the background and will wait.",
+            json.dumps(_plan_review(blocking_plan_issues=["Plan review incomplete."])),
+        )
+
+
+def test_wrong_kind_source_is_rejected_instead_of_returning_early():
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            json.dumps({"kind": "coder_followup", "summary": "Done."}),
+            json.dumps(_pr_review(blocking_items=["Fix the leak."])),
+        )
+
+
+def test_synthesized_carried_disposition_is_rejected():
+    source = _pr_review(blocking_items=["Fix the leak."], prior_item_dispositions=[])
+    rejects(source, _pr_review(
+        blocking_items=["Fix the leak."],
+        prior_item_dispositions=[{"item_id": "item-4", "disposition": "resolved"}],
+    ))
+
+
+def test_changed_disposition_value_is_rejected():
+    source = _plan_review(prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "blocking", "note": "The retry loop is open."},
+    ])
+    rejects(source, _plan_review(prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "resolved", "note": "The retry loop is open."},
+    ]))
+
+
+@pytest.mark.parametrize("note", [
+    "This is still open in the revised plan.",
+    "This is not already covered by the revised plan.",
+    "not handled by the current plan",
+])
+def test_unjustified_resolution_is_rejected(note):
+    source = _plan_review(prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "blocking", "note": note},
+    ])
+    rejects(source, _plan_review(prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "resolved", "note": note},
+    ]))
+
+
+def test_context_completed_id_written_as_resolved_is_rejected():
+    source = _pr_review(blocking_items=["Fix the leak."], prior_item_dispositions=[])
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            json.dumps(source),
+            json.dumps(_pr_review(
+                blocking_items=["Fix the leak."],
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            )),
+            allowed_prior_item_ids=("item-2",),
+        )
+
+
+def test_context_completed_id_as_active_disposition_is_accepted():
+    source = _pr_review(blocking_items=["Fix the leak."], prior_item_dispositions=[])
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(_pr_review(
+            blocking_items=["Fix the leak."],
+            prior_item_dispositions=[{"item_id": "item-2", "disposition": "blocking"}],
+        )),
+        allowed_prior_item_ids=("item-2",),
+    )
+
+
+def test_disposition_note_dropping_a_modifier_is_rejected():
+    source = _pr_review(prior_item_dispositions=[
+        {"item_id": "item-1", "disposition": "same-pr", "note": "Only the retry path is affected."},
+    ])
+    rejects(source, _pr_review(prior_item_dispositions=[
+        {"item_id": "item-1", "disposition": "same-pr", "note": "The retry path is affected."},
+    ]))
+
+
+def test_authorized_disposition_normalizations_are_accepted():
+    # Enum alias normalization plus a justified active-to-resolved change.
+    source = _plan_review(
+        state="blocking",
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "still blocking", "note": "The retry loop is open."},
+            {"item_id": "item-2", "disposition": "same-plan",
+             "note": "The revised plan already covers this."},
+            {"item_id": "item-3", "disposition": "future", "note": "Deferred work."},
+        ],
+    )
+    check(source, _plan_review(
+        state="blocking",
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "The retry loop is open."},
+            {"item_id": "item-2", "disposition": "resolved",
+             "note": "The revised plan already covers this."},
+            {"item_id": "item-3", "disposition": "blocking", "note": "Deferred work."},
+        ],
+    ))
+
+
+def test_deterministic_unknown_id_removal_stays_allowed():
+    source = _pr_review(prior_item_dispositions=[
+        {"item_id": "item-9", "disposition": "resolved", "note": "Unknown carried ID."},
+    ])
+    check(source, _pr_review(prior_item_dispositions=[]))
+
+
+def test_pinned_grounding_vocabulary_cannot_drift():
+    assert _rp.GROUNDING_STOP_WORDS == frozenset({
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+        "has", "have", "in", "into", "is", "it", "its", "no", "not", "of", "on",
+        "or", "that", "the", "their", "this", "to", "was", "were", "will", "with",
+    })
+    assert _rp.CONTRACTION_NORMALIZATIONS == (
+        ("can't", "cannot"),
+        ("cannot", "cannot"),
+        ("won't", "will not"),
+        ("shan't", "shall not"),
+    )
+    assert _rp.SEMANTIC_MODIFIERS == frozenset({
+        "no", "not", "never", "none", "neither", "nor", "cannot", "without",
+        "unless", "except", "only", "always", "must", "should", "may", "optional",
+        "required", "all", "any", "every", "some", "most", "least", "more", "less",
+        "fewer", "before", "after", "until",
+    })
+    assert _rp.COVERAGE_PHRASES == (
+        "already covered",
+        "is covered by",
+        "covers this",
+        "addressed by the current plan",
+        "addressed by the current pr",
+        "handled by the current plan",
+        "handled by the current pr",
+    )
+    assert _rp.NEGATION_MARKERS == (
+        "not", "never", "nor", "cannot", "without", "fails to", "yet to be",
+        "rather than",
+    )
+    # The still-open list is generated from the coverage list, so every coverage
+    # phrase automatically carries its single-word negated counterparts.
+    assert _rp.STILL_OPEN_PHRASES == frozenset({
+        "still open", "still missing", "still blocking", "remains open",
+        "remains unresolved",
+    }) | {
+        f"{marker} {phrase}"
+        for marker in _rp.NEGATION_MARKERS if " " not in marker
+        for phrase in _rp.COVERAGE_PHRASES
+    }
+    assert _rp.REVIEW_KIND_UNIQUE_FIELDS == {
+        "plan_review": frozenset({
+            "blocking_plan_issues", "same_plan_followups", "prior_plan_item_dispositions",
+        }),
+        "pr_review": frozenset({
+            "blocking_items", "same_pr_followups", "prior_item_dispositions",
+        }),
+    }
+    # Derived exempt sets stay tied to their single source of truth.
+    assert "blocking_plan_issues" in _rp.REVIEW_SCHEMA_VOCABULARY
+    assert {"protocol", "record"} <= _rp.NEUTRALIZATION_LABEL_TOKENS
+    from coding_review_agent_loop.protocol_markers import RESERVED_MARKER_REGISTRY
+    expected_labels = set()
+    for definition in RESERVED_MARKER_REGISTRY:
+        expected_labels.update(
+            token for token in definition.safe_label.casefold().replace("[", " ")
+            .replace("]", " ").replace("_", " ").replace("-", " ").split() if token
+        )
+    assert expected_labels <= _rp.NEUTRALIZATION_LABEL_TOKENS
+
+
+def test_coverage_predicate_is_negation_safe():
+    assert _rp.coverage_predicate("The revised plan already covers this.")
+    assert not _rp.coverage_predicate("This is not already covered by the revised plan.")
+    assert not _rp.coverage_predicate("not handled by the current plan")
+    assert not _rp.coverage_predicate("This isn't already covered.")
+    assert not _rp.coverage_predicate("The plan already covers this, but it is still open.")
+
+
+def test_context_completed_active_id_cannot_ground_a_blocking_verdict():
+    # Issue #871 round 1, item-1: an ID completed from the repair context is
+    # supplied by the orchestrator, not authored by the reviewer, so it is not
+    # evidence of open work and may never manufacture a blocking verdict from a
+    # source that carries no blocking state, finding, or active disposition.
+    source = _pr_review(
+        state="approved",
+        summary="The diff is correct.",
+        blocking_items=[],
+        prior_item_dispositions=[],
+    )
+    with pytest.raises(AgentLoopError, match="state: blocking"):
+        validate_repair_preservation(
+            json.dumps(source),
+            json.dumps(_pr_review(
+                state="blocking",
+                summary="The diff is correct.",
+                blocking_items=[],
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "blocking"}],
+            )),
+            allowed_prior_item_ids=("item-2",),
+        )
+
+
+def test_future_to_active_promotion_cannot_ground_a_blocking_verdict():
+    # The source `future` disposition is not open current-scope work, and the
+    # schema-mandated re-statement is authorized only because the target is
+    # blocking, so it can never be that blocking state's own support.
+    source = _plan_review(
+        state="approved",
+        summary="Plan is sound.",
+        blocking_plan_issues=[],
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "future", "note": "Deferred work."},
+        ],
+    )
+    with pytest.raises(AgentLoopError, match="state: blocking"):
+        check(source, _plan_review(
+            state="blocking",
+            summary="Plan is sound.",
+            blocking_plan_issues=[],
+            prior_plan_item_dispositions=[
+                {"item_id": "item-1", "disposition": "blocking", "note": "Deferred work."},
+            ],
+        ))
+
+
+def test_preserved_active_source_disposition_still_grounds_a_blocking_verdict():
+    source = _pr_review(
+        state="approved",
+        summary="The diff is correct.",
+        blocking_items=[],
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "The leak is open."},
+        ],
+    )
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(_pr_review(
+            state="blocking",
+            summary="The diff is correct.",
+            blocking_items=[],
+            prior_item_dispositions=[
+                {"item_id": "item-1", "disposition": "blocking", "note": "The leak is open."},
+            ],
+        )),
+        allowed_prior_item_ids=("item-1",),
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket", "findings_key"),
+    [
+        (_pr_review, "blocking_items", "blocking_items"),
+        (_plan_review, "blocking_plan_issues", "blocking_plan_issues"),
+    ],
+)
+def test_empty_source_finding_cannot_absorb_global_source_prose(
+    builder, bucket, findings_key
+):
+    # Issue #871 round 2, item-3: an empty source finding carries no prose, so
+    # it may not act as a wildcard. Whole-source token coverage alone cannot
+    # tell a finding apart from the summary or any other global prose, so a
+    # repair that promotes the source summary into a finding must be rejected
+    # even though every one of its tokens appears somewhere in the source.
+    source = builder(
+        state="approved",
+        summary="Close the socket leak",
+        **{findings_key: [{}]},
+    )
+    rejects(source, builder(
+        state="blocking",
+        summary="Close the socket leak",
+        **{bucket: ["Close the socket leak"]},
+    ))
+
+
+@pytest.mark.parametrize("builder", [_pr_review, _plan_review])
+def test_empty_source_finding_cannot_absorb_another_source_finding_text(builder):
+    # The same wildcard route must not let one source finding's text be
+    # duplicated into a second target finding through an empty source entry.
+    bucket = "blocking_items" if builder is _pr_review else "blocking_plan_issues"
+    source = builder(
+        state="blocking",
+        summary="Findings.",
+        **{bucket: ["The socket leak is unbounded.", {}]},
+    )
+    rejects(source, builder(
+        state="blocking",
+        summary="Findings.",
+        **{bucket: [
+            "The socket leak is unbounded.",
+            "The socket leak is unbounded.",
+        ]},
+    ))
+
+
+def test_marker_only_source_finding_still_accepts_its_neutralization():
+    # The empty-candidate branch stays open for the documented case it exists
+    # for: a source finding that is nothing but a reserved marker, replaced by a
+    # neutralization label whose tokens are exempt.
+    source = _pr_review(blocking_items=["<!-- AGENT_LOOP_META: v1_abc -->"])
+    check(source, _pr_review(blocking_items=["[protocol LOOP_META record]"]))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_summary_cannot_become_a_blocking_finding_without_source_findings(builder, bucket):
+    # Issue #871 round 3, item-4: when the payload declares no finding at all,
+    # the freeform fallback may not split the serialized payload into candidate
+    # prose. Otherwise an approved source whose summary reads like a defect can
+    # be repaired into a blocking finding, and that finding then grounds the
+    # inverted verdict.
+    source = builder(
+        state="approved",
+        summary="Close the socket leak",
+        **{bucket: []},
+    )
+    rejects(source, builder(
+        state="blocking",
+        summary="Close the socket leak",
+        **{bucket: ["Close the socket leak"]},
+    ))
+
+
+@pytest.mark.parametrize("builder", [_pr_review, _plan_review])
+def test_no_payload_field_can_become_a_finding_without_source_findings(builder):
+    # The same hole would also let a disposition note, or any other payload
+    # field, be promoted into a finding.
+    bucket = "blocking_items" if builder is _pr_review else "blocking_plan_issues"
+    field = "prior_item_dispositions" if builder is _pr_review else "prior_plan_item_dispositions"
+    source = builder(
+        state="blocking",
+        summary="Findings.",
+        **{
+            bucket: [],
+            field: [
+                {"item_id": "item-1", "disposition": "blocking",
+                 "note": "The retry loop never terminates."},
+            ],
+        },
+    )
+    rejects(source, builder(
+        state="blocking",
+        summary="Findings.",
+        **{
+            bucket: ["The retry loop never terminates."],
+            field: [
+                {"item_id": "item-1", "disposition": "blocking",
+                 "note": "The retry loop never terminates."},
+            ],
+        },
+    ))
+
+
+def test_freeform_prose_outside_the_payload_still_supports_a_finding():
+    # The fallback the approved plan describes stays available for its real
+    # case: reviewer prose that sits outside the recovered JSON object.
+    source = (
+        json.dumps(_pr_review(state="blocking", summary="Findings.", blocking_items=[]))
+        + "\n- The retry loop never terminates on a truncated response.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(_pr_review(
+            state="blocking",
+            summary="Findings.",
+            blocking_items=["The retry loop never terminates on a truncated response."],
+        )),
+    )
+
+
+def _trailing_prose_source(builder, bucket, prose):
+    """A payload declaring no finding, followed by reviewer prose."""
+    return (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + f"\n- {prose}\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize(
+    ("source_prose", "inverted"),
+    [
+        ("This path is not exploitable.", "This path is exploitable."),
+        ("This path isn't exploitable.", "This path is exploitable."),
+        ("This path isn’t exploitable.", "This path is exploitable."),
+        ("The leak happens only on the retry path.",
+         "The leak happens on the retry path."),
+        ("The leak happens on the retry path.",
+         "The leak happens only on the retry path."),
+    ],
+)
+def test_freeform_fallback_candidate_rejects_a_modifier_change(
+    builder, bucket, source_prose, inverted
+):
+    # Issue #871 round 4, item-5: a trailing-prose candidate is still a matched
+    # source/target pair, so modifier-count equality applies to it exactly as it
+    # does to a declared source finding. Subset coverage alone cannot see the
+    # deletion, because `not` is exempt and `only` simply disappears.
+    source = _trailing_prose_source(builder, bucket, source_prose)
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking", summary="Findings.", **{bucket: [inverted]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_freeform_fallback_candidate_accepts_equal_modifier_counts(builder, bucket):
+    # The fallback still works for a faithful recovery, including an in-place
+    # contraction expansion, which normalization makes identical on both sides.
+    source = _trailing_prose_source(
+        builder, bucket, "This path isn't exploitable without the retry loop."
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: ["This path is not exploitable without the retry loop."]},
+        )),
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_one_trailing_prose_finding_cannot_support_two_repaired_findings(builder, bucket):
+    # Issue #871 round 5, item-6: the freeform candidate list must represent one
+    # concern exactly once. Emitting both a line and the paragraph containing it
+    # gave a single trailing statement two equivalent candidates, so repair could
+    # duplicate it into two findings, match each copy injectively, and clear the
+    # inflated cardinality ceiling.
+    source = _trailing_prose_source(
+        builder, bucket, "The retry loop never terminates on a truncated response."
+    )
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking",
+                summary="Findings.",
+                **{bucket: [
+                    "The retry loop never terminates on a truncated response.",
+                    "The retry loop never terminates on a truncated response.",
+                ]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_a_wrapped_trailing_paragraph_is_one_candidate(builder, bucket):
+    # A multi-line paragraph is wrapped prose, so it joins into a single
+    # candidate and cannot support two findings either.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\nThe retry loop never terminates\non a truncated response.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: ["The retry loop never terminates on a truncated response."]},
+        )),
+    )
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking",
+                summary="Findings.",
+                **{bucket: [
+                    "The retry loop never terminates on a truncated response.",
+                    "The retry loop never terminates on a truncated response.",
+                ]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_protocol_footer_and_signature_are_not_finding_candidates(builder, bucket):
+    # The footer and signature are tool-owned structural records, so they may
+    # not stand in as reviewer prose for a repaired finding.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking", summary="Findings.", **{bucket: ["OpenAI Codex"]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_two_distinct_trailing_bullets_support_two_findings(builder, bucket):
+    # Two genuinely distinct bulleted concerns still yield two candidates.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\n- The retry loop never terminates on a truncated response.\n"
+        + "- The socket leak is unbounded under backpressure.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: [
+                "The retry loop never terminates on a truncated response.",
+                "The socket leak is unbounded under backpressure.",
+            ]},
+        )),
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_one_wrapped_trailing_bullet_supports_exactly_one_finding(builder, bucket):
+    # Issue #871 round 6, item-6: a bullet wrapped across physical lines is one
+    # list ITEM, so its continuation joins the item rather than becoming a second
+    # candidate that repair could match independently.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\n- The retry loop never terminates\n  on a truncated response.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: ["The retry loop never terminates on a truncated response."]},
+        )),
+    )
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking",
+                summary="Findings.",
+                **{bucket: [
+                    "The retry loop never terminates on a truncated response.",
+                    "The retry loop never terminates on a truncated response.",
+                ]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_two_wrapped_trailing_bullets_support_two_findings(builder, bucket):
+    # Two actual bullets, each wrapped, still yield two candidates.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\n- The retry loop never terminates\n  on a truncated response.\n"
+        + "- The socket leak is unbounded\n  under backpressure.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: [
+                "The retry loop never terminates on a truncated response.",
+                "The socket leak is unbounded under backpressure.",
+            ]},
+        )),
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_a_list_heading_plus_one_bullet_supports_exactly_one_finding(builder, bucket):
+    # Issue #871 round 7, item-6 and round 8, item-9: a lead-in line such as
+    # `Review concerns:` is list structure, not a concern. Emitting it as its own
+    # candidate let repair turn one bulleted concern into two injectively matched
+    # ledger findings, and prepending it to the first item let a repaired finding
+    # match on the heading's tokens alone while dropping the real concern. The
+    # lead-in is therefore dropped from the candidate list entirely.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\nReview concerns:\n"
+        + "- The retry loop never terminates on a truncated response.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: ["The retry loop never terminates on a truncated response."]},
+        )),
+    )
+    for fabricated in (
+        ["Review concerns"],
+        [
+            "Review concerns",
+            "The retry loop never terminates on a truncated response.",
+        ],
+    ):
+        with pytest.raises(AgentLoopError, match="grounding"):
+            validate_repair_preservation(
+                source,
+                json.dumps(builder(
+                    state="blocking", summary="Findings.", **{bucket: fabricated},
+                )),
+            )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_a_list_heading_does_not_reduce_two_real_bullets(builder, bucket):
+    # Joining the lead-in into the first item must not cost the second concern:
+    # two actual bullets under a heading still support two findings.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\nReview concerns:\n"
+        + "- The retry loop never terminates on a truncated response.\n"
+        + "- The socket leak is unbounded under backpressure.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: [
+                "The retry loop never terminates on a truncated response.",
+                "The socket leak is unbounded under backpressure.",
+            ]},
+        )),
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("exempt_only", ["blocking", "[protocol LOOP_META record]"])
+def test_empty_source_finding_cannot_become_an_exempt_only_finding(
+    builder, bucket, exempt_only
+):
+    # Issue #871 round 6, item-7: `_joined_text({})` is empty for the same reason
+    # a marker-only finding is, so without marker provenance an approved source
+    # carrying `[{}]` could be repaired into a blocking review whose finding is
+    # nothing but exempt tokens, and that match would ground the verdict.
+    source = builder(
+        state="approved", summary="The diff is correct.", **{bucket: [{}]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="The diff is correct.", **{bucket: [exempt_only]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("unsupported", [
+    "blocking",
+    "[protocol split-child record]",
+    "it is in the plan",
+])
+def test_marker_only_source_finding_only_accepts_its_own_label(
+    builder, bucket, unsupported
+):
+    # Issue #871 round 9, item-10: the neutralization exception is for replacing
+    # a source marker with ITS OWN authorized safe label. Accepting any
+    # exempt-only target instead let a marker-only source finding correspond to
+    # schema vocabulary (`blocking`), an unrelated registry safe label, or
+    # stop-word-only prose, and the source blocking state then grounded that
+    # fabricated ledger finding.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [unsupported]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_marker_only_source_finding_accepts_the_marker_kept_verbatim(builder, bucket):
+    # Leaving the marker in place is lossless, so it stays legal alongside the
+    # authorized neutralization.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    ))
+
+
+_LOOP_META_MARKER = "<!-- AGENT_LOOP_META: v1_abc -->"
+_LOOP_META_LABEL = "[protocol LOOP_META record]"
+_SPLIT_CHILD_MARKER = "<!-- AGENT_SPLIT_CHILD: parent=7 key=" + "a" * 64 + " -->"
+_SPLIT_CHILD_LABEL = "[protocol split-child record]"
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("neutralized", [
+    f"{_LOOP_META_LABEL} {_SPLIT_CHILD_LABEL}",
+    f"{_LOOP_META_MARKER} {_SPLIT_CHILD_LABEL}",
+    f"{_LOOP_META_LABEL} {_SPLIT_CHILD_MARKER}",
+])
+def test_two_marker_families_accept_a_complete_neutralization(
+    builder, bucket, neutralized
+):
+    # Issue #871 round 11, item-10: marker identity is tracked with occurrence
+    # cardinality, so a source finding carrying two distinct families is
+    # preserved when EVERY occurrence is either kept verbatim or replaced by its
+    # own safe label, in any mixture.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_MARKER} {_SPLIT_CHILD_MARKER}"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [neutralized]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("lossy", [
+    _LOOP_META_LABEL,
+    _SPLIT_CHILD_LABEL,
+    _LOOP_META_MARKER,
+    f"{_LOOP_META_LABEL} {_LOOP_META_LABEL}",
+])
+def test_two_marker_families_reject_a_dropped_or_duplicated_occurrence(
+    builder, bucket, lossy
+):
+    # Dropping either family, or duplicating one in place of the other, is a
+    # lossy repair: the frozenset comparison used to accept it because every safe
+    # label is an exempt token, so the target carried no content tokens.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_MARKER} {_SPLIT_CHILD_MARKER}"]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [lossy]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_repeated_same_family_markers_keep_their_cardinality(builder, bucket):
+    # Two occurrences of ONE family may not collapse into a single label either.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_MARKER} {_LOOP_META_MARKER}"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_LABEL} {_LOOP_META_LABEL}"]},
+    ))
+    check(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_MARKER} {_LOOP_META_LABEL}"]},
+    ))
+    for lossy in (_LOOP_META_LABEL, _LOOP_META_MARKER):
+        rejects(source, builder(
+            state="blocking", summary="Findings.", **{bucket: [lossy]},
+        ))
+
+
+# A malformed name-bearing-line fallback spans its whole line, so the
+# non-overlapping scanner reports one occurrence while the historical stripping
+# pass neutralizes BOTH mentions.
+_OVERLAPPING_MARKERS = "AGENT_SPLIT_UNFILED_WARNING AGENT_APPROVED_FOLLOWUPS"
+_SPLIT_WARNING_LABEL = "[protocol split-warning record]"
+_APPROVED_FOLLOWUPS_LABEL = "[protocol APPROVED_FOLLOWUPS record]"
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("neutralized", [
+    f"{_SPLIT_WARNING_LABEL} {_APPROVED_FOLLOWUPS_LABEL}",
+    _OVERLAPPING_MARKERS,
+])
+def test_overlapping_malformed_markers_accept_a_complete_neutralization(
+    builder, bucket, neutralized
+):
+    # Issue #871 round 12, item-10: provenance is counted from the registry's
+    # historical replacement spans, the same set the stripping pass uses, so a
+    # malformed fallback that hides a second reserved token on its line reports
+    # both occurrences. A complete neutralization stays accepted.
+    source = builder(
+        state="blocking", summary="Findings.", **{bucket: [_OVERLAPPING_MARKERS]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [neutralized]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("lossy", [
+    _SPLIT_WARNING_LABEL,
+    _APPROVED_FOLLOWUPS_LABEL,
+])
+def test_overlapping_malformed_markers_reject_a_dropped_occurrence(
+    builder, bucket, lossy
+):
+    # Counting the non-overlapping scan saw only the outer family, so a repaired
+    # finding naming one label satisfied the Counter equality while the hidden
+    # occurrence was silently dropped.
+    source = builder(
+        state="blocking", summary="Findings.", **{bucket: [_OVERLAPPING_MARKERS]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [lossy]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_marker_only_source_finding_rejects_an_unrelated_raw_marker(builder, bucket):
+    # Issue #871 round 10, item-10: joining strips every reserved marker, so an
+    # unrelated raw marker family also normalizes to the empty string. Marker
+    # identity is compared instead of accepting every empty result, so only the
+    # source's own family (or its safe label) is authorized.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_SPLIT_CHILD: parent=7 key=" + "a" * 64 + " -->"]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("exempt_only", ["blocking", "it is in the plan"])
+def test_substantive_source_finding_cannot_become_exempt_only_text(
+    builder, bucket, exempt_only
+):
+    # Issue #871 round 10, item-11: an exempt-only target has an empty
+    # content-token set, which is trivially a subset of ANY candidate, and
+    # whole-source coverage is vacuous for it. Without the substantive-content
+    # guard repair could replace a real reviewer finding with schema vocabulary
+    # or stop-word-only prose and still ground the blocking verdict.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["The socket leak is unbounded under backpressure."]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [exempt_only]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_modifier_only_source_finding_must_keep_its_modifiers(builder, bucket):
+    # The bounded rule for a modifier-only candidate: the target is not required
+    # to carry content tokens, but the modifier-count equality rule forces it to
+    # carry the same modifiers, so it cannot become exempt-only text either.
+    source = builder(
+        state="blocking", summary="Findings.", **{bucket: ["never"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.", **{bucket: ["never"]},
+    ))
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: ["blocking"]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_marker_only_source_finding_is_still_neutralizable_in_both_kinds(builder, bucket):
+    # The neutralization exception stays open for a finding that really was
+    # nothing but a reserved marker.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["[protocol LOOP_META record]"]},
+    ))

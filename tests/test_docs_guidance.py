@@ -416,6 +416,66 @@ def test_architecture_records_label_and_read_back_invariants():
     assert "producing login and ID" in text
 
 
+def test_docs_describe_reviewer_repair_admission_and_grounding():
+    """Issue #871: the canonical documents name the refusal boundary."""
+    doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    for fragment in (
+        "Reviewer repair is refused before any backend call",
+        "field unique",
+        "bare protocol state footer",
+        "agent-unavailable",
+        "empty-response",
+        "grounding check",
+        "Support is token\ncoverage",
+        "matched injectively",
+        "per-modifier occurrence counts",
+        "contraction normalization",
+        "negation-safe coverage predicate",
+        "manufacture an approval",
+    ):
+        assert fragment in doc, fragment
+
+    # Issue #871 round 7, item-8: the empty-finding rule must be stated once.
+    # An earlier round left a stale sentence saying an empty finding is a
+    # candidate that corresponds to an exempt-only target, directly next to the
+    # implemented rule that a genuinely empty entry is dropped. A reader of the
+    # security boundary cannot be handed both claims, so the superseded wording
+    # is asserted absent while the implemented rule is asserted present.
+    normalized = " ".join(doc.split())
+    assert "genuinely empty entry such as `{}` is dropped" in normalized
+    assert (
+        "A declared source finding that carries no prose is a candidate only "
+        "when it really was nothing but a reserved marker" in normalized
+    )
+    assert (
+        "it corresponds solely to its own authorized neutralization" in normalized
+    )
+    assert (
+        "Every other exempt-only target is refused, whichever candidate it is "
+        "matched against" in normalized
+    )
+    assert (
+        "compared by marker identity and occurrence count over the registry's "
+        "historical replacement spans" in normalized
+    )
+    assert "represent the COMPLETE source marker multiset" in normalized
+    assert (
+        "a target matched to a substantive candidate must therefore retain "
+        "substantive content of its own" in normalized
+    )
+    assert "An empty or marker-only source finding" not in normalized
+    assert (
+        "a lead-in line before the first bullet is list structure that is "
+        "dropped" in normalized
+    )
+    assert "joins the first item" not in normalized
+
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    assert "Reviewer repair is refused fail-closed" in architecture
+    assert "a refusal is a reviewer unavailability, never a synthesized verdict" in architecture
+    assert "proposal to evaluate, never an" in architecture
+
+
 def test_docs_describe_conflict_round_continuity_exception():
     # #829: the conflict-resolution round advances the head with no reviewer,
     # so both the canonical and operator contracts must name that transition.

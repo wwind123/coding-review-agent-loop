@@ -1,5 +1,6 @@
 """Bounded loss checks for parseable review and implementation repair inputs."""
 
+from collections import Counter
 from collections.abc import Callable, Sequence
 import re
 
@@ -10,7 +11,11 @@ from .protocol import (
     normalize_response_file_structured_text,
     parse_plan_revision_patch,
 )
-from .protocol_markers import historical_text_fragments
+from .protocol_markers import (
+    RESERVED_MARKER_REGISTRY,
+    historical_replacement_labels,
+    historical_text_fragments,
+)
 
 
 _KINDS = {
@@ -41,12 +46,651 @@ _ARCHITECTURE_LIST_KEYS = frozenset({
 _ARCHITECTURE_FLOW_ALIAS_KEYS = ("execution_flows", "data_flows")
 
 
+REVIEW_KINDS = frozenset({"plan_review", "pr_review"})
+
+# Bucket names carried by each review kind.  Order is (blocking, same-scope,
+# future); the first two are the current-scope buckets.
+REVIEW_FINDING_BUCKETS = {
+    "plan_review": ("blocking_plan_issues", "same_plan_followups", "future_followups"),
+    "pr_review": ("blocking_items", "same_pr_followups", "future_followups"),
+}
+REVIEW_DISPOSITION_FIELD = {
+    "plan_review": "prior_plan_item_dispositions",
+    "pr_review": "prior_item_dispositions",
+}
+# The kind's non-resolving active disposition values.  A carried item left in
+# one of these states is still open work.
+REVIEW_ACTIVE_DISPOSITIONS = {
+    "plan_review": frozenset({"blocking", "same-plan"}),
+    "pr_review": frozenset({"blocking", "same-pr"}),
+}
+# Fields unique to one review schema.  A kindless payload is admitted to repair
+# only on the strength of one of these; `summary`, `state`, `schema_version`,
+# `future_followups`, `human_requirement_dispositions`, and
+# `architecture_impact` are shared with other response schemas and are never
+# admission evidence.
+REVIEW_KIND_UNIQUE_FIELDS = {
+    "plan_review": frozenset({
+        "blocking_plan_issues", "same_plan_followups", "prior_plan_item_dispositions",
+    }),
+    "pr_review": frozenset({
+        "blocking_items", "same_pr_followups", "prior_item_dispositions",
+    }),
+}
+
+# The repair prompt's `### Invalid enum values:` normalization table.  A drift
+# assertion derives these pairs from `_REPAIR_PROMPT` itself.
+DISPOSITION_VALUE_ALIASES = {
+    "still blocking": "blocking",
+    "still same-pr": "same-pr",
+    "still same-plan": "same-plan",
+}
+
+# (A) A literal closed stop list.  Pinned verbatim by a test.
+GROUNDING_STOP_WORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+    "has", "have", "in", "into", "is", "it", "its", "no", "not", "of", "on",
+    "or", "that", "the", "their", "this", "to", "was", "were", "will", "with",
+})
+
+# (B) Schema vocabulary derived from the two review parsers' key names and
+# enum values.  Repair may supply these words while rewriting an envelope.
+REVIEW_SCHEMA_VOCABULARY = frozenset({
+    "blocking_plan_issues", "same_plan_followups", "blocking_items",
+    "same_pr_followups", "future_followups", "prior_plan_item_dispositions",
+    "prior_item_dispositions", "summary", "state", "kind", "schema_version",
+    "item_id", "disposition", "note", "reviewer", "architecture_impact",
+    "human_requirement_dispositions",
+    "approved", "blocking", "same-plan", "same-pr", "future", "resolved",
+})
+
+# (C) Carried item IDs are structural identifiers, not reviewer prose.
+ITEM_ID_PATTERN = re.compile(r"(?i)\bitem[-_ ]?\d+\b")
+
+# Polarity and limiting qualifiers whose deletion, addition, or substitution
+# inverts a matched finding's meaning.  Exempt from both the stop list and the
+# minimum-length rule so they stay visible to the comparison.
+SEMANTIC_MODIFIERS = frozenset({
+    "no", "not", "never", "none", "neither", "nor", "cannot", "without",
+    "unless", "except", "only", "always", "must", "should", "may", "optional",
+    "required", "all", "any", "every", "some", "most", "least", "more", "less",
+    "fewer", "before", "after", "until",
+})
+
+# Applied BEFORE punctuation is stripped: the tokenizer splits on
+# non-alphanumerics, so a contracted negation would otherwise be destroyed and
+# could never be counted.  Both apostrophe forms are normalized.
+CONTRACTION_NORMALIZATIONS = (
+    ("can't", "cannot"),
+    ("cannot", "cannot"),
+    ("won't", "will not"),
+    ("shan't", "shall not"),
+)
+_APOSTROPHE_FORMS = ("'", "\u2019")
+_GENERAL_CONTRACTED_NEGATION_RE = re.compile(r"(?i)\b([a-z]+)n['\u2019]t\b")
+
+COVERAGE_PHRASES = (
+    "already covered",
+    "is covered by",
+    "covers this",
+    "addressed by the current plan",
+    "addressed by the current pr",
+    "handled by the current plan",
+    "handled by the current pr",
+)
+NEGATION_MARKERS = (
+    "not", "never", "nor", "cannot", "without", "fails to", "yet to be",
+    "rather than",
+)
+_PINNED_STILL_OPEN_PHRASES = (
+    "still open", "still missing", "still blocking", "remains open",
+    "remains unresolved",
+)
+# Generated from the coverage list so every coverage phrase automatically
+# carries its negated counterparts.
+STILL_OPEN_PHRASES = frozenset(_PINNED_STILL_OPEN_PHRASES) | frozenset(
+    f"{marker} {phrase}"
+    for marker in NEGATION_MARKERS
+    if " " not in marker
+    for phrase in COVERAGE_PHRASES
+)
+
+_SENTENCE_SPLIT_RE = re.compile(r"[.;\n]|(?:^|\s)[-*\u2022]\s")
+
+
+def normalize_contractions(text: str) -> str:
+    """Rewrite contracted negatives to their canonical words."""
+    for contraction, replacement in CONTRACTION_NORMALIZATIONS:
+        for apostrophe in _APOSTROPHE_FORMS:
+            spelling = contraction.replace("'", apostrophe)
+            text = re.compile(re.escape(spelling), re.IGNORECASE).sub(replacement, text)
+    return _GENERAL_CONTRACTED_NEGATION_RE.sub(r"\1 not", text)
+
+
+def _neutralization_label_tokens() -> frozenset[str]:
+    """(D) Neutralization labels derived from the marker registry."""
+    tokens: set[str] = set()
+    for definition in RESERVED_MARKER_REGISTRY:
+        for token in re.split(r"[^0-9a-z]+", definition.safe_label.casefold()):
+            if token:
+                tokens.add(token)
+    return frozenset(tokens)
+
+
+NEUTRALIZATION_LABEL_TOKENS = _neutralization_label_tokens()
+
+_SCHEMA_VOCABULARY_TOKENS = frozenset(
+    token
+    for entry in REVIEW_SCHEMA_VOCABULARY
+    for token in re.split(r"[^0-9a-z]+", entry.casefold())
+    if token
+)
+
+
+def _raw_tokens(text: str) -> list[str]:
+    normalized = ITEM_ID_PATTERN.sub(" ", normalize_contractions(text)).casefold()
+    return [token for token in re.split(r"[^0-9a-z]+", normalized) if token]
+
+
+def _content_tokens(text: str) -> list[str]:
+    """Tokens that must be supported by the source."""
+    kept: list[str] = []
+    for token in _raw_tokens(text):
+        if token in SEMANTIC_MODIFIERS:
+            kept.append(token)
+            continue
+        if len(token) < 3 or token.isdigit():
+            continue
+        if token in GROUNDING_STOP_WORDS or token in _SCHEMA_VOCABULARY_TOKENS:
+            continue
+        if token in NEUTRALIZATION_LABEL_TOKENS:
+            continue
+        kept.append(token)
+    return kept
+
+
+def _modifier_counts(text: str) -> Counter:
+    return Counter(token for token in _raw_tokens(text) if token in SEMANTIC_MODIFIERS)
+
+
+def _joined_text(value: object) -> str:
+    return " ".join(fragment for fragment in _fragments(value) if fragment)
+
+
+def _raw_string_values(value: object) -> list[str]:
+    """Substantive strings of *value* WITHOUT reserved-marker stripping."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [text for child in value for text in _raw_string_values(child)]
+    if isinstance(value, dict):
+        return [
+            text for key, child in value.items()
+            if key not in _FINDING_METADATA_KEYS
+            for text in _raw_string_values(child)
+        ]
+    return []
+
+
+def _normalized_label(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _authorized_neutralization_labels(value: object) -> Counter:
+    """Safe labels that may legally replace the markers *value* embeds.
+
+    `_joined_text` strips markers, so a marker-only source finding and a
+    genuinely empty one such as `{}` both flatten to the empty string. Marker
+    provenance is therefore read from the unstripped strings, and the identity AND
+    the occurrence count of the markers found are kept: the documented exception
+    replaces EACH source marker with ITS OWN authorized safe label, so an empty
+    result means the entry is not marker-only, a different family is unsupported,
+    and two occurrences may not collapse into one (#871).
+
+    Occurrences come from the registry's historical replacement spans — the same
+    set the stripping pass uses — rather than the non-overlapping scan, so a
+    malformed name-bearing-line fallback cannot hide a second reserved token on
+    its own line and let the repair drop that occurrence unnoticed.
+    """
+    counts: Counter = Counter()
+    for text in _raw_string_values(value):
+        for label in historical_replacement_labels(text):
+            counts[_normalized_label(label)] += 1
+    return counts
+
+
+def _consume_neutralization_labels(
+    text: str, labels: Sequence[str]
+) -> tuple[Counter, str]:
+    """Split *text* into the *labels* it spells out and the remaining prose."""
+    counts: Counter = Counter()
+    remaining = _normalized_label(text)
+    for label in sorted(labels, key=len, reverse=True):
+        while label and label in remaining:
+            counts[label] += 1
+            remaining = " ".join(remaining.replace(label, " ", 1).split())
+    return counts, remaining
+
+
+_PROTOCOL_RECORD_LINE_RE = re.compile(r"\A(?:<!--.*-->|--\s+\S.*)\Z", re.DOTALL)
+_LIST_ITEM_RE = re.compile(r"\A[-*\u2022]\s+(?P<body>.*)\Z", re.DOTALL)
+
+
+def _freeform_finding_candidates(text: str) -> list[str]:
+    """Non-overlapping reviewer-prose candidates drawn from freeform text.
+
+    Each concern must appear exactly once. A paragraph contributes EITHER its
+    individual lines (when it is a bulleted block) OR its joined prose, never
+    both: emitting a line and then the paragraph containing it would give one
+    trailing reviewer statement two equivalent candidates, which would let
+    repair duplicate it into two findings, match each copy injectively, and
+    raise the correspondence ceiling (#871).
+
+    Protocol footer and signature lines are tool-owned structural records, not
+    reviewer prose, so they are never candidates.
+    """
+    candidates: list[str] = []
+    for block in re.split(r"\n\s*\n", text):
+        lines = [line.strip() for line in block.splitlines()]
+        lines = [
+            line for line in lines
+            if line and not _PROTOCOL_RECORD_LINE_RE.match(line)
+        ]
+        if not lines:
+            continue
+        if any(_LIST_ITEM_RE.match(line) for line in lines):
+            # A bulleted block states one concern per list ITEM, not per
+            # physical line: a wrapped bullet's continuation lines join the item
+            # they belong to, so one wrapped bullet stays one candidate and
+            # cannot be matched twice (#871).
+            items: list[list[str]] = []
+            for line in lines:
+                match = _LIST_ITEM_RE.match(line)
+                if match is not None:
+                    items.append([match.group("body").strip()])
+                elif items:
+                    items[-1].append(line)
+                # A lead-in line such as `Review concerns:` before the first
+                # bullet introduces the list. It is structure, not a concern, so
+                # it is dropped entirely: keeping it as its own candidate let
+                # repair emit the heading as a second ledger finding, and
+                # prepending it to the first item let a repaired finding match on
+                # the heading's tokens alone while omitting the real concern
+                # (#871).
+            for item in items:
+                joined_item = " ".join(" ".join(item).split())
+                if joined_item:
+                    candidates.append(joined_item)
+            continue
+        joined = " ".join(" ".join(lines).split())
+        if joined:
+            candidates.append(joined)
+    return candidates
+
+
+def coverage_predicate(text: str) -> bool:
+    """Negation-safe test for `the current plan/PR already covers this`."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    normalized = " ".join(normalize_contractions(text).casefold().split())
+    if any(phrase in normalized for phrase in STILL_OPEN_PHRASES):
+        return False
+    for sentence in _SENTENCE_SPLIT_RE.split(normalized):
+        if not sentence:
+            continue
+        for phrase in COVERAGE_PHRASES:
+            index = sentence.find(phrase)
+            while index != -1:
+                prefix = sentence[:index]
+                if not any(
+                    re.search(rf"\b{re.escape(marker)}\b", prefix)
+                    for marker in NEGATION_MARKERS
+                ):
+                    return True
+                index = sentence.find(phrase, index + 1)
+    return False
+
+
+def coverage_predicate_for_item(text: str, item_id: object) -> bool:
+    """Run the coverage predicate over only the segments naming *item_id*."""
+    if not isinstance(text, str) or not isinstance(item_id, str) or not item_id.strip():
+        return False
+    needle = item_id.casefold()
+    segments = [
+        segment
+        for segment in _SENTENCE_SPLIT_RE.split(
+            " ".join(normalize_contractions(text).casefold().split())
+        )
+        if needle in segment
+    ]
+    return any(coverage_predicate(segment) for segment in segments)
+
+
+def _normalized_disposition(value: object) -> object:
+    if isinstance(value, str):
+        return DISPOSITION_VALUE_ALIASES.get(" ".join(value.split()).casefold(), value)
+    return value
+
+
+def _validate_review_grounding(
+    raw: str,
+    source: dict | None,
+    target: dict,
+    *,
+    target_kind: str,
+    allowed_prior_item_ids: Sequence[str] | None,
+) -> None:
+    """Require every repaired reviewer verdict to be supported by the source.
+
+    Token coverage bounds added vocabulary and matched-pair modifier counts
+    bound polarity inversion.  This is a bounded support check, not a
+    certification that the reviewer's finding is correct.
+    """
+
+    def reject(detail: str) -> None:
+        raise AgentLoopError(
+            f"Repair content preservation failed for {target_kind} grounding: {detail}. "
+            "A repaired review must be supported by the reviewer's own source text."
+        )
+
+    if not isinstance(source, dict):
+        reject("the source carries no mechanically recoverable review payload")
+        return
+    if "kind" in source and source["kind"] != target_kind:
+        # A present-but-invalid source kind (empty string, null, any non-string)
+        # is not the repaired kind either, so it fails closed exactly like an
+        # explicit mismatch instead of slipping past a string-only comparison.
+        reject(f"the source payload declares kind {source['kind']!r}")
+
+    source_tokens = set(_content_tokens(raw))
+
+    def supported(value: object) -> bool:
+        if value is None:
+            return True
+        if not isinstance(value, str):
+            return False
+        return set(_content_tokens(value)) <= source_tokens
+
+    buckets = REVIEW_FINDING_BUCKETS[target_kind]
+    current_scope_buckets = buckets[:2]
+
+    def bucket_entries(payload: dict, names: Sequence[str]) -> list[object]:
+        entries: list[object] = []
+        for name in names:
+            value = payload.get(name)
+            if isinstance(value, list):
+                entries.extend(value)
+        return entries
+
+    source_findings = bucket_entries(source, buckets)
+    source_candidates: list[str] = []
+    # Parallel to source_candidates: for a source finding whose prose is empty
+    # BECAUSE it was nothing but reserved markers, the safe labels those markers
+    # authorize; empty for every other candidate.
+    candidate_marker_labels: list[Counter] = []
+    for entry in source_findings:
+        entry_text = _joined_text(entry)
+        if _content_tokens(entry_text) or _modifier_counts(entry_text):
+            source_candidates.append(entry_text)
+            candidate_marker_labels.append(Counter())
+        elif (marker_labels := _authorized_neutralization_labels(entry)):
+            source_candidates.append(entry_text)
+            candidate_marker_labels.append(marker_labels)
+        # A genuinely empty entry such as `{}` carries no reviewer content at
+        # all. It is dropped rather than kept: keeping it would both hand repair
+        # a wildcard for an exempt-token-only finding and raise the
+        # correspondence ceiling on the strength of nothing (#871).
+    if not source_findings:
+        # The payload declares no finding in any bucket. Only freeform prose
+        # OUTSIDE the recovered JSON object can be a reviewer finding here: the
+        # object's own fields are structured data, and `summary` in particular is
+        # not a finding. Splitting the serialized payload into prose segments
+        # would let an approved source's summary be copied into a current-scope
+        # blocking finding and then ground the inverted verdict (#871).
+        source_candidates = _freeform_finding_candidates(_payload_and_trailing(raw)[1])
+        candidate_marker_labels = [Counter() for _ in source_candidates]
+
+    # Each target finding keeps the safe labels of the markers IT embeds, so a
+    # raw marker in the repaired text can be compared against the source
+    # candidate's own marker families rather than merely stripping to nothing.
+    target_findings: list[tuple[str, str, Counter]] = []
+    for name in buckets:
+        value = target.get(name)
+        if not isinstance(value, list):
+            continue
+        for entry in value:
+            target_findings.append((
+                name, _joined_text(entry), _authorized_neutralization_labels(entry),
+            ))
+
+    # The ceiling applies to the freeform fallback too, so a payload declaring no
+    # finding cannot gain one from a shorter list of prose segments.
+    if len(target_findings) > len(source_candidates):
+        reject(
+            f"the repaired review carries {len(target_findings)} findings while the "
+            f"source carries {len(source_candidates)} corresponding candidates"
+        )
+
+    candidate_tokens = [set(_content_tokens(text)) for text in source_candidates]
+    candidate_modifiers = [_modifier_counts(text) for text in source_candidates]
+
+    matched_candidate_by_finding: dict[int, int] = {}
+    matched_finding_by_candidate: dict[int, int] = {}
+
+    def can_match(finding_index: int, candidate_index: int) -> bool:
+        _name, text, target_labels = target_findings[finding_index]
+        tokens = set(_content_tokens(text))
+        if not candidate_tokens[candidate_index] and not candidate_modifiers[candidate_index]:
+            # A candidate with no prose corresponds to nothing unless it is a
+            # genuine marker-only source finding, and then ONLY to that entry's
+            # own authorized neutralization — the marker kept verbatim (stripped
+            # to nothing) or replaced by one of its own safe labels. Accepting
+            # any exempt-only target instead would fabricate review substance:
+            # schema vocabulary, stop words and every registry safe label are
+            # exempt, so a target finding of `blocking`, an unrelated marker's
+            # label, or stop-word-only prose would carry no content tokens and
+            # match, and whole-source coverage cannot tell a finding apart from
+            # the rest of the source text (#871).
+            labels = candidate_marker_labels[candidate_index]
+            if not labels or _modifier_counts(text):
+                return False
+            # Marker IDENTITY and CARDINALITY both have to hold, so the target
+            # must represent the COMPLETE source marker multiset: each occurrence
+            # either kept verbatim — which `_joined_text` strips, so it is counted
+            # from the target's own raw markers — or replaced by its own safe
+            # label, which survives as text. An unrelated family, a dropped
+            # occurrence, a duplicated one, and any leftover prose are all
+            # refused, because every safe label is an exempt token and would
+            # otherwise match vacuously (#871).
+            spelled, remaining = _consume_neutralization_labels(text, labels)
+            if remaining:
+                return False
+            return target_labels + spelled == labels
+        if not tokens and not _modifier_counts(text):
+            # The candidate is substantive, so the repaired finding must retain
+            # substantive content of its own. An exempt-only target — schema
+            # vocabulary such as `blocking`, or stop-word-only prose — has an
+            # empty content-token set, which is trivially a subset of any
+            # candidate, and whole-source coverage is vacuous for it, so without
+            # this guard repair could replace a real reviewer finding with a
+            # fabricated placeholder and still ground a blocking verdict. A
+            # modifier-only candidate is bounded by the equality rule below,
+            # which forces the target to carry those same modifiers (#871).
+            return False
+        if not tokens <= candidate_tokens[candidate_index]:
+            return False
+        # Modifier-count equality applies to EVERY matched pair, including a
+        # freeform fallback candidate. A trailing-prose finding is still a
+        # matched source/target pair, and subset coverage alone cannot detect a
+        # deleted negation or limiting qualifier, so exempting the fallback
+        # would let `This path is not exploitable` be repaired into `This path
+        # is exploitable` (#871).
+        return _modifier_counts(text) == candidate_modifiers[candidate_index]
+
+    def augment(finding_index: int, visited: set[int]) -> bool:
+        for candidate_index in range(len(source_candidates)):
+            if candidate_index in visited or not can_match(finding_index, candidate_index):
+                continue
+            visited.add(candidate_index)
+            previous = matched_finding_by_candidate.get(candidate_index)
+            if previous is None or augment(previous, visited):
+                matched_finding_by_candidate[candidate_index] = finding_index
+                matched_candidate_by_finding[finding_index] = candidate_index
+                return True
+        return False
+
+    for finding_index, (name, text, _labels) in enumerate(target_findings):
+        if not supported(text):
+            reject(f"`{name}` carries content absent from the source")
+        if not augment(finding_index, set()):
+            reject(
+                f"`{name}` has no distinct corresponding source finding with the same "
+                "negations and limiting qualifiers"
+            )
+
+    summary = target.get("summary")
+    if isinstance(summary, str) and not supported(summary):
+        reject("`summary` carries content absent from the source")
+
+    disposition_field = REVIEW_DISPOSITION_FIELD[target_kind]
+    active_values = REVIEW_ACTIVE_DISPOSITIONS[target_kind]
+    source_disposition_entries = source.get(disposition_field)
+    source_dispositions: dict[object, dict] = {}
+    if isinstance(source_disposition_entries, list):
+        for entry in source_disposition_entries:
+            if isinstance(entry, dict) and entry.get("item_id") is not None:
+                source_dispositions.setdefault(entry["item_id"], entry)
+    source_has_active_disposition = any(
+        _normalized_disposition(entry.get("disposition")) in active_values
+        for entry in source_dispositions.values()
+    )
+
+    allowed_ids = set(allowed_prior_item_ids or ())
+    target_disposition_entries = target.get(disposition_field)
+    # Only an active target disposition that PRESERVES an active SOURCE
+    # disposition can ground a blocking verdict.  A disposition completed from
+    # `allowed_prior_item_ids`, or one promoted out of a source `future`, is
+    # supplied by the repair context or by the target's own state and is not
+    # reviewer-authored evidence of open work; counting it would let an
+    # approved, finding-free source be repaired into a blocking review.
+    target_preserves_active_source_disposition = False
+    if isinstance(target_disposition_entries, list):
+        for entry in target_disposition_entries:
+            if not isinstance(entry, dict):
+                continue
+            item_id = entry.get("item_id")
+            disposition = entry.get("disposition")
+            note = entry.get("note")
+            source_entry = source_dispositions.get(item_id)
+            if source_entry is None:
+                # Completion of a carried ID supplied by the repair context.
+                if item_id not in allowed_ids:
+                    reject(
+                        f"`{disposition_field}` carries item `{item_id}`, which the source "
+                        "never dispositioned and the repair context never allowed"
+                    )
+                if disposition == "resolved":
+                    if not coverage_predicate_for_item(raw, item_id):
+                        reject(
+                            f"`{disposition_field}` resolves carried item `{item_id}` without "
+                            "source support"
+                        )
+                elif disposition not in active_values:
+                    reject(
+                        f"`{disposition_field}` completes carried item `{item_id}` with "
+                        f"disposition `{disposition}` instead of an active disposition"
+                    )
+                if isinstance(note, str) and note.strip() and not supported(note):
+                    reject(
+                        f"`{disposition_field}` note for `{item_id}` is absent from the source"
+                    )
+                continue
+            source_disposition = _normalized_disposition(source_entry.get("disposition"))
+            source_note = source_entry.get("note")
+            source_entry_text = _joined_text(source_entry)
+            if disposition in active_values and source_disposition in active_values:
+                target_preserves_active_source_disposition = True
+            if disposition != source_disposition:
+                authorized_resolution = (
+                    disposition == "resolved"
+                    and source_disposition in active_values
+                    and coverage_predicate(source_note if isinstance(source_note, str) else "")
+                )
+                # The schema forbids a `future` disposition in a blocking
+                # review while still requiring every carried item to appear, so
+                # the repair prompt must re-state it.  Permit only the
+                # non-resolving active value, which keeps the item open.
+                schema_mandated_future_change = (
+                    source_disposition == "future"
+                    and target.get("state") == "blocking"
+                    and disposition in active_values
+                )
+                if not (authorized_resolution or schema_mandated_future_change):
+                    reject(
+                        f"`{disposition_field}` changes item `{item_id}` from "
+                        f"`{source_disposition}` to `{disposition}` without source support"
+                    )
+            if isinstance(note, str) and note.strip():
+                entry_tokens = set(_content_tokens(source_entry_text))
+                if not set(_content_tokens(note)) <= entry_tokens:
+                    reject(
+                        f"`{disposition_field}` note for `{item_id}` is absent from the "
+                        "source entry"
+                    )
+                if isinstance(source_note, str) and source_note.strip() and (
+                    _modifier_counts(note) != _modifier_counts(source_note)
+                ):
+                    reject(
+                        f"`{disposition_field}` note for `{item_id}` drops, adds, or "
+                        "substitutes a negation or limiting qualifier"
+                    )
+
+    source_state = source.get("state")
+    source_state = source_state if isinstance(source_state, str) else None
+    target_state = target.get("state")
+    if not isinstance(target_state, str):
+        # A repaired review with no declared verdict carries nothing to ground;
+        # the strict schema validator rejects it on its own.
+        return
+    source_current_findings = bool(bucket_entries(source, current_scope_buckets))
+    target_matched_current = any(
+        name in current_scope_buckets and index in matched_candidate_by_finding
+        for index, (name, _text, _labels) in enumerate(target_findings)
+    )
+    if target_state == "blocking":
+        if not (
+            source_state == "blocking"
+            or target_matched_current
+            or target_preserves_active_source_disposition
+        ):
+            reject(
+                "`state: blocking` is supported by no source blocking state, preserved "
+                "source finding, or active carried disposition"
+            )
+    elif target_state == "approved":
+        if source_state != "approved":
+            reject("`state: approved` is not supported by an approved source state")
+        if source_current_findings or source_has_active_disposition:
+            reject(
+                "`state: approved` cannot be manufactured while the source itself carries "
+                "current-scope findings or active carried dispositions"
+            )
+    else:
+        reject(f"`state` value {target_state!r} is not a grounded review verdict")
+
+
 def _schema_valid_architecture_entry(value: object) -> bool:
     """Return whether one architecture-list entry can pass schema validation."""
     return isinstance(value, str) and bool(value.strip())
 
 
-def _payload(text: str) -> dict | None:
+def _payload_and_trailing(text: str) -> tuple[dict | None, str]:
+    """Split *text* into its recovered JSON object and the prose that follows.
+
+    The trailing remainder is the only part of a source that can carry freeform
+    reviewer prose: the recovered object's own fields are structured data, not
+    findings.
+    """
     text, _ = normalize_response_file_structured_text(text)
     stripped = text.lstrip()
     fence = _FENCED_JSON_PREFIX_RE.match(stripped)
@@ -65,8 +709,23 @@ def _payload(text: str) -> dict | None:
     try:
         parsed = _extract_json_object_prefix(text)
     except AgentLoopError:
-        return None
-    return parsed[0] if parsed else None
+        return None, text
+    if not parsed:
+        return None, text
+    return parsed[0], parsed[1]
+
+
+def _payload(text: str) -> dict | None:
+    return _payload_and_trailing(text)[0]
+
+
+def recover_payload(text: str) -> dict | None:
+    """Return the JSON object mechanically recoverable from *text*, if any.
+
+    Shared with the repair admission gate so the gate and the grounding guard
+    agree on exactly which sources carry a recoverable structured payload.
+    """
+    return _payload(text)
 
 
 def require_recoverable_semantic_patch(raw: str) -> None:
@@ -210,6 +869,7 @@ def validate_repair_preservation(
     unresolved_item_ids: Sequence[str] | None = None,
     surfaced_requirement_ids: Sequence[str] | None = None,
     reviewer_requirement_ids: Sequence[str] | None = None,
+    allowed_prior_item_ids: Sequence[str] | None = None,
     allow_legacy_matrix_removal: bool = False,
 ) -> None:
     """Reject observable losses, not certify semantic equivalence.
@@ -218,6 +878,17 @@ def validate_repair_preservation(
     Do not heuristically parse broken JSON or interpret prose as item ledgers.
     """
     source, target = _payload(raw), _payload(repaired)
+    # Reviewer grounding is triggered by the repaired TARGET kind, so it also
+    # covers a legacy repair entry point and an absent or wrong-kind source,
+    # neither of which reaches the loss checks below.
+    if isinstance(target, dict) and target.get("kind") in REVIEW_KINDS:
+        _validate_review_grounding(
+            raw,
+            source,
+            target,
+            target_kind=target["kind"],
+            allowed_prior_item_ids=allowed_prior_item_ids,
+        )
     if (not source or not target or not isinstance(source.get("kind"), str)
             or source["kind"] not in _KINDS):
         return

@@ -1354,6 +1354,28 @@ def structured_pr_review(
     )
 
 
+def malformed_pr_review_source(**kwargs) -> str:
+    """A PR review with real substance in a schema-invalid envelope.
+
+    Repair recovers a malformed envelope; it may never invent review content,
+    so a repair fixture must carry the reviewer's own findings and verdict.
+    """
+    rendered = structured_pr_review(**kwargs)
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    payload.pop("schema_version", None)
+    return json.dumps(payload) + rendered[split:]
+
+
+def malformed_plan_review_source(**kwargs) -> str:
+    """A plan review with real substance in a schema-invalid envelope."""
+    rendered = structured_plan_review(**kwargs)
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    payload.pop("schema_version", None)
+    return json.dumps(payload) + rendered[split:]
+
+
 def structured_plan_review(
     *,
     state: str = "approved",

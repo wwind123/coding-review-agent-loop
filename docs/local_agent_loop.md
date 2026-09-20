@@ -3121,6 +3121,109 @@ original response. If the repair CLI fails, returns empty output, or produces
 invalid output, the original validation failure remains local and nothing is
 posted to GitHub.
 
+Reviewer repair is refused before any backend call when the source carries no
+review substance. A `plan_review` or `pr_review` source is admitted only when a
+JSON object is mechanically recoverable from it and that object either declares
+the expected reviewer kind or, when it carries no `kind`, carries a field unique
+to that review schema (`blocking_plan_issues`, `same_plan_followups`, or
+`prior_plan_item_dispositions` for a plan review; `blocking_items`,
+`same_pr_followups`, or `prior_item_dispositions` for a PR review). The
+kind-unique-field fallback applies only to a source that carries no `kind` key at
+all: a `kind` that is present but is not exactly the expected reviewer kind —
+including an empty string, a null, or any non-string value — is refused, and the
+grounding check below fails closed on the same rule rather than on a string-only
+comparison. Fields shared
+with other schemas — `summary`, `state`, `schema_version`, `future_followups`,
+`human_requirement_dispositions`, `architecture_impact` — are never admission
+evidence, so narration, tool-use diagnostics, a bare protocol state footer, an
+explicitly different kind, and a kindless object carrying only a generic state
+and summary are all refused. A refusal is classified as a reviewer
+unavailability (`agent-unavailable`) with a bounded retry inside the configured
+retry policy, never as a deterministic blocking verdict: no reviewer comment is
+posted and no carried ledger item is numbered for that reviewer. An empty
+reviewer response keeps its existing `empty-response` path and never reaches
+repair, and a transient repair-backend provider failure keeps its resumable
+`repair-provider-failure` classification. A reviewer output whose own
+diagnostics already name a definitive provider condition — an auth, billing, or
+credit failure, an unsupported model or effort, an exhausted resource, or an
+indeterminate containment result — keeps that classification and its operator
+suggestion: refusing to repair such a turn says nothing about reviewer
+availability, and a rerun cannot fix it.
+
+Whenever a repaired response's own kind is `plan_review` or `pr_review`, a
+grounding check requires every repaired finding, summary, and carried
+disposition to be supported by the reviewer's own source text; it fails closed
+when the source payload is absent or declares a different kind. Support is token
+coverage — not contiguous containment, so the documented title-plus-detail
+concatenation stays legal — of the candidate against the whole normalized
+source, after removing four exempt sets: a pinned closed stop list, the review
+schema's own vocabulary, carried `item-<n>` identifiers, and the reserved-marker
+neutralization labels derived from the marker registry. Findings in all three
+buckets are matched injectively to source findings from any bucket, so a
+promotion out of `future_followups` remains legal while the repaired finding
+count may never exceed the number of source candidates. When the source payload
+declares no finding in any bucket, the candidates come only from freeform prose
+that sits *outside* the recovered JSON object: the object's own fields are
+structured data, and `summary` in particular is not a finding, so splitting the
+serialized payload into prose segments would let an approved source's summary be
+copied into a current-scope finding and then ground an inverted blocking verdict.
+Those freeform candidates are non-overlapping — a paragraph contributes either its
+list items or its joined prose, never both, a wrapped bullet's continuation
+lines join the item they belong to, and a lead-in line before the first bullet is
+list structure that is dropped rather than a concern of its own, so it can neither
+raise the ceiling nor let a repaired finding match on the heading alone — so
+one trailing reviewer statement cannot be matched twice and raise the ceiling,
+and protocol footer and signature lines are structural records rather than
+candidates. A declared source finding that carries
+no prose is a candidate only when it really was nothing but a reserved marker, and
+then it corresponds solely to its own authorized neutralization: the target must
+represent the COMPLETE source marker multiset, each occurrence either kept
+verbatim or replaced by that occurrence's own safe label, compared by marker
+identity and occurrence count over the registry's historical replacement spans —
+the same occurrence set the stripping pass uses, so a malformed name-bearing-line
+fallback cannot hide a second reserved token on its line — rather than by the
+empty string that stripping any marker leaves behind, so an unrelated family, a dropped occurrence, a duplicated
+one, and leftover prose are all refused. Every other exempt-only target is refused,
+whichever candidate it is matched against: schema vocabulary, the stop list and
+every registry safe label are exempt, so `blocking`, an unrelated marker or its
+label, or stop-word-only prose has an empty content-token set that is trivially a
+subset of any candidate and vacuously covered by the whole source, and a target
+matched to a substantive candidate must therefore retain substantive content of
+its own. A modifier-only candidate is bounded instead by the modifier-count
+equality rule below, which forces the target to carry the same modifiers. A genuinely empty entry such as `{}` is dropped, so it can neither become
+a wildcard for an exempt-token-only finding nor raise the ceiling.
+Whole-source coverage alone cannot tell
+a finding apart from the summary or any other global prose, so without that
+restriction a source summary could be promoted into a fabricated finding and
+ground a blocking verdict. Each matched finding pair — including one matched
+against a freeform trailing-prose candidate — and each matched disposition note
+pair, must carry equal per-modifier occurrence counts over a pinned set of
+negations and limiting qualifiers, compared after a pinned
+contraction normalization that runs before punctuation stripping over both
+apostrophe forms — so deleting, adding, or substituting `not`, `isn't`, or
+`only` is rejected even though subset coverage alone would accept it. The
+verdict is grounded against the source rather than against what survives into
+the target: a repaired `blocking` needs an unambiguous source blocking state, a
+preserved source finding, or a carried disposition that is active in the source
+*and* preserved as active in the target — a disposition completed from the repair
+context's allowed IDs, or one re-stated out of a source `future`, is supplied by
+the orchestrator or by the target's own state and can never be that state's own
+support; a repaired
+`approved` needs an unambiguous approved source state *and* a source that itself
+carries no current-scope finding and no active disposition, so demoting a
+current-scope finding into `future_followups` can never manufacture an approval.
+Carried dispositions are matched by `item_id`, and only bounded normalizations
+are authorized: the repair prompt's own enum aliases (`still blocking` →
+`blocking` and its siblings); an active-to-`resolved` change only when the
+source note satisfies a negation-safe coverage predicate (a pinned coverage
+phrase that no pinned negation marker precedes inside its own sentence, with the
+still-open phrase list generated from the coverage list so every phrase carries
+its negated counterparts); re-stating a source `future` disposition as the
+kind's non-resolving active value in a blocking review; and completing an ID
+supplied in the repair context as that same non-resolving active value.
+Deterministic removal of unknown IDs is unaffected. The check is a bounded
+support check, not a certification that a genuine reviewer finding is correct.
+
 Repair is lossless formatting, not summarization: findings must retain their full
 evidence, code references, and requested tests; summaries and test reports must
 retain failures, timeouts, skips, and partial-coverage caveats. Object-to-string
