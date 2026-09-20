@@ -1303,3 +1303,73 @@ def test_marker_only_source_finding_still_accepts_its_neutralization():
     # neutralization label whose tokens are exempt.
     source = _pr_review(blocking_items=["<!-- AGENT_LOOP_META: v1_abc -->"])
     check(source, _pr_review(blocking_items=["[protocol LOOP_META record]"]))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_summary_cannot_become_a_blocking_finding_without_source_findings(builder, bucket):
+    # Issue #871 round 3, item-4: when the payload declares no finding at all,
+    # the freeform fallback may not split the serialized payload into candidate
+    # prose. Otherwise an approved source whose summary reads like a defect can
+    # be repaired into a blocking finding, and that finding then grounds the
+    # inverted verdict.
+    source = builder(
+        state="approved",
+        summary="Close the socket leak",
+        **{bucket: []},
+    )
+    rejects(source, builder(
+        state="blocking",
+        summary="Close the socket leak",
+        **{bucket: ["Close the socket leak"]},
+    ))
+
+
+@pytest.mark.parametrize("builder", [_pr_review, _plan_review])
+def test_no_payload_field_can_become_a_finding_without_source_findings(builder):
+    # The same hole would also let a disposition note, or any other payload
+    # field, be promoted into a finding.
+    bucket = "blocking_items" if builder is _pr_review else "blocking_plan_issues"
+    field = "prior_item_dispositions" if builder is _pr_review else "prior_plan_item_dispositions"
+    source = builder(
+        state="blocking",
+        summary="Findings.",
+        **{
+            bucket: [],
+            field: [
+                {"item_id": "item-1", "disposition": "blocking",
+                 "note": "The retry loop never terminates."},
+            ],
+        },
+    )
+    rejects(source, builder(
+        state="blocking",
+        summary="Findings.",
+        **{
+            bucket: ["The retry loop never terminates."],
+            field: [
+                {"item_id": "item-1", "disposition": "blocking",
+                 "note": "The retry loop never terminates."},
+            ],
+        },
+    ))
+
+
+def test_freeform_prose_outside_the_payload_still_supports_a_finding():
+    # The fallback the approved plan describes stays available for its real
+    # case: reviewer prose that sits outside the recovered JSON object.
+    source = (
+        json.dumps(_pr_review(state="blocking", summary="Findings.", blocking_items=[]))
+        + "\n- The retry loop never terminates on a truncated response.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(_pr_review(
+            state="blocking",
+            summary="Findings.",
+            blocking_items=["The retry loop never terminates on a truncated response."],
+        )),
+    )

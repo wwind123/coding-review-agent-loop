@@ -327,7 +327,13 @@ def _validate_review_grounding(
     # pair, so its freeform prose supports coverage only.
     compare_modifiers = bool(source_candidates)
     if not source_candidates:
-        source_candidates = _prose_segments(raw)
+        # The payload declares no finding in any bucket. Only freeform prose
+        # OUTSIDE the recovered JSON object can be a reviewer finding here: the
+        # object's own fields are structured data, and `summary` in particular is
+        # not a finding. Splitting the serialized payload into prose segments
+        # would let an approved source's summary be copied into a current-scope
+        # blocking finding and then ground the inverted verdict (#871).
+        source_candidates = _prose_segments(_payload_and_trailing(raw)[1])
 
     target_findings: list[tuple[str, str]] = []
     for name in buckets:
@@ -337,10 +343,12 @@ def _validate_review_grounding(
         for entry in value:
             target_findings.append((name, _joined_text(entry)))
 
-    if source_findings and len(target_findings) > len(source_findings):
+    # The ceiling applies to the freeform fallback too, so a payload declaring no
+    # finding cannot gain one from a shorter list of prose segments.
+    if len(target_findings) > len(source_candidates):
         reject(
             f"the repaired review carries {len(target_findings)} findings while the "
-            f"source carries {len(source_findings)}"
+            f"source carries {len(source_candidates)} corresponding candidates"
         )
 
     candidate_tokens = [set(_content_tokens(text)) for text in source_candidates]
@@ -524,7 +532,13 @@ def _schema_valid_architecture_entry(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def _payload(text: str) -> dict | None:
+def _payload_and_trailing(text: str) -> tuple[dict | None, str]:
+    """Split *text* into its recovered JSON object and the prose that follows.
+
+    The trailing remainder is the only part of a source that can carry freeform
+    reviewer prose: the recovered object's own fields are structured data, not
+    findings.
+    """
     text, _ = normalize_response_file_structured_text(text)
     stripped = text.lstrip()
     fence = _FENCED_JSON_PREFIX_RE.match(stripped)
@@ -543,8 +557,14 @@ def _payload(text: str) -> dict | None:
     try:
         parsed = _extract_json_object_prefix(text)
     except AgentLoopError:
-        return None
-    return parsed[0] if parsed else None
+        return None, text
+    if not parsed:
+        return None, text
+    return parsed[0], parsed[1]
+
+
+def _payload(text: str) -> dict | None:
+    return _payload_and_trailing(text)[0]
 
 
 def recover_payload(text: str) -> dict | None:

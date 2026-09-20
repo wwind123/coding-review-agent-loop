@@ -3118,7 +3118,13 @@ schema's own vocabulary, carried `item-<n>` identifiers, and the reserved-marker
 neutralization labels derived from the marker registry. Findings in all three
 buckets are matched injectively to source findings from any bucket, so a
 promotion out of `future_followups` remains legal while the repaired finding
-count may never exceed the source's. An empty or marker-only source finding
+count may never exceed the number of source candidates. When the source payload
+declares no finding in any bucket, the candidates come only from freeform prose
+that sits *outside* the recovered JSON object: the object's own fields are
+structured data, and `summary` in particular is not a finding, so splitting the
+serialized payload into prose segments would let an approved source's summary be
+copied into a current-scope finding and then ground an inverted blocking verdict.
+An empty or marker-only source finding
 carries no prose and is therefore not a wildcard: it corresponds only to a
 target finding that is itself empty after the exempt sets are removed, which is
 the reserved-marker neutralization case. Whole-source coverage alone cannot tell

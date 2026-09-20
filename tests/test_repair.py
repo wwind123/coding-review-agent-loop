@@ -2650,6 +2650,9 @@ def test_pr_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_pat
     approved_without_marker = structured_pr_review(
         state="approved",
         summary="The absolute URL missing from the redirect is a defect.",
+        # Issue #871: the reviewer's own finding, so the repaired blocking item
+        # preserves it instead of promoting the summary into a fabricated one.
+        blocking_items=["The absolute URL missing from the redirect is a defect."],
         reviewer="OpenAI Codex",
         human_requirements_resolved=False,
     )
@@ -2778,6 +2781,9 @@ def test_plan_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_p
         reviewer="OpenAI Codex",
         human_requirements_resolved=False,
         summary="The plan changes the public API.",
+        # Issue #871: the reviewer's own finding, so the repaired blocking issue
+        # preserves it instead of promoting the summary into a fabricated one.
+        blocking_plan_issues=["The plan changes the public API."],
         human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
     )
     repaired_blocking = structured_plan_review(
@@ -3036,6 +3042,9 @@ def test_plan_loop_repair_blocking_records_same_plan_followups(tmp_path):
         reviewer="OpenAI Codex",
         human_requirements_resolved=False,
         summary="Add a regression test for the parser edge case.",
+        # Issue #871: the reviewer's own followup, so the repaired same-plan
+        # entry preserves it instead of promoting the summary into a new finding.
+        same_plan_followups=["Add a regression test for the parser edge case."],
         human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
     )
     repaired_blocking = structured_plan_review(
