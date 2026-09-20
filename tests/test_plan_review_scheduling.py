@@ -384,6 +384,90 @@ def test_one_unobserved_identity_on_either_side_is_broad(missing):
         assert missing in classification.reason
 
 
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "execution_recommendation_identity",
+        "human_requirement_disposition_digest",
+    ],
+)
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_blank_identities_are_unobserved_and_classify_broad(missing, blank):
+    """A blank identity is not an observation; two blanks must not compare equal."""
+    incomplete = _contracts(**{missing: blank})
+    assert incomplete.missing_identities == (missing,)
+    assert not incomplete.complete
+    both_blank = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(),
+        previous_contracts=_contracts(**{missing: blank}),
+        current_contracts=_contracts(**{missing: blank}),
+    )
+    assert both_blank.broad
+    assert missing in both_blank.reason
+    for previous, current in ((incomplete, _contracts()), (_contracts(), incomplete)):
+        one_side = classify_plan_transition(
+            _key(),
+            _key(plan="plan-2"),
+            _revision(),
+            previous_contracts=previous,
+            current_contracts=current,
+        )
+        assert one_side.broad
+        assert missing in one_side.reason
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "execution_recommendation_identity",
+        "human_requirement_disposition_digest",
+        "architecture_impact_status",
+    ],
+)
+@pytest.mark.parametrize("wrong", [1, 1.5, True, object(), ("rec-1",), ["rec-1"], {"a": 1}])
+def test_wrong_typed_identities_are_rejected_outright(field, wrong):
+    with pytest.raises(AgentLoopError, match="must be a string or None"):
+        _contracts(**{field: wrong})
+
+
+def test_blank_architecture_status_is_unobserved_and_classifies_broad():
+    incomplete = _contracts(architecture_impact_status="  ")
+    assert incomplete.missing_identities == ("architecture_impact_status",)
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(),
+        previous_contracts=incomplete,
+        current_contracts=_contracts(architecture_impact_status=""),
+    )
+    assert classification.broad
+    assert "architecture_impact_status" in classification.reason
+
+
+def test_architecture_status_domain_is_enforced():
+    for value in ("Unchanged", "modified", "no-change", "unknown"):
+        with pytest.raises(AgentLoopError, match="architecture_impact_status"):
+            _contracts(architecture_impact_status=value)
+    for value in ("changed", "unchanged"):
+        assert _contracts(architecture_impact_status=value).complete
+
+
+def test_identities_are_stripped_before_comparison():
+    padded = _contracts(execution_recommendation_identity="  rec-1  ")
+    assert padded.execution_recommendation_identity == "rec-1"
+    assert padded == _contracts()
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(),
+        previous_contracts=padded,
+        current_contracts=_contracts(),
+    )
+    assert classification.narrow
+
+
 def test_an_empty_closing_issue_set_is_a_complete_declaration():
     contracts = _contracts(additional_closing_issue_ids=())
     assert contracts.complete
@@ -672,6 +756,123 @@ def test_degraded_history_after_an_opening_latches_the_complete_board(history_cl
     assert decision.phase == "full-board"
     assert decision.reason.startswith(POST_PANEL_PREFIX)
     assert decision.latches_force_full
+
+
+@pytest.mark.parametrize(
+    "history_class",
+    [PLAN_HISTORY_ABSENT, PLAN_HISTORY_INVALID, PLAN_HISTORY_CONTRADICTORY_KEY],
+)
+def test_degraded_history_outranks_a_secondary_owned_finding(history_class):
+    """A readable degraded class continues; it never stops for ownership doubt."""
+    decision = select_plan_reviewers(
+        PlanSchedulerSnapshot(
+            contract=_contract(),
+            previous_key=_key(),
+            current_key=_key(),
+            degraded_history_class=history_class,
+            obligations=(_obligation(owners=("Claude",)),),
+        ),
+        _recheck(),
+    )
+    assert decision.selected_reviewers == (PRIMARY,)
+    assert decision.phase == "primary"
+    assert decision.reason.startswith(STRICT_PRE_PANEL_PREFIX)
+    assert plan_history_fallback_reason(history_class) in decision.reason
+    assert "not authoritative ownership" in decision.reason
+    assert not decision.latches_force_full
+    assert not decision.records_panel_opening
+
+
+@pytest.mark.parametrize(
+    "history_class",
+    [PLAN_HISTORY_ABSENT, PLAN_HISTORY_INVALID, PLAN_HISTORY_CONTRADICTORY_KEY],
+)
+def test_degraded_history_outranks_a_premature_secondary_review(history_class):
+    decision = select_plan_reviewers(
+        PlanSchedulerSnapshot(
+            contract=_contract(),
+            previous_key=_key(),
+            current_key=_key(),
+            degraded_history_class=history_class,
+            premature_secondary_reviews=("Claude",),
+        ),
+        _recheck(),
+    )
+    assert decision.selected_reviewers == (PRIMARY,)
+    assert decision.phase == "primary"
+    assert decision.reason.startswith(STRICT_PRE_PANEL_PREFIX)
+    assert plan_history_fallback_reason(history_class) in decision.reason
+    assert "unqualified artifacts" in decision.reason
+    assert not decision.records_panel_opening
+
+
+@pytest.mark.parametrize(
+    "history_class",
+    [PLAN_HISTORY_ABSENT, PLAN_HISTORY_INVALID, PLAN_HISTORY_CONTRADICTORY_KEY],
+)
+def test_degraded_history_outranks_both_ownership_ambiguities_together(history_class):
+    decision = select_plan_reviewers(
+        PlanSchedulerSnapshot(
+            contract=_contract(),
+            previous_key=_key(),
+            current_key=_key(),
+            degraded_history_class=history_class,
+            premature_secondary_reviews=("Antigravity",),
+            obligations=(_obligation(owners=("Claude",)),),
+        ),
+        _recheck(),
+    )
+    assert decision.selected_reviewers == (PRIMARY,)
+    assert decision.phase == "primary"
+    assert plan_history_continues(history_class)
+    assert "unqualified artifacts" in decision.reason
+    assert "not authoritative ownership" in decision.reason
+
+
+def test_intact_history_still_stops_for_both_ownership_ambiguities():
+    """Precedence is narrow: intact history keeps both diagnostic stops."""
+    with pytest.raises(PlanPrePanelSafetyError, match="pending on"):
+        select_plan_reviewers(
+            _snapshot(
+                previous_key=_key(), obligations=(_obligation(owners=("Claude",)),)
+            ),
+            _recheck(),
+        )
+    with pytest.raises(PlanPrePanelSafetyError, match="premature blocking plan review"):
+        select_plan_reviewers(
+            _snapshot(previous_key=_key(), premature_secondary_reviews=("Claude",)),
+            _recheck(),
+        )
+
+
+@pytest.mark.parametrize(
+    "history_class",
+    [PLAN_HISTORY_ABSENT, PLAN_HISTORY_INVALID, PLAN_HISTORY_CONTRADICTORY_KEY],
+)
+def test_degraded_history_never_both_continues_and_stops(history_class):
+    """One durable history, one outcome, whatever else the snapshot carries."""
+    for extra in (
+        {},
+        {"obligations": (_obligation(owners=("Claude",)),)},
+        {"premature_secondary_reviews": ("Claude",)},
+        {
+            "obligations": (_obligation(owners=("Claude",)),),
+            "premature_secondary_reviews": ("Antigravity",),
+        },
+        {"force_full": True, "force_full_source": "automatic"},
+    ):
+        decision = select_plan_reviewers(
+            PlanSchedulerSnapshot(
+                contract=_contract(),
+                previous_key=_key(),
+                current_key=_key(),
+                degraded_history_class=history_class,
+                **extra,
+            ),
+            _recheck(),
+        )
+        assert decision.selected_reviewers == (PRIMARY,)
+        assert decision.phase == "primary"
 
 
 def test_intact_history_has_no_fallback_reason():

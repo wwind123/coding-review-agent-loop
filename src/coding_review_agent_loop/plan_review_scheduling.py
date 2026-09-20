@@ -121,6 +121,10 @@ NARROW_PLAN_PATCH_FIELDS = frozenset(
 # Risk-matrix row operations a narrow planning remediation may carry.
 NARROW_PLAN_MATRIX_OPERATIONS = frozenset({"matrix_add", "matrix_edit"})
 
+# ``architecture_impact_status`` carries the status itself, not a digest, so its
+# domain is the same two values the architecture-impact contract accepts.
+ARCHITECTURE_IMPACT_STATUSES = frozenset({"changed", "unchanged"})
+
 
 class PlanPrePanelSafetyError(AgentLoopError):
     """Staged planning cannot stay primary-only without guessing.
@@ -398,6 +402,26 @@ class PlanCrossCuttingContracts:
                 "additional_closing_issue_ids entries must be non-empty strings."
             )
         object.__setattr__(self, "additional_closing_issue_ids", tuple(sorted(set(ids))))
+        # Normalize every required identity so that only an observed, non-blank
+        # string counts.  A non-string is a contract violation and raises; a
+        # blank or whitespace-only string becomes ``None`` so it is reported
+        # unobserved, never silently compared equal to another blank.
+        for name in self.REQUIRED_IDENTITY_FIELDS:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise AgentLoopError(
+                    f"Cross-cutting plan contract {name!r} must be a string or None."
+                )
+            cleaned = value.strip()
+            object.__setattr__(self, name, cleaned or None)
+        status = self.architecture_impact_status
+        if status is not None and status not in ARCHITECTURE_IMPACT_STATUSES:
+            raise AgentLoopError(
+                "Cross-cutting plan contract 'architecture_impact_status' must be one "
+                f"of {', '.join(sorted(ARCHITECTURE_IMPACT_STATUSES))}, not {status!r}."
+            )
 
     # ``additional_closing_issue_ids`` is deliberately excluded: an empty
     # closing-issue set is a real, complete declaration.  The other three are
@@ -412,10 +436,12 @@ class PlanCrossCuttingContracts:
 
     @property
     def missing_identities(self) -> tuple[str, ...]:
+        """Required identities that were not observed as a non-blank string."""
         return tuple(
             name
             for name in self.REQUIRED_IDENTITY_FIELDS
-            if getattr(self, name) is None
+            if not isinstance(getattr(self, name), str)
+            or not getattr(self, name).strip()
         )
 
     @property
@@ -862,7 +888,14 @@ def select_plan_reviewers(
             premature = tuple(
                 name for name in snapshot.premature_secondary_reviews if name in secondaries
             )
-            if premature:
+            # A readable degraded class always continues under the conservative
+            # fallback, so it takes deterministic precedence over both
+            # ownership-ambiguity diagnostics: the same durable history must
+            # never both continue and stop.  The strict primary-only turn below
+            # is already the safest board, and the ownership claims that would
+            # otherwise raise come from exactly the history that decoded as
+            # absent, invalid, or contradictory.
+            if premature and not degraded:
                 raise PlanPrePanelSafetyError(
                     plan_pre_panel_safety_message(
                         "an interrupted round holds a premature blocking plan review "
@@ -870,7 +903,7 @@ def select_plan_reviewers(
                     )
                 )
             secondary_pending = pending_owner_set & secondaries
-            if secondary_pending:
+            if secondary_pending and not degraded:
                 # Secondaries are never plan-finding owners before their first
                 # legitimate panel invocation; do not guess ownership and do not
                 # spend the panel silently.
@@ -898,6 +931,19 @@ def select_plan_reviewers(
                     active_obligations or snapshot.previous_key is not None
                 ):
                     strict_reasons.append(classification.reason)
+                if degraded and premature:
+                    strict_reasons.append(
+                        "premature blocking plan review(s) from "
+                        f"{', '.join(premature)} are unqualified artifacts of the "
+                        "degraded history and establish no finding, ownership, or "
+                        "approval"
+                    )
+                if degraded and secondary_pending:
+                    strict_reasons.append(
+                        "secondary-owned plan finding claims from "
+                        f"{', '.join(sorted(secondary_pending))} come from the same "
+                        "degraded history and are not authoritative ownership"
+                    )
                 if strict_reasons:
                     reason = (
                         STRICT_PRE_PANEL_PREFIX
