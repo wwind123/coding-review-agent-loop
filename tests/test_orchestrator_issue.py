@@ -4529,9 +4529,9 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
     # #862 plan-flow analog: an earlier plan subject raised and resolved
     # item-1, the carried set is empty, and the reviewer repeats item-1 as
     # resolved.  The no-op entry is stripped instead of failing the run.
-    # item-2 is raised under that subject and never cleared, so the ledger
-    # stays genuinely unreconstructible: a history whose only cross-subject
-    # item is the resolved one now reads as complete (#905).
+    # This is the compatibility-default policy, so the resolved-only history
+    # must still read as an incomplete ledger and still select full context:
+    # staged planning's durable cleared-item proof does not apply here (#905).
     old_plan = "Old plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     mid_plan = "Mid plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     new_plan = "New plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -4543,27 +4543,11 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
         status="blocking",
         source_status="blocking",
     )
-    uncleared_item = UnresolvedReviewItem(
-        item_id="item-2",
-        reviewer="OpenAI Codex",
-        source_round=1,
-        text="Old subject item that was never cleared.",
-        status="blocking",
-        source_status="blocking",
-    )
     raised = _attach_round_metadata(
-        structured_plan_review(
-            state="blocking",
-            blocking_plan_issues=[
-                "Old subject item.",
-                "Old subject item that was never cleared.",
-            ],
-        ),
+        structured_plan_review(state="blocking", blocking_plan_issues=["Old subject item."]),
         PostedRoundMetadata(
             flow="plan", role="reviewer", agent="Codex", round_number=1,
-            subject=_plan_subject(old_plan),
-            new_items=(old_item, uncleared_item),
-            state="blocking",
+            subject=_plan_subject(old_plan), new_items=(old_item,), state="blocking",
         ),
     )
     resolved = _attach_round_metadata(
@@ -4626,6 +4610,9 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
         "despite incomplete ledger" in message
         for message in logged
     )
+    # The default path still takes the conservative full-context branch it
+    # took before staged planning existed.
+    assert any("(context mode: full (ledger incomplete))" in message for message in logged)
 
 def test_round_resolved_history_ids_available_when_plan_ledger_is_complete():
     # #872 follow-up: a lossless semantic patch needs resolved-history proof in

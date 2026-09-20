@@ -343,10 +343,14 @@ rebuilds the transition classifier's authenticated inputs — the durable
 patch was bound to — from the coder records themselves, so an interruption
 between a remediation planner turn and its scheduler checkpoint keeps the same
 narrow classification instead of latching the complete board; anything that
-cannot be re-verified stays broad. Ledger completeness is judged the same way:
-an item recorded under an earlier plan subject stops counting as a missing
-obligation once the run has carried or minted that item, or once the recorded
-history proves it was canonically cleared. That second proof has to come from
+cannot be re-verified stays broad. Under staged planning, and only there,
+ledger completeness is judged the same way: an item recorded under an earlier
+plan subject stops counting as a missing obligation once the run has carried or
+minted that item, or once the recorded history proves it was canonically
+cleared. Full-board planning keeps the conservative reading it had before this
+policy existed, where any cross-subject item at all makes the ledger
+unreconstructible, so the compatibility default's context-mode selection and
+posted bodies are unchanged. That second proof has to come from
 the durable history rather than the running process, because a reviewer-only
 advance records an empty carried ledger — after remediation there is nothing
 left to carry — and a restart on exactly that seam would otherwise rediscover

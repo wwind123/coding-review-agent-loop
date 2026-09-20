@@ -7570,8 +7570,9 @@ def _round_ledger_may_be_incomplete(
     ledger, so a restart on that seam would otherwise rediscover a cleared
     cross-subject item and read the ledger as unreconstructible.  Callers that
     pass nothing keep the previous conservative reading, where any
-    cross-subject item at all makes the ledger unreconstructible (#905, from
-    #841).
+    cross-subject item at all makes the ledger unreconstructible; that is what
+    the PR flow and the compatibility-default full-board planning path both
+    do, so only staged planning changes behavior here (#905, from #841).
     """
     same_subject_incomplete = (
         current_resume.ledger_may_be_incomplete
@@ -9164,7 +9165,13 @@ def _run_plan_first_loop(
             comments=issue_context.comments,
             flow="plan",
             current_subject=current_plan_subject,
-            accounted_item_ids=tuple(sorted(plan_accounted_item_ids)),
+            # Compatibility default: full-board planning keeps the previous
+            # conservative reading, where any cross-subject item at all makes
+            # the ledger unreconstructible, so its context-mode selection and
+            # posted bodies are unchanged by staged planning (#905).
+            accounted_item_ids=(
+                tuple(sorted(plan_accounted_item_ids)) if staged_planning else ()
+            ),
         )
         plan_hr_ids = _surfaced_reviewer_requirement_ids(
             issue_context.human_requirements,
