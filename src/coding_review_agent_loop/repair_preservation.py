@@ -353,8 +353,14 @@ def _validate_review_grounding(
         _name, text = target_findings[finding_index]
         tokens = set(_content_tokens(text))
         if not candidate_tokens[candidate_index] and not candidate_modifiers[candidate_index]:
-            # A marker-only or empty source entry has no prose to compare.
-            return True
+            # A marker-only or empty source entry carries no prose, so it can
+            # only correspond to a target finding that carries none either —
+            # which is exactly the reserved-marker neutralization case, whose
+            # label tokens are exempt. Matching it unconditionally would let the
+            # source summary or any other global prose be promoted into a
+            # fabricated finding, because whole-source coverage alone cannot
+            # tell a finding apart from the rest of the source text (#871).
+            return not tokens and not _modifier_counts(text)
         if not tokens <= candidate_tokens[candidate_index]:
             return False
         if not compare_modifiers:

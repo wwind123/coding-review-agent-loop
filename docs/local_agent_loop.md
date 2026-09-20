@@ -3118,7 +3118,13 @@ schema's own vocabulary, carried `item-<n>` identifiers, and the reserved-marker
 neutralization labels derived from the marker registry. Findings in all three
 buckets are matched injectively to source findings from any bucket, so a
 promotion out of `future_followups` remains legal while the repaired finding
-count may never exceed the source's. Each matched finding pair, and each matched
+count may never exceed the source's. An empty or marker-only source finding
+carries no prose and is therefore not a wildcard: it corresponds only to a
+target finding that is itself empty after the exempt sets are removed, which is
+the reserved-marker neutralization case. Whole-source coverage alone cannot tell
+a finding apart from the summary or any other global prose, so without that
+restriction a source summary could be promoted into a fabricated finding and
+ground a blocking verdict. Each matched finding pair, and each matched
 disposition note pair, must carry equal per-modifier occurrence counts over a
 pinned set of negations and limiting qualifiers, compared after a pinned
 contraction normalization that runs before punctuation stripping over both

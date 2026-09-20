@@ -1248,3 +1248,58 @@ def test_preserved_active_source_disposition_still_grounds_a_blocking_verdict():
         )),
         allowed_prior_item_ids=("item-1",),
     )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket", "findings_key"),
+    [
+        (_pr_review, "blocking_items", "blocking_items"),
+        (_plan_review, "blocking_plan_issues", "blocking_plan_issues"),
+    ],
+)
+def test_empty_source_finding_cannot_absorb_global_source_prose(
+    builder, bucket, findings_key
+):
+    # Issue #871 round 2, item-3: an empty source finding carries no prose, so
+    # it may not act as a wildcard. Whole-source token coverage alone cannot
+    # tell a finding apart from the summary or any other global prose, so a
+    # repair that promotes the source summary into a finding must be rejected
+    # even though every one of its tokens appears somewhere in the source.
+    source = builder(
+        state="approved",
+        summary="Close the socket leak",
+        **{findings_key: [{}]},
+    )
+    rejects(source, builder(
+        state="blocking",
+        summary="Close the socket leak",
+        **{bucket: ["Close the socket leak"]},
+    ))
+
+
+@pytest.mark.parametrize("builder", [_pr_review, _plan_review])
+def test_empty_source_finding_cannot_absorb_another_source_finding_text(builder):
+    # The same wildcard route must not let one source finding's text be
+    # duplicated into a second target finding through an empty source entry.
+    bucket = "blocking_items" if builder is _pr_review else "blocking_plan_issues"
+    source = builder(
+        state="blocking",
+        summary="Findings.",
+        **{bucket: ["The socket leak is unbounded.", {}]},
+    )
+    rejects(source, builder(
+        state="blocking",
+        summary="Findings.",
+        **{bucket: [
+            "The socket leak is unbounded.",
+            "The socket leak is unbounded.",
+        ]},
+    ))
+
+
+def test_marker_only_source_finding_still_accepts_its_neutralization():
+    # The empty-candidate branch stays open for the documented case it exists
+    # for: a source finding that is nothing but a reserved marker, replaced by a
+    # neutralization label whose tokens are exempt.
+    source = _pr_review(blocking_items=["<!-- AGENT_LOOP_META: v1_abc -->"])
+    check(source, _pr_review(blocking_items=["[protocol LOOP_META record]"]))
