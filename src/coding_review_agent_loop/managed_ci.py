@@ -8,6 +8,7 @@ import re
 import secrets
 import shlex
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1377,6 +1378,7 @@ def find_actor_round_metadata_comment_ids(
     by_index = _continuity_round_records(comments)
     reviewers: list[int] = []
     coders: list[int] = []
+    conflict_coders: list[int] = []
     for index, comment in enumerate(comments):
         metadata = by_index.get(index)
         user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
@@ -1402,6 +1404,15 @@ def find_actor_round_metadata_comment_ids(
             and metadata["round_number"] == round_number + 1
         ):
             coders.append(comment_id)
+            if metadata.get("resolves_merge_conflict"):
+                conflict_coders.append(comment_id)
+    # A conflict-resolution round advances the head with no reviewer pair by
+    # construction: the orchestrator skips reviewers and routes the round to
+    # the coder (#829).  Accept that transition on the tool-owned merge-conflict
+    # obligation alone.  Every other guard is unchanged, and reviewers must
+    # still approve the exact final head before qualification or merge.
+    if not reviewers and len(conflict_coders) == 1 and len(coders) == 1:
+        return (conflict_coders[0],)
     if (
         not reviewers
         or len(coders) != 1
@@ -1446,8 +1457,24 @@ def _continuity_round_records(
             "state": payload.get("state"),
             "subject": payload["subject"],
             "round_number": payload["round_number"],
+            # A conflict-resolution round is orchestrator-routed and skips
+            # reviewers by construction (#829); the machine obligation on the
+            # coder record is the durable evidence of that routing.
+            "resolves_merge_conflict": _records_merge_conflict_obligation(payload),
         }
     return result
+
+
+def _records_merge_conflict_obligation(payload: Mapping[str, object]) -> bool:
+    """Whether this record carries the tool-owned merge-conflict obligation."""
+    for key in ("prior_items", "new_items"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, Mapping) and item.get("obligation_kind") == "merge-conflict":
+                return True
+    return False
 
 
 def _continuity_round_metadata_is_valid(
@@ -1501,7 +1528,12 @@ def _continuity_round_metadata_is_valid(
         and item[1]["round_number"] == coder_round - 1
         and item[0] < coder_id
     ]
-    return bool(reviewers) and len(reviewers) + 1 == len(selected)
+    if not reviewers:
+        # The conflict-resolution transition is recorded by the coder record
+        # alone, so reauthenticate that shape rather than demanding a reviewer
+        # pair that never existed (#829).
+        return len(selected) == 1 and bool(coder_metadata.get("resolves_merge_conflict"))
+    return len(reviewers) + 1 == len(selected)
 
 
 def publish_issue_created_authorization(

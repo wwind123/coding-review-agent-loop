@@ -414,3 +414,19 @@ def test_architecture_records_label_and_read_back_invariants():
     assert "shared write read-back verifier" in text
     assert "historical bare-marker body" in text
     assert "producing login and ID" in text
+
+
+def test_docs_describe_conflict_round_continuity_exception():
+    # #829: the conflict-resolution round advances the head with no reviewer,
+    # so both the canonical and operator contracts must name that transition.
+    arch_text = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    doc_text = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
+    assert "merge-conflict resolution round" in arch_text
+    assert "tool-owned merge-conflict obligation" in arch_text
+    assert "outside the coder's classifiable item namespace" in arch_text
+    assert "resume reauthenticates the same shape" in arch_text
+    assert "merge-conflict resolution round is the single exception" in doc_text
+    assert "tool-owned merge-conflict obligation instead of a review pair" in doc_text
+    for text in (arch_text, doc_text):
+        assert "still fails closed" in text
+        assert "approve the exact final head before qualification or merge" in text
