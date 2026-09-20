@@ -1128,3 +1128,23 @@ def test_snapshot_hashes_clean_and_dirty_gitlinks_without_reading_directory(tmp_
         registry=registry,
     )
     assert evidence.observations[0].attribution.state == "unknown"
+
+
+def test_referenced_paths_treat_bare_launcher_like_the_absolute_spelling(tmp_path):
+    """Issue #892: referenced-path projection must be launcher-spelling independent."""
+    from coding_review_agent_loop.local_test_evidence import _referenced_paths
+
+    root = tmp_path / "checkout"
+    (root / "tests").mkdir(parents=True)
+    (root / "tests" / "test_thing.py").write_text("", encoding="utf-8")
+    memory = tmp_path / "memory"
+
+    inner = ["python3", "-m", "pytest", "tests/test_thing.py", "-q"]
+    options = ["run-tests", "--timeout-seconds", "900", "--memory-dir", str(memory), "--"]
+    absolute = [str(tmp_path / "bin" / "agent-loop"), *options, *inner]
+    bare = ["agent-loop", *options, *inner]
+
+    expected = _referenced_paths(root, inner)
+    assert "tests/test_thing.py" in expected
+    assert _referenced_paths(root, absolute) == expected
+    assert _referenced_paths(root, bare) == expected

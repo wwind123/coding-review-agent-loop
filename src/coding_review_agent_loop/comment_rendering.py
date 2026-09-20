@@ -103,7 +103,9 @@ def _render_test_command_for_comment(
             and _SHELL_ASSIGNMENT_RE.match(tokens[prefix_len])
         ):
             prefix_len += 1
-        parsed = parse_managed_test_invocation(tokens[prefix_len:])
+        parsed = parse_managed_test_invocation(
+            tokens[prefix_len:], allow_command_name_launcher=True
+        )
     except (ValueError, TestRuntimeConfigurationError):
         return command
     if parsed is None:

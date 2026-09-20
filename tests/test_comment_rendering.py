@@ -2135,3 +2135,40 @@ def test_staged_policy_public_audit_comments_identify_phase_and_neutral_accounti
     assert any("Phase: secondary-audit; force-full: False (source: none)." in c for c in reconciliations)
     for comment in runner.comments:
         assert "AGENT_ROUND" not in comment.split("<!--")[0]
+
+
+def test_bare_launcher_managed_comment_hides_the_memory_directory():
+    """Issue #892: the reported bare spelling must not publish the cache path."""
+    memory_dir = "/home/wwind123/.cache/coding-review-agent-loop/repos/example/memory"
+    command = shlex.join([
+        "agent-loop", "run-tests", "--timeout-seconds", "900",
+        "--memory-dir", memory_dir, "--",
+        "python3", "-m", "pytest", "tests/test_followups.py", "-q",
+    ])
+
+    rendered = _render_test_command_for_comment(command)
+
+    assert rendered == (
+        shlex.join(["python3", "-m", "pytest", "tests/test_followups.py", "-q"])
+        + " (agent-loop instrumented; whole-command timeout 900s)"
+    )
+    assert memory_dir not in rendered
+    assert ".cache" not in rendered
+    assert "--memory-dir" not in rendered
+
+    module_form = shlex.join([
+        "python3", "-m", "coding_review_agent_loop.cli", "run-tests",
+        "--memory-dir", memory_dir, "--",
+        "python3", "-m", "pytest", "tests/test_followups.py", "-q",
+    ])
+    assert memory_dir not in _render_test_command_for_comment(module_form)
+
+
+@pytest.mark.parametrize("command", [
+    # Malformed options fail closed to the verbatim command.
+    "agent-loop run-tests --unknown -- python3 -m pytest tests/test_followups.py",
+    # A timeout above the policy ceiling also falls back to verbatim.
+    "agent-loop run-tests --timeout-seconds 99999 -- python3 -m pytest tests/test_followups.py",
+])
+def test_bare_launcher_malformed_or_over_ceiling_still_renders_verbatim(command):
+    assert _render_test_command_for_comment(command) == command

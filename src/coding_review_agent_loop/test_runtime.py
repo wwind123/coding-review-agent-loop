@@ -289,22 +289,63 @@ def _is_absolute_executable(token: str) -> bool:
     return bool(token) and Path(token).is_absolute()
 
 
-def parse_managed_test_invocation(argv: Sequence[str]) -> ManagedTestInvocation | None:
+def _is_bare_command_name(token: str) -> bool:
+    """A PATH-resolved launcher spelling that cannot name a location.
+
+    Only separator-free command names qualify.  A path-shaped spelling such as
+    ``../agent-loop`` can point outside a checkout, so it never gains the
+    report-side exemption.
+    """
+    return (
+        bool(token)
+        and not token.startswith("-")
+        and "/" not in token
+        and os.sep not in token
+        and (os.altsep is None or os.altsep not in token)
+        and token not in {".", ".."}
+    )
+
+
+def _is_recognized_launcher(token: str, *, allow_command_name_launcher: bool) -> bool:
+    if _is_absolute_executable(token):
+        return True
+    return allow_command_name_launcher and _is_bare_command_name(token)
+
+
+def parse_managed_test_invocation(
+    argv: Sequence[str],
+    *,
+    allow_command_name_launcher: bool = False,
+) -> ManagedTestInvocation | None:
     """Parse the exact wrapper contract, returning ``None`` for a bare command.
 
     A recognized-looking wrapper with malformed options raises a configuration
     error.  Consumers that inspect untrusted response text can catch that error
     and fail closed to the original command.
+
+    The launcher must be an absolute executable by default.  Report-side
+    consumers that interpret agent-reported command text pass
+    ``allow_command_name_launcher=True`` so a separator-free PATH command name
+    (``agent-loop run-tests ...`` or ``python3 -m coding_review_agent_loop.cli
+    run-tests ...``) is recognized on the same terms.
     """
     tokens = tuple(str(item) for item in argv)
     prefix_len = 0
-    if len(tokens) >= 2 and _is_absolute_executable(tokens[0]) and Path(tokens[0]).name == "agent-loop":
+    if (
+        len(tokens) >= 2
+        and _is_recognized_launcher(
+            tokens[0], allow_command_name_launcher=allow_command_name_launcher
+        )
+        and Path(tokens[0]).name == "agent-loop"
+    ):
         if tokens[1] != "run-tests":
             return None
         prefix_len = 2
     elif (
         len(tokens) >= 4
-        and _is_absolute_executable(tokens[0])
+        and _is_recognized_launcher(
+            tokens[0], allow_command_name_launcher=allow_command_name_launcher
+        )
         and tokens[1] == "-m"
         and tokens[2] == "coding_review_agent_loop.cli"
         and tokens[3] == "run-tests"
@@ -553,7 +594,11 @@ def managed_wrapper_traversal(tokens: Sequence[str]) -> ManagedWrapperTraversal:
     return ManagedWrapperTraversal(recognized_prefix, positions, None)
 
 
-def parse_managed_test_command(argv: Sequence[str]) -> ManagedTestInvocation | None:
+def parse_managed_test_command(
+    argv: Sequence[str],
+    *,
+    allow_command_name_launcher: bool = False,
+) -> ManagedTestInvocation | None:
     """Parse a managed wrapper after supported shell execution prefixes.
 
     Prefix recognition is deliberately conservative.  Once a prefix is seen,
@@ -564,7 +609,9 @@ def parse_managed_test_command(argv: Sequence[str]) -> ManagedTestInvocation | N
     prefix_head = managed_wrapper_traversal(tokens).effective_head_index
     if prefix_head is None:
         return None
-    return parse_managed_test_invocation(tokens[prefix_head:])
+    return parse_managed_test_invocation(
+        tokens[prefix_head:], allow_command_name_launcher=allow_command_name_launcher
+    )
 
 
 def resolve_wrapper_prefix() -> tuple[str, ...] | None:

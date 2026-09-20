@@ -1423,6 +1423,47 @@ def test_prefixed_managed_test_wrapper_citation_matches_broker_inner_command() -
     assert parsed.rows[0].status == "verified"
 
 
+def test_bare_launcher_citation_matches_broker_inner_command() -> None:
+    """Issue #892: the launcher spelling agents actually report must project."""
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    citation = evidence["rows"][0]["evidence_citations"][0]
+    citation["command"] = (
+        "agent-loop run-tests --timeout-seconds 1800 "
+        "--memory-dir /home/test/.cache/agent-loop -- "
+        "python3 -m pytest tests/test_orchestrator_pr.py -q"
+    )
+
+    parsed = parse_risk_test_matrix_evidence(
+        evidence,
+        matrix=matrix,
+        authoritative_test_observations=[_rich_receipt()],
+    )
+
+    assert parsed.rows[0].status == "verified"
+
+
+def test_bare_module_launcher_citation_matches_broker_inner_command() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    citation = evidence["rows"][0]["evidence_citations"][0]
+    citation["command"] = (
+        "python3 -m coding_review_agent_loop.cli run-tests "
+        "--memory-dir /home/test/.cache/agent-loop -- "
+        "python3 -m pytest tests/test_orchestrator_pr.py -q"
+    )
+
+    parsed = parse_risk_test_matrix_evidence(
+        evidence,
+        matrix=matrix,
+        authoritative_test_observations=[_rich_receipt()],
+    )
+
+    assert parsed.rows[0].status == "verified"
+
+
 def test_managed_test_wrapper_citation_rejects_different_inner_command() -> None:
     matrix = parse_risk_test_matrix(_matrix())
     identity = risk_test_matrix_identity(matrix)
@@ -1446,7 +1487,9 @@ def test_managed_test_wrapper_citation_rejects_different_inner_command() -> None
     "python3 -m pytest tests/test_orchestrator_pr.py -q",
     "/opt/venv/bin/agent-loop run-tests --timeout-seconds 1 "
     "--timeout-seconds 2 -- python3 -m pytest tests/test_orchestrator_pr.py -q",
-    "agent-loop run-tests --timeout-seconds 1800 -- "
+    "agent-loop run-tests --unknown -- "
+    "python3 -m pytest tests/test_orchestrator_pr.py -q",
+    "../agent-loop run-tests --timeout-seconds 1800 -- "
     "python3 -m pytest tests/test_orchestrator_pr.py -q",
 ])
 def test_managed_test_wrapper_citation_rejects_noncanonical_or_malformed_command(

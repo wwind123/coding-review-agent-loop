@@ -1291,3 +1291,90 @@ def test_cli_successful_inner_probe_clears_matching_failure(tmp_path, monkeypatc
         "--", *command,
     ]) == 0
     assert [row["state"] for row in runtime.load_launcher_health(memory)] == ["verified"]
+
+
+def test_bare_launcher_recognition_is_opt_in_and_fails_closed(tmp_path):
+    memory = tmp_path / "memory"
+    bare = [
+        "agent-loop", "run-tests", "--timeout-seconds", "900",
+        "--memory-dir", str(memory), "--", "python3", "-m", "pytest", "tests/",
+    ]
+    absolute = [str(tmp_path / "agent-loop"), *bare[1:]]
+
+    assert runtime.parse_managed_test_invocation(bare) is None
+    assert runtime.parse_managed_test_command(bare) is None
+
+    parsed = runtime.parse_managed_test_invocation(bare, allow_command_name_launcher=True)
+    reference = runtime.parse_managed_test_invocation(absolute)
+    assert parsed is not None and reference is not None
+    assert parsed.inner_argv == reference.inner_argv
+    assert parsed.timeout_seconds == reference.timeout_seconds
+    assert parsed.memory_dir == reference.memory_dir
+    assert parsed.prefix_argv == ("agent-loop", "run-tests")
+
+    module = runtime.parse_managed_test_invocation(
+        ["python3", "-m", "coding_review_agent_loop.cli", "run-tests", "--", "pytest", "tests/"],
+        allow_command_name_launcher=True,
+    )
+    assert module is not None
+    assert module.inner_argv == ("pytest", "tests/")
+
+    prefixed = runtime.parse_managed_test_command(
+        ["timeout", "1800", *bare], allow_command_name_launcher=True
+    )
+    assert prefixed is not None
+    assert prefixed.inner_argv == ("python3", "-m", "pytest", "tests/")
+
+    # Path-shaped relative spellings and unrelated modules never qualify.
+    for rejected in (
+        ["../agent-loop", "run-tests", "--", "true"],
+        ["./agent-loop", "run-tests", "--", "true"],
+        ["python3", "-m", "other_module.cli", "run-tests", "--", "true"],
+    ):
+        assert runtime.parse_managed_test_invocation(
+            rejected, allow_command_name_launcher=True
+        ) is None
+
+    # Malformed options still fail closed under the opt-in.
+    with pytest.raises(runtime.TestRuntimeConfigurationError):
+        runtime.parse_managed_test_invocation(
+            ["agent-loop", "run-tests", "--unknown", "--", "true"],
+            allow_command_name_launcher=True,
+        )
+    with pytest.raises(runtime.TestRuntimeConfigurationError):
+        runtime.parse_managed_test_invocation(
+            ["agent-loop", "run-tests", "--memory-dir", str(memory), "true"],
+            allow_command_name_launcher=True,
+        )
+    with pytest.raises(runtime.TestRuntimeConfigurationError):
+        runtime.parse_managed_test_invocation(
+            [
+                "agent-loop", "run-tests", "--timeout-seconds", "1",
+                "--timeout-seconds", "2", "--", "true",
+            ],
+            allow_command_name_launcher=True,
+        )
+
+
+def test_report_side_consumers_pass_the_launcher_opt_in_explicitly():
+    """Each report-side consumer opts in at its call site, not by default."""
+    import inspect
+
+    from coding_review_agent_loop import (
+        comment_rendering,
+        local_test_evidence,
+        protocol,
+        workdir_guard,
+    )
+
+    for module, function in (
+        (workdir_guard, "_validate_managed_command"),
+        (comment_rendering, "_render_test_command_for_comment"),
+        (protocol, "_managed_test_wrapper_inner_command"),
+        (local_test_evidence, "_referenced_paths"),
+    ):
+        source = inspect.getsource(getattr(module, function))
+        assert "allow_command_name_launcher=True" in source, function
+
+    signature = inspect.signature(runtime.parse_managed_test_invocation)
+    assert signature.parameters["allow_command_name_launcher"].default is False
