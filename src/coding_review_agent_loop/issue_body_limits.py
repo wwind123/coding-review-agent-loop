@@ -41,10 +41,40 @@ class BoundedSection:
     """Where the complete text remains available."""
 
 
-def _notice(section: BoundedSection) -> str:
+def shortening_notice(section: BoundedSection) -> str:
+    """Return the pointer notice :func:`shortened_section` appends for ``section``."""
     return (
         f"[Shortened to fit the GitHub body limit; only the opening of the "
         f"{section.name} is repeated here. The complete text is in {section.pointer}.]"
+    )
+
+
+def is_bounded_form(value: str, section: BoundedSection) -> bool:
+    """Report whether ``value`` is exactly ``section.text`` or a shortened form of it.
+
+    Unlike :func:`bounded_text_present`, which searches a rendered body and so
+    tolerates surrounding text, this compares an isolated stored field: the
+    value must be the full text, the bare pointer notice, or exactly what
+    :func:`shortened_section` produces for some budget -- a whitespace-trimmed
+    opening of ``section.text``, a blank line, and the notice, with nothing
+    before or after.  Recovery checks that reconcile a stored value use this so
+    a divergent record cannot pass as a shortened one (#907).
+    """
+    if value == section.text:
+        return True
+    notice = shortening_notice(section)
+    if value == notice:
+        return True
+    suffix = f"\n\n{notice}"
+    if not value.endswith(suffix):
+        return False
+    retained = value[: -len(suffix)]
+    # `shortened_section` cuts at a budget and right-strips, so an exact
+    # shortened form is a non-empty prefix of the text with no trailing space.
+    return (
+        bool(retained)
+        and retained == retained.rstrip()
+        and section.text.startswith(retained)
     )
 
 
@@ -57,7 +87,7 @@ def shortened_section(section: BoundedSection, *, budget: int) -> str:
     """
     if len(section.text) <= budget:
         return section.text
-    notice = _notice(section)
+    notice = shortening_notice(section)
     keep = max(budget - len(notice) - 2, 0)
     if keep == 0:
         return notice
@@ -75,7 +105,7 @@ def bounded_text_present(body: str, section: BoundedSection, *, after: str | Non
     """
     if not section.text or section.text in body:
         return True
-    notice = _notice(section)
+    notice = shortening_notice(section)
     end = body.find(notice)
     if end < 0:
         return False

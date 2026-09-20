@@ -1,6 +1,7 @@
 import base64
 import dataclasses
 import json
+import re
 
 import pytest
 
@@ -34,6 +35,8 @@ from coding_review_agent_loop.decomposition import (
     find_existing_decomposition,
     find_existing_topology_checkpoint,
     format_decomposition_parent_summary,
+    retained_parent_excerpt_section,
+    retained_parent_scope_matches,
     format_execution_decision,
     format_phase_implementation_handoff_comment,
     format_topology_checkpoint,
@@ -44,6 +47,7 @@ from coding_review_agent_loop.decomposition import (
     normalize_execution_recommendation,
     find_existing_execution_decision,
 )
+from coding_review_agent_loop.issue_body_limits import shortened_section, shortening_notice
 from coding_review_agent_loop.protocol import (
     EXECUTION_DISPOSITION_DIRECT,
     EXECUTION_DISPOSITION_PLANNING,
@@ -1972,3 +1976,212 @@ def test_fresh_child_recovery_still_rejects_a_foreign_parent_excerpt(tmp_path):
         parent_issue=56,
         phase=phase,
     )
+
+
+def test_oversized_retained_excerpt_is_shortened_in_the_parent_summary():
+    """#907: the parent summary embeds the retained-parent excerpt.
+
+    Issue #841 created its three child issues and then failed to publish the
+    summary with 'GitHub comment body exceeds 60000 characters'.
+    """
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    huge_excerpt = "\n".join(
+        f"Retained scope line {index}: " + "detail " * 30 for index in range(3_000)
+    )
+    assert len(huge_excerpt) > MAX_GITHUB_BODY_CHARS
+    phase = PlanPhase(
+        title="Stage one",
+        scope="Implement the reviewed stage contract.",
+        non_goals="No rollout.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low.",
+        validation="Run the focused tests.",
+        parent_context="Approved parent plan.",
+        automation="agent-pr",
+        depends_on=(),
+    )
+
+    body = format_decomposition_parent_summary(
+        parent_issue=841,
+        mode="implement-by-phase",
+        plan_hash="a" * 16,
+        created=(CreatedPhaseIssue(phase=phase, issue_url="https://example/issues/904", issue_number=904),),
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="b" * 64, plan_hash="a" * 16, excerpt=huge_excerpt,
+        ),
+    )
+
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "Approved plan decomposed for issue #841." in body
+    # The child table and the plan identity survive; only the excerpt is cut.
+    assert "https://example/issues/904" in body
+    assert "Retained scope line 0:" in body
+    assert "canonical plan comment" in body
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        pytest.param("保留された親スコープの詳細な説明文です。", id="cjk"),
+        pytest.param('He said "\\\\path\\to\\file" — \U0001f9ea test\t', id="escape-heavy"),
+    ],
+)
+def test_non_ascii_retained_excerpt_is_shortened_in_the_parent_summary(unit):
+    """#907: the excerpt budget must measure the rendered body, not characters.
+
+    `_encode_json_payload` serializes with `ensure_ascii=True`, so a CJK
+    character costs a six-character escape (an emoji, a surrogate pair) before
+    base64 expands it again.  A character-ratio budget retains far more text
+    than the body can hold and the summary still overflows.
+    """
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    huge_excerpt = "\n".join(f"{index}: {unit * 20}" for index in range(3_000))
+    assert len(huge_excerpt) > MAX_GITHUB_BODY_CHARS
+    phase = PlanPhase(
+        title="Stage one",
+        scope="Implement the reviewed stage contract.",
+        non_goals="No rollout.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low.",
+        validation="Run the focused tests.",
+        parent_context="Approved parent plan.",
+        automation="agent-pr",
+        depends_on=(),
+    )
+
+    body = format_decomposition_parent_summary(
+        parent_issue=841,
+        mode="implement-by-phase",
+        plan_hash="a" * 16,
+        created=(
+            CreatedPhaseIssue(
+                phase=phase, issue_url="https://example/issues/904", issue_number=904
+            ),
+        ),
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="b" * 64, plan_hash="a" * 16, excerpt=huge_excerpt,
+        ),
+    )
+
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "Approved plan decomposed for issue #841." in body
+    assert "https://example/issues/904" in body
+    assert "canonical plan comment" in body
+    # The embedded record still decodes, and carries the same shortened excerpt.
+    encoded = re.search(r"<!-- AGENT_PLAN_DECOMPOSITION: (\S+) -->", body).group(1)
+    metadata = _decode_metadata(encoded)
+    assert metadata.retained_parent_scope is not None
+    assert metadata.retained_parent_scope.excerpt in body
+    assert len(metadata.retained_parent_scope.excerpt) < len(huge_excerpt)
+
+
+def test_parent_summary_overflow_names_the_surface_when_nothing_can_be_cut():
+    """A summary whose fixed sections overflow raises a precise diagnostic."""
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    phase = PlanPhase(
+        title="T" * 400,
+        scope="Implement the reviewed stage contract.",
+        non_goals="No rollout.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low.",
+        validation="Run the focused tests.",
+        parent_context="Approved parent plan.",
+        automation="agent-pr",
+        depends_on=(),
+    )
+    created = tuple(
+        CreatedPhaseIssue(phase=phase, issue_url=f"https://example/issues/{n}", issue_number=n)
+        for n in range(1, 120)
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        format_decomposition_parent_summary(
+            parent_issue=841,
+            mode="implement-by-phase",
+            plan_hash="a" * 16,
+            created=created,
+        )
+
+    message = str(excinfo.value)
+    assert "Decomposition parent summary for issue #841" in message
+    assert str(MAX_GITHUB_BODY_CHARS) in message
+
+
+def test_retained_parent_scope_matches_only_reconciles_the_excerpt():
+    """#907: every field but the excerpt must still match exactly."""
+    expected = RetainedParentScope(
+        plan_subject="s" * 32,
+        plan_hash="a" * 16,
+        excerpt="The approved plan's retained scope.\nSecond line of detail.",
+        status="required",
+        deliverables=("Deliver the retained scope.",),
+    )
+    section = retained_parent_excerpt_section(expected.excerpt, parent_issue=841)
+
+    assert retained_parent_scope_matches(expected, expected, parent_issue=841)
+    assert retained_parent_scope_matches(None, None, parent_issue=841)
+    assert not retained_parent_scope_matches(None, expected, parent_issue=841)
+    shortened = dataclasses.replace(
+        expected, excerpt=shortened_section(section, budget=len(expected.excerpt) // 2)
+    )
+    assert shortened.excerpt != expected.excerpt
+    assert retained_parent_scope_matches(shortened, expected, parent_issue=841)
+    # A shortened excerpt recorded under a different parent points elsewhere.
+    assert not retained_parent_scope_matches(
+        dataclasses.replace(
+            expected,
+            excerpt=shortened_section(
+                retained_parent_excerpt_section(expected.excerpt, parent_issue=999),
+                budget=len(expected.excerpt) // 2,
+            ),
+        ),
+        expected,
+        parent_issue=841,
+    )
+    assert not retained_parent_scope_matches(
+        dataclasses.replace(shortened, status="none"), expected, parent_issue=841
+    )
+    assert not retained_parent_scope_matches(
+        dataclasses.replace(expected, excerpt="A different plan's scope."),
+        expected,
+        parent_issue=841,
+    )
+
+
+def test_retained_parent_scope_rejects_content_around_a_bounded_excerpt():
+    """#907: the stored excerpt must be an exact full or shortened form.
+
+    The recovery check reads an isolated record field, so anything appended to
+    or prefixed onto the full text or a shortened form is divergent and must
+    fail closed rather than be tolerated as surrounding body text.
+    """
+    expected = RetainedParentScope(
+        plan_subject="s" * 32,
+        plan_hash="a" * 16,
+        excerpt="The approved plan's retained scope.\nSecond line of detail.",
+    )
+    section = retained_parent_excerpt_section(expected.excerpt, parent_issue=841)
+    notice = shortening_notice(section)
+    shortened = shortened_section(section, budget=len(expected.excerpt) // 2)
+    assert shortened != expected.excerpt
+
+    def matches(excerpt):
+        return retained_parent_scope_matches(
+            dataclasses.replace(expected, excerpt=excerpt), expected, parent_issue=841
+        )
+
+    assert matches(expected.excerpt)
+    assert matches(shortened)
+    assert matches(notice)
+    # Appended, prefixed or interleaved content is divergent, in both forms.
+    assert not matches(expected.excerpt + "\n\nForeign appended scope.")
+    assert not matches("Foreign leading scope.\n\n" + expected.excerpt)
+    assert not matches(shortened + "\n\nForeign appended scope.")
+    assert not matches("Foreign leading scope.\n\n" + shortened)
+    assert not matches(notice + "\n\nForeign appended scope.")
+    assert not matches(expected.excerpt + "\n\n" + notice + "\n\nForeign scope.")
+    # A retained opening that is not an opening of the recomputed plan fails.
+    assert not matches("Foreign opening.\n\n" + notice)
