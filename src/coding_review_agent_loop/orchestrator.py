@@ -9932,6 +9932,7 @@ def _run_plan_first_loop(
                     # A reviewer cannot repair a missing coder attestation.
                     missing_acknowledgements = []
                 still_missing = []
+                repaired_plan_approvals: dict[str, str] = {}
                 for reviewer_name, review_output in approved_review_outputs:
                     if human_requirements_resolved(review_output):
                         continue
@@ -9974,6 +9975,28 @@ def _run_plan_first_loop(
                                 f"Planning round {round_number}: repair recovered "
                                 f"HUMAN_REQUIREMENTS_RESOLVED for {reviewer_name}",
                             )
+                            repaired_plan_approvals[reviewer_name] = repaired_text
+                            if staged_planning:
+                                # The record posted before the repair stores no
+                                # surfaced requirement IDs, because the original
+                                # text carried no acknowledgement.  Without an
+                                # amended record the next round would reject this
+                                # approval as unacknowledged and re-invoke the
+                                # reviewer instead of advancing the phase, so the
+                                # repaired result is persisted here; a later
+                                # record for the same reviewer supersedes the
+                                # earlier one (#905).
+                                log(
+                                    config,
+                                    f"Planning round {round_number}: persisting the repaired "
+                                    f"{reviewer_name} plan approval for the exact-plan carry",
+                                )
+                                _post_plan_reviewer_comment(
+                                    reviewer_name,
+                                    repaired_parsed,
+                                    review_output=repaired_text,
+                                    model_used=None,
+                                )
                             continue
                         if repaired_parsed.state == "blocking":
                             log(
@@ -10046,6 +10069,13 @@ def _run_plan_first_loop(
                         item for item in unresolved_items if item.status in {"blocking", "same-plan"}
                     ]
                     all_approved = False
+                if repaired_plan_approvals:
+                    # Later gates and the approval carry must read the repaired
+                    # text, not the output that lacked the acknowledgement.
+                    approved_review_outputs = [
+                        (name, repaired_plan_approvals.get(name, output))
+                        for name, output in approved_review_outputs
+                    ]
 
         # The final gate evaluates every required plan reviewer, carried and
         # current alike.  A paused reviewer counts only through a qualifying

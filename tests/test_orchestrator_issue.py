@@ -8838,6 +8838,199 @@ def test_staged_planning_withdrawn_requirement_blocks_carried_approvals(
     assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
 
 
+def _repaired_acknowledgement_fixtures():
+    """A staged plan whose primary approves without acknowledging the requirement.
+
+    Repair recovers the acknowledgement, so the reviewer's verdict is unchanged
+    and only the signed-requirement marker and dispositions are added.
+    """
+    requirement = HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Keep the public API unchanged.",
+    )
+    dispositions = [
+        {
+            "requirement_id": requirement.requirement_id,
+            "disposition": "addressed",
+            "evidence": "The plan preserves the public API.",
+        }
+    ]
+    plan_output = structured_v1_plan_state().replace(
+        '"human_requirement_dispositions": []',
+        '"human_requirement_dispositions": ' + json.dumps(dispositions),
+        1,
+    ).replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        "\n"
+        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+        "### Human requirements\n"
+        f"- {requirement.requirement_id}: the plan preserves the public API.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+    # Structurally complete, so it passes reviewer validation and is posted as
+    # written; only the signed-requirement marker is missing, which is exactly
+    # what the post-reconciliation acknowledgement repair recovers.
+    unacknowledged = structured_plan_review(
+        state="approved",
+        human_requirement_dispositions=dispositions,
+    )
+    repaired = structured_plan_review(
+        state="approved",
+        human_requirements_resolved=True,
+        human_requirement_dispositions=dispositions,
+    )
+    panel = structured_plan_review(
+        state="approved",
+        reviewer="Google Gemini",
+        human_requirements_resolved=True,
+        human_requirement_dispositions=dispositions,
+    )
+    return requirement, plan_output, unacknowledged, repaired, panel
+
+
+def test_staged_planning_persists_a_repaired_primary_acknowledgement(tmp_path, monkeypatch):
+    """`carried-approval-requires-current-ack`, `reviewer-only-phase-advance`.
+
+    A repaired acknowledgement must reach the durable record before the phase
+    advance. The record posted with the original text stores no surfaced
+    requirement IDs, so without the amendment the next round would reject the
+    primary's approval as unacknowledged and invoke the primary again instead
+    of opening the independent panel.
+    """
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output],
+        codex_outputs=[unacknowledged],
+        gemini_outputs=[panel],
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(
+            runner_arg, config=config, issue_number=issue_number
+        )
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired
+    ):
+        assert run_issue_loop(
+            runner,
+            issue_number=56,
+            config=_staged_plan_config(tmp_path),
+            plan_first=True,
+        ) == 0
+
+    records = _plan_round_records(runner)
+    codex_records = [
+        record
+        for record in records
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    # The amended record supersedes the one written before the repair, and it
+    # is the one that carries the acknowledgement for the surfaced set.
+    assert codex_records[-1].round_number == 1
+    assert codex_records[-1].state == "approved"
+    assert codex_records[-1].surfaced_reviewer_requirement_ids == (
+        requirement.requirement_id,
+    )
+    prelaunch = [record for record in records if record.phase == "scheduler-prelaunch"]
+    assert [record.scheduler_phase for record in prelaunch] == [
+        "primary",
+        "secondary-audit",
+    ]
+    # The panel opens instead of re-running the primary.
+    assert prelaunch[1].scheduler_selected_reviewers == ("Gemini",)
+    assert "Codex" in prelaunch[1].scheduler_approved_reviewers
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "codex") == 1
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "gemini") == 1
+
+
+def test_staged_planning_resume_reads_the_repaired_primary_acknowledgement(
+    tmp_path, monkeypatch
+):
+    """`resume-no-duplicate-calls`: the repaired approval survives a restart.
+
+    The amendment is durable, so a process that stops after the phase-advance
+    record and restarts still carries the primary's acknowledged approval and
+    invokes only the secondary panel.
+    """
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output],
+        codex_outputs=[unacknowledged],
+        gemini_outputs=[panel],
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(
+            runner_arg, config=config, issue_number=issue_number
+        )
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    config = _staged_plan_config(tmp_path)
+    real_post = orchestrator_module.post_issue_comment
+
+    def interrupt_after_the_advance(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        if kwargs["body"].startswith("Plan review phase advance to round 2."):
+            raise KeyboardInterrupt
+        return result
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired
+    ):
+        with patch.object(
+            orchestrator_module,
+            "post_issue_comment",
+            side_effect=interrupt_after_the_advance,
+        ):
+            with pytest.raises(KeyboardInterrupt):
+                run_issue_loop(
+                    runner, issue_number=56, config=config, plan_first=True
+                )
+
+        calls_before = [
+            cmd[0]
+            for cmd, _cwd in runner.commands
+            if cmd[0] in {"claude", "codex", "gemini"}
+        ]
+        assert calls_before.count("codex") == 1
+
+        assert run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True
+        ) == 0
+
+    records = _plan_round_records(runner)
+    prelaunch = {
+        record.round_number: record
+        for record in records
+        if record.phase == "scheduler-prelaunch"
+    }
+    assert prelaunch[2].scheduler_phase == "secondary-audit"
+    assert prelaunch[2].scheduler_selected_reviewers == ("Gemini",)
+    assert "Codex" in prelaunch[2].scheduler_approved_reviewers
+    # The restart adds the panel reviewer and nothing else.
+    after = [
+        cmd[0]
+        for cmd, _cwd in runner.commands
+        if cmd[0] in {"claude", "codex", "gemini"}
+    ]
+    assert after == [*calls_before, "gemini"]
+
+
 def test_staged_planning_round_budget_diagnostic_is_distinct(tmp_path):
     """`round-budget-diagnostic`: exhaustion during a pending phase advance."""
     runner = _FakeRunner(

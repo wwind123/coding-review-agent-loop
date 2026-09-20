@@ -377,7 +377,12 @@ auditable without pinning later rounds to the fallback, and the persisted
 planning contract is immutable under both policies. A carried exact-key
 approval is honored only when it also carried the acknowledgement for exactly
 the currently surfaced planning-requirement ID set, so the signed-requirement
-gate cannot be satisfied vacuously. Discussion-mode and child-planning cycles
+gate cannot be satisfied vacuously. When structured repair recovers a missing
+acknowledgement, staged planning persists the repaired reviewer result as an
+amended record before the phase advance, because the record written from the
+original text carries no requirement IDs and a later record for the same
+reviewer supersedes the earlier one; otherwise the very approval that repair
+just recovered would be rejected on the next round. Discussion-mode and child-planning cycles
 keep the full board by configuration reset. See
 [staged issue plan review](docs/local_agent_loop.md#staged-issue-plan-review).
 
