@@ -1333,3 +1333,48 @@ def test_managed_ci_resume_rejects_supplied_scope_conflicting_with_parent_plan(
         run()
 
     assert_no_agent_process(runner)
+
+
+def test_child_planning_cycle_resets_the_staged_planning_policy(tmp_path, monkeypatch):
+    """`derived-configs-neutralize-planning-policy` (#905, from #841)."""
+    parent_config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+        plan_review_force_full=True,
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: IssueContext(
+            number=issue_number, repo="OWNER/REPO", title="Child",
+            body="Child", url="child-url", comments=(),
+        ),
+    )
+
+    def fake_plan_first_loop(runner, **kwargs):
+        captured["config"] = kwargs["config"]
+        return 0
+
+    monkeypatch.setattr(orchestrator, "_run_plan_first_loop", fake_plan_first_loop)
+
+    assert orchestrator._run_child_planning_cycle(
+        FakeRunner(),
+        config=parent_config,
+        memory=None,
+        usage_context=orchestrator._new_usage_context(parent_config),
+        parent_issue=55,
+        child_issue_number=56,
+    ) == 0
+
+    child_config = captured["config"]
+    assert child_config.plan_execution_mode == "auto"
+    # The child plan review stays full-board by configuration reset, not by
+    # convention: the parent's staged policy is never inherited.
+    assert child_config.plan_review_policy == "all-reviewers"
+    assert child_config.primary_plan_reviewer is None
+    assert child_config.plan_review_force_full is False
+    assert child_config.reviewer == parent_config.reviewer

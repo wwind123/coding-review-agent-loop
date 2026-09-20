@@ -2547,6 +2547,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--semantic-followup-max-candidates", "--semantic-followup-prompt-char-limit",
     "--containment-memory-max", "--containment-memory-swap-max", "--containment-tasks-max",
     "--primary-reviewer",
+    "--plan-review-policy", "--primary-plan-reviewer",
     "--containment-aggregate-memory-high", "--containment-aggregate-memory-max",
     "--containment-aggregate-memory-swap-max", "--containment-aggregate-tasks-max",
     "--containment-os-headroom-percent", "--containment-slice", "--containment-cache-dir",

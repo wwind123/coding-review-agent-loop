@@ -2196,3 +2196,116 @@ def _render_discuss_answer_summary(*, is_final: bool, subject: str, round_number
         lines.extend(["", *_render_discuss_research_section(research_mode=research_mode, reviewer_votes=reviewer_votes, round_history=round_history, evidence_reconciliation=evidence_reconciliation)])
     lines.extend(["", "-- Orchestrator", f"<!-- AGENT_DISCUSS_CONSENSUS: {subject} -->"] if is_final else ["", "-- Orchestrator"])
     return "\n".join(lines)
+
+
+_PLAN_STRICT_PRE_PANEL_PREFIX = "strict pre-panel fallback:"
+_PLAN_POST_PANEL_PREFIX = "post-panel fallback:"
+_PLAN_OPERATOR_OVERRIDE_PREFIX = "operator force-full:"
+
+
+def render_plan_scheduling_audit(
+    *,
+    phase: str,
+    reason: str,
+    selected: Sequence[str],
+    paused: Sequence[tuple[str, str]],
+    primary: str | None,
+    active_owners: Sequence[str],
+    plan_subject: str,
+    panel_evidence: bool,
+    degraded_history_class: str,
+    degraded_history_reason: str | None,
+    force_full: bool,
+    force_full_source: str | None,
+    calls_avoided: int,
+    unqualified_artifacts: Sequence[str] = (),
+) -> str:
+    """Render the posted planning scheduler record (#905, from #841).
+
+    The wording deliberately distinguishes the strict pre-panel fallback, the
+    post-panel fallback, and the operator override so an auditor can tell which
+    rule selected the board without re-deriving it.
+
+    The decision kind is keyed on authoritative decision data, not on the reason
+    prefix alone: the scheduler also stamps the post-panel prefix on the
+    *ordinary* owner-scoped remediation decision, which is not a fallback, so
+    labelling it one would contradict the phase, selected-reviewer, and
+    force-full fields rendered beside it.  The remediation board size is read
+    from the paused list rather than assumed: owner-scoped selection equals the
+    complete configured board whenever every secondary owns an active finding.
+    """
+    if reason.startswith(_PLAN_OPERATOR_OVERRIDE_PREFIX) or force_full_source == "operator":
+        kind = "operator override (qualified panel opening, source `operator`)"
+    elif reason.startswith(_PLAN_STRICT_PRE_PANEL_PREFIX):
+        kind = "strict pre-panel fallback (primary-only, no latch)"
+    elif reason.startswith(_PLAN_POST_PANEL_PREFIX) and phase == "full-board":
+        kind = "post-panel fallback (complete board" + (
+            ", automatic latch)" if force_full else ")"
+        )
+    elif phase == "remediation":
+        kind = (
+            "owner-scoped remediation decision ("
+            + ("partial board" if paused else "complete board")
+            + (", automatic latch)" if force_full else ", no automatic latch)")
+        )
+    else:
+        kind = "ordinary staged planning decision"
+    lines = [
+        "Plan review scheduling audit.",
+        "",
+        f"- Decision kind: {kind}",
+        f"- Phase: `{phase}`",
+        f"- Candidate plan: `{plan_subject}`",
+        f"- Selected reviewers: {', '.join(selected) or 'none'}",
+        "- Paused reviewers: "
+        + (
+            "; ".join(f"{name} ({why})" for name, why in paused)
+            if paused
+            else "none"
+        ),
+        f"- Primary plan reviewer: {primary or '(none)'}",
+        f"- Active finding owners: {', '.join(active_owners) or '(none)'}",
+        f"- Qualified panel opening recorded: {'yes' if panel_evidence else 'no'}",
+        f"- Force-full: {force_full} (source: {force_full_source or 'none'})",
+        f"- Scheduler calls avoided cumulatively: {calls_avoided}",
+        f"- Scheduling reason: {reason}",
+    ]
+    if degraded_history_class and degraded_history_class != "intact":
+        lines.append(
+            f"- Degraded planning history class: `{degraded_history_class}`"
+            + (f" ({degraded_history_reason})" if degraded_history_reason else "")
+        )
+    if unqualified_artifacts:
+        rendered = list(unqualified_artifacts[:6])
+        suffix = " ..." if len(unqualified_artifacts) > 6 else ""
+        lines.append(
+            "- Unqualified pre-opening artifacts (not approvals, not ownership): "
+            + "; ".join(rendered)
+            + suffix
+        )
+    lines.extend(["", "-- Orchestrator"])
+    return "\n".join(lines)
+
+
+def render_plan_phase_advance(
+    *,
+    next_round_number: int,
+    plan_subject: str,
+    missing_reviewers: Sequence[str],
+    phase: str,
+) -> str:
+    """Render the reviewer-only planning phase-advance record."""
+    return "\n".join(
+        [
+            f"Plan review phase advance to round {next_round_number}.",
+            "",
+            "No planner turn is invoked for this round: the candidate plan is "
+            f"byte-identical (`{plan_subject}`) and no must-fix plan item remains.",
+            "",
+            f"- Outstanding phase after this advance: `{phase}`",
+            "- Reviewer(s) still missing a qualifying exact-plan approval: "
+            + (", ".join(missing_reviewers) or "none"),
+            "",
+            "-- Orchestrator",
+        ]
+    )

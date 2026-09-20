@@ -2235,3 +2235,111 @@ def test_assignment_and_env_prefixed_managed_comment_hides_the_memory_directory(
 ])
 def test_prefix_wrapped_malformed_or_unsupported_still_renders_verbatim(command):
     assert _render_test_command_for_comment(command) == command
+
+
+def test_render_plan_scheduling_audit_distinguishes_each_decision_kind():
+    """`scope-5` (#905, from #841): each family reads distinctly."""
+    from coding_review_agent_loop.comment_rendering import render_plan_scheduling_audit
+
+    common = {
+        "selected": ("Codex",),
+        "paused": (("Gemini", "primary phase"),),
+        "primary": "Codex",
+        "active_owners": (),
+        "plan_subject": "a" * 64,
+        "panel_evidence": False,
+        "degraded_history_class": "intact",
+        "degraded_history_reason": None,
+        "force_full": False,
+        "force_full_source": None,
+        "calls_avoided": 2,
+    }
+    ordinary = render_plan_scheduling_audit(
+        phase="primary", reason="primary phase: an exact-plan primary approval", **common
+    )
+    strict = render_plan_scheduling_audit(
+        phase="primary",
+        reason="strict pre-panel fallback: metadata is degraded",
+        **{**common, "degraded_history_class": "invalid", "degraded_history_reason": "decoded invalid"},
+    )
+    post = render_plan_scheduling_audit(
+        phase="full-board",
+        reason="post-panel fallback: force-full latch",
+        **{**common, "panel_evidence": True, "force_full": True, "force_full_source": "automatic"},
+    )
+    override = render_plan_scheduling_audit(
+        phase="full-board",
+        reason="operator force-full: the complete plan board is authorized",
+        **{**common, "force_full": True, "force_full_source": "operator"},
+    )
+    # The scheduler stamps the post-panel prefix on the ordinary owner-scoped
+    # remediation decision too, which selects a partial board and raises no
+    # latch; it must never read as the complete-board post-panel fallback.
+    remediation = render_plan_scheduling_audit(
+        phase="remediation",
+        reason=(
+            "post-panel fallback: narrow plan remediation: finding owners from the "
+            "canonical ledger and the primary must recheck"
+        ),
+        **{**common, "panel_evidence": True, "active_owners": ("Gemini",)},
+    )
+
+    assert "ordinary staged planning decision" in ordinary
+    assert "strict pre-panel fallback (primary-only, no latch)" in strict
+    assert "`invalid`" in strict and "decoded invalid" in strict
+    assert "post-panel fallback (complete board, automatic latch)" in post
+    assert "operator override (qualified panel opening, source `operator`)" in override
+    # Owner-scoped selection equals the complete configured board whenever
+    # every secondary owns an active finding, so the board size is read from
+    # the paused list instead of being assumed partial.
+    complete_board_remediation = render_plan_scheduling_audit(
+        phase="remediation",
+        reason=(
+            "post-panel fallback: narrow plan remediation: finding owners from the "
+            "canonical ledger and the primary must recheck"
+        ),
+        **{
+            **common,
+            "selected": ("Codex", "Gemini"),
+            "paused": (),
+            "panel_evidence": True,
+            "active_owners": ("Gemini",),
+        },
+    )
+
+    assert (
+        "owner-scoped remediation decision (partial board, no automatic latch)"
+        in remediation
+    )
+    assert "post-panel fallback" not in remediation.split("- Scheduling reason:")[0]
+    assert "- Force-full: False (source: none)" in remediation
+    assert (
+        "owner-scoped remediation decision (complete board, no automatic latch)"
+        in complete_board_remediation
+    )
+    assert "partial board" not in complete_board_remediation
+    assert "post-panel fallback" not in complete_board_remediation.split(
+        "- Scheduling reason:"
+    )[0]
+    assert "- Selected reviewers: Codex, Gemini" in complete_board_remediation
+    assert "- Force-full: False (source: none)" in complete_board_remediation
+    for rendered in (ordinary, strict, post, override, remediation):
+        assert "Gemini (primary phase)" in rendered
+        assert "Scheduler calls avoided cumulatively: 2" in rendered
+        assert "Primary plan reviewer: Codex" in rendered
+
+
+def test_render_plan_phase_advance_names_the_outstanding_reviewers():
+    from coding_review_agent_loop.comment_rendering import render_plan_phase_advance
+
+    rendered = render_plan_phase_advance(
+        next_round_number=3,
+        plan_subject="b" * 64,
+        missing_reviewers=("Gemini",),
+        phase="secondary-audit",
+    )
+
+    assert "Plan review phase advance to round 3." in rendered
+    assert "No planner turn is invoked" in rendered
+    assert "`secondary-audit`" in rendered
+    assert "Gemini" in rendered

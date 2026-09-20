@@ -2502,6 +2502,7 @@ def build_plan_review_prompt(
     compact_prior: CompactPriorContext | None = None,
     compact_tail: CompactPlanTailContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    superseded_prepanel_review: SupersededPrepanelReview | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2516,6 +2517,7 @@ def build_plan_review_prompt(
             unresolved_items=unresolved_items,
             compact_prior=compact_prior,
             compact_tail=compact_tail,
+            superseded_prepanel_review=superseded_prepanel_review,
         )
         return compact_prompt
     coder_name = agent_display_name(config.coder)
@@ -2534,6 +2536,9 @@ def build_plan_review_prompt(
         require_plan_dispositions=True,
     )
     unresolved_items_guidance = _build_unresolved_plan_items_guidance() if unresolved_items else ""
+    superseded_prepanel_block = superseded_prepanel_plan_review_context_block(
+        superseded_prepanel_review
+    )
     return f"""Review the implementation plan for GitHub issue #{issue_number} in {config.repo} (planning round {round_number}).
 
 Use this local checkout only to inspect context. Do not edit files, create a
@@ -2549,7 +2554,7 @@ branch, commit, push, or open a pull request during this planning review.
 Plan from {coder_name}:
 
 {plan}
-
+{superseded_prepanel_block}
 Review the plan for correctness, architecture fit, missing edge cases, test
 strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -2600,9 +2605,7 @@ Signed human issue requirements are approval-critical issue constraints for this
 plan review.
 {human_requirements_guidance}
 {_phased_plan_guard(config)}{_agent_unavailable_guidance(reviewer_signature)}Use blocking only when the current plan still has blocking plan issues or
-same-plan follow-ups. All configured reviewers ({reviewer_group}) must approve
-in the same planning round before implementation can proceed.
-Use approved only if there are no blocking plan issues, no Same-plan
+same-plan follow-ups. {_plan_review_scheduling_guidance(config, reviewer_group)}Use approved only if there are no blocking plan issues, no Same-plan
 follow-ups, and no carried-forward plan items left active for this planning
 round. Structured responses must start with one top-level JSON object, place
 the `AGENT_PLAN_STATE` footer immediately after that payload, then your
@@ -2632,6 +2635,7 @@ def _build_compact_plan_review_prompt(
     unresolved_items: Sequence[UnresolvedReviewItem],
     compact_prior: CompactPriorContext | None,
     compact_tail: CompactPlanTailContext | None,
+    superseded_prepanel_review: SupersededPrepanelReview | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_name = agent_display_name(reviewer)
@@ -2649,6 +2653,10 @@ def _build_compact_plan_review_prompt(
         require_plan_dispositions=True,
     )
     unresolved_items_guidance = _build_unresolved_plan_items_guidance() if unresolved_items else ""
+    # Volatile, per-reviewer context: it must never enter the cached stable prefix.
+    superseded_prepanel_block = superseded_prepanel_plan_review_context_block(
+        superseded_prepanel_review
+    )
     stable_prefix = _compact_plan_stable_prefix(
         config=config,
         workdir_guidance=_coder_workdir_guidance(config, implementation=False, agent=reviewer),
@@ -2687,10 +2695,9 @@ Action for this call: {action}
 Current implementation plan from {coder_name}:
 
 {plan}
-
+{superseded_prepanel_block}
 {_agent_unavailable_guidance(reviewer_signature)}
-All configured reviewers ({reviewer_group}) must approve in the same planning
-round before implementation can proceed. Use approved only if there are no
+{_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
 items left active for this planning round. Do not place your signature before
 the AGENT_PLAN_STATE footer. Your response must end with, in this exact order:
@@ -3903,6 +3910,87 @@ def superseded_prepanel_review_context_block(
             "claims omitted)"
         )
     return "\n".join(lines) + "\n"
+
+
+def superseded_prepanel_plan_review_context_block(
+    review: SupersededPrepanelReview | None,
+) -> str:
+    """Render a secondary's superseded premature plan review as context only (#905).
+
+    The planning counterpart of ``superseded_prepanel_review_context_block``:
+    under ``--plan-review-force-full`` the same secondary is freshly invoked,
+    and its earlier pre-panel claims must reach it as explicitly
+    non-authoritative context rather than silently disappearing.
+    """
+    if review is None:
+        return ""
+    lines = [
+        "",
+        "Superseded pre-panel plan review context (non-authoritative; context only):",
+        f"Your earlier {review.state or 'unknown'} plan review of candidate plan "
+        f"{review.head_sha} in planning round {review.round_number} was recorded before any "
+        "qualified panel opening. The operator planning force-full override superseded it: it "
+        "is not a finding, not a plan-item disposition, not an approval, and none of its "
+        "claims entered the unresolved plan-item ledger"
+        + (f" (superseded plan item IDs: {', '.join(review.item_ids)})" if review.item_ids else "")
+        + ".",
+        "Review the current candidate plan independently. Re-raise any concern below that "
+        "still holds as a new finding of this plan review, or leave it out. Do not "
+        "disposition these claims as prior plan items.",
+    ]
+    if review.summary.strip():
+        lines.append(f"- Earlier summary: {_bounded_context_text(review.summary)}")
+    for claim in review.claims[:SUPERSEDED_PREPANEL_CONTEXT_MAX_CLAIMS]:
+        lines.append(f"- Earlier claim: {_bounded_context_text(claim)}")
+    if len(review.claims) > SUPERSEDED_PREPANEL_CONTEXT_MAX_CLAIMS:
+        lines.append(
+            f"- ({len(review.claims) - SUPERSEDED_PREPANEL_CONTEXT_MAX_CLAIMS} more earlier "
+            "claims omitted)"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _plan_review_scheduling_guidance(
+    config: AgentLoopConfig, reviewer_group: str, *, compact: bool = False
+) -> str:
+    """Approval rule for the configured plan-review scheduling policy (#905).
+
+    The compatibility default keeps today's same-round wording verbatim; the
+    staged policy replaces it, because "all reviewers approve in the same
+    planning round" is false once the panel opens in its own round.
+    """
+    if config.plan_review_policy != "primary-then-panel":
+        if compact:
+            return (
+                f"All configured reviewers ({reviewer_group}) must approve in the same planning\n"
+                "round before implementation can proceed. "
+            )
+        return (
+            f"All configured reviewers ({reviewer_group}) must approve\n"
+            "in the same planning round before implementation can proceed.\n"
+        )
+    primary = (
+        agent_display_name(config.primary_plan_reviewer)
+        if config.primary_plan_reviewer is not None
+        else "(missing; configuration is invalid)"
+    )
+    return (
+        "Issue plan review is using the opt-in `primary-then-panel` planning policy.\n"
+        f"`{primary}` is the configured primary plan reviewer. The primary must approve the\n"
+        "exact current candidate plan before the secondary plan panel runs at all; before\n"
+        "that approval the pre-panel phase is strictly primary-only. After it, every\n"
+        "configured secondary reviewer receives an independent audit of the complete issue\n"
+        "context and the byte-identical approved candidate plan, in its own reviewer-only\n"
+        "round with no planner turn. Reach your own conclusions; do not merely validate or\n"
+        "re-triage the primary's findings. A panel blocker routes the next round to the\n"
+        "active finding owners from the canonical ledger plus the primary. An exact-plan\n"
+        "approval is carried across later rounds only while every component of the\n"
+        "candidate plan key is unchanged, including the surfaced signed-requirement set, so\n"
+        "any plan revision or requirement change invalidates it. Approval is withheld until\n"
+        f"every required reviewer ({reviewer_group}) holds an approval of the exact final\n"
+        "candidate plan, collected by a final exact-plan sweep if necessary. Reviewers are\n"
+        "therefore not required to approve in the same planning round.\n"
+    )
 
 
 def _pr_review_scheduling_guidance(config: AgentLoopConfig) -> str:

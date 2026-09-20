@@ -4029,3 +4029,29 @@ def test_discuss_parallel_non_final_partial_round_continues_to_next_round(tmp_pa
     assert "Consensus kind: `converged` after round 2." in final
     assert "Round 1: Codex: `implement`, Gemini: `failed`, Claude: `implement`" in final
     assert "Round 2: Codex: `implement`, Gemini: `implement`, Claude: `implement`" in final
+
+
+def test_discuss_loop_is_unaffected_by_the_staged_planning_policy(tmp_path):
+    """`discussion-mode-unaffected` (#905, from #841)."""
+    implement_text = _discuss_review_text(outcome="implement")
+    runner = FakeRunner(codex_outputs=[implement_text], gemini_outputs=[implement_text])
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+
+    assert run_discuss_loop(runner, issue_number=56, config=config) == 0
+
+    # Every configured participant is invoked; none is paused.
+    assert "Round 1: Codex position" in runner.comments[0]
+    assert "Round 1: Gemini position" in runner.comments[1]
+    for body in runner.comments:
+        metadata_match = ROUND_RESUME_MARKER_RE.search(body)
+        if metadata_match is None:
+            continue
+        metadata = _decode_round_metadata(metadata_match.group("payload"))
+        assert metadata.flow == "discuss"
+        assert metadata.scheduler_metadata_status == "absent"
+        assert metadata.plan_candidate_key is None

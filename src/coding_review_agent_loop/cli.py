@@ -733,6 +733,40 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--plan-review-policy",
+            choices=("all-reviewers", "primary-then-panel"),
+            default="all-reviewers",
+            help=(
+                "Issue plan-review scheduling policy, selected independently of "
+                "--pr-review-policy. The default invokes every configured reviewer in each "
+                "planning round; primary-then-panel gates an independent secondary plan "
+                "panel on one primary plan approval of the exact candidate plan."
+            ),
+        )
+        subparser.add_argument(
+            "--primary-plan-reviewer",
+            type=normalize_agent_name,
+            choices=("claude", "codex", "gemini", "antigravity"),
+            default=None,
+            help=(
+                "Reviewer that must approve each exact candidate plan before the secondary "
+                "plan panel runs; required only with --plan-review-policy primary-then-panel."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-review-force-full",
+            dest="plan_review_force_full",
+            action="store_true",
+            help=(
+                "Force the complete plan reviewer board under --plan-review-policy "
+                "primary-then-panel and record it as an operator-sourced qualified panel "
+                "opening. This recovers the secondary-owned plan finding and the premature "
+                "blocking secondary plan review diagnostics. It cannot recover an "
+                "unreadable planning round-metadata record set; restore the missing records "
+                "instead."
+            ),
+        )
+        subparser.add_argument(
             "--pr-review-broad-rule",
             dest="pr_review_broad_rules",
             action="append",

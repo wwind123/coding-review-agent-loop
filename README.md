@@ -689,6 +689,30 @@ opt-in and does not change the default or the CI/merge gates. Use
 independent severity-weighted coverage before any proposal to change the
 default; measurements without verified provenance are reported as unavailable.
 
+### Staged issue plan review
+
+The same staged idea is available for issue plan review, selected independently
+of the PR policy and off by default:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO --plan-first \
+  --plan-review-policy primary-then-panel \
+  --primary-plan-reviewer codex \
+  --reviewer codex --reviewer claude --reviewer gemini \
+  --max-rounds 10
+```
+
+One primary plan reviewer works the plan to an approval of the exact candidate
+plan, then the secondary panel audits that byte-identical plan independently in
+a reviewer-only round with no planner turn. Every required reviewer must still
+approve the exact final plan. Because each phase advance costs a planning round,
+raise `--max-rounds` when enabling it. `--plan-review-force-full` authorizes the
+complete plan board and recovers the two ownership-ambiguity diagnostics; it
+cannot recover an unreadable planning history. Omitting the flags keeps today's
+full-board planning behavior unchanged, and discussion-mode and child-planning
+cycles always stay full-board. See
+[staged issue plan review](docs/local_agent_loop.md#staged-issue-plan-review).
+
 ## Safety and Permissions
 
 Agents can run commands and change code. Keep their normal permission prompts

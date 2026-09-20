@@ -274,6 +274,7 @@ from .protocol import (
     StructuredPlanState,
     StructuredPlanRevision,
     PlanRevisionPatch,
+    parse_plan_revision_patch,
     StructuredTaskResult,
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
@@ -397,6 +398,8 @@ from .ci_health import (
 )
 from .comment_rendering import (
     DEFERRED_STAGES_MARKER_RE,
+    render_plan_phase_advance,
+    render_plan_scheduling_audit,
     EXECUTION_RECOMMENDATION_MARKER_RE,
     RISK_TEST_MATRIX_MARKER_RE,
     ITEM_SUMMARY_LIMIT,
@@ -492,6 +495,25 @@ from .plan_assembly import (
     decode_assembled_plan_sidecar,
     hydrate_authenticated_plan_state,
     make_assembled_plan_sidecar,
+)
+from .plan_review_scheduling import (
+    PLAN_HISTORY_CONTRADICTORY_KEY,
+    PLAN_HISTORY_INTACT,
+    PLAN_HISTORY_TRANSPORT_FAILURE,
+    PlanCandidateKey,
+    PlanCrossCuttingContracts,
+    PlanPrePanelSafetyError,
+    PlanRevisionDescriptor,
+    PlanReviewSchedulingContract,
+    PlanSchedulerSnapshot,
+    classify_plan_history,
+    classify_plan_transition,
+    make_plan_contract,
+    plan_history_fallback_reason,
+    plan_policy_capabilities,
+    plan_undecodable_history_message,
+    select_plan_reviewers,
+    surfaced_requirement_id_digest,
 )
 from .protocol_markers import (
     TrustedBody,
@@ -4977,6 +4999,20 @@ def _build_requirements_context(
     )
 
 
+def _describe_requirement_set_change(
+    previous_ids: set[str], refreshed_ids: set[str]
+) -> str:
+    """Name the added and withdrawn signed requirement IDs for a stop message."""
+    added = sorted(refreshed_ids - previous_ids)
+    withdrawn = sorted(previous_ids - refreshed_ids)
+    parts: list[str] = []
+    if added:
+        parts.append(f"added {', '.join(added)}")
+    if withdrawn:
+        parts.append(f"withdrawn {', '.join(withdrawn)}")
+    return "; ".join(parts) if parts else "the surfaced requirement set changed"
+
+
 def _surfaced_reviewer_requirement_ids(
     human_requirements: Sequence,
     *,
@@ -6196,7 +6232,15 @@ def _run_child_planning_cycle(
     child_issue_number: int,
 ) -> int:
     """Run the child's own plan/review cycle (policy ``auto``) after its handoff."""
-    child_config = dataclasses_replace(config, plan_execution_mode="auto")
+    # Child plan review always runs the full board: staged planning scheduling
+    # is a parent-run decision and is never inherited (#905, from #841).
+    child_config = dataclasses_replace(
+        config,
+        plan_execution_mode="auto",
+        plan_review_policy="all-reviewers",
+        primary_plan_reviewer=None,
+        plan_review_force_full=False,
+    )
     child_issue_context = get_issue_context(
         runner, config=child_config, issue_number=child_issue_number
     )
@@ -7513,7 +7557,23 @@ def _round_ledger_may_be_incomplete(
     comments: Sequence[object],
     flow: str,
     current_subject: str,
+    accounted_item_ids: Sequence[str] = (),
 ) -> bool:
+    """Whether the active finding ledger may be missing a recorded item.
+
+    ``accounted_item_ids`` holds item IDs that are demonstrably part of the
+    reconstructed ledger even when the durable record that introduced them
+    names an earlier plan subject: the ones this run carried or minted, plus
+    the ones recorded history proves were canonically cleared.  The cleared
+    half has to come from recorded history rather than the in-process set
+    alone, because a reviewer-only phase advance persists an empty carried
+    ledger, so a restart on that seam would otherwise rediscover a cleared
+    cross-subject item and read the ledger as unreconstructible.  Callers that
+    pass nothing keep the previous conservative reading, where any
+    cross-subject item at all makes the ledger unreconstructible; that is what
+    the PR flow and the compatibility-default full-board planning path both
+    do, so only staged planning changes behavior here (#905, from #841).
+    """
     same_subject_incomplete = (
         current_resume.ledger_may_be_incomplete
         if current_resume is not None
@@ -7522,10 +7582,12 @@ def _round_ledger_may_be_incomplete(
     if prior_unresolved_items:
         return same_subject_incomplete
     records = _extract_round_metadata_records(comments, flow=flow)
+    accounted = set(accounted_item_ids)
     cross_subject_incomplete = any(
-        record.metadata.new_items
+        item.item_id not in accounted
         for record in records
         if record.metadata.subject != current_subject
+        for item in record.metadata.new_items
     )
     return same_subject_incomplete or cross_subject_incomplete
 
@@ -8669,6 +8731,117 @@ def _run_plan_first_loop(
     )
     coder_name = agent_display_name(config.coder)
     configured_reviewers = reviewers(config)
+
+    # --- Staged planning scheduling (#905, from #841) -------------------
+    plan_reviewer_names = tuple(agent_display_name(name) for name in configured_reviewers)
+    plan_capabilities = plan_policy_capabilities(config.plan_review_policy)
+    staged_planning = plan_capabilities.scheduler_enabled
+    plan_scheduler_contract = (
+        make_plan_contract(
+            plan_reviewer_names,
+            config.plan_review_policy,
+            (
+                agent_display_name(config.primary_plan_reviewer)
+                if config.primary_plan_reviewer is not None
+                else None
+            ),
+        )
+        if staged_planning
+        else None
+    )
+    plan_primary_name = (
+        plan_scheduler_contract.primary_reviewer if plan_scheduler_contract is not None else None
+    )
+    plan_operator_force_full = bool(config.plan_review_force_full)
+    plan_automatic_force_full = False
+    plan_scheduler_calls_avoided = 0
+    plan_phase_advance_pending = False
+
+    def stop_plan_pre_panel(message: str, *, round_number: int | None) -> None:
+        """Log and post the planning diagnostic, then stop before any turn."""
+        label = f"round {round_number}" if round_number is not None else "startup"
+        log(config, f"Planning {label}: {message}")
+        # Plain audit text only: no round metadata that a later resume could
+        # mistake for a planning scheduler checkpoint or a panel opening.
+        post_issue_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=f"Plan review scheduling diagnostic ({label}): {message}",
+        )
+        raise PlanPrePanelSafetyError(message)
+
+    def plan_history_records(
+        *, refresh: bool = False, round_number: int | None = None
+    ) -> tuple[PostedRoundRecord, ...]:
+        """Planning round-metadata records, or the class-D stop.
+
+        Checked at startup and again at every round boundary: a record set that
+        cannot be extracted at all makes panel state, finding ownership, and
+        exact-plan approvals unknowable, and the operator override cannot
+        authorize a board over it.  Round boundaries re-read the durable
+        history so records this run posted are part of it.
+        """
+        comments = issue_context.comments
+        if refresh:
+            comments = get_issue_context(
+                runner, config=config, issue_number=issue_number
+            ).comments
+        try:
+            return _extract_round_metadata_records(comments, flow="plan")
+        except AgentLoopError as exc:
+            stop_plan_pre_panel(
+                plan_undecodable_history_message(exc), round_number=round_number
+            )
+            raise
+
+    def planning_contract_drift_records() -> tuple[PostedRoundRecord, ...]:
+        """Planning records inspected for an in-flight contract change.
+
+        Drift detection runs under *both* policies: restarting a run that
+        already persisted a staged planning contract with the compatibility
+        default would otherwise silently continue on a different contract.  The
+        default path keeps its historical behavior for an unreadable record set,
+        which ``_resume_plan_round`` already reports; only staged planning turns
+        that into the class-D diagnostic stop.
+        """
+        if staged_planning:
+            return plan_history_records()
+        try:
+            return _extract_round_metadata_records(issue_context.comments, flow="plan")
+        except AgentLoopError:
+            return ()
+
+    for record in planning_contract_drift_records():
+        metadata = record.metadata
+        try:
+            persisted_contract = _plan_scheduler_contract_from_metadata(metadata)
+        except AgentLoopError:
+            persisted_contract = None
+        if persisted_contract is not None and persisted_contract != plan_scheduler_contract:
+            raise AgentLoopError(
+                "Plan review scheduler contract changed during resume; the required "
+                "reviewer board, the planning policy, and the primary plan reviewer "
+                "must remain immutable for the run. This run is configured with "
+                f"--plan-review-policy {config.plan_review_policy} and primary "
+                f"{plan_primary_name or '(none)'}, but issue #{issue_number} already "
+                "carries a planning scheduler contract for policy "
+                f"{persisted_contract.policy} with primary "
+                f"{persisted_contract.primary_reviewer or '(none)'} and reviewer board "
+                f"{', '.join(persisted_contract.required_reviewers)}. Rerun with the "
+                "persisted planning policy, primary, and reviewer board."
+            )
+        if not staged_planning:
+            continue
+        if (
+            metadata.scheduler_force_full
+            and metadata.scheduler_force_full_source == "operator"
+        ):
+            plan_operator_force_full = True
+        if metadata.scheduler_calls_avoided is not None:
+            plan_scheduler_calls_avoided = max(
+                plan_scheduler_calls_avoided, metadata.scheduler_calls_avoided
+            )
     require_fresh_execution_contract = bool(
         getattr(config, "execution_strategy_contract_required", False)
     )
@@ -8683,6 +8856,17 @@ def _run_plan_first_loop(
     next_unresolved_item_number = 1
     current_plan_sidecar: AssembledPlanSidecar | None = None
     current_response_form: str | None = None
+    # Authenticated revision provenance for the planning transition
+    # classifier.  Both stay ``None`` across a resume boundary, so a key change
+    # observed only after a restart classifies broad rather than being assumed
+    # narrow from unauthenticated state.
+    current_plan_patch: PlanRevisionPatch | None = None
+    previous_plan_contracts: PlanCrossCuttingContracts | None = None
+    # Item IDs this run has carried or minted.  A durable record that named an
+    # earlier plan subject no longer makes the ledger look unreconstructible
+    # once the run itself has accounted for that item, which is what a resumed
+    # run does for every item the resumed round carried.
+    plan_accounted_item_ids: set[str] = set()
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
     plan_validation_diagnostic: PlanValidationDiagnosticTransport | None = None
     if resume_state is None:
@@ -8917,6 +9101,17 @@ def _run_plan_first_loop(
                 resumed_round.coder_metadata.assembled_plan_sidecar
             )
             current_response_form = resumed_round.coder_metadata.response_form
+        # Rebuild the authenticated classifier inputs from durable records, so
+        # a restart right after a remediation coder turn classifies the same
+        # plan-step revision narrow instead of latching the complete board.
+        current_plan_patch, previous_plan_contracts = _resumed_plan_transition_inputs(
+            issue_context.comments,
+            coder_metadata=resumed_round.coder_metadata,
+        )
+        plan_accounted_item_ids.update(
+            item.item_id
+            for item in (*resumed_round.prior_items, *resumed_round.current_round_new_items)
+        )
         log(config, f"Planning issue #{issue_number}: resuming round {start_round_number}")
         # A resumed round carries its planning-generation discriminator in
         # durable coder metadata. Historical rounds intentionally have no
@@ -8952,13 +9147,6 @@ def _run_plan_first_loop(
             else ()
         )
         current_plan_subject = _plan_subject(current_plan)
-        round_ledger_incomplete = _round_ledger_may_be_incomplete(
-            current_resume=current_resume,
-            prior_unresolved_items=prior_unresolved_items,
-            comments=issue_context.comments,
-            flow="plan",
-            current_subject=current_plan_subject,
-        )
         round_resolved_history_item_ids = _round_resolved_history_item_ids(
             prior_unresolved_items=prior_unresolved_items,
             comments=issue_context.comments,
@@ -8966,6 +9154,249 @@ def _run_plan_first_loop(
             reconciliation_mode="aggregate",
             same_status="same-plan",
         )
+        plan_accounted_item_ids.update(
+            item.item_id
+            for item in (*prior_unresolved_items, *round_new_unresolved_items)
+        )
+        plan_accounted_item_ids.update(round_resolved_history_item_ids)
+        round_ledger_incomplete = _round_ledger_may_be_incomplete(
+            current_resume=current_resume,
+            prior_unresolved_items=prior_unresolved_items,
+            comments=issue_context.comments,
+            flow="plan",
+            current_subject=current_plan_subject,
+            # Compatibility default: full-board planning keeps the previous
+            # conservative reading, where any cross-subject item at all makes
+            # the ledger unreconstructible, so its context-mode selection and
+            # posted bodies are unchanged by staged planning (#905).
+            accounted_item_ids=(
+                tuple(sorted(plan_accounted_item_ids)) if staged_planning else ()
+            ),
+        )
+        plan_hr_ids = _surfaced_reviewer_requirement_ids(
+            issue_context.human_requirements,
+            requirement_scope="planning requirements",
+        )
+        current_plan_key = _plan_candidate_key_for(
+            plan_subject=current_plan_subject,
+            sidecar=current_plan_sidecar,
+            surfaced_requirement_ids=plan_hr_ids,
+        )
+        plan_scheduler_decision = None
+        plan_panel_evidence = PlanPanelEvidence()
+        plan_qualifying_approvals: tuple[str, ...] = ()
+        plan_previous_key: PlanCandidateKey | None = None
+        round_reviewers = tuple(configured_reviewers)
+        if staged_planning:
+            assert plan_scheduler_contract is not None
+            incomplete_key = current_plan_key.incompleteness_reason()
+            if incomplete_key is not None:
+                raise AgentLoopError(
+                    "--plan-review-policy primary-then-panel requires a generation-1 plan: "
+                    f"{incomplete_key}. Re-plan the issue so the canonical plan carries an "
+                    "execution-strategy recommendation and a risk matrix, or rerun with the "
+                    "compatibility default --plan-review-policy all-reviewers."
+                )
+            plan_records = plan_history_records(refresh=True, round_number=round_number)
+            plan_panel_evidence = _derive_plan_panel_evidence(
+                plan_records,
+                primary_reviewer=plan_primary_name,
+                required_reviewers=plan_reviewer_names,
+            )
+            plan_qualifying_approvals = _carried_plan_approvals(
+                plan_records,
+                current_key=current_plan_key,
+                required_reviewers=plan_reviewer_names,
+                surfaced_requirement_ids=plan_hr_ids,
+                panel_evidence=plan_panel_evidence,
+                primary_reviewer=plan_primary_name,
+            )
+            latest_scheduler_record = next(
+                (
+                    record
+                    for record in reversed(plan_records)
+                    if record.metadata.scheduler_metadata_status == "valid"
+                    and record.metadata.scheduler_contract is not None
+                ),
+                None,
+            )
+            if latest_scheduler_record is not None:
+                plan_previous_key = _plan_key_from_payload(
+                    latest_scheduler_record.metadata.plan_candidate_key
+                )
+            # The four-class degraded-history partition.  Exactly one outcome
+            # each; classes A, B, and C always continue under a conservative
+            # fallback and only a transport extraction failure stops (handled
+            # by ``plan_history_records``).
+            has_planning_history = any(
+                record.metadata.role == "reviewer" for record in plan_records
+            )
+            key_contradiction = bool(
+                plan_previous_key is not None
+                and plan_previous_key.subject == current_plan_key.subject
+                and not plan_previous_key.matches(current_plan_key)
+            )
+            # Degradation is scoped to the current recoverable boundary: the
+            # latest valid planning scheduler checkpoint.  An invalid record
+            # written before it is historical audit state that stays listed in
+            # the audit but must not pin every later round to the fallback
+            # forever, which would suppress each fresh exact-key primary
+            # approval until the round budget ran out.
+            recovery_boundary_index = (
+                latest_scheduler_record.index if latest_scheduler_record is not None else -1
+            )
+            if any(
+                record.index > recovery_boundary_index
+                and record.metadata.scheduler_metadata_status == "invalid"
+                for record in plan_records
+            ):
+                plan_history_class = classify_plan_history("invalid")
+            elif has_planning_history and latest_scheduler_record is None:
+                plan_history_class = classify_plan_history("absent")
+            else:
+                plan_history_class = classify_plan_history(
+                    "valid", key_contradiction=key_contradiction
+                )
+            if plan_history_class == PLAN_HISTORY_CONTRADICTORY_KEY:
+                # A contradictory persisted key can supply neither an approval
+                # nor a panel opening.
+                plan_qualifying_approvals = ()
+            plan_classification = classify_plan_transition(
+                plan_previous_key,
+                current_plan_key,
+                _plan_revision_descriptor(
+                    response_form=current_response_form,
+                    sidecar=current_plan_sidecar,
+                    patch=current_plan_patch,
+                ),
+                previous_contracts=previous_plan_contracts,
+                current_contracts=_plan_cross_cutting_contracts(current_plan_sidecar),
+                ledger_reconstructible=not round_ledger_incomplete,
+            )
+            if plan_panel_evidence.opened and plan_panel_evidence.post_opening_automatic_latch:
+                plan_automatic_force_full = True
+            plan_snapshot = PlanSchedulerSnapshot(
+                contract=plan_scheduler_contract,
+                previous_key=plan_previous_key,
+                current_key=current_plan_key,
+                obligations=_scheduler_obligations(
+                    prior_unresolved_items,
+                    required_reviewers=plan_reviewer_names,
+                    active_statuses=frozenset({"blocking", "same-plan"}),
+                ),
+                force_full=plan_automatic_force_full,
+                force_full_source="automatic" if plan_automatic_force_full else None,
+                operator_force_full=plan_operator_force_full,
+                panel_evidence=plan_panel_evidence.opened,
+                phase=(
+                    latest_scheduler_record.metadata.scheduler_phase
+                    if latest_scheduler_record is not None
+                    else None
+                ),
+                degraded_history_class=plan_history_class,
+                premature_secondary_reviews=(
+                    () if plan_panel_evidence.opened
+                    else plan_panel_evidence.premature_secondary_reviews
+                ),
+            )
+            try:
+                plan_scheduler_decision = select_plan_reviewers(
+                    plan_snapshot,
+                    plan_classification,
+                    qualifying_approvals=plan_qualifying_approvals,
+                    phase=plan_snapshot.phase,
+                )
+            except PlanPrePanelSafetyError as exc:
+                stop_plan_pre_panel(str(exc), round_number=round_number)
+                raise
+            if plan_scheduler_decision.latches_force_full:
+                plan_automatic_force_full = True
+            plan_scheduler_calls_avoided += plan_scheduler_decision.calls_avoided
+            plan_recorded_force_full, plan_recorded_force_full_source = (
+                _scheduler_recorded_force_full(
+                    operator=plan_operator_force_full,
+                    automatic=plan_automatic_force_full,
+                )
+            )
+            plan_selected_names = set(plan_scheduler_decision.selected_reviewers)
+            round_reviewers = tuple(
+                reviewer
+                for reviewer in configured_reviewers
+                if agent_display_name(reviewer) in plan_selected_names
+            )
+            log(
+                config,
+                f"Planning round {round_number}: {plan_scheduler_contract.policy} plan scheduler "
+                f"phase={plan_scheduler_decision.phase} {plan_scheduler_decision.reason}; "
+                f"selected={', '.join(plan_scheduler_decision.selected_reviewers) or 'none'}; "
+                "paused="
+                f"{', '.join(f'{name} ({why})' for name, why in plan_scheduler_decision.paused_reviewers) or 'none'}; "
+                f"primary={plan_primary_name or 'none'}; active_owners="
+                f"{', '.join(plan_scheduler_decision.active_owners) or 'none'}; "
+                f"panel_evidence={plan_panel_evidence.opened}; "
+                f"force_full={plan_recorded_force_full} "
+                f"(source: {plan_recorded_force_full_source or 'none'}); "
+                f"degraded_history={plan_history_class}; "
+                f"calls_avoided_cumulative={plan_scheduler_calls_avoided}",
+            )
+            post_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=_attach_round_metadata(
+                    render_plan_scheduling_audit(
+                        phase=plan_scheduler_decision.phase,
+                        reason=plan_scheduler_decision.reason,
+                        selected=plan_scheduler_decision.selected_reviewers,
+                        paused=plan_scheduler_decision.paused_reviewers,
+                        primary=plan_primary_name,
+                        active_owners=plan_scheduler_decision.active_owners,
+                        plan_subject=current_plan_subject,
+                        panel_evidence=plan_panel_evidence.opened,
+                        degraded_history_class=plan_history_class,
+                        degraded_history_reason=plan_history_fallback_reason(plan_history_class),
+                        force_full=plan_recorded_force_full,
+                        force_full_source=plan_recorded_force_full_source,
+                        calls_avoided=plan_scheduler_calls_avoided,
+                        unqualified_artifacts=(
+                            () if plan_panel_evidence.opened
+                            else plan_panel_evidence.unqualified_artifacts
+                        ),
+                    ),
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="summary",
+                        agent="Orchestrator",
+                        round_number=round_number,
+                        subject=current_plan_subject,
+                        prior_items=prior_unresolved_items,
+                        phase="scheduler-prelaunch",
+                        scheduler_contract=plan_scheduler_contract.as_dict(),
+                        scheduler_obligation_digest=hashlib.sha256(
+                            repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                        ).hexdigest()[:16],
+                        scheduler_selected_reviewers=plan_scheduler_decision.selected_reviewers,
+                        scheduler_paused_reviewers=plan_scheduler_decision.paused_reviewers,
+                        scheduler_reasons=(
+                            plan_scheduler_decision.reason,
+                            plan_classification.reason,
+                        ),
+                        scheduler_final_sweep=plan_scheduler_decision.final_sweep,
+                        scheduler_force_full=plan_recorded_force_full,
+                        scheduler_force_full_source=plan_recorded_force_full_source,
+                        scheduler_calls_avoided=plan_scheduler_calls_avoided,
+                        scheduler_phase=plan_scheduler_decision.phase,
+                        scheduler_primary_reviewer=plan_primary_name,
+                        scheduler_approved_reviewers=tuple(plan_qualifying_approvals),
+                        scheduler_active_owners=plan_scheduler_decision.active_owners,
+                        plan_candidate_key=current_plan_key.as_dict(),
+                        scheduler_plan_previous_key=(
+                            plan_previous_key.as_dict() if plan_previous_key is not None else None
+                        ),
+                        **_architecture_metadata_fields(config),
+                    ),
+                ),
+            )
         use_compact_context = (
             config.planning_context_mode == "compact"
             and round_number >= 2
@@ -8983,6 +9414,100 @@ def _run_plan_first_loop(
         resumed_by_name = {
             record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
         }
+        # Superseded pre-panel plan reviews, replayed to their own author only
+        # as non-authoritative context under the operator planning override.
+        superseded_plan_prepanel: dict[str, PostedRoundRecord] = {}
+        # Item IDs claimed only by superseded pre-panel reviews; excluded from
+        # the ledger even when the record itself is not replayed as context.
+        superseded_prepanel_item_ids: set[str] = set()
+        if staged_planning and plan_primary_name is not None:
+            def _is_unqualified_prepanel(record: PostedRoundRecord) -> bool:
+                return not (
+                    plan_panel_evidence.opening_index is not None
+                    and record.index > plan_panel_evidence.opening_index
+                )
+
+            if plan_operator_force_full:
+                # The override authorizes the complete board over exactly the
+                # artifacts the pre-panel diagnostic would otherwise stop on,
+                # so each superseded secondary gets its own earlier claims back
+                # as context, and never as findings, ownership, or approval.
+                # A reviewer that already produced a qualified post-opening
+                # review has had its fresh turn, so it needs no replay.
+                already_freshly_invoked = {
+                    record.metadata.agent
+                    for record in plan_records
+                    if record.metadata.role == "reviewer"
+                    and not _is_unqualified_prepanel(record)
+                }
+                for record in sorted(plan_records, key=lambda item: item.index):
+                    metadata = record.metadata
+                    if (
+                        metadata.role == "reviewer"
+                        and metadata.agent
+                        and metadata.agent != plan_primary_name
+                        and metadata.agent in plan_reviewer_names
+                        and metadata.agent not in already_freshly_invoked
+                        and _is_unqualified_prepanel(record)
+                    ):
+                        superseded_plan_prepanel[metadata.agent] = record
+                        superseded_prepanel_item_ids.update(
+                            item.item_id for item in metadata.new_items
+                        )
+            # A secondary plan review recorded before any qualified panel
+            # opening is an unqualified artifact: it is never resumed as
+            # settled work, never an approval, and never ownership.  The
+            # reviewer is freshly invoked once a qualified opening exists.
+            for name in [
+                name
+                for name, record in resumed_by_name.items()
+                if name != plan_primary_name and _is_unqualified_prepanel(record)
+            ]:
+                log(
+                    config,
+                    f"Planning round {round_number}: {name}'s plan review predates any "
+                    "qualified panel opening; it is superseded, non-authoritative "
+                    "context and is not resumed as settled work",
+                )
+                if plan_operator_force_full:
+                    superseded_plan_prepanel[name] = resumed_by_name[name]
+                superseded_prepanel_item_ids.update(
+                    item.item_id for item in resumed_by_name[name].metadata.new_items
+                )
+                resumed_by_name.pop(name, None)
+            if superseded_prepanel_item_ids:
+                # A reconciled resume rehydrates every current-round item,
+                # including the superseded secondary's own claims (and their
+                # duplicates on the reconciliation summary).  Those claims are
+                # excluded from finding and ownership accounting, so they must
+                # not survive as must-fix obligations once the same secondary
+                # is freshly invoked.
+                rehydrated = [
+                    item
+                    for item in round_new_unresolved_items
+                    if item.item_id in superseded_prepanel_item_ids
+                ]
+                if rehydrated:
+                    log(
+                        config,
+                        f"Planning round {round_number}: dropping superseded pre-panel plan "
+                        "item(s) "
+                        + ", ".join(sorted({item.item_id for item in rehydrated}))
+                        + " from the current-round ledger; they establish no obligation",
+                    )
+                    round_new_unresolved_items[:] = [
+                        item
+                        for item in round_new_unresolved_items
+                        if item.item_id not in superseded_prepanel_item_ids
+                    ]
+            if superseded_plan_prepanel:
+                log(
+                    config,
+                    f"Planning round {round_number}: replaying superseded pre-panel plan "
+                    "review context to "
+                    + ", ".join(sorted(superseded_plan_prepanel))
+                    + " as non-authoritative context only",
+                )
 
         def _build_plan_review_prompt(reviewer: AgentName) -> str:
             # Built once per reviewer from pre-round state only, so the same
@@ -9005,13 +9530,17 @@ def _run_plan_first_loop(
                         "missing edge cases, test strategy, and ambiguity."
                     ),
                 ),
+                # Each reviewer sees only its own superseded pre-panel review.
+                superseded_prepanel_review=_superseded_prepanel_plan_review(
+                    superseded_plan_prepanel.get(agent_display_name(reviewer))
+                ),
             )
 
         plan_fatal_errors: list[tuple[str, AgentLoopError]] = []
         plan_turn_results: dict[AgentName, _ReviewerTurnResult] = {}
         early_published_plan_reviewers: set[AgentName] = {
             reviewer
-            for reviewer in configured_reviewers
+            for reviewer in round_reviewers
             if (
                 (record := resumed_by_name.get(agent_display_name(reviewer))) is not None
                 and record.metadata.phase == "publication"
@@ -9045,6 +9574,20 @@ def _run_plan_first_loop(
                         round_number=round_number, subject=_plan_subject(current_plan),
                         prior_items=prior_unresolved_items, dispositions=parsed.dispositions,
                         new_items=new_items, state=parsed.state,
+                        # Staged planning only: a full-board planning run keeps
+                        # writing exactly today's record shape.  The surfaced
+                        # planning-requirement IDs are persisted only when this
+                        # review actually carried HUMAN_REQUIREMENTS_RESOLVED,
+                        # so a later round cannot satisfy the signed-requirement
+                        # gate vacuously through a carried approval.
+                        plan_candidate_key=(
+                            current_plan_key.as_dict() if staged_planning else None
+                        ),
+                        surfaced_reviewer_requirement_ids=(
+                            tuple(plan_hr_ids)
+                            if staged_planning and human_requirements_resolved(review_output)
+                            else ()
+                        ),
                         compact_prior_summaries=tuple(compact_prior_summaries),
                         model_used=model_used, phase=phase,
                         **(_metadata_identity_fields(identity) if identity is not None else {}),
@@ -9058,7 +9601,7 @@ def _run_plan_first_loop(
 
         if config.review_parallel:
             pending_plan_reviewers = [
-                reviewer for reviewer in configured_reviewers
+                reviewer for reviewer in round_reviewers
                 if resumed_by_name.get(agent_display_name(reviewer)) is None
             ]
             if pending_plan_reviewers:
@@ -9156,7 +9699,7 @@ def _run_plan_first_loop(
                     on_completion=_publish_plan_completion,
                 )
 
-        for reviewer in configured_reviewers:
+        for reviewer in round_reviewers:
             reviewer_name = agent_display_name(reviewer)
             resumed_record = resumed_by_name.get(reviewer_name)
             if resumed_record is not None:
@@ -9356,7 +9899,7 @@ def _run_plan_first_loop(
                 round_new_unresolved_items.extend(reviewer_new_unresolved_items)
 
         if config.review_parallel and not (current_resume is not None and current_resume.reconciled):
-            settled = ", ".join(agent_display_name(reviewer) for reviewer in configured_reviewers)
+            settled = ", ".join(agent_display_name(reviewer) for reviewer in round_reviewers)
             post_issue_comment(
                 runner, config=config, issue_number=issue_number,
                 body=_attach_round_metadata(
@@ -9397,6 +9940,12 @@ def _run_plan_first_loop(
             )
         )
         unresolved_items = [*unresolved_items, *round_new_unresolved_items]
+        # Items minted and cleared inside one round never reappear as prior
+        # items, so record them here too.
+        plan_accounted_item_ids.update(item.item_id for item in unresolved_items)
+        plan_accounted_item_ids.update(
+            item.item_id for item in round_new_unresolved_items
+        )
         must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-plan"}]
         if all_approved and not must_fix_items and issue_context.human_requirements:
             hr_ids = _surfaced_reviewer_requirement_ids(
@@ -9460,6 +10009,7 @@ def _run_plan_first_loop(
                     # A reviewer cannot repair a missing coder attestation.
                     missing_acknowledgements = []
                 still_missing = []
+                repaired_plan_approvals: dict[str, str] = {}
                 for reviewer_name, review_output in approved_review_outputs:
                     if human_requirements_resolved(review_output):
                         continue
@@ -9502,6 +10052,28 @@ def _run_plan_first_loop(
                                 f"Planning round {round_number}: repair recovered "
                                 f"HUMAN_REQUIREMENTS_RESOLVED for {reviewer_name}",
                             )
+                            repaired_plan_approvals[reviewer_name] = repaired_text
+                            if staged_planning:
+                                # The record posted before the repair stores no
+                                # surfaced requirement IDs, because the original
+                                # text carried no acknowledgement.  Without an
+                                # amended record the next round would reject this
+                                # approval as unacknowledged and re-invoke the
+                                # reviewer instead of advancing the phase, so the
+                                # repaired result is persisted here; a later
+                                # record for the same reviewer supersedes the
+                                # earlier one (#905).
+                                log(
+                                    config,
+                                    f"Planning round {round_number}: persisting the repaired "
+                                    f"{reviewer_name} plan approval for the exact-plan carry",
+                                )
+                                _post_plan_reviewer_comment(
+                                    reviewer_name,
+                                    repaired_parsed,
+                                    review_output=repaired_text,
+                                    model_used=None,
+                                )
                             continue
                         if repaired_parsed.state == "blocking":
                             log(
@@ -9574,8 +10146,65 @@ def _run_plan_first_loop(
                         item for item in unresolved_items if item.status in {"blocking", "same-plan"}
                     ]
                     all_approved = False
+                if repaired_plan_approvals:
+                    # Later gates and the approval carry must read the repaired
+                    # text, not the output that lacked the acknowledgement.
+                    approved_review_outputs = [
+                        (name, repaired_plan_approvals.get(name, output))
+                        for name, output in approved_review_outputs
+                    ]
 
-        if all_approved and not must_fix_items:
+        # The final gate evaluates every required plan reviewer, carried and
+        # current alike.  A paused reviewer counts only through a qualifying
+        # exact-key carried approval; a reviewer that blocked this round loses
+        # any carry it held.
+        plan_missing_approvals: tuple[str, ...] = ()
+        if staged_planning:
+            blocked_this_round = {name for name, _output in blocking_reviews}
+            approved_this_round = {name for name, _output in approved_review_outputs}
+            plan_round_qualifying = (
+                set(plan_qualifying_approvals) | approved_this_round
+            ) - blocked_this_round
+            plan_missing_approvals = tuple(
+                name for name in plan_reviewer_names if name not in plan_round_qualifying
+            )
+        plan_phase_advance_pending = bool(
+            staged_planning
+            and all_approved
+            and not must_fix_items
+            and plan_missing_approvals
+        )
+        # The outstanding phase, not the one that just ran: both the durable
+        # phase-advance record and the round-budget diagnostic must name the
+        # round that is still pending.
+        plan_outstanding_phase = (
+            _outstanding_plan_phase(
+                plan_snapshot,
+                decision=plan_scheduler_decision,
+                current_key=current_plan_key,
+                obligations=_scheduler_obligations(
+                    unresolved_items,
+                    required_reviewers=plan_reviewer_names,
+                    active_statuses=frozenset({"blocking", "same-plan"}),
+                ),
+                qualifying_approvals=tuple(sorted(plan_round_qualifying)),
+                panel_evidence=(
+                    plan_panel_evidence.opened
+                    or (
+                        plan_scheduler_decision is not None
+                        and plan_scheduler_decision.records_panel_opening
+                    )
+                ),
+                force_full=plan_automatic_force_full,
+                force_full_source=(
+                    "automatic" if plan_automatic_force_full else None
+                ),
+            )
+            if plan_phase_advance_pending
+            else None
+        )
+
+        if all_approved and not must_fix_items and not plan_missing_approvals:
             # Re-read both sides at the approval-to-implementation boundary so
             # a human instruction posted during planning cannot be hidden by
             # the original snapshot. New signed IDs require a fresh planning
@@ -9590,10 +10219,19 @@ def _run_plan_first_loop(
                 requirement.requirement_id
                 for requirement in refreshed_issue_context.human_requirements
             }
-            if not refreshed_requirement_ids.issubset(previous_requirement_ids):
+            if refreshed_requirement_ids != previous_requirement_ids:
+                # Any set inequality is a changed requirement set, not only an
+                # addition.  A withdrawal is equally disqualifying: every plan
+                # review and every carried exact-key approval was bound to the
+                # earlier surfaced requirement digest, so a withdrawn ID leaves
+                # the approvals acknowledging a requirement that no longer
+                # exists (#905, from #841).
                 raise AgentLoopError(
-                    f"Issue #{issue_number} gained signed human requirement(s) after plan approval. "
-                    "Re-run planning so the new signed requirements receive explicit acknowledgement."
+                    f"Issue #{issue_number} signed human requirement(s) changed after plan "
+                    "approval: "
+                    f"{_describe_requirement_set_change(previous_requirement_ids, refreshed_requirement_ids)}. "
+                    "Re-run planning so the current signed requirements receive explicit "
+                    "acknowledgement."
                 )
             issue_context = refreshed_issue_context
             if parent_issue_context is not None:
@@ -9608,11 +10246,13 @@ def _run_plan_first_loop(
                     requirement.requirement_id
                     for requirement in refreshed_parent_context.human_requirements
                 }
-                if not refreshed_parent_requirement_ids.issubset(previous_parent_requirement_ids):
+                if refreshed_parent_requirement_ids != previous_parent_requirement_ids:
                     raise AgentLoopError(
-                        f"Authoritative parent issue #{parent_issue_context.number} gained signed "
-                        "human requirement(s) after plan approval. Re-run planning so the new "
-                        "signed parent requirements receive explicit acknowledgement."
+                        f"Authoritative parent issue #{parent_issue_context.number} signed human "
+                        "requirement(s) changed after plan approval: "
+                        f"{_describe_requirement_set_change(previous_parent_requirement_ids, refreshed_parent_requirement_ids)}"
+                        ". Re-run planning so the current signed parent requirements receive "
+                        "explicit acknowledgement."
                     )
                 parent_issue_context = refreshed_parent_context
             approved_future_followup_sources = [
@@ -10097,10 +10737,60 @@ def _run_plan_first_loop(
             raise AgentLoopError(f"Unknown plan execution mode: {mode}")
 
         if round_number == config.max_rounds:
+            if plan_phase_advance_pending:
+                # Distinct from the blocking-plan-issues message: no reviewer
+                # reported a blocker, the run simply ran out of rounds while a
+                # reviewer-only phase advance was still outstanding.
+                raise AgentLoopError(
+                    f"Reached max planning rounds ({config.max_rounds}) for issue #{issue_number} "
+                    "while a reviewer-only plan phase advance was still pending. Outstanding "
+                    f"phase: {plan_outstanding_phase or 'secondary-audit'}; "
+                    "reviewer(s) still missing an exact-plan approval: "
+                    f"{', '.join(plan_missing_approvals)}. No reviewer reported blocking plan "
+                    "issues. Staged planning spends one round per phase advance; raise "
+                    "--max-rounds and rerun."
+                )
             raise AgentLoopError(
                 f"One or more reviewers still reported blocking plan issues after "
                 f"round {round_number}; human review required."
             )
+
+        if plan_phase_advance_pending:
+            # Reviewer-only round: the candidate plan stays byte-identical, no
+            # planner turn runs, and the posted phase-advance record makes the
+            # advance auditable and resumable.
+            log(
+                config,
+                f"Planning round {round_number}: advancing to a reviewer-only plan round; "
+                f"reviewer(s) still missing an exact-plan approval: "
+                f"{', '.join(plan_missing_approvals)}; no planner turn is invoked",
+            )
+            post_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=_attach_round_metadata(
+                    render_plan_phase_advance(
+                        next_round_number=round_number + 1,
+                        plan_subject=current_plan_subject,
+                        missing_reviewers=plan_missing_approvals,
+                        phase=plan_outstanding_phase or "secondary-audit",
+                    ),
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="summary",
+                        agent="Orchestrator",
+                        round_number=round_number + 1,
+                        subject=current_plan_subject,
+                        prior_items=tuple(unresolved_items),
+                        phase="plan-phase-advance",
+                        plan_candidate_key=current_plan_key.as_dict(),
+                        **_architecture_metadata_fields(config),
+                    ),
+                ),
+            )
+            resumed_round = None
+            continue
 
         combined_review = "\n\n".join(f"{name} plan review:\n\n{review}" for name, review in blocking_reviews)
         log(
@@ -10234,6 +10924,14 @@ def _run_plan_first_loop(
         canonical_plan: str | None = None
         public_comment = plan_response.text
         raw_structured_coder_response: str | None = None
+        # Observed before the sidecar is replaced: the classifier compares the
+        # cross-cutting contracts across exactly this transition.
+        previous_plan_contracts = _plan_cross_cutting_contracts(current_plan_sidecar)
+        current_plan_patch = (
+            plan_response.marker_value
+            if semantic_revision and isinstance(plan_response.marker_value, PlanRevisionPatch)
+            else None
+        )
         if semantic_revision:
             if not isinstance(plan_response.marker_value, PlanRevisionPatch):
                 raise AgentLoopError(
@@ -11743,11 +12441,20 @@ def _scheduler_obligations(
     items: Sequence[UnresolvedReviewItem],
     *,
     required_reviewers: Sequence[str] = (),
+    active_statuses: frozenset[str] = frozenset({"blocking", "same-pr"}),
 ) -> tuple[ReviewObligation, ...]:
+    """Build scheduler obligations from the canonical finding ledger.
+
+    ``active_statuses`` defaults to the PR statuses.  The planning flow retains
+    its follow-up findings as ``same-plan`` (#905, from #841), so it passes that
+    status instead; otherwise a post-panel narrow revision for a ``same-plan``
+    finding would lose its durable owner and the scheduler would fall through to
+    a final sweep instead of invoking that owner plus the primary.
+    """
     obligations: list[ReviewObligation] = []
     required = set(required_reviewers)
     for item in items:
-        if item.status not in {"blocking", "same-pr"}:
+        if item.status not in active_statuses:
             continue
         owners = item.resolution_owners or (item.reviewer,)
         raw_states = item.owner_states
@@ -12291,6 +12998,41 @@ def _superseded_prepanel_review(record: PostedRoundRecord | None) -> SupersededP
     )
 
 
+def _superseded_prepanel_plan_review(
+    record: PostedRoundRecord | None,
+) -> SupersededPrepanelReview | None:
+    """Planning counterpart of ``_superseded_prepanel_review`` (#905).
+
+    Builds the non-authoritative prompt context for a secondary plan review
+    recorded before any qualified panel opening, so the operator planning
+    force-full override can replay that reviewer's own earlier claims to it
+    without their ever entering the ledger, ownership, or approval accounting.
+    """
+    if record is None:
+        return None
+    metadata = record.metadata
+    reviewer = metadata.agent or "reviewer"
+    claims: list[str] = [item.text for item in metadata.new_items if item.text]
+    if not claims:
+        source_text = metadata.canonical_reviewer_response or record.body
+        try:
+            parsed = parse_plan_review(source_text, reviewer=reviewer)
+        except AgentLoopError:
+            parsed = None
+        if parsed is not None:
+            claims.extend(item.text for item in parsed.items.blocking if item.text)
+            claims.extend(item.text for item in parsed.items.same_plan if item.text)
+    return SupersededPrepanelReview(
+        reviewer=reviewer,
+        round_number=metadata.round_number,
+        head_sha=metadata.subject or "(unknown)",
+        state=metadata.state or "unknown",
+        summary=review_freeform_summary_text(record.body),
+        claims=tuple(claims),
+        item_ids=tuple(item.item_id for item in metadata.new_items),
+    )
+
+
 def _scheduler_recorded_force_full(*, operator: bool, automatic: bool) -> tuple[bool, str | None]:
     """Return the persisted force-full latch and its audit source (#840)."""
     if operator:
@@ -12298,6 +13040,425 @@ def _scheduler_recorded_force_full(*, operator: bool, automatic: bool) -> tuple[
     if automatic:
         return True, "automatic"
     return False, None
+
+
+# Planning counterpart of ``PANEL_OPENED_PHASES``: phases that only exist after
+# the secondary plan panel has opened, and which therefore look like an opening
+# without being one on their own.
+PLAN_PANEL_OPENED_PHASES = frozenset(
+    {"secondary-audit", "remediation", "final-secondary-sweep", "full-board"}
+)
+
+
+@dataclass(frozen=True)
+class PlanPanelEvidence:
+    """Qualified planning panel-opening evidence (#905, from #841).
+
+    ``opening_index`` is the comment index of the first qualified opening.
+    Premature secondary plan reviews, ``full-board``/``remediation``
+    checkpoints, and unattributed or automatic latches recorded before it are
+    unqualified artifacts and are never panel evidence.
+    """
+
+    opening_index: int | None = None
+    opening_source: str | None = None
+    unqualified_artifacts: tuple[str, ...] = ()
+    premature_secondary_reviews: tuple[str, ...] = ()
+    prepanel_latch: bool = False
+    post_opening_automatic_latch: bool = False
+
+    @property
+    def opened(self) -> bool:
+        return self.opening_index is not None
+
+
+def _plan_identity_digest(value: object) -> str | None:
+    """Stable short digest of one authenticated plan identity component."""
+    if value is None:
+        return None
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _plan_candidate_key_for(
+    *,
+    plan_subject: str,
+    sidecar: AssembledPlanSidecar | None,
+    surfaced_requirement_ids: Sequence[str],
+) -> PlanCandidateKey:
+    """Build the canonical exact-plan candidate key for one planning round.
+
+    Every component is read from the authenticated assembled sidecar, never
+    from rendered Markdown, so the key a reviewer record persists is the same
+    key the scheduler, the panel evidence, and resume compare against.
+    """
+    payload = dict(sidecar.canonical_json) if sidecar is not None else {}
+    version = payload.get("execution_strategy_contract_version")
+    version = version if isinstance(version, int) and not isinstance(version, bool) else None
+    execution_identity = (
+        _plan_identity_digest(payload.get("execution_recommendation")) if version == 1 else None
+    )
+    matrix_identity = None
+    if payload.get("risk_test_matrix_contract_version") == 1 and isinstance(
+        payload.get("risk_test_matrix"), dict
+    ):
+        matrix_identity = _plan_identity_digest(
+            [payload.get("risk_test_matrix"), payload.get("risk_test_matrix_changes", [])]
+        )
+    return PlanCandidateKey(
+        subject=plan_subject,
+        aggregate_plan_identity=(
+            sidecar.aggregate_identity if sidecar is not None else None
+        ),
+        execution_strategy_identity=execution_identity,
+        risk_test_matrix_identity=matrix_identity,
+        surfaced_requirement_id_digest=surfaced_requirement_id_digest(
+            tuple(surfaced_requirement_ids)
+        ),
+        execution_strategy_contract_version=version,
+    )
+
+
+def _outstanding_plan_phase(
+    snapshot: PlanSchedulerSnapshot,
+    *,
+    decision,
+    current_key: PlanCandidateKey | None,
+    obligations: Sequence[ReviewObligation],
+    qualifying_approvals: Sequence[str],
+    panel_evidence: bool,
+    force_full: bool,
+    force_full_source: str | None,
+) -> str:
+    """The phase the pending reviewer-only round will run.
+
+    The scheduler decision in hand describes the board that just ran, so it
+    still reads `primary` right after the primary's approval and `remediation`
+    right after an owner-scoped round.  The phase-advance record and the
+    round-budget diagnostic must instead name the outstanding phase, so project
+    the scheduler forward over the unchanged candidate key: the plan is
+    byte-identical (a `recheck` transition), the ledger is the post-round one,
+    the approvals are this round's settled set, and the round just wrote a valid
+    scheduler record, which is the next round's recovery boundary and clears the
+    readable degraded classes (#905, from #841).
+    """
+    projected = dataclasses_replace(
+        snapshot,
+        previous_key=current_key,
+        current_key=current_key,
+        obligations=tuple(obligations),
+        panel_evidence=panel_evidence,
+        force_full=force_full,
+        force_full_source=force_full_source,
+        phase=decision.phase if decision is not None else snapshot.phase,
+        degraded_history_class=PLAN_HISTORY_INTACT,
+        fallback_reasons=(),
+        premature_secondary_reviews=(
+            () if panel_evidence else snapshot.premature_secondary_reviews
+        ),
+    )
+    try:
+        return select_plan_reviewers(
+            projected,
+            classify_plan_transition(current_key, current_key),
+            qualifying_approvals=tuple(qualifying_approvals),
+            phase=projected.phase,
+        ).phase
+    except AgentLoopError:
+        # A projection is never allowed to break the advance itself; the
+        # independent panel audit is the conservative outstanding phase.
+        return "secondary-audit"
+
+
+def _plan_scheduler_contract_from_metadata(
+    metadata: PostedRoundMetadata,
+) -> PlanReviewSchedulingContract | None:
+    if metadata.scheduler_contract is None:
+        return None
+    return PlanReviewSchedulingContract.from_mapping(metadata.scheduler_contract)
+
+
+def _plan_key_from_payload(payload: object) -> PlanCandidateKey | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return PlanCandidateKey.from_mapping(payload)
+    except AgentLoopError:
+        return None
+
+
+def _derive_plan_panel_evidence(
+    records: Sequence[PostedRoundRecord],
+    *,
+    primary_reviewer: str | None,
+    required_reviewers: Sequence[str],
+) -> PlanPanelEvidence:
+    """Derive the first qualified planning panel opening from comment order.
+
+    A qualified opening is either an operator-sourced planning force-full
+    record, or a ``secondary-audit`` planning scheduler record for candidate
+    key K that lists the primary as approved and is preceded by the primary's
+    own approved plan review of K.
+    """
+    secondaries = set(required_reviewers) - {primary_reviewer}
+    primary_approved_keys: set[tuple[object, ...]] = set()
+    artifacts: list[str] = []
+    premature: list[str] = []
+    prepanel_latch = False
+    opening: PostedRoundRecord | None = None
+    opening_source: str | None = None
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        valid = metadata.scheduler_metadata_status == "valid"
+        record_key = _plan_key_from_payload(metadata.plan_candidate_key)
+        if (
+            valid
+            and metadata.scheduler_force_full
+            and metadata.scheduler_force_full_source == "operator"
+            # Defensive: an operator opening is still bound to a complete
+            # generation-1 candidate key, so a partial-key record can never
+            # establish a qualified panel opening.
+            and record_key is not None
+            and record_key.complete
+        ):
+            opening, opening_source = record, "operator"
+            break
+        if (
+            valid
+            and primary_reviewer is not None
+            and metadata.scheduler_phase == "secondary-audit"
+            and primary_reviewer in metadata.scheduler_approved_reviewers
+            and record_key is not None
+            and record_key.complete
+            and record_key.components in primary_approved_keys
+        ):
+            opening, opening_source = record, "primary-approval"
+            break
+        if (
+            metadata.role == "reviewer"
+            and metadata.agent == primary_reviewer
+            and metadata.state == "approved"
+            and record_key is not None
+            and record_key.complete
+        ):
+            primary_approved_keys.add(record_key.components)
+        if metadata.role == "reviewer" and metadata.agent in secondaries:
+            artifacts.append(
+                f"{metadata.agent} plan review (round {metadata.round_number}, "
+                f"plan {metadata.subject})"
+            )
+            if metadata.state == "blocking":
+                premature.append(metadata.agent)
+        elif valid and metadata.scheduler_phase in PLAN_PANEL_OPENED_PHASES:
+            artifacts.append(
+                f"{metadata.scheduler_phase} planning scheduler record "
+                f"(round {metadata.round_number}, plan {metadata.subject})"
+            )
+        elif metadata.scheduler_metadata_status == "invalid":
+            # Retained for audit even though it grants no phase authority.
+            artifacts.append(
+                "invalid planning scheduler record "
+                f"(round {metadata.round_number}, plan {metadata.subject})"
+            )
+        if valid and metadata.scheduler_force_full:
+            prepanel_latch = True
+    post_opening_latch = bool(
+        opening is not None
+        and any(
+            record.index > opening.index
+            and record.metadata.scheduler_metadata_status == "valid"
+            and record.metadata.scheduler_force_full
+            and record.metadata.scheduler_force_full_source != "operator"
+            for record in records
+        )
+    )
+    return PlanPanelEvidence(
+        opening_index=opening.index if opening is not None else None,
+        opening_source=opening_source,
+        unqualified_artifacts=tuple(dict.fromkeys(artifacts)),
+        premature_secondary_reviews=tuple(dict.fromkeys(premature)),
+        prepanel_latch=prepanel_latch,
+        post_opening_automatic_latch=post_opening_latch,
+    )
+
+
+def _carried_plan_approvals(
+    records: Sequence[PostedRoundRecord],
+    *,
+    current_key: PlanCandidateKey,
+    required_reviewers: Sequence[str],
+    surfaced_requirement_ids: Sequence[str],
+    panel_evidence: PlanPanelEvidence,
+    primary_reviewer: str | None,
+) -> tuple[str, ...]:
+    """Reviewers holding a qualifying exact-key approval carried from history.
+
+    A carried approval counts only when the stored record matches every
+    component of the current candidate key and itself carried
+    ``HUMAN_REQUIREMENTS_RESOLVED`` for exactly the currently surfaced
+    planning-requirement ID set.  Plan reviewer records persist the surfaced
+    requirement IDs only when the approval actually carried that
+    acknowledgement, so an approval without it can never satisfy the signed
+    requirement gate vacuously.
+    """
+    if not current_key.complete:
+        return ()
+    required = set(required_reviewers)
+    surfaced = {str(item) for item in surfaced_requirement_ids}
+    carried: dict[str, bool] = {}
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        if metadata.role != "reviewer" or metadata.agent not in required:
+            continue
+        if metadata.agent != primary_reviewer and not (
+            panel_evidence.opened
+            and panel_evidence.opening_index is not None
+            and record.index > panel_evidence.opening_index
+        ):
+            # Secondary records before the qualified opening are unqualified
+            # artifacts: never approvals, never ownership.
+            continue
+        record_key = _plan_key_from_payload(metadata.plan_candidate_key)
+        qualifies = (
+            metadata.state == "approved"
+            and record_key is not None
+            and record_key.matches(current_key)
+            and (
+                not surfaced
+                or set(metadata.surfaced_reviewer_requirement_ids) == surfaced
+            )
+        )
+        # A later record for the same reviewer supersedes an earlier one.
+        carried[metadata.agent] = bool(qualifies)
+    return tuple(sorted(name for name, ok in carried.items() if ok))
+
+
+def _plan_cross_cutting_contracts(
+    sidecar: AssembledPlanSidecar | None,
+) -> PlanCrossCuttingContracts:
+    """Observe the authenticated cross-cutting plan contracts from a sidecar.
+
+    An unobserved identity stays ``None`` so the classifier reports it rather
+    than comparing two defaulted objects equal.
+    """
+    if sidecar is None:
+        return PlanCrossCuttingContracts()
+    payload = dict(sidecar.canonical_json)
+
+    def digest(value: object) -> str | None:
+        if value is None:
+            return None
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:32]
+
+    architecture = payload.get("architecture_impact")
+    status = (
+        architecture.get("status") if isinstance(architecture, dict) else None
+    )
+    return PlanCrossCuttingContracts(
+        execution_recommendation_identity=digest(payload.get("execution_recommendation")),
+        human_requirement_disposition_digest=digest(
+            payload.get("human_requirement_dispositions", [])
+        ),
+        additional_closing_issue_ids=tuple(
+            str(item) for item in payload.get("additional_closing_issue_ids", []) or ()
+        ),
+        architecture_impact_status=status if status in {"changed", "unchanged"} else None,
+    )
+
+
+def _resumed_plan_transition_inputs(
+    comments: Sequence[object],
+    *,
+    coder_metadata: PostedRoundMetadata | None,
+) -> tuple[object | None, PlanCrossCuttingContracts | None]:
+    """Rebuild the authenticated transition inputs a resume would otherwise lose.
+
+    The classifier decides `narrow` from the authenticated `semantic-patch-v1`
+    payload and the cross-cutting contracts of the state the patch was bound to.
+    Both live in durable records, so a restart immediately after a remediation
+    coder turn must reconstruct them instead of classifying the same plan-step
+    revision `broad` and latching the complete board (#905, from #841).
+
+    Every binding is re-verified here: the patch must match the record's own
+    base round and base state identity, and the base round's sidecar must
+    hydrate to exactly that state identity.  Anything unverifiable returns
+    ``(None, None)``, which keeps the conservative broad classification.
+    """
+    if coder_metadata is None or coder_metadata.response_form != "semantic-patch-v1":
+        return None, None
+    try:
+        patch = parse_plan_revision_patch(coder_metadata.raw_patch_provenance or {})
+    except (AgentLoopError, TypeError, ValueError, KeyError) as exc:
+        del exc
+        return None, None
+    if (
+        patch.base_round_number != coder_metadata.base_round_number
+        or patch.base_state_identity != coder_metadata.base_state_identity
+        or patch.base_state_identity is None
+    ):
+        return None, None
+    try:
+        records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError:
+        return None, None
+    for record in reversed(records):
+        metadata = record.metadata
+        if (
+            metadata.role != "coder"
+            or metadata.round_number != patch.base_round_number
+            or metadata.assembled_plan_sidecar is None
+        ):
+            continue
+        try:
+            base_sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+            if (
+                hydrate_authenticated_plan_state(base_sidecar).state_identity
+                != patch.base_state_identity
+            ):
+                continue
+        except (AgentLoopError, TypeError, ValueError, KeyError) as exc:
+            del exc
+            continue
+        return patch, _plan_cross_cutting_contracts(base_sidecar)
+    return None, None
+
+
+def _plan_revision_descriptor(
+    *,
+    response_form: str | None,
+    sidecar: AssembledPlanSidecar | None,
+    patch: object | None,
+) -> PlanRevisionDescriptor | None:
+    """Describe the authenticated revision that produced the current key."""
+    if response_form != "semantic-patch-v1" or patch is None or sidecar is None:
+        return None
+    operations = getattr(patch, "operations", ())
+    fields = tuple(
+        str(operation.field)
+        for operation in operations
+        if getattr(operation, "op", None) == "replace"
+        and getattr(operation, "field", None)
+    )
+    matrix_ops = tuple(
+        str(operation.op)
+        for operation in operations
+        if getattr(operation, "op", None) not in {None, "replace"}
+    )
+    return PlanRevisionDescriptor(
+        response_form="semantic-patch-v1",
+        semantic_patch_contract_version=int(
+            getattr(patch, "semantic_patch_contract_version", 0) or 0
+        ),
+        base_state_identity=getattr(patch, "base_state_identity", None),
+        sidecar_bound=True,
+        operation_fields=fields,
+        matrix_operations=matrix_ops,
+    )
 
 
 def _latest_pr_reviewer_records(

@@ -1447,3 +1447,226 @@ def test_parallel_plan_review_settles_healthy_reviewer_when_peer_returns_narrati
     assert any("Gemini plan review complete." in comment for comment in runner.comments)
     # No publication checkpoint or fabricated verdict for the refused reviewer.
     assert not any("Plan review incomplete" in comment for comment in runner.comments)
+
+
+# ---------------------------------------------------------------------------
+# #905 (from #841): staged planning resume and reviewer failure
+
+
+def _staged_parallel_config(tmp_path, **overrides):
+    values = {
+        "reviewer": ("codex", "gemini"),
+        "review_parallel": True,
+        "plan_review_policy": "primary-then-panel",
+        "primary_plan_reviewer": "codex",
+        "max_rounds": 6,
+    }
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+def test_staged_planning_reviewer_failure_stays_required(tmp_path):
+    """`reviewer-failure-remains-required`: no approval is waived."""
+    from agent_loop_helpers import structured_v1_plan_state
+
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[("codex exploded", 1)],
+        gemini_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Gemini")
+        ],
+    )
+    config = _staged_parallel_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(AgentLoopError, match="Codex"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    # The primary is the only selected reviewer in the primary phase, so its
+    # failure stops the round without ever approving the plan.
+    assert not any(cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands)
+    assert not any("plan approved" in comment.lower() for comment in runner.comments)
+
+
+def test_staged_planning_resume_after_publication_keeps_the_panel_finding(tmp_path):
+    """`resume-no-duplicate-calls`: a staged checkpoint is not a reconciliation.
+
+    Staged planning writes a `scheduler-prelaunch` summary every round and a
+    `plan-phase-advance` summary before a reviewer-only round.  Neither may be
+    read as reviewer reconciliation, or a published blocking panel review would
+    resume without its numbered item, owner, and durable obligation.
+    """
+    from agent_loop_helpers import structured_v1_plan_state
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+    fresh = structured_v1_plan_state()
+    base = orchestrator.AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(fresh), round_number=1
+    )
+    patch_payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Name the rollout owner in the plan steps.",
+        "prior_plan_item_dispositions": [
+            {
+                "item_id": "item-1",
+                "disposition": "resolved",
+                "rationale": "The revised plan step names the rollout owner.",
+            }
+        ],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {
+                "op": "replace",
+                "field": "plan_steps",
+                "value": ["Implement the reviewed scope and name the rollout owner."],
+            }
+        ],
+    }
+    patch_text = (
+        json.dumps(patch_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}]
+    runner = FakeRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_plan_review(
+                state="approved", prior_plan_item_dispositions=resolved
+            ),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking",
+                reviewer="Google Gemini",
+                summary="One plan step omits the rollout owner.",
+                blocking_plan_issues=["Name the rollout owner in the plan steps."],
+            ),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+    )
+    config = _staged_parallel_config(tmp_path)
+    real_post = orchestrator.post_issue_comment
+
+    def interrupt_before_reconciliation(*args, **kwargs):
+        if "Plan review round 2 reconciliation" in kwargs["body"]:
+            raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    # Round 1 settles the primary; round 2 is the reviewer-only panel round.
+    # The panel publishes its blocking review and the run is then interrupted
+    # at the reconciliation boundary.
+    with patch.object(
+        orchestrator, "post_issue_comment", side_effect=interrupt_before_reconciliation
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    def plan_records():
+        records = []
+        for comment in runner.issue_comments:
+            match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+            if match is None:
+                continue
+            metadata = orchestrator._decode_round_metadata(match["payload"])
+            if metadata.flow == "plan":
+                records.append(metadata)
+        return records
+
+    interrupted = plan_records()
+    # The panel round holds its staged checkpoints and the publication record,
+    # but no reconciliation record: the round is genuinely unsettled.
+    assert [record.phase for record in interrupted if record.round_number == 2] == [
+        "plan-phase-advance",
+        "scheduler-prelaunch",
+        "publication",
+    ]
+    assert not any(
+        record.new_items for record in interrupted if record.round_number == 2
+    )
+
+    gemini_calls_before = sum(
+        1 for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"]
+    )
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    resumed = plan_records()
+    reconciliation = [
+        record
+        for record in resumed
+        if record.round_number == 2 and record.phase == "reconciliation"
+    ]
+    assert len(reconciliation) == 1
+    # The published panel finding keeps its ID, its owner, and its obligation.
+    items = reconciliation[0].new_items
+    assert [item.item_id for item in items] == ["item-1"]
+    assert items[0].reviewer == "Gemini"
+    assert items[0].status == "blocking"
+    # The settled panel reviewer is not re-invoked for the resumed round: its
+    # next call is the round-3 remediation turn.
+    gemini_rounds = [
+        record.round_number
+        for record in resumed
+        if record.role == "reviewer" and record.agent == "Gemini"
+    ]
+    assert gemini_rounds == [2, 3]
+    assert (
+        sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"])
+        == gemini_calls_before + 1
+    )
+    # The planner is given the reconstructed obligation, and the round-3
+    # remediation reviews disposition it rather than minting a duplicate.
+    planner_prompts = [
+        "\n".join(cmd) for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]
+    ]
+    assert "item-1" in planner_prompts[-1]
+    assert not any(
+        item.item_id == "item-1"
+        for record in resumed
+        if record.round_number == 3
+        for item in record.new_items
+    )
+
+
+def test_staged_planning_resume_does_not_re_invoke_a_settled_reviewer(tmp_path):
+    """`resume-no-duplicate-calls`: settled work is reconstructed, not redone."""
+    from agent_loop_helpers import structured_v1_plan_state
+
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = _staged_parallel_config(tmp_path, max_rounds=1)
+
+    # Round 1 settles the primary, then the run stops on the round budget while
+    # the reviewer-only panel advance is still pending.
+    with pytest.raises(AgentLoopError, match="phase advance was still pending"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    commands_before = len(runner.commands)
+    runner.gemini_outputs.append(
+        structured_plan_review(state="approved", reviewer="Google Gemini")
+    )
+    assert (
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=_staged_parallel_config(tmp_path, max_rounds=6),
+            plan_first=True,
+        )
+        == 0
+    )
+
+    resumed_commands = runner.commands[commands_before:]
+    # The primary holds a qualifying exact-key approval, so it is carried; only
+    # the outstanding secondary is invoked, and no planner turn is fabricated.
+    assert not any(cmd[:1] == ["codex"] for cmd, _cwd in resumed_commands)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in resumed_commands)
+    assert len([cmd for cmd, _cwd in resumed_commands if cmd[:1] == ["gemini"]]) == 1

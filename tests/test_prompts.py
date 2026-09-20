@@ -4357,3 +4357,95 @@ def test_emitted_invocation_guidance_lines_pass_the_checkout_validator(
         )
         assert str(memory_dir) in rendered
         validate_test_commands_within_workdir([rendered], assigned_workdir=checkout)
+
+
+def test_plan_review_prompts_state_the_staged_approval_rule(tmp_path):
+    """`planning-prompt-scheduling-guidance` (#905, from #841)."""
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.prompts import build_plan_review_prompt
+
+    default_config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    staged_config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+
+    for compact in (False, True):
+        default_prompt = build_plan_review_prompt(
+            56, 1, "Plan.", default_config, reviewer="codex", compact_context=compact
+        )
+        staged_prompt = build_plan_review_prompt(
+            56, 1, "Plan.", staged_config, reviewer="codex", compact_context=compact
+        )
+        # The compatibility default keeps today's same-round wording verbatim.
+        assert "must approve in the same planning" in default_prompt.replace("\n", " ")
+        assert "primary-then-panel" not in default_prompt
+        # Staged planning never claims same-round approval.
+        assert "must approve in the same planning" not in staged_prompt.replace("\n", " ")
+        assert "primary-then-panel" in staged_prompt
+        assert "primary plan reviewer" in staged_prompt
+        assert "secondary plan panel" in staged_prompt
+        assert "final exact-plan sweep" in staged_prompt.replace("\n", " ")
+        assert "carried across later rounds" in staged_prompt.replace("\n", " ")
+
+
+def test_superseded_prepanel_plan_review_context_block_is_non_authoritative(tmp_path):
+    """`operator-force-full-override` (#905): replayed plan claims are context only."""
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.prompts import (
+        SupersededPrepanelReview,
+        build_plan_review_prompt,
+        superseded_prepanel_plan_review_context_block,
+    )
+
+    staged_config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+    superseded = SupersededPrepanelReview(
+        reviewer="Gemini",
+        round_number=1,
+        head_sha="plan-subject-abc",
+        state="blocking",
+        summary="Gemini premature plan summary",
+        claims=("premature plan concern", "y" * 2000),
+        item_ids=("item-1",),
+    )
+    assert superseded_prepanel_plan_review_context_block(None) == ""
+    for compact in (False, True):
+        prompt = build_plan_review_prompt(
+            56,
+            2,
+            "Plan.",
+            staged_config,
+            reviewer="gemini",
+            compact_context=compact,
+            superseded_prepanel_review=superseded,
+        )
+        flat = " ".join(prompt.split())
+        assert (
+            "Superseded pre-panel plan review context (non-authoritative; context only):"
+            in prompt
+        )
+        assert "not a finding, not a plan-item disposition, not an approval" in flat
+        assert (
+            "none of its claims entered the unresolved plan-item ledger "
+            "(superseded plan item IDs: item-1)"
+        ) in flat
+        assert (
+            "Re-raise any concern below that still holds as a new finding of this plan review"
+            in flat
+        )
+        assert "- Earlier claim: premature plan concern" in prompt
+        assert "- Earlier summary: Gemini premature plan summary" in prompt
+        # Replayed claims are bounded.
+        assert "y" * 700 not in prompt
+    for compact in (False, True):
+        plain = build_plan_review_prompt(
+            56, 2, "Plan.", staged_config, reviewer="gemini", compact_context=compact
+        )
+        assert "Superseded pre-panel plan review context" not in plain

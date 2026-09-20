@@ -64,7 +64,7 @@ Source paths below are relative to
 | Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. |
-| Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head. |
+| Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py`, `plan_review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head or a candidate plan. |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. |
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
@@ -311,6 +311,80 @@ owner, selection, approval-head, and scheduler-policy call-accounting metadata
 are optional extensions to the legacy scheduler core, so old records remain
 decodable and grant no staged phase authority.
 See [selective and staged review](docs/local_agent_loop.md#selective-intermediate-pr-review).
+
+Issue plan review has its own scheduling component, `plan_review_scheduling.py`,
+selected independently of the PR policy by `--plan-review-policy`. Full-board
+planning stays the compatibility default. The staged planning policy binds every
+decision to one canonical **exact-plan candidate key**: the ordered tuple of the
+plan subject, aggregate plan identity, execution-strategy identity,
+risk-test-matrix identity, and a digest of the surfaced planning-requirement
+IDs. Staged planning requires a generation-1 plan, because a legacy unversioned
+plan cannot form that key. The key is persisted on planning scheduler records
+and on every plan reviewer record, so a later round compares a stored approval
+component-for-component instead of inferring equivalence from the subject.
+
+The plan-first lifecycle gains a **reviewer-only phase-advance round**. When no
+must-fix plan item remains but a required reviewer still lacks a qualifying
+exact-key approval, the loop posts a `plan-phase-advance` record, increments the
+round number, and runs the secondary panel (later the final sweep) against a
+byte-identical candidate plan with no planner turn. The advance record and the
+round-budget diagnostic name the phase that is still outstanding, projected by
+running the scheduler over the unchanged candidate key and the post-round
+approvals, not the phase of the board that just finished. Resume anchors on the latest
+coder record and the highest round number for that plan subject, so a round with
+a phase-advance record and no coder record is a legitimate reviewer-only round
+and never synthesizes a planner turn. A planning round counts as reconciled only
+when it holds an actual reconciliation record: the `scheduler-prelaunch` and
+`plan-phase-advance` summaries are pre-reviewer checkpoints, so an interruption
+at either one resumes as an unsettled round that still reconstructs each
+published reviewer's numbered items, owners, and obligations. Resume also
+rebuilds the transition classifier's authenticated inputs — the durable
+`semantic-patch-v1` payload and the cross-cutting contracts of the state that
+patch was bound to — from the coder records themselves, so an interruption
+between a remediation planner turn and its scheduler checkpoint keeps the same
+narrow classification instead of latching the complete board; anything that
+cannot be re-verified stays broad. Under staged planning, and only there,
+ledger completeness is judged the same way: an item recorded under an earlier
+plan subject stops counting as a missing obligation once the run has carried or
+minted that item, or once the recorded history proves it was canonically
+cleared. Full-board planning keeps the conservative reading it had before this
+policy existed, where any cross-subject item at all makes the ledger
+unreconstructible, so the compatibility default's context-mode selection and
+posted bodies are unchanged. That second proof has to come from
+the durable history rather than the running process, because a reviewer-only
+advance records an empty carried ledger — after remediation there is nothing
+left to carry — and a restart on exactly that seam would otherwise rediscover
+the cleared item and read the ledger as unreconstructible. With both proofs, a
+resumed run's later phase advance carries the approvals it just recorded into
+the final sweep instead of re-invoking the complete board. Because each
+advance costs a round, staged
+planning consumes strictly more rounds than full-board planning, and exhausting
+`--max-rounds` during a pending advance is reported distinctly from reviewer
+blocking issues.
+
+Planning scheduler metadata is a flow-discriminated branch of the same durable
+round-metadata transport. A planning record carries the candidate key in place
+of the PR-only SHA pair and omits the PR-only broad-rule and scope-digest state,
+so a planning record and a PR record can never be decoded as one another even
+when both carry `policy: primary-then-panel`. Degraded planning history is
+partitioned into exactly four disjoint classes with one outcome each: absent,
+invalid, and contradictory-key history always continue under a conservative
+fallback (strict primary-only before a qualified opening, complete board with an
+automatic latch after one), and only a transport extraction failure stops the
+run, checked at startup and at every round boundary. Degradation is scoped to
+the latest valid planning scheduler checkpoint, so an older invalid record stays
+auditable without pinning later rounds to the fallback, and the persisted
+planning contract is immutable under both policies. A carried exact-key
+approval is honored only when it also carried the acknowledgement for exactly
+the currently surfaced planning-requirement ID set, so the signed-requirement
+gate cannot be satisfied vacuously. When structured repair recovers a missing
+acknowledgement, staged planning persists the repaired reviewer result as an
+amended record before the phase advance, because the record written from the
+original text carries no requirement IDs and a later record for the same
+reviewer supersedes the earlier one; otherwise the very approval that repair
+just recovered would be rejected on the next round. Discussion-mode and child-planning cycles
+keep the full board by configuration reset. See
+[staged issue plan review](docs/local_agent_loop.md#staged-issue-plan-review).
 
 Frozen policy evaluation is a local read-only boundary. `review-evaluation`
 validates artifacts and deterministically reports severity-weighted marginal

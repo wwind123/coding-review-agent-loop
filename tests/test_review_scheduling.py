@@ -1584,3 +1584,69 @@ def test_non_staged_policies_ignore_pre_panel_rules():
         operator_force_full=True,
     )
     assert select_reviewers(compat, NARROW).reason == "compatibility policy"
+
+
+# ---------------------------------------------------------------------------
+# #905 (from #841): independent planning-policy configuration surface
+
+
+def test_plan_review_policy_validates_independently_of_the_pr_policy(tmp_path):
+    args = build_parser().parse_args(
+        [
+            "issue", "56", "--plan-review-policy", "primary-then-panel",
+            "--primary-plan-reviewer", "codex",
+            "--reviewer", "codex", "--reviewer", "gemini",
+        ]
+    )
+    assert args.plan_review_policy == "primary-then-panel"
+    assert args.primary_plan_reviewer == "codex"
+    assert args.pr_review_policy == "all-reviewers"
+
+    # Staged planning with full-board PR review, and the reverse, both validate.
+    staged_plan_only = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+    assert staged_plan_only.pr_review_policy == "all-reviewers"
+    assert staged_plan_only.primary_reviewer is None
+    staged_pr_only = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+    )
+    assert staged_pr_only.plan_review_policy == "all-reviewers"
+    assert staged_pr_only.primary_plan_reviewer is None
+
+    with pytest.raises(AgentLoopError, match="--primary-plan-reviewer is required"):
+        make_config(
+            tmp_path, reviewer=("codex", "gemini"),
+            plan_review_policy="primary-then-panel",
+        )
+    with pytest.raises(AgentLoopError, match="one of the configured"):
+        make_config(
+            tmp_path, reviewer=("codex", "gemini"),
+            plan_review_policy="primary-then-panel", primary_plan_reviewer="claude",
+        )
+    with pytest.raises(AgentLoopError, match="at least one secondary"):
+        make_config(
+            tmp_path, reviewer=("codex",),
+            plan_review_policy="primary-then-panel", primary_plan_reviewer="codex",
+        )
+    with pytest.raises(
+        AgentLoopError, match="requires --plan-review-policy primary-then-panel"
+    ):
+        make_config(tmp_path, reviewer=("codex", "gemini"), primary_plan_reviewer="codex")
+    with pytest.raises(
+        AgentLoopError, match="--plan-review-force-full requires"
+    ):
+        make_config(
+            tmp_path, reviewer=("codex", "gemini"), plan_review_force_full=True
+        )
+
+    default = make_config(tmp_path, reviewer=("codex", "gemini"))
+    assert default.plan_review_policy == "all-reviewers"
+    assert default.primary_plan_reviewer is None
+    assert default.plan_review_force_full is False
