@@ -6783,6 +6783,9 @@ class PlanRevisionPatchOperation:
     rationale: str | None = None
 
     def to_payload(self) -> dict[str, object]:
+        return _json_array_mapping(self._raw_payload())
+
+    def _raw_payload(self) -> dict[str, object]:
         if self.op == "replace":
             return {"op": self.op, "field": self.field, "value": _patch_value_payload(self.value)}
         if self.op == "matrix_add":
@@ -6836,7 +6839,7 @@ class PlanRevisionPatch:
     operations: tuple[PlanRevisionPatchOperation, ...]
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        return _json_array_mapping({
             "schema_version": self.schema_version,
             "kind": self.kind,
             "semantic_patch_contract_version": self.semantic_patch_contract_version,
@@ -6853,7 +6856,27 @@ class PlanRevisionPatch:
             "base_round_number": self.base_round_number,
             "base_state_identity": self.base_state_identity,
             "operations": [operation.to_payload() for operation in self.operations],
-        }
+        })
+
+
+def _json_array_payload(value: object) -> object:
+    """Return ``value`` with every sequence rendered as a JSON array.
+
+    ``dataclasses.asdict`` preserves tuples for immutable fields such as
+    ``ArchitectureImpact.execution_data_flows``.  Patch payloads are stored as
+    provenance, re-parsed with the wire parsers, and compared for equality
+    against the stored JSON copy, so a tuple here both fails the parsers and
+    breaks ``list != tuple`` equality on restart (#879).
+    """
+    if isinstance(value, Mapping):
+        return {key: _json_array_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_array_payload(item) for item in value]
+    return value
+
+
+def _json_array_mapping(payload: dict[str, object]) -> dict[str, object]:
+    return {key: _json_array_payload(item) for key, item in payload.items()}
 
 
 def _patch_value_payload(value: object) -> object:

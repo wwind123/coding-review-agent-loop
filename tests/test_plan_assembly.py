@@ -579,3 +579,78 @@ def test_semantic_round_metadata_rejects_response_form_kind_mismatch(
 
     with pytest.raises(AgentLoopError, match="does not match canonical plan kind"):
         _decode_round_metadata_mapping(wrong_payload)
+
+
+def test_stored_patch_provenance_round_trips_and_resumes(tmp_path) -> None:
+    # Regression for #879: to_payload() used to emit tuples, but provenance is
+    # re-parsed with the wire parsers on every restart and the stored copy is
+    # compared for equality against a freshly re-serialized patch.
+    state = _state(_base([_row("row-a")]))
+    architecture_impact = {
+        "status": "changed",
+        "rationale": "The revision adds a publication seam.",
+        "affected_components": ["round_state.py"],
+        "dependencies": [],
+        "execution_data_flows": ["plan round -> metadata"],
+        "persistence": ["round metadata"],
+        "public_contracts": [],
+        "security_boundaries": [],
+        "canonical_document_action": "update",
+        "canonical_document_path": "ARCHITECTURE.md",
+        "canonical_document_rationale": "Record the new seam.",
+    }
+    patch = _patch(
+        state,
+        [{"op": "replace", "field": "architecture_impact", "value": architecture_impact}],
+    )
+
+    assembled, sidecar = assemble_authenticated_plan_revision(
+        state, patch, result_round_number=5
+    )
+
+    assert sidecar.raw_patch is not None
+    assert sidecar.raw_patch == json.loads(json.dumps(sidecar.raw_patch))
+    reparsed = parse_plan_revision_patch(sidecar.raw_patch)
+    assert reparsed.base_state_identity == state.state_identity
+    replaced = reparsed.operations[0].value
+    assert replaced.execution_data_flows == ("plan round -> metadata",)
+    # Both sides of the restart integrity check must agree exactly.
+    assert reparsed.to_payload() == sidecar.raw_patch
+
+    canonical_plan = render_canonical_plan_revision(assembled, ())
+    sidecar = make_assembled_plan_sidecar(
+        assembled,
+        round_number=5,
+        response_form="semantic-patch-v1",
+        raw_patch=sidecar.raw_patch,
+        rendered_plan=canonical_plan,
+    )
+    raw_patch_body = json.dumps(sidecar.raw_patch) + (
+        "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    metadata = PostedRoundMetadata(
+        flow="plan",
+        role="coder",
+        agent="Claude",
+        round_number=5,
+        subject=_plan_subject(canonical_plan),
+        canonical_plan=canonical_plan,
+        raw_structured_coder_response=raw_patch_body,
+        response_form="semantic-patch-v1",
+        base_round_number=state.round_number,
+        base_state_identity=state.state_identity,
+        aggregate_plan_identity=sidecar.aggregate_identity,
+        raw_patch_provenance=sidecar.raw_patch,
+        assembled_plan_sidecar=sidecar.to_payload(),
+    )
+    comment = _attach_round_metadata("Published canonical plan", metadata)
+
+    resumed = _resume_plan_round(
+        [type("Comment", (), {"body": comment})()],
+        configured_reviewers=("codex",),
+    )
+
+    assert resumed is not None
+    resumed_plan, resumed_round = resumed
+    assert resumed_plan == canonical_plan
+    assert resumed_round.coder_output == raw_patch_body
