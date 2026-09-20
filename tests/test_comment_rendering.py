@@ -2272,13 +2272,27 @@ def test_render_plan_scheduling_audit_distinguishes_each_decision_kind():
         reason="operator force-full: the complete plan board is authorized",
         **{**common, "force_full": True, "force_full_source": "operator"},
     )
+    # The scheduler stamps the post-panel prefix on the ordinary owner-scoped
+    # remediation decision too, which selects a partial board and raises no
+    # latch; it must never read as the complete-board post-panel fallback.
+    remediation = render_plan_scheduling_audit(
+        phase="remediation",
+        reason=(
+            "post-panel fallback: narrow plan remediation: finding owners from the "
+            "canonical ledger and the primary must recheck"
+        ),
+        **{**common, "panel_evidence": True, "active_owners": ("Gemini",)},
+    )
 
     assert "ordinary staged planning decision" in ordinary
     assert "strict pre-panel fallback (primary-only, no latch)" in strict
     assert "`invalid`" in strict and "decoded invalid" in strict
     assert "post-panel fallback (complete board, automatic latch)" in post
     assert "operator override (qualified panel opening, source `operator`)" in override
-    for rendered in (ordinary, strict, post, override):
+    assert "owner-scoped remediation decision (partial board, no latch)" in remediation
+    assert "post-panel fallback" not in remediation.split("- Scheduling reason:")[0]
+    assert "- Force-full: False (source: none)" in remediation
+    for rendered in (ordinary, strict, post, override, remediation):
         assert "Gemini (primary phase)" in rendered
         assert "Scheduler calls avoided cumulatively: 2" in rendered
         assert "Primary plan reviewer: Codex" in rendered

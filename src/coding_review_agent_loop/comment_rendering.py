@@ -2225,13 +2225,23 @@ def render_plan_scheduling_audit(
     The wording deliberately distinguishes the strict pre-panel fallback, the
     post-panel fallback, and the operator override so an auditor can tell which
     rule selected the board without re-deriving it.
+
+    The decision kind is keyed on authoritative decision data, not on the reason
+    prefix alone: the scheduler also stamps the post-panel prefix on the
+    *ordinary* owner-scoped remediation decision, which selects a partial board
+    and raises no latch, so labelling it a post-panel fallback would contradict
+    the phase, selected-reviewer, and force-full fields rendered beside it.
     """
-    if reason.startswith(_PLAN_OPERATOR_OVERRIDE_PREFIX):
+    if reason.startswith(_PLAN_OPERATOR_OVERRIDE_PREFIX) or force_full_source == "operator":
         kind = "operator override (qualified panel opening, source `operator`)"
     elif reason.startswith(_PLAN_STRICT_PRE_PANEL_PREFIX):
         kind = "strict pre-panel fallback (primary-only, no latch)"
-    elif reason.startswith(_PLAN_POST_PANEL_PREFIX):
-        kind = "post-panel fallback (complete board, automatic latch)"
+    elif reason.startswith(_PLAN_POST_PANEL_PREFIX) and phase == "full-board":
+        kind = "post-panel fallback (complete board" + (
+            ", automatic latch)" if force_full else ")"
+        )
+    elif phase == "remediation":
+        kind = "owner-scoped remediation decision (partial board, no latch)"
     else:
         kind = "ordinary staged planning decision"
     lines = [

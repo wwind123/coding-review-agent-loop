@@ -8561,6 +8561,25 @@ def _plan_round_records(runner):
     return records
 
 
+def _plan_audit_body(runner, *, round_number):
+    """The posted planning scheduler audit body for one round."""
+    for comment in runner.issue_comments:
+        body = comment["body"]
+        if not body.startswith("Plan review scheduling audit."):
+            continue
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", body)
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if (
+            metadata.flow == "plan"
+            and metadata.phase == "scheduler-prelaunch"
+            and metadata.round_number == round_number
+        ):
+            return body
+    raise AssertionError(f"no planning scheduler audit posted for round {round_number}")
+
+
 def _staged_plan_history(
     tmp_path, *, reviewer_records=(), scheduler_record=True, reconciliation_record=False
 ):
@@ -9347,6 +9366,16 @@ def test_staged_planning_panel_blocker_routes_to_owner_plus_primary(tmp_path):
     assert remediation.scheduler_force_full_source is None
     assert "narrow plan remediation" in " ".join(remediation.scheduler_reasons)
     assert "full-board" not in phases
+    # The posted audit must describe the ordinary owner-scoped remediation as
+    # what it is, not as the complete-board post-panel fallback, so its decision
+    # kind agrees with the phase, board, and force-full fields beside it.
+    remediation_body = _plan_audit_body(runner, round_number=remediation.round_number)
+    assert (
+        "owner-scoped remediation decision (partial board, no latch)" in remediation_body
+    )
+    assert "post-panel fallback (complete board" not in remediation_body
+    assert "- Phase: `remediation`" in remediation_body
+    assert "- Force-full: False (source: none)" in remediation_body
 
 
 def _remediation_plan_fixtures():
