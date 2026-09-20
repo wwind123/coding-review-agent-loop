@@ -22,6 +22,7 @@ from coding_review_agent_loop.semantic_dedupe import (
     SemanticDedupeMatcher,
     SemanticProviderResult,
     _isolated_provider_config,
+    default_semantic_transport,
     build_semantic_prompt,
     parse_semantic_match,
 )
@@ -344,6 +345,92 @@ def test_antigravity_isolated_config_replaces_the_model_chain(tmp_path):
         import shutil
 
         shutil.rmtree(isolated_dir, ignore_errors=True)
+
+
+def test_isolated_config_neutralizes_primary_then_panel_scheduling(tmp_path):
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+    )
+    isolated_config, isolated_dir = _isolated_provider_config(config, "claude", "")
+    try:
+        assert isolated_config.reviewer == ("claude",)
+        assert isolated_config.pr_review_policy == "all-reviewers"
+        assert isolated_config.primary_reviewer is None
+        assert isolated_config.pr_review_force_full is False
+    finally:
+        import shutil
+
+        shutil.rmtree(isolated_dir, ignore_errors=True)
+
+
+def test_isolated_config_does_not_inherit_selective_force_full(tmp_path):
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        pr_review_policy="selective-intermediate",
+        pr_review_force_full=True,
+    )
+    isolated_config, isolated_dir = _isolated_provider_config(config, "codex", "")
+    try:
+        assert isolated_config.reviewer == ("codex",)
+        assert isolated_config.pr_review_policy == "all-reviewers"
+        assert isolated_config.primary_reviewer is None
+        assert isolated_config.pr_review_force_full is False
+    finally:
+        import shutil
+
+        shutil.rmtree(isolated_dir, ignore_errors=True)
+
+
+def test_isolated_config_keeps_default_all_reviewers_behavior(tmp_path):
+    config = make_config(
+        tmp_path,
+        semantic_followup_backend="antigravity",
+        semantic_followup_model="Model X",
+    )
+    isolated_config, isolated_dir = _isolated_provider_config(config, "antigravity", "Model X")
+    try:
+        assert isolated_config.reviewer == ("antigravity",)
+        assert isolated_config.antigravity_model is None
+        assert isolated_config.antigravity_models == ("Model X",)
+        assert isolated_config.pr_review_policy == "all-reviewers"
+        assert isolated_config.primary_reviewer is None
+        assert isolated_config.pr_review_force_full is False
+    finally:
+        import shutil
+
+        shutil.rmtree(isolated_dir, ignore_errors=True)
+
+
+def test_default_transport_matches_under_primary_then_panel(tmp_path):
+    classification = json.dumps(
+        {
+            "duplicate_of": 484,
+            "confidence": "high",
+            "reason": "Both entries track the same deferred deliverable.",
+        }
+    )
+    runner = FakeRunner(claude_outputs=[(classification, 0)])
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+        semantic_followup_backend="claude",
+    )
+    matcher = SemanticDedupeMatcher(runner=runner, config=config)
+
+    match = matcher.match(
+        proposed="Track the deferred recovery work.",
+        candidates=(SemanticCandidate(identity=484, title="Existing", body="Recovery"),),
+        source_context=_source(parent=473).render(),
+    )
+
+    assert match.duplicate_of == 484
+    assert matcher.transport is default_semantic_transport
 
 
 def test_invalid_semantic_result_is_not_counted_as_validated_usage(tmp_path):
