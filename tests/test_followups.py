@@ -451,3 +451,59 @@ def test_invalid_semantic_result_is_not_counted_as_validated_usage(tmp_path):
 
     assert usage.records[0].outcome == "invalid_output"
     assert usage.records[0].validation_status == "invalid"
+
+
+def test_oversized_approved_plan_summary_is_shortened_to_fit(tmp_path):
+    """#814: an eight-round plan can exceed GitHub's comment limit.
+
+    The canonical plan lives in round metadata and its sidecars, so the
+    visible copy is cut rather than failing the publication.
+    """
+    from coding_review_agent_loop.followups import (
+        PLAN_SUMMARY_TRUNCATION_NOTICE,
+        _publish_plan_approved_followups,
+    )
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    posted: list[str] = []
+
+    class _CapturingRunner(FakeRunner):
+        def run(self, args, **kwargs):  # type: ignore[override]
+            if "comment" in args and "--body-file" in args:
+                path = args[args.index("--body-file") + 1]
+                posted.append(open(path, encoding="utf-8").read())
+            return super().run(args, **kwargs)
+
+    config = make_config(tmp_path, approved_followups="summarize")
+    approved_plan = "\n".join(f"Step {index}: " + "detail " * 40 for index in range(2_000))
+    assert len(approved_plan) > MAX_GITHUB_BODY_CHARS
+
+    published = _publish_plan_approved_followups(
+        _CapturingRunner(),
+        config=config,
+        issue_number=871,
+        approved_plan=approved_plan,
+        plan_hash="abc123def456",
+        plan_subject="subject-871",
+        issue_comments=[],
+        sources=[],
+        source_context=_source(parent=871),
+        allow_issue_filing=False,
+    )
+
+    assert published is True
+    assert posted, "the approval summary must be published"
+    body = posted[-1]
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert body.startswith("Planning complete for issue #871.")
+    assert PLAN_SUMMARY_TRUNCATION_NOTICE in body
+    assert "AGENT_PLAN_APPROVED_FOLLOWUPS" in body
+
+
+def test_plan_summary_truncation_notice_uses_descriptive_wording():
+    """The visible notice must not name a reserved marker token (#814)."""
+    from coding_review_agent_loop.followups import PLAN_SUMMARY_TRUNCATION_NOTICE
+    from coding_review_agent_loop.protocol_markers import MARKER_BY_TOKEN
+
+    for token in MARKER_BY_TOKEN:
+        assert token not in PLAN_SUMMARY_TRUNCATION_NOTICE

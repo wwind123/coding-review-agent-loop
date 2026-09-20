@@ -20,6 +20,7 @@ from .github import (
 )
 from .logging import log
 from .protocol import ApprovedFollowup, UnresolvedReviewItem
+from .round_transport import MAX_GITHUB_BODY_CHARS
 from .runner import Runner
 from .protocol_markers import TrustedBody, sanitize_historical_text
 from .semantic_dedupe import (
@@ -1390,6 +1391,29 @@ def _format_same_pr_followups(followups: Sequence[ApprovedFollowup]) -> str:
     return "\n".join(lines).strip()
 
 
+# Headroom for the notice, the marker, and the trailing signature so one
+# re-render is always enough.
+_PLAN_SUMMARY_SAFETY_MARGIN = 1_000
+
+PLAN_SUMMARY_TRUNCATION_NOTICE = (
+    "[The approved plan is shown in full in this issue's canonical plan comment and its "
+    "bounded transport sidecars; only its opening is repeated here because the complete "
+    "text does not fit in one GitHub comment.]"
+)
+
+
+def _bounded_approved_plan_text(approved_plan: str, *, budget: int | None) -> str:
+    """Return the plan text, shortened to ``budget`` characters when needed.
+
+    The canonical plan already lives losslessly in round metadata and its
+    sidecars, so this visible copy is presentation only and may be cut (#814).
+    """
+    if budget is None or len(approved_plan) <= budget:
+        return approved_plan
+    keep = max(budget - len(PLAN_SUMMARY_TRUNCATION_NOTICE) - 2, 0)
+    return f"{approved_plan[:keep].rstrip()}\n\n{PLAN_SUMMARY_TRUNCATION_NOTICE}"
+
+
 def _format_plan_approval_summary_with_followups(
     issue_number: int,
     approved_plan: str,
@@ -1398,7 +1422,9 @@ def _format_plan_approval_summary_with_followups(
     issue_urls: Sequence[str] = (),
     filing_enabled: bool = False,
     publication_details: str | None = None,
+    plan_char_budget: int | None = None,
 ) -> str:
+    approved_plan = _bounded_approved_plan_text(approved_plan, budget=plan_char_budget)
     lines = [
         f"Planning complete for issue #{issue_number}.",
         "",
@@ -1555,20 +1581,37 @@ def _publish_plan_approved_followups(
     # The approved plan is a re-rendered historical GitHub artifact.  Its
     # encoded plan metadata may contain durable records, but those records are
     # not newly authorized by this follow-up comment.
-    body = _format_plan_approval_summary_with_followups(
-        issue_number,
-        sanitize_historical_text(approved_plan),
-        reconciliation=reconciliation,
-        issue_urls=issue_urls,
-        filing_enabled=filing_enabled,
-        publication_details=publication_details,
-    )
-    body = _append_plan_approved_followups_marker(
-        body,
-        issue_number=issue_number,
-        plan_hash=plan_hash,
-        mode=mode,
-    )
+    rendered_plan = sanitize_historical_text(approved_plan)
+
+    def _render(plan_char_budget: int | None) -> str:
+        return _append_plan_approved_followups_marker(
+            _format_plan_approval_summary_with_followups(
+                issue_number,
+                rendered_plan,
+                reconciliation=reconciliation,
+                issue_urls=issue_urls,
+                filing_enabled=filing_enabled,
+                publication_details=publication_details,
+                plan_char_budget=plan_char_budget,
+            ),
+            issue_number=issue_number,
+            plan_hash=plan_hash,
+            mode=mode,
+        )
+
+    body = _render(None)
+    if len(body) > MAX_GITHUB_BODY_CHARS:
+        # Every other section of this comment is bounded, so the overflow is
+        # the embedded plan.  Keep the sections and the marker intact and cut
+        # the plan copy; the canonical plan stays in metadata and sidecars.
+        overflow = len(body) - MAX_GITHUB_BODY_CHARS
+        budget = max(len(rendered_plan) - overflow - _PLAN_SUMMARY_SAFETY_MARGIN, 0)
+        body = _render(budget)
+        if len(body) > MAX_GITHUB_BODY_CHARS:
+            raise AgentLoopError(
+                "Plan approval summary exceeds the GitHub comment limit even with a "
+                "shortened plan; its fixed sections are too large to publish."
+            )
     post_issue_comment(
         runner,
         config=config,
