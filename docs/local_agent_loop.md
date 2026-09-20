@@ -971,34 +971,6 @@ GitHub renders as "No description provided.") remain valid. Keep those
 sidecars with the anchor: resume fails loudly if one is missing or corrupt, at
 which point restore the sidecars or remove the incomplete anchor and rerun.
 
-#### Tool-owned protocol records
-
-Beyond the round transport, agent-loop publishes protocol records whose payload
-lives in a hidden marker. Each of these comments now opens with one bounded,
-deterministic visible line naming the record and its role, for example
-`Agent-loop managed-CI authorization record (machine-readable). Binds issue
-#868 to pull request #877 at head e75771c. Not an agent response; keep this
-comment.` The labelled record types are:
-
-- the managed-CI issue authorization record, with distinct wording for the
-  creation, fresh re-authorization, and head-continuity kinds;
-- the managed-CI exact-head intent record, which also names its lifecycle
-  state;
-- the managed-CI unprotected-override audit and the resume-provenance audit;
-- the managed-CI qualified-head record;
-- the plan-validation diagnostic record.
-
-The issue-to-PR handoff and the PR expected-closing contract already render
-their own visible prose and are unchanged. All of these records are
-machine-readable and must be kept: deleting one can cost resume continuity,
-recovery context, or an audit trail. The label sits outside the marker span, so
-the marker grammar, payload, trust boundary, parsing, and recovery are
-unchanged, and older marker-only copies (which GitHub renders as "No
-description provided.") remain valid and still parse. Because each label is a
-pure function of the already-authenticated record, a retry produces a
-byte-identical body; every one of these writes is then verified by comparing
-the server's stored body and the producing identity against what was posted.
-
 Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
 require multiple reviewers:
 
@@ -3306,6 +3278,38 @@ The remaining legacy compatibility surface is intentionally narrow:
   revision responses.
 - Resume reconstruction should rely on `AGENT_LOOP_META` instead of reparsing
   old prose whenever metadata exists for the active round.
+
+### Tool-owned protocol records
+
+Beyond the round transport, agent-loop publishes protocol records whose payload
+lives in a hidden marker. Each of these comments now opens with one bounded,
+deterministic visible line naming the record and its role, for example:
+
+```text
+Agent-loop managed-CI authorization record (machine-readable). Binds issue #868
+to pull request #877 at head e75771c. Not an agent response; keep this comment.
+```
+
+The labelled record types are:
+
+- the managed-CI issue authorization record, with distinct wording for the
+  creation, fresh re-authorization, and head-continuity kinds;
+- the managed-CI exact-head intent record, which also names its lifecycle
+  state;
+- the managed-CI unprotected-override audit and the resume-provenance audit;
+- the managed-CI qualified-head record;
+- the plan-validation diagnostic record.
+
+The issue-to-PR handoff and the PR expected-closing contract already render
+their own visible prose and are unchanged. All of these records are
+machine-readable and must be kept: deleting one can cost resume continuity,
+recovery context, or an audit trail. The label sits outside the marker span, so
+the marker grammar, payload, trust boundary, parsing, and recovery are
+unchanged, and older marker-only copies (which GitHub renders as "No
+description provided.") remain valid and still parse. Because each label is a
+pure function of the already-authenticated record, a retry produces a
+byte-identical body; every one of these writes is then verified by comparing
+the server's stored body and the producing identity against what was posted.
 
 ### Carried item identity
 

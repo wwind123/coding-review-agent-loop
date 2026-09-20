@@ -439,6 +439,10 @@ between GitHub and local artifacts:
 | --- | --- |
 | Source and candidate identity | Git commits/branches and live GitHub PR metadata. |
 | Cross-invocation workflow history | GitHub comments with round metadata, canonical issue/PR handoffs, plan identities, and managed-CI intents; oversized payloads use sidecar comments. |
+| Invocation results | Unique response files and external subprocess logs; validate the current attempt before accepting an artifact. |
+| Work in progress | Tool-owned or explicitly supplied checkouts; tracked diffs can be preserved as salvage on supported failure paths. |
+| Local evidence | Test observations/receipts, runtime recommendations, usage summaries, and containment evidence. |
+| Orientation only | Repo-scoped memory, file inventories, and cached execution profiles; these may be stale. |
 
 Durable comment carriers persist a bounded visible label outside the unchanged
 hidden record, composed only from trusted vocabulary and already-authenticated
@@ -450,10 +454,6 @@ alike — is verified by comparing the server's stored body for that comment wit
 the exact posted carrier and checking the producing login and ID, fetching the
 comment when the write response carries no envelope; a rejected read-back takes
 that seam's existing failure path rather than being accepted on an exit status.
-| Invocation results | Unique response files and external subprocess logs; validate the current attempt before accepting an artifact. |
-| Work in progress | Tool-owned or explicitly supplied checkouts; tracked diffs can be preserved as salvage on supported failure paths. |
-| Local evidence | Test observations/receipts, runtime recommendations, usage summaries, and containment evidence. |
-| Orientation only | Repo-scoped memory, file inventories, and cached execution profiles; these may be stale. |
 
 Resume reconstructs state from recorded evidence and then checks it against the
 live PR, issue, plan, requirements, and policy. GitHub metadata is durable but

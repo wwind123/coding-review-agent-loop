@@ -404,7 +404,7 @@ def test_docs_list_tool_owned_machine_readable_record_types():
         assert "machine-readable and must be kept" in document
         assert "marker-only copies" in document
         assert "remain valid" in document
-    assert "#### Tool-owned protocol records" in doc_text
+    assert "### Tool-owned protocol records" in doc_text
     assert "issue-to-PR handoff" in doc_text and "expected-closing contract" in doc_text
 
 
