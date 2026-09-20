@@ -236,21 +236,35 @@ def _normalized_label(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
-def _authorized_neutralization_labels(value: object) -> frozenset[str]:
+def _authorized_neutralization_labels(value: object) -> Counter:
     """Safe labels that may legally replace the markers *value* embeds.
 
     `_joined_text` strips markers, so a marker-only source finding and a
     genuinely empty one such as `{}` both flatten to the empty string. Marker
-    provenance is therefore read from the unstripped strings, and the identity of
-    the markers found is kept: the documented exception replaces a source marker
-    with ITS OWN authorized safe label, so an empty result means the entry is not
-    marker-only and any other exempt-only text is unsupported (#871).
+    provenance is therefore read from the unstripped strings, and the identity AND
+    the occurrence count of the markers found are kept: the documented exception
+    replaces EACH source marker with ITS OWN authorized safe label, so an empty
+    result means the entry is not marker-only, a different family is unsupported,
+    and two occurrences may not collapse into one (#871).
     """
-    return frozenset(
-        _normalized_label(occurrence.definition.safe_label)
-        for text in _raw_string_values(value)
-        for occurrence in scan_reserved_markers(text)
-    )
+    counts: Counter = Counter()
+    for text in _raw_string_values(value):
+        for occurrence in scan_reserved_markers(text):
+            counts[_normalized_label(occurrence.definition.safe_label)] += 1
+    return counts
+
+
+def _consume_neutralization_labels(
+    text: str, labels: Sequence[str]
+) -> tuple[Counter, str]:
+    """Split *text* into the *labels* it spells out and the remaining prose."""
+    counts: Counter = Counter()
+    remaining = _normalized_label(text)
+    for label in sorted(labels, key=len, reverse=True):
+        while label and label in remaining:
+            counts[label] += 1
+            remaining = " ".join(remaining.replace(label, " ", 1).split())
+    return counts, remaining
 
 
 _PROTOCOL_RECORD_LINE_RE = re.compile(r"\A(?:<!--.*-->|--\s+\S.*)\Z", re.DOTALL)
@@ -408,12 +422,12 @@ def _validate_review_grounding(
     # Parallel to source_candidates: for a source finding whose prose is empty
     # BECAUSE it was nothing but reserved markers, the safe labels those markers
     # authorize; empty for every other candidate.
-    candidate_marker_labels: list[frozenset[str]] = []
+    candidate_marker_labels: list[Counter] = []
     for entry in source_findings:
         entry_text = _joined_text(entry)
         if _content_tokens(entry_text) or _modifier_counts(entry_text):
             source_candidates.append(entry_text)
-            candidate_marker_labels.append(frozenset())
+            candidate_marker_labels.append(Counter())
         elif (marker_labels := _authorized_neutralization_labels(entry)):
             source_candidates.append(entry_text)
             candidate_marker_labels.append(marker_labels)
@@ -429,12 +443,12 @@ def _validate_review_grounding(
         # would let an approved source's summary be copied into a current-scope
         # blocking finding and then ground the inverted verdict (#871).
         source_candidates = _freeform_finding_candidates(_payload_and_trailing(raw)[1])
-        candidate_marker_labels = [frozenset()] * len(source_candidates)
+        candidate_marker_labels = [Counter() for _ in source_candidates]
 
     # Each target finding keeps the safe labels of the markers IT embeds, so a
     # raw marker in the repaired text can be compared against the source
     # candidate's own marker families rather than merely stripping to nothing.
-    target_findings: list[tuple[str, str, frozenset[str]]] = []
+    target_findings: list[tuple[str, str, Counter]] = []
     for name in buckets:
         value = target.get(name)
         if not isinstance(value, list):
@@ -475,14 +489,18 @@ def _validate_review_grounding(
             labels = candidate_marker_labels[candidate_index]
             if not labels or _modifier_counts(text):
                 return False
-            normalized = _normalized_label(text)
-            if normalized:
-                return normalized in labels
-            # The target stripped to nothing, which means it too was nothing but
-            # reserved markers. Marker IDENTITY still has to hold: an unrelated
-            # raw marker family also strips to the empty string, so compare the
-            # families rather than accepting every empty result (#871).
-            return bool(target_labels) and target_labels <= labels
+            # Marker IDENTITY and CARDINALITY both have to hold, so the target
+            # must represent the COMPLETE source marker multiset: each occurrence
+            # either kept verbatim — which `_joined_text` strips, so it is counted
+            # from the target's own raw markers — or replaced by its own safe
+            # label, which survives as text. An unrelated family, a dropped
+            # occurrence, a duplicated one, and any leftover prose are all
+            # refused, because every safe label is an exempt token and would
+            # otherwise match vacuously (#871).
+            spelled, remaining = _consume_neutralization_labels(text, labels)
+            if remaining:
+                return False
+            return target_labels + spelled == labels
         if not tokens and not _modifier_counts(text):
             # The candidate is substantive, so the repaired finding must retain
             # substantive content of its own. An exempt-only target — schema

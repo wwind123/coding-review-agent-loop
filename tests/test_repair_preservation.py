@@ -1696,7 +1696,7 @@ def test_empty_source_finding_cannot_become_an_exempt_only_finding(
 )
 @pytest.mark.parametrize("unsupported", [
     "blocking",
-    "[protocol SPLIT_CHILD record]",
+    "[protocol split-child record]",
     "it is in the plan",
 ])
 def test_marker_only_source_finding_only_accepts_its_own_label(
@@ -1732,6 +1732,86 @@ def test_marker_only_source_finding_accepts_the_marker_kept_verbatim(builder, bu
         state="blocking", summary="Findings.",
         **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
     ))
+
+
+_LOOP_META_MARKER = "<!-- AGENT_LOOP_META: v1_abc -->"
+_LOOP_META_LABEL = "[protocol LOOP_META record]"
+_SPLIT_CHILD_MARKER = "<!-- AGENT_SPLIT_CHILD: parent=7 key=" + "a" * 64 + " -->"
+_SPLIT_CHILD_LABEL = "[protocol split-child record]"
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("neutralized", [
+    f"{_LOOP_META_LABEL} {_SPLIT_CHILD_LABEL}",
+    f"{_LOOP_META_MARKER} {_SPLIT_CHILD_LABEL}",
+    f"{_LOOP_META_LABEL} {_SPLIT_CHILD_MARKER}",
+])
+def test_two_marker_families_accept_a_complete_neutralization(
+    builder, bucket, neutralized
+):
+    # Issue #871 round 11, item-10: marker identity is tracked with occurrence
+    # cardinality, so a source finding carrying two distinct families is
+    # preserved when EVERY occurrence is either kept verbatim or replaced by its
+    # own safe label, in any mixture.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_MARKER} {_SPLIT_CHILD_MARKER}"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [neutralized]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("lossy", [
+    _LOOP_META_LABEL,
+    _SPLIT_CHILD_LABEL,
+    _LOOP_META_MARKER,
+    f"{_LOOP_META_LABEL} {_LOOP_META_LABEL}",
+])
+def test_two_marker_families_reject_a_dropped_or_duplicated_occurrence(
+    builder, bucket, lossy
+):
+    # Dropping either family, or duplicating one in place of the other, is a
+    # lossy repair: the frozenset comparison used to accept it because every safe
+    # label is an exempt token, so the target carried no content tokens.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_MARKER} {_SPLIT_CHILD_MARKER}"]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [lossy]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_repeated_same_family_markers_keep_their_cardinality(builder, bucket):
+    # Two occurrences of ONE family may not collapse into a single label either.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_MARKER} {_LOOP_META_MARKER}"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_LABEL} {_LOOP_META_LABEL}"]},
+    ))
+    check(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: [f"{_LOOP_META_MARKER} {_LOOP_META_LABEL}"]},
+    ))
+    for lossy in (_LOOP_META_LABEL, _LOOP_META_MARKER):
+        rejects(source, builder(
+            state="blocking", summary="Findings.", **{bucket: [lossy]},
+        ))
 
 
 @pytest.mark.parametrize(

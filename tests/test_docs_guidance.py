@@ -454,7 +454,8 @@ def test_docs_describe_reviewer_repair_admission_and_grounding():
         "Every other exempt-only target is refused, whichever candidate it is "
         "matched against" in normalized
     )
-    assert "compared by marker identity" in normalized
+    assert "compared by marker identity and occurrence count" in normalized
+    assert "represent the COMPLETE source marker multiset" in normalized
     assert (
         "a target matched to a substantive candidate must therefore retain "
         "substantive content of its own" in normalized

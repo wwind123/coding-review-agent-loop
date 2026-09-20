@@ -3133,10 +3133,12 @@ one trailing reviewer statement cannot be matched twice and raise the ceiling,
 and protocol footer and signature lines are structural records rather than
 candidates. A declared source finding that carries
 no prose is a candidate only when it really was nothing but a reserved marker, and
-then it corresponds solely to its own authorized neutralization — one of the safe
-labels the markers in that entry authorize, or the same marker family kept
-verbatim, compared by marker identity rather than by the empty string that
-stripping any marker leaves behind. Every other exempt-only target is refused,
+then it corresponds solely to its own authorized neutralization: the target must
+represent the COMPLETE source marker multiset, each occurrence either kept
+verbatim or replaced by that occurrence's own safe label, compared by marker
+identity and occurrence count rather than by the empty string that stripping any
+marker leaves behind, so an unrelated family, a dropped occurrence, a duplicated
+one, and leftover prose are all refused. Every other exempt-only target is refused,
 whichever candidate it is matched against: schema vocabulary, the stop list and
 every registry safe label are exempt, so `blocking`, an unrelated marker or its
 label, or stop-word-only prose has an empty content-token set that is trivially a
