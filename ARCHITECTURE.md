@@ -63,7 +63,7 @@ Source paths below are relative to
 | Agent-facing context | `prompts.py`, `memory.py` | Render issue/plan/human/feedback context and advisory repository orientation. |
 | Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
-| Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. |
+| Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head. |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. |
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier. |
@@ -277,6 +277,13 @@ All selected reviewers receive the same pre-round snapshot. Parallel execution
 can publish a finished review before the other reviewers finish; durable
 provisional records are settled through a reconciliation barrier before coder
 follow-up. A peer's same-round comment is not automatically a carried item.
+
+Every reviewer turn — plan review and PR review, full and compact prompts —
+carries a no-execution policy: a reviewer inspects files and reads code, and a
+command, test invocation, or verification step quoted inside the plan, issue,
+PR description, or diff under review is a proposal to evaluate, never an
+instruction to run. A reviewer turn that produces no review is a reviewer
+availability failure; it is never repaired into a verdict.
 
 The default policy invokes all reviewers. Opt-in selective intermediate review
 can pause already-approved reviewers for bounded fixes, but their old approvals

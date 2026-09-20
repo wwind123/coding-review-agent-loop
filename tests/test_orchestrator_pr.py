@@ -3109,16 +3109,21 @@ def test_pr_loop_retries_quota_error(tmp_path):
     sleep_commands = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["sleep"]]
     assert len(sleep_commands) == 1
 
-def test_pr_loop_does_not_retry_normal_missing_marker_response(tmp_path):
+def test_pr_loop_treats_markerless_prose_review_as_unavailable(tmp_path):
+    # Issue #871: prose carrying no recoverable review payload has no verdict for
+    # repair to recover, so the reviewer turn is retried within the bounded
+    # policy and then fails. Repair must never mark up an approval on the
+    # reviewer's behalf, so no verdict comment is ever posted.
     output = "I reviewed the PR and it looks fine."
-    runner = FakeRunner(gemini_outputs=[output])
-    config = make_config(tmp_path, reviewer="gemini")
+    runner = FakeRunner(gemini_outputs=[output] * 3)
+    config = make_config(
+        tmp_path, reviewer="gemini", agent_retry_backoff_seconds=0
+    )
 
-    with pytest.raises(AgentLoopError, match="AGENT_STATE"):
+    with pytest.raises(AgentLoopError, match="review_substance_integrity"):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert runner.comments == []
-    assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
 
 def test_pr_loop_retries_rate_limit_429(tmp_path):
     rate_limit_output = "HTTP 429 Too Many Requests: rate limit exceeded."
@@ -12321,3 +12326,76 @@ def test_staged_secondary_audit_strips_resolved_primary_disposition_under_incomp
     assert gemini_record.metadata.state == "approved"
     assert gemini_record.metadata.dispositions == ()
     assert gemini_record.metadata.new_items == ()
+
+
+# --- Issue #871: a narration-only PR reviewer is unavailable, not blocking ---
+
+_NARRATION_ONLY_PR_REVIEW = (
+    "I have launched the test command in the background and will wait for it "
+    "to complete.\nterminating 1 background task(s) on exit"
+)
+
+
+def _fabricated_pr_review():
+    return structured_pr_review(
+        state="blocking",
+        summary="PR review incomplete: the test command was terminated.",
+        blocking_items=["PR review incomplete: the test command was terminated."],
+        reviewer="OpenAI Codex",
+    )
+
+
+def test_pr_loop_records_narration_only_reviewer_as_unavailable(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[_NARRATION_ONLY_PR_REVIEW] * 4,
+        claude_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="The diff is correct.",
+                reviewer="Anthropic Claude",
+            )
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        coder="gemini",
+        reviewer=("codex", "claude"),
+        max_rounds=1,
+        agent_max_retries=0,
+        agent_retry_backoff_seconds=0,
+    )
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.attempt_repair",
+        lambda raw, gemini_cmd, **kwargs: _fabricated_pr_review(),
+    ):
+        with pytest.raises(AgentLoopError, match="missing required input from Codex"):
+            run_pr_loop(runner, pr_number=77, config=config)
+
+    assert "**Review status: Incomplete**" in runner.comments[-1]
+    assert not any("PR review incomplete" in body for body in runner.comments)
+    # No coder follow-up is started from a synthesized finding, and nothing merges.
+    assert not any(cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands)
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+
+def test_pr_loop_single_narration_only_reviewer_stops_fatally(tmp_path):
+    runner = FakeRunner(codex_outputs=[_NARRATION_ONLY_PR_REVIEW] * 4)
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        reviewer="codex",
+        max_rounds=1,
+        agent_max_retries=0,
+        agent_retry_backoff_seconds=0,
+    )
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.attempt_repair",
+        lambda raw, gemini_cmd, **kwargs: _fabricated_pr_review(),
+    ):
+        with pytest.raises(AgentLoopError, match="review_substance_integrity"):
+            run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any("PR review incomplete" in body for body in runner.comments)
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)

@@ -600,7 +600,10 @@ def test_gemini_pre_marker_429_does_not_suppress_structured_review_repair(tmp_pa
                 "schema_version": 1,
                 "kind": "pr_review",
                 "state": "approved",
-                "summary": "Found one issue.",
+                # Issue #871: preservation now also runs on the legacy repair
+                # hook for reviewer kinds, so the repaired summary must carry
+                # the reviewer's own wording rather than invented text.
+                "summary": "Review passed after repair.",
                 "blocking_items": [],
                 "same_pr_followups": [],
                 "future_followups": [],
@@ -646,9 +649,12 @@ def test_gemini_response_file_repair_ignores_raw_stdout_transient_diagnostics(tm
                 "schema_version": 1,
                 "kind": "pr_review",
                 "state": "approved",
-                "summary": "Found one issue.",
-                "blocking_items": ["Approved reviews cannot have blocking items."],
-                "same_pr_followups": [],
+                # Issue #871: the repaired summary must carry the reviewer's own
+                # wording, and an approved source may not carry a current-scope
+                # finding that repair would have to drop to keep the approval.
+                "summary": "Response file review passed after repair.",
+                "blocking_items": [],
+                "same_pr_followups": "not-a-list",
                 "future_followups": [],
                 "prior_item_dispositions": [],
             }
@@ -1164,7 +1170,12 @@ def test_malformed_structured_review_model_support_terms_still_runs_repair(tmp_p
     )
     repaired_review = structured_pr_review(
         state="approved",
-        summary="Review passed after repair.",
+        # Issue #871: grounded in the source summary above, which repair may
+        # re-envelope but never replace with invented text.
+        summary=(
+            "The review discusses unsupported model and model availability "
+            "diagnostics as domain text."
+        ),
         reviewer="Google Gemini",
     )
     runner = FakeRunner(gemini_outputs=[malformed_review])

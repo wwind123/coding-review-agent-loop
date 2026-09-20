@@ -797,3 +797,374 @@ def test_no_reviewer_ids_become_signed_requirements():
               "evidence": "No signed human requirements were surfaced."}],
             context="coder_followup",
         )
+
+
+# --- Issue #871: reviewer repair grounding ----------------------------------
+
+from coding_review_agent_loop import repair_preservation as _rp
+
+
+def _plan_review(**fields):
+    payload = {"kind": "plan_review", "state": "blocking", "summary": "Findings."}
+    payload.update(fields)
+    return payload
+
+
+def _pr_review(**fields):
+    payload = {"kind": "pr_review", "state": "blocking", "summary": "Findings."}
+    payload.update(fields)
+    return payload
+
+
+def rejects(source, target, match="grounding"):
+    with pytest.raises(AgentLoopError, match=match):
+        check(source, target)
+
+
+def test_unsupported_blocking_finding_is_rejected():
+    source = _plan_review(blocking_plan_issues=["The retry loop never terminates."])
+    rejects(source, _plan_review(blocking_plan_issues=[
+        "The retry loop never terminates.",
+        "Plan review incomplete: the test command was terminated.",
+    ]))
+
+
+def test_unsupported_verdict_without_any_source_finding_is_rejected():
+    source = _plan_review(state="approved", summary="Plan is sound.", blocking_plan_issues=[])
+    rejects(source, _plan_review(
+        state="blocking",
+        summary="Plan is sound.",
+        blocking_plan_issues=["Plan review incomplete: the test command was terminated."],
+    ))
+
+
+def test_synthesized_approval_is_rejected_in_both_directions():
+    rejects(
+        _pr_review(state="blocking", blocking_items=["The pool is never closed."]),
+        _pr_review(state="approved", summary="Findings.", blocking_items=[]),
+    )
+    rejects(
+        _pr_review(state="unknown", summary="Findings."),
+        _pr_review(state="approved", summary="Findings."),
+    )
+
+
+def test_approval_by_demotion_into_the_future_bucket_is_rejected():
+    source = _pr_review(state="approved", blocking_items=["The pool is never closed."])
+    rejects(source, _pr_review(
+        state="approved",
+        blocking_items=[],
+        future_followups=["The pool is never closed."],
+    ))
+
+
+def test_approval_with_an_active_source_disposition_is_rejected():
+    source = _pr_review(
+        state="approved",
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "same-pr", "note": "Open."}],
+    )
+    rejects(source, _pr_review(state="approved", prior_item_dispositions=[]))
+
+
+def test_synthesized_future_followup_is_rejected():
+    source = _plan_review(blocking_plan_issues=["The retry loop never terminates."])
+    rejects(source, _plan_review(
+        blocking_plan_issues=["The retry loop never terminates."],
+        future_followups=["Consider adding a metrics dashboard."],
+    ))
+
+
+def test_repaired_finding_count_may_not_exceed_the_source_total():
+    source = _pr_review(blocking_items=["Fix the leak in the pool handler."])
+    rejects(source, _pr_review(blocking_items=[
+        "Fix the leak in the pool handler.",
+        "Fix the leak in the pool handler.",
+    ]))
+
+
+def test_two_repaired_findings_may_not_share_one_source_finding():
+    source = _pr_review(blocking_items=[
+        "Fix the leak in the pool handler.",
+        "Close the socket on error.",
+    ])
+    rejects(source, _pr_review(blocking_items=[
+        "Fix the leak in the pool handler.",
+        "Fix the leak.",
+    ]))
+
+
+@pytest.mark.parametrize("builder,bucket", [(_plan_review, "blocking_plan_issues"),
+                                            (_pr_review, "blocking_items")])
+def test_deleted_negation_inverts_a_matched_finding(builder, bucket):
+    source = builder(**{bucket: ["This path is not exploitable."]})
+    rejects(source, builder(**{bucket: ["This path is exploitable."]}))
+
+
+@pytest.mark.parametrize("apostrophe", ["'", "’"])
+def test_deleted_contracted_negation_inverts_a_matched_finding(apostrophe):
+    source = _pr_review(blocking_items=[f"This path isn{apostrophe}t exploitable."])
+    rejects(source, _pr_review(blocking_items=["This path is exploitable."]))
+
+
+def test_added_negation_inverts_a_matched_finding():
+    source = _pr_review(blocking_items=["This path is exploitable."])
+    rejects(source, _pr_review(blocking_items=["This path is not exploitable."]))
+
+
+def test_deleted_limiting_qualifier_inverts_a_matched_finding():
+    source = _plan_review(blocking_plan_issues=["The bug reproduces only on the retry path."])
+    rejects(source, _plan_review(
+        blocking_plan_issues=["The bug reproduces on the retry path."]
+    ))
+
+
+def test_in_place_contraction_expansion_keeps_equal_modifier_counts():
+    # The outer lossless check still pins the reviewer's literal wording; the
+    # grounding rule must not additionally read an expansion as an inversion.
+    assert (
+        _rp._modifier_counts("This path isn't exploitable.")
+        == _rp._modifier_counts("This path is not exploitable.")
+    )
+    assert (
+        _rp._modifier_counts("This path is exploitable.")
+        != _rp._modifier_counts("This path is not exploitable.")
+    )
+
+
+def test_documented_title_and_detail_concatenation_is_accepted():
+    detail = "Wire the capability getter; add a two-round test; no mutation on 503."
+    source = _plan_review(blocking_plan_issues=[
+        {"id": "item-1", "title": "Add coverage", "detail": detail},
+    ])
+    check(source, _plan_review(blocking_plan_issues=["Add coverage: " + detail]))
+
+
+def test_schema_supplied_summary_is_accepted():
+    source = _plan_review(
+        summary="",
+        blocking_plan_issues=["The retry loop never terminates."],
+    )
+    check(source, _plan_review(
+        summary="The retry loop never terminates.",
+        blocking_plan_issues=["The retry loop never terminates."],
+    ))
+
+
+def test_marker_neutralization_label_is_accepted():
+    source = _pr_review(
+        blocking_items=["The body embeds <!-- AGENT_LOOP_META: v1_abc --> verbatim."]
+    )
+    check(source, _pr_review(
+        blocking_items=["The body embeds [protocol LOOP_META record] verbatim."]
+    ))
+
+
+def test_worked_example_12_promotion_to_blocking_is_accepted():
+    source = _plan_review(
+        state="approved",
+        summary="Plan is sound.",
+        future_followups=["The migration must run before the backfill."],
+    )
+    check(source, _plan_review(
+        state="blocking",
+        summary="Plan is sound.",
+        blocking_plan_issues=["The migration must run before the backfill."],
+        future_followups=[],
+    ))
+
+
+def test_promotion_from_an_active_disposition_is_accepted():
+    source = _pr_review(
+        state="approved",
+        summary="Findings.",
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "same-pr", "note": "Still open."},
+        ],
+    )
+    check(source, _pr_review(
+        state="blocking",
+        summary="Findings.",
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "same-pr", "note": "Still open."},
+        ],
+    ))
+
+
+def test_absent_source_payload_fails_closed_for_a_reviewer_target():
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            "I launched the test command in the background and will wait.",
+            json.dumps(_plan_review(blocking_plan_issues=["Plan review incomplete."])),
+        )
+
+
+def test_wrong_kind_source_is_rejected_instead_of_returning_early():
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            json.dumps({"kind": "coder_followup", "summary": "Done."}),
+            json.dumps(_pr_review(blocking_items=["Fix the leak."])),
+        )
+
+
+def test_synthesized_carried_disposition_is_rejected():
+    source = _pr_review(blocking_items=["Fix the leak."], prior_item_dispositions=[])
+    rejects(source, _pr_review(
+        blocking_items=["Fix the leak."],
+        prior_item_dispositions=[{"item_id": "item-4", "disposition": "resolved"}],
+    ))
+
+
+def test_changed_disposition_value_is_rejected():
+    source = _plan_review(prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "blocking", "note": "The retry loop is open."},
+    ])
+    rejects(source, _plan_review(prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "resolved", "note": "The retry loop is open."},
+    ]))
+
+
+@pytest.mark.parametrize("note", [
+    "This is still open in the revised plan.",
+    "This is not already covered by the revised plan.",
+    "not handled by the current plan",
+])
+def test_unjustified_resolution_is_rejected(note):
+    source = _plan_review(prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "blocking", "note": note},
+    ])
+    rejects(source, _plan_review(prior_plan_item_dispositions=[
+        {"item_id": "item-1", "disposition": "resolved", "note": note},
+    ]))
+
+
+def test_context_completed_id_written_as_resolved_is_rejected():
+    source = _pr_review(blocking_items=["Fix the leak."], prior_item_dispositions=[])
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            json.dumps(source),
+            json.dumps(_pr_review(
+                blocking_items=["Fix the leak."],
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            )),
+            allowed_prior_item_ids=("item-2",),
+        )
+
+
+def test_context_completed_id_as_active_disposition_is_accepted():
+    source = _pr_review(blocking_items=["Fix the leak."], prior_item_dispositions=[])
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(_pr_review(
+            blocking_items=["Fix the leak."],
+            prior_item_dispositions=[{"item_id": "item-2", "disposition": "blocking"}],
+        )),
+        allowed_prior_item_ids=("item-2",),
+    )
+
+
+def test_disposition_note_dropping_a_modifier_is_rejected():
+    source = _pr_review(prior_item_dispositions=[
+        {"item_id": "item-1", "disposition": "same-pr", "note": "Only the retry path is affected."},
+    ])
+    rejects(source, _pr_review(prior_item_dispositions=[
+        {"item_id": "item-1", "disposition": "same-pr", "note": "The retry path is affected."},
+    ]))
+
+
+def test_authorized_disposition_normalizations_are_accepted():
+    # Enum alias normalization plus a justified active-to-resolved change.
+    source = _plan_review(
+        state="blocking",
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "still blocking", "note": "The retry loop is open."},
+            {"item_id": "item-2", "disposition": "same-plan",
+             "note": "The revised plan already covers this."},
+            {"item_id": "item-3", "disposition": "future", "note": "Deferred work."},
+        ],
+    )
+    check(source, _plan_review(
+        state="blocking",
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "The retry loop is open."},
+            {"item_id": "item-2", "disposition": "resolved",
+             "note": "The revised plan already covers this."},
+            {"item_id": "item-3", "disposition": "blocking", "note": "Deferred work."},
+        ],
+    ))
+
+
+def test_deterministic_unknown_id_removal_stays_allowed():
+    source = _pr_review(prior_item_dispositions=[
+        {"item_id": "item-9", "disposition": "resolved", "note": "Unknown carried ID."},
+    ])
+    check(source, _pr_review(prior_item_dispositions=[]))
+
+
+def test_pinned_grounding_vocabulary_cannot_drift():
+    assert _rp.GROUNDING_STOP_WORDS == frozenset({
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+        "has", "have", "in", "into", "is", "it", "its", "no", "not", "of", "on",
+        "or", "that", "the", "their", "this", "to", "was", "were", "will", "with",
+    })
+    assert _rp.CONTRACTION_NORMALIZATIONS == (
+        ("can't", "cannot"),
+        ("cannot", "cannot"),
+        ("won't", "will not"),
+        ("shan't", "shall not"),
+    )
+    assert _rp.SEMANTIC_MODIFIERS == frozenset({
+        "no", "not", "never", "none", "neither", "nor", "cannot", "without",
+        "unless", "except", "only", "always", "must", "should", "may", "optional",
+        "required", "all", "any", "every", "some", "most", "least", "more", "less",
+        "fewer", "before", "after", "until",
+    })
+    assert _rp.COVERAGE_PHRASES == (
+        "already covered",
+        "is covered by",
+        "covers this",
+        "addressed by the current plan",
+        "addressed by the current pr",
+        "handled by the current plan",
+        "handled by the current pr",
+    )
+    assert _rp.NEGATION_MARKERS == (
+        "not", "never", "nor", "cannot", "without", "fails to", "yet to be",
+        "rather than",
+    )
+    # The still-open list is generated from the coverage list, so every coverage
+    # phrase automatically carries its single-word negated counterparts.
+    assert _rp.STILL_OPEN_PHRASES == frozenset({
+        "still open", "still missing", "still blocking", "remains open",
+        "remains unresolved",
+    }) | {
+        f"{marker} {phrase}"
+        for marker in _rp.NEGATION_MARKERS if " " not in marker
+        for phrase in _rp.COVERAGE_PHRASES
+    }
+    assert _rp.REVIEW_KIND_UNIQUE_FIELDS == {
+        "plan_review": frozenset({
+            "blocking_plan_issues", "same_plan_followups", "prior_plan_item_dispositions",
+        }),
+        "pr_review": frozenset({
+            "blocking_items", "same_pr_followups", "prior_item_dispositions",
+        }),
+    }
+    # Derived exempt sets stay tied to their single source of truth.
+    assert "blocking_plan_issues" in _rp.REVIEW_SCHEMA_VOCABULARY
+    assert {"protocol", "record"} <= _rp.NEUTRALIZATION_LABEL_TOKENS
+    from coding_review_agent_loop.protocol_markers import RESERVED_MARKER_REGISTRY
+    expected_labels = set()
+    for definition in RESERVED_MARKER_REGISTRY:
+        expected_labels.update(
+            token for token in definition.safe_label.casefold().replace("[", " ")
+            .replace("]", " ").replace("_", " ").replace("-", " ").split() if token
+        )
+    assert expected_labels <= _rp.NEUTRALIZATION_LABEL_TOKENS
+
+
+def test_coverage_predicate_is_negation_safe():
+    assert _rp.coverage_predicate("The revised plan already covers this.")
+    assert not _rp.coverage_predicate("This is not already covered by the revised plan.")
+    assert not _rp.coverage_predicate("not handled by the current plan")
+    assert not _rp.coverage_predicate("This isn't already covered.")
+    assert not _rp.coverage_predicate("The plan already covers this, but it is still open.")

@@ -3078,6 +3078,65 @@ original response. If the repair CLI fails, returns empty output, or produces
 invalid output, the original validation failure remains local and nothing is
 posted to GitHub.
 
+Reviewer repair is refused before any backend call when the source carries no
+review substance. A `plan_review` or `pr_review` source is admitted only when a
+JSON object is mechanically recoverable from it and that object either declares
+the expected reviewer kind or, when it carries no `kind`, carries a field unique
+to that review schema (`blocking_plan_issues`, `same_plan_followups`, or
+`prior_plan_item_dispositions` for a plan review; `blocking_items`,
+`same_pr_followups`, or `prior_item_dispositions` for a PR review). Fields shared
+with other schemas — `summary`, `state`, `schema_version`, `future_followups`,
+`human_requirement_dispositions`, `architecture_impact` — are never admission
+evidence, so narration, tool-use diagnostics, a bare protocol state footer, an
+explicitly different kind, and a kindless object carrying only a generic state
+and summary are all refused. A refusal is classified as a reviewer
+unavailability (`agent-unavailable`) with a bounded retry inside the configured
+retry policy, never as a deterministic blocking verdict: no reviewer comment is
+posted and no carried ledger item is numbered for that reviewer. An empty
+reviewer response keeps its existing `empty-response` path and never reaches
+repair, and a transient repair-backend provider failure keeps its resumable
+`repair-provider-failure` classification. A reviewer output whose own
+diagnostics already name a definitive provider condition — an auth, billing, or
+credit failure, an unsupported model or effort, an exhausted resource, or an
+indeterminate containment result — keeps that classification and its operator
+suggestion: refusing to repair such a turn says nothing about reviewer
+availability, and a rerun cannot fix it.
+
+Whenever a repaired response's own kind is `plan_review` or `pr_review`, a
+grounding check requires every repaired finding, summary, and carried
+disposition to be supported by the reviewer's own source text; it fails closed
+when the source payload is absent or declares a different kind. Support is token
+coverage — not contiguous containment, so the documented title-plus-detail
+concatenation stays legal — of the candidate against the whole normalized
+source, after removing four exempt sets: a pinned closed stop list, the review
+schema's own vocabulary, carried `item-<n>` identifiers, and the reserved-marker
+neutralization labels derived from the marker registry. Findings in all three
+buckets are matched injectively to source findings from any bucket, so a
+promotion out of `future_followups` remains legal while the repaired finding
+count may never exceed the source's. Each matched finding pair, and each matched
+disposition note pair, must carry equal per-modifier occurrence counts over a
+pinned set of negations and limiting qualifiers, compared after a pinned
+contraction normalization that runs before punctuation stripping over both
+apostrophe forms — so deleting, adding, or substituting `not`, `isn't`, or
+`only` is rejected even though subset coverage alone would accept it. The
+verdict is grounded against the source rather than against what survives into
+the target: a repaired `blocking` needs an unambiguous source blocking state, a
+preserved source finding, or an active carried disposition; a repaired
+`approved` needs an unambiguous approved source state *and* a source that itself
+carries no current-scope finding and no active disposition, so demoting a
+current-scope finding into `future_followups` can never manufacture an approval.
+Carried dispositions are matched by `item_id`, and only bounded normalizations
+are authorized: the repair prompt's own enum aliases (`still blocking` →
+`blocking` and its siblings); an active-to-`resolved` change only when the
+source note satisfies a negation-safe coverage predicate (a pinned coverage
+phrase that no pinned negation marker precedes inside its own sentence, with the
+still-open phrase list generated from the coverage list so every phrase carries
+its negated counterparts); re-stating a source `future` disposition as the
+kind's non-resolving active value in a blocking review; and completing an ID
+supplied in the repair context as that same non-resolving active value.
+Deterministic removal of unknown IDs is unaffected. The check is a bounded
+support check, not a certification that a genuine reviewer finding is correct.
+
 Repair is lossless formatting, not summarization: findings must retain their full
 evidence, code references, and requested tests; summaries and test reports must
 retain failures, timeouts, skips, and partial-coverage caveats. Object-to-string

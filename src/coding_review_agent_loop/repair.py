@@ -27,7 +27,12 @@ from .config import (
 )
 from .logging import agent_log_path
 from .runner import strip_ansi
-from .repair_preservation import validate_repair_preservation
+from .repair_preservation import (
+    REVIEW_KINDS,
+    REVIEW_KIND_UNIQUE_FIELDS,
+    recover_payload,
+    validate_repair_preservation,
+)
 from .protocol_markers import scan_reserved_markers
 from .usage import RunUsageContext, estimate_usage
 from .protocol import (
@@ -47,7 +52,7 @@ from .protocol import (
     semantic_risk_claim_example_json,
     semantic_risk_claim_schema_text,
 )
-from .errors import FreshContractIntegrityError
+from .errors import FreshContractIntegrityError, ReviewSubstanceIntegrityError
 
 _logger = logging.getLogger(__name__)
 
@@ -1297,6 +1302,7 @@ RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
     "transient_provider_error", "fresh_contract_integrity", "semantic_patch_integrity",
+    "review_substance_integrity",
 ]
 
 
@@ -1551,6 +1557,40 @@ def _issue_implementation_instruction(
         + " A positive PR with a blocked disposition remains a terminal conflict after repair; "
         "do not relabel or silently remove that blocker.\n"
     )
+
+
+def require_recoverable_review_substance(raw: str, *, expected_kind: str) -> None:
+    """Refuse reviewer repair when the source carries no review substance.
+
+    Repair is documented as lossless format recovery.  Narration, tool-use
+    diagnostics, and a bare protocol state footer carry no verdict and no
+    finding, so a repair model asked to "fix" them can only invent a review.
+    Admit a reviewer source only when a JSON object is mechanically
+    recoverable AND it either declares the expected kind or carries a field
+    unique to that review schema.
+    """
+    if expected_kind not in REVIEW_KINDS:
+        return
+    payload = recover_payload(raw)
+    if not isinstance(payload, dict):
+        raise ReviewSubstanceIntegrityError(
+            f"Reviewer repair refused: the `{expected_kind}` source carries no "
+            "mechanically recoverable review payload, only narration or diagnostics."
+        )
+    kind = payload.get("kind")
+    if isinstance(kind, str) and kind.strip():
+        if kind != expected_kind:
+            raise ReviewSubstanceIntegrityError(
+                f"Reviewer repair refused: the source declares kind `{kind}`, not the "
+                f"expected `{expected_kind}`."
+            )
+        return
+    if not (REVIEW_KIND_UNIQUE_FIELDS[expected_kind] & set(payload)):
+        raise ReviewSubstanceIntegrityError(
+            f"Reviewer repair refused: the kindless source carries no field unique to "
+            f"the `{expected_kind}` schema; a generic state and summary are not review "
+            "substance."
+        )
 
 
 def require_recoverable_fresh_execution_contract(raw: str, *, expected_kind: str) -> None:
@@ -1831,6 +1871,7 @@ def execute_repair(
                         unresolved_item_ids=prompt_kwargs.get("unresolved_item_ids"),
                         surfaced_requirement_ids=prompt_kwargs.get("surfaced_requirement_ids"),
                         reviewer_requirement_ids=prompt_kwargs.get("reviewer_requirement_ids"),
+                        allowed_prior_item_ids=prompt_kwargs.get("allowed_prior_item_ids"),
                         allow_legacy_matrix_removal=bool(
                             prompt_kwargs.get("reject_unsolicited_risk_test_matrix_contract")
                         ),
@@ -2116,6 +2157,7 @@ def attempt_repair(
                 unresolved_item_ids=unresolved_item_ids,
                 surfaced_requirement_ids=surfaced_requirement_ids,
                 reviewer_requirement_ids=reviewer_requirement_ids,
+                allowed_prior_item_ids=allowed_prior_item_ids,
                 allow_legacy_matrix_removal=reject_unsolicited_risk_test_matrix_contract,
             )
         except Exception as exc:

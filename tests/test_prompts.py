@@ -4054,3 +4054,55 @@ def test_selector_guidance_forbids_command_strings_in_coder_and_correction_promp
         assert semantic_risk_claim_example_json() in text, name
     correction = " ".join(surfaces["correction"].split())
     assert "Command strings and handles outside this catalog are dropped" in correction
+
+
+# --- Issue #871: every reviewer turn carries the no-execution policy ---------
+
+import json as _json
+from pathlib import Path
+
+from coding_review_agent_loop.prompts import QUOTED_COMMAND_REVIEW_RULE
+
+
+def test_every_reviewer_prompt_builder_carries_the_no_execution_policy(tmp_path):
+    config = make_config(tmp_path, reviewer="codex")
+    prompts = {
+        "plan_review": build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex"),
+        "plan_review_compact": build_plan_review_prompt(
+            56, 1, "Plan.", config, reviewer="codex", compact_context=True
+        ),
+        "pr_review": build_review_prompt(77, 1, config, reviewer="codex"),
+        "pr_review_compact": build_review_prompt(
+            77, 1, config, reviewer="codex", compact_context=True
+        ),
+    }
+    for label, prompt in prompts.items():
+        assert "Do not run tests, builds, compilation" in prompt, label
+        assert QUOTED_COMMAND_REVIEW_RULE in prompt, label
+
+
+def test_antigravity_reviewer_marker_instruction_asks_for_inspection_only():
+    from coding_review_agent_loop.agents.antigravity import (
+        _REVIEWER_QUOTED_COMMAND_RULE,
+        _with_public_response_marker_instruction,
+    )
+
+    reviewer = _with_public_response_marker_instruction("BASE", role="reviewer")
+    assert "Run any verification steps" not in reviewer
+    assert "do not run tests, builds, or any background work" in reviewer
+    assert _REVIEWER_QUOTED_COMMAND_RULE in reviewer
+
+    for role in (None, "coder", "planner"):
+        other = _with_public_response_marker_instruction("BASE", role=role)
+        assert "Run any verification steps" in other
+        assert _REVIEWER_QUOTED_COMMAND_RULE not in other
+
+
+def test_antigravity_single_shot_reviewer_instruction_covers_quoted_commands(tmp_path):
+    import coding_review_agent_loop.agents.antigravity as agy
+
+    instruction = agy.single_shot_session_instruction("main")
+    assert agy._REVIEWER_QUOTED_COMMAND_RULE in instruction
+    assert "DO NOT run tests" in instruction
+    # The reviewer tool-permission allow-list is unchanged by this rule.
+    assert "command(git diff)" in _json.dumps(agy._REVIEWER_SETTINGS_INJECTION)

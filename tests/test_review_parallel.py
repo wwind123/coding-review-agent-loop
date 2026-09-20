@@ -18,6 +18,7 @@ from coding_review_agent_loop.runner import CommandResult
 from agent_loop_helpers import (
     FakeRunner,
     make_config,
+    malformed_plan_review_source,
     structured_coder_followup,
     structured_plan_review,
     structured_plan_revision,
@@ -1251,7 +1252,9 @@ def test_pr_loop_parallel_rejects_shared_reviewer_workdirs_with_workdirs_ready_h
 # ---------------------------------------------------------------------------
 
 def test_plan_first_parallel_repair_isolated_between_reviewers(tmp_path):
-    malformed_codex = "Plan looks fine but this response is missing the state marker."
+    # A repairable source must carry the reviewer's own verdict; narration alone
+    # is refused before any repair backend call (#871).
+    malformed_codex = malformed_plan_review_source(summary="Codex approves after repair.")
     repaired_codex = structured_plan_review(summary="Codex approves after repair.")
     gemini_ok = structured_plan_review(summary="Gemini approves the plan.", reviewer="Google Gemini")
 
@@ -1401,3 +1404,46 @@ def test_primary_then_panel_parallel_panel_failure_keeps_healthy_result_and_bloc
     assert any("Google Gemini review" in comment for comment in runner.comments)
     assert not any(command[:1] == ["claude"] for command, _cwd in runner.commands)
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+# --- Issue #871: a narration-only reviewer never blocks the healthy one ------
+
+_NARRATION_ONLY_REVIEW = (
+    "I have launched the test command in the background and will wait for it "
+    "to complete.\nterminating 1 background task(s) on exit"
+)
+
+
+def test_parallel_plan_review_settles_healthy_reviewer_when_peer_returns_narration(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[_initial_plan()],
+        codex_outputs=[_NARRATION_ONLY_REVIEW] * 4,
+        gemini_outputs=[
+            structured_plan_review(
+                summary="Gemini plan review complete.", reviewer="Google Gemini"
+            )
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        review_parallel=True,
+        agent_max_retries=0,
+        agent_retry_backoff_seconds=0,
+    )
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.attempt_repair",
+        lambda raw, gemini_cmd, **kwargs: structured_plan_review(
+            state="blocking",
+            summary="Plan review incomplete: the test command was terminated.",
+            blocking_plan_issues=["Plan review incomplete: the test command was terminated."],
+        ),
+    ):
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    # The healthy reviewer's settled turn is kept.
+    assert any("Gemini plan review complete." in comment for comment in runner.comments)
+    # No publication checkpoint or fabricated verdict for the refused reviewer.
+    assert not any("Plan review incomplete" in comment for comment in runner.comments)

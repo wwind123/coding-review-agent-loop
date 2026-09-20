@@ -85,6 +85,7 @@ from .errors import (
     HumanDecisionRequiredError,
     IssueImplementationConflictError,
     QuotaResetExceededError,
+    ReviewSubstanceIntegrityError,
     UnknownPriorItemDispositionError,
 )
 from .expected_closure import (
@@ -328,6 +329,7 @@ from .repair import (
     unknown_dispositions_are_resolved_history,
     require_recoverable_fresh_execution_contract,
     require_recoverable_fresh_risk_test_matrix_contract,
+    require_recoverable_review_substance,
 )
 from .repair_preservation import (
     require_recoverable_semantic_patch,
@@ -773,6 +775,21 @@ PR_FOLLOWUP_SALVAGE_SCOPE = "pr-followup"
 # Threshold above which a rate-limit reset time causes an immediate exit
 # rather than a silent wait (5 minutes).
 LONG_RESET_THRESHOLD_SECONDS = 300
+
+# Failure categories that already name a definitive provider, credential, or
+# host condition extracted from the agent's own diagnostics. A review-substance
+# repair refusal (#871) must never reclassify one of these into a retryable
+# reviewer unavailability: the reviewer turn failed for a reason a rerun cannot
+# fix, and the operator needs the original suggestion.
+_PROVIDER_DEFINITIVE_FAILURE_CATEGORIES = frozenset(
+    {
+        "non-retryable",
+        "unsupported_model",
+        "unsupported_effort",
+        "resource-exhausted",
+        "containment-indeterminate",
+    }
+)
 
 # Subset of TRANSIENT_AGENT_OUTPUT_RE patterns that specifically signal quota / rate-limit errors
 # and where a reset time might be present in the error text.
@@ -2353,6 +2370,26 @@ def _run_structured_repair(
                     fallback_planned=False,
                 )
             ]
+    review_expected_kind = repair_kwargs.get("expected_kind")
+    if review_expected_kind in {"plan_review", "pr_review"}:
+        try:
+            require_recoverable_review_substance(raw, expected_kind=review_expected_kind)
+        except ReviewSubstanceIntegrityError as exc:
+            # No configuration may bypass this: a reviewer turn with no review
+            # substance has no verdict for repair to recover.
+            return None, None, [
+                RepairAttemptResult(
+                    backend="none",
+                    model="review-substance-integrity",
+                    prompt="",
+                    output=raw,
+                    returncode=None,
+                    outcome="review_substance_integrity",
+                    diagnostic=str(exc),
+                    log_path=None,
+                    fallback_planned=False,
+                )
+            ]
     if repair_kwargs.get("require_execution_strategy_contract"):
         expected_kind = repair_kwargs.get("expected_kind")
         if isinstance(expected_kind, str):
@@ -2420,8 +2457,14 @@ def _run_structured_repair(
         if repaired is None:
             return None, None, []
         try:
-            if repair_kwargs.get("expected_kind") == "plan_revision_patch":
-                validate_repair_preservation(raw, repaired)
+            if repair_kwargs.get("expected_kind") in {
+                "plan_revision_patch", "plan_review", "pr_review",
+            }:
+                validate_repair_preservation(
+                    raw,
+                    repaired,
+                    allowed_prior_item_ids=repair_kwargs.get("allowed_prior_item_ids"),
+                )
             parsed = validate(repaired)
         except AgentLoopError as exc:
             return repaired, None, [
@@ -3890,6 +3933,31 @@ def _run_validated_agent(
                             if terminal_repair.integrity_contract == "execution_recommendation"
                             else "fresh planning risk-test-matrix contract is not mechanically recoverable"
                         )
+                    elif (
+                        terminal_repair is not None
+                        and terminal_repair.outcome == "review_substance_integrity"
+                    ):
+                        # The reviewer's own turn produced no review, usually
+                        # because its tooling cut the turn short. That is a
+                        # reviewer availability failure, not a verdict: retry
+                        # within the configured policy and never let repair
+                        # synthesize a blocking item on the reviewer's behalf.
+                        plan_validation_exhaustion = None
+                        plan_validation_capture_eligible = False
+                        if (
+                            last_failure_category
+                            not in _PROVIDER_DEFINITIVE_FAILURE_CATEGORIES
+                        ):
+                            # A provider/credential diagnostic the reviewer's own
+                            # output already named stays authoritative: refusing
+                            # its repair says nothing about availability, and a
+                            # rerun cannot fix an auth or billing failure.
+                            should_retry = True
+                            last_failure_category = "agent-unavailable"
+                            last_classification_text = (
+                                "reviewer response carried no recoverable review substance; "
+                                "repair refused"
+                            )
                     elif (
                         terminal_repair is not None
                         and terminal_repair.outcome == "semantic_patch_integrity"

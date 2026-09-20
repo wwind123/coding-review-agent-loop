@@ -414,3 +414,28 @@ def test_architecture_records_label_and_read_back_invariants():
     assert "shared write read-back verifier" in text
     assert "historical bare-marker body" in text
     assert "producing login and ID" in text
+
+
+def test_docs_describe_reviewer_repair_admission_and_grounding():
+    """Issue #871: the canonical documents name the refusal boundary."""
+    doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    for fragment in (
+        "Reviewer repair is refused before any backend call",
+        "field unique",
+        "bare protocol state footer",
+        "agent-unavailable",
+        "empty-response",
+        "grounding check",
+        "Support is token\ncoverage",
+        "matched injectively",
+        "per-modifier occurrence counts",
+        "contraction normalization",
+        "negation-safe coverage predicate",
+        "manufacture an approval",
+    ):
+        assert fragment in doc, fragment
+
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    assert "Reviewer repair is refused fail-closed" in architecture
+    assert "a refusal is a reviewer unavailability, never a synthesized verdict" in architecture
+    assert "proposal to evaluate, never an" in architecture
