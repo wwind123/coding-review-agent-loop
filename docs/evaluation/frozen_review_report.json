@@ -1,13 +1,16 @@
 {
-  "artifact_sha256": "9efc4ab9a558c943e8f1d0c4da24743895e4c43df246fcdc18c4cfb4bc326f3c",
+  "artifact_sha256": "e128065a580570acfc8a5e0156c9a696cb7719cec509936414a2a52b6eaca7bc",
   "flows": {
     "plan": {
       "policies": {
         "all-reviewers": {
           "marginal_findings_beyond_primary": {
-            "reason": "no run for this policy declares a primary reviewer",
-            "status": "not-applicable",
-            "value": null
+            "status": "verified",
+            "value": {
+              "Anthropic Claude": [
+                "historical-plan-all-001:plan-untested-fallback"
+              ]
+            }
           },
           "metrics": {
             "calls_avoided": {
@@ -60,15 +63,16 @@
             }
           },
           "primary_to_panel_approval_regressions": {
-            "reason": "no run for this policy declares a primary reviewer",
-            "status": "not-applicable",
+            "reason": "approval-round measurement absent for runs: historical-plan-all-001",
+            "status": "unavailable",
             "value": null
           },
           "run_count": 1,
           "severity_weighted_marginal_findings": {
-            "reason": "no run for this policy declares a primary reviewer",
-            "status": "not-applicable",
-            "value": null
+            "status": "verified",
+            "value": {
+              "Anthropic Claude": 3
+            }
           },
           "status": "verified",
           "valid_unique_findings": {

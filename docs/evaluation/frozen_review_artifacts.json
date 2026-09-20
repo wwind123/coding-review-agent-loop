@@ -149,6 +149,7 @@
       "run_id": "historical-plan-all-001",
       "flow": "plan",
       "policy": "all-reviewers",
+      "primary_reviewer": "OpenAI Codex",
       "findings": [
         {
           "id": "plan-missing-migration-step",

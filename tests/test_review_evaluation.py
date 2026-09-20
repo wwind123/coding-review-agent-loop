@@ -449,12 +449,28 @@ def test_checked_in_fixture_report_is_reproducible_and_cli_never_touches_github(
     # Escaped plan defects were never measured for the staged run; the row says
     # so instead of borrowing the full-board figure.
     assert plan["primary-then-panel"]["metrics"]["escaped_defects"]["status"] == "unavailable"
-    assert plan["primary-then-panel"]["severity_weighted_marginal_findings"] == {
-        "status": "verified", "value": {"Anthropic Claude": 3},
+    # Reviewer overlap and severity-weighted marginal findings are reported for
+    # both planning policies, so staged planning can be compared against the
+    # full-board baseline rather than against a not-applicable row.
+    for policy in PLAN_POLICIES:
+        assert plan[policy]["marginal_findings_beyond_primary"]["status"] == "verified"
+        assert plan[policy]["severity_weighted_marginal_findings"] == {
+            "status": "verified", "value": {"Anthropic Claude": 3},
+        }
+    assert plan["all-reviewers"]["marginal_findings_beyond_primary"]["value"] == {
+        "Anthropic Claude": ["historical-plan-all-001:plan-untested-fallback"],
+    }
+    assert plan["primary-then-panel"]["marginal_findings_beyond_primary"]["value"] == {
+        "Anthropic Claude": ["historical-plan-primary-panel-001:plan-untested-fallback"],
     }
     assert plan["primary-then-panel"]["primary_to_panel_approval_regressions"] == {
         "value": [1], "status": "verified",
     }
+    # The full-board planning run has no primary-to-panel transition to
+    # measure, so that row is unavailable naming the run rather than estimated.
+    regressions = plan["all-reviewers"]["primary_to_panel_approval_regressions"]
+    assert regressions["status"] == "unavailable"
+    assert "historical-plan-all-001" in regressions["reason"]
 
     output = tmp_path / "report.json"
     assert cli_main(["review-evaluation", str(FIXTURE_ARTIFACTS), "--output", str(output)]) == 0
@@ -593,14 +609,27 @@ def test_direct_evaluation_rejects_a_malformed_flow_instead_of_dropping_or_defau
         evaluate_frozen_artifacts({"schema_version": 1, "runs": [run]})
 
 
-def test_direct_evaluation_defaults_only_an_absent_or_null_flow_to_pr():
+def test_only_an_absent_flow_key_defaults_to_pr_and_an_explicit_null_is_rejected(tmp_path):
+    # The compatibility exception covers legacy PR artifacts that carry no
+    # flow key at all. An explicit null is a labeled run missing its label, so
+    # assigning it to pr could let a planning run contaminate the PR rows.
     absent = _run(run_id="absent-flow")
     assert "flow" not in absent
-    explicit_null = _run(run_id="null-flow", flow=None)
-    report = evaluate_frozen_artifacts({"schema_version": 1, "runs": [absent, explicit_null]})
-    assert report["flows"]["pr"]["run_count"] == 2
+    report = evaluate_frozen_artifacts({"schema_version": 1, "runs": [absent]})
+    assert report["flows"]["pr"]["run_count"] == 1
     assert report["flows"]["plan"]["run_count"] == 0
-    assert report["flows"]["pr"]["policies"]["primary-then-panel"]["run_count"] == 2
+    assert report["flows"]["pr"]["policies"]["primary-then-panel"]["run_count"] == 1
+    assert load_frozen_artifacts(_write(tmp_path, [absent]))["runs"][0]["flow"] == "pr"
+
+    explicit_null = _run(run_id="null-flow", flow=None)
+    for artifacts in (
+        {"schema_version": 1, "runs": [explicit_null]},
+        {"schema_version": 1, "runs": [_run(), explicit_null]},
+    ):
+        with pytest.raises(AgentLoopError, match="explicit null flow"):
+            evaluate_frozen_artifacts(artifacts)
+    with pytest.raises(AgentLoopError, match="explicit null flow"):
+        load_frozen_artifacts(_write(tmp_path, [explicit_null], "null.json"))
 
 
 def test_direct_evaluation_normalizes_flow_case_and_surrounding_space():

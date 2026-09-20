@@ -389,7 +389,8 @@ keep the full board by configuration reset. See
 Frozen policy evaluation is a local read-only boundary. `review-evaluation`
 validates artifacts and deterministically reports severity-weighted marginal
 coverage and process/cost/CI outcomes per flow: each run carries a validated
-`flow` (`pr` or `plan`, defaulting to `pr` so PR-only artifacts keep loading),
+`flow` (`pr` or `plan`; only an absent key defaults to `pr`, so PR-only
+artifacts keep loading while an explicit null is rejected),
 run identity is unique per `(flow, policy, run_id)`, and aggregation and report
 titling are per flow, so PR and planning runs that share a policy name are
 never pooled. Every measurement

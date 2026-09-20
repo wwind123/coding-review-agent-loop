@@ -1519,9 +1519,11 @@ by run, so identical IDs across runs never collide; two records with the same
 `flow`, `policy`, and `run_id` are rejected so distinct findings can never be
 collapsed into one.
 
-`flow` is `pr` or `plan` and defaults to `pr` when omitted, so PR-only
-artifacts written before the flow dimension keep loading unchanged and produce
-byte-identical PR rows. Run identity is unique per `(flow, policy, run_id)`,
+`flow` is `pr` or `plan` and defaults to `pr` only when the key is absent, so
+PR-only artifacts written before the flow dimension keep loading unchanged and
+produce byte-identical PR rows. An explicitly present `"flow": null` is a
+labeled run whose label is missing, not a legacy record, and is rejected rather
+than assigned to the PR rows. Run identity is unique per `(flow, policy, run_id)`,
 and aggregation and report titling are per flow. The text report prints a
 section titled `Frozen PR review policy evaluation` and one titled
 `Frozen plan review policy evaluation`, and the JSON report carries
@@ -1533,7 +1535,10 @@ latency, reviewer overlap, findings, and escaped plan defects out of the PR
 rows and the reverse. `selective-intermediate` is PR-only and is rejected on a
 planning run rather than producing an always-empty planning row. Marginal-beyond-primary rows are `not-applicable` for policies whose
 runs declare no primary; a historical full-board run may declare a hypothetical
-`primary_reviewer` to measure what the other reviewers would have added. Runs
+`primary_reviewer` to measure what the other reviewers would have added; the
+frozen full-board planning run does exactly that, so reviewer overlap and
+severity-weighted marginal findings are comparable across both planning
+policies. Runs
 using `primary-then-panel` must declare their primary. Primary-to-panel
 approval regressions are a whole-policy measurement: if any primary-bearing run
 lacks either approval-round endpoint or verified run provenance, the row is
@@ -1742,8 +1747,9 @@ now available: `review-evaluation` carries a `flow` dimension, and
 planning runs whose calls, tokens, latency, reviewer overlap, unique and
 severity-weighted marginal findings, and escaped plan defects are reported in
 the `plan` flow, separately from the PR rows. A measurement the frozen run
-never recorded, such as escaped plan defects on the staged run, is reported as
-`unavailable` with a reason rather than borrowed from the full-board run, so
+never recorded, such as escaped plan defects on the staged run or the
+full-board run's absent primary-to-panel transition, is reported as
+`unavailable` with a reason rather than borrowed from the other run, so
 changing the default still needs runs whose provenance covers the measurement
 the decision rests on.
 

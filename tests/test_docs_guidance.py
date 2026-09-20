@@ -557,11 +557,12 @@ def test_docs_document_the_flow_aware_planning_policy_evaluation():
 
     # The flow dimension, its backward-compatible default, and per-flow
     # uniqueness, aggregation, and titling.
-    assert "`flow` is `pr` or `plan` and defaults to `pr` when omitted" in text
+    assert "`flow` is `pr` or `plan` and defaults to `pr` only when the key is absent" in text
+    assert "is rejected rather\nthan assigned to the PR rows" in text
     assert "`(flow, policy, run_id)`" in text
     assert "Frozen plan review policy evaluation" in text
     assert "`selective-intermediate` is PR-only" in text
-    assert "validated\n`flow` (`pr` or `plan`, defaulting to `pr`" in architecture
+    assert "validated\n`flow` (`pr` or `plan`; only an absent key defaults to `pr`" in architecture
     assert "`(flow, policy, run_id)`" in architecture
     # The stale "no flow dimension today" caveat is replaced by the comparison
     # the planning rows now support, with its provenance limit stated.

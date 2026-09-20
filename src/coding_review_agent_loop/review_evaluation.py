@@ -32,6 +32,9 @@ PLAN_POLICIES = ("all-reviewers", "primary-then-panel")
 # is a PR-only policy and is rejected on a planning run rather than silently
 # producing an always-empty planning row.
 FLOW_POLICIES: dict[str, tuple[str, ...]] = {"pr": POLICIES, "plan": PLAN_POLICIES}
+# Sentinel distinguishing an absent ``flow`` key, which defaults for legacy
+# PR-only artifacts, from an explicitly present null value, which does not.
+_ABSENT = object()
 FLOW_TITLES = {
     "pr": "Frozen PR review policy evaluation",
     "plan": "Frozen plan review policy evaluation",
@@ -178,14 +181,22 @@ def _severity(value: object, label: str) -> str | None:
 
 
 def _run_flow(value: object, label: str) -> str:
-    """Return the validated flow for a run, defaulting to ``pr``.
+    """Return the validated flow for a run; only an absent key defaults.
 
     A PR-only artifact written before the flow dimension existed carries no
-    ``flow`` field; defaulting it to ``pr`` keeps such artifacts loading
-    unchanged instead of rejecting them.
+    ``flow`` key at all, and that is the whole compatibility exception:
+    ``_ABSENT`` defaults to ``pr`` so such artifacts keep loading unchanged.
+    An explicitly present ``"flow": null`` is a labeled run whose label is
+    missing, not a legacy record, so it is rejected rather than assigned to
+    the PR rows where a planning run's measurements could contaminate them.
     """
-    if value is None:
+    if value is _ABSENT:
         return DEFAULT_FLOW
+    if value is None:
+        raise AgentLoopError(
+            f"Frozen evaluation {label} has an explicit null flow; omit the field entirely "
+            f"to keep the legacy {DEFAULT_FLOW!r} default, or name one of: {', '.join(FLOWS)}."
+        )
     flow = _nonblank_string(value, f"{label} flow").lower()
     if flow not in FLOWS:
         raise AgentLoopError(
@@ -227,7 +238,7 @@ def _resolved_runs(runs: list[object]) -> list[tuple[Mapping[str, object], str, 
         label = f"run {index}"
         if not isinstance(run, dict):
             raise AgentLoopError(f"Frozen evaluation {label} must be an object.")
-        flow = _run_flow(run.get("flow"), label)
+        flow = _run_flow(run.get("flow", _ABSENT), label)
         resolved.append((run, flow, _run_policy(run.get("policy"), flow, label)))
     return resolved
 
@@ -254,7 +265,7 @@ def _reject_duplicate_runs(runs: list[Mapping[str, object]]) -> None:
 def _validate_run(run: object, index: int) -> dict[str, object]:
     if not isinstance(run, dict):
         raise AgentLoopError(f"Frozen evaluation run {index} must be an object.")
-    flow = _run_flow(run.get("flow"), f"run {index}")
+    flow = _run_flow(run.get("flow", _ABSENT), f"run {index}")
     policy = _run_policy(run.get("policy"), flow, f"run {index}")
     run_id = _nonblank_string(run.get("run_id", str(index + 1)), f"run {index} ID")
     run_provenance = _provenance(run.get("provenance"), f"run {run_id}")
