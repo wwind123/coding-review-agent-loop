@@ -9205,6 +9205,117 @@ def test_staged_planning_advance_after_remediation_names_the_final_sweep(tmp_pat
     assert "Antigravity" in post_remediation
 
 
+def test_staged_planning_resumed_remediation_stays_owner_scoped(tmp_path):
+    """`panel-blocker-remediation`: resume keeps the narrow classification.
+
+    The classifier decides `narrow` from the authenticated semantic patch and
+    the cross-cutting contracts of the state it was bound to. Both live in
+    durable coder records, so an interruption between the remediation coder
+    turn and its scheduler checkpoint must reconstruct them instead of
+    classifying the same plan-step revision `broad` and latching the board.
+    """
+    fresh, patch_text = _remediation_plan_fixtures()
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}]
+    # The round-4 board is re-invoked because a resumed run sees cross-subject
+    # ledger history that a live startup snapshot does not, so the classifier
+    # takes the documented post-panel fallback; those approvals carry no
+    # disposition because item-1 is already cleared.
+    runner = _FakeRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_plan_review(
+                state="approved", prior_plan_item_dispositions=resolved
+            ),
+            structured_plan_review(state="approved"),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking",
+                reviewer="Google Gemini",
+                summary="One plan step omits the rollout owner.",
+                blocking_plan_issues=["Name the rollout owner in the plan steps."],
+            ),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=resolved,
+            ),
+            structured_plan_review(state="approved", reviewer="Google Gemini"),
+        ],
+        antigravity_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Antigravity"),
+            structured_plan_review(state="approved", reviewer="Google Antigravity"),
+        ],
+    )
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+    real_post = orchestrator_module.post_issue_comment
+    audits = {"count": 0}
+
+    def interrupt_before_remediation_checkpoint(*args, **kwargs):
+        # Rounds 1 and 2 post their own scheduler checkpoints first, so the
+        # third one is the remediation round's, posted after the round-3
+        # planner turn has already been recorded.
+        if kwargs["body"].startswith("Plan review scheduling audit."):
+            audits["count"] += 1
+            if audits["count"] == 3:
+                raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    with patch.object(
+        orchestrator_module,
+        "post_issue_comment",
+        side_effect=interrupt_before_remediation_checkpoint,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    interrupted = _plan_round_records(runner)
+    # The remediation planner turn is durable; its scheduler checkpoint is not.
+    assert any(
+        record.round_number == 3 and record.role == "coder" for record in interrupted
+    )
+    assert not any(
+        record.round_number == 3 and record.phase == "scheduler-prelaunch"
+        for record in interrupted
+    )
+    reviewer_calls_before = [
+        cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"codex", "gemini"}
+    ]
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    remediation = [
+        record
+        for record in _plan_round_records(runner)
+        if record.round_number == 3 and record.phase == "scheduler-prelaunch"
+    ]
+    assert len(remediation) == 1
+    decision = remediation[0]
+    # Owner-scoped: the ledger owner plus the primary, and no latch.
+    assert decision.scheduler_phase == "remediation"
+    assert set(decision.scheduler_selected_reviewers) == {"Gemini", "Codex"}
+    assert [name for name, _why in decision.scheduler_paused_reviewers] == [
+        "Antigravity"
+    ]
+    assert decision.scheduler_active_owners == ("Gemini",)
+    assert decision.scheduler_force_full is False
+    assert decision.scheduler_force_full_source is None
+    assert "narrow plan remediation" in " ".join(decision.scheduler_reasons)
+    # The resumed remediation round invokes exactly the owner plus the primary.
+    round_three_reviewers = {
+        record.agent
+        for record in _plan_round_records(runner)
+        if record.round_number == 3 and record.role == "reviewer"
+    }
+    assert round_three_reviewers == {"Codex", "Gemini"}
+    assert [
+        cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"codex", "gemini"}
+    ][: len(reviewer_calls_before)] == reviewer_calls_before
+
+
 def test_staged_planning_round_budget_names_the_outstanding_final_sweep(tmp_path):
     """`round-budget-diagnostic`: exhaustion after remediation names the sweep."""
     runner = _remediation_runner()

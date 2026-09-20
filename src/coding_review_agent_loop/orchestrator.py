@@ -274,6 +274,7 @@ from .protocol import (
     StructuredPlanState,
     StructuredPlanRevision,
     PlanRevisionPatch,
+    parse_plan_revision_patch,
     StructuredTaskResult,
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
@@ -9077,6 +9078,13 @@ def _run_plan_first_loop(
                 resumed_round.coder_metadata.assembled_plan_sidecar
             )
             current_response_form = resumed_round.coder_metadata.response_form
+        # Rebuild the authenticated classifier inputs from durable records, so
+        # a restart right after a remediation coder turn classifies the same
+        # plan-step revision narrow instead of latching the complete board.
+        current_plan_patch, previous_plan_contracts = _resumed_plan_transition_inputs(
+            issue_context.comments,
+            coder_metadata=resumed_round.coder_metadata,
+        )
         log(config, f"Planning issue #{issue_number}: resuming round {start_round_number}")
         # A resumed round carries its planning-generation discriminator in
         # durable coder metadata. Historical rounds intentionally have no
@@ -13174,6 +13182,63 @@ def _plan_cross_cutting_contracts(
         ),
         architecture_impact_status=status if status in {"changed", "unchanged"} else None,
     )
+
+
+def _resumed_plan_transition_inputs(
+    comments: Sequence[object],
+    *,
+    coder_metadata: PostedRoundMetadata | None,
+) -> tuple[object | None, PlanCrossCuttingContracts | None]:
+    """Rebuild the authenticated transition inputs a resume would otherwise lose.
+
+    The classifier decides `narrow` from the authenticated `semantic-patch-v1`
+    payload and the cross-cutting contracts of the state the patch was bound to.
+    Both live in durable records, so a restart immediately after a remediation
+    coder turn must reconstruct them instead of classifying the same plan-step
+    revision `broad` and latching the complete board (#905, from #841).
+
+    Every binding is re-verified here: the patch must match the record's own
+    base round and base state identity, and the base round's sidecar must
+    hydrate to exactly that state identity.  Anything unverifiable returns
+    ``(None, None)``, which keeps the conservative broad classification.
+    """
+    if coder_metadata is None or coder_metadata.response_form != "semantic-patch-v1":
+        return None, None
+    try:
+        patch = parse_plan_revision_patch(coder_metadata.raw_patch_provenance or {})
+    except (AgentLoopError, TypeError, ValueError, KeyError) as exc:
+        del exc
+        return None, None
+    if (
+        patch.base_round_number != coder_metadata.base_round_number
+        or patch.base_state_identity != coder_metadata.base_state_identity
+        or patch.base_state_identity is None
+    ):
+        return None, None
+    try:
+        records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError:
+        return None, None
+    for record in reversed(records):
+        metadata = record.metadata
+        if (
+            metadata.role != "coder"
+            or metadata.round_number != patch.base_round_number
+            or metadata.assembled_plan_sidecar is None
+        ):
+            continue
+        try:
+            base_sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+            if (
+                hydrate_authenticated_plan_state(base_sidecar).state_identity
+                != patch.base_state_identity
+            ):
+                continue
+        except (AgentLoopError, TypeError, ValueError, KeyError) as exc:
+            del exc
+            continue
+        return patch, _plan_cross_cutting_contracts(base_sidecar)
+    return None, None
 
 
 def _plan_revision_descriptor(

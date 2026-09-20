@@ -337,7 +337,13 @@ and never synthesizes a planner turn. A planning round counts as reconciled only
 when it holds an actual reconciliation record: the `scheduler-prelaunch` and
 `plan-phase-advance` summaries are pre-reviewer checkpoints, so an interruption
 at either one resumes as an unsettled round that still reconstructs each
-published reviewer's numbered items, owners, and obligations. Because each
+published reviewer's numbered items, owners, and obligations. Resume also
+rebuilds the transition classifier's authenticated inputs — the durable
+`semantic-patch-v1` payload and the cross-cutting contracts of the state that
+patch was bound to — from the coder records themselves, so an interruption
+between a remediation planner turn and its scheduler checkpoint keeps the same
+narrow classification instead of latching the complete board; anything that
+cannot be re-verified stays broad. Because each
 advance costs a round, staged
 planning consumes strictly more rounds than full-board planning, and exhausting
 `--max-rounds` during a pending advance is reported distinctly from reviewer
