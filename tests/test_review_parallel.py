@@ -1447,3 +1447,78 @@ def test_parallel_plan_review_settles_healthy_reviewer_when_peer_returns_narrati
     assert any("Gemini plan review complete." in comment for comment in runner.comments)
     # No publication checkpoint or fabricated verdict for the refused reviewer.
     assert not any("Plan review incomplete" in comment for comment in runner.comments)
+
+
+# ---------------------------------------------------------------------------
+# #905 (from #841): staged planning resume and reviewer failure
+
+
+def _staged_parallel_config(tmp_path, **overrides):
+    values = {
+        "reviewer": ("codex", "gemini"),
+        "review_parallel": True,
+        "plan_review_policy": "primary-then-panel",
+        "primary_plan_reviewer": "codex",
+        "max_rounds": 6,
+    }
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+def test_staged_planning_reviewer_failure_stays_required(tmp_path):
+    """`reviewer-failure-remains-required`: no approval is waived."""
+    from agent_loop_helpers import structured_v1_plan_state
+
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[("codex exploded", 1)],
+        gemini_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Gemini")
+        ],
+    )
+    config = _staged_parallel_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(AgentLoopError, match="Codex"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    # The primary is the only selected reviewer in the primary phase, so its
+    # failure stops the round without ever approving the plan.
+    assert not any(cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands)
+    assert not any("plan approved" in comment.lower() for comment in runner.comments)
+
+
+def test_staged_planning_resume_does_not_re_invoke_a_settled_reviewer(tmp_path):
+    """`resume-no-duplicate-calls`: settled work is reconstructed, not redone."""
+    from agent_loop_helpers import structured_v1_plan_state
+
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = _staged_parallel_config(tmp_path, max_rounds=1)
+
+    # Round 1 settles the primary, then the run stops on the round budget while
+    # the reviewer-only panel advance is still pending.
+    with pytest.raises(AgentLoopError, match="phase advance was still pending"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    commands_before = len(runner.commands)
+    runner.gemini_outputs.append(
+        structured_plan_review(state="approved", reviewer="Google Gemini")
+    )
+    assert (
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=_staged_parallel_config(tmp_path, max_rounds=6),
+            plan_first=True,
+        )
+        == 0
+    )
+
+    resumed_commands = runner.commands[commands_before:]
+    # The primary holds a qualifying exact-key approval, so it is carried; only
+    # the outstanding secondary is invoked, and no planner turn is fabricated.
+    assert not any(cmd[:1] == ["codex"] for cmd, _cwd in resumed_commands)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in resumed_commands)
+    assert len([cmd for cmd, _cwd in resumed_commands if cmd[:1] == ["gemini"]]) == 1

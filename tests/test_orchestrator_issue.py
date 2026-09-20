@@ -8428,3 +8428,356 @@ def test_refused_plan_reviewer_leaves_nothing_for_a_resume_to_replay(tmp_path):
     for runner in (first, second):
         assert not any("Plan review incomplete" in body for body in runner.comments)
         assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+
+
+# --- Staged primary-then-panel plan review (#905, from #841) --------------
+
+
+def _staged_plan_config(tmp_path, **overrides):
+    values = {
+        "reviewer": ("codex", "gemini"),
+        "plan_review_policy": "primary-then-panel",
+        "primary_plan_reviewer": "codex",
+        "max_rounds": 6,
+    }
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+def _plan_round_records(runner):
+    """Decode every posted planning round record in comment order."""
+    records = []
+    for comment in runner.issue_comments:
+        body = comment["body"]
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", body)
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if metadata.flow == "plan":
+            records.append(metadata)
+    return records
+
+
+def _staged_plan_history(tmp_path, *, reviewer_records=(), scheduler_record=True):
+    """A generation-1 planning round-1 coder record plus reviewer records.
+
+    ``scheduler_record`` writes the round-1 planning scheduler checkpoint, so
+    the history decodes as intact rather than as the ``absent`` degraded class.
+    """
+    config = _staged_plan_config(tmp_path)
+    structured = validate_structured_plan_state(structured_v1_plan_state())
+    canonical = render_canonical_plan_state(structured, config)
+    sidecar = orchestrator_module.make_assembled_plan_sidecar(
+        structured, round_number=1, response_form="fresh-plan-state", rendered_plan=canonical
+    )
+    subject = _plan_subject(canonical)
+    comments = [
+        {
+            "author": {"login": "bot"},
+            "createdAt": "2026-09-14T00:00:00Z",
+            "body": _attach_round_metadata(
+                canonical + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+                PostedRoundMetadata(
+                    flow="plan",
+                    role="coder",
+                    agent="Anthropic Claude",
+                    round_number=1,
+                    subject=subject,
+                    canonical_plan=canonical,
+                    raw_structured_coder_response=structured_v1_plan_state(),
+                    state="blocking",
+                    execution_strategy_contract_version=1,
+                    execution_strategy_identity=structured.execution_recommendation.identity(),
+                    risk_test_matrix_contract_version=1,
+                    risk_test_matrix_payload=structured.risk_test_matrix.to_payload(),
+                    risk_test_matrix_changes_payload=(),
+                    risk_test_matrix_identity=risk_test_matrix_identity(
+                        structured.risk_test_matrix, structured.risk_test_matrix_changes
+                    ),
+                    risk_test_matrix_boundary_digest=risk_test_matrix_identity(
+                        structured.risk_test_matrix, structured.risk_test_matrix_changes
+                    ),
+                    response_form="fresh-plan-state",
+                    aggregate_plan_identity=sidecar.aggregate_identity,
+                    assembled_plan_sidecar=sidecar.to_payload(),
+                ),
+            ),
+        }
+    ]
+    if scheduler_record:
+        contract = orchestrator_module.make_plan_contract(
+            ("Codex", "Gemini"), "primary-then-panel", "Codex"
+        )
+        key = orchestrator_module._plan_candidate_key_for(
+            plan_subject=subject, sidecar=sidecar, surfaced_requirement_ids=()
+        )
+        comments.append(
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-09-14T00:00:00Z",
+                "body": _attach_round_metadata(
+                    "Plan review scheduling audit.\n\n-- Orchestrator",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="summary",
+                        agent="Orchestrator",
+                        round_number=1,
+                        subject=subject,
+                        phase="scheduler-prelaunch",
+                        scheduler_contract=contract.as_dict(),
+                        scheduler_obligation_digest="0" * 16,
+                        scheduler_selected_reviewers=("Codex",),
+                        scheduler_paused_reviewers=(("Gemini", "primary phase"),),
+                        scheduler_reasons=("primary phase",),
+                        scheduler_final_sweep=False,
+                        scheduler_force_full=False,
+                        scheduler_calls_avoided=1,
+                        scheduler_phase="primary",
+                        scheduler_primary_reviewer="Codex",
+                        plan_candidate_key=key.as_dict(),
+                    ),
+                ),
+            }
+        )
+    for index, (agent, state, items) in enumerate(reviewer_records, start=1):
+        comments.append(
+            {
+                "author": {"login": "bot"},
+                "createdAt": f"2026-09-14T00:00:{index:02d}Z",
+                "body": _attach_round_metadata(
+                    f"{agent} plan review.\n<!-- AGENT_PLAN_STATE: {state} -->\n-- {agent}",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="reviewer",
+                        agent=agent,
+                        round_number=1,
+                        subject=subject,
+                        state=state,
+                        new_items=items,
+                    ),
+                ),
+            }
+        )
+    return comments, canonical
+
+
+def test_default_full_board_planning_writes_no_scheduler_metadata(tmp_path):
+    """`default-full-board-planning`: the compatibility path is unchanged."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=3)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    records = _plan_round_records(runner)
+    assert records, "the planning flow must still post durable round records"
+    assert all(record.scheduler_metadata_status == "absent" for record in records)
+    assert all(record.plan_candidate_key is None for record in records)
+    assert all(record.phase != "scheduler-prelaunch" for record in records)
+    reviewer_rounds = {
+        (record.agent, record.round_number)
+        for record in records
+        if record.role == "reviewer"
+    }
+    # Every configured reviewer is invoked in the same planning round.
+    assert reviewer_rounds == {("Codex", 1), ("Gemini", 1)}
+
+
+def test_staged_planning_primary_gate_then_reviewer_only_panel_round(tmp_path):
+    """`primary-blocking-revision`, `panel-opens-on-primary-approval`,
+    `reviewer-only-phase-advance`, and `final-exact-plan-gate` together."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+
+    assert run_issue_loop(
+        runner, issue_number=56, config=_staged_plan_config(tmp_path), plan_first=True
+    ) == 0
+
+    records = _plan_round_records(runner)
+    prelaunch = [record for record in records if record.phase == "scheduler-prelaunch"]
+    assert [record.scheduler_phase for record in prelaunch] == [
+        "primary",
+        "secondary-audit",
+    ]
+    # Round 1 is strictly primary-only; the secondary is paused, not dropped.
+    assert prelaunch[0].scheduler_selected_reviewers == ("Codex",)
+    assert [name for name, _why in prelaunch[0].scheduler_paused_reviewers] == ["Gemini"]
+    assert prelaunch[0].scheduler_metadata_status == "valid"
+    # The panel opens on the exact-plan primary approval, against the same key.
+    assert prelaunch[1].scheduler_selected_reviewers == ("Gemini",)
+    assert "Codex" in prelaunch[1].scheduler_approved_reviewers
+    assert prelaunch[0].plan_candidate_key == prelaunch[1].plan_candidate_key
+    # The panel round is reviewer-only: one planner turn in the whole run.
+    advance = [record for record in records if record.phase == "plan-phase-advance"]
+    assert [record.round_number for record in advance] == [2]
+    assert len([record for record in records if record.role == "coder"]) == 1
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "claude") == 1
+    # Each reviewer ran exactly once, in its own round.
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "codex") == 1
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "gemini") == 1
+    assert [
+        record.round_number
+        for record in records
+        if record.role == "reviewer" and record.agent == "Gemini"
+    ] == [2]
+
+
+def test_staged_planning_round_budget_diagnostic_is_distinct(tmp_path):
+    """`round-budget-diagnostic`: exhaustion during a pending phase advance."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=_staged_plan_config(tmp_path, max_rounds=1),
+            plan_first=True,
+        )
+
+    message = str(excinfo.value)
+    assert "reviewer-only plan phase advance was still pending" in message
+    assert "Gemini" in message
+    assert "--max-rounds" in message
+    assert "still reported blocking plan issues" not in message
+
+
+def test_staged_planning_stops_on_premature_secondary_plan_review(tmp_path):
+    """`pre-panel-safety-diagnostic`: no reviewer and no planner turn."""
+    comments, _canonical = _staged_plan_history(
+        tmp_path,
+        reviewer_records=[
+            (
+                "Gemini",
+                "blocking",
+                (
+                    UnresolvedReviewItem(
+                        item_id="item-1",
+                        reviewer="Gemini",
+                        source_round=1,
+                        text="Secondary-owned plan finding.",
+                        status="blocking",
+                    ),
+                ),
+            )
+        ],
+    )
+    runner = _FakeRunner(issue_comments=comments)
+
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(
+            runner, issue_number=56, config=_staged_plan_config(tmp_path), plan_first=True
+        )
+
+    assert "no qualified panel opening exists" in str(excinfo.value)
+    assert any(
+        "Plan review scheduling diagnostic" in comment["body"]
+        for comment in runner.issue_comments
+    )
+    assert not any(
+        cmd[0] in {"claude", "codex", "gemini"} for cmd, _cwd in runner.commands
+    )
+
+
+def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path):
+    """`operator-force-full-override`: the override authorizes the board."""
+    comments, _canonical = _staged_plan_history(
+        tmp_path,
+        reviewer_records=[
+            (
+                "Gemini",
+                "blocking",
+                (
+                    UnresolvedReviewItem(
+                        item_id="item-1",
+                        reviewer="Gemini",
+                        source_round=1,
+                        text="Secondary-owned plan finding.",
+                        status="blocking",
+                    ),
+                ),
+            )
+        ],
+    )
+    runner = _FakeRunner(
+        issue_comments=comments,
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=_staged_plan_config(tmp_path, plan_review_force_full=True, max_rounds=1),
+            plan_first=True,
+        )
+
+    # The override selects the complete board rather than stopping.
+    assert not isinstance(excinfo.value, orchestrator_module.PlanPrePanelSafetyError)
+    prelaunch = [
+        record for record in _plan_round_records(runner) if record.phase == "scheduler-prelaunch"
+    ]
+    # The last checkpoint is this run's decision; the first is seeded history.
+    decision = prelaunch[-1]
+    assert decision.scheduler_phase == "full-board"
+    assert set(decision.scheduler_selected_reviewers) == {"Codex", "Gemini"}
+    assert decision.scheduler_force_full is True
+    assert decision.scheduler_force_full_source == "operator"
+    assert "superseded premature secondary plan review" in " ".join(
+        decision.scheduler_reasons
+    )
+    # The superseded review establishes no approval and no ownership: the same
+    # secondary is freshly invoked.
+    assert any(cmd[0] == "gemini" for cmd, _cwd in runner.commands)
+
+
+def test_staged_planning_stops_when_planning_history_cannot_be_extracted(tmp_path):
+    """`undecodable-planning-history-stop`: only class D stops the run, and the
+    operator override cannot recover it."""
+    config = _staged_plan_config(tmp_path, plan_review_force_full=True)
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(
+            IssueComment(
+                author="bot",
+                created_at="2026-09-14T00:00:00Z",
+                body="Plan round record.\n<!-- AGENT_LOOP_META: not-a-valid-payload -->",
+            ),
+        ),
+    )
+    runner = _FakeRunner()
+
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        orchestrator_module._run_plan_first_loop(
+            runner,
+            issue_number=56,
+            config=config,
+            memory=None,
+            issue_context=issue_context,
+            usage_context=orchestrator_module._new_usage_context(config),
+        )
+
+    message = str(excinfo.value)
+    assert "could not be extracted" in message
+    assert "--plan-review-force-full cannot authorize" in message
+    assert not any(
+        cmd[0] in {"claude", "codex", "gemini"} for cmd, _cwd in runner.commands
+    )
+    assert any(
+        "Plan review scheduling diagnostic (startup)" in comment["body"]
+        for comment in runner.issue_comments
+    )

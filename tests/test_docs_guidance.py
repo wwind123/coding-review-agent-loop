@@ -490,3 +490,61 @@ def test_docs_describe_conflict_round_continuity_exception():
     for text in (arch_text, doc_text):
         assert "still fails closed" in text
         assert "approve the exact final head before qualification or merge" in text
+
+
+def test_architecture_documents_the_planning_scheduler():
+    """`scope-5` (#905, from #841): the canonical overview is updated."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "ARCHITECTURE.md").read_text()
+
+    assert "plan_review_scheduling.py" in text
+    assert "exact-plan candidate key" in text
+    assert "reviewer-only phase-advance round" in text
+    assert "plan-phase-advance" in text
+    assert "four disjoint classes" in text
+    assert "only a transport extraction failure stops the" in text
+    assert "run, checked at startup and at every round boundary" in text
+    assert "--plan-review-policy" in text
+    assert "docs/local_agent_loop.md#staged-issue-plan-review" in text
+
+
+def test_operator_docs_document_the_staged_planning_flags_and_limits():
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "docs" / "local_agent_loop.md").read_text()
+    readme = (root / "README.md").read_text()
+
+    assert "### Staged issue plan review" in text
+    for flag in (
+        "--plan-review-policy",
+        "--primary-plan-reviewer",
+        "--plan-review-force-full",
+    ):
+        assert flag in text
+        assert flag in readme
+    for phase in (
+        "`primary`",
+        "`secondary-audit`",
+        "`remediation`",
+        "`final-secondary-sweep`",
+        "`full-board`",
+    ):
+        assert phase in text
+    # Round budget, candidate key, classifier, panel evidence, fallbacks.
+    assert "Raise\n`--max-rounds` when enabling it." in text
+    assert "generation-1" in text
+    assert "`recheck`" in text and "`narrow`" in text and "`broad`" in text
+    assert "qualified panel opening" in text
+    assert "strict pre-panel fallback:" in text
+    assert "post-panel fallback:" in text
+    # The four degraded-history classes and the override's recovery limits.
+    for label in ("A `absent`", "B `invalid`", "C `contradictory-key`", "D transport failure"):
+        assert label in text
+    assert "recovers the first two\nonly" in text
+    assert "never recover class D" in text
+    # Carried approvals and the exclusions.
+    assert "HUMAN_REQUIREMENTS_RESOLVED" in text
+    assert "Discussion-mode scheduling and the child-planning cycle always invoke the full" in text

@@ -366,6 +366,28 @@ def test_isolated_config_neutralizes_primary_then_panel_scheduling(tmp_path):
         shutil.rmtree(isolated_dir, ignore_errors=True)
 
 
+def test_isolated_config_neutralizes_staged_planning_scheduling(tmp_path):
+    """`derived-configs-neutralize-planning-policy` (#905, from #841)."""
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+        plan_review_force_full=True,
+    )
+    isolated_config, isolated_dir = _isolated_provider_config(config, "claude", "")
+    try:
+        # A single-reviewer isolated board would otherwise fail validation.
+        assert isolated_config.reviewer == ("claude",)
+        assert isolated_config.plan_review_policy == "all-reviewers"
+        assert isolated_config.primary_plan_reviewer is None
+        assert isolated_config.plan_review_force_full is False
+    finally:
+        import shutil
+
+        shutil.rmtree(isolated_dir, ignore_errors=True)
+
+
 def test_isolated_config_does_not_inherit_selective_force_full(tmp_path):
     config = make_config(
         tmp_path,

@@ -1550,6 +1550,144 @@ the calls avoided by selective scheduling after same-head carries, recovery
 skips, and unavailable reviewers have been removed from eligibility, so the
 example does not double-count the paused approvals.
 
+### Staged issue plan review
+
+Issue plan review has its own scheduling policy, selected independently of
+`--pr-review-policy`:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO --plan-first \
+  --plan-review-policy primary-then-panel \
+  --primary-plan-reviewer codex \
+  --reviewer codex --reviewer claude --reviewer gemini \
+  --max-rounds 10
+```
+
+`--plan-review-policy` accepts `all-reviewers` (the compatibility default) and
+`primary-then-panel`. `--primary-plan-reviewer` is required by the staged
+policy, must be on the configured `--reviewer` board, and needs at least one
+secondary. `--plan-review-force-full` is the operator override. All three
+validate independently of `--pr-review-policy`, `--primary-reviewer`, and
+`--pr-review-force-full`, so a run may stage planning with full-board PR review
+or the reverse. Omitting them preserves today's full-board planning behavior
+byte-for-byte: no planning scheduler metadata is written and no reviewer is
+paused.
+
+#### Candidate key and generation-1 requirement
+
+Every staged planning decision is bound to one canonical *exact-plan candidate
+key*: the ordered tuple of the plan subject, aggregate plan identity,
+execution-strategy identity, risk-test-matrix identity, and a deterministic
+digest of the surfaced planning-requirement IDs in force for the round. The same
+key is used by scheduler records, carried approvals, panel-opening evidence, and
+resume. A legacy unversioned plan has no execution-strategy or risk-matrix
+identity, so the key cannot be formed; staged planning is refused with an
+actionable message instead of degrading silently.
+
+#### Phases and the reviewer-only phase advance
+
+1. `primary`: only the primary plan reviewer is invoked. It rechecks its own
+   plan findings on each revision until it approves the exact candidate key.
+2. `secondary-audit`: an exact-key primary approval opens the panel. Every
+   available secondary without a qualified exact-key approval is invoked with
+   the complete issue context and the byte-identical candidate plan the primary
+   approved.
+3. `remediation`: a narrow revision after the opening invokes the active finding
+   owners from the canonical ledger plus the primary.
+4. `final-secondary-sweep`: every required reviewer still missing a qualifying
+   approval of the unchanged candidate key is invoked.
+5. `full-board`: a broad revision after a qualified opening, the automatic
+   latch, and the operator override.
+
+`secondary-audit` and `final-secondary-sweep` run as *reviewer-only rounds*: the
+loop posts a `plan-phase-advance` record, increments the round number, and
+invokes the reviewers against a byte-identical candidate plan with no planner
+turn. **Round budget:** each advance costs a round, so staged planning always
+consumes more rounds than full-board planning for the same plan. Raise
+`--max-rounds` when enabling it. Exhausting the budget while an advance is still
+pending reports that cause distinctly from "reviewers still reported blocking
+plan issues", naming the outstanding phase and reviewers.
+
+#### Transition classifier
+
+The planning flow has no diff, so the classifier uses authenticated data only
+and never attributes a patch operation to a finding or an owner. It reports
+`recheck` when the candidate key is unchanged; `narrow` when the revision is an
+authenticated `semantic-patch-v1` bound to the immediately preceding base
+identity whose operations touch only `summary`, `plan_steps`, `deferred_work`,
+`plan_actions`, `external_dependencies`, and risk-matrix row add/edit
+operations, while the execution-recommendation identity, human-requirement
+dispositions, `additional_closing_issue_ids`, and architecture-impact status are
+all unchanged; and `broad` for everything else, including a full-state rewrite,
+a missing or unbindable sidecar, and an unreconstructible ledger. A routine
+remediation revision that edits plan steps and matrix rows therefore stays
+narrow and does not latch the complete board on the first revision. Ownership
+always comes from the canonical finding ledger, never from the patch.
+
+#### Qualified panel evidence
+
+A qualified panel opening is derived from comment order: an operator-sourced
+planning force-full record, or a `secondary-audit` planning scheduler record for
+candidate key K that lists the primary as approved and is preceded by the
+primary's own approved plan review of K. Premature secondary plan reviews,
+`full-board`/`remediation` checkpoints, and unattributed or automatic latches
+recorded before an opening are unqualified artifacts: they are listed in the
+audit, excluded from approval, ownership, and resume accounting, and supplied to
+a re-invoked secondary only as non-authoritative superseded context.
+
+#### Degraded planning history and the diagnostic stop
+
+Degraded planning history is partitioned into exactly four disjoint classes with
+one outcome each, so the same durable history can never both continue and stop:
+
+| Class | Condition | Outcome |
+| --- | --- | --- |
+| A `absent` | The record carries no scheduler fields at all (every legacy and full-board planning comment). | Conservative fallback; continue. |
+| B `invalid` | Scheduler fields extracted but are partial, malformed, or internally contradictory. | Conservative fallback; continue. |
+| C `contradictory-key` | The record decodes valid but its persisted key components contradict the canonical plan. | Conservative fallback; continue. |
+| D transport failure | The planning round-metadata record set cannot be extracted at all. | Stop with the planning diagnostic. |
+
+Before a qualified opening the fallback re-invokes only the primary with full
+context under a `strict pre-panel fallback:` reason and latches nothing; after
+one it selects the complete board under a `post-panel fallback:` reason and
+raises the durable `automatic` latch.
+
+The run stops with a plain `Plan review scheduling diagnostic` comment, and no
+reviewer and no planner turn, in exactly three cases: an active plan finding
+pending on a configured secondary with no qualified opening; an interrupted
+round holding a premature blocking secondary plan review; and the class-D
+transport extraction failure. `--plan-review-force-full` recovers the first two
+only. It can never recover class D, because approval, ownership, and
+qualification accounting all depend on a readable record set — restore the
+missing planning round-metadata records and rerun instead.
+
+#### Carried approvals and signed human requirements
+
+An exact-key approval is carried across rounds only when the stored record
+matches every component of the current candidate key *and* itself carried
+`HUMAN_REQUIREMENTS_RESOLVED` for exactly the currently surfaced
+planning-requirement ID set. Plan reviewer records persist those IDs only when
+the approval actually carried the acknowledgement, so a carried approval can
+never satisfy the signed-requirement gate vacuously. Any plan revision, and any
+added, edited, replaced, or withdrawn signed requirement, changes the
+requirement-digest component of the key and invalidates every carried approval.
+The final gate evaluates every required reviewer, carried and current alike; a
+carried approval that fails the key or acknowledgement comparison blocks
+approval and re-invokes that reviewer rather than being repaired in place. Plan
+item numbering, disposition reconciliation, deferred stages, child-stage
+topology, and decomposition decisions are never changed by scheduling.
+
+#### Exclusions
+
+Discussion-mode scheduling and the child-planning cycle always invoke the full
+board, enforced by configuration reset rather than by convention: the child
+planning configuration and the semantic-dedupe isolated provider configuration
+both reset the planning policy, primary, and force-full fields. PR-flow
+scheduling, qualification, managed CI, branch protection, and merge behavior are
+unchanged. The staged planning policy remains non-default until a flow-separated
+frozen evaluation justifies the latency and cost tradeoff; `review-evaluation`
+separates planning rows from PR rows by flow.
+
 ### Phased decomposition versus split materialization
 
 Decomposition modes and split materialization select one child-issue path.

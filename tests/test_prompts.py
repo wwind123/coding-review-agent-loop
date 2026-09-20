@@ -4357,3 +4357,35 @@ def test_emitted_invocation_guidance_lines_pass_the_checkout_validator(
         )
         assert str(memory_dir) in rendered
         validate_test_commands_within_workdir([rendered], assigned_workdir=checkout)
+
+
+def test_plan_review_prompts_state_the_staged_approval_rule(tmp_path):
+    """`planning-prompt-scheduling-guidance` (#905, from #841)."""
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.prompts import build_plan_review_prompt
+
+    default_config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    staged_config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+
+    for compact in (False, True):
+        default_prompt = build_plan_review_prompt(
+            56, 1, "Plan.", default_config, reviewer="codex", compact_context=compact
+        )
+        staged_prompt = build_plan_review_prompt(
+            56, 1, "Plan.", staged_config, reviewer="codex", compact_context=compact
+        )
+        # The compatibility default keeps today's same-round wording verbatim.
+        assert "must approve in the same planning" in default_prompt.replace("\n", " ")
+        assert "primary-then-panel" not in default_prompt
+        # Staged planning never claims same-round approval.
+        assert "must approve in the same planning" not in staged_prompt.replace("\n", " ")
+        assert "primary-then-panel" in staged_prompt
+        assert "primary plan reviewer" in staged_prompt
+        assert "secondary plan panel" in staged_prompt
+        assert "final exact-plan sweep" in staged_prompt.replace("\n", " ")
+        assert "carried across later rounds" in staged_prompt.replace("\n", " ")

@@ -212,6 +212,11 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
             "pr_review_policy": "all-reviewers",
             "primary_reviewer": None,
             "pr_review_force_full": False,
+            # Planning scheduling is coupled to the same reviewer-count
+            # validation, so the planning trio is neutralized alongside it.
+            "plan_review_policy": "all-reviewers",
+            "primary_plan_reviewer": None,
+            "plan_review_force_full": False,
         }
         if backend == "claude":
             values["claude_model"] = model

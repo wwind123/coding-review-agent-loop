@@ -22,6 +22,7 @@ from .logging import datetime_stamp, log
 from .runner import Runner
 from .test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from .workdirs import active_workdir, agent_workdir
+from .plan_review_scheduling import PLAN_REVIEW_POLICIES
 from .review_scheduling import (
     DEFAULT_BROAD_RULES,
     PR_REVIEW_POLICIES,
@@ -169,6 +170,11 @@ class AgentLoopConfig:
     primary_reviewer: AgentName | None = None
     pr_review_broad_rules: tuple[str, ...] = DEFAULT_BROAD_RULES
     pr_review_force_full: bool = False
+    # Issue plan-review scheduling, selected independently of the PR policy
+    # (#905, from #841).  ``all-reviewers`` is the compatibility default.
+    plan_review_policy: str = "all-reviewers"
+    primary_plan_reviewer: AgentName | None = None
+    plan_review_force_full: bool = False
     auto_agent_dirs: tuple[AgentName, ...] = ()
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
@@ -493,6 +499,32 @@ class AgentLoopConfig:
         elif self.primary_reviewer is not None:
             raise AgentLoopError(
                 "--primary-reviewer requires --pr-review-policy primary-then-panel."
+            )
+        if self.plan_review_policy not in PLAN_REVIEW_POLICIES:
+            raise AgentLoopError(
+                "--plan-review-policy must be 'all-reviewers' or 'primary-then-panel'."
+            )
+        if self.plan_review_policy == "primary-then-panel":
+            if len(configured_reviewers) < 2:
+                raise AgentLoopError(
+                    "--plan-review-policy primary-then-panel requires at least one secondary reviewer."
+                )
+            if self.primary_plan_reviewer is None:
+                raise AgentLoopError(
+                    "--primary-plan-reviewer is required with "
+                    "--plan-review-policy primary-then-panel."
+                )
+            if self.primary_plan_reviewer not in configured_reviewers:
+                raise AgentLoopError(
+                    "--primary-plan-reviewer must be one of the configured --reviewer agents."
+                )
+        elif self.primary_plan_reviewer is not None:
+            raise AgentLoopError(
+                "--primary-plan-reviewer requires --plan-review-policy primary-then-panel."
+            )
+        if self.plan_review_force_full and self.plan_review_policy != "primary-then-panel":
+            raise AgentLoopError(
+                "--plan-review-force-full requires --plan-review-policy primary-then-panel."
             )
         object.__setattr__(self, "pr_review_broad_rules", normalize_broad_rules(self.pr_review_broad_rules))
         if self.discuss_research not in DISCUSS_RESEARCH_MODES:
@@ -1480,6 +1512,9 @@ def config_from_args(
             else DEFAULT_BROAD_RULES
         ),
         pr_review_force_full=bool(getattr(args, "pr_review_force_full", False)),
+        plan_review_policy=getattr(args, "plan_review_policy", None) or "all-reviewers",
+        primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
+        plan_review_force_full=bool(getattr(args, "plan_review_force_full", False)),
         auto_agent_dirs=auto_agent_dirs,
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),

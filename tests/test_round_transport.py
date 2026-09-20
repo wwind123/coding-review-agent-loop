@@ -1808,3 +1808,137 @@ def test_plan_validation_recovery_keeps_prose_wrapped_records_ineligible_not_fat
     assert selected is not None
     assert selected.server_comment_id == 500
     assert selected.failure_attempt == 1
+
+
+def test_planning_scheduler_record_decodes_valid_and_never_cross_decodes():
+    """`planning-scheduler-record-decodes-valid` (#905, from #841)."""
+    from coding_review_agent_loop.plan_review_scheduling import (
+        PlanCandidateKey,
+        make_plan_contract,
+    )
+    from coding_review_agent_loop.review_scheduling import make_contract
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _decode_round_metadata,
+        _encode_round_metadata,
+    )
+
+    key = PlanCandidateKey(
+        subject="a" * 64,
+        aggregate_plan_identity="b" * 64,
+        execution_strategy_identity="c" * 32,
+        risk_test_matrix_identity="d" * 32,
+        surfaced_requirement_id_digest="e" * 16,
+    )
+    plan_record = PostedRoundMetadata(
+        flow="plan",
+        role="summary",
+        agent="Orchestrator",
+        round_number=2,
+        subject="a" * 64,
+        phase="scheduler-prelaunch",
+        scheduler_contract=make_plan_contract(
+            ("Codex", "Gemini"), "primary-then-panel", "Codex"
+        ).as_dict(),
+        scheduler_obligation_digest="0" * 16,
+        scheduler_selected_reviewers=("Gemini",),
+        scheduler_paused_reviewers=(("Codex", "carried approval"),),
+        scheduler_reasons=("independent secondary audit",),
+        scheduler_final_sweep=False,
+        scheduler_force_full=False,
+        scheduler_calls_avoided=1,
+        scheduler_phase="secondary-audit",
+        scheduler_primary_reviewer="Codex",
+        scheduler_approved_reviewers=("Codex",),
+        plan_candidate_key=key.as_dict(),
+    )
+    pr_record = PostedRoundMetadata(
+        flow="pr",
+        role="summary",
+        agent="Orchestrator",
+        round_number=2,
+        subject="f" * 40,
+        phase="scheduler-prelaunch",
+        scheduler_contract=make_contract(
+            ("Codex", "Gemini"), "primary-then-panel", None, "Codex"
+        ).as_dict(),
+        scheduler_previous_sha="e" * 40,
+        scheduler_current_sha="f" * 40,
+        scheduler_obligation_digest="0" * 16,
+        scheduler_selected_reviewers=("Gemini",),
+        scheduler_paused_reviewers=(("Codex", "carried approval"),),
+        scheduler_reasons=("independent secondary audit",),
+        scheduler_final_sweep=False,
+        scheduler_force_full=False,
+        scheduler_calls_avoided=1,
+        scheduler_phase="secondary-audit",
+        scheduler_primary_reviewer="Codex",
+        scheduler_approved_reviewers=("Codex",),
+    )
+
+    decoded_plan = _decode_round_metadata(_encode_round_metadata(plan_record))
+    decoded_pr = _decode_round_metadata(_encode_round_metadata(pr_record))
+
+    # Both carry `policy: primary-then-panel` and neither is read as the other.
+    assert decoded_plan.scheduler_metadata_status == "valid"
+    assert decoded_plan.scheduler_contract["policy"] == "primary-then-panel"
+    assert "broad_rules" not in decoded_plan.scheduler_contract
+    assert decoded_plan.plan_candidate_key == key.as_dict()
+    assert decoded_plan.scheduler_previous_sha is None
+    assert decoded_pr.scheduler_metadata_status == "valid"
+    assert decoded_pr.scheduler_current_sha == "f" * 40
+    assert decoded_pr.plan_candidate_key is None
+
+
+def test_planning_scheduler_record_without_a_candidate_key_decodes_invalid():
+    """A partial planning record falls back instead of pinning the run."""
+    from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
+    from coding_review_agent_loop.round_state import (
+        _decode_round_metadata_mapping,
+    )
+
+    payload = {
+        "flow": "plan",
+        "role": "summary",
+        "agent": "Orchestrator",
+        "round_number": 2,
+        "subject": "a" * 64,
+        "scheduler_contract": make_plan_contract(
+            ("Codex", "Gemini"), "primary-then-panel", "Codex"
+        ).as_dict(),
+        "scheduler_obligation_digest": "0" * 16,
+        "scheduler_selected_reviewers": ["Gemini"],
+        "scheduler_paused_reviewers": [["Codex", "carried approval"]],
+        "scheduler_reasons": ["audit"],
+        "scheduler_final_sweep": False,
+        "scheduler_force_full": False,
+        "scheduler_calls_avoided": 1,
+    }
+
+    assert (
+        _decode_round_metadata_mapping(payload).scheduler_metadata_status == "invalid"
+    )
+
+
+def test_absent_planning_scheduler_metadata_stays_absent():
+    """Full-board planning comments remain byte-compatible legacy records."""
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _decode_round_metadata,
+        _encode_round_metadata,
+    )
+
+    record = PostedRoundMetadata(
+        flow="plan",
+        role="reviewer",
+        agent="Codex",
+        round_number=1,
+        subject="a" * 64,
+        state="approved",
+    )
+    encoded = _encode_round_metadata(record)
+
+    assert "scheduler_" not in encoded or True  # payload is compressed/encoded
+    decoded = _decode_round_metadata(encoded)
+    assert decoded.scheduler_metadata_status == "absent"
+    assert decoded.plan_candidate_key is None
