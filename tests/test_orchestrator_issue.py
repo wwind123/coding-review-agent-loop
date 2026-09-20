@@ -9209,45 +9209,14 @@ def test_staged_planning_resumed_remediation_stays_owner_scoped(tmp_path):
     """`panel-blocker-remediation`: resume keeps the narrow classification.
 
     The classifier decides `narrow` from the authenticated semantic patch and
-    the cross-cutting contracts of the state it was bound to. Both live in
-    durable coder records, so an interruption between the remediation coder
-    turn and its scheduler checkpoint must reconstruct them instead of
-    classifying the same plan-step revision `broad` and latching the board.
+    the cross-cutting contracts of the state it was bound to, and the ledger
+    stays reconstructible because the run has already accounted for the items
+    recorded under the earlier plan subject. An interruption between the
+    remediation coder turn and its scheduler checkpoint must therefore resume
+    into the same owner-scoped board and the same final sweep an uninterrupted
+    run produces, with no complete-board re-invocation and no latch.
     """
-    fresh, patch_text = _remediation_plan_fixtures()
-    resolved = [{"item_id": "item-1", "disposition": "resolved"}]
-    # The round-4 board is re-invoked because a resumed run sees cross-subject
-    # ledger history that a live startup snapshot does not, so the classifier
-    # takes the documented post-panel fallback; those approvals carry no
-    # disposition because item-1 is already cleared.
-    runner = _FakeRunner(
-        claude_outputs=[fresh, patch_text],
-        codex_outputs=[
-            structured_plan_review(state="approved"),
-            structured_plan_review(
-                state="approved", prior_plan_item_dispositions=resolved
-            ),
-            structured_plan_review(state="approved"),
-        ],
-        gemini_outputs=[
-            structured_plan_review(
-                state="blocking",
-                reviewer="Google Gemini",
-                summary="One plan step omits the rollout owner.",
-                blocking_plan_issues=["Name the rollout owner in the plan steps."],
-            ),
-            structured_plan_review(
-                state="approved",
-                reviewer="Google Gemini",
-                prior_plan_item_dispositions=resolved,
-            ),
-            structured_plan_review(state="approved", reviewer="Google Gemini"),
-        ],
-        antigravity_outputs=[
-            structured_plan_review(state="approved", reviewer="Google Antigravity"),
-            structured_plan_review(state="approved", reviewer="Google Antigravity"),
-        ],
-    )
+    runner = _remediation_runner()
     config = _staged_plan_config(
         tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
     )
@@ -9281,39 +9250,56 @@ def test_staged_planning_resumed_remediation_stays_owner_scoped(tmp_path):
         record.round_number == 3 and record.phase == "scheduler-prelaunch"
         for record in interrupted
     )
-    reviewer_calls_before = [
-        cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"codex", "gemini"}
-    ]
+
+    def reviewer_calls():
+        return [
+            cmd[0]
+            for cmd, _cwd in runner.commands
+            if cmd[0] in {"codex", "gemini", "agy"}
+        ]
+
+    calls_before = reviewer_calls()
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
-    remediation = [
-        record
-        for record in _plan_round_records(runner)
-        if record.round_number == 3 and record.phase == "scheduler-prelaunch"
-    ]
-    assert len(remediation) == 1
-    decision = remediation[0]
+    resumed = _plan_round_records(runner)
+    prelaunch = {
+        record.round_number: record
+        for record in resumed
+        if record.phase == "scheduler-prelaunch"
+    }
+    remediation = prelaunch[3]
     # Owner-scoped: the ledger owner plus the primary, and no latch.
-    assert decision.scheduler_phase == "remediation"
-    assert set(decision.scheduler_selected_reviewers) == {"Gemini", "Codex"}
-    assert [name for name, _why in decision.scheduler_paused_reviewers] == [
+    assert remediation.scheduler_phase == "remediation"
+    assert set(remediation.scheduler_selected_reviewers) == {"Gemini", "Codex"}
+    assert [name for name, _why in remediation.scheduler_paused_reviewers] == [
         "Antigravity"
     ]
-    assert decision.scheduler_active_owners == ("Gemini",)
-    assert decision.scheduler_force_full is False
-    assert decision.scheduler_force_full_source is None
-    assert "narrow plan remediation" in " ".join(decision.scheduler_reasons)
-    # The resumed remediation round invokes exactly the owner plus the primary.
-    round_three_reviewers = {
-        record.agent
-        for record in _plan_round_records(runner)
-        if record.round_number == 3 and record.role == "reviewer"
-    }
-    assert round_three_reviewers == {"Codex", "Gemini"}
-    assert [
-        cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"codex", "gemini"}
-    ][: len(reviewer_calls_before)] == reviewer_calls_before
+    assert remediation.scheduler_active_owners == ("Gemini",)
+    assert remediation.scheduler_force_full is False
+    assert remediation.scheduler_force_full_source is None
+    assert "narrow plan remediation" in " ".join(remediation.scheduler_reasons)
+    # The round-3 approvals are carried: the sweep invokes only the reviewer
+    # that still lacks an exact-plan approval, with no post-panel latch.
+    sweep = prelaunch[4]
+    assert sweep.scheduler_phase == "final-secondary-sweep"
+    assert sweep.scheduler_selected_reviewers == ("Antigravity",)
+    assert sweep.scheduler_force_full is False
+    assert sweep.scheduler_force_full_source is None
+    assert not any(
+        record.scheduler_phase == "full-board" for record in prelaunch.values()
+    )
+    reviewer_rounds = [
+        (record.agent, record.round_number)
+        for record in resumed
+        if record.role == "reviewer"
+    ]
+    assert reviewer_rounds.count(("Antigravity", 4)) == 1
+    assert ("Codex", 4) not in reviewer_rounds
+    assert ("Gemini", 4) not in reviewer_rounds
+    # The resumed run re-invokes nothing already settled: it adds exactly the
+    # remediation owner plus primary and the single sweep reviewer.
+    assert reviewer_calls() == [*calls_before, "codex", "gemini", "agy"]
 
 
 def test_staged_planning_round_budget_names_the_outstanding_final_sweep(tmp_path):

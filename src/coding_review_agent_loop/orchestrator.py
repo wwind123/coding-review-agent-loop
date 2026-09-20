@@ -7557,7 +7557,17 @@ def _round_ledger_may_be_incomplete(
     comments: Sequence[object],
     flow: str,
     current_subject: str,
+    accounted_item_ids: Sequence[str] = (),
 ) -> bool:
+    """Whether the active finding ledger may be missing a recorded item.
+
+    ``accounted_item_ids`` holds item IDs this run has already carried or
+    minted, so they are demonstrably part of the reconstructed ledger even when
+    the durable record that introduced them names an earlier plan subject.
+    Callers that pass nothing keep the previous conservative reading, where any
+    cross-subject item at all makes the ledger unreconstructible (#905, from
+    #841).
+    """
     same_subject_incomplete = (
         current_resume.ledger_may_be_incomplete
         if current_resume is not None
@@ -7566,10 +7576,12 @@ def _round_ledger_may_be_incomplete(
     if prior_unresolved_items:
         return same_subject_incomplete
     records = _extract_round_metadata_records(comments, flow=flow)
+    accounted = set(accounted_item_ids)
     cross_subject_incomplete = any(
-        record.metadata.new_items
+        item.item_id not in accounted
         for record in records
         if record.metadata.subject != current_subject
+        for item in record.metadata.new_items
     )
     return same_subject_incomplete or cross_subject_incomplete
 
@@ -8844,6 +8856,11 @@ def _run_plan_first_loop(
     # narrow from unauthenticated state.
     current_plan_patch: PlanRevisionPatch | None = None
     previous_plan_contracts: PlanCrossCuttingContracts | None = None
+    # Item IDs this run has carried or minted.  A durable record that named an
+    # earlier plan subject no longer makes the ledger look unreconstructible
+    # once the run itself has accounted for that item, which is what a resumed
+    # run does for every item the resumed round carried.
+    plan_accounted_item_ids: set[str] = set()
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
     plan_validation_diagnostic: PlanValidationDiagnosticTransport | None = None
     if resume_state is None:
@@ -9085,6 +9102,10 @@ def _run_plan_first_loop(
             issue_context.comments,
             coder_metadata=resumed_round.coder_metadata,
         )
+        plan_accounted_item_ids.update(
+            item.item_id
+            for item in (*resumed_round.prior_items, *resumed_round.current_round_new_items)
+        )
         log(config, f"Planning issue #{issue_number}: resuming round {start_round_number}")
         # A resumed round carries its planning-generation discriminator in
         # durable coder metadata. Historical rounds intentionally have no
@@ -9120,12 +9141,17 @@ def _run_plan_first_loop(
             else ()
         )
         current_plan_subject = _plan_subject(current_plan)
+        plan_accounted_item_ids.update(
+            item.item_id
+            for item in (*prior_unresolved_items, *round_new_unresolved_items)
+        )
         round_ledger_incomplete = _round_ledger_may_be_incomplete(
             current_resume=current_resume,
             prior_unresolved_items=prior_unresolved_items,
             comments=issue_context.comments,
             flow="plan",
             current_subject=current_plan_subject,
+            accounted_item_ids=tuple(sorted(plan_accounted_item_ids)),
         )
         round_resolved_history_item_ids = _round_resolved_history_item_ids(
             prior_unresolved_items=prior_unresolved_items,
@@ -9824,6 +9850,12 @@ def _run_plan_first_loop(
             )
         )
         unresolved_items = [*unresolved_items, *round_new_unresolved_items]
+        # Items minted and cleared inside one round never reappear as prior
+        # items, so record them here too.
+        plan_accounted_item_ids.update(item.item_id for item in unresolved_items)
+        plan_accounted_item_ids.update(
+            item.item_id for item in round_new_unresolved_items
+        )
         must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-plan"}]
         if all_approved and not must_fix_items and issue_context.human_requirements:
             hr_ids = _surfaced_reviewer_requirement_ids(

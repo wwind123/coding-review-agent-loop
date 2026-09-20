@@ -343,7 +343,11 @@ rebuilds the transition classifier's authenticated inputs — the durable
 patch was bound to — from the coder records themselves, so an interruption
 between a remediation planner turn and its scheduler checkpoint keeps the same
 narrow classification instead of latching the complete board; anything that
-cannot be re-verified stays broad. Because each
+cannot be re-verified stays broad. Ledger completeness is judged the same way:
+an item recorded under an earlier plan subject stops counting as a missing
+obligation once the run itself has carried or minted that item, so a resumed
+run's later phase advance carries the approvals it just recorded into the final
+sweep instead of re-invoking the complete board. Because each
 advance costs a round, staged
 planning consumes strictly more rounds than full-board planning, and exhausting
 `--max-rounds` during a pending advance is reported distinctly from reviewer
