@@ -4177,3 +4177,32 @@ def test_issue_context_neutralizes_record_shaped_text_instead_of_rejecting_it():
     assert "issue=1 plan=abc mode=summarize" not in rendered
     assert PLAN_FOLLOWUPS_LABEL in rendered
     assert "into the description." in rendered
+
+
+def test_format_human_requirements_neutralizes_reserved_names_in_the_body():
+    """#891: a signed requirement body is an ordinary human comment.
+
+    The trust-boundary documentation claims every untrusted GitHub surface is
+    rendered with reserved names replaced, so this render must not be the one
+    exception.
+    """
+    text = format_human_requirements(
+        (
+            HumanReviewRequirement(
+                source_type="PR comment",
+                author="reviewer",
+                created_at="2026-09-19T10:00:00Z",
+                url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+                body=(
+                    f"Keep the {PLAN_FOLLOWUPS_TOKEN} label stable, and the "
+                    f"{HANDOFF_TOKEN} one too."
+                ),
+            ),
+        )
+    )
+
+    assert PLAN_FOLLOWUPS_TOKEN not in text
+    assert HANDOFF_TOKEN not in text
+    assert PLAN_FOLLOWUPS_LABEL in text
+    assert HANDOFF_LABEL in text
+    assert "label stable, and the" in text

@@ -647,7 +647,8 @@ segments, and writers verify a one-to-one match between every visible
 occurrence and its authorized canonical segment before posting.
 
 Naming a reserved record in issue or pull-request prose is safe. Untrusted
-GitHub text — an issue title or body, a pull-request title or body, or a
+GitHub text — an issue title or body, a pull-request title or body, a comment,
+or the body of a signed human requirement, which is itself an ordinary
 comment — that merely names a token is rendered into prompts with every
 reserved name replaced by the registry's stable descriptive label, for every
 strictness class. The run logs once which surface named it. This matters

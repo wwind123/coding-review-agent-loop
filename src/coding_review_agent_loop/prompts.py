@@ -819,7 +819,9 @@ def format_human_requirements(
                 f"- Created: {requirement.created_at or '(unknown time)'}",
                 f"- URL: {requirement.url or '(unavailable)'}",
                 "",
-                requirement.body,
+                # A signed requirement body is an ordinary human issue or PR
+                # comment, so it is untrusted GitHub text like any other.
+                neutralize_untrusted_github_text(requirement.body, fallback="(none)"),
             ]
         )
         for requirement in human_requirements

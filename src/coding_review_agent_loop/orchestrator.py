@@ -3101,6 +3101,17 @@ def _run_validated_agent(
         # recovery diagnostic. Failed exits alone may be salvaged from the
         # per-invocation response-file artifact.
         if artifact and result.returncode != 0:
+            # Salvage must not depend on the exit code.  The zero-exit path
+            # already defangs reserved names before validation, so defang the
+            # artifact the same way instead of discarding a complete answer
+            # whose prose merely names a record (#891).
+            artifact = (
+                text
+                if artifact == result.text
+                else _neutralize_untrusted_markers(
+                    artifact, config=config, agent_name=agent_name
+                )
+            )
             try:
                 artifact_unavailable = parse_agent_unavailable(artifact)
             except AgentLoopError:
@@ -3137,9 +3148,7 @@ def _run_validated_agent(
             else:
                 # Let the existing agent-unavailable policy handle the valid
                 # envelope, even when the command itself failed.
-                text = _neutralize_untrusted_markers(
-                    artifact, config=config, agent_name=agent_name
-                )
+                text = artifact
 
         containment = result.containment
         target_exec_retryable = False
