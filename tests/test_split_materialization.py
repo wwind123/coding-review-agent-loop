@@ -666,3 +666,50 @@ def test_find_open_pr_closing_issue_returns_evidence_after_first_page(tmp_path):
     assert found.evidence[0].matched_text == "Fixes #476"
     pr_list = next(cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "list"])
     assert pr_list[pr_list.index("--limit") + 1] == "100000"
+
+
+def test_oversized_split_child_body_is_shortened_so_the_stage_publishes():
+    """#902: a stage split out of a huge plan must still be publishable.
+
+    The proposed scope and rationale are plan-derived, so an unbounded body
+    died with 'GitHub issue body exceeds 60000 characters' at create time.
+    """
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+    from coding_review_agent_loop.split_materialization import (
+        SplitStageProposal,
+        _format_child_issue_body,
+    )
+
+    huge_scope = "\n".join(f"Stage scope line {index}: " + "detail " * 30 for index in range(3_000))
+    huge_rationale = "\n".join(f"Rationale line {index}: " + "because " * 30 for index in range(3_000))
+    assert len(huge_scope) > MAX_GITHUB_BODY_CHARS
+
+    body = _format_child_issue_body(
+        parent_issue=841,
+        proposal=SplitStageProposal(title="Stage one", body=huge_scope, key="a" * 64),
+        rationale=(("codex", huge_rationale),),
+        siblings_so_far=(),
+    )
+
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "Part of #841" in body
+    assert "Stage scope line 0:" in body
+    assert "<!-- AGENT_SPLIT_CHILD: parent=841 key=" in body
+    assert "parent issue #841 and its discussion" in body
+
+
+def test_split_child_body_reports_the_overflowing_section():
+    """#902: an unshortenable body names the surface and section, not a size."""
+    from coding_review_agent_loop.issue_body_limits import BoundedSection, fit_github_body
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        fit_github_body(
+            "x" * 200,
+            sections=(BoundedSection(name="proposed scope", text="", pointer="parent issue #7"),),
+            surface="Split child issue body for parent #7",
+            limit=100,
+        )
+
+    message = str(excinfo.value)
+    assert "Split child issue body for parent #7" in message
+    assert "no shortenable plan-derived section" in message

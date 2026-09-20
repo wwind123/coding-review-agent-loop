@@ -45,6 +45,7 @@ from .protocol import (
     sanitize_architecture_impact,
     validate_direct_readiness,
 )
+from .issue_body_limits import BoundedSection, fit_github_body
 from .round_transport import MAX_GITHUB_BODY_CHARS
 
 AUTOMATION_CLASSES = set(EXECUTION_AUTOMATION_CLASSES)
@@ -1405,40 +1406,23 @@ def format_phase_issue_body(
             execution_strategy_contract_version=execution_strategy_contract_version,
             inherited_matrix_row_ids=inherited_matrix_row_ids,
         )
-    if len(body) > MAX_GITHUB_BODY_CHARS:
-        # Every other section is bounded by its own contract, so the overflow is
-        # the inherited plan excerpt.  Keep the stage contract, the markers and
-        # the identity intact, and point at the parent's canonical plan (#902).
-        overflow = len(body) - MAX_GITHUB_BODY_CHARS
-        bounded = _bounded_parent_excerpt(
-            parent_excerpt,
-            budget=max(len(parent_excerpt) - overflow - _CHILD_BODY_SAFETY_MARGIN, 0),
-            parent_issue=parent_issue,
-        )
-        body = body.replace(parent_excerpt, bounded, 1)
-        if len(body) > MAX_GITHUB_BODY_CHARS:
-            raise AgentLoopError(
-                f"Child phase issue body for parent #{parent_issue} exceeds the GitHub "
-                "limit even with a shortened parent-plan excerpt; its stage contract "
-                "sections are too large to publish."
-            )
-    return body
-
-
-_CHILD_BODY_SAFETY_MARGIN = 1_000
-
-
-def _bounded_parent_excerpt(excerpt: str, *, budget: int, parent_issue: int) -> str:
-    """Shorten an inherited plan excerpt that cannot fit in a child issue body."""
-    notice = (
-        f"[The complete approved plan is in issue #{parent_issue}'s canonical plan comment "
-        "and its machine-readable attachments; only its opening is repeated here because "
-        "the full text does not fit in one GitHub issue body.]"
+    # Every other section is bounded by its own contract, so an oversized child
+    # body is the inherited plan excerpt.  Keep the stage contract, the markers
+    # and the identity intact, and point at the parent's canonical plan (#902).
+    return fit_github_body(
+        body,
+        sections=(
+            BoundedSection(
+                name="approved parent-plan excerpt",
+                text=parent_excerpt,
+                pointer=(
+                    f"issue #{parent_issue}'s canonical plan comment and its "
+                    "machine-readable attachments"
+                ),
+            ),
+        ),
+        surface=f"Child phase issue body for parent #{parent_issue}",
     )
-    if len(excerpt) <= budget:
-        return excerpt
-    keep = max(budget - len(notice) - 2, 0)
-    return f"{excerpt[:keep].rstrip()}\n\n{notice}"
 
 
 def _phase_disposition_lines(phase: PlanPhase) -> list[str]:

@@ -18,6 +18,7 @@ from .github import (
     search_issues,
     validate_open_issue,
 )
+from .issue_body_limits import BoundedSection, fit_github_body
 from .logging import log
 from .protocol import ApprovedFollowup, UnresolvedReviewItem
 from .round_transport import MAX_GITHUB_BODY_CHARS
@@ -881,11 +882,16 @@ def _followup_issue_body(
     else:
         lines.append("Reviewers:")
         lines.extend(f"- {reviewer}" for reviewer in reviewers)
+    pointer = f"the approved review on PR #{pr_number}"
+    main_text = _safe_followup_main_text(followup.text)
+    bounded: list[BoundedSection] = [
+        BoundedSection(name="follow-up text", text=main_text, pointer=pointer)
+    ]
     lines.extend(
         [
             "",
             "Follow-up:",
-            f"- {_safe_followup_main_text(followup.text)}",
+            f"- {main_text}",
         ]
     )
     if possible_duplicate:
@@ -897,17 +903,28 @@ def _followup_issue_body(
             ]
         )
     lines.extend(["", "Original reviewer notes:"])
-    lines.extend(
-        f"- {sanitize_historical_text(item.reviewer)}: {sanitize_historical_text(item.text)}"
-        for item in followup.items
-    )
+    for item in followup.items:
+        safe_reviewer = sanitize_historical_text(item.reviewer)
+        safe_text = sanitize_historical_text(item.text)
+        lines.append(f"- {safe_reviewer}: {safe_text}")
+        bounded.append(
+            BoundedSection(
+                name=f"original note from {safe_reviewer}",
+                text=safe_text,
+                pointer=pointer,
+            )
+        )
     lines.extend(
         [
             "",
             "This was mentioned in an approved review as future work and did not block merge readiness.",
         ]
     )
-    return "\n".join(lines)
+    return fit_github_body(
+        "\n".join(lines),
+        sections=bounded,
+        surface=f"Follow-up issue body for PR #{pr_number}",
+    )
 
 
 def _plan_followup_issue_title(followup: PlanGroupedApprovedFollowup) -> str:
@@ -960,18 +977,26 @@ def _plan_followup_issue_body(
         lines.append("- Original plan item ID(s): " + ", ".join(item_ids))
     if source_context is not None:
         lines.append(f"- Lookup context: {source_context.render()}")
+    pointer = f"issue #{issue_number}'s canonical plan comment and its planning discussion"
+    main_text = _safe_followup_main_text(followup.text)
+    bounded: list[BoundedSection] = [
+        BoundedSection(name="canonical follow-up text", text=main_text, pointer=pointer)
+    ]
     lines.extend(
         [
             "",
             "Canonical follow-up:",
-            f"- {_safe_followup_main_text(followup.text)}",
+            f"- {main_text}",
             "",
             "Original reviewer notes:",
         ]
     )
     for source in followup.sources:
-        lines.append(
-            f"- {_plan_source_label(source)}: {sanitize_historical_text(source.text)}"
+        label = _plan_source_label(source)
+        safe_text = sanitize_historical_text(source.text)
+        lines.append(f"- {label}: {safe_text}")
+        bounded.append(
+            BoundedSection(name=f"original note from {label}", text=safe_text, pointer=pointer)
         )
         for note in source.notes:
             lines.append(f"  - Update from {sanitize_historical_text(note)}")
@@ -990,7 +1015,13 @@ def _plan_followup_issue_body(
             "implementation scope and is not a PR-review prior item.",
         ]
     )
-    return "\n".join(lines)
+    # A follow-up filed from a large approved plan embeds plan-derived reviewer
+    # text; bound it so the issue stays publishable (#902).
+    return fit_github_body(
+        "\n".join(lines),
+        sections=bounded,
+        surface=f"Plan follow-up issue body for issue #{issue_number}",
+    )
 
 
 def _validated_created_issue_url(url: str | None, *, repo: str) -> tuple[int | None, str | None]:
