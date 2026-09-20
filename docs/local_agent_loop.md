@@ -1842,7 +1842,9 @@ Copyable commands, one per workflow, each stopping where noted:
 # Detailed staged plan: create phase children, stop (review/resume each child separately)
 agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode decompose-only
 
-# Same plan, but also implement phase 1 now; stops after phase 1's PR review loop
+# Same plan, but also implement the current phase now; stops after that phase's PR review loop.
+# Rerun the same command after that phase's child closes with a merged PR to advance to the next
+# phase, and again once every phase is delivered to get the terminal report.
 agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode implement-by-phase
 
 # Discuss-mode split consensus: file generic linked children, stop (no implementation in discuss mode)
@@ -1851,7 +1853,7 @@ agent-loop discuss 123 --repo OWNER/REPO --materialize-split-issues
 # Plan-only run whose deferred_stages should still be filed as generic children; stops after plan approval
 agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode plan-only --materialize-split-issues
 
-# Pick work back up on a child created by either path
+# Pick work back up on a child that is still open
 agent-loop issue <child-issue-number> --repo OWNER/REPO
 ```
 
@@ -1868,11 +1870,19 @@ Two worked examples:
 
 1. **Plan-first staged master issue.** Run `--plan-first` with reviewers
    until the plan is approved, then run `--plan-execution-mode decompose-only`
-   to create the phase children. Continue with
-   `agent-loop issue <first-child>` per phase (or use `implement-by-phase`
-   instead of `decompose-only` to have phase 1 implemented in the same run).
-   `--materialize-split-issues` is not used anywhere in this flow — the phase
-   children already are the detailed decomposition.
+   to create the phase children and drive each one with
+   `agent-loop issue <child>`. With `implement-by-phase` instead of
+   `decompose-only`, the same parent command also runs the work: each parent
+   rerun selects the first phase that is not yet complete, dispatches it, and
+   stops after that phase's PR review loop. A phase counts as complete once its
+   child issue is closed and its implementation PR is merged (for a
+   `human-action` or `manual-close` phase, once its child issue is closed), so
+   the sequence is: run the parent, finish the child it names, rerun the
+   parent. When every phase is delivered the parent rerun prints a terminal
+   report naming each stage and any operator-owned retained-parent or
+   final-integration work, and dispatches nothing further; it does not close
+   the parent for you. `--materialize-split-issues` is not used anywhere in
+   this flow — the phase children already are the detailed decomposition.
 2. **Discuss-mode split consensus.** Run
    `agent-loop discuss 123 --repo OWNER/REPO --materialize-split-issues` to
    get a `split` consensus filed as generic linked child issues, then plan or

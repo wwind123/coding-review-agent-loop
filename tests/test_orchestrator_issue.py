@@ -10073,11 +10073,36 @@ def test_get_issue_state_normalizes_lowercase_states(tmp_path):
     ],
 )
 def test_get_issue_state_fails_closed(tmp_path, payload, returncode, message):
-    """Matrix row `issue-state-read-fails-closed`: every rejected case."""
+    """Matrix row `issue-state-read-fails-closed`: every rejected case.
+
+    The stub reproduces the real `Runner.run` check semantics, so a reader that
+    left `check` at its default would raise the generic command failure instead
+    of the contextual diagnostic and this test would fail.
+    """
 
     class _Runner:
-        def run(self, cmd, **_kwargs):
+        def run(self, cmd, *, check=True, **_kwargs):
+            if check and returncode != 0:
+                raise AgentLoopError(
+                    f"Command failed with exit {returncode}: {' '.join(cmd)}"
+                )
             return CommandResult(cmd, None, json.dumps(payload), "", returncode)
 
     with pytest.raises(AgentLoopError, match=re.escape(message)):
         get_issue_state(_Runner(), config=make_config(tmp_path), issue_number=99)
+
+
+def test_get_issue_state_reads_with_check_disabled(tmp_path):
+    """A nonzero `gh` exit must reach the contextual diagnostic, not the generic one."""
+    seen = {}
+
+    class _Runner:
+        def run(self, cmd, *, check=True, **_kwargs):
+            seen["check"] = check
+            if check:
+                raise AgentLoopError("Command failed with exit 1: " + " ".join(cmd))
+            return CommandResult(cmd, None, "", "not found", 1)
+
+    with pytest.raises(AgentLoopError, match=re.escape("`gh` exited 1")):
+        get_issue_state(_Runner(), config=make_config(tmp_path), issue_number=99)
+    assert seen["check"] is False

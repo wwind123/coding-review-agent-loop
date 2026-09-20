@@ -1704,6 +1704,9 @@ def _read_issue_state_projection(
             "{number:.number,state:.state,is_pr:has(\"pull_request\"),url:.html_url}",
         ],
         cwd=active_workdir(config),
+        # `check=False` so a nonzero `gh` exit reaches the contextual
+        # diagnostic below instead of the Runner's generic command failure.
+        check=False,
     )
     if result.returncode != 0:
         raise AgentLoopError(

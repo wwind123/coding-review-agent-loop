@@ -6,6 +6,7 @@ import re
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
+import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
@@ -84,6 +85,7 @@ from agent_loop_helpers import (
     phase_handoff_comment,
     pr_payload_for_state,
     staged_legacy_plan_records,
+    staged_v1_recorded_plan_records,
     plan_decomposition_json,
     structured_plan_review,
     structured_plan_state,
@@ -2203,7 +2205,9 @@ def test_retained_parent_scope_rejects_content_around_a_bounded_excerpt():
 # --- Staged parent advancement (#918) -------------------------------------
 
 
-def test_staged_parent_advances_to_the_next_phase_after_the_first_completes(tmp_path):
+def test_staged_parent_advances_to_the_next_phase_after_the_first_completes(
+    tmp_path, monkeypatch
+):
     """Matrix row `advance-next-phase`: a merged stage-1 dispatches stage-2."""
     plan, created, summary = staged_legacy_plan_records()
     parent_comments = approved_plan_comments(plan) + [
@@ -2225,6 +2229,24 @@ def test_staged_parent_advances_to_the_next_phase_after_the_first_completes(tmp_
         pr_payload={"body": "Fixes #100"},
     )
     config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+    # Order the durable handoff against the coder invocation without relying on
+    # comment/command index arithmetic.
+    events = []
+    real_post = orchestrator_module.post_phase_implementation_handoff_comment
+    real_implement = orchestrator_module._implement_approved_issue
+
+    def _record_post(*args, **kwargs):
+        events.append(f"handoff-{kwargs['phase_index']}")
+        return real_post(*args, **kwargs)
+
+    def _record_implement(*args, **kwargs):
+        events.append("coder")
+        return real_implement(*args, **kwargs)
+
+    monkeypatch.setattr(
+        orchestrator_module, "post_phase_implementation_handoff_comment", _record_post
+    )
+    monkeypatch.setattr(orchestrator_module, "_implement_approved_issue", _record_implement)
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
@@ -2237,9 +2259,13 @@ def test_staged_parent_advances_to_the_next_phase_after_the_first_completes(tmp_
     ]
     assert [item.phase_index for item in handoffs] == [2]
     assert handoffs[0].child_issue_number == 100
+    # Stage-1 is never re-dispatched and never gets a duplicate handoff, and the
+    # stage-2 handoff is persisted before any coder runs.
+    assert events == ["handoff-2", "coder"]
     claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     assert len(claude_calls) == 1
     assert "GitHub issue #100" in claude_calls[0][-1]
+    assert "GitHub issue #99" not in claude_calls[0][-1]
 
 
 def test_staged_parent_reports_a_terminal_state_when_every_phase_is_complete(tmp_path, capsys):
@@ -2405,9 +2431,17 @@ def test_first_staged_run_without_a_handoff_dispatches_phase_one(tmp_path):
         if PHASE_IMPLEMENTATION_MARKER_RE.search(comment)
     ]
     assert [item.phase_index for item in handoffs] == [1]
-    # No child issue-state lookup is made for a phase with no recorded handoff.
+    # No child issue-state lookup is made for any phase, including the selected
+    # phase 1, because no phase carries a recorded handoff.
     assert not any(
-        cmd[:2] == ["gh", "api"] and cmd[2].endswith("/issues/100") for cmd, _cwd in runner.commands
+        cmd[:2] == ["gh", "api"] and cmd[2].endswith(f"/issues/{child}")
+        for cmd, _cwd in runner.commands
+        for child in (99, 100, 101)
+    )
+    # Child PR evidence is only read for a phase whose child state was read, so
+    # the absence of any child issue-state read above also excludes it.
+    assert not any(
+        cmd[:3] == ["gh", "pr", "view"] and "912" in cmd for cmd, _cwd in runner.commands
     )
 
 
@@ -2535,7 +2569,10 @@ def test_staged_progress_rejects_divergent_handoffs_for_one_index(monkeypatch, t
 def test_staged_progress_excludes_handoffs_outside_the_outcome_plan_identity(
     monkeypatch, tmp_path
 ):
-    """Matrix row `legacy-topology-rerun`: the filter binds to the outcome.
+    """Matrix row `legacy-topology-rerun`, handoff-filter aspect only.
+
+    The orchestrated identity, obligation and hint behavior of that row is
+    covered by the legacy rerun tests above; this asserts the filter directly.
 
     A later-index handoff recorded under a different plan hash (or a different
     mode) is invisible to progress, so it cannot trip the ordered-prefix
@@ -2595,3 +2632,124 @@ def test_staged_dry_run_dispatch_reads_no_child_state(tmp_path, capsys):
     assert "staged child work:" not in output
     assert runner.commands == []
     assert runner.comments == []
+
+
+def test_staged_parent_fails_closed_when_child_pr_evidence_is_unreadable(tmp_path):
+    """Matrix row `unauthenticated-child-fails-closed`: unreadable PR evidence.
+
+    The canonical record names PR #912, but GitHub answers with a PR whose URL
+    does not match the recorded one, so the evidence cannot be authenticated.
+    """
+    plan, created, summary = staged_legacy_plan_records()
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+        phase_handoff_comment(plan, created, 1),
+    ]
+    unreadable = pr_payload_for_state(912, "MERGED")
+    unreadable["url"] = "https://github.com/OWNER/REPO/pull/913"
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={99: [child_pr_handoff_comment(99, 912)]},
+        issue_payloads_by_number={99: {"state": "closed"}},
+        pr_payloads_by_number={912: unreadable},
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    with pytest.raises(AgentLoopError, match="state could not be determined"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+def test_legacy_rerun_with_recorded_stage_ids_keeps_todays_hint(tmp_path, capsys):
+    """Matrix row `legacy-topology-rerun`: recorded stage identity and hint."""
+    plan, created, summary = staged_v1_recorded_plan_records()
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+        phase_handoff_comment(plan, created, 1),
+    ]
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={99: []},
+        issue_payloads_by_number={99: {"state": "open"}},
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    output = capsys.readouterr().out
+    # Stage identity comes from the recorded summary, not the ordinal fallback.
+    assert "recorded-stage-1: in progress (#99)" in output
+    assert "recorded-stage-2: pending" in output
+    # A legacy handoff resumes as direct implementation, never child planning.
+    assert "resume directly with `agent-loop issue 99`" in output
+    assert "--plan-first" not in output
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
+
+
+def test_legacy_rerun_without_recorded_stage_ids_uses_the_ordinal_fallback(tmp_path, capsys):
+    """Matrix row `legacy-topology-rerun`: ordinal identity and `none` obligations."""
+    plan, created, summary = staged_legacy_plan_records(stage_count=2)
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+        phase_handoff_comment(plan, created, 1),
+        phase_handoff_comment(plan, created, 2),
+    ]
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={
+            99: [child_pr_handoff_comment(99, 912)],
+            100: [child_pr_handoff_comment(100, 913)],
+        },
+        issue_payloads_by_number={99: {"state": "closed"}, 100: {"state": "closed"}},
+        pr_payloads_by_number={
+            912: pr_payload_for_state(912, "MERGED"),
+            913: pr_payload_for_state(913, "MERGED"),
+        },
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    output = capsys.readouterr().out
+    assert "1: delivered by child issue #99 with merged PR #912" in output
+    assert "2: delivered by child issue #100 with merged PR #913" in output
+    # A legacy summary records no obligations, so both report `none`.
+    assert "Retained-parent obligations: none." in output
+    assert "Final-integration obligations: none." in output
+    assert "No parent-side work remains" in output
+
+
+def test_legacy_rerun_reports_recorded_summary_obligations(tmp_path, capsys):
+    """Matrix row `legacy-topology-rerun`: obligations come from the summary."""
+    plan, created, summary = staged_v1_recorded_plan_records()
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+        phase_handoff_comment(plan, created, 1),
+        phase_handoff_comment(plan, created, 2),
+    ]
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={
+            99: [child_pr_handoff_comment(99, 912)],
+            100: [child_pr_handoff_comment(100, 913)],
+        },
+        issue_payloads_by_number={99: {"state": "closed"}, 100: {"state": "closed"}},
+        pr_payloads_by_number={
+            912: pr_payload_for_state(912, "MERGED"),
+            913: pr_payload_for_state(913, "MERGED"),
+        },
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    output = capsys.readouterr().out
+    assert "recorded-stage-1: delivered by child issue #99 with merged PR #912" in output
+    assert "Retained-parent obligations: required" in output
+    assert "The recorded rollout note." in output
+    assert "Final-integration obligations: required" in output
+    assert "Wire the recorded stages together." in output
+    assert "remains open pending that operator-owned parent work" in output
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)

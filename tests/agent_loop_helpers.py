@@ -82,7 +82,9 @@ from coding_review_agent_loop.comment_rendering import (
 )
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
+    PlanPhase,
     RecordedPhase,
+    RetainedParentScope,
     approved_plan_hash,
     find_existing_phase_implementation_handoff,
     format_decomposition_parent_summary,
@@ -160,6 +162,7 @@ from coding_review_agent_loop.prompts import (
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     DiscussEvidenceClaim,
+    ExecutionAllocation,
     _expect_string_list,
     _extract_structured_coder_followup_payload,
     _extract_structured_plan_review_payload,
@@ -1812,6 +1815,70 @@ def staged_legacy_plan_records(*, stage_count=3, automations=None):
         mode="implement-by-phase",
         plan_hash=approved_plan_hash(plan),
         created=created,
+    )
+    return plan, created, summary
+
+
+def staged_v1_recorded_plan_records(*, stage_count=2, automations=None):
+    """A recorded `approved-plan-v1` summary consumed on the legacy path.
+
+    The summary records stage ids and parent obligations (which only the v1
+    source serializes), while the run itself carries no live v1 recommendation,
+    so the dispatcher takes the legacy branch over recorded identities.
+    """
+    plan = structured_plan_state(summary="Deliver the recorded staged contracts.")
+    automations = automations or ("agent-pr",) * stage_count
+    created = tuple(
+        CreatedPhaseIssue(
+            phase=PlanPhase(
+                title=f"Stage {index}",
+                scope="Deliver the contract.",
+                non_goals="None.",
+                dependency_notes="None.",
+                rollout_risk="low",
+                validation="Tests pass.",
+                parent_context="Parent context.",
+                automation=automations[index - 1],
+                stage_id=f"recorded-stage-{index}",
+                position=index,
+                deliverables=("A deliverable.",),
+                non_goals_items=("No unrelated change.",),
+                acceptance_criteria=("It passes.",),
+                compatibility_constraints=("Preserve callers.",),
+                covered_scope_item_ids=(f"scope-{index}",),
+                execution_disposition="direct-implementation",
+                disposition_rationale="Reviewed route.",
+            ),
+            issue_url=f"https://github.com/OWNER/REPO/issues/{98 + index}",
+            issue_number=98 + index,
+        )
+        for index in range(1, stage_count + 1)
+    )
+    plan_hash = approved_plan_hash(plan)
+    summary = format_decomposition_parent_summary(
+        parent_issue=56,
+        mode="implement-by-phase",
+        plan_hash=plan_hash,
+        created=created,
+        topology_source="approved-plan-v1",
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="recorded-subject",
+            plan_hash=plan_hash,
+            excerpt="Keep the rollout note on the parent.",
+            status="required",
+            deliverables=("The recorded rollout note.",),
+            acceptance_criteria=("The recorded rollout note is published.",),
+        ),
+        final_integration_work=ExecutionAllocation(
+            status="required",
+            deliverables=("Wire the recorded stages together.",),
+            acceptance_criteria=("The recorded end-to-end behavior passes.",),
+            covered_scope_item_ids=("scope-final",),
+        ),
+        strategy="staged",
+        execution_strategy_contract_version=1,
+        recommendation_digest="d" * 64,
+        plan_subject="recorded-subject",
     )
     return plan, created, summary
 
