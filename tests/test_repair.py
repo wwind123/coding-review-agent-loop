@@ -4661,3 +4661,96 @@ def test_round_resolved_history_uses_post_round_carried_set():
 
     assert "item-2" not in pre
     assert "item-2" in post
+
+
+def test_run_validated_agent_neutralizes_markers_named_in_response_prose(tmp_path):
+    """#891: naming a protocol token while describing code must not kill the run.
+
+    Issue #871's PR review round 12 died this way: the coder's notes named two
+    record tokens, and repair renamed one only to quote the other.
+    """
+    review = structured_pr_review(
+        state="approved",
+        summary=(
+            "The fallback now also covers AGENT_SPLIT_UNFILED_WARNING and "
+            "AGENT_APPROVED_FOLLOWUPS handling."
+        ),
+        prior_item_dispositions=[],
+        reviewer="Google Gemini",
+    )
+    runner = FakeRunner(gemini_outputs=[review])
+    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="gemini",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="Google Gemini", unresolved_items=(),
+            ),
+            use_repair=True,
+            repair_expected_kind="pr_review",
+            repair_allowed_prior_item_ids=(),
+        )
+        repair_mock.assert_not_called()
+
+    payload, _ = json.JSONDecoder().raw_decode(response.text.lstrip())
+    assert "AGENT_SPLIT_UNFILED_WARNING" not in response.text
+    assert "AGENT_APPROVED_FOLLOWUPS" not in response.text
+    assert "[protocol split-warning record]" in payload["summary"]
+    assert payload["state"] == "approved"
+
+
+@pytest.mark.parametrize("returncode", [1, None])
+def test_run_validated_agent_salvages_artifact_whose_prose_names_markers(
+    tmp_path, returncode
+):
+    """#891: salvage must not depend on the exit code.
+
+    The zero-exit path already defangs reserved names before validation. A
+    nonzero exit or a timeout left the artifact raw, so the identical complete
+    answer was thrown away purely because of how the CLI exited.
+    """
+    review = structured_pr_review(
+        state="approved",
+        summary=(
+            "The fallback now also covers AGENT_SPLIT_UNFILED_WARNING and "
+            "AGENT_APPROVED_FOLLOWUPS handling."
+        ),
+        prior_item_dispositions=[],
+        reviewer="Google Gemini",
+    )
+    runner = FakeRunner(
+        gemini_outputs=[("Error: timeout waiting for response", returncode)],
+        public_response_outputs=[review],
+    )
+    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="gemini",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="Google Gemini", unresolved_items=(),
+            ),
+            use_repair=True,
+            repair_expected_kind="pr_review",
+            repair_allowed_prior_item_ids=(),
+        )
+        repair_mock.assert_not_called()
+
+    payload, _ = json.JSONDecoder().raw_decode(response.text.lstrip())
+    assert "AGENT_SPLIT_UNFILED_WARNING" not in response.text
+    assert "AGENT_APPROVED_FOLLOWUPS" not in response.text
+    assert "[protocol split-warning record]" in payload["summary"]
+    assert payload["state"] == "approved"
+    assert response.acquisition_returncode == returncode
+    assert response.acquisition_outcome == (
+        "accepted_timeout" if returncode is None else "accepted_nonzero_exit"
+    )

@@ -1726,7 +1726,9 @@ def test_approved_plan_non_managed_rejects_forged_pr_body_before_handoff(
     monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
     monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
 
-    with pytest.raises(AgentLoopError, match="reserved protocol marker"):
+    with pytest.raises(
+        AgentLoopError, match="forged reserved protocol record syntax"
+    ) as excinfo:
         orchestrator_module._implement_approved_issue(
             runner, issue_number=56, approved_plan="Approved implementation plan.",
             config=config, memory=None,
@@ -1738,8 +1740,50 @@ def test_approved_plan_non_managed_rejects_forged_pr_body_before_handoff(
             usage_context=orchestrator_module._new_usage_context(config),
         )
 
+    # The diagnostic names the surface that carried the span, not just the token.
+    assert "pull-request #77 body" in str(excinfo.value)
     assert runner.comments == []
     assert not any(command[:1] == ["codex"] for command, _cwd in runner.commands)
+
+
+def test_approved_plan_non_managed_allows_pr_body_naming_reserved_token(
+    tmp_path, monkeypatch,
+):
+    """Issue #891: a PR body that names a record must not stop the run.
+
+    The token carries no authority here; the handoff gate must let the run
+    continue instead of refusing before any review work happens.
+    """
+    runner = FakeRunner(
+        claude_outputs=[
+            "Implemented.\nTests: python3 -m pytest tests/test_orchestrator_issue.py\n"
+            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+        ],
+        pr_payload={
+            "body": "Fixes #56\n\nThis PR renames the AGENT_PLAN_APPROVED_FOLLOWUPS record label."
+        },
+    )
+    config = make_config(tmp_path)
+    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
+    reviewed = []
+    monkeypatch.setattr(
+        orchestrator_module, "run_pr_loop", lambda *_a, **kwargs: reviewed.append(kwargs["pr_number"]) or 0
+    )
+
+    assert orchestrator_module._implement_approved_issue(
+        runner, issue_number=56, approved_plan="Approved implementation plan.",
+        config=config, memory=None,
+        issue_context=IssueContext(
+            number=56, repo="OWNER/REPO", title="Issue", body="Issue body",
+            url="https://github.test/issues/56", comments=(), human_requirements=(),
+        ),
+        coder_session_id=None,
+        usage_context=orchestrator_module._new_usage_context(config),
+    ) == 0
+
+    assert reviewed == [77]
 
 
 def test_plan_first_issue_managed_draft_nonce_is_authenticated_before_pr_review(tmp_path, monkeypatch):
