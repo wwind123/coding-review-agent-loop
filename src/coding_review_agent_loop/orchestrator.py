@@ -9417,6 +9417,9 @@ def _run_plan_first_loop(
         # Superseded pre-panel plan reviews, replayed to their own author only
         # as non-authoritative context under the operator planning override.
         superseded_plan_prepanel: dict[str, PostedRoundRecord] = {}
+        # Item IDs claimed only by superseded pre-panel reviews; excluded from
+        # the ledger even when the record itself is not replayed as context.
+        superseded_prepanel_item_ids: set[str] = set()
         if staged_planning and plan_primary_name is not None:
             def _is_unqualified_prepanel(record: PostedRoundRecord) -> bool:
                 return not (
@@ -9448,6 +9451,9 @@ def _run_plan_first_loop(
                         and _is_unqualified_prepanel(record)
                     ):
                         superseded_plan_prepanel[metadata.agent] = record
+                        superseded_prepanel_item_ids.update(
+                            item.item_id for item in metadata.new_items
+                        )
             # A secondary plan review recorded before any qualified panel
             # opening is an unqualified artifact: it is never resumed as
             # settled work, never an approval, and never ownership.  The
@@ -9465,7 +9471,35 @@ def _run_plan_first_loop(
                 )
                 if plan_operator_force_full:
                     superseded_plan_prepanel[name] = resumed_by_name[name]
+                superseded_prepanel_item_ids.update(
+                    item.item_id for item in resumed_by_name[name].metadata.new_items
+                )
                 resumed_by_name.pop(name, None)
+            if superseded_prepanel_item_ids:
+                # A reconciled resume rehydrates every current-round item,
+                # including the superseded secondary's own claims (and their
+                # duplicates on the reconciliation summary).  Those claims are
+                # excluded from finding and ownership accounting, so they must
+                # not survive as must-fix obligations once the same secondary
+                # is freshly invoked.
+                rehydrated = [
+                    item
+                    for item in round_new_unresolved_items
+                    if item.item_id in superseded_prepanel_item_ids
+                ]
+                if rehydrated:
+                    log(
+                        config,
+                        f"Planning round {round_number}: dropping superseded pre-panel plan "
+                        "item(s) "
+                        + ", ".join(sorted({item.item_id for item in rehydrated}))
+                        + " from the current-round ledger; they establish no obligation",
+                    )
+                    round_new_unresolved_items[:] = [
+                        item
+                        for item in round_new_unresolved_items
+                        if item.item_id not in superseded_prepanel_item_ids
+                    ]
             if superseded_plan_prepanel:
                 log(
                     config,

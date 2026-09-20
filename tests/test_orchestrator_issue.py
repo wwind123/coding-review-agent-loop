@@ -8561,7 +8561,9 @@ def _plan_round_records(runner):
     return records
 
 
-def _staged_plan_history(tmp_path, *, reviewer_records=(), scheduler_record=True):
+def _staged_plan_history(
+    tmp_path, *, reviewer_records=(), scheduler_record=True, reconciliation_record=False
+):
     """A generation-1 planning round-1 coder record plus reviewer records.
 
     ``scheduler_record`` writes the round-1 planning scheduler checkpoint, so
@@ -8657,6 +8659,30 @@ def _staged_plan_history(tmp_path, *, reviewer_records=(), scheduler_record=True
                         subject=subject,
                         state=state,
                         new_items=items,
+                    ),
+                ),
+            }
+        )
+    if reconciliation_record:
+        # A reconciled round: the summary checkpoint repeats the round's items,
+        # so a resume rehydrates them into the current-round ledger.
+        reconciled_items = tuple(
+            item for _agent, _state, items in reviewer_records for item in items
+        )
+        comments.append(
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-01-01T00:01:00Z",
+                "body": _attach_round_metadata(
+                    "Plan round reconciliation.\n\n-- Orchestrator",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="summary",
+                        agent="Orchestrator",
+                        round_number=1,
+                        subject=subject,
+                        phase="reconciliation",
+                        new_items=reconciled_items,
                     ),
                 ),
             }
@@ -9097,6 +9123,9 @@ def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path
     """`operator-force-full-override`: the override authorizes the board."""
     comments, _canonical = _staged_plan_history(
         tmp_path,
+        # The interrupted round is reconciled, so a resume rehydrates every
+        # current-round item, including the superseded secondary's claim.
+        reconciliation_record=True,
         reviewer_records=[
             (
                 "Gemini",
@@ -9171,6 +9200,15 @@ def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path
         command[-1] for command, _cwd in runner.commands if command[:1] == ["codex"]
     ][-1]
     assert "Superseded pre-panel plan review context" not in codex_prompt
+    # The reconciled resume rehydrates the round's items, but the superseded
+    # claim establishes no obligation: no planner turn is needed, and the
+    # fresh approvals settle the round with no surviving must-fix item.
+    assert not any(cmd[0] == "claude" for cmd, _cwd in runner.commands)
+    posted = _plan_round_records(runner)[len(comments):]
+    assert posted, "the resumed round must post its own durable records"
+    for record in posted:
+        assert "item-1" not in {item.item_id for item in record.new_items}
+        assert "item-1" not in {item.item_id for item in record.prior_items}
 
 
 def test_staged_planning_stops_when_planning_history_cannot_be_extracted(tmp_path):
