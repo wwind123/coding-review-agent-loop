@@ -1183,7 +1183,11 @@ def get_pr_review_context(
     log_untrusted_marker_neutralization(
         config,
         surface=f"Pull request #{pr_number} text",
-        texts=[metadata.body, *(comment.body for comment in comments)],
+        texts=[
+            metadata.title,
+            metadata.body,
+            *(comment.body for comment in comments),
+        ],
     )
     return PullRequestReviewContext(
         metadata=metadata,
@@ -1879,15 +1883,16 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
         comments=_parse_issue_comments(data.get("comments")),
     )
     body = _optional_str(data.get("body"))
+    title = _optional_str(data.get("title"))
     log_untrusted_marker_neutralization(
         config,
         surface=f"Issue #{issue_number} text",
-        texts=[body, *(comment.body for comment in comments)],
+        texts=[title, body, *(comment.body for comment in comments)],
     )
     return IssueContext(
         number=int(data.get("number") or issue_number),
         repo=config.repo,
-        title=_optional_str(data.get("title")),
+        title=title,
         body=body,
         url=_optional_str(data.get("url")),
         comments=comments,

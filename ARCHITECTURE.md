@@ -497,8 +497,11 @@ Key contracts to preserve when changing the implementation:
 - Keep untrusted issue/PR prose and model output separate from tool-owned
   protocol markers. A marker or model signature alone is not authentication.
   Untrusted text that merely names a reserved token is neutralized into the
-  registry's descriptive label when rendered into prompts, never refused;
-  record-shaped untrusted spans and tool-owned publications stay fail-closed.
+  registry's descriptive label when rendered into prompts, never refused.
+  Rejection is narrower than neutralization: record-shaped spans fail closed at
+  the pull-request-body authorization gate, in a current agent response, and in
+  tool-owned publications. Other untrusted surfaces are neutralized, and
+  authority there still depends on the typed record parsers' own checks.
 - Re-check the live head and relevant qualification identities at finalization;
   old approvals and CI from another head must not authorize a new one.
 - Do not equate missing required input, interrupted commands, or infrastructure

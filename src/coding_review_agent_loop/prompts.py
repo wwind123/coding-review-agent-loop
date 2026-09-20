@@ -52,7 +52,7 @@ from .protocol import (
     risk_test_matrix_prompt_examples,
     semantic_risk_claim_schema_text,
 )
-from .protocol_markers import sanitize_historical_text
+from .protocol_markers import sanitize_historical_text, sanitize_untrusted_prose
 from .workdirs import agent_workdir
 from .test_runtime import (
     preflight_wrapper_candidates,
@@ -676,12 +676,13 @@ def neutralize_untrusted_github_text(text: str | None, *, fallback: str) -> str:
     Issue and pull-request prose legitimately names a protocol record when the
     work concerns the protocol itself.  The name never carried authority, but
     rendering it verbatim made the marker-safety guards treat the whole run as
-    forged.  Render the registry's stable descriptive label instead; nothing
-    downstream parses prompt text as a durable record.
+    forged.  Render the registry's stable descriptive label instead — for every
+    strictness class, including entries whose scanner has no bare-name
+    fallback.  Nothing downstream parses prompt text as a durable record.
     """
     if not text:
         return fallback
-    return sanitize_historical_text(text)
+    return sanitize_untrusted_prose(text)
 
 
 def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000) -> str:
@@ -3631,7 +3632,7 @@ def _build_compact_pr_review_prompt(
     action = (
         compact_tail.action if compact_tail and compact_tail.action else None
     ) or "Review the current PR diff for correctness, security, test coverage, and maintainability."
-    title = pr_metadata.title or "(unknown)"
+    title = neutralize_untrusted_github_text(pr_metadata.title, fallback="(unknown)")
     head_branch = pr_metadata.head_branch or "(unknown)"
     base_branch = pr_metadata.base_branch or "(unknown)"
     url_line = f"- URL: {pr_metadata.url}\n" if pr_metadata.url else ""
@@ -3987,7 +3988,7 @@ def build_review_prompt(
             coder_followup_context=sanitize_historical_text(coder_followup_context),
         )
         return compact_prompt
-    title = metadata.title or "(unknown)"
+    title = neutralize_untrusted_github_text(metadata.title, fallback="(unknown)")
     head_branch = metadata.head_branch or "(unknown)"
     base_branch = metadata.base_branch or "(unknown)"
     head_sha = metadata.head_sha or "(unknown)"

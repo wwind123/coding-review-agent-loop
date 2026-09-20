@@ -1902,13 +1902,17 @@ def test_pr_review_runs_when_pr_and_issue_text_name_a_reserved_token(tmp_path, c
     """
     token = "AGENT_PLAN_APPROVED_FOLLOWUPS"
     label = "[protocol PLAN_APPROVED_FOLLOWUPS record]"
+    # A `well-formed-only` entry has no bare-name fallback in the scanner, so
+    # cover one on the title surfaces too.
+    strict_token = "AGENT_ISSUE_PR_HANDOFF"
+    strict_label = "[protocol ISSUE_PR_HANDOFF record]"
     runner = FakeRunner(
         codex_outputs=[
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
         ],
         issue_payload={
             "number": 56,
-            "title": "Reserved token label",
+            "title": f"Reserved {strict_token} label",
             "body": f"The planner writes {token} when it approves follow-ups.",
         },
         issue_comments=[
@@ -1918,7 +1922,10 @@ def test_pr_review_runs_when_pr_and_issue_text_name_a_reserved_token(tmp_path, c
                 "body": f"The {token} name also appears in a comment.",
             }
         ],
-        pr_payload={"body": f"Fixes #56\n\nThis PR renames the {token} record label."},
+        pr_payload={
+            "title": f"Rename the {strict_token} label",
+            "body": f"Fixes #56\n\nThis PR renames the {token} record label.",
+        },
     )
     config = make_config(tmp_path, quiet=False)
 
@@ -1926,14 +1933,23 @@ def test_pr_review_runs_when_pr_and_issue_text_name_a_reserved_token(tmp_path, c
 
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert token not in prompt
+    assert strict_token not in prompt
     assert label in prompt
+    assert f"- Title: Rename the {strict_label} label" in prompt
     # Surrounding prose survives, so the reviewer still sees the request.
     assert "when it approves follow-ups." in prompt
     assert "name also appears in a comment." in prompt
-    # The run says which surfaces named the token and that it grants no authority.
+    # The run says which surfaces named the tokens, titles included, and that
+    # they grant no authority.
     logged = capsys.readouterr().err
-    assert f"Issue #56 text names reserved protocol marker(s) {token}" in logged
-    assert f"Pull request #77 text names reserved protocol marker(s) {token}" in logged
+    assert (
+        f"Issue #56 text names reserved protocol marker(s) {strict_token}, {token}"
+        in logged
+    )
+    assert (
+        f"Pull request #77 text names reserved protocol marker(s) {strict_token}, {token}"
+        in logged
+    )
     assert logged.count("They carry no authority.") == 2
 
 

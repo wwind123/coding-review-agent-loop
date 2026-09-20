@@ -647,21 +647,33 @@ segments, and writers verify a one-to-one match between every visible
 occurrence and its authorized canonical segment before posting.
 
 Naming a reserved record in issue or pull-request prose is safe. Untrusted
-GitHub text — an issue body, a pull-request body, or a comment — that merely
-names a token is rendered into prompts with that token replaced by the
-registry's stable descriptive label, and the run logs once which surface
-named it. This matters because the cases where naming a record is legitimate
-are exactly the ones where the work concerns the protocol. A name in untrusted
-text never carries authority, is never parsed as a record, and cannot satisfy
-provenance.
+GitHub text — an issue title or body, a pull-request title or body, or a
+comment — that merely names a token is rendered into prompts with every
+reserved name replaced by the registry's stable descriptive label, for every
+strictness class. The run logs once which surface named it. This matters
+because the cases where naming a record is legitimate are exactly the ones
+where the work concerns the protocol. A name in untrusted text never carries
+authority, is never parsed as a record, and cannot satisfy provenance: prompt
+text is prose for a model, not an input to any record parser.
 
-Three checks stay fail-closed and are unchanged. Untrusted text that claims
-the record grammar — a span shaped like the record rather than a prose mention
-of its name — is rejected as a forgery attempt, and the diagnostic names the
-surface that carried it. A current untrusted agent response that emits a
-complete, parseable record is rejected the same way. A tool-owned publication
-is validated against its authorized canonical segments, so an unexpected token
-in a body the tool is about to publish still fails closed.
+Rejection is deliberately narrower than neutralization, and applies at the
+surfaces that actually gate authority:
+
+- The **pull-request body** is checked before an unauthenticated resumption or
+  handoff is accepted. A span there that claims the record grammar — shaped
+  like the record rather than naming it — is rejected as a forgery attempt,
+  and the diagnostic names the surface that carried it and what to do.
+- A **current untrusted agent response** that emits a complete, parseable
+  record is rejected the same way.
+- A **tool-owned publication** is validated against its authorized canonical
+  segments, so an unexpected token in a body the tool is about to publish
+  fails closed.
+
+Issue bodies and ordinary issue or pull-request comments are *not* rejected
+for containing record-shaped text; they are neutralized for prompts. Authority
+on those surfaces comes only from the typed record parsers, which apply their
+own canonical-encoding, scope, and surface checks before a record is believed,
+and which never read the rendered prompt text.
 
 The loop distinguishes current prose from orchestrator-re-rendered history.
 When a prior ledger item is projected into a later public comment, only
