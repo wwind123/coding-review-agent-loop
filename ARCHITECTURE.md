@@ -345,9 +345,14 @@ between a remediation planner turn and its scheduler checkpoint keeps the same
 narrow classification instead of latching the complete board; anything that
 cannot be re-verified stays broad. Ledger completeness is judged the same way:
 an item recorded under an earlier plan subject stops counting as a missing
-obligation once the run itself has carried or minted that item, so a resumed
-run's later phase advance carries the approvals it just recorded into the final
-sweep instead of re-invoking the complete board. Because each
+obligation once the run has carried or minted that item, or once the recorded
+history proves it was canonically cleared. That second proof has to come from
+the durable history rather than the running process, because a reviewer-only
+advance records an empty carried ledger — after remediation there is nothing
+left to carry — and a restart on exactly that seam would otherwise rediscover
+the cleared item and read the ledger as unreconstructible. With both proofs, a
+resumed run's later phase advance carries the approvals it just recorded into
+the final sweep instead of re-invoking the complete board. Because each
 advance costs a round, staged
 planning consumes strictly more rounds than full-board planning, and exhausting
 `--max-rounds` during a pending advance is reported distinctly from reviewer

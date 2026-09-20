@@ -7561,10 +7561,15 @@ def _round_ledger_may_be_incomplete(
 ) -> bool:
     """Whether the active finding ledger may be missing a recorded item.
 
-    ``accounted_item_ids`` holds item IDs this run has already carried or
-    minted, so they are demonstrably part of the reconstructed ledger even when
-    the durable record that introduced them names an earlier plan subject.
-    Callers that pass nothing keep the previous conservative reading, where any
+    ``accounted_item_ids`` holds item IDs that are demonstrably part of the
+    reconstructed ledger even when the durable record that introduced them
+    names an earlier plan subject: the ones this run carried or minted, plus
+    the ones recorded history proves were canonically cleared.  The cleared
+    half has to come from recorded history rather than the in-process set
+    alone, because a reviewer-only phase advance persists an empty carried
+    ledger, so a restart on that seam would otherwise rediscover a cleared
+    cross-subject item and read the ledger as unreconstructible.  Callers that
+    pass nothing keep the previous conservative reading, where any
     cross-subject item at all makes the ledger unreconstructible (#905, from
     #841).
     """
@@ -9141,10 +9146,18 @@ def _run_plan_first_loop(
             else ()
         )
         current_plan_subject = _plan_subject(current_plan)
+        round_resolved_history_item_ids = _round_resolved_history_item_ids(
+            prior_unresolved_items=prior_unresolved_items,
+            comments=issue_context.comments,
+            flow="plan",
+            reconciliation_mode="aggregate",
+            same_status="same-plan",
+        )
         plan_accounted_item_ids.update(
             item.item_id
             for item in (*prior_unresolved_items, *round_new_unresolved_items)
         )
+        plan_accounted_item_ids.update(round_resolved_history_item_ids)
         round_ledger_incomplete = _round_ledger_may_be_incomplete(
             current_resume=current_resume,
             prior_unresolved_items=prior_unresolved_items,
@@ -9152,13 +9165,6 @@ def _run_plan_first_loop(
             flow="plan",
             current_subject=current_plan_subject,
             accounted_item_ids=tuple(sorted(plan_accounted_item_ids)),
-        )
-        round_resolved_history_item_ids = _round_resolved_history_item_ids(
-            prior_unresolved_items=prior_unresolved_items,
-            comments=issue_context.comments,
-            flow="plan",
-            reconciliation_mode="aggregate",
-            same_status="same-plan",
         )
         plan_hr_ids = _surfaced_reviewer_requirement_ids(
             issue_context.human_requirements,

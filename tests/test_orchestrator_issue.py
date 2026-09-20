@@ -4529,6 +4529,9 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
     # #862 plan-flow analog: an earlier plan subject raised and resolved
     # item-1, the carried set is empty, and the reviewer repeats item-1 as
     # resolved.  The no-op entry is stripped instead of failing the run.
+    # item-2 is raised under that subject and never cleared, so the ledger
+    # stays genuinely unreconstructible: a history whose only cross-subject
+    # item is the resolved one now reads as complete (#905).
     old_plan = "Old plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     mid_plan = "Mid plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     new_plan = "New plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -4540,11 +4543,27 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
         status="blocking",
         source_status="blocking",
     )
+    uncleared_item = UnresolvedReviewItem(
+        item_id="item-2",
+        reviewer="OpenAI Codex",
+        source_round=1,
+        text="Old subject item that was never cleared.",
+        status="blocking",
+        source_status="blocking",
+    )
     raised = _attach_round_metadata(
-        structured_plan_review(state="blocking", blocking_plan_issues=["Old subject item."]),
+        structured_plan_review(
+            state="blocking",
+            blocking_plan_issues=[
+                "Old subject item.",
+                "Old subject item that was never cleared.",
+            ],
+        ),
         PostedRoundMetadata(
             flow="plan", role="reviewer", agent="Codex", round_number=1,
-            subject=_plan_subject(old_plan), new_items=(old_item,), state="blocking",
+            subject=_plan_subject(old_plan),
+            new_items=(old_item, uncleared_item),
+            state="blocking",
         ),
     )
     resolved = _attach_round_metadata(
@@ -9300,6 +9319,89 @@ def test_staged_planning_resumed_remediation_stays_owner_scoped(tmp_path):
     # The resumed run re-invokes nothing already settled: it adds exactly the
     # remediation owner plus primary and the single sweep reviewer.
     assert reviewer_calls() == [*calls_before, "codex", "gemini", "agy"]
+
+
+def test_staged_planning_resume_on_the_phase_advance_seam_keeps_the_sweep_narrow(tmp_path):
+    """`reviewer-only-phase-advance`: the cleared ledger survives a restart.
+
+    A reviewer-only advance carries no unresolved item, so its durable record
+    persists an empty ledger. A process that stops on exactly that seam and
+    restarts must still read the ledger as reconstructible -- the remediated
+    item is cleared by recorded history, not merely by the interrupted run's
+    memory -- so the final sweep stays narrow and invokes only the reviewer
+    that still lacks an exact-plan approval.
+    """
+    runner = _remediation_runner()
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+    real_post = orchestrator_module.post_issue_comment
+
+    def interrupt_after_the_sweep_advance(*args, **kwargs):
+        # Post the advance first: the seam under test is a restart with that
+        # record durable and nothing after it.
+        result = real_post(*args, **kwargs)
+        if kwargs["body"].startswith("Plan review phase advance to round 4."):
+            raise KeyboardInterrupt
+        return result
+
+    with patch.object(
+        orchestrator_module,
+        "post_issue_comment",
+        side_effect=interrupt_after_the_sweep_advance,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    interrupted = _plan_round_records(runner)
+    advance = [
+        record
+        for record in interrupted
+        if record.phase == "plan-phase-advance" and record.round_number == 4
+    ]
+    assert len(advance) == 1
+    # The seam: the advance record carries no ledger at all, because
+    # remediation cleared the only item before it was written.
+    assert advance[0].prior_items == ()
+    assert not any(
+        record.round_number == 4 and record.phase == "scheduler-prelaunch"
+        for record in interrupted
+    )
+
+    def reviewer_calls():
+        return [
+            cmd[0]
+            for cmd, _cwd in runner.commands
+            if cmd[0] in {"codex", "gemini", "agy"}
+        ]
+
+    calls_before = reviewer_calls()
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    resumed = _plan_round_records(runner)
+    prelaunch = {
+        record.round_number: record
+        for record in resumed
+        if record.phase == "scheduler-prelaunch"
+    }
+    sweep = prelaunch[4]
+    assert sweep.scheduler_phase == "final-secondary-sweep"
+    assert sweep.scheduler_selected_reviewers == ("Antigravity",)
+    assert sweep.scheduler_force_full is False
+    assert sweep.scheduler_force_full_source is None
+    assert not any(
+        record.scheduler_phase == "full-board" for record in prelaunch.values()
+    )
+    reviewer_rounds = [
+        (record.agent, record.round_number)
+        for record in resumed
+        if record.role == "reviewer"
+    ]
+    assert reviewer_rounds.count(("Antigravity", 4)) == 1
+    assert ("Codex", 4) not in reviewer_rounds
+    assert ("Gemini", 4) not in reviewer_rounds
+    assert reviewer_calls() == [*calls_before, "agy"]
 
 
 def test_staged_planning_round_budget_names_the_outstanding_final_sweep(tmp_path):
