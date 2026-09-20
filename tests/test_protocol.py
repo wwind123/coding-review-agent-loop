@@ -79,10 +79,12 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
     validate_structured_plan_revision,
     sanitize_architecture_impact,
+    RISK_MATRIX_MAX_LIST_ITEMS,
     RISK_TEST_MATRIX_CHANGE_KEYS,
     RISK_TEST_MATRIX_REQUIRED_KEYS,
     RISK_TEST_MATRIX_ROW_KEYS,
     risk_test_matrix_prompt_examples,
+    semantic_risk_claim_schema_text,
 )
 
 
@@ -4659,3 +4661,101 @@ def test_discuss_final_synthesis_parser_rejects_invalid_classification_shape():
     parsed = parse_structured_discuss_final_synthesis(_synthesis_response(final))
     assert parsed is not None
     assert serialize_discuss_final_synthesis(parsed).startswith('{"schema_version":1')
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_claim_truncates_an_overlong_fact_list_instead_of_rejecting(kind):
+    """#913: a row covering many tests must not discard a reviewed PR.
+
+    PR #912 was approved by the primary and then lost its follow-up to
+    'test_identifiers exceeds the 12-item bound'.
+    """
+    identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(13)]
+    claims = [{
+        "row_id": "row-1",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": identifiers,
+        "test_locations": ["tests/test_mod.py"],
+        "workflow_path_claim": "issue mode / follow-up",
+        "outcome_assertions": ["Every listed test passed."],
+        "forbidden_effect_assertions": ["No unauthorized evidence was accepted."],
+    }]
+
+    parsed = _validate_claims_envelope(kind, claims)
+
+    claim = parsed.risk_test_matrix_claims.claims[0]
+    assert claim.test_identifiers == tuple(identifiers[:12])
+    assert any("listed 13 items" in caveat for caveat in claim.caveats)
+    assert claim.test_locations == ("tests/test_mod.py",)
+
+
+def test_semantic_claim_still_rejects_a_malformed_overlong_fact_list():
+    identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(12)] + [""]
+    claims = [{
+        "row_id": "row-1",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": identifiers,
+    }]
+
+    with pytest.raises(AgentLoopError, match="test_identifiers"):
+        _validate_claims_envelope("coder_followup", claims)
+
+
+@pytest.mark.parametrize("repeat_index", [0, 11])
+def test_semantic_claim_rejects_a_duplicate_in_the_discarded_tail(repeat_index):
+    """#913: truncation must not hide a duplicate that falls past the bound."""
+    identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(12)]
+    identifiers.append(identifiers[repeat_index])
+    claims = [{
+        "row_id": "row-1",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": identifiers,
+    }]
+
+    with pytest.raises(AgentLoopError, match="test_identifiers contains duplicate items"):
+        _validate_claims_envelope("coder_followup", claims)
+
+
+def test_semantic_claim_rejects_duplicates_confined_to_the_discarded_tail():
+    identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(12)]
+    identifiers.extend(["tests/test_mod.py::test_tail", "tests/test_mod.py::test_tail"])
+    claims = [{
+        "row_id": "row-1",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": identifiers,
+    }]
+
+    with pytest.raises(AgentLoopError, match="test_identifiers contains duplicate items"):
+        _validate_claims_envelope("coder_followup", claims)
+
+
+def test_semantic_claim_discloses_every_truncated_fact_list_and_dropped_refs():
+    """#913: bookkeeping caveats must coexist with a full model caveat list."""
+    claim = _complete_semantic_claim()
+    claim["execution_refs"] = ["turn:observation-1", _COMMAND_REF]
+    claim["test_identifiers"] = [
+        f"tests/test_mod.py::test_case_{index}" for index in range(13)
+    ]
+    claim["outcome_assertions"] = [f"Assertion {index} held." for index in range(14)]
+    claim["caveats"] = [f"Model caveat {index}." for index in range(16)]
+
+    parsed = _validate_claims_envelope("coder_followup", [claim])
+
+    parsed_claim = parsed.risk_test_matrix_claims.claims[0]
+    assert len(parsed_claim.caveats) == 16
+    assert parsed_claim.caveats[:14] == tuple(f"Model caveat {index}." for index in range(14))
+    dropped_caveat, truncation_caveat = parsed_claim.caveats[-2:]
+    assert _COMMAND_REF in dropped_caveat
+    assert "test_identifiers listed 13 items" in truncation_caveat
+    assert "outcome_assertions listed 14 items" in truncation_caveat
+    assert len(truncation_caveat.encode("utf-8")) <= 1_024
+    assert parsed_claim.test_identifiers == tuple(claim["test_identifiers"][:12])
+    assert parsed_claim.outcome_assertions == tuple(claim["outcome_assertions"][:12])
+
+
+def test_semantic_risk_claim_schema_text_states_the_fact_list_bound():
+    """#913: the shared producer contract must name the per-list bound."""
+    text = semantic_risk_claim_schema_text()
+
+    assert f"most {RISK_MATRIX_MAX_LIST_ITEMS} items" in text
+    assert "split broader coverage across additional" in text

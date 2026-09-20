@@ -400,6 +400,15 @@ facts (never the approved row's planned text), carries an
 the single bounded correction continuation. A correction that is still
 incomplete leaves the row unverified; there is no second correction.
 
+Each fact list is bounded to twelve items. A longer list is a claim defect
+rather than an envelope defect (#913): the first twelve entries are retained,
+the claim gains one bounded caveat naming every truncated field and how many
+items it listed, and after authentication the row is unverified with a
+`truncated-semantic-claim` diagnostic naming those fields, which triggers the
+same single bounded correction continuation. The shared claim schema text
+states the bound on every producer surface, so coverage that does not fit in
+one row should be split across additional approved rows.
+
 `execution_refs` must be the opaque selectors printed by `agent-loop run-tests`
 in the same turn. Tests run directly, outside the wrapper, belong in `tests_run`
 only and cannot verify a row; with no selector, omit the claim rather than
