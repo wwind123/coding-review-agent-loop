@@ -581,3 +581,39 @@ def test_text_report_titles_and_aggregates_each_flow_separately():
     assert "reviewer_calls: 3" in pr_section
     assert "reviewer_calls: 99" in plan_section
     assert "reviewer_calls: 99" not in pr_section
+
+
+@pytest.mark.parametrize("flow", ["issue", "PR-flow", "", "   ", 0, [], {}, 3, True])
+def test_direct_evaluation_rejects_a_malformed_flow_instead_of_dropping_or_defaulting(flow):
+    # Direct evaluation of an unvalidated artifact is an exercised public path.
+    # An unknown flow must not silently drop the run from every report, and a
+    # falsy wrong-typed flow must not be coerced into the pr default.
+    run = _run(run_id="odd-flow", flow=flow)
+    with pytest.raises(AgentLoopError, match="flow"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [run]})
+
+
+def test_direct_evaluation_defaults_only_an_absent_or_null_flow_to_pr():
+    absent = _run(run_id="absent-flow")
+    assert "flow" not in absent
+    explicit_null = _run(run_id="null-flow", flow=None)
+    report = evaluate_frozen_artifacts({"schema_version": 1, "runs": [absent, explicit_null]})
+    assert report["flows"]["pr"]["run_count"] == 2
+    assert report["flows"]["plan"]["run_count"] == 0
+    assert report["flows"]["pr"]["policies"]["primary-then-panel"]["run_count"] == 2
+
+
+def test_direct_evaluation_normalizes_flow_case_and_surrounding_space():
+    report = evaluate_frozen_artifacts(
+        {"schema_version": 1, "runs": [_run(run_id="cased", flow=" Plan ")]}
+    )
+    assert report["flows"]["plan"]["run_count"] == 1
+    assert report["flows"]["pr"]["run_count"] == 0
+    # A duplicate identity is still caught after normalization.
+    with pytest.raises(AgentLoopError, match="repeat run ID 'cased'"):
+        evaluate_frozen_artifacts(
+            {
+                "schema_version": 1,
+                "runs": [_run(run_id="cased", flow="plan"), _run(run_id="cased", flow=" PLAN ")],
+            }
+        )

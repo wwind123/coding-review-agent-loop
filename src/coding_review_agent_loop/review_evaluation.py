@@ -195,6 +195,17 @@ def _run_flow(value: object, label: str) -> str:
     return flow
 
 
+def _resolved_flows(runs: list[Mapping[str, object]]) -> list[tuple[Mapping[str, object], str]]:
+    """Pair each run with its validated flow, failing closed on a bad value.
+
+    Every path that partitions runs by flow resolves the value here, so an
+    unknown flow can never silently drop a run from every report and a
+    wrong-typed or blank flow can never be coerced into the ``pr`` default.
+    Only an absent or null ``flow`` defaults.
+    """
+    return [(run, _run_flow(run.get("flow"), f"run {index}")) for index, run in enumerate(runs)]
+
+
 def _reject_duplicate_runs(runs: list[Mapping[str, object]]) -> None:
     """Fail closed when two records share a flow, policy, and run ID.
 
@@ -204,8 +215,7 @@ def _reject_duplicate_runs(runs: list[Mapping[str, object]]) -> None:
     namespace, because PR and planning runs are compared independently.
     """
     seen: set[tuple[str, str, str]] = set()
-    for run in runs:
-        flow = str(run.get("flow") or DEFAULT_FLOW)
+    for run, flow in _resolved_flows(runs):
         key = (flow, str(run.get("policy")), str(run.get("run_id")))
         if key in seen:
             raise AgentLoopError(
@@ -522,7 +532,11 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
     runs = artifacts.get("runs")
     if not isinstance(runs, list):
         raise AgentLoopError("Validated frozen artifacts require a runs array.")
-    _reject_duplicate_runs([run for run in runs if isinstance(run, dict)])
+    # Resolve and validate every flow once, before duplicate detection and
+    # partitioning, so direct evaluation of an unvalidated artifact fails
+    # closed on a malformed flow exactly as loading does.
+    resolved = _resolved_flows([run for run in runs if isinstance(run, dict)])
+    _reject_duplicate_runs([run for run, _ in resolved])
     canonical = json.dumps(dict(artifacts), separators=(",", ":"), sort_keys=True, ensure_ascii=False)
     report: dict[str, object] = {
         "schema_version": 1,
@@ -531,11 +545,7 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
         "flows": {},
     }
     for flow in FLOWS:
-        flow_runs = [
-            run
-            for run in runs
-            if isinstance(run, dict) and str(run.get("flow") or DEFAULT_FLOW) == flow
-        ]
+        flow_runs = [run for run, run_flow in resolved if run_flow == flow]
         report["flows"][flow] = {
             "title": FLOW_TITLES[flow],
             "run_count": len(flow_runs),
