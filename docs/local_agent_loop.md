@@ -3130,9 +3130,10 @@ target finding that is itself empty after the exempt sets are removed, which is
 the reserved-marker neutralization case. Whole-source coverage alone cannot tell
 a finding apart from the summary or any other global prose, so without that
 restriction a source summary could be promoted into a fabricated finding and
-ground a blocking verdict. Each matched finding pair, and each matched
-disposition note pair, must carry equal per-modifier occurrence counts over a
-pinned set of negations and limiting qualifiers, compared after a pinned
+ground a blocking verdict. Each matched finding pair — including one matched
+against a freeform trailing-prose candidate — and each matched disposition note
+pair, must carry equal per-modifier occurrence counts over a pinned set of
+negations and limiting qualifiers, compared after a pinned
 contraction normalization that runs before punctuation stripping over both
 apostrophe forms — so deleting, adding, or substituting `not`, `isn't`, or
 `only` is rejected even though subset coverage alone would accept it. The

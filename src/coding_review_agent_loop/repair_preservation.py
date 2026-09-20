@@ -322,10 +322,6 @@ def _validate_review_grounding(
 
     source_findings = bucket_entries(source, buckets)
     source_candidates = [_joined_text(entry) for entry in source_findings]
-    # Modifier-count equality compares a repaired finding against the source
-    # finding it was derived from.  A source with no bucket entries has no such
-    # pair, so its freeform prose supports coverage only.
-    compare_modifiers = bool(source_candidates)
     if not source_candidates:
         # The payload declares no finding in any bucket. Only freeform prose
         # OUTSIDE the recovered JSON object can be a reviewer finding here: the
@@ -371,8 +367,12 @@ def _validate_review_grounding(
             return not tokens and not _modifier_counts(text)
         if not tokens <= candidate_tokens[candidate_index]:
             return False
-        if not compare_modifiers:
-            return True
+        # Modifier-count equality applies to EVERY matched pair, including a
+        # freeform fallback candidate. A trailing-prose finding is still a
+        # matched source/target pair, and subset coverage alone cannot detect a
+        # deleted negation or limiting qualifier, so exempting the fallback
+        # would let `This path is not exploitable` be repaired into `This path
+        # is exploitable` (#871).
         return _modifier_counts(text) == candidate_modifiers[candidate_index]
 
     def augment(finding_index: int, visited: set[int]) -> bool:

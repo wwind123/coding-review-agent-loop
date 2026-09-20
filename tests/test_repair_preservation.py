@@ -1373,3 +1373,64 @@ def test_freeform_prose_outside_the_payload_still_supports_a_finding():
             blocking_items=["The retry loop never terminates on a truncated response."],
         )),
     )
+
+
+def _trailing_prose_source(builder, bucket, prose):
+    """A payload declaring no finding, followed by reviewer prose."""
+    return (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + f"\n- {prose}\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize(
+    ("source_prose", "inverted"),
+    [
+        ("This path is not exploitable.", "This path is exploitable."),
+        ("This path isn't exploitable.", "This path is exploitable."),
+        ("This path isn’t exploitable.", "This path is exploitable."),
+        ("The leak happens only on the retry path.",
+         "The leak happens on the retry path."),
+        ("The leak happens on the retry path.",
+         "The leak happens only on the retry path."),
+    ],
+)
+def test_freeform_fallback_candidate_rejects_a_modifier_change(
+    builder, bucket, source_prose, inverted
+):
+    # Issue #871 round 4, item-5: a trailing-prose candidate is still a matched
+    # source/target pair, so modifier-count equality applies to it exactly as it
+    # does to a declared source finding. Subset coverage alone cannot see the
+    # deletion, because `not` is exempt and `only` simply disappears.
+    source = _trailing_prose_source(builder, bucket, source_prose)
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking", summary="Findings.", **{bucket: [inverted]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_freeform_fallback_candidate_accepts_equal_modifier_counts(builder, bucket):
+    # The fallback still works for a faithful recovery, including an in-place
+    # contraction expansion, which normalization makes identical on both sides.
+    source = _trailing_prose_source(
+        builder, bucket, "This path isn't exploitable without the retry loop."
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: ["This path is not exploitable without the retry loop."]},
+        )),
+    )
