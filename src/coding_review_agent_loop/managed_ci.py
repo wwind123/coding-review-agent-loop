@@ -4626,14 +4626,13 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
             for run_id, run_attempt in contract.terminal_attempts
         ],
     }
-    label = protocol_record_label(
-        "managed_ci_intent",
-        pr_number=pr_number,
-        head_sha=expected_head_sha,
-        state=state,
-    )
+    # The intent record is the one protocol comment parsed by the installed
+    # base workflow, whose envelope is anchored at the start of the body
+    # (`^<!-- AGENT_MANAGED_CI_INTENT_V2 ... -->$` in .github/workflows/ci.yml).
+    # A visible #878 label ahead of the marker makes every dispatch fail with
+    # "expected exactly one fresh intent for requested nonce", so this record
+    # stays marker-only until the workflow contract accepts a prefix (#888).
     return TrustedBody.canonical(
-        f"{label}\n\n"
         f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->",
         expected_tokens=(INTENT_MARKER,),
     )

@@ -1,6 +1,7 @@
 import ast
 import copy
 import json
+import re
 import shlex
 from dataclasses import replace
 from pathlib import Path
@@ -5956,7 +5957,12 @@ def test_altered_authorization_label_fails_read_back_and_adopts_no_identity(tmp_
     assert runner.intent_comments == []
 
 
-def test_intent_body_is_labeled_and_keeps_its_marker_and_determinism(tmp_path):
+def test_intent_body_stays_marker_only_for_the_base_workflow_validator(tmp_path):
+    """#888: the installed workflow anchors its envelope at the body start.
+
+    A visible #878 label ahead of the marker made every managed dispatch fail
+    with "expected exactly one fresh intent for requested nonce".
+    """
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     runner = V2ManagedRunner()
     contract = v2_contract()
@@ -5969,11 +5975,13 @@ def test_intent_body_is_labeled_and_keeps_its_marker_and_determinism(tmp_path):
         comment for comment in runner.intent_comments
         if comment["id"] == contract.intent_comment_id
     )
-    label, separator, marker = stored["body"].partition("\n\n")
-    assert separator == "\n\n"
-    assert label.startswith("Agent-loop managed exact-head CI intent record")
-    assert "in state prepared" in label
-    assert marker.startswith(f"<!-- {managed_ci.INTENT_MARKER} ") and marker.endswith("-->")
+    body = stored["body"]
+    assert body.startswith(f"<!-- {managed_ci.INTENT_MARKER} ")
+    # The exact envelope the base workflow applies, anchored and fullmatch.
+    envelope = re.compile(
+        rf"^<!-- {managed_ci.INTENT_MARKER} (?P<payload>.*?) -->$", re.S
+    )
+    assert envelope.match(body) is not None
 
     _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
     first = next(
@@ -5986,7 +5994,7 @@ def test_intent_body_is_labeled_and_keeps_its_marker_and_determinism(tmp_path):
         if comment["id"] == contract.intent_comment_id
     )["body"]
     assert first == second
-    assert "in state dispatch-requested" in second
+    assert envelope.match(second) is not None
 
 
 def test_labeled_intent_comment_is_rediscovered_like_a_marker_only_one(tmp_path):
@@ -6013,7 +6021,12 @@ def test_labeled_intent_comment_is_rediscovered_like_a_marker_only_one(tmp_path)
 
 
 class AlteredLabelIntentRunner(V2ManagedRunner):
-    """Alter the visible label on the echoed intent create or update."""
+    """Alter the echoed intent body on create or update.
+
+    The intent record is marker-only again (#888), so the alteration prepends
+    a visible prefix instead of editing a label, which is exactly the drift the
+    read-back must reject.
+    """
 
     def __init__(self, *, alter_patch=False, **kwargs):
         super().__init__(**kwargs)
@@ -6032,16 +6045,14 @@ class AlteredLabelIntentRunner(V2ManagedRunner):
             except json.JSONDecodeError:
                 return result
             if isinstance(payload, dict) and isinstance(payload.get("body"), str):
-                payload["body"] = payload["body"].replace(
-                    "Agent-loop", "Agent-loop (edited)", 1
-                )
+                payload["body"] = "Agent-loop (edited)\n\n" + payload["body"]
                 return CommandResult(
                     result.args, result.cwd, json.dumps(payload), "", 0
                 )
         return result
 
 
-def test_altered_intent_label_fails_the_create_read_back(tmp_path):
+def test_altered_intent_body_fails_the_create_read_back(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     runner = AlteredLabelIntentRunner()
     contract = v2_contract()
@@ -6054,7 +6065,7 @@ def test_altered_intent_label_fails_the_create_read_back(tmp_path):
     assert contract.intent_state is None
 
 
-def test_altered_intent_label_fails_the_patch_read_back_without_advancing_state(tmp_path):
+def test_altered_intent_body_fails_the_patch_read_back_without_advancing_state(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     runner = AlteredLabelIntentRunner(alter_patch=True)
     contract = v2_contract()
