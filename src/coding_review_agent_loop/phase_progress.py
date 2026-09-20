@@ -17,6 +17,7 @@ phase or re-dispatching an ambiguous one.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from .config import AgentLoopConfig
@@ -157,9 +158,13 @@ def _reconcile(
             )
         stage_id = outcome.stage_ids[index - 1]
         existing = by_index.get(index)
-        if existing is not None and existing != handoff:
+        if existing is not None:
+            # At most one record may exist per index.  An identical duplicate is
+            # rejected too: two durable records for one phase is an ambiguous
+            # history the parent must not silently collapse.
+            shape = "divergent" if existing != handoff else "duplicate"
             raise AgentLoopError(
-                f"Issue #{parent_issue} carries divergent phase handoff records for phase "
+                f"Issue #{parent_issue} carries {shape} phase handoff records for phase "
                 f"{index} (`{stage_id}`): child issues #{existing.child_issue_number} and "
                 f"#{handoff.child_issue_number}; repair the records before rerunning."
             )
@@ -187,6 +192,47 @@ def _reconcile(
     return by_index
 
 
+@contextmanager
+def _phase_read_context(
+    *, parent_issue: int, phase_index: int, stage_id: str, child_issue_number: int
+):
+    """Attach parent/phase/stage/child context to any failed live read.
+
+    The underlying readers only know the child issue or PR they were asked
+    about, so an unreadable issue state or an unauthenticatable canonical PR
+    record would otherwise reach the operator without naming which staged
+    parent and stage is blocked.  The original diagnostic is preserved as the
+    message tail and as the exception cause.
+    """
+    try:
+        yield
+    except AgentLoopError as exc:
+        raise AgentLoopError(
+            f"Issue #{parent_issue} could not authenticate phase {phase_index} "
+            f"(`{stage_id}`) from child issue #{child_issue_number}: {exc} "
+            "Repair that child's issue state or its canonical issue-to-PR handoff "
+            "record, then rerun the parent."
+        ) from exc
+
+
+def _read_child_issue_state(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    parent_issue: int,
+    phase_index: int,
+    stage_id: str,
+    child_issue_number: int,
+) -> str:
+    with _phase_read_context(
+        parent_issue=parent_issue,
+        phase_index=phase_index,
+        stage_id=stage_id,
+        child_issue_number=child_issue_number,
+    ):
+        return get_issue_state(runner, config=config, issue_number=child_issue_number)
+
+
 def _resolve_agent_phase(
     runner: Runner,
     *,
@@ -197,14 +243,22 @@ def _resolve_agent_phase(
     child_issue_number: int,
 ) -> tuple[str, str, int | None, str | None]:
     """Authenticate one recorded agent phase; returns (status, child, pr, pr state)."""
-    child_state = get_issue_state(runner, config=config, issue_number=child_issue_number)
-    child_context = get_issue_context(runner, config=config, issue_number=child_issue_number)
-    authenticated = authenticate_canonical_issue_pr(
-        runner,
-        config=config,
-        issue_number=child_issue_number,
-        issue_context=child_context,
-    )
+    with _phase_read_context(
+        parent_issue=parent_issue,
+        phase_index=phase_index,
+        stage_id=stage_id,
+        child_issue_number=child_issue_number,
+    ):
+        child_state = get_issue_state(runner, config=config, issue_number=child_issue_number)
+        child_context = get_issue_context(
+            runner, config=config, issue_number=child_issue_number
+        )
+        authenticated = authenticate_canonical_issue_pr(
+            runner,
+            config=config,
+            issue_number=child_issue_number,
+            issue_context=child_context,
+        )
     pr_number = authenticated.pr_number if authenticated is not None else None
     pr_state = authenticated.state if authenticated is not None else None
     if child_state == "OPEN":
@@ -296,8 +350,13 @@ def resolve_staged_phase_progress(
             # operator work and its recorded remark are done: the parent has no
             # other durable signal for operator-owned work, and without this a
             # mid-topology human stage would block the topology forever.
-            child_state = get_issue_state(
-                runner, config=config, issue_number=child_issue_number
+            child_state = _read_child_issue_state(
+                runner,
+                config=config,
+                parent_issue=parent_issue,
+                phase_index=index,
+                stage_id=stage_id,
+                child_issue_number=child_issue_number,
             )
             status = (
                 STATUS_COMPLETE if child_state == "CLOSED" else STATUS_HUMAN_PENDING

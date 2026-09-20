@@ -2545,18 +2545,25 @@ def test_staged_progress_reconciliation_fails_closed(monkeypatch, tmp_path, crea
         )
 
 
-def test_staged_progress_rejects_divergent_handoffs_for_one_index(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("second", "shape"),
+    [
+        (lambda: dataclasses.replace(_handoff(1, 99), phase_title="Renamed"), "divergent"),
+        (lambda: _handoff(1, 99), "duplicate"),
+    ],
+)
+def test_staged_progress_rejects_more_than_one_handoff_for_one_index(
+    monkeypatch, tmp_path, second, shape
+):
+    """At most one record may exist per index, identical duplicates included."""
     created = (
         CreatedPhaseIssue(phase=_recorded("One"), issue_url=None, issue_number=99),
     )
     monkeypatch.setattr(
         phase_progress_module, "find_phase_implementation_handoffs_for_parent",
-        lambda *_args, **_kwargs: (
-            _handoff(1, 99),
-            dataclasses.replace(_handoff(1, 99), phase_title="Renamed"),
-        ),
+        lambda *_args, **_kwargs: (_handoff(1, 99), second()),
     )
-    with pytest.raises(AgentLoopError, match="divergent phase handoff records"):
+    with pytest.raises(AgentLoopError, match=f"{shape} phase handoff records"):
         resolve_staged_phase_progress(
             _ExplodingRunner(),
             config=make_config(tmp_path),
@@ -2655,9 +2662,41 @@ def test_staged_parent_fails_closed_when_child_pr_evidence_is_unreadable(tmp_pat
     )
     config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
 
-    with pytest.raises(AgentLoopError, match="state could not be determined"):
+    with pytest.raises(AgentLoopError) as failure:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    message = str(failure.value)
+    # The progress boundary names the staged parent, phase, stage and child ...
+    assert "Issue #56 could not authenticate phase 1 (`1`) from child issue #99" in message
+    assert "then rerun the parent" in message
+    # ... while preserving the underlying cause.
+    assert "state could not be determined" in message
+    assert "#912" in message
     assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("automation", ["agent-pr", "human-action"])
+def test_staged_parent_names_the_phase_when_a_child_state_is_malformed(tmp_path, automation):
+    """An unreadable child issue state names the parent, phase, stage and child."""
+    plan, created, summary = staged_legacy_plan_records(
+        stage_count=1, automations=(automation,)
+    )
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+    ]
+    if automation == "agent-pr":
+        parent_comments.append(phase_handoff_comment(plan, created, 1))
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_payloads_by_number={99: {"state": "merged"}},
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    with pytest.raises(AgentLoopError) as failure:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    message = str(failure.value)
+    assert "Issue #56 could not authenticate phase 1 (`1`) from child issue #99" in message
+    assert "reported unexpected state 'merged'" in message
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 
