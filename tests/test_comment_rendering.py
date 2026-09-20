@@ -2135,3 +2135,103 @@ def test_staged_policy_public_audit_comments_identify_phase_and_neutral_accounti
     assert any("Phase: secondary-audit; force-full: False (source: none)." in c for c in reconciliations)
     for comment in runner.comments:
         assert "AGENT_ROUND" not in comment.split("<!--")[0]
+
+
+def test_bare_launcher_managed_comment_hides_the_memory_directory():
+    """Issue #892: the reported bare spelling must not publish the cache path."""
+    memory_dir = "/home/wwind123/.cache/coding-review-agent-loop/repos/example/memory"
+    command = shlex.join([
+        "agent-loop", "run-tests", "--timeout-seconds", "900",
+        "--memory-dir", memory_dir, "--",
+        "python3", "-m", "pytest", "tests/test_followups.py", "-q",
+    ])
+
+    rendered = _render_test_command_for_comment(command)
+
+    assert rendered == (
+        shlex.join(["python3", "-m", "pytest", "tests/test_followups.py", "-q"])
+        + " (agent-loop instrumented; whole-command timeout 900s)"
+    )
+    assert memory_dir not in rendered
+    assert ".cache" not in rendered
+    assert "--memory-dir" not in rendered
+
+    module_form = shlex.join([
+        "python3", "-m", "coding_review_agent_loop.cli", "run-tests",
+        "--memory-dir", memory_dir, "--",
+        "python3", "-m", "pytest", "tests/test_followups.py", "-q",
+    ])
+    assert memory_dir not in _render_test_command_for_comment(module_form)
+
+
+@pytest.mark.parametrize("command", [
+    # Malformed options fail closed to the verbatim command.
+    "agent-loop run-tests --unknown -- python3 -m pytest tests/test_followups.py",
+    # A timeout above the policy ceiling also falls back to verbatim.
+    "agent-loop run-tests --timeout-seconds 99999 -- python3 -m pytest tests/test_followups.py",
+])
+def test_bare_launcher_malformed_or_over_ceiling_still_renders_verbatim(command):
+    assert _render_test_command_for_comment(command) == command
+
+
+@pytest.mark.parametrize("launcher", ["agent-loop", "/opt/venv/bin/agent-loop"])
+def test_prefix_wrapped_managed_comment_hides_the_memory_directory(launcher):
+    """Round-2 item-1: prefix-wrapped clauses must not render verbatim."""
+    memory_dir = "/home/wwind123/.cache/coding-review-agent-loop/repos/example/memory"
+    command = shlex.join([
+        "timeout", "1800", launcher, "run-tests", "--timeout-seconds", "900",
+        "--memory-dir", memory_dir, "--",
+        "python3", "-m", "pytest", "tests/test_followups.py", "-q",
+    ])
+
+    rendered = _render_test_command_for_comment(command)
+
+    assert rendered == (
+        shlex.join([
+            "timeout", "1800",
+            "python3", "-m", "pytest", "tests/test_followups.py", "-q",
+        ])
+        + " (agent-loop instrumented; whole-command timeout 900s)"
+    )
+    assert memory_dir not in rendered
+    assert ".cache" not in rendered
+    # The wrapper clause itself is gone; the bare launcher name survives only
+    # inside the fixed `agent-loop instrumented` annotation.
+    assert "run-tests" not in rendered
+    if launcher.startswith("/"):
+        assert launcher not in rendered
+
+
+@pytest.mark.parametrize("launcher", ["agent-loop", "/opt/venv/bin/agent-loop"])
+def test_assignment_and_env_prefixed_managed_comment_hides_the_memory_directory(launcher):
+    memory_dir = "/home/wwind123/.cache/coding-review-agent-loop/repos/example/memory"
+    command = shlex.join([
+        "MODE=inline", "env", "-u", "AGENT_LOOP_INVOCATION_ID", launcher, "run-tests",
+        "--memory-dir", memory_dir, "--",
+        ".venv/bin/python", "-m", "pytest", "tests/test_pat_auth.py", "-q",
+    ])
+
+    rendered = _render_test_command_for_comment(command)
+
+    assert rendered == (
+        shlex.join([
+            "MODE=inline", "env", "-u", "AGENT_LOOP_INVOCATION_ID",
+            ".venv/bin/python", "-m", "pytest", "tests/test_pat_auth.py", "-q",
+        ])
+        + " (agent-loop instrumented; whole-command timeout 1800s)"
+    )
+    assert memory_dir not in rendered
+
+
+@pytest.mark.parametrize("command", [
+    # Malformed options under a prefix still fall back to verbatim.
+    "timeout 1800 agent-loop run-tests --unknown -- python3 -m pytest tests/",
+    "timeout 1800 /opt/venv/bin/agent-loop run-tests --memory-dir /c --memory-dir /c "
+    "-- python3 -m pytest tests/",
+    # An over-ceiling timeout under a prefix also falls back to verbatim.
+    "timeout 1800 agent-loop run-tests --timeout-seconds 99999 -- python3 -m pytest tests/",
+    # An unsupported prefix is not traversed and never gains the rendering.
+    "sudo agent-loop run-tests --memory-dir /c -- python3 -m pytest tests/",
+])
+def test_prefix_wrapped_malformed_or_unsupported_still_renders_verbatim(command):
+    assert _render_test_command_for_comment(command) == command

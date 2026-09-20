@@ -4258,3 +4258,102 @@ def test_format_human_requirements_neutralizes_reserved_names_in_the_body():
     assert PLAN_FOLLOWUPS_LABEL in text
     assert HANDOFF_LABEL in text
     assert "label stable, and the" in text
+
+
+def test_emitted_invocation_guidance_lines_pass_the_checkout_validator(
+    tmp_path, monkeypatch
+):
+    """Standing alignment guard between emitted guidance and report validation.
+
+    This cannot fail for issue #892's defect: ``resolve_wrapper_prefix`` and
+    ``_wrapper_candidates`` both require an absolute path, so every emitted
+    prefix is already the accepted spelling.  It is kept as a guard against a
+    future wrapper flag the validator does not know about, and is additionally
+    exercised against a bare-launcher rendered prefix so the report-side
+    recognition path itself is covered.
+    """
+    from coding_review_agent_loop.workdir_guard import (
+        validate_test_commands_within_workdir,
+    )
+
+    config = make_config(
+        tmp_path,
+        test_command=(sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"),
+    )
+    checkout = config.claude_dir
+    # The memory directory lives outside the checkout by design.
+    memory_dir = tmp_path / "cache" / "memory"
+    memory_dir.mkdir(parents=True)
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit=None,
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary=None,
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+        runtime_observations=(
+            {
+                "normalized_command": "python3 -m pytest tests/test_workdir_guard.py -q",
+                "environment_fingerprint": "fingerprint-a",
+            },
+            {
+                "normalized_command": "python3 -m pytest tests/ -q -p no:cacheprovider",
+                "environment_fingerprint": "fingerprint-b",
+            },
+        ),
+    )
+    wrapper = runtime.LauncherProbeResult(
+        ("/opt/agent-loop", "run-tests"), "verified", "agent-loop preflight: verified"
+    )
+    monkeypatch.setattr(
+        prompts_module, "preflight_wrapper_candidates", lambda **_kwargs: (wrapper,)
+    )
+
+    prompt = build_issue_prompt(892, config, memory=memory)
+    guidance = [
+        line.split("Invocation guidance:", 1)[1].strip()
+        for line in prompt.splitlines()
+        if "Invocation guidance:" in line
+    ]
+    assert guidance, "no invocation-guidance lines were generated"
+    validate_test_commands_within_workdir(guidance, assigned_workdir=checkout)
+
+    # The placeholder-command line (emitted when no timings are remembered).
+    bare_memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit=None,
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary=None,
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+    )
+    placeholder_config = make_config(tmp_path, test_command=None)
+    placeholder_prompt = build_issue_prompt(892, placeholder_config, memory=bare_memory)
+    placeholder_guidance = [
+        line.split("Invocation guidance:", 1)[1].strip()
+        for line in placeholder_prompt.splitlines()
+        if "Invocation guidance:" in line
+    ]
+    assert placeholder_guidance, "no placeholder guidance line was generated"
+    validate_test_commands_within_workdir(
+        placeholder_guidance, assigned_workdir=placeholder_config.claude_dir
+    )
+
+    # The same assertions over a bare-launcher rendered prefix, which exercises
+    # the report-side recognition added for issue #892.
+    for prefix in (
+        ("agent-loop", "run-tests"),
+        ("python3", "-m", "coding_review_agent_loop.cli", "run-tests"),
+    ):
+        rendered = runtime.render_test_wrapper(
+            ("python3", "-m", "pytest", "tests/test_workdir_guard.py", "-q"),
+            timeout_seconds=900,
+            memory_dir=memory_dir,
+            prefix=prefix,
+        )
+        assert str(memory_dir) in rendered
+        validate_test_commands_within_workdir([rendered], assigned_workdir=checkout)

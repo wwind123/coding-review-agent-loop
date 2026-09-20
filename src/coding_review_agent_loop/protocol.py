@@ -2125,7 +2125,9 @@ def _citation_matches_observation(
 def _managed_test_wrapper_inner_command(command: str) -> str | None:
     """Project a managed-wrapper citation to its broker argv."""
     try:
-        parsed = parse_managed_test_command(shlex.split(command))
+        parsed = parse_managed_test_command(
+            shlex.split(command), allow_command_name_launcher=True
+        )
     except (ValueError, TestRuntimeConfigurationError):
         return None
     if parsed is None:

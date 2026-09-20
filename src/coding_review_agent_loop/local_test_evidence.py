@@ -1209,7 +1209,7 @@ def _referenced_paths(root: Path, argv: Sequence[str]) -> set[str]:
     try:
         from .test_runtime import parse_managed_test_invocation
 
-        parsed = parse_managed_test_invocation(argv)
+        parsed = parse_managed_test_invocation(argv, allow_command_name_launcher=True)
         if parsed is not None:
             inner = parsed.inner_argv
     except Exception:

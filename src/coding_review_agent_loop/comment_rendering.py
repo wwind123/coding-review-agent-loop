@@ -59,6 +59,7 @@ from .round_transport import (
 from .test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     TestRuntimeConfigurationError,
+    managed_wrapper_traversal,
     parse_managed_test_invocation,
     resolve_timeout_seconds,
 )
@@ -86,7 +87,6 @@ _AGENT_BY_DISPLAY_NAME = {
     agent_display_name(agent): agent
     for agent in ("claude", "codex", "gemini", "antigravity")
 }
-_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _render_test_command_for_comment(
@@ -97,13 +97,17 @@ def _render_test_command_for_comment(
     """Hide managed wrapper plumbing while preserving ordinary reports exactly."""
     try:
         tokens = shlex.split(command)
-        prefix_len = 0
-        while (
-            prefix_len < len(tokens)
-            and _SHELL_ASSIGNMENT_RE.match(tokens[prefix_len])
-        ):
-            prefix_len += 1
-        parsed = parse_managed_test_invocation(tokens[prefix_len:])
+        # Traverse leading assignments and supported execution prefixes with
+        # the same contract the checkout guard and citation projection use, so
+        # a prefix-wrapped clause such as `timeout 1800 agent-loop run-tests
+        # --memory-dir ... -- pytest` does not fall through to verbatim
+        # rendering and publish the operator's memory directory.
+        prefix_len = managed_wrapper_traversal(tokens).effective_head_index
+        if prefix_len is None:
+            return command
+        parsed = parse_managed_test_invocation(
+            tokens[prefix_len:], allow_command_name_launcher=True
+        )
     except (ValueError, TestRuntimeConfigurationError):
         return command
     if parsed is None:

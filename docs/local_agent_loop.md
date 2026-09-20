@@ -3756,6 +3756,36 @@ clauses still undergo the existing path and live-target checks. Malformed
 wrapper options receive no special exemption. This validates reported command
 text; it does not execute the report or provide a shell sandbox.
 
+#### Recognized launcher spellings for reported command text
+
+Agents report the launcher spelling they actually typed, which is often a bare
+PATH command name rather than the absolute path the prompt renders. Report-side
+recognition therefore accepts three launcher spellings: the absolute
+`agent-loop` console entry, the absolute interpreter's
+`-m coding_review_agent_loop.cli` fallback, and a separator-free PATH command
+name in either of those positions (`agent-loop run-tests ...` and
+`python3 -m coding_review_agent_loop.cli run-tests ...`). Accepting the bare
+spelling is what keeps the wrapper's own `--memory-dir` and `--timeout-seconds`
+values, which point at an agent-memory directory outside the checkout by
+design, from being scanned as reported test locations.
+
+The four report-side consumers that adopt this recognition are checkout
+validation of reported test commands, risk-matrix citation-to-receipt
+projection, public comment rendering of reported commands, and referenced-path
+projection for local test evidence. They adopt it consistently so a spelling
+accepted by one gate cannot fail a later one or leak wrapper plumbing into a
+published comment.
+
+Path-shaped spellings such as `../agent-loop`, `./agent-loop`, or
+`bin/agent-loop` do not qualify: a bare command name cannot name a location,
+whereas a relative path can, so extending the exemption to it would widen the
+containment boundary. Recognition is opt-in per call site: the shared parser's
+default remains absolute-only, and actual command execution is unchanged, since
+`run-tests` parses its own argv through argparse and never consults this
+parser. Malformed, duplicate, or unknown wrapper options still fail closed
+under every launcher spelling, and the inner command after `--` is always
+validated.
+
 Explicit `sh`, `bash`, and `zsh` command-string invocations (`-c`, including
 simple combinations such as `-lc`) are validated as nested commands. An
 external virtualenv interpreter is checked separately from its test paths;

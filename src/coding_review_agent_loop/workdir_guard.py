@@ -1206,7 +1206,9 @@ def _validate_managed_command(command: str, *, assigned: Path, origin: Origin) -
         prefix_len = _wrapper_traversal(tokens, managed=True).effective_head_index
         if prefix_len is None:
             return False
-        managed = parse_managed_test_invocation(tokens[prefix_len:])
+        managed = parse_managed_test_invocation(
+            tokens[prefix_len:], allow_command_name_launcher=True
+        )
     except (ValueError, TestRuntimeConfigurationError):
         managed = None
     if managed is not None:

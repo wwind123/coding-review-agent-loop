@@ -1301,3 +1301,118 @@ def test_checkout_inspected_evidence_leaves_missing_status_claim_alone(tmp_path)
     claim = DiscussEvidenceClaim(fact="fact", status="missing", source=None, verification_basis=None)
 
     validate_checkout_inspected_evidence([claim], assigned_workdir=tmp_path)
+
+
+# --- issue #892: launcher-spelling recognition for report-side validation ----
+
+_MEMORY_DIR_892 = "/home/wwind123/.cache/coding-review-agent-loop/repos/wwind123-coding-review-agent-loop/memory"
+
+
+def test_emitted_absolute_invocation_guidance_command_is_accepted(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    validate_test_commands_within_workdir(
+        [
+            "/home/wwind123/.local/bin/agent-loop run-tests --timeout-seconds 360 "
+            f"--memory-dir {_MEMORY_DIR_892} -- python3 -m pytest tests/ -q -p no:cacheprovider"
+        ],
+        assigned_workdir=checkout,
+    )
+
+
+def test_bare_launcher_wrapper_memory_dir_is_not_a_test_location(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    validate_test_commands_within_workdir(
+        [
+            f"agent-loop run-tests --timeout-seconds 900 --memory-dir {_MEMORY_DIR_892} "
+            "-- python3 -m pytest tests/test_followups.py tests/test_protocol_markers.py"
+        ],
+        assigned_workdir=checkout,
+    )
+
+
+@pytest.mark.parametrize("memory_option", [
+    f"--memory-dir {_MEMORY_DIR_892}",
+    f"--memory-dir={_MEMORY_DIR_892}",
+])
+def test_bare_interpreter_module_launcher_is_accepted(tmp_path, memory_option):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    validate_test_commands_within_workdir(
+        [
+            "python3 -m coding_review_agent_loop.cli run-tests "
+            f"{memory_option} -- python3 -m pytest tests/"
+        ],
+        assigned_workdir=checkout,
+    )
+
+
+def test_bare_launcher_prefix_wrapped_clause_is_accepted(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    validate_test_commands_within_workdir(
+        [
+            f"pwd && timeout 1800 agent-loop run-tests --memory-dir {_MEMORY_DIR_892} "
+            "-- python3 -m pytest tests/"
+        ],
+        assigned_workdir=checkout,
+    )
+
+
+def test_bare_launcher_inner_selection_is_still_checked(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    outside_target = tmp_path / "outside" / "test_thing.py"
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            [
+                f"agent-loop run-tests --memory-dir {_MEMORY_DIR_892} "
+                f"-- python3 -m pytest {outside_target}"
+            ],
+            assigned_workdir=checkout,
+        )
+
+
+def test_memory_dir_repeated_as_inner_test_path_is_still_rejected(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            [
+                f"agent-loop run-tests --memory-dir {_MEMORY_DIR_892} "
+                f"-- python3 -m pytest {_MEMORY_DIR_892}"
+            ],
+            assigned_workdir=checkout,
+        )
+
+
+@pytest.mark.parametrize("launcher", ["../agent-loop", "./agent-loop", "bin/agent-loop"])
+def test_relative_path_launcher_spellings_gain_no_exemption(tmp_path, launcher):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            [
+                f"{launcher} run-tests --memory-dir {_MEMORY_DIR_892} "
+                "-- python3 -m pytest tests/"
+            ],
+            assigned_workdir=checkout,
+        )
+
+
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize("options", [
+    f"--memory-dir {_MEMORY_DIR_892}",
+    f"--unknown 1 --memory-dir {_MEMORY_DIR_892} --",
+    f"--memory-dir {_MEMORY_DIR_892} --memory-dir {_MEMORY_DIR_892} --",
+])
+def test_malformed_bare_launcher_options_get_no_exemption(tmp_path, origin, options):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            [f"agent-loop run-tests {options} python3 -m pytest tests/test_api.py"],
+            assigned_workdir=checkout,
+            origin=origin,
+        )
