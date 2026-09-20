@@ -482,6 +482,65 @@ def test_an_empty_closing_issue_set_is_a_complete_declaration():
     assert classification.narrow
 
 
+def test_an_unobserved_operation_set_is_broad_not_narrow():
+    """An authenticated patch always carries an operation; empty means unobserved."""
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(operation_fields=(), matrix_operations=()),
+        previous_contracts=_contracts(),
+        current_contracts=_contracts(),
+    )
+    assert classification.broad
+    assert "reports no authenticated patch operations" in classification.reason
+
+
+@pytest.mark.parametrize(
+    "fields,matrix",
+    [
+        (("plan_steps",), ()),
+        ((), ("matrix_edit",)),
+        (("summary", "deferred_work"), ()),
+        ((), ("matrix_add",)),
+    ],
+)
+def test_one_observed_operation_side_is_enough_to_classify_narrow(fields, matrix):
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(operation_fields=fields, matrix_operations=matrix),
+        previous_contracts=_contracts(),
+        current_contracts=_contracts(),
+    )
+    assert classification.narrow
+
+
+def test_an_unobserved_operation_set_cannot_smuggle_an_excluded_operation():
+    """The empty-set guard protects the excluded field and matrix operations."""
+    for fields, matrix in (
+        (("deferred_stages",), ()),
+        ((), ("matrix_retire",)),
+        ((), ("matrix_split",)),
+        ((), ("matrix_merge",)),
+    ):
+        observed = classify_plan_transition(
+            _key(),
+            _key(plan="plan-2"),
+            _revision(operation_fields=fields, matrix_operations=matrix),
+            previous_contracts=_contracts(),
+            current_contracts=_contracts(),
+        )
+        assert observed.broad
+    unobserved = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(operation_fields=(), matrix_operations=()),
+        previous_contracts=_contracts(),
+        current_contracts=_contracts(),
+    )
+    assert unobserved.broad
+
+
 def test_unreconstructible_ledger_is_broad():
     classification = classify_plan_transition(
         _key(), _key(), ledger_reconstructible=False
@@ -554,12 +613,55 @@ def test_exact_key_primary_approval_opens_the_independent_panel():
 
 
 def test_premature_secondary_approval_never_shrinks_the_first_panel():
+    """A secondary cannot hold a qualified approval before the panel opens."""
     decision = select_plan_reviewers(
         _snapshot(previous_key=_key()),
         _recheck(),
-        qualifying_approvals=(PRIMARY,),
+        # "Claude" holds a stored exact-key approval predating any opening.
+        qualifying_approvals=(PRIMARY, "Claude"),
     )
+    assert decision.phase == "secondary-audit"
     assert set(decision.selected_reviewers) == set(SECONDARIES)
+    assert decision.records_panel_opening
+    # The premature approval is named as unqualified, never silently honored.
+    assert "Claude" in decision.reason
+    assert "do not shrink this audit" in decision.reason
+    # Only the primary is paused, on its own approval that opened the panel.
+    assert tuple(name for name, _ in decision.paused_reviewers) == (PRIMARY,)
+    assert "carried" in _paused(decision)[PRIMARY]
+    # The premature approval is not counted as a call avoided either.
+    assert decision.calls_avoided == 0
+
+
+@pytest.mark.parametrize("premature", [("Claude",), ("Antigravity",), SECONDARIES])
+def test_premature_secondary_approvals_are_ignored_in_the_primary_phase(premature):
+    """Before an opening they change neither the board nor the pause reasons."""
+    decision = select_plan_reviewers(
+        _snapshot(previous_key=_key()), _recheck(), qualifying_approvals=premature
+    )
+    assert decision.selected_reviewers == (PRIMARY,)
+    assert decision.phase == "primary"
+    assert not decision.records_panel_opening
+    for name in premature:
+        assert "waits for an exact-plan primary approval" in _paused(decision)[name]
+        assert "carried" not in _paused(decision)[name]
+
+
+def test_a_post_opening_secondary_approval_is_still_honored():
+    """The exclusion is narrow: after a qualified opening the carry applies."""
+    decision = select_plan_reviewers(
+        PlanSchedulerSnapshot(
+            contract=_contract(),
+            previous_key=_key(),
+            current_key=_key(),
+            panel_evidence=True,
+        ),
+        _recheck(),
+        qualifying_approvals=(PRIMARY, "Claude"),
+    )
+    assert decision.selected_reviewers == ("Antigravity",)
+    assert decision.phase == "final-secondary-sweep"
+    assert "qualifying exact-plan approval carried" in _paused(decision)["Claude"]
 
 
 def test_narrow_remediation_after_the_panel_routes_to_owners_plus_primary():

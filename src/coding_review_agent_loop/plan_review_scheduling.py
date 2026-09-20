@@ -758,6 +758,16 @@ def classify_plan_transition(
         return PlanTransitionClassification(
             "broad", f"cross-cutting plan contract(s) changed: {', '.join(changed)}"
         )
+    if not revision.operation_fields and not revision.matrix_operations:
+        # An authenticated patch always carries at least one operation, so an
+        # empty operation set means the caller did not observe it.  A defaulted
+        # value is not evidence: without the operation set there is nothing to
+        # check against the narrow field and matrix-operation allowances.
+        return PlanTransitionClassification(
+            "broad",
+            "the candidate plan key changed but the revision reports no "
+            "authenticated patch operations to classify",
+        )
     outside = tuple(
         sorted(
             {
@@ -842,6 +852,19 @@ def select_plan_reviewers(
         raise AgentLoopError(
             f"Unsupported plan scheduler phase checkpoint: {checkpoint_phase!r}."
         )
+
+    # A secondary approval recorded before any qualified panel opening is an
+    # unqualified artifact by the policy's own rule: the panel has not yet run,
+    # so that reviewer never performed the independent audit the panel exists
+    # for.  Dropping it here keeps it out of selection, the pause reasons, and
+    # the calls-avoided accounting alike, so it can never shrink the first
+    # `secondary-audit` board.
+    premature_approvals: tuple[str, ...] = ()
+    if capabilities.requires_primary and not snapshot.panel_evidence:
+        premature_approvals = tuple(
+            sorted(name for name in approvals if name != primary)
+        )
+        approvals -= set(premature_approvals)
 
     degraded, degraded_reason = _degraded_fallback(snapshot)
     fallback_reasons = tuple(
@@ -977,6 +1000,12 @@ def select_plan_reviewers(
                 reason = (
                     "independent secondary audit after an exact-plan primary approval"
                 )
+                if premature_approvals:
+                    reason += (
+                        "; premature plan approval(s) from "
+                        f"{', '.join(premature_approvals)} predate any qualified "
+                        "opening, are not carried, and do not shrink this audit"
+                    )
                 remaining = sorted(
                     obligation.item_id for obligation in active_obligations
                 )
