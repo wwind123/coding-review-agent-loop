@@ -10,12 +10,14 @@ from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import post_issue_comment, post_pr_comment
 from coding_review_agent_loop.protocol_markers import (
     ISSUE_BODY_SURFACE,
+    PROTOCOL_RECORD_LABEL_MAX_CHARS,
     ISSUE_COMMENT_SURFACE,
     PR_BODY_SURFACE,
     PR_COMMENT_SURFACE,
     RESERVED_MARKER_REGISTRY,
     TrustedBody,
     assert_source_inventory,
+    protocol_record_label,
     sanitize_historical_text,
     scan_reserved_markers,
 )
@@ -166,3 +168,54 @@ def test_issue_provenance_trailer_is_not_a_reserved_marker_or_forged_body_record
 
     assert not scan_reserved_markers(body)
     TrustedBody.current_untrusted_visible(body)
+
+
+def test_protocol_record_label_is_deterministic_bounded_and_marker_free():
+    families = (
+        ("managed_ci_authorization", {"kind": "creation", "issue_number": 878, "pr_number": 900, "head_sha": "e75771cabc"}),
+        ("managed_ci_authorization", {"kind": "fresh", "issue_number": 878, "pr_number": 900}),
+        ("managed_ci_authorization", {"kind": "continuity", "issue_number": 878, "pr_number": 900}),
+        ("managed_ci_intent", {"pr_number": 900, "head_sha": "e75771c", "state": "prepared"}),
+        ("managed_ci_override_audit", {"pr_number": 900, "head_sha": "e75771c"}),
+        ("managed_ci_resume_audit", {"pr_number": 900, "head_sha": "e75771c"}),
+        ("managed_ci_qualified_head", {"pr_number": 900, "head_sha": "e75771c"}),
+        ("plan_validation_diagnostic", {"issue_number": 878, "attempt": 2}),
+    )
+    seen = set()
+    for family, kwargs in families:
+        label = protocol_record_label(family, **kwargs)
+        assert label == protocol_record_label(family, **kwargs)
+        assert label.isascii()
+        assert len(label) <= PROTOCOL_RECORD_LABEL_MAX_CHARS
+        assert scan_reserved_markers(label) == ()
+        assert "machine-readable" in label
+        seen.add(label)
+    assert len(seen) == len(families)
+
+
+def test_protocol_record_label_falls_back_neutrally_for_unknown_identity():
+    label = protocol_record_label("managed_ci_authorization", kind="creation")
+
+    assert "the originating issue" in label
+    assert "this pull request" in label
+    assert "None" not in label
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"kind": "creation", "head_sha": "e75771c" * 20},
+        {"kind": "creation", "head_sha": "hé75771c"},
+        {"kind": "creation", "head_sha": "not a sha"},
+    ),
+)
+def test_protocol_record_label_rejects_oversized_or_non_ascii_fields(kwargs):
+    with pytest.raises(AgentLoopError):
+        protocol_record_label("managed_ci_authorization", **kwargs)
+
+
+def test_protocol_record_label_rejects_unknown_family_and_kind():
+    with pytest.raises(AgentLoopError, match="record family"):
+        protocol_record_label("not_a_record_family")
+    with pytest.raises(AgentLoopError, match="record kind"):
+        protocol_record_label("managed_ci_authorization", kind="invented")

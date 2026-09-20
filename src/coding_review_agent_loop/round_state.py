@@ -31,6 +31,7 @@ from .local_test_evidence import canonicalize_bounded_evidence
 from .protocol_markers import (
     ISSUE_COMMENT_SURFACE,
     TrustedBody,
+    protocol_record_label,
     sanitize_historical_text,
     scan_reserved_markers,
 )
@@ -811,12 +812,28 @@ class PlanValidationDiagnosticTransport:
         return self.payload.candidate_digest[:16]
 
 
+def _plan_validation_diagnostic_label(
+    payload: PlanValidationDiagnosticPayload,
+) -> str:
+    """Render the deterministic label for one diagnostic payload.
+
+    Both identity fields used here live in the payload, so the label of an
+    already-posted record can be regenerated exactly during decoding.
+    """
+    return protocol_record_label(
+        "plan_validation_diagnostic",
+        issue_number=payload.issue_number,
+        attempt=payload.failure_attempt,
+    )
+
+
 def encode_plan_validation_diagnostic_body(
     payload: PlanValidationDiagnosticPayload,
 ) -> TrustedBody:
     """Encode only the immutable pre-POST diagnostic payload."""
     encoded = encode_mapping(payload.as_dict())
     return TrustedBody.canonical(
+        f"{_plan_validation_diagnostic_label(payload)}\n\n"
         f"<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: {encoded} -->",
         surface=ISSUE_COMMENT_SURFACE,
         expected_tokens=("AGENT_PLAN_VALIDATION_DIAGNOSTIC",),
@@ -827,8 +844,9 @@ def decode_plan_validation_diagnostic_body(
     body: str,
 ) -> PlanValidationDiagnosticPayload:
     matches = tuple(PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.finditer(body))
-    if len(matches) != 1 or body.strip() != matches[0].group(0):
+    if len(matches) != 1:
         raise AgentLoopError("Plan-validation diagnostic is not an exact canonical record.")
+    marker = matches[0].group(0)
     encoded = matches[0].group("payload")
     try:
         mapping = decode_mapping(encoded)
@@ -839,11 +857,20 @@ def decode_plan_validation_diagnostic_body(
             surface=ISSUE_COMMENT_SURFACE,
             expected_tokens=("AGENT_PLAN_VALIDATION_DIAGNOSTIC",),
         )
-        return PlanValidationDiagnosticPayload.from_mapping(mapping)
+        payload = PlanValidationDiagnosticPayload.from_mapping(mapping)
     except (AgentLoopError, TypeError, ValueError, KeyError) as exc:
         if isinstance(exc, AgentLoopError) and str(exc).startswith("Invalid plan-validation"):
             raise
         raise AgentLoopError("Invalid plan-validation diagnostic record.") from exc
+    # Exactly two canonical carrier forms are accepted: the historical bare
+    # marker, and the marker introduced by its own regenerated label.  Any other
+    # surrounding text is still rejected.
+    # The comparison is against the unmodified body: surrounding whitespace
+    # would be a third carrier form, and only these two are canonical.
+    labeled = f"{_plan_validation_diagnostic_label(payload)}\n\n{marker}"
+    if body not in {marker, labeled}:
+        raise AgentLoopError("Plan-validation diagnostic is not an exact canonical record.")
+    return payload
 
 
 def has_plan_validation_diagnostic_marker(comments: Sequence[object]) -> bool:
