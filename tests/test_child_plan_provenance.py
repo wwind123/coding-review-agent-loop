@@ -1042,3 +1042,62 @@ def test_rerun_preflight_still_rejects_a_foreign_retained_excerpt(tmp_path, monk
             config=make_config(tmp_path), issue_context=parent,
             mode="implement-by-phase", normalized_topology=(normalized, retained),
         )
+
+
+def test_rerun_preflight_rejects_an_appended_retained_excerpt(tmp_path, monkeypatch):
+    """#907: a record carrying the plan text plus extra content is divergent."""
+    from coding_review_agent_loop.decomposition import EXECUTION_TOPOLOGY_SOURCE
+    from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
+
+    plan = fresh_staged_plan()
+    payload, _end = json.JSONDecoder().raw_decode(plan)
+    recommendation = parse_execution_recommendation_payload(
+        payload["execution_recommendation"], context="test recommendation"
+    )
+    normalized, retained = normalize_execution_recommendation(
+        recommendation, approved_plan=plan, plan_subject=_plan_subject(plan)
+    )
+    created = (
+        CreatedPhaseIssue(normalized.phases[0], "https://github.com/OWNER/REPO/issues/56", 56),
+        CreatedPhaseIssue(normalized.phases[1], "https://github.com/OWNER/REPO/issues/57", 57),
+    )
+    appended = dataclasses.replace(
+        retained, excerpt=retained.excerpt + "\n\nForeign appended scope."
+    )
+    summary = format_decomposition_parent_summary(
+        parent_issue=55,
+        mode="implement-by-phase",
+        plan_hash=approved_plan_hash(plan),
+        created=created,
+        topology_source=EXECUTION_TOPOLOGY_SOURCE,
+        retained_parent_scope=appended,
+        final_integration_work=normalized.final_integration_work,
+        strategy=normalized.strategy,
+        execution_strategy_contract_version=normalized.execution_strategy_contract_version,
+        recommendation_digest=normalized.recommendation_digest,
+        plan_subject=_plan_subject(plan),
+    )
+    # The record is short enough to carry the divergent text verbatim.
+    assert "Foreign appended scope." in summary
+    parent = IssueContext(
+        number=55,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Body",
+        url="https://github.com/OWNER/REPO/issues/55",
+        comments=(comment(plan_record(plan)), comment(summary)),
+    )
+    monkeypatch.setattr(
+        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator, "create_decomposition_child_issues",
+        lambda *_args, **_kwargs: created,
+    )
+
+    with pytest.raises(AgentLoopError, match="disagrees with the approved normalized topology"):
+        orchestrator._preflight_fresh_staged_topology(
+            FakeRunner(), issue_number=55, approved_plan=plan,
+            config=make_config(tmp_path), issue_context=parent,
+            mode="implement-by-phase", normalized_topology=(normalized, retained),
+        )

@@ -51,6 +51,7 @@ from .issue_body_limits import (
     BoundedSection,
     bounded_text_present,
     fit_github_body,
+    is_bounded_form,
     shortened_section,
 )
 from .round_transport import MAX_GITHUB_BODY_CHARS
@@ -2678,19 +2679,17 @@ def retained_parent_scope_matches(
     A summary published for a large plan carries a shortened excerpt, while the
     scope recomputed from the approved plan on a rerun always carries the full
     text.  Plain equality would then wedge exactly the runs the bounding makes
-    publishable, so the excerpt is reconciled through the same bounded-section
-    rules the child issue bodies use; every other field must still match
-    exactly (#907).
+    publishable, so the excerpt is accepted when it is exactly the recomputed
+    text or exactly one of the shortened forms this parent's renderer can
+    produce for it; every other field must still match exactly (#907).
     """
     if recorded is None or expected is None:
         return recorded == expected
     if dataclasses.replace(recorded, excerpt="") != dataclasses.replace(expected, excerpt=""):
         return False
-    if recorded.excerpt == expected.excerpt:
-        return True
     if not expected.excerpt:
-        return False
-    return bounded_text_present(
+        return not recorded.excerpt
+    return is_bounded_form(
         recorded.excerpt,
         retained_parent_excerpt_section(expected.excerpt, parent_issue=parent_issue),
     )

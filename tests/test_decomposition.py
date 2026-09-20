@@ -47,7 +47,7 @@ from coding_review_agent_loop.decomposition import (
     normalize_execution_recommendation,
     find_existing_execution_decision,
 )
-from coding_review_agent_loop.issue_body_limits import shortened_section
+from coding_review_agent_loop.issue_body_limits import shortened_section, shortening_notice
 from coding_review_agent_loop.protocol import (
     EXECUTION_DISPOSITION_DIRECT,
     EXECUTION_DISPOSITION_PLANNING,
@@ -2149,3 +2149,39 @@ def test_retained_parent_scope_matches_only_reconciles_the_excerpt():
         expected,
         parent_issue=841,
     )
+
+
+def test_retained_parent_scope_rejects_content_around_a_bounded_excerpt():
+    """#907: the stored excerpt must be an exact full or shortened form.
+
+    The recovery check reads an isolated record field, so anything appended to
+    or prefixed onto the full text or a shortened form is divergent and must
+    fail closed rather than be tolerated as surrounding body text.
+    """
+    expected = RetainedParentScope(
+        plan_subject="s" * 32,
+        plan_hash="a" * 16,
+        excerpt="The approved plan's retained scope.\nSecond line of detail.",
+    )
+    section = retained_parent_excerpt_section(expected.excerpt, parent_issue=841)
+    notice = shortening_notice(section)
+    shortened = shortened_section(section, budget=len(expected.excerpt) // 2)
+    assert shortened != expected.excerpt
+
+    def matches(excerpt):
+        return retained_parent_scope_matches(
+            dataclasses.replace(expected, excerpt=excerpt), expected, parent_issue=841
+        )
+
+    assert matches(expected.excerpt)
+    assert matches(shortened)
+    assert matches(notice)
+    # Appended, prefixed or interleaved content is divergent, in both forms.
+    assert not matches(expected.excerpt + "\n\nForeign appended scope.")
+    assert not matches("Foreign leading scope.\n\n" + expected.excerpt)
+    assert not matches(shortened + "\n\nForeign appended scope.")
+    assert not matches("Foreign leading scope.\n\n" + shortened)
+    assert not matches(notice + "\n\nForeign appended scope.")
+    assert not matches(expected.excerpt + "\n\n" + notice + "\n\nForeign scope.")
+    # A retained opening that is not an opening of the recomputed plan fails.
+    assert not matches("Foreign opening.\n\n" + notice)
