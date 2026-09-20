@@ -1540,3 +1540,100 @@ def test_two_distinct_trailing_bullets_support_two_findings(builder, bucket):
             ]},
         )),
     )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_one_wrapped_trailing_bullet_supports_exactly_one_finding(builder, bucket):
+    # Issue #871 round 6, item-6: a bullet wrapped across physical lines is one
+    # list ITEM, so its continuation joins the item rather than becoming a second
+    # candidate that repair could match independently.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\n- The retry loop never terminates\n  on a truncated response.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: ["The retry loop never terminates on a truncated response."]},
+        )),
+    )
+    with pytest.raises(AgentLoopError, match="grounding"):
+        validate_repair_preservation(
+            source,
+            json.dumps(builder(
+                state="blocking",
+                summary="Findings.",
+                **{bucket: [
+                    "The retry loop never terminates on a truncated response.",
+                    "The retry loop never terminates on a truncated response.",
+                ]},
+            )),
+        )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_two_wrapped_trailing_bullets_support_two_findings(builder, bucket):
+    # Two actual bullets, each wrapped, still yield two candidates.
+    source = (
+        json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
+        + "\n- The retry loop never terminates\n  on a truncated response.\n"
+        + "- The socket leak is unbounded\n  under backpressure.\n"
+        + "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    validate_repair_preservation(
+        source,
+        json.dumps(builder(
+            state="blocking",
+            summary="Findings.",
+            **{bucket: [
+                "The retry loop never terminates on a truncated response.",
+                "The socket leak is unbounded under backpressure.",
+            ]},
+        )),
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("exempt_only", ["blocking", "[protocol LOOP_META record]"])
+def test_empty_source_finding_cannot_become_an_exempt_only_finding(
+    builder, bucket, exempt_only
+):
+    # Issue #871 round 6, item-7: `_joined_text({})` is empty for the same reason
+    # a marker-only finding is, so without marker provenance an approved source
+    # carrying `[{}]` could be repaired into a blocking review whose finding is
+    # nothing but exempt tokens, and that match would ground the verdict.
+    source = builder(
+        state="approved", summary="The diff is correct.", **{bucket: [{}]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="The diff is correct.", **{bucket: [exempt_only]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_marker_only_source_finding_is_still_neutralizable_in_both_kinds(builder, bucket):
+    # The neutralization exception stays open for a finding that really was
+    # nothing but a reserved marker.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["[protocol LOOP_META record]"]},
+    ))

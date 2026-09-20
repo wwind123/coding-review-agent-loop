@@ -11,7 +11,11 @@ from .protocol import (
     normalize_response_file_structured_text,
     parse_plan_revision_patch,
 )
-from .protocol_markers import RESERVED_MARKER_REGISTRY, historical_text_fragments
+from .protocol_markers import (
+    RESERVED_MARKER_REGISTRY,
+    historical_text_fragments,
+    scan_reserved_markers,
+)
 
 
 _KINDS = {
@@ -213,6 +217,32 @@ def _joined_text(value: object) -> str:
     return " ".join(fragment for fragment in _fragments(value) if fragment)
 
 
+def _raw_string_values(value: object) -> list[str]:
+    """Substantive strings of *value* WITHOUT reserved-marker stripping."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [text for child in value for text in _raw_string_values(child)]
+    if isinstance(value, dict):
+        return [
+            text for key, child in value.items()
+            if key not in _FINDING_METADATA_KEYS
+            for text in _raw_string_values(child)
+        ]
+    return []
+
+
+def _carries_reserved_marker(value: object) -> bool:
+    """Whether *value* actually embeds a reserved protocol marker.
+
+    `_joined_text` strips markers, so a marker-only source finding and a
+    genuinely empty one such as `{}` both flatten to the empty string. Only the
+    former may correspond to a neutralization label, so marker provenance is
+    read from the unstripped strings (#871).
+    """
+    return any(scan_reserved_markers(text) for text in _raw_string_values(value))
+
+
 _PROTOCOL_RECORD_LINE_RE = re.compile(r"\A(?:<!--.*-->|--\s+\S.*)\Z", re.DOTALL)
 _LIST_ITEM_RE = re.compile(r"\A[-*\u2022]\s+(?P<body>.*)\Z", re.DOTALL)
 
@@ -240,13 +270,24 @@ def _freeform_finding_candidates(text: str) -> list[str]:
         if not lines:
             continue
         if any(_LIST_ITEM_RE.match(line) for line in lines):
-            # A bulleted block states one concern per line, so each line is its
-            # own candidate and the joined block is not emitted as well.
+            # A bulleted block states one concern per list ITEM, not per
+            # physical line: a wrapped bullet's continuation lines join the item
+            # they belong to, so one wrapped bullet stays one candidate and
+            # cannot be matched twice (#871).
+            items: list[list[str]] = []
             for line in lines:
                 match = _LIST_ITEM_RE.match(line)
-                body = (match.group("body") if match else line).strip()
-                if body:
-                    candidates.append(body)
+                if match is not None:
+                    items.append([match.group("body").strip()])
+                elif items:
+                    items[-1].append(line)
+                else:
+                    # A lead-in line before the first bullet is its own concern.
+                    items.append([line])
+            for item in items:
+                joined_item = " ".join(" ".join(item).split())
+                if joined_item:
+                    candidates.append(joined_item)
             continue
         joined = " ".join(" ".join(lines).split())
         if joined:
@@ -349,8 +390,23 @@ def _validate_review_grounding(
         return entries
 
     source_findings = bucket_entries(source, buckets)
-    source_candidates = [_joined_text(entry) for entry in source_findings]
-    if not source_candidates:
+    source_candidates: list[str] = []
+    # Parallel to source_candidates: True only for a source finding whose prose
+    # is empty BECAUSE it was nothing but a reserved marker.
+    candidate_is_marker_only: list[bool] = []
+    for entry in source_findings:
+        entry_text = _joined_text(entry)
+        if _content_tokens(entry_text) or _modifier_counts(entry_text):
+            source_candidates.append(entry_text)
+            candidate_is_marker_only.append(False)
+        elif _carries_reserved_marker(entry):
+            source_candidates.append(entry_text)
+            candidate_is_marker_only.append(True)
+        # A genuinely empty entry such as `{}` carries no reviewer content at
+        # all. It is dropped rather than kept: keeping it would both hand repair
+        # a wildcard for an exempt-token-only finding and raise the
+        # correspondence ceiling on the strength of nothing (#871).
+    if not source_findings:
         # The payload declares no finding in any bucket. Only freeform prose
         # OUTSIDE the recovered JSON object can be a reviewer finding here: the
         # object's own fields are structured data, and `summary` in particular is
@@ -358,6 +414,7 @@ def _validate_review_grounding(
         # would let an approved source's summary be copied into a current-scope
         # blocking finding and then ground the inverted verdict (#871).
         source_candidates = _freeform_finding_candidates(_payload_and_trailing(raw)[1])
+        candidate_is_marker_only = [False] * len(source_candidates)
 
     target_findings: list[tuple[str, str]] = []
     for name in buckets:
@@ -385,13 +442,18 @@ def _validate_review_grounding(
         _name, text = target_findings[finding_index]
         tokens = set(_content_tokens(text))
         if not candidate_tokens[candidate_index] and not candidate_modifiers[candidate_index]:
-            # A marker-only or empty source entry carries no prose, so it can
-            # only correspond to a target finding that carries none either —
-            # which is exactly the reserved-marker neutralization case, whose
-            # label tokens are exempt. Matching it unconditionally would let the
-            # source summary or any other global prose be promoted into a
-            # fabricated finding, because whole-source coverage alone cannot
-            # tell a finding apart from the rest of the source text (#871).
+            # A candidate with no prose corresponds to nothing unless it is a
+            # genuine marker-only source finding, and then only to a target
+            # finding that is itself empty after the exempt sets — the
+            # reserved-marker neutralization case. Without the provenance check
+            # an exempt-token-only string such as `blocking` or a bare
+            # neutralization label would match and fabricate review substance,
+            # and without the emptiness check the source summary or any other
+            # global prose could be promoted into a finding, because whole-source
+            # coverage alone cannot tell a finding apart from the rest of the
+            # source text (#871).
+            if not candidate_is_marker_only[candidate_index]:
+                return False
             return not tokens and not _modifier_counts(text)
         if not tokens <= candidate_tokens[candidate_index]:
             return False
