@@ -1101,3 +1101,235 @@ def test_rerun_preflight_rejects_an_appended_retained_excerpt(tmp_path, monkeypa
             config=make_config(tmp_path), issue_context=parent,
             mode="implement-by-phase", normalized_topology=(normalized, retained),
         )
+
+
+class _ManagedResumeCaptured(Exception):
+    """Sentinel raised at handoff revalidation, after plan recovery."""
+
+
+def legacy_plan_record(plan, *, subject):
+    """A pre-canonical free-form plan record carrying a divergent subject."""
+    return _attach_round_metadata(plan, PostedRoundMetadata(
+        flow="plan", role="coder", agent="Claude", round_number=1, subject=subject,
+    ))
+
+
+def managed_ci_resume(
+    tmp_path,
+    monkeypatch,
+    *,
+    child,
+    parent,
+    parent_issue_context,
+    approved_plan_context=None,
+):
+    """Drive the managed-CI ordinary resume up to handoff revalidation."""
+    fetched = []
+
+    def fake_get_issue_context(_runner, *, config, issue_number):
+        fetched.append(issue_number)
+        return child if issue_number == child.number else parent
+
+    monkeypatch.setattr(orchestrator, "get_issue_context", fake_get_issue_context)
+    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "recover_issue_created_handoff",
+        lambda *_a, **_k: orchestrator.AuthenticatedIssueCreatedHandoff(
+            pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+            head_sha="abc123", branch="agent-loop/managed-56",
+            trusted_actor_login="agent-loop", trusted_actor_id=1,
+            protection_mode="voluntary", override_nonce="opening-nonce",
+        ),
+    )
+    captured = {}
+
+    def revalidate(*_args, **kwargs):
+        captured.update(kwargs)
+        raise _ManagedResumeCaptured
+
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", revalidate)
+    runner = FakeRunner(
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        reviewer=("codex",),
+    )
+
+    def run():
+        return orchestrator.run_pr_loop(
+            runner, pr_number=77, config=config,
+            parent_issue_context=parent_issue_context,
+            approved_plan_context=approved_plan_context,
+        )
+
+    return run, runner, captured, fetched
+
+
+def assert_no_agent_process(runner):
+    assert not any(
+        command[:1] in (["claude"], ["codex"], ["gemini"])
+        for command, _cwd in runner.commands
+    )
+
+
+def test_managed_ci_resume_recovers_staged_parent_held_plan(tmp_path, monkeypatch):
+    """A staged child with only its handoff record resumes from the parent plan."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    assert len(child.comments) == 1
+    run, runner, captured, _fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=parent
+    )
+
+    with pytest.raises(_ManagedResumeCaptured):
+        run()
+
+    assert captured["handoff"].approved_plan_hash == approved_plan_hash(plan)
+    assert_no_agent_process(runner)
+
+
+def test_managed_ci_resume_refreshes_stale_parent_snapshot_once(tmp_path, monkeypatch):
+    """A caller snapshot predating plan approval is refreshed before the lookup."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    stale_parent = dataclasses.replace(parent, comments=parent.comments[1:])
+    assert orchestrator.recover_approved_plan_context(
+        stale_parent.comments, expected_hash=approved_plan_hash(plan)
+    ).is_available is False
+    run, runner, captured, fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent,
+        parent_issue_context=stale_parent,
+    )
+
+    with pytest.raises(_ManagedResumeCaptured):
+        run()
+
+    assert captured["handoff"].approved_plan_hash == approved_plan_hash(plan)
+    assert fetched.count(parent.number) == 1
+    assert_no_agent_process(runner)
+
+
+def test_managed_ci_resume_without_parent_context_still_fails_closed(tmp_path, monkeypatch):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    run, runner, _captured, _fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=None
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match="Managed-CI ordinary resume could not recover the canonical approved plan.",
+    ):
+        run()
+
+    assert_no_agent_process(runner)
+
+
+def test_managed_ci_resume_parent_without_matching_hash_fails_closed(tmp_path, monkeypatch):
+    """The recovered parent plan must still hash-match the canonical handoff."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    other_plan = "Unrelated approved plan.\n\n### Plan steps\n1. Do something else."
+    mismatched_parent = dataclasses.replace(
+        parent, comments=(comment(plan_record(other_plan)),) + parent.comments[1:]
+    )
+    run, runner, _captured, _fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=mismatched_parent,
+        parent_issue_context=mismatched_parent,
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match="Managed-CI ordinary resume could not recover the canonical approved plan.",
+    ):
+        run()
+
+    assert_no_agent_process(runner)
+
+
+def test_managed_ci_resume_subject_rejected_child_record_permits_parent_fallback(
+    tmp_path, monkeypatch
+):
+    """A hash-matching child record rejected on its derived subject is not adopted."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    child = dataclasses.replace(
+        child,
+        comments=(comment(legacy_plan_record(plan, subject="divergent-subject")),)
+        + child.comments,
+    )
+    child_only = orchestrator.recover_approved_plan_context(
+        child.comments, expected_hash=approved_plan_hash(plan)
+    )
+    assert not child_only.is_available
+    assert not child_only.has_matching_candidate
+    run, runner, captured, _fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=parent
+    )
+
+    with pytest.raises(_ManagedResumeCaptured):
+        run()
+
+    assert captured["handoff"].approved_plan_hash == approved_plan_hash(plan)
+    assert_no_agent_process(runner)
+
+
+def test_managed_ci_resume_divergent_child_records_never_consult_parent(
+    tmp_path, monkeypatch
+):
+    """Divergent hash-matching child records keep failing closed."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    seen = []
+
+    def divergent(comments, **kwargs):
+        seen.append(comments)
+        return orchestrator.ApprovedPlanContext(
+            plan_hash=kwargs["expected_hash"],
+            availability="mismatched",
+            has_matching_candidate=True,
+            diagnostic="Multiple divergent canonical plan records match handoff hash.",
+        )
+
+    monkeypatch.setattr(orchestrator, "recover_approved_plan_context", divergent)
+    run, runner, _captured, _fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=parent
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match="Managed-CI ordinary resume could not recover the canonical approved plan.",
+    ):
+        run()
+
+    assert len(seen) == 1
+    assert seen[0] is child.comments
+    assert_no_agent_process(runner)
+
+
+def test_managed_ci_resume_rejects_supplied_scope_conflicting_with_parent_plan(
+    tmp_path, monkeypatch
+):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    supplied = orchestrator.make_approved_plan_context(
+        "Different plan.\n\n### Plan steps\n1. Change the boundary.",
+        source_locator="test",
+    )
+    run, runner, _captured, _fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=parent,
+        approved_plan_context=supplied,
+    )
+
+    with pytest.raises(
+        AgentLoopError, match="does not match the canonical issue plan"
+    ):
+        run()
+
+    assert_no_agent_process(runner)

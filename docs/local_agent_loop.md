@@ -2309,7 +2309,22 @@ branch, selected base, live exact head, expected issue association, an
 actor-owned managed-label history, and the canonical approved-plan scope when
 one applies. PR mode fetches the issue and its canonical plan comments from
 GitHub and requires a server-observed issue timeline association to the PR;
-PR-body closing text is corroboration, not authority. Identical retries reuse
+PR-body closing text is corroboration, not authority.
+
+Both managed-CI recovery branches — the fresh authorization above and the
+ordinary same-PR resume — refresh the child issue snapshot and the
+authoritative in-process parent issue snapshot before reading either one's
+comments, so a caller-supplied snapshot that predates plan approval cannot
+defeat recovery. A staged decomposition child normally carries only its
+issue-to-PR handoff record, with the approved plan round living on its parent
+issue. When the child yields no record at all carrying the handoff plan hash,
+the canonical plan may therefore be recovered from that refreshed parent
+snapshot. The fallback is hash-only and reaches the parent solely because the
+child's authenticated fresh-phase identity named it: divergent child records
+that do match the handoff hash still fail closed without consulting the
+parent, and the handoff plan hash remains the only binding on whatever the
+parent yields. Documentation never excuses an implementation defect; the
+source remains authoritative. Identical retries reuse
 an existing valid creation, fresh, or continuity authorization at that exact
 head instead of publishing a competing grant; conflicting records,
 ambiguous provenance, or changed live state fail closed before labels,
