@@ -4659,3 +4659,41 @@ def test_discuss_final_synthesis_parser_rejects_invalid_classification_shape():
     parsed = parse_structured_discuss_final_synthesis(_synthesis_response(final))
     assert parsed is not None
     assert serialize_discuss_final_synthesis(parsed).startswith('{"schema_version":1')
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_claim_truncates_an_overlong_fact_list_instead_of_rejecting(kind):
+    """#913: a row covering many tests must not discard a reviewed PR.
+
+    PR #912 was approved by the primary and then lost its follow-up to
+    'test_identifiers exceeds the 12-item bound'.
+    """
+    identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(13)]
+    claims = [{
+        "row_id": "row-1",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": identifiers,
+        "test_locations": ["tests/test_mod.py"],
+        "workflow_path_claim": "issue mode / follow-up",
+        "outcome_assertions": ["Every listed test passed."],
+        "forbidden_effect_assertions": ["No unauthorized evidence was accepted."],
+    }]
+
+    parsed = _validate_claims_envelope(kind, claims)
+
+    claim = parsed.risk_test_matrix_claims.claims[0]
+    assert claim.test_identifiers == tuple(identifiers[:12])
+    assert any("listed 13 items" in caveat for caveat in claim.caveats)
+    assert claim.test_locations == ("tests/test_mod.py",)
+
+
+def test_semantic_claim_still_rejects_a_malformed_overlong_fact_list():
+    identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(12)] + [""]
+    claims = [{
+        "row_id": "row-1",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": identifiers,
+    }]
+
+    with pytest.raises(AgentLoopError, match="test_identifiers"):
+        _validate_claims_envelope("coder_followup", claims)

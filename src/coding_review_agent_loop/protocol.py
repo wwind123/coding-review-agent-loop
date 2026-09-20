@@ -3125,14 +3125,38 @@ def _optional_semantic_fact_string(value: object, *, context: str) -> str:
     return normalized
 
 
-def _optional_semantic_fact_list(value: object, *, context: str) -> tuple[str, ...]:
+def _optional_semantic_fact_list(
+    value: object, *, context: str, dropped: list[str] | None = None
+) -> tuple[str, ...]:
     """Normalize an absent/null/empty semantic fact list to ``()``.
 
-    Non-list values, non-string or blank items, duplicate items, and bound
-    violations still raise.
+    A row that genuinely covers many tests is ordinary, so a list longer than
+    ``RISK_MATRIX_MAX_LIST_ITEMS`` keeps its first entries and reports the
+    overflow through ``dropped`` instead of rejecting the envelope before the
+    PR is authenticated (#913).  Non-list values, non-string or blank items,
+    duplicates, and oversize individual entries still raise.
     """
     if value is None:
         return ()
+    if isinstance(value, list) and len(value) > RISK_MATRIX_MAX_LIST_ITEMS:
+        kept = _risk_bounded_string_list(
+            value[:RISK_MATRIX_MAX_LIST_ITEMS], context=context
+        )
+        # Validate the discarded entries too, so a malformed tail is still a
+        # defect rather than something truncation can hide.
+        _risk_bounded_string_list(
+            value[RISK_MATRIX_MAX_LIST_ITEMS:],
+            context=context,
+            max_items=len(value) - RISK_MATRIX_MAX_LIST_ITEMS,
+        )
+        if len(set(kept)) != len(kept):
+            raise AgentLoopError(f"{context} contains duplicate items.")
+        if dropped is not None:
+            dropped.append(
+                f"{context} listed {len(value)} items; the first "
+                f"{RISK_MATRIX_MAX_LIST_ITEMS} are retained."
+            )
+        return kept
     rendered = _risk_bounded_string_list(value, context=context)
     if len(set(rendered)) != len(rendered):
         raise AgentLoopError(f"{context} contains duplicate items.")
@@ -3321,21 +3345,26 @@ def _parse_semantic_risk_coverage_claims(
                         f"{claim_context}.execution_refs selector `{ref}` has known non-authoritative "
                         "launch-integrity state and cannot be selected before authentication."
                     )
+        truncated_facts: list[str] = []
         test_identifiers = _optional_semantic_fact_list(
             payload.get("test_identifiers"),
             context=f"{claim_context}.test_identifiers",
+            dropped=truncated_facts,
         )
         test_locations = _optional_semantic_fact_list(
             payload.get("test_locations"),
             context=f"{claim_context}.test_locations",
+            dropped=truncated_facts,
         )
         outcome_assertions = _optional_semantic_fact_list(
             payload.get("outcome_assertions"),
             context=f"{claim_context}.outcome_assertions",
+            dropped=truncated_facts,
         )
         forbidden_effect_assertions = _optional_semantic_fact_list(
             payload.get("forbidden_effect_assertions"),
             context=f"{claim_context}.forbidden_effect_assertions",
+            dropped=truncated_facts,
         )
         caveats = _risk_bounded_string_list(
             payload.get("caveats", []),
@@ -3347,6 +3376,9 @@ def _parse_semantic_risk_coverage_claims(
                 *caveats[: SEMANTIC_RISK_CLAIMS_MAX_CAVEATS - 1],
                 _dropped_execution_refs_caveat(dropped_refs),
             )
+        for truncation in truncated_facts:
+            # Keep the row's own caveats ahead of the bookkeeping ones (#913).
+            caveats = (*caveats[: SEMANTIC_RISK_CLAIMS_MAX_CAVEATS - 1], truncation)
         claim = SemanticRiskCoverageClaim(
             row_id=row_id,
             execution_refs=tuple(admissible_refs),
