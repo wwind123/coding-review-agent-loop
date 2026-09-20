@@ -2464,6 +2464,20 @@ malformed metadata and authorization-comment fallbacks are rejected. A push,
 branch name, PR body, author, label, draft state, missing link, fork, or race cannot extend
 authority; recovery prints the explicit fresh-authorization command instead.
 
+A merge-conflict resolution round is the single exception, because it runs no
+reviewer. When the head conflicts with the base branch, agent-loop skips the
+board and routes the round to the coder, so continuity accepts that head move on
+the tool-owned merge-conflict obligation instead of a review pair: exactly one
+actor-authored coder round metadata record for the new exact head, newer than
+the predecessor authorization, carrying the orchestrator-minted merge-conflict
+obligation that no agent response can add or classify. The continuity record
+binds that one record, and resume re-parses and rechecks the same shape. A head
+advance with neither an ordered review/coder pair nor that obligation still
+fails closed, and the board must still approve the exact final head before
+qualification or merge. This removes the second `--managed-ci-fresh` grant that
+an ordinary base-branch move used to require, without widening what counts as an
+approval.
+
 #### Creating a managed PR from an existing branch
 
 When code is already pushed to the repository but no PR exists, use the
