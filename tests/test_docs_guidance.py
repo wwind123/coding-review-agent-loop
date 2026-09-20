@@ -450,7 +450,15 @@ def test_docs_describe_reviewer_repair_admission_and_grounding():
     assert (
         "it corresponds solely to its own authorized neutralization" in normalized
     )
-    assert "Every other exempt-only target is refused" in normalized
+    assert (
+        "Every other exempt-only target is refused, whichever candidate it is "
+        "matched against" in normalized
+    )
+    assert "compared by marker identity" in normalized
+    assert (
+        "a target matched to a substantive candidate must therefore retain "
+        "substantive content of its own" in normalized
+    )
     assert "An empty or marker-only source finding" not in normalized
     assert (
         "a lead-in line before the first bullet is list structure that is "

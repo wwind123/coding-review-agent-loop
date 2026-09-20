@@ -1738,6 +1738,66 @@ def test_marker_only_source_finding_accepts_the_marker_kept_verbatim(builder, bu
     ("builder", "bucket"),
     [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
 )
+def test_marker_only_source_finding_rejects_an_unrelated_raw_marker(builder, bucket):
+    # Issue #871 round 10, item-10: joining strips every reserved marker, so an
+    # unrelated raw marker family also normalizes to the empty string. Marker
+    # identity is compared instead of accepting every empty result, so only the
+    # source's own family (or its safe label) is authorized.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_LOOP_META: v1_abc -->"]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["<!-- AGENT_SPLIT_CHILD: parent=7 key=" + "a" * 64 + " -->"]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+@pytest.mark.parametrize("exempt_only", ["blocking", "it is in the plan"])
+def test_substantive_source_finding_cannot_become_exempt_only_text(
+    builder, bucket, exempt_only
+):
+    # Issue #871 round 10, item-11: an exempt-only target has an empty
+    # content-token set, which is trivially a subset of ANY candidate, and
+    # whole-source coverage is vacuous for it. Without the substantive-content
+    # guard repair could replace a real reviewer finding with schema vocabulary
+    # or stop-word-only prose and still ground the blocking verdict.
+    source = builder(
+        state="blocking", summary="Findings.",
+        **{bucket: ["The socket leak is unbounded under backpressure."]},
+    )
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: [exempt_only]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
+def test_modifier_only_source_finding_must_keep_its_modifiers(builder, bucket):
+    # The bounded rule for a modifier-only candidate: the target is not required
+    # to carry content tokens, but the modifier-count equality rule forces it to
+    # carry the same modifiers, so it cannot become exempt-only text either.
+    source = builder(
+        state="blocking", summary="Findings.", **{bucket: ["never"]},
+    )
+    check(source, builder(
+        state="blocking", summary="Findings.", **{bucket: ["never"]},
+    ))
+    rejects(source, builder(
+        state="blocking", summary="Findings.", **{bucket: ["blocking"]},
+    ))
+
+
+@pytest.mark.parametrize(
+    ("builder", "bucket"),
+    [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
+)
 def test_marker_only_source_finding_is_still_neutralizable_in_both_kinds(builder, bucket):
     # The neutralization exception stays open for a finding that really was
     # nothing but a reserved marker.

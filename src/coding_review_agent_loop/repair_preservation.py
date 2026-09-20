@@ -431,13 +431,18 @@ def _validate_review_grounding(
         source_candidates = _freeform_finding_candidates(_payload_and_trailing(raw)[1])
         candidate_marker_labels = [frozenset()] * len(source_candidates)
 
-    target_findings: list[tuple[str, str]] = []
+    # Each target finding keeps the safe labels of the markers IT embeds, so a
+    # raw marker in the repaired text can be compared against the source
+    # candidate's own marker families rather than merely stripping to nothing.
+    target_findings: list[tuple[str, str, frozenset[str]]] = []
     for name in buckets:
         value = target.get(name)
         if not isinstance(value, list):
             continue
         for entry in value:
-            target_findings.append((name, _joined_text(entry)))
+            target_findings.append((
+                name, _joined_text(entry), _authorized_neutralization_labels(entry),
+            ))
 
     # The ceiling applies to the freeform fallback too, so a payload declaring no
     # finding cannot gain one from a shorter list of prose segments.
@@ -454,7 +459,7 @@ def _validate_review_grounding(
     matched_finding_by_candidate: dict[int, int] = {}
 
     def can_match(finding_index: int, candidate_index: int) -> bool:
-        _name, text = target_findings[finding_index]
+        _name, text, target_labels = target_findings[finding_index]
         tokens = set(_content_tokens(text))
         if not candidate_tokens[candidate_index] and not candidate_modifiers[candidate_index]:
             # A candidate with no prose corresponds to nothing unless it is a
@@ -471,7 +476,24 @@ def _validate_review_grounding(
             if not labels or _modifier_counts(text):
                 return False
             normalized = _normalized_label(text)
-            return normalized == "" or normalized in labels
+            if normalized:
+                return normalized in labels
+            # The target stripped to nothing, which means it too was nothing but
+            # reserved markers. Marker IDENTITY still has to hold: an unrelated
+            # raw marker family also strips to the empty string, so compare the
+            # families rather than accepting every empty result (#871).
+            return bool(target_labels) and target_labels <= labels
+        if not tokens and not _modifier_counts(text):
+            # The candidate is substantive, so the repaired finding must retain
+            # substantive content of its own. An exempt-only target — schema
+            # vocabulary such as `blocking`, or stop-word-only prose — has an
+            # empty content-token set, which is trivially a subset of any
+            # candidate, and whole-source coverage is vacuous for it, so without
+            # this guard repair could replace a real reviewer finding with a
+            # fabricated placeholder and still ground a blocking verdict. A
+            # modifier-only candidate is bounded by the equality rule below,
+            # which forces the target to carry those same modifiers (#871).
+            return False
         if not tokens <= candidate_tokens[candidate_index]:
             return False
         # Modifier-count equality applies to EVERY matched pair, including a
@@ -494,7 +516,7 @@ def _validate_review_grounding(
                 return True
         return False
 
-    for finding_index, (name, text) in enumerate(target_findings):
+    for finding_index, (name, text, _labels) in enumerate(target_findings):
         if not supported(text):
             reject(f"`{name}` carries content absent from the source")
         if not augment(finding_index, set()):
@@ -610,7 +632,7 @@ def _validate_review_grounding(
     source_current_findings = bool(bucket_entries(source, current_scope_buckets))
     target_matched_current = any(
         name in current_scope_buckets and index in matched_candidate_by_finding
-        for index, (name, _text) in enumerate(target_findings)
+        for index, (name, _text, _labels) in enumerate(target_findings)
     )
     if target_state == "blocking":
         if not (

@@ -3133,12 +3133,17 @@ one trailing reviewer statement cannot be matched twice and raise the ceiling,
 and protocol footer and signature lines are structural records rather than
 candidates. A declared source finding that carries
 no prose is a candidate only when it really was nothing but a reserved marker, and
-then it corresponds solely to its own authorized neutralization — the same marker
-kept verbatim, or one of the safe labels the markers in that entry authorize.
-Every other exempt-only target is refused, because schema vocabulary, the stop
-list and every registry safe label are exempt, so `blocking`, an unrelated
-marker's label, or stop-word-only prose would otherwise match and fabricate a
-finding. A genuinely empty entry such as `{}` is dropped, so it can neither become
+then it corresponds solely to its own authorized neutralization — one of the safe
+labels the markers in that entry authorize, or the same marker family kept
+verbatim, compared by marker identity rather than by the empty string that
+stripping any marker leaves behind. Every other exempt-only target is refused,
+whichever candidate it is matched against: schema vocabulary, the stop list and
+every registry safe label are exempt, so `blocking`, an unrelated marker or its
+label, or stop-word-only prose has an empty content-token set that is trivially a
+subset of any candidate and vacuously covered by the whole source, and a target
+matched to a substantive candidate must therefore retain substantive content of
+its own. A modifier-only candidate is bounded instead by the modifier-count
+equality rule below, which forces the target to carry the same modifiers. A genuinely empty entry such as `{}` is dropped, so it can neither become
 a wildcard for an exempt-token-only finding nor raise the ceiling.
 Whole-source coverage alone cannot tell
 a finding apart from the summary or any other global prose, so without that
