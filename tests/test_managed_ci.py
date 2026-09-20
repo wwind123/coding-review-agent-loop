@@ -65,7 +65,11 @@ from coding_review_agent_loop.managed_ci import (
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
-from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE, PR_COMMENT_SURFACE
+from coding_review_agent_loop.protocol_markers import (
+    PR_BODY_SURFACE,
+    PR_COMMENT_SURFACE,
+    protocol_record_label,
+)
 from coding_review_agent_loop.orchestrator import (
     _finalize_ordinary_recovery_merge,
     _render_ci_rerun_command,
@@ -235,7 +239,33 @@ class V2ManagedRunner(ManagedRunner):
         self.compare_payload = compare_payload
         self.labels_posted = False
         self.intent_snapshots = []
+        self.audit_comments = {}
         self.dispatch_count = 0
+
+    def _next_comment_id(self):
+        """Allocate one unused comment identity across every stored comment."""
+        known = [
+            int(item.get("id", 0))
+            for item in self.intent_comments
+            if isinstance(item, dict)
+        ]
+        known.extend(int(key) for key in self.audit_comments)
+        return max(known, default=16) + 1
+
+    def _stored_comment(self, comment_id, body):
+        """Return the envelope GitHub would report for one stored comment."""
+        for comment in self.intent_comments:
+            if isinstance(comment, dict) and comment.get("id") == comment_id:
+                return comment
+        if comment_id in self.audit_comments:
+            return self.audit_comments[comment_id]
+        if body is None:
+            return None
+        return {
+            "id": comment_id,
+            "user": {"login": self.actor_login, "id": self.actor_id},
+            "body": body,
+        }
 
     def _capture_intent_body(self, body):
         marker = "AGENT_MANAGED_CI_INTENT_V2"
@@ -329,29 +359,51 @@ class V2ManagedRunner(ManagedRunner):
             cmd, cwd_path = self._record_command(args, cwd)
             body = self._form_value(cmd, "body")
             record = self._capture_intent_body(body)
-            comment_id = (
-                max((int(item.get("id", 0)) for item in self.intent_comments if isinstance(item, dict)), default=16) + 1
-                if record is not None
-                else 17
-            )
+            comment_id = self._next_comment_id()
             if record is not None:
                 self.intent_comments.append({
                     "id": comment_id,
                     "user": {"login": self.actor_login, "id": self.actor_id},
                     "body": body,
                 })
-            return CommandResult(cmd, cwd_path, json.dumps({"id": comment_id}), "", 0)
+            else:
+                self.audit_comments[comment_id] = {
+                    "id": comment_id,
+                    "user": {"login": self.actor_login, "id": self.actor_id},
+                    "body": body,
+                }
+            # GitHub echoes the stored comment envelope on a successful write.
+            return CommandResult(
+                cmd,
+                cwd_path,
+                json.dumps(self._stored_comment(comment_id, body)),
+                "",
+                0,
+            )
         if endpoint.startswith("repos/OWNER/REPO/issues/comments/"):
             cmd, cwd_path = self._record_command(args, cwd)
+            comment_id = int(endpoint.rsplit("/", 1)[-1])
             body = self._form_value(cmd, "body")
+            if body is None:
+                stored = self._stored_comment(comment_id, None)
+                if stored is None:
+                    return CommandResult(cmd, cwd_path, "", "HTTP 404: Not Found", 1)
+                return CommandResult(cmd, cwd_path, json.dumps(stored), "", 0)
             record = self._capture_intent_body(body)
             if record is not None:
-                comment_id = int(endpoint.rsplit("/", 1)[-1])
                 for comment in self.intent_comments:
                     if isinstance(comment, dict) and comment.get("id") == comment_id:
                         comment["body"] = body
                         break
-            return CommandResult(cmd, cwd_path, "{}", "", 0)
+            elif comment_id in self.audit_comments:
+                self.audit_comments[comment_id]["body"] = body
+            return CommandResult(
+                cmd,
+                cwd_path,
+                json.dumps(self._stored_comment(comment_id, body)),
+                "",
+                0,
+            )
         if endpoint.endswith("/actions/workflows/ci.yml/dispatches"):
             self.dispatch_count += 1
             return super()._run_locked(args, cwd=cwd, check=check)
@@ -3822,7 +3874,8 @@ def test_pr_mode_resumes_only_from_durable_issue_authorization_and_mints_fresh_a
     assert contract is not None
     assert contract.activation_path == "managed"
     assert contract.audit_nonce and contract.audit_nonce != "old-nonce"
-    assert contract.audit_comment_id == 17
+    # The verified audit write adopts the identity GitHub stored for it.
+    assert contract.audit_comment_id in runner.audit_comments
     assert contract.intent_generation
     assert contract.ordinary_recovery_capable is True
     assert any("active_label_event_id=101" in " ".join(cmd) for cmd, _ in runner.commands)
@@ -5764,3 +5817,372 @@ def test_merge_pr_uses_expected_head_guard(tmp_path):
 
     command = runner.commands[-1][0]
     assert command[-2:] == ["--match-head-commit", "abc123"]
+
+
+# --- Issue #878: visible labels on tool-owned managed-CI records ------------
+
+
+def _authorization_record(kind, *, head="abc123"):
+    extra = (
+        {
+            "predecessor_head": "old-head",
+            "predecessor_comment_id": 41,
+            "round_comment_ids": (88, 89),
+        }
+        if kind == "continuity"
+        else {}
+    )
+    return ManagedCiIssueAuthorization(
+        kind=kind,
+        repository="OWNER/REPO",
+        issue_number=643,
+        pr_number=7,
+        base_ref="main",
+        head_sha=head,
+        actor_login="agent-loop",
+        actor_id=1,
+        protection="voluntary",
+        waiver="allow-unprotected-managed-ci",
+        nonce="nonce-643",
+        label_event_id=101,
+        **extra,
+    )
+
+
+def _authorization_marker(record):
+    encoded = managed_ci._encode_issue_authorization_payload(record.to_payload())
+    return f"<!-- {managed_ci.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
+
+
+def test_authorization_bodies_are_labeled_per_kind_without_touching_the_marker():
+    labels = {}
+    for kind in ("creation", "fresh", "continuity"):
+        record = _authorization_record(kind)
+        body = str(format_issue_created_authorization_comment(record))
+        marker = _authorization_marker(record)
+        label, separator, tail = body.partition("\n\n")
+        labels[kind] = label
+        assert separator == "\n\n"
+        assert tail == marker
+        assert label.startswith("Agent-loop managed-CI ")
+        assert "issue #643" in label and "pull request #7" in label
+        assert "abc123"[:7] in label
+        assert parse_issue_created_authorization_comment(body) == record
+        # Deterministic: a retry renders a byte-identical body.
+        assert str(format_issue_created_authorization_comment(record)) == body
+    assert len(set(labels.values())) == 3
+
+
+def test_labeled_creation_authorization_is_published_once_and_read_back(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    published = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+
+    stored = next(
+        comment for comment in runner.intent_comments
+        if comment["id"] == published.authorization_comment_id
+    )
+    record = parse_issue_created_authorization_comment(stored["body"])
+    assert record is not None and record.kind == "creation"
+    assert stored["body"] == str(format_issue_created_authorization_comment(record))
+    assert stored["body"].startswith("Agent-loop managed-CI authorization record")
+
+
+def test_historical_marker_only_authorization_still_suppresses_republication(tmp_path):
+    expected = _authorization_record("creation")
+    runner = AuthorizationCommentRunner(
+        issue_events=[label_event()],
+        intent_comments=[{
+            "id": 41,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": _authorization_marker(expected),
+        }],
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    published = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+
+    assert published.authorization_comment_id == 41
+    assert not any(
+        "issues/7/comments" in " ".join(command) and "POST" in command
+        for command, _cwd in runner.commands
+    )
+
+
+class AlteredLabelAuthorizationRunner(AuthorizationCommentRunner):
+    """Echo a stored body whose visible label was altered in transit."""
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next(
+            (part for part in args if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if endpoint == "repos/OWNER/REPO/issues/7/comments" and "POST" in args:
+            body = self._form_value(list(args), "body") or ""
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                cmd, cwd_path,
+                json.dumps({
+                    "id": 17,
+                    "body": body.replace("Agent-loop", "Agent-loop (edited)", 1),
+                    "user": {"login": self.actor_login, "id": self.actor_id},
+                }),
+                "", 0,
+            )
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def test_altered_authorization_label_fails_read_back_and_adopts_no_identity(tmp_path):
+    runner = AlteredLabelAuthorizationRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    with pytest.raises(AgentLoopError, match="returned a different body"):
+        publish_issue_created_authorization(
+            runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+        )
+    assert runner.intent_comments == []
+
+
+def test_intent_body_is_labeled_and_keeps_its_marker_and_determinism(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner()
+    contract = v2_contract()
+
+    _ensure_v2_intent(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    stored = next(
+        comment for comment in runner.intent_comments
+        if comment["id"] == contract.intent_comment_id
+    )
+    label, separator, marker = stored["body"].partition("\n\n")
+    assert separator == "\n\n"
+    assert label.startswith("Agent-loop managed exact-head CI intent record")
+    assert "in state prepared" in label
+    assert marker.startswith(f"<!-- {managed_ci.INTENT_MARKER} ") and marker.endswith("-->")
+
+    _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+    first = next(
+        comment for comment in runner.intent_comments
+        if comment["id"] == contract.intent_comment_id
+    )["body"]
+    _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+    second = next(
+        comment for comment in runner.intent_comments
+        if comment["id"] == contract.intent_comment_id
+    )["body"]
+    assert first == second
+    assert "in state dispatch-requested" in second
+
+
+def test_labeled_intent_comment_is_rediscovered_like_a_marker_only_one(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    historical = v2_intent_comment(run_id=100, run_attempt=1)
+    labeled = dict(historical)
+    labeled["body"] = (
+        protocol_record_label(
+            "managed_ci_intent", pr_number=7, head_sha="abc123", state="attached"
+        )
+        + "\n\n"
+        + historical["body"]
+    )
+    runner = V2ManagedRunner(intent_comments=[labeled])
+    contract = v2_contract()
+
+    _ensure_v2_intent(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert (contract.intent_comment_id, contract.nonce, contract.attached_run_id) == (
+        17, "nonce-1", 100,
+    )
+
+
+class AlteredLabelIntentRunner(V2ManagedRunner):
+    """Alter the visible label on the echoed intent create or update."""
+
+    def __init__(self, *, alter_patch=False, **kwargs):
+        super().__init__(**kwargs)
+        self.alter_patch = alter_patch
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        result = super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+        endpoint = next(
+            (part for part in args if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        patching = endpoint.startswith("repos/OWNER/REPO/issues/comments/")
+        creating = endpoint == "repos/OWNER/REPO/issues/7/comments" and "POST" in list(args)
+        if (patching and self.alter_patch) or (creating and not self.alter_patch):
+            try:
+                payload = json.loads(result.stdout or "{}")
+            except json.JSONDecodeError:
+                return result
+            if isinstance(payload, dict) and isinstance(payload.get("body"), str):
+                payload["body"] = payload["body"].replace(
+                    "Agent-loop", "Agent-loop (edited)", 1
+                )
+                return CommandResult(
+                    result.args, result.cwd, json.dumps(payload), "", 0
+                )
+        return result
+
+
+def test_altered_intent_label_fails_the_create_read_back(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = AlteredLabelIntentRunner()
+    contract = v2_contract()
+
+    with pytest.raises(AgentLoopError, match="returned a different body"):
+        _ensure_v2_intent(
+            runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        )
+    assert contract.intent_comment_id is None
+    assert contract.intent_state is None
+
+
+def test_altered_intent_label_fails_the_patch_read_back_without_advancing_state(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = AlteredLabelIntentRunner(alter_patch=True)
+    contract = v2_contract()
+    _ensure_v2_intent(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+    assert contract.intent_state == "prepared"
+
+    with pytest.raises(AgentLoopError, match="returned a different body"):
+        _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+
+    assert contract.intent_state == "prepared"
+
+
+def _override_audit_runner(**kwargs):
+    return V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"body": f"{UNPROTECTED_OVERRIDE_TRAILER} nonce=nonce-from-preflight"},
+        **kwargs,
+    )
+
+
+def test_override_audit_names_its_record_and_still_parses(tmp_path):
+    runner = _override_audit_runner()
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        managed_ci_expected_override_nonce="nonce-from-preflight",
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None and contract.activation_path == "managed"
+    audit = runner.audit_comments[contract.audit_comment_id]["body"]
+    assert audit.startswith("Agent-loop managed-CI unprotected-override audit record")
+    assert f"\n{UNPROTECTED_OVERRIDE_TRAILER} " in audit
+    record = parse_managed_ci_override_record(
+        audit, surface=PR_COMMENT_SURFACE, schema="audit", required=True
+    )
+    assert record is not None and record.nonce == "nonce-from-preflight"
+
+
+class AlteredAuditLabelRunner(V2ManagedRunner):
+    """Echo audit comments whose visible label differs from the posted one."""
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        result = super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+        endpoint = next(
+            (part for part in args if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if endpoint != "repos/OWNER/REPO/issues/7/comments" or "POST" not in list(args):
+            return result
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return result
+        body = payload.get("body") if isinstance(payload, dict) else None
+        if isinstance(body, str) and body.startswith("Agent-loop managed-CI"):
+            payload["body"] = body.replace("Agent-loop", "Agent-loop (edited)", 1)
+            return CommandResult(result.args, result.cwd, json.dumps(payload), "", 0)
+        return result
+
+
+def test_unverified_override_audit_falls_back_to_ordinary_ci(tmp_path):
+    runner = AlteredAuditLabelRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"body": f"{UNPROTECTED_OVERRIDE_TRAILER} nonce=nonce-from-preflight"},
+    )
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        managed_ci_expected_override_nonce="nonce-from-preflight",
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is None
+
+
+def test_qualified_head_comment_is_labeled_and_verified(tmp_path):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    runner = ManualQualificationRunner(issue_events=[label_event()])
+    contract = v2_contract(
+        issue_created_pr=True,
+        active_label_event_id=101,
+        invocation_applied_label=True,
+        protection_mode="strict",
+        attached_run_id=100,
+        run_attempt=2,
+        intent_generation="generation-1",
+    )
+
+    qualified = publish_manual_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123",
+        contract=contract, reviewers=("Codex",),
+    )
+
+    assert qualified == "abc123"
+    audit = runner.audit_comments[contract.audit_comment_id]["body"]
+    label, separator, tail = audit.partition("\n\n")
+    assert separator == "\n\n"
+    assert label.startswith("Agent-loop managed-CI qualified-head record")
+    # The canonical marker span itself is unchanged; it has no parser consumer.
+    assert tail.startswith(f"<!-- {QUALIFICATION_MARKER} repo=OWNER/REPO pr=7 ")
+    assert "qualified_head=abc123" in tail
+
+
+class AlteredQualificationLabelRunner(ManualQualificationRunner, AlteredAuditLabelRunner):
+    pass
+
+
+def test_unverified_qualification_audit_raises_and_adopts_no_head(tmp_path):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    runner = AlteredQualificationLabelRunner(issue_events=[label_event()])
+    contract = v2_contract(
+        issue_created_pr=True,
+        active_label_event_id=101,
+        invocation_applied_label=True,
+        protection_mode="strict",
+        attached_run_id=100,
+        run_attempt=2,
+        intent_generation="generation-1",
+    )
+
+    with pytest.raises(AgentLoopError, match="returned a different body"):
+        publish_manual_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha="abc123",
+            contract=contract, reviewers=("Codex",),
+        )
+
+    assert contract.audit_comment_id is None

@@ -68,6 +68,23 @@ visible label such as `Agent-loop plan attachment 2/5 (machine-readable
 overflow: ...)`; keep them with the comment that follows. Older unlabeled
 sidecars remain valid.
 
+Agent-loop also posts tool-owned protocol records whose data lives in a hidden
+marker. Each one opens with a short visible label naming the record and its
+role, so it is recognizable instead of rendering as "No description provided.".
+The record types are:
+
+- the managed-CI issue authorization record, and its fresh re-authorization and
+  head-continuity forms;
+- the managed-CI exact-head intent record;
+- the managed-CI unprotected-override audit and resume-provenance audit;
+- the managed-CI qualified-head record;
+- the issue-to-PR handoff and the PR expected-closing contract;
+- the plan-validation diagnostic record.
+
+These comments are machine-readable and must be kept: resume, recovery, and
+audit read them back. Older marker-only copies, which GitHub renders as
+"No description provided.", remain valid and still parse.
+
 ## Requirements
 
 - Python 3.11 or newer.

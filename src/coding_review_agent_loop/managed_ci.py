@@ -29,6 +29,7 @@ from .github import (
     get_pr_head_sha,
     get_pr_mergeability,
     parse_strong_issue_reference_evidence,
+    patch_verified_trusted_protocol_comment,
     post_verified_trusted_pr_protocol_comment,
 )
 from .logging import log
@@ -39,6 +40,7 @@ from .protocol_markers import (
     PR_BODY_SURFACE,
     PR_COMMENT_SURFACE,
     TrustedBody,
+    protocol_record_label,
     scan_reserved_markers,
 )
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
@@ -293,8 +295,18 @@ def format_issue_created_authorization_comment(
 ) -> TrustedBody:
     """Render the complete v1 authorization record for a PR comment only."""
     encoded = _encode_issue_authorization_payload(authorization.to_payload())
+    # The label is a pure function of the already-authenticated record, so every
+    # call site and every retry renders a byte-identical body.  It sits outside
+    # the marker span, which is unchanged.
+    label = protocol_record_label(
+        "managed_ci_authorization",
+        kind=authorization.kind,
+        issue_number=authorization.issue_number,
+        pr_number=authorization.pr_number,
+        head_sha=authorization.head_sha,
+    )
     return TrustedBody.canonical(
-        f"<!-- {ISSUE_AUTHORIZATION_MARKER}: {encoded} -->",
+        f"{label}\n\n<!-- {ISSUE_AUTHORIZATION_MARKER}: {encoded} -->",
         surface=PR_COMMENT_SURFACE,
         expected_tokens=(ISSUE_AUTHORIZATION_MARKER,),
     )
@@ -3779,8 +3791,14 @@ def _activate_v2_managed_ci(
                 return None
             assert override is not None
             override_nonce = override.nonce
+            # The bare protocol trailer is anchored to a line start, so the
+            # label paragraph above it does not move the matched span.
+            audit_label = protocol_record_label(
+                "managed_ci_override_audit", pr_number=pr_number, head_sha=live_sha
+            )
             audit_body = TrustedBody.canonical(
                 (
+                    f"{audit_label}\n\n"
                     f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce} repo={config.repo} "
                     f"base={base_ref} head={live_sha} protection={protection.state}\n\n"
                     "Voluntary gate: GitHub cannot prevent manual merges, other automation, "
@@ -3788,27 +3806,19 @@ def _activate_v2_managed_ci(
                 ),
                 expected_tokens=(UNPROTECTED_OVERRIDE_TRAILER,),
             )
-            audit_body.validate_for_surface(PR_COMMENT_SURFACE)
-            audit = runner.run(
-                [
-                    config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/comments",
-                    "-f", "body=" + str(audit_body),
-                ], cwd=active_workdir(config), check=False,
-            )
-            if audit.returncode != 0:
-                _restore_ordinary_ci_after_v2_fallback(
-                    runner, config=config, pr_number=pr_number,
-                    reason="the override audit comment could not be recorded",
-                )
-                return None
             try:
-                audit_id = json.loads(audit.stdout or "{}").get("id")
-            except json.JSONDecodeError:
-                audit_id = None
-            if not isinstance(audit_id, int):
+                audit_id = post_verified_trusted_pr_protocol_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=audit_body,
+                    expected_author_login=actor_login,
+                    expected_author_id=actor_id,
+                )
+            except AgentLoopError:
                 _restore_ordinary_ci_after_v2_fallback(
                     runner, config=config, pr_number=pr_number,
-                    reason="the override audit comment response was malformed",
+                    reason="the override audit comment could not be recorded and verified",
                 )
                 return None
         else:
@@ -3853,7 +3863,11 @@ def _activate_v2_managed_ci(
             return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
         if protection.state != "strict":
             override_nonce = secrets.token_urlsafe(24)
+            resume_label = protocol_record_label(
+                "managed_ci_resume_audit", pr_number=pr_number, head_sha=live_sha
+            )
             resume_body = (
+                f"{resume_label}\n\n"
                 f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce} repo={config.repo} "
                 f"base={base_ref} head={live_sha} protection={protection.state} "
                 f"active_label_event_id={active_event[0]} resume_from={resume_audit_id} "
@@ -3864,32 +3878,20 @@ def _activate_v2_managed_ci(
                 resume_body,
                 expected_tokens=(UNPROTECTED_OVERRIDE_TRAILER,),
             )
-            trusted_resume_body.validate_for_surface(PR_COMMENT_SURFACE)
-            audit = runner.run(
-                [
-                    config.gh_cmd, "api", "--method", "POST",
-                    f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={trusted_resume_body}",
-                ], cwd=active_workdir(config), check=False,
-            )
-            if audit.returncode != 0:
-                recovery = _release_for_ordinary_recovery(
-                    runner, config=config, pr_number=pr_number, base_ref=base_ref,
-                    expected_head_sha=live_sha, active_event=active_event,
-                    reason="the fresh resume audit could not be recorded",
-                    recovery_capable=ordinary_recovery_capable,
-                    fresh_issue_number=issue_hint,
-                    fresh_authorization_allowed=origin == "issue-created",
-                )
-                return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
             try:
-                audit_id = json.loads(audit.stdout or "{}").get("id")
-            except json.JSONDecodeError:
-                audit_id = None
-            if not isinstance(audit_id, int):
+                audit_id = post_verified_trusted_pr_protocol_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=trusted_resume_body,
+                    expected_author_login=actor_login,
+                    expected_author_id=actor_id,
+                )
+            except AgentLoopError:
                 recovery = _release_for_ordinary_recovery(
                     runner, config=config, pr_number=pr_number, base_ref=base_ref,
                     expected_head_sha=live_sha, active_event=active_event,
-                    reason="the fresh resume audit response was malformed",
+                    reason="the fresh resume audit could not be recorded and verified",
                     recovery_capable=ordinary_recovery_capable,
                     fresh_issue_number=issue_hint,
                     fresh_authorization_allowed=origin == "issue-created",
@@ -4301,7 +4303,11 @@ def publish_manual_v2_qualification(
     run_text = str(contract.attached_run_id) if contract.attached_run_id is not None else "unknown"
     attempt_text = str(contract.run_attempt) if contract.run_attempt is not None else "unknown"
     reviewer_text = ",".join(reviewers) or "unknown"
+    qualification_label = protocol_record_label(
+        "managed_ci_qualified_head", pr_number=pr_number, head_sha=expected_head_sha
+    )
     body = (
+        f"{qualification_label}\n\n"
         f"<!-- {QUALIFICATION_MARKER} repo={config.repo} pr={pr_number} base={contract.base_ref or config.base} "
         f"protocol=2 qualified_head={expected_head_sha} reviewers={reviewer_text} "
         f"protection={contract.protection_mode or 'unknown'} nonce={contract.nonce or 'unknown'} "
@@ -4315,22 +4321,16 @@ def publish_manual_v2_qualification(
             "after agent-loop exits."
         )
     trusted_body = TrustedBody.canonical(body, expected_tokens=(QUALIFICATION_MARKER,))
-    trusted_body.validate_for_surface(PR_COMMENT_SURFACE)
-    posted = runner.run(
-        [
-            config.gh_cmd, "api", "--method", "POST",
-            f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={trusted_body}",
-        ], cwd=active_workdir(config), check=False,
+    # The qualified-head record has no parser or recovery consumer; its canonical
+    # marker span is preserved and the write is verified before it is adopted.
+    contract.audit_comment_id = post_verified_trusted_pr_protocol_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=trusted_body,
+        expected_author_login=contract.trusted_actor_login,
+        expected_author_id=contract.trusted_actor_id,
     )
-    if posted.returncode != 0:
-        raise AgentLoopError(f"Unable to publish the SHA-bound qualification audit for PR #{pr_number}.")
-    try:
-        audit_id = json.loads(posted.stdout or "{}").get("id")
-    except json.JSONDecodeError:
-        audit_id = None
-    if not isinstance(audit_id, int):
-        raise AgentLoopError(f"Qualification audit for PR #{pr_number} returned no comment ID.")
-    contract.audit_comment_id = audit_id
     if get_pr_head_sha(runner, config, pr_number) != expected_head_sha:
         raise AgentLoopError(
             f"PR #{pr_number} head changed after qualification publication; rerun review and exact-head CI."
@@ -4626,7 +4626,14 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
             for run_id, run_attempt in contract.terminal_attempts
         ],
     }
+    label = protocol_record_label(
+        "managed_ci_intent",
+        pr_number=pr_number,
+        head_sha=expected_head_sha,
+        state=state,
+    )
     return TrustedBody.canonical(
+        f"{label}\n\n"
         f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->",
         expected_tokens=(INTENT_MARKER,),
     )
@@ -4746,6 +4753,19 @@ def _v2_attachment_is_excluded(contract: ManagedCiContract) -> bool:
     )
 
 
+def _intent_producer_login(contract: ManagedCiContract) -> str:
+    """Return the authenticated producer the intent ledger must be written by."""
+    if not contract.trusted_actor_login:
+        raise AgentLoopError("Managed-CI v2 intent requires an authenticated trusted actor.")
+    return contract.trusted_actor_login
+
+
+def _intent_producer_id(contract: ManagedCiContract) -> int:
+    if not isinstance(contract.trusted_actor_id, int) or contract.trusted_actor_id < 1:
+        raise AgentLoopError("Managed-CI v2 intent requires an authenticated trusted actor ID.")
+    return contract.trusted_actor_id
+
+
 def _ensure_v2_intent(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, expected_head_sha: str, contract: ManagedCiContract
 ) -> None:
@@ -4799,20 +4819,16 @@ def _ensure_v2_intent(
     contract.nonce = secrets.token_urlsafe(24)
     contract.created_at = int(time.time())
     body = _intent_body(contract, pr_number=pr_number, expected_head_sha=expected_head_sha, state="prepared")
-    body.validate_for_surface(PR_COMMENT_SURFACE)
-    created = runner.run(
-        [config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={body}"],
-        cwd=active_workdir(config), check=False,
+    # The create is verified against the stored body and the authenticated
+    # producer; a numeric ID alone is not proof the ledger was persisted.
+    contract.intent_comment_id = post_verified_trusted_pr_protocol_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=body,
+        expected_author_login=_intent_producer_login(contract),
+        expected_author_id=_intent_producer_id(contract),
     )
-    if created.returncode != 0:
-        raise AgentLoopError("Unable to create managed-CI v2 intent ledger comment.")
-    try:
-        payload = json.loads(created.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise AgentLoopError("Managed-CI intent create response was invalid JSON.") from exc
-    if not isinstance(payload.get("id"), int):
-        raise AgentLoopError("Managed-CI intent comment was created without an ID.")
-    contract.intent_comment_id = payload["id"]
     contract.intent_state = "prepared"
 
 
@@ -4826,15 +4842,17 @@ def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedC
         expected_head_sha=contract.expected_head_sha or "",
         state=state,
     )
-    body.validate_for_surface(PR_COMMENT_SURFACE)
     # The immutable identifying fields are already in the original marker;
-    # state updates add only live provenance and are still actor-owned.
-    updated = runner.run(
-        [config.gh_cmd, "api", "--method", "PATCH", f"repos/{config.repo}/issues/comments/{contract.intent_comment_id}", "-f", f"body={body}"],
-        cwd=active_workdir(config), check=False,
+    # state updates add only live provenance and are still actor-owned.  The
+    # stored body and producer are read back before the state is recorded.
+    patch_verified_trusted_protocol_comment(
+        runner,
+        config=config,
+        comment_id=contract.intent_comment_id,
+        body=body,
+        expected_author_login=_intent_producer_login(contract),
+        expected_author_id=_intent_producer_id(contract),
     )
-    if updated.returncode != 0:
-        raise AgentLoopError("Unable to persist managed-CI v2 intent state.")
     contract.intent_state = state
 
 

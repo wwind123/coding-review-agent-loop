@@ -66,7 +66,7 @@ Source paths below are relative to
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head. |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. |
-| GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. |
+| GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
 | Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. |
@@ -439,6 +439,17 @@ between GitHub and local artifacts:
 | --- | --- |
 | Source and candidate identity | Git commits/branches and live GitHub PR metadata. |
 | Cross-invocation workflow history | GitHub comments with round metadata, canonical issue/PR handoffs, plan identities, and managed-CI intents; oversized payloads use sidecar comments. |
+
+Durable comment carriers persist a bounded visible label outside the unchanged
+hidden record, composed only from trusted vocabulary and already-authenticated
+record fields, so labels are deterministic and historical marker-only comments
+stay readable. The plan-validation diagnostic decoder accepts exactly two
+canonical forms: the historical bare-marker body, and the marker introduced by
+its own regenerated label. Every tool-owned comment write — create and update
+alike — is verified by comparing the server's stored body for that comment with
+the exact posted carrier and checking the producing login and ID, fetching the
+comment when the write response carries no envelope; a rejected read-back takes
+that seam's existing failure path rather than being accepted on an exit status.
 | Invocation results | Unique response files and external subprocess logs; validate the current attempt before accepting an artifact. |
 | Work in progress | Tool-owned or explicitly supplied checkouts; tracked diffs can be preserved as salvage on supported failure paths. |
 | Local evidence | Test observations/receipts, runtime recommendations, usage summaries, and containment evidence. |

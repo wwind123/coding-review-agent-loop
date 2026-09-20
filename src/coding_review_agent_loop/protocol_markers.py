@@ -716,3 +716,126 @@ def assert_source_inventory(root: Path) -> None:
         raise AgentLoopError(
             "Unregistered AGENT_* protocol-looking literal(s): " + ", ".join(sorted(unknown))
         )
+
+
+PROTOCOL_RECORD_LABEL_MAX_CHARS = 320
+_RECORD_LABEL_FIELD_MAX_CHARS = 64
+_RECORD_LABEL_FIELD_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+
+# Closed, trusted vocabulary.  Labels are composed only from these phrases and
+# from already-authenticated identity fragments, never from agent or operator
+# text, so every label is a pure function of the record it introduces.
+_RECORD_LABEL_NAMES: dict[tuple[str, str], str] = {
+    ("managed_ci_authorization", "creation"): "managed-CI authorization record",
+    ("managed_ci_authorization", "fresh"): "managed-CI fresh re-authorization record",
+    ("managed_ci_authorization", "continuity"): "managed-CI authorization continuity record",
+    ("managed_ci_intent", ""): "managed exact-head CI intent record",
+    ("managed_ci_override_audit", ""): "managed-CI unprotected-override audit record",
+    ("managed_ci_resume_audit", ""): "managed-CI resume provenance audit record",
+    ("managed_ci_qualified_head", ""): "managed-CI qualified-head record",
+    ("plan_validation_diagnostic", ""): "plan-validation diagnostic record",
+}
+_RECORD_LABEL_FAMILIES = frozenset(family for family, _ in _RECORD_LABEL_NAMES)
+
+
+def _record_label_field(value: str | None, *, field: str) -> str | None:
+    """Validate one bounded identity fragment, or report it as unknown."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AgentLoopError(f"Protocol record label {field} must be text.")
+    if not value:
+        return None
+    if not value.isascii() or len(value) > _RECORD_LABEL_FIELD_MAX_CHARS:
+        raise AgentLoopError(
+            f"Protocol record label {field} is not bounded ASCII text."
+        )
+    if _RECORD_LABEL_FIELD_RE.fullmatch(value) is None:
+        raise AgentLoopError(f"Protocol record label {field} is not a plain identifier.")
+    return value
+
+
+def _record_label_number(value: int | None) -> int | None:
+    if value is None or isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _record_label_issue(issue_number: int | None) -> str:
+    number = _record_label_number(issue_number)
+    return f"issue #{number}" if number is not None else "the originating issue"
+
+
+def _record_label_pr(pr_number: int | None) -> str:
+    number = _record_label_number(pr_number)
+    return f"pull request #{number}" if number is not None else "this pull request"
+
+
+def protocol_record_label(
+    family: str,
+    *,
+    kind: str | None = None,
+    issue_number: int | None = None,
+    pr_number: int | None = None,
+    head_sha: str | None = None,
+    state: str | None = None,
+    attempt: int | None = None,
+) -> str:
+    """Render one bounded, deterministic visible label for a tool-owned record.
+
+    Tool-owned protocol comments carry their payload in a hidden marker, which
+    GitHub renders as "No description provided.".  The label names the record
+    and its role in one line placed *outside* the marker span, so the marker
+    grammar, payload, parsing, and recovery are untouched.  Repeated calls with
+    the same inputs return byte-identical text, which keeps retries and
+    read-after-write verification exact.
+    """
+    if family not in _RECORD_LABEL_FAMILIES:
+        raise AgentLoopError(f"Unknown tool-owned protocol record family: {family}.")
+    name = _RECORD_LABEL_NAMES.get((family, kind or ""))
+    if name is None:
+        raise AgentLoopError(
+            f"Unknown {family} protocol record kind: {kind or '(none)'}."
+        )
+    head = _record_label_field(head_sha, field="head")
+    head_text = f" at head {head[:7]}" if head is not None else ""
+    if family == "managed_ci_authorization":
+        role = (
+            f"Binds {_record_label_issue(issue_number)} to "
+            f"{_record_label_pr(pr_number)}{head_text}."
+        )
+    elif family == "managed_ci_intent":
+        lifecycle = _record_label_field(state, field="state")
+        state_text = f" in state {lifecycle}" if lifecycle is not None else ""
+        role = (
+            f"Tracks the exact-head CI intent for {_record_label_pr(pr_number)}"
+            f"{head_text}{state_text}."
+        )
+    elif family == "managed_ci_override_audit":
+        role = (
+            "Records the unprotected-override waiver used to activate managed CI for "
+            f"{_record_label_pr(pr_number)}{head_text}."
+        )
+    elif family == "managed_ci_resume_audit":
+        role = (
+            "Records resume provenance for managed CI on "
+            f"{_record_label_pr(pr_number)}{head_text}."
+        )
+    elif family == "managed_ci_qualified_head":
+        role = (
+            f"Records the qualified merge head for {_record_label_pr(pr_number)}"
+            f"{head_text}."
+        )
+    else:
+        number = _record_label_number(attempt)
+        attempt_text = f" (failure attempt {number})" if number is not None else ""
+        role = (
+            "Records deterministic plan-validation exhaustion for "
+            f"{_record_label_issue(issue_number)}{attempt_text}."
+        )
+    label = f"Agent-loop {name} (machine-readable). {role} Not an agent response; keep this comment."
+    if not label.isascii() or len(label) > PROTOCOL_RECORD_LABEL_MAX_CHARS:
+        raise AgentLoopError("Protocol record label exceeds its bounded ASCII budget.")
+    if scan_reserved_markers(label) or any(token in label for token in MARKER_BY_TOKEN):
+        raise AgentLoopError("Protocol record label must not contain reserved marker text.")
+    return label

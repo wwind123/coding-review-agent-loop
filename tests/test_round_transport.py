@@ -1741,3 +1741,65 @@ def test_interrupted_publication_duplicates_hydrate_and_missing_part_reported() 
     hydrated, missing = transport.hydrate_mapping(anchor_payload, incomplete)
     assert missing == {"canonical_plan"}
     assert hydrated["canonical_plan"] is None
+
+
+def test_plan_validation_diagnostic_body_is_labeled_and_round_trips() -> None:
+    payload = _diagnostic_payload(attempt=3)
+    body = str(encode_plan_validation_diagnostic_body(payload))
+    label, separator, marker = body.partition("\n\n")
+
+    assert separator == "\n\n"
+    assert label.startswith("Agent-loop plan-validation diagnostic record")
+    assert "failure attempt 3" in label
+    assert marker.startswith("<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: ")
+    assert marker.endswith("-->")
+    assert decode_plan_validation_diagnostic_body(body) == payload
+    # Deterministic, so a retry and the posted read-back stay byte-identical.
+    assert str(encode_plan_validation_diagnostic_body(payload)) == body
+
+
+def test_plan_validation_decoder_accepts_only_the_two_canonical_forms() -> None:
+    payload = _diagnostic_payload(attempt=2)
+    labeled = str(encode_plan_validation_diagnostic_body(payload))
+    historical = labeled.split("\n\n", 1)[1]
+
+    assert decode_plan_validation_diagnostic_body(historical) == payload
+    assert decode_plan_validation_diagnostic_body(labeled) == payload
+
+    for rejected in (
+        f"Unrelated operator prose.\n\n{historical}",
+        f"{labeled}\n\nUnrelated trailing prose.",
+        labeled.replace("Agent-loop", "Agent-loop (edited)", 1),
+    ):
+        with pytest.raises(AgentLoopError, match="exact canonical record"):
+            decode_plan_validation_diagnostic_body(rejected)
+
+
+def test_plan_validation_recovery_keeps_prose_wrapped_records_ineligible_not_fatal() -> None:
+    historical_payload = _diagnostic_payload(attempt=1)
+    historical = IssueComment(
+        author="agent", author_id=7, comment_id=500,
+        created_at="2026-01-01T00:00:00Z",
+        body=str(encode_plan_validation_diagnostic_body(historical_payload)).split("\n\n", 1)[1],
+    )
+    wrapped = IssueComment(
+        author="agent", author_id=7, comment_id=501,
+        created_at="2026-01-01T00:00:01Z",
+        body="Operator note.\n\n"
+        + str(encode_plan_validation_diagnostic_body(_diagnostic_payload(attempt=9))),
+    )
+
+    selected = recover_plan_validation_diagnostic(
+        (historical, wrapped),
+        repository="OWNER/REPO", issue_number=813,
+        expected_author_login="agent", expected_author_id=7,
+        planning_generation=1, target_coder_round=1,
+        prior_plan_subject=None, candidate_kind="plan_state",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=1,
+        risk_test_matrix_contract_version=1,
+    )
+
+    assert selected is not None
+    assert selected.server_comment_id == 500
+    assert selected.failure_attempt == 1

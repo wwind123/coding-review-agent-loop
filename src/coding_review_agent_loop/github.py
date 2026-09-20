@@ -2063,6 +2063,71 @@ def post_trusted_pr_comment(
         )
 
 
+def _fetch_protocol_comment_envelope(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    comment_id: int,
+    context: str,
+) -> dict[str, object]:
+    """Re-read one stored comment when a write response omits its envelope."""
+    result = runner.run(
+        [config.gh_cmd, "api", f"repos/{config.repo}/issues/comments/{comment_id}"],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError(f"{context} could not be read back from GitHub.")
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(f"{context} read-back returned invalid JSON.") from exc
+    if not isinstance(payload, dict):
+        raise AgentLoopError(f"{context} read-back returned no comment envelope.")
+    return payload
+
+
+def verify_written_protocol_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    payload: dict[str, object],
+    body: TrustedBody,
+    expected_author_login: str | None,
+    expected_author_id: int | None,
+    context: str,
+) -> int:
+    """Apply the uniform read-back contract to one comment write response.
+
+    Every tool-owned comment write compares the server's stored body for the
+    just-written comment against the exact posted carrier and verifies the
+    producing identity.  When the write response carries no body or author, the
+    comment is fetched explicitly rather than trusted on its status code.
+    """
+    comment_id = payload.get("id")
+    if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id < 1:
+        raise AgentLoopError(f"{context} returned no comment ID.")
+    envelope = payload
+    if envelope.get("body") is None or not isinstance(
+        envelope.get("user") or envelope.get("author"), dict
+    ):
+        envelope = _fetch_protocol_comment_envelope(
+            runner, config=config, comment_id=comment_id, context=context
+        )
+    if envelope.get("body") != str(body):
+        raise AgentLoopError(f"{context} returned a different body.")
+    returned_user = envelope.get("user") or envelope.get("author")
+    if not isinstance(returned_user, dict):
+        raise AgentLoopError(f"{context} returned no author identity.")
+    login = returned_user.get("login") or returned_user.get("slug")
+    user_id = returned_user.get("id")
+    if expected_author_login is not None and login != expected_author_login:
+        raise AgentLoopError(f"{context} was authored by an unexpected actor.")
+    if expected_author_id is not None and user_id != expected_author_id:
+        raise AgentLoopError(f"{context} has an unexpected actor identity.")
+    return comment_id
+
+
 def post_verified_trusted_pr_protocol_comment(
     runner: Runner,
     *,
@@ -2076,10 +2141,9 @@ def post_verified_trusted_pr_protocol_comment(
 
     Durable authorization records use the REST issue-comment endpoint so the
     returned comment identity is available to the caller.  The body is
-    validated again at this seam; if GitHub includes author/body fields in its
-    response, they must agree with the authenticated producer and exact
-    carrier.  A numeric comment ID is mandatory even for providers that return
-    a reduced response payload.
+    validated again at this seam, and the stored body and producing identity
+    are read back through the shared envelope verifier before the record is
+    adopted.
     """
     if not isinstance(body, TrustedBody):
         raise AgentLoopError("Verified trusted PR protocol posting requires a TrustedBody.")
@@ -2109,31 +2173,79 @@ def post_verified_trusted_pr_protocol_comment(
         raise AgentLoopError(
             f"Trusted PR protocol record for PR #{pr_number} returned invalid JSON."
         ) from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("id"), int):
+    if not isinstance(payload, dict):
         raise AgentLoopError(
             f"Trusted PR protocol record for PR #{pr_number} returned no comment ID."
         )
-    returned_body = payload.get("body")
-    if returned_body != str(body):
+    return verify_written_protocol_comment(
+        runner,
+        config=config,
+        payload=payload,
+        body=body,
+        expected_author_login=expected_author_login,
+        expected_author_id=expected_author_id,
+        context=f"Trusted PR protocol record for PR #{pr_number}",
+    )
+
+
+def patch_verified_trusted_protocol_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    comment_id: int,
+    body: TrustedBody,
+    expected_author_login: str | None = None,
+    expected_author_id: int | None = None,
+    surface: str = PR_COMMENT_SURFACE,
+) -> int:
+    """Update one trusted protocol comment and verify the stored result.
+
+    A successful exit status is not proof that the new body was persisted, so
+    the update response is held to the same read-back contract as a create.
+    """
+    if not isinstance(body, TrustedBody):
+        raise AgentLoopError("Verified trusted protocol update requires a TrustedBody.")
+    body.validate_for_surface(surface)
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "api",
+            "--method",
+            "PATCH",
+            f"repos/{config.repo}/issues/comments/{comment_id}",
+            "-f",
+            f"body={body}",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    context = f"Trusted protocol comment update for comment {comment_id}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
         raise AgentLoopError(
-            f"Trusted PR protocol record for PR #{pr_number} returned a different body."
+            f"Unable to persist the trusted protocol comment update for comment {comment_id}."
+            + (f" {detail}" if detail else "")
         )
-    returned_user = payload.get("user") or payload.get("author")
-    if not isinstance(returned_user, dict):
-        raise AgentLoopError(
-            f"Trusted PR protocol record for PR #{pr_number} returned no author identity."
-        )
-    login = returned_user.get("login") or returned_user.get("slug")
-    user_id = returned_user.get("id")
-    if expected_author_login is not None and login != expected_author_login:
-        raise AgentLoopError(
-            f"Trusted PR protocol record for PR #{pr_number} was authored by an unexpected actor."
-        )
-    if expected_author_id is not None and user_id != expected_author_id:
-        raise AgentLoopError(
-            f"Trusted PR protocol record for PR #{pr_number} has an unexpected actor identity."
-        )
-    return payload["id"]
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(f"{context} returned invalid JSON.") from exc
+    if not isinstance(payload, dict):
+        raise AgentLoopError(f"{context} returned no comment envelope.")
+    if payload.get("id") is None:
+        payload = {**payload, "id": comment_id}
+    updated_id = verify_written_protocol_comment(
+        runner,
+        config=config,
+        payload=payload,
+        body=body,
+        expected_author_login=expected_author_login,
+        expected_author_id=expected_author_id,
+        context=context,
+    )
+    if updated_id != comment_id:
+        raise AgentLoopError(f"{context} returned a different comment identity.")
+    return updated_id
 
 
 def post_trusted_pr_contract_record(

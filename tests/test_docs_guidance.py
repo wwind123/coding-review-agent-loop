@@ -384,3 +384,33 @@ def test_architecture_states_cross_row_selector_reuse_policy():
     assert "duplicate admissible selectors" not in text
     assert "One admissible selector may be cited by several rows" in text
     assert "an admissible selector repeated within one row" in text
+
+
+def test_docs_list_tool_owned_machine_readable_record_types():
+    doc_text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    readme_text = README.read_text(encoding="utf-8")
+    record_types = (
+        "managed-CI issue authorization record",
+        "fresh re-authorization",
+        "managed-CI exact-head intent record",
+        "unprotected-override audit",
+        "resume-provenance audit",
+        "managed-CI qualified-head record",
+        "plan-validation diagnostic record",
+    )
+    for document in (doc_text, readme_text):
+        for record_type in record_types:
+            assert record_type in document, record_type
+        assert "machine-readable and must be kept" in document
+        assert "marker-only copies" in document
+        assert "remain valid" in document
+    assert "#### Tool-owned protocol records" in doc_text
+    assert "issue-to-PR handoff" in doc_text and "expected-closing contract" in doc_text
+
+
+def test_architecture_records_label_and_read_back_invariants():
+    text = ARCHITECTURE.read_text(encoding="utf-8")
+    assert "deterministic visible-label invariant" in text
+    assert "shared write read-back verifier" in text
+    assert "historical bare-marker body" in text
+    assert "producing login and ID" in text
