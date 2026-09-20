@@ -2228,9 +2228,11 @@ def render_plan_scheduling_audit(
 
     The decision kind is keyed on authoritative decision data, not on the reason
     prefix alone: the scheduler also stamps the post-panel prefix on the
-    *ordinary* owner-scoped remediation decision, which selects a partial board
-    and raises no latch, so labelling it a post-panel fallback would contradict
-    the phase, selected-reviewer, and force-full fields rendered beside it.
+    *ordinary* owner-scoped remediation decision, which is not a fallback, so
+    labelling it one would contradict the phase, selected-reviewer, and
+    force-full fields rendered beside it.  The remediation board size is read
+    from the paused list rather than assumed: owner-scoped selection equals the
+    complete configured board whenever every secondary owns an active finding.
     """
     if reason.startswith(_PLAN_OPERATOR_OVERRIDE_PREFIX) or force_full_source == "operator":
         kind = "operator override (qualified panel opening, source `operator`)"
@@ -2241,7 +2243,11 @@ def render_plan_scheduling_audit(
             ", automatic latch)" if force_full else ")"
         )
     elif phase == "remediation":
-        kind = "owner-scoped remediation decision (partial board, no latch)"
+        kind = (
+            "owner-scoped remediation decision ("
+            + ("partial board" if paused else "complete board")
+            + (", automatic latch)" if force_full else ", no automatic latch)")
+        )
     else:
         kind = "ordinary staged planning decision"
     lines = [

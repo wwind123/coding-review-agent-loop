@@ -2289,9 +2289,40 @@ def test_render_plan_scheduling_audit_distinguishes_each_decision_kind():
     assert "`invalid`" in strict and "decoded invalid" in strict
     assert "post-panel fallback (complete board, automatic latch)" in post
     assert "operator override (qualified panel opening, source `operator`)" in override
-    assert "owner-scoped remediation decision (partial board, no latch)" in remediation
+    # Owner-scoped selection equals the complete configured board whenever
+    # every secondary owns an active finding, so the board size is read from
+    # the paused list instead of being assumed partial.
+    complete_board_remediation = render_plan_scheduling_audit(
+        phase="remediation",
+        reason=(
+            "post-panel fallback: narrow plan remediation: finding owners from the "
+            "canonical ledger and the primary must recheck"
+        ),
+        **{
+            **common,
+            "selected": ("Codex", "Gemini"),
+            "paused": (),
+            "panel_evidence": True,
+            "active_owners": ("Gemini",),
+        },
+    )
+
+    assert (
+        "owner-scoped remediation decision (partial board, no automatic latch)"
+        in remediation
+    )
     assert "post-panel fallback" not in remediation.split("- Scheduling reason:")[0]
     assert "- Force-full: False (source: none)" in remediation
+    assert (
+        "owner-scoped remediation decision (complete board, no automatic latch)"
+        in complete_board_remediation
+    )
+    assert "partial board" not in complete_board_remediation
+    assert "post-panel fallback" not in complete_board_remediation.split(
+        "- Scheduling reason:"
+    )[0]
+    assert "- Selected reviewers: Codex, Gemini" in complete_board_remediation
+    assert "- Force-full: False (source: none)" in complete_board_remediation
     for rendered in (ordinary, strict, post, override, remediation):
         assert "Gemini (primary phase)" in rendered
         assert "Scheduler calls avoided cumulatively: 2" in rendered

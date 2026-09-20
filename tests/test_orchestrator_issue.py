@@ -9371,7 +9371,8 @@ def test_staged_planning_panel_blocker_routes_to_owner_plus_primary(tmp_path):
     # kind agrees with the phase, board, and force-full fields beside it.
     remediation_body = _plan_audit_body(runner, round_number=remediation.round_number)
     assert (
-        "owner-scoped remediation decision (partial board, no latch)" in remediation_body
+        "owner-scoped remediation decision (partial board, no automatic latch)"
+        in remediation_body
     )
     assert "post-panel fallback (complete board" not in remediation_body
     assert "- Phase: `remediation`" in remediation_body
