@@ -4998,6 +4998,20 @@ def _build_requirements_context(
     )
 
 
+def _describe_requirement_set_change(
+    previous_ids: set[str], refreshed_ids: set[str]
+) -> str:
+    """Name the added and withdrawn signed requirement IDs for a stop message."""
+    added = sorted(refreshed_ids - previous_ids)
+    withdrawn = sorted(previous_ids - refreshed_ids)
+    parts: list[str] = []
+    if added:
+        parts.append(f"added {', '.join(added)}")
+    if withdrawn:
+        parts.append(f"withdrawn {', '.join(withdrawn)}")
+    return "; ".join(parts) if parts else "the surfaced requirement set changed"
+
+
 def _surfaced_reviewer_requirement_ids(
     human_requirements: Sequence,
     *,
@@ -10016,10 +10030,19 @@ def _run_plan_first_loop(
                 requirement.requirement_id
                 for requirement in refreshed_issue_context.human_requirements
             }
-            if not refreshed_requirement_ids.issubset(previous_requirement_ids):
+            if refreshed_requirement_ids != previous_requirement_ids:
+                # Any set inequality is a changed requirement set, not only an
+                # addition.  A withdrawal is equally disqualifying: every plan
+                # review and every carried exact-key approval was bound to the
+                # earlier surfaced requirement digest, so a withdrawn ID leaves
+                # the approvals acknowledging a requirement that no longer
+                # exists (#905, from #841).
                 raise AgentLoopError(
-                    f"Issue #{issue_number} gained signed human requirement(s) after plan approval. "
-                    "Re-run planning so the new signed requirements receive explicit acknowledgement."
+                    f"Issue #{issue_number} signed human requirement(s) changed after plan "
+                    "approval: "
+                    f"{_describe_requirement_set_change(previous_requirement_ids, refreshed_requirement_ids)}. "
+                    "Re-run planning so the current signed requirements receive explicit "
+                    "acknowledgement."
                 )
             issue_context = refreshed_issue_context
             if parent_issue_context is not None:
@@ -10034,11 +10057,13 @@ def _run_plan_first_loop(
                     requirement.requirement_id
                     for requirement in refreshed_parent_context.human_requirements
                 }
-                if not refreshed_parent_requirement_ids.issubset(previous_parent_requirement_ids):
+                if refreshed_parent_requirement_ids != previous_parent_requirement_ids:
                     raise AgentLoopError(
-                        f"Authoritative parent issue #{parent_issue_context.number} gained signed "
-                        "human requirement(s) after plan approval. Re-run planning so the new "
-                        "signed parent requirements receive explicit acknowledgement."
+                        f"Authoritative parent issue #{parent_issue_context.number} signed human "
+                        "requirement(s) changed after plan approval: "
+                        f"{_describe_requirement_set_change(previous_parent_requirement_ids, refreshed_parent_requirement_ids)}"
+                        ". Re-run planning so the current signed parent requirements receive "
+                        "explicit acknowledgement."
                     )
                 parent_issue_context = refreshed_parent_context
             approved_future_followup_sources = [

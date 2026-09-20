@@ -3001,9 +3001,105 @@ def test_issue_loop_plan_first_fails_closed_when_requirements_change_after_appro
         ],
     )
 
-    with pytest.raises(AgentLoopError, match="Issue #56 gained signed human requirement"):
+    with pytest.raises(
+        AgentLoopError,
+        match=r"Issue #56 signed human requirement\(s\) changed after plan approval: "
+        r"added hr-",
+    ):
         run_issue_loop(runner, issue_number=56, config=make_config(tmp_path), plan_first=True)
 
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+
+
+def test_issue_loop_plan_first_fails_closed_when_a_requirement_is_withdrawn(
+    tmp_path, monkeypatch
+):
+    """A withdrawal at the live approval boundary is a changed requirement set.
+
+    Every plan review and every carried exact-key approval was bound to the
+    earlier surfaced requirement digest, so a withdrawn ID must stop and
+    re-enter planning rather than proceed to implementation (#905, from #841).
+    """
+    requirement_1 = HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Keep the public API unchanged.",
+    )
+    requirement_2 = HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-05-17T08:10:00Z",
+        url="https://github.com/OWNER/REPO/issues/56#issuecomment-2",
+        body="Also preserve the audit trail.",
+    )
+
+    def _context(*requirements):
+        return IssueContext(
+            number=56,
+            repo="OWNER/REPO",
+            title="Issue",
+            body="Issue body",
+            url="https://github.com/OWNER/REPO/issues/56",
+            comments=(),
+            human_requirements=requirements,
+        )
+
+    contexts = iter(
+        (_context(requirement_1, requirement_2), _context(requirement_1))
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_issue_context",
+        lambda *args, **kwargs: next(contexts),
+    )
+    dispositions = [
+        {
+            "requirement_id": "Requirement 1",
+            "disposition": "addressed",
+            "evidence": "The plan preserves the public API.",
+        },
+        {
+            "requirement_id": "Requirement 2",
+            "disposition": "addressed",
+            "evidence": "The plan preserves the audit trail.",
+        },
+    ]
+    plan_output = structured_plan_state(summary="Plan the compatibility fix.").replace(
+        '"human_requirement_dispositions": []',
+        '"human_requirement_dispositions": ' + json.dumps(dispositions),
+        1,
+    ).replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        "\n"
+        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+        "### Human requirements\n"
+        "- Requirement 1: the plan preserves the public API.\n"
+        "- Requirement 2: the plan preserves the audit trail.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+    runner = FakeRunner(
+        claude_outputs=[plan_output],
+        codex_outputs=[
+            structured_plan_review(
+                state="approved",
+                summary="Plan approved.",
+                human_requirements_resolved=True,
+                human_requirement_dispositions=dispositions,
+            )
+        ],
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match=r"Issue #56 signed human requirement\(s\) changed after plan approval: "
+        r"withdrawn hr-",
+    ):
+        run_issue_loop(runner, issue_number=56, config=make_config(tmp_path), plan_first=True)
+
+    # The run stops before implementation: no PR and no coder implementation turn.
     assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
 
 
@@ -8627,6 +8723,104 @@ def test_staged_planning_primary_gate_then_reviewer_only_panel_round(tmp_path):
         for record in records
         if record.role == "reviewer" and record.agent == "Gemini"
     ] == [2]
+
+
+def test_staged_planning_withdrawn_requirement_blocks_carried_approvals(
+    tmp_path, monkeypatch
+):
+    """`human-requirements-and-decomposition`, `carried-approval-requires-current-ack`.
+
+    The primary's carried exact-key approval and the panel's fresh approval are
+    both bound to the earlier surfaced requirement digest, so withdrawing a
+    signed requirement at the live approval boundary must stop the run instead
+    of letting those acknowledgements satisfy the gate for a requirement set
+    that no longer exists.
+    """
+    requirement_1 = HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Keep the public API unchanged.",
+    )
+    requirement_2 = HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-05-17T08:10:00Z",
+        url="https://github.com/OWNER/REPO/issues/56#issuecomment-2",
+        body="Also preserve the audit trail.",
+    )
+    dispositions = [
+        {
+            "requirement_id": requirement_1.requirement_id,
+            "disposition": "addressed",
+            "evidence": "The plan preserves the public API.",
+        },
+        {
+            "requirement_id": requirement_2.requirement_id,
+            "disposition": "addressed",
+            "evidence": "The plan preserves the audit trail.",
+        },
+    ]
+    plan_output = structured_v1_plan_state().replace(
+        '"human_requirement_dispositions": []',
+        '"human_requirement_dispositions": ' + json.dumps(dispositions),
+        1,
+    ).replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        "\n"
+        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+        "### Human requirements\n"
+        f"- {requirement_1.requirement_id}: the plan preserves the public API.\n"
+        f"- {requirement_2.requirement_id}: the plan preserves the audit trail.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output],
+        codex_outputs=[
+            structured_plan_review(
+                state="approved",
+                human_requirements_resolved=True,
+                human_requirement_dispositions=dispositions,
+            )
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                human_requirements_resolved=True,
+                human_requirement_dispositions=dispositions,
+            )
+        ],
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(
+            runner_arg, config=config, issue_number=issue_number
+        )
+        # The withdrawal lands only after the panel round has settled, so the
+        # primary already holds a carried approval for the earlier digest.
+        panel_ran = any(cmd[0] == "gemini" for cmd, _cwd in runner.commands)
+        requirements = (
+            (requirement_1,) if panel_ran else (requirement_1, requirement_2)
+        )
+        return replace(context, human_requirements=requirements)
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+
+    with pytest.raises(
+        AgentLoopError,
+        match=r"Issue #56 signed human requirement\(s\) changed after plan approval: "
+        r"withdrawn hr-",
+    ):
+        run_issue_loop(
+            runner, issue_number=56, config=_staged_plan_config(tmp_path), plan_first=True
+        )
+
+    # Both reviewers approved, yet the plan is not carried into implementation.
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
 
 
 def test_staged_planning_round_budget_diagnostic_is_distinct(tmp_path):

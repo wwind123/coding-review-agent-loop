@@ -1693,6 +1693,14 @@ approval and re-invokes that reviewer rather than being repaired in place. Plan
 item numbering, disposition reconciliation, deferred stages, child-stage
 topology, and decomposition decisions are never changed by scheduling.
 
+At the approval-to-implementation boundary the loop re-reads the issue, and the
+authoritative parent issue when there is one, and stops whenever the surfaced
+signed requirement set differs at all from the set the plan was reviewed
+against. An addition and a withdrawal are equally disqualifying: every plan
+review and every carried approval was bound to the earlier requirement digest,
+so the message names the added and withdrawn IDs and you re-run planning rather
+than carrying the plan into implementation.
+
 #### Exclusions
 
 Discussion-mode scheduling and the child-planning cycle always invoke the full
@@ -1701,8 +1709,11 @@ planning configuration and the semantic-dedupe isolated provider configuration
 both reset the planning policy, primary, and force-full fields. PR-flow
 scheduling, qualification, managed CI, branch protection, and merge behavior are
 unchanged. The staged planning policy remains non-default until a flow-separated
-frozen evaluation justifies the latency and cost tradeoff; `review-evaluation`
-separates planning rows from PR rows by flow.
+frozen evaluation justifies the latency and cost tradeoff. That evaluation is
+not available yet: `review-evaluation` has no flow dimension today and reports
+PR policy rows only, so it cannot compare staged planning against full-board
+planning. Separating planning rows from PR rows by flow is a prerequisite that a
+later stage must deliver before the default can change.
 
 ### Phased decomposition versus split materialization
 
