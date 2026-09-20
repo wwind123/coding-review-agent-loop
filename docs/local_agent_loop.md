@@ -1680,6 +1680,16 @@ only. It can never recover class D, because approval, ownership, and
 qualification accounting all depend on a readable record set — restore the
 missing planning round-metadata records and rerun instead.
 
+When the override authorizes the complete board, each superseded pre-panel
+secondary plan review is named in the posted audit, excluded from approval and
+ownership accounting, and replayed to its own author — and to no other
+reviewer — as an explicitly non-authoritative `Superseded pre-panel plan review
+context` block in that reviewer's fresh plan review prompt. The block is
+bounded, states that the earlier claims are not findings, not plan-item
+dispositions, and not approvals, and instructs the reviewer to re-raise any
+concern that still holds as a new finding of the fresh review rather than
+dispositioning it as a prior plan item.
+
 #### Carried approvals and signed human requirements
 
 An exact-key approval is carried across rounds only when the stored record

@@ -9414,7 +9414,40 @@ def _run_plan_first_loop(
         resumed_by_name = {
             record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
         }
+        # Superseded pre-panel plan reviews, replayed to their own author only
+        # as non-authoritative context under the operator planning override.
+        superseded_plan_prepanel: dict[str, PostedRoundRecord] = {}
         if staged_planning and plan_primary_name is not None:
+            def _is_unqualified_prepanel(record: PostedRoundRecord) -> bool:
+                return not (
+                    plan_panel_evidence.opening_index is not None
+                    and record.index > plan_panel_evidence.opening_index
+                )
+
+            if plan_operator_force_full:
+                # The override authorizes the complete board over exactly the
+                # artifacts the pre-panel diagnostic would otherwise stop on,
+                # so each superseded secondary gets its own earlier claims back
+                # as context, and never as findings, ownership, or approval.
+                # A reviewer that already produced a qualified post-opening
+                # review has had its fresh turn, so it needs no replay.
+                already_freshly_invoked = {
+                    record.metadata.agent
+                    for record in plan_records
+                    if record.metadata.role == "reviewer"
+                    and not _is_unqualified_prepanel(record)
+                }
+                for record in sorted(plan_records, key=lambda item: item.index):
+                    metadata = record.metadata
+                    if (
+                        metadata.role == "reviewer"
+                        and metadata.agent
+                        and metadata.agent != plan_primary_name
+                        and metadata.agent in plan_reviewer_names
+                        and metadata.agent not in already_freshly_invoked
+                        and _is_unqualified_prepanel(record)
+                    ):
+                        superseded_plan_prepanel[metadata.agent] = record
             # A secondary plan review recorded before any qualified panel
             # opening is an unqualified artifact: it is never resumed as
             # settled work, never an approval, and never ownership.  The
@@ -9422,11 +9455,7 @@ def _run_plan_first_loop(
             for name in [
                 name
                 for name, record in resumed_by_name.items()
-                if name != plan_primary_name
-                and not (
-                    plan_panel_evidence.opening_index is not None
-                    and record.index > plan_panel_evidence.opening_index
-                )
+                if name != plan_primary_name and _is_unqualified_prepanel(record)
             ]:
                 log(
                     config,
@@ -9434,7 +9463,17 @@ def _run_plan_first_loop(
                     "qualified panel opening; it is superseded, non-authoritative "
                     "context and is not resumed as settled work",
                 )
+                if plan_operator_force_full:
+                    superseded_plan_prepanel[name] = resumed_by_name[name]
                 resumed_by_name.pop(name, None)
+            if superseded_plan_prepanel:
+                log(
+                    config,
+                    f"Planning round {round_number}: replaying superseded pre-panel plan "
+                    "review context to "
+                    + ", ".join(sorted(superseded_plan_prepanel))
+                    + " as non-authoritative context only",
+                )
 
         def _build_plan_review_prompt(reviewer: AgentName) -> str:
             # Built once per reviewer from pre-round state only, so the same
@@ -9456,6 +9495,10 @@ def _run_plan_first_loop(
                         "Review the current plan for correctness, architecture fit, "
                         "missing edge cases, test strategy, and ambiguity."
                     ),
+                ),
+                # Each reviewer sees only its own superseded pre-panel review.
+                superseded_prepanel_review=_superseded_prepanel_plan_review(
+                    superseded_plan_prepanel.get(agent_display_name(reviewer))
                 ),
             )
 
@@ -12910,6 +12953,41 @@ def _superseded_prepanel_review(record: PostedRoundRecord | None) -> SupersededP
         if parsed is not None:
             claims.extend(item.text for item in parsed.blocking_items if item.text)
             claims.extend(item.text for item in parsed.followups.same_pr if item.text)
+    return SupersededPrepanelReview(
+        reviewer=reviewer,
+        round_number=metadata.round_number,
+        head_sha=metadata.subject or "(unknown)",
+        state=metadata.state or "unknown",
+        summary=review_freeform_summary_text(record.body),
+        claims=tuple(claims),
+        item_ids=tuple(item.item_id for item in metadata.new_items),
+    )
+
+
+def _superseded_prepanel_plan_review(
+    record: PostedRoundRecord | None,
+) -> SupersededPrepanelReview | None:
+    """Planning counterpart of ``_superseded_prepanel_review`` (#905).
+
+    Builds the non-authoritative prompt context for a secondary plan review
+    recorded before any qualified panel opening, so the operator planning
+    force-full override can replay that reviewer's own earlier claims to it
+    without their ever entering the ledger, ownership, or approval accounting.
+    """
+    if record is None:
+        return None
+    metadata = record.metadata
+    reviewer = metadata.agent or "reviewer"
+    claims: list[str] = [item.text for item in metadata.new_items if item.text]
+    if not claims:
+        source_text = metadata.canonical_reviewer_response or record.body
+        try:
+            parsed = parse_plan_review(source_text, reviewer=reviewer)
+        except AgentLoopError:
+            parsed = None
+        if parsed is not None:
+            claims.extend(item.text for item in parsed.items.blocking if item.text)
+            claims.extend(item.text for item in parsed.items.same_plan if item.text)
     return SupersededPrepanelReview(
         reviewer=reviewer,
         round_number=metadata.round_number,

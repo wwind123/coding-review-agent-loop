@@ -9151,6 +9151,26 @@ def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path
         if record.role == "reviewer" and not record.new_items
     ]
     assert {record.agent for record in fresh_reviews} == {"Codex", "Gemini"}
+    # The superseded review reaches its own author as explicitly
+    # non-authoritative context, and no other reviewer.
+    gemini_prompt = [
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["gemini"]
+    ][-1]
+    flat = " ".join(gemini_prompt.split())
+    assert (
+        "Superseded pre-panel plan review context (non-authoritative; context only):"
+        in gemini_prompt
+    )
+    assert "not a finding, not a plan-item disposition, not an approval" in flat
+    assert (
+        "none of its claims entered the unresolved plan-item ledger "
+        "(superseded plan item IDs: item-1)"
+    ) in flat
+    assert "- Earlier claim: Secondary-owned plan finding." in gemini_prompt
+    codex_prompt = [
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["codex"]
+    ][-1]
+    assert "Superseded pre-panel plan review context" not in codex_prompt
 
 
 def test_staged_planning_stops_when_planning_history_cannot_be_extracted(tmp_path):
