@@ -1841,3 +1841,96 @@ def test_scope_applicable_matrix_rejects_unknown_stage_owner() -> None:
             execution_owner="stage-not-in-plan",
             valid_stage_ids=("stage-first",),
         )
+
+
+def test_truncated_semantic_claim_parses_but_never_derives_as_verified() -> None:
+    """#913: accepted truncation is content loss, so the row must not verify."""
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(
+        execution_ref="invocation:observation-1", receipt_id="receipt-1"
+    )
+    identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(13)]
+    payload = {
+        "schema_version": 1,
+        "kind": "coder_followup",
+        "state": "blocking",
+        "summary": "Updated the PR.",
+        "addressed_items": [],
+        "remaining_items": [],
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "risk_test_matrix_claims": [{
+            "row_id": "row-ordinary",
+            "execution_refs": ["invocation:observation-1"],
+            "test_identifiers": identifiers,
+            "test_locations": ["tests/test_mod.py"],
+            "workflow_path_claim": "ordinary / review-only",
+            "outcome_assertions": ["Every listed test passed."],
+            "forbidden_effect_assertions": ["No unauthorized evidence was accepted."],
+        }],
+    }
+    parsed = validate_structured_coder_followup(
+        json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        delivered_risk_test_matrix_row_ids=["row-ordinary"],
+        execution_catalog=[{
+            "execution_ref": "invocation:observation-1",
+            "outcome": "passed",
+            "provenance": "parent-observed",
+        }],
+    )
+
+    claim = parsed.risk_test_matrix_claims.claims[0]
+    assert claim.truncated_fact_fields == ("test_identifiers",)
+    assert claim.test_identifiers == tuple(identifiers[:12])
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=parsed.risk_test_matrix_claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    row = result.evidence.rows[0]
+    assert row.status == "stale/unverified"
+    assert row.evidence_citations == ()
+    truncation = [d for d in result.diagnostics if d.code == "truncated-semantic-claim"]
+    assert len(truncation) == 1
+    assert "test_identifiers" in truncation[0].message
+    assert any("lost listed facts" in caveat for caveat in row.caveats)
+
+
+def test_untruncated_semantic_claim_still_verifies() -> None:
+    """#913 guard: the truncation diagnostic must not fire on a bounded claim."""
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(
+        execution_ref="invocation:observation-1", receipt_id="receipt-1"
+    )
+    claims = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=tuple(f"tests/test_mod.py::test_case_{index}" for index in range(12)),
+        test_locations=("tests/test_mod.py",),
+        workflow_path_claim="ordinary / review-only",
+        outcome_assertions=("Every listed test passed.",),
+        forbidden_effect_assertions=("No unauthorized evidence was accepted.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert result.evidence.rows[0].status == "verified"
+    assert not [d for d in result.diagnostics if d.code == "truncated-semantic-claim"]

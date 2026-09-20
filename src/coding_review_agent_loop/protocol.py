@@ -573,6 +573,11 @@ class SemanticRiskCoverageClaim:
     test broker.  They are intentionally not receipt IDs and are never
     persisted as evidence authority.
 
+    ``truncated_fact_fields`` names fact lists that overflowed the
+    ``RISK_MATRIX_MAX_LIST_ITEMS`` bound and were truncated before the PR was
+    authenticated (#913).  Truncation is accepted content loss, so derivation
+    treats the row as a claim defect rather than promoting it to ``verified``.
+
     ``dropped_execution_refs`` records model-supplied refs that the
     catalog-aware parser could not resolve to a current-turn handle (#859).
     They are never selectable or citable; derivation turns each one into an
@@ -589,6 +594,7 @@ class SemanticRiskCoverageClaim:
     forbidden_effect_assertions: tuple[str, ...]
     caveats: tuple[str, ...] = ()
     dropped_execution_refs: tuple[str, ...] = ()
+    truncated_fact_fields: tuple[str, ...] = ()
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -1786,6 +1792,23 @@ def derive_risk_test_matrix_evidence(
                 ))
                 caveats.append(
                     "The semantic coverage claim did not provide all facts required for verified evidence."
+                )
+            if claim.truncated_fact_fields:
+                # Truncation before authentication is accepted content loss
+                # (#913), so the retained prefix cannot stand in for the whole
+                # claim: the row stays unverified and says why.
+                valid_selected = False
+                diagnostics.append(PostAuthClaimDiagnostic(
+                    row.row_id,
+                    "truncated-semantic-claim",
+                    f"Semantic coverage exceeded the {RISK_MATRIX_MAX_LIST_ITEMS}-item "
+                    "list bound and was truncated: "
+                    + ", ".join(claim.truncated_fact_fields)
+                    + ".",
+                ))
+                caveats.append(
+                    "The semantic coverage claim lost listed facts to the per-list bound, "
+                    "so it cannot be verified."
                 )
             for dropped_ref in claim.dropped_execution_refs:
                 # Dropped before authentication (#859): never selectable, so
@@ -3130,14 +3153,19 @@ def _optional_semantic_fact_string(value: object, *, context: str) -> str:
 
 
 def _optional_semantic_fact_list(
-    value: object, *, context: str, dropped: list[str] | None = None
+    value: object,
+    *,
+    context: str,
+    field: str | None = None,
+    truncations: list[tuple[str, str]] | None = None,
 ) -> tuple[str, ...]:
     """Normalize an absent/null/empty semantic fact list to ``()``.
 
     A row that genuinely covers many tests is ordinary, so a list longer than
     ``RISK_MATRIX_MAX_LIST_ITEMS`` keeps its first entries and reports the
-    overflow through ``dropped`` instead of rejecting the envelope before the
-    PR is authenticated (#913).  Non-list values, non-string or blank items,
+    overflow through ``truncations`` instead of rejecting the envelope before
+    the PR is authenticated (#913).  The caller records the truncated field on
+    the claim, so derivation can refuse to verify a row that lost content.  Non-list values, non-string or blank items,
     duplicates, and oversize individual entries still raise.
     """
     if value is None:
@@ -3149,11 +3177,12 @@ def _optional_semantic_fact_list(
         rendered = _risk_bounded_string_list(value, context=context, max_items=len(value))
         if len(set(rendered)) != len(rendered):
             raise AgentLoopError(f"{context} contains duplicate items.")
-        if dropped is not None:
-            dropped.append(
+        if truncations is not None:
+            truncations.append((
+                field or context,
                 f"{context} listed {len(rendered)} items; the first "
-                f"{RISK_MATRIX_MAX_LIST_ITEMS} are retained."
-            )
+                f"{RISK_MATRIX_MAX_LIST_ITEMS} are retained.",
+            ))
         return rendered[:RISK_MATRIX_MAX_LIST_ITEMS]
     rendered = _risk_bounded_string_list(value, context=context)
     if len(set(rendered)) != len(rendered):
@@ -3241,6 +3270,12 @@ def _parse_semantic_risk_coverage_claims(
     to empty defaults: they are recoverable after authentication, where
     derivation records the row as unverified with an
     ``incomplete-semantic-claim`` diagnostic.
+
+    A fact list longer than ``RISK_MATRIX_MAX_LIST_ITEMS`` is likewise a
+    claim defect rather than an envelope defect (#913): the first entries are
+    retained, the truncated fields are recorded on ``truncated_fact_fields``
+    and named in one bounded caveat, and derivation records the row as
+    unverified with a ``truncated-semantic-claim`` diagnostic.
 
     With a live catalog, selectors that cannot resolve to a current-turn
     broker handle are a claim defect, not an envelope defect (#859).  Command
@@ -3352,26 +3387,30 @@ def _parse_semantic_risk_coverage_claims(
                         f"{claim_context}.execution_refs selector `{ref}` has known non-authoritative "
                         "launch-integrity state and cannot be selected before authentication."
                     )
-        truncated_facts: list[str] = []
+        truncated_facts: list[tuple[str, str]] = []
         test_identifiers = _optional_semantic_fact_list(
             payload.get("test_identifiers"),
             context=f"{claim_context}.test_identifiers",
-            dropped=truncated_facts,
+            field="test_identifiers",
+            truncations=truncated_facts,
         )
         test_locations = _optional_semantic_fact_list(
             payload.get("test_locations"),
             context=f"{claim_context}.test_locations",
-            dropped=truncated_facts,
+            field="test_locations",
+            truncations=truncated_facts,
         )
         outcome_assertions = _optional_semantic_fact_list(
             payload.get("outcome_assertions"),
             context=f"{claim_context}.outcome_assertions",
-            dropped=truncated_facts,
+            field="outcome_assertions",
+            truncations=truncated_facts,
         )
         forbidden_effect_assertions = _optional_semantic_fact_list(
             payload.get("forbidden_effect_assertions"),
             context=f"{claim_context}.forbidden_effect_assertions",
-            dropped=truncated_facts,
+            field="forbidden_effect_assertions",
+            truncations=truncated_facts,
         )
         caveats = _risk_bounded_string_list(
             payload.get("caveats", []),
@@ -3382,7 +3421,9 @@ def _parse_semantic_risk_coverage_claims(
         if dropped_refs:
             bookkeeping.append(_dropped_execution_refs_caveat(dropped_refs))
         if truncated_facts:
-            bookkeeping.append(_truncated_fact_lists_caveat(truncated_facts))
+            bookkeeping.append(
+                _truncated_fact_lists_caveat([message for _, message in truncated_facts])
+            )
         if bookkeeping:
             # Reserve room for every bookkeeping caveat at once, so neither one
             # overwrites the other and accepted content loss stays disclosed
@@ -3402,6 +3443,7 @@ def _parse_semantic_risk_coverage_claims(
             forbidden_effect_assertions=forbidden_effect_assertions,
             caveats=caveats,
             dropped_execution_refs=tuple(dropped_refs),
+            truncated_fact_fields=tuple(field for field, _ in truncated_facts),
         )
         result.append(claim)
     return SemanticRiskCoverageClaims(tuple(result))
