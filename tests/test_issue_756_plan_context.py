@@ -25,12 +25,14 @@ from coding_review_agent_loop.prompts import (
     render_coder_human_requirements_prompt_context,
 )
 from coding_review_agent_loop.protocol import validate_human_requirements_acknowledgement
+from coding_review_agent_loop import round_state
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
     PostedRoundRecord,
     _attach_round_metadata,
     make_approved_plan_context,
     recover_approved_plan_context,
+    _approved_plan_hash,
     _latest_pr_approved_reviews_for_head,
 )
 
@@ -397,3 +399,57 @@ def test_full_and_compact_review_prompts_keep_plan_outside_issue_history(tmp_pat
         assert "Broader redesign" in prompt
     assert "Canonical approved plan text" in full
     assert "Canonical approved plan text" in compact
+
+
+def _plan_comment_body(plan: str, *, subject: str | None, canonical: bool) -> str:
+    metadata = PostedRoundMetadata(
+        flow="plan", role="coder", agent="Claude", round_number=1, subject=subject,
+        canonical_plan=plan if canonical else None,
+        raw_structured_coder_response=plan if canonical else None,
+    )
+    return _attach_round_metadata(plan, metadata)
+
+
+def test_recover_approved_plan_context_subject_rejection_reports_no_matching_candidate():
+    """A subject-rejected legacy record leaves has_matching_candidate False.
+
+    The managed-CI hash-only fallback guard depends on exactly this value: a
+    child record whose hash matches but whose derived subject differs must not
+    be mistaken for a divergent matching candidate.
+    """
+    plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
+    expected_hash = _approved_plan_hash(plan)
+    comments = [
+        IssueComment(
+            author="bot", created_at="2026-05-01T00:00:00Z",
+            body=_plan_comment_body(plan, subject="divergent-subject", canonical=False),
+        )
+    ]
+
+    recovered = recover_approved_plan_context(comments, expected_hash=expected_hash)
+
+    assert not recovered.is_available
+    assert not recovered.has_matching_candidate
+    assert "expected plan subject" in (recovered.diagnostic or "")
+
+
+def test_recover_approved_plan_context_divergent_matches_report_matching_candidate(
+    monkeypatch,
+):
+    """Divergent records matching the handoff hash set has_matching_candidate."""
+    first = "Approved plan A.\n\n### Plan steps\n1. First."
+    second = "Approved plan B.\n\n### Plan steps\n1. Second."
+    monkeypatch.setattr(round_state, "_approved_plan_hash", lambda _text: "collided")
+    comments = [
+        IssueComment(
+            author="bot", created_at="2026-05-01T00:00:00Z",
+            body=_plan_comment_body(text, subject=None, canonical=True),
+        )
+        for text in (first, second)
+    ]
+
+    recovered = recover_approved_plan_context(comments, expected_hash="collided")
+
+    assert not recovered.is_available
+    assert recovered.has_matching_candidate
+    assert "divergent" in (recovered.diagnostic or "")

@@ -12458,3 +12458,189 @@ def test_pr_loop_single_narration_only_reviewer_stops_fatally(tmp_path):
 
     assert not any("PR review incomplete" in body for body in runner.comments)
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+
+def _plan_comment(plan: str) -> IssueComment:
+    return IssueComment(
+        author="coding-review-agent-loop",
+        created_at="2026-05-01T00:00:00Z",
+        body=_attach_round_metadata(
+            plan,
+            PostedRoundMetadata(
+                flow="plan", role="coder", agent="Claude", round_number=1,
+                subject=orchestrator._plan_subject(plan), canonical_plan=plan,
+                raw_structured_coder_response=plan,
+            ),
+        ),
+    )
+
+
+def _handoff_comment(plan_hash: str) -> IssueComment:
+    return IssueComment(
+        author="coding-review-agent-loop",
+        created_at="2026-05-01T00:02:00Z",
+        body=format_issue_pr_handoff_comment(
+            issue_number=56, pr_number=77,
+            pr_url="https://github.com/OWNER/REPO/pull/77",
+            pr_head_sha="abc123", flow="approved-plan-implementation",
+            plan_hash=plan_hash,
+        ),
+    )
+
+
+def _issue(number: int, comments: tuple[IssueComment, ...]) -> IssueContext:
+    return IssueContext(
+        number=number, repo="OWNER/REPO", title=f"Issue {number}",
+        body="Scope.", url=f"https://github.com/OWNER/REPO/issues/{number}",
+        comments=comments,
+    )
+
+
+def _managed_resume_runner() -> FakeRunner:
+    return FakeRunner(
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+
+
+def _ordinary_managed_config(tmp_path, **overrides):
+    return make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        reviewer=("codex",), **overrides,
+    )
+
+
+def _issue_created_handoff() -> orchestrator.AuthenticatedIssueCreatedHandoff:
+    return orchestrator.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="voluntary", override_nonce="opening-nonce",
+    )
+
+
+def test_pr_ordinary_resume_without_parent_context_still_fails_closed(tmp_path, monkeypatch):
+    """Plain PR-mode resume has no parent identity and keeps the hard stop."""
+    plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
+    child = _issue(56, (_handoff_comment(orchestrator.approved_plan_hash(plan)),))
+    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context", lambda *_a, **_k: child
+    )
+    monkeypatch.setattr(
+        orchestrator, "recover_issue_created_handoff",
+        lambda *_a, **_k: _issue_created_handoff(),
+    )
+    monkeypatch.setattr(
+        orchestrator, "revalidate_issue_created_handoff",
+        lambda *_a, **_k: (_ for _ in ()).throw(_FreshScopeCaptured()),
+    )
+    runner = _managed_resume_runner()
+
+    with pytest.raises(
+        AgentLoopError,
+        match="Managed-CI ordinary resume could not recover the canonical approved plan.",
+    ):
+        run_pr_loop(runner, pr_number=77, config=_ordinary_managed_config(tmp_path))
+
+    assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
+
+
+def test_pr_ordinary_resume_ignores_parent_when_child_plan_recovers(tmp_path, monkeypatch):
+    """A recoverable child plan wins and the parent comments are never read."""
+    plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
+    decoy = "Decoy plan.\n\n### Plan steps\n1. Do something else entirely."
+    plan_hash = orchestrator.approved_plan_hash(plan)
+    child = _issue(56, (_plan_comment(plan), _handoff_comment(plan_hash)))
+    parent = _issue(55, (_plan_comment(decoy),))
+    read_comments: list[int] = []
+
+    real_recover = orchestrator.recover_approved_plan_context
+
+    def recording_recover(comments, **kwargs):
+        read_comments.append(len(comments))
+        return real_recover(comments, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "recover_approved_plan_context", recording_recover)
+    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    monkeypatch.setattr(
+        orchestrator, "recover_issue_created_handoff",
+        lambda *_a, **_k: _issue_created_handoff(),
+    )
+    captured: dict[str, object] = {}
+
+    def revalidate(*_args, **kwargs):
+        captured.update(kwargs)
+        raise _FreshScopeCaptured
+
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", revalidate)
+    runner = _managed_resume_runner()
+
+    with pytest.raises(_FreshScopeCaptured):
+        run_pr_loop(
+            runner, pr_number=77, config=_ordinary_managed_config(tmp_path),
+            parent_issue_context=parent,
+        )
+
+    assert captured["handoff"].approved_plan_hash == plan_hash
+    # Only the child comments were consulted by the managed-CI recovery.
+    assert read_comments == [len(child.comments)]
+
+
+def test_pr_fresh_authorization_recovers_parent_held_plan(tmp_path, monkeypatch):
+    """A staged child under --managed-ci-fresh recovers the parent-held plan."""
+    plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
+    plan_hash = orchestrator.approved_plan_hash(plan)
+    child = _issue(56, (_handoff_comment(plan_hash),))
+    parent = _issue(55, (_plan_comment(plan),))
+    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    captured: dict[str, object] = {}
+
+    def authorize(*_args, **kwargs):
+        captured.update(kwargs)
+        raise _FreshScopeCaptured
+
+    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    config = _ordinary_managed_config(
+        tmp_path, managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+    )
+    runner = _managed_resume_runner()
+
+    with pytest.raises(_FreshScopeCaptured):
+        run_pr_loop(
+            runner, pr_number=77, config=config, parent_issue_context=parent,
+        )
+
+    assert captured["approved_plan_hash"] == plan_hash
+    assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
+
+
+def test_pr_fresh_authorization_without_parent_context_still_fails_closed(tmp_path, monkeypatch):
+    plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
+    child = _issue(56, (_handoff_comment(orchestrator.approved_plan_hash(plan)),))
+    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator, "get_issue_context", lambda *_a, **_k: child)
+    monkeypatch.setattr(
+        orchestrator, "authorize_fresh_issue_created_resume",
+        lambda *_a, **_k: (_ for _ in ()).throw(_FreshScopeCaptured()),
+    )
+    config = _ordinary_managed_config(
+        tmp_path, managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match="could not recover the canonical approved plan for the explicit issue scope",
+    ):
+        run_pr_loop(_managed_resume_runner(), pr_number=77, config=config)

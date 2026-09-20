@@ -12858,6 +12858,56 @@ def _preserve_issue_created_managed_suppression(
     )
 
 
+def _recover_managed_ci_approved_plan(
+    child_comments: Sequence[object],
+    *,
+    expected_hash: str,
+    parent_comments: Sequence[object] | None = None,
+) -> ApprovedPlanContext:
+    """Recover the canonical approved plan for a managed-CI resume.
+
+    A staged decomposition child carries only its issue-to-PR handoff record;
+    the approved plan round lives on the authoritative parent issue named by
+    the child's authenticated fresh-phase identity.  The fallback predicate is
+    exactly what the recovery model reports: the child recovery is unavailable
+    *and* ``has_matching_candidate`` is False, i.e. no candidate survived.
+    Only then are the in-process parent comments consulted, as the ordinary
+    PR-mode recovery path does.
+
+    That predicate is deliberately broader than "the child carries no record
+    with ``expected_hash``".  No ``expected_subject`` is passed here, but
+    ``recover_approved_plan_context`` still derives a required subject for a
+    legacy free-form record from its own metadata, so such a record can carry
+    the handoff hash, be rejected on that derived subject, and still leave
+    ``has_matching_candidate`` False.  The fallback is permitted in that case:
+    the subject-rejected record is never adopted, and the canonical handoff
+    plan hash remains the sole binding on whatever the parent yields.
+
+    Only divergent accepted candidates — several records matching the hash
+    that disagree on the plan text — set ``has_matching_candidate`` True, and
+    those keep failing closed: the parent is never consulted.  The parent
+    identity is only ever the in-process context supplied by the staged-child
+    dispatch; nothing is inferred from PR body text or from the handoff
+    record's own fields.
+    """
+
+    candidate = recover_approved_plan_context(
+        child_comments,
+        expected_hash=expected_hash,
+    )
+    if candidate.is_available or candidate.has_matching_candidate:
+        return candidate
+    if parent_comments is None:
+        return candidate
+    parent_candidate = recover_approved_plan_context(
+        parent_comments,
+        expected_hash=expected_hash,
+    )
+    if parent_candidate.is_available:
+        return parent_candidate
+    return candidate
+
+
 def run_pr_loop(
     runner: Runner,
     *,
@@ -12900,6 +12950,24 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
+        issue_context_refreshed = False
+        parent_issue_context_refreshed = False
+        # A caller-provided issue snapshot may predate plan approval. Refresh
+        # both the child and the authoritative in-process parent snapshot
+        # before any managed-CI canonical plan recovery reads their comments,
+        # so a stale snapshot cannot defeat the guarded parent fallback.  Each
+        # issue is fetched at most once per run; the later refresh block is
+        # guarded by these flags.
+        if issue_context is not None:
+            issue_context = get_issue_context(
+                runner, config=config, issue_number=issue_context.number
+            )
+            issue_context_refreshed = True
+        if parent_issue_context is not None:
+            parent_issue_context = get_issue_context(
+                runner, config=config, issue_number=parent_issue_context.number
+            )
+            parent_issue_context_refreshed = True
         if config.managed_ci_fresh_authorization:
             fresh_issue_number = managed_ci_issue_number or config.managed_ci_issue_number
             if fresh_issue_number is None:
@@ -12917,6 +12985,7 @@ def run_pr_loop(
                 issue_context = get_issue_context(
                     runner, config=config, issue_number=fresh_issue_number
                 )
+                issue_context_refreshed = True
             elif issue_context.number != fresh_issue_number:
                 raise AgentLoopError(
                     "Managed-CI fresh authorization issue scope does not match the "
@@ -12939,9 +13008,14 @@ def run_pr_loop(
                             "Managed-CI fresh authorization found an approved-plan handoff "
                             "without a canonical plan identity."
                         )
-                    recovered = recover_approved_plan_context(
+                    recovered = _recover_managed_ci_approved_plan(
                         issue_context.comments,
                         expected_hash=canonical_handoff.plan_hash,
+                        parent_comments=(
+                            parent_issue_context.comments
+                            if parent_issue_context is not None
+                            else None
+                        ),
                     )
                     if not recovered.is_available:
                         raise AgentLoopError(
@@ -13068,6 +13142,7 @@ def run_pr_loop(
                             config=config,
                             issue_number=managed_ci_handoff.issue_number,
                         )
+                        issue_context_refreshed = True
                     canonical_handoff = find_latest_issue_pr_handoff(
                         issue_context.comments,
                         issue_number=managed_ci_handoff.issue_number,
@@ -13079,9 +13154,14 @@ def run_pr_loop(
                         and canonical_handoff.flow == "approved-plan-implementation"
                         and canonical_handoff.plan_hash
                     ):
-                        candidate_scope = recover_approved_plan_context(
+                        candidate_scope = _recover_managed_ci_approved_plan(
                             issue_context.comments,
                             expected_hash=canonical_handoff.plan_hash,
+                            parent_comments=(
+                                parent_issue_context.comments
+                                if parent_issue_context is not None
+                                else None
+                            ),
                         )
                         if not candidate_scope.is_available:
                             raise AgentLoopError(
@@ -13169,16 +13249,16 @@ def run_pr_loop(
             repository=config.repo,
             pr_number=pr_number,
         )
-        issue_context_refreshed = False
-        parent_issue_context_refreshed = False
         # A caller-provided issue snapshot may predate plan approval. Refresh
-        # it before deriving requirements or handoff provenance.
+        # it before deriving requirements or handoff provenance.  The managed-CI
+        # recovery block above already refreshed whatever it read, so these
+        # fetches are flag-guarded to keep each issue fetched once per run.
         if issue_context is not None and not issue_context_refreshed:
             issue_context = get_issue_context(
                 runner, config=config, issue_number=issue_context.number
             )
             issue_context_refreshed = True
-        if parent_issue_context is not None:
+        if parent_issue_context is not None and not parent_issue_context_refreshed:
             parent_issue_context = get_issue_context(
                 runner, config=config, issue_number=parent_issue_context.number
             )
