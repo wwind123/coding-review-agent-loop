@@ -45,6 +45,7 @@ from .protocol import (
     sanitize_architecture_impact,
     validate_direct_readiness,
 )
+from .issue_body_limits import BoundedSection, bounded_text_present, fit_github_body
 from .round_transport import MAX_GITHUB_BODY_CHARS
 
 AUTOMATION_CLASSES = set(EXECUTION_AUTOMATION_CLASSES)
@@ -1331,12 +1332,13 @@ def format_phase_issue_body(
             "This phase is a manual closure/checkpoint. A human should add the required remark/update and "
             "close this issue when the checkpoint is satisfied."
         )
+    parent_excerpt = sanitize_historical_text(phase.parent_context)
     body = "\n".join(
         [
             f"Child phase issue for parent #{parent_issue}: {parent_url}",
             "",
-            "## Approved parent-plan excerpt for this phase",
-            sanitize_historical_text(phase.parent_context),
+            PARENT_EXCERPT_HEADING,
+            parent_excerpt,
             "",
             "## Scope",
             phase.scope,
@@ -1404,7 +1406,33 @@ def format_phase_issue_body(
             execution_strategy_contract_version=execution_strategy_contract_version,
             inherited_matrix_row_ids=inherited_matrix_row_ids,
         )
-    return body
+    # Every other section is bounded by its own contract, so an oversized child
+    # body is the inherited plan excerpt.  Keep the stage contract, the markers
+    # and the identity intact, and point at the parent's canonical plan (#902).
+    return fit_github_body(
+        body,
+        sections=(_parent_excerpt_section(parent_excerpt, parent_issue=parent_issue),),
+        surface=f"Child phase issue body for parent #{parent_issue}",
+    )
+
+
+PARENT_EXCERPT_HEADING = "## Approved parent-plan excerpt for this phase"
+
+
+def _parent_excerpt_section(excerpt: str, *, parent_issue: int) -> BoundedSection:
+    """Describe the inherited plan excerpt embedded in a child phase body.
+
+    The renderer and the fresh-recovery content check share this description so
+    a published body that was shortened still matches its reviewed phase.
+    """
+    return BoundedSection(
+        name="approved parent-plan excerpt",
+        text=excerpt,
+        pointer=(
+            f"issue #{parent_issue}'s canonical plan comment and its "
+            "machine-readable attachments"
+        ),
+    )
 
 
 def _phase_disposition_lines(phase: PlanPhase) -> list[str]:
@@ -1448,10 +1476,14 @@ def _fresh_phase_content_matches(
     body = candidate.body
     if not isinstance(body, str):
         return False
+    excerpt = _parent_excerpt_section(
+        sanitize_historical_text(phase.parent_context), parent_issue=parent_issue
+    )
+    if not bounded_text_present(body, excerpt, after=PARENT_EXCERPT_HEADING):
+        return False
     fragments = [
         f"Child phase issue for parent #{parent_issue}:",
-        "## Approved parent-plan excerpt for this phase",
-        sanitize_historical_text(phase.parent_context),
+        PARENT_EXCERPT_HEADING,
         "## Scope",
         phase.scope,
         "## Non-goals",

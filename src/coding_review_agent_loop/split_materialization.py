@@ -23,6 +23,7 @@ from .child_topology import (
 from .decomposition import _decode_json_payload, _encode_json_payload, _issue_number_from_url
 from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
+from .issue_body_limits import BoundedSection, fit_github_body
 from .logging import log
 from .protocol import ChildStage, DeferredStage, ISSUE_REFERENCE_RE, TRACKER_ACTION_TITLE_RE
 from .runner import Runner
@@ -164,21 +165,43 @@ def _format_child_issue_body(
     rationale: Sequence[tuple[str, str]],
     siblings_so_far: Sequence[MaterializedSplitChild],
 ) -> str:
+    parent_pointer = f"parent issue #{parent_issue} and its discussion"
+    scope = sanitize_historical_text(proposal.body)
+    bounded: list[BoundedSection] = [
+        BoundedSection(name="proposed scope", text=scope, pointer=parent_pointer)
+    ]
     lines = [
         f"Part of #{parent_issue}",
         "",
         f"Child stage issue split out of parent #{parent_issue}.",
         "",
         "## Proposed scope",
-        sanitize_historical_text(proposal.body),
+        scope,
         "",
         "## Split rationale from parent discussion",
     ]
     if rationale:
         for reviewer, text in rationale:
-            lines.append(f"- {sanitize_historical_text(reviewer)}: {sanitize_historical_text(text)}")
+            safe_reviewer = sanitize_historical_text(reviewer)
+            safe_text = sanitize_historical_text(text)
+            lines.append(f"- {safe_reviewer}: {safe_text}")
+            bounded.append(
+                BoundedSection(
+                    name=f"split rationale from {safe_reviewer}",
+                    text=safe_text,
+                    pointer=parent_pointer,
+                )
+            )
     else:
         lines.append("- No structured rationale was recorded; see the parent issue discussion.")
+    bounded.extend(
+        BoundedSection(
+            name=f"sibling stage title for {sibling.key}",
+            text=sanitize_historical_text(sibling.title),
+            pointer=parent_pointer,
+        )
+        for sibling in siblings_so_far
+    )
     lines.extend(
         [
             "",
@@ -195,7 +218,13 @@ def _format_child_issue_body(
             "-- coding-review-agent-loop",
         ]
     )
-    return "\n".join(lines)
+    # A stage split out of a large plan carries plan-derived text; bound it so
+    # the child stays publishable and keeps its identity marker (#902).
+    return fit_github_body(
+        "\n".join(lines),
+        sections=bounded,
+        surface=f"Split child issue body for parent #{parent_issue}",
+    )
 
 
 def _encode_split_metadata(metadata: SplitMaterializationMetadata) -> str:

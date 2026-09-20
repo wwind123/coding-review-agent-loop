@@ -507,3 +507,111 @@ def test_plan_summary_truncation_notice_uses_descriptive_wording():
 
     for token in MARKER_BY_TOKEN:
         assert token not in PLAN_SUMMARY_TRUNCATION_NOTICE
+
+
+def test_oversized_plan_followup_issue_body_is_shortened():
+    """#902: a follow-up filed from a huge approved plan must publish.
+
+    The canonical text and the original reviewer notes come from the plan
+    review, so an unbounded body failed the GitHub 60000-character guard.
+    """
+    from coding_review_agent_loop.followups import (
+        PlanApprovedFollowupSource,
+        PlanGroupedApprovedFollowup,
+        _plan_followup_issue_body,
+    )
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    huge_note = "\n".join(f"Reviewer note line {index}: " + "detail " * 30 for index in range(3_000))
+    assert len(huge_note) > MAX_GITHUB_BODY_CHARS
+    followup = PlanGroupedApprovedFollowup(
+        text="Split the transport rewrite into its own stage.",
+        items=(ApprovedFollowup(reviewer="codex", text=huge_note),),
+        sources=(
+            PlanApprovedFollowupSource(
+                item_id="item-1", reviewer="codex", source_round=1, text=huge_note
+            ),
+        ),
+    )
+
+    body = _plan_followup_issue_body(
+        issue_number=841,
+        plan_hash="abc123",
+        plan_subject="Stage the transport rewrite",
+        followup=followup,
+    )
+
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "Future follow-up from approved planning for issue #841." in body
+    assert "Split the transport rewrite into its own stage." in body
+    assert "Reviewer note line 0:" in body
+    assert "canonical plan comment" in body
+
+
+def test_oversized_pr_followup_issue_body_is_shortened():
+    """#902: a PR-review follow-up issue body is bounded on the same path."""
+    from coding_review_agent_loop.followups import GroupedApprovedFollowup
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    huge_note = "\n".join(f"Reviewer note line {index}: " + "detail " * 30 for index in range(3_000))
+    followup = GroupedApprovedFollowup(
+        text="Bound the remaining tool-created bodies.",
+        items=(ApprovedFollowup(reviewer="codex", text=huge_note),),
+    )
+
+    body = _followup_issue_body(99, followup)
+
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "Future follow-up from approved review on PR #99." in body
+    assert "Bound the remaining tool-created bodies." in body
+    assert "Reviewer note line 0:" in body
+    assert "the approved review on PR #99" in body
+
+
+def test_oversized_plan_followup_update_notes_alone_are_shortened():
+    """#902: plan-review update notes are plan-derived and must be bounded.
+
+    The canonical text and the original note are small here, so only the
+    `Update from` lines can push the body past the GitHub limit.
+    """
+    from coding_review_agent_loop.followups import (
+        PlanApprovedFollowupSource,
+        PlanGroupedApprovedFollowup,
+        _plan_followup_issue_body,
+    )
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    notes = tuple(
+        "\n".join(f"Update {group} line {index}: " + "detail " * 30 for index in range(300))
+        for group in range(6)
+    )
+    assert sum(len(note) for note in notes) > MAX_GITHUB_BODY_CHARS
+    followup = PlanGroupedApprovedFollowup(
+        text="Bound the remaining plan-derived bodies.",
+        items=(ApprovedFollowup(reviewer="codex", text="Short original note."),),
+        sources=(
+            PlanApprovedFollowupSource(
+                item_id="item-1",
+                reviewer="codex",
+                source_round=1,
+                text="Short original note.",
+                notes=notes,
+            ),
+        ),
+    )
+
+    body = _plan_followup_issue_body(
+        issue_number=841,
+        plan_hash="abc123",
+        plan_subject="Stage the transport rewrite",
+        followup=followup,
+    )
+
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "Future follow-up from approved planning for issue #841." in body
+    assert "Bound the remaining plan-derived bodies." in body
+    assert "Short original note." in body
+    # Room is shared, so every update note keeps its opening and a pointer.
+    for group in range(len(notes)):
+        assert f"Update {group} line 0:" in body
+    assert body.count("canonical plan comment") >= len(notes)
