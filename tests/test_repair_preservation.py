@@ -1607,9 +1607,12 @@ def test_two_wrapped_trailing_bullets_support_two_findings(builder, bucket):
     [(_pr_review, "blocking_items"), (_plan_review, "blocking_plan_issues")],
 )
 def test_a_list_heading_plus_one_bullet_supports_exactly_one_finding(builder, bucket):
-    # Issue #871 round 7, item-6: a lead-in line such as `Review concerns:` is
-    # list structure, not a concern. Emitting it as its own candidate let repair
-    # turn one bulleted concern into two injectively matched ledger findings.
+    # Issue #871 round 7, item-6 and round 8, item-9: a lead-in line such as
+    # `Review concerns:` is list structure, not a concern. Emitting it as its own
+    # candidate let repair turn one bulleted concern into two injectively matched
+    # ledger findings, and prepending it to the first item let a repaired finding
+    # match on the heading's tokens alone while dropping the real concern. The
+    # lead-in is therefore dropped from the candidate list entirely.
     source = (
         json.dumps(builder(state="blocking", summary="Findings.", **{bucket: []}))
         + "\nReview concerns:\n"
@@ -1624,18 +1627,20 @@ def test_a_list_heading_plus_one_bullet_supports_exactly_one_finding(builder, bu
             **{bucket: ["The retry loop never terminates on a truncated response."]},
         )),
     )
-    with pytest.raises(AgentLoopError, match="grounding"):
-        validate_repair_preservation(
-            source,
-            json.dumps(builder(
-                state="blocking",
-                summary="Findings.",
-                **{bucket: [
-                    "Review concerns",
-                    "The retry loop never terminates on a truncated response.",
-                ]},
-            )),
-        )
+    for fabricated in (
+        ["Review concerns"],
+        [
+            "Review concerns",
+            "The retry loop never terminates on a truncated response.",
+        ],
+    ):
+        with pytest.raises(AgentLoopError, match="grounding"):
+            validate_repair_preservation(
+                source,
+                json.dumps(builder(
+                    state="blocking", summary="Findings.", **{bucket: fabricated},
+                )),
+            )
 
 
 @pytest.mark.parametrize(

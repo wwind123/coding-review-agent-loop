@@ -449,9 +449,10 @@ def test_docs_describe_reviewer_repair_admission_and_grounding():
     )
     assert "An empty or marker-only source finding" not in normalized
     assert (
-        "a lead-in line before the first bullet is list structure that joins "
-        "the first item" in normalized
+        "a lead-in line before the first bullet is list structure that is "
+        "dropped" in normalized
     )
+    assert "joins the first item" not in normalized
 
     architecture = ARCHITECTURE.read_text(encoding="utf-8")
     assert "Reviewer repair is refused fail-closed" in architecture

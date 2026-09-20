@@ -3127,7 +3127,8 @@ copied into a current-scope finding and then ground an inverted blocking verdict
 Those freeform candidates are non-overlapping — a paragraph contributes either its
 list items or its joined prose, never both, a wrapped bullet's continuation
 lines join the item they belong to, and a lead-in line before the first bullet is
-list structure that joins the first item rather than a concern of its own — so
+list structure that is dropped rather than a concern of its own, so it can neither
+raise the ceiling nor let a repaired finding match on the heading alone — so
 one trailing reviewer statement cannot be matched twice and raise the ceiling,
 and protocol footer and signature lines are structural records rather than
 candidates. A declared source finding that carries

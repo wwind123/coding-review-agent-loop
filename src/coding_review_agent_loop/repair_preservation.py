@@ -275,19 +275,19 @@ def _freeform_finding_candidates(text: str) -> list[str]:
             # they belong to, so one wrapped bullet stays one candidate and
             # cannot be matched twice (#871).
             items: list[list[str]] = []
-            lead_in: list[str] = []
             for line in lines:
                 match = _LIST_ITEM_RE.match(line)
                 if match is not None:
-                    # A lead-in line such as `Review concerns:` introduces the
-                    # list; it is structure, not a separate concern, so it joins
-                    # the first item instead of raising the candidate count.
-                    items.append([*lead_in, match.group("body").strip()])
-                    lead_in = []
+                    items.append([match.group("body").strip()])
                 elif items:
                     items[-1].append(line)
-                else:
-                    lead_in.append(line)
+                # A lead-in line such as `Review concerns:` before the first
+                # bullet introduces the list. It is structure, not a concern, so
+                # it is dropped entirely: keeping it as its own candidate let
+                # repair emit the heading as a second ledger finding, and
+                # prepending it to the first item let a repaired finding match on
+                # the heading's tokens alone while omitting the real concern
+                # (#871).
             for item in items:
                 joined_item = " ".join(" ".join(item).split())
                 if joined_item:
