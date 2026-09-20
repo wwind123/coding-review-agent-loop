@@ -1972,3 +1972,45 @@ def test_fresh_child_recovery_still_rejects_a_foreign_parent_excerpt(tmp_path):
         parent_issue=56,
         phase=phase,
     )
+
+
+def test_oversized_retained_excerpt_is_shortened_in_the_parent_summary():
+    """#907: the parent summary embeds the retained-parent excerpt.
+
+    Issue #841 created its three child issues and then failed to publish the
+    summary with 'GitHub comment body exceeds 60000 characters'.
+    """
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    huge_excerpt = "\n".join(
+        f"Retained scope line {index}: " + "detail " * 30 for index in range(3_000)
+    )
+    assert len(huge_excerpt) > MAX_GITHUB_BODY_CHARS
+    phase = PlanPhase(
+        title="Stage one",
+        scope="Implement the reviewed stage contract.",
+        non_goals="No rollout.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low.",
+        validation="Run the focused tests.",
+        parent_context="Approved parent plan.",
+        automation="agent-pr",
+        depends_on=(),
+    )
+
+    body = format_decomposition_parent_summary(
+        parent_issue=841,
+        mode="implement-by-phase",
+        plan_hash="a" * 16,
+        created=(CreatedPhaseIssue(phase=phase, issue_url="https://example/issues/904", issue_number=904),),
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="b" * 64, plan_hash="a" * 16, excerpt=huge_excerpt,
+        ),
+    )
+
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "Approved plan decomposed for issue #841." in body
+    # The child table and the plan identity survive; only the excerpt is cut.
+    assert "https://example/issues/904" in body
+    assert "Retained scope line 0:" in body
+    assert "canonical plan comment" in body

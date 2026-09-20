@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 import re
@@ -45,7 +46,13 @@ from .protocol import (
     sanitize_architecture_impact,
     validate_direct_readiness,
 )
-from .issue_body_limits import BoundedSection, bounded_text_present, fit_github_body
+from .issue_body_limits import (
+    BODY_SAFETY_MARGIN,
+    BoundedSection,
+    bounded_text_present,
+    fit_github_body,
+    shortened_section,
+)
 from .round_transport import MAX_GITHUB_BODY_CHARS
 
 AUTOMATION_CLASSES = set(EXECUTION_AUTOMATION_CLASSES)
@@ -2517,6 +2524,7 @@ def format_decomposition_parent_summary(
     recommendation_digest: str | None = None,
     plan_subject: str | None = None,
     inherited_matrix_row_ids: Sequence[str] = (),
+    _excerpt_bounded: bool = False,
 ) -> str:
     phase_identities = tuple(
         phase_identity(
@@ -2639,7 +2647,52 @@ def format_decomposition_parent_summary(
             "-- coding-review-agent-loop",
         ]
     )
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    if len(body) <= MAX_GITHUB_BODY_CHARS or _excerpt_bounded:
+        if len(body) > MAX_GITHUB_BODY_CHARS:
+            raise AgentLoopError(
+                f"Decomposition summary for issue #{parent_issue} exceeds the GitHub body "
+                "limit even with a shortened retained-parent excerpt; its fixed sections "
+                "are too large to publish."
+            )
+        return body
+    # The retained-parent excerpt is plan-derived and appears twice: once as
+    # visible text and once inside the base64 record payload.  Shortening only
+    # the visible copy cannot fit, so bound it at the source and re-render, and
+    # measure the fixed overhead with an empty excerpt first (#907).
+    assert retained_parent_scope is not None
+    probe = format_decomposition_parent_summary(
+        parent_issue=parent_issue, mode=mode, plan_hash=plan_hash, created=created,
+        topology_source=topology_source,
+        retained_parent_scope=dataclasses.replace(retained_parent_scope, excerpt=""),
+        final_integration_work=final_integration_work, strategy=strategy,
+        execution_strategy_contract_version=execution_strategy_contract_version,
+        recommendation_digest=recommendation_digest, plan_subject=plan_subject,
+        inherited_matrix_row_ids=inherited_matrix_row_ids, _excerpt_bounded=True,
+    )
+    # Each retained character costs one visible byte plus about 4/3 of a byte in
+    # the base64 payload, so divide the remaining room by three for headroom.
+    budget = max((MAX_GITHUB_BODY_CHARS - BODY_SAFETY_MARGIN - len(probe)) // 3, 0)
+    bounded = shortened_section(
+        BoundedSection(
+            name="retained parent scope excerpt",
+            text=retained_parent_scope.excerpt,
+            pointer=(
+                f"issue #{parent_issue}'s canonical plan comment and its "
+                "machine-readable attachments"
+            ),
+        ),
+        budget=budget,
+    )
+    return format_decomposition_parent_summary(
+        parent_issue=parent_issue, mode=mode, plan_hash=plan_hash, created=created,
+        topology_source=topology_source,
+        retained_parent_scope=dataclasses.replace(retained_parent_scope, excerpt=bounded),
+        final_integration_work=final_integration_work, strategy=strategy,
+        execution_strategy_contract_version=execution_strategy_contract_version,
+        recommendation_digest=recommendation_digest, plan_subject=plan_subject,
+        inherited_matrix_row_ids=inherited_matrix_row_ids, _excerpt_bounded=True,
+    )
 
 
 def format_phase_implementation_handoff_comment(
