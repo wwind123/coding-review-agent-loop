@@ -194,6 +194,14 @@ def _format_child_issue_body(
             )
     else:
         lines.append("- No structured rationale was recorded; see the parent issue discussion.")
+    bounded.extend(
+        BoundedSection(
+            name=f"sibling stage title for {sibling.key}",
+            text=sanitize_historical_text(sibling.title),
+            pointer=parent_pointer,
+        )
+        for sibling in siblings_so_far
+    )
     lines.extend(
         [
             "",

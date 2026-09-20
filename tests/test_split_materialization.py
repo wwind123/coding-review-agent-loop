@@ -713,3 +713,27 @@ def test_split_child_body_reports_the_overflowing_section():
     message = str(excinfo.value)
     assert "Split child issue body for parent #7" in message
     assert "no shortenable plan-derived section" in message
+
+
+def test_body_diagnostic_names_the_largest_section_when_fixed_text_fills_the_limit():
+    """#902: the diagnostic names the surface and the overflowing section."""
+    from coding_review_agent_loop.issue_body_limits import BoundedSection, fit_github_body
+
+    fixed = "f" * 120
+    excerpt = "e" * 200
+    with pytest.raises(AgentLoopError) as excinfo:
+        fit_github_body(
+            fixed + excerpt,
+            sections=(
+                BoundedSection(
+                    name="proposed scope", text=excerpt, pointer="parent issue #7"
+                ),
+            ),
+            surface="Split child issue body for parent #7",
+            limit=100,
+            margin=10,
+        )
+
+    message = str(excinfo.value)
+    assert "Split child issue body for parent #7" in message
+    assert "proposed scope section" in message

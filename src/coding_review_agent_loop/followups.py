@@ -895,12 +895,16 @@ def _followup_issue_body(
         ]
     )
     if possible_duplicate:
+        safe_duplicate = sanitize_historical_text(possible_duplicate)
         lines.extend(
             [
                 "",
                 "Possible duplicate (not suppressed because semantic confidence was not high):",
-                f"- {sanitize_historical_text(possible_duplicate)}",
+                f"- {safe_duplicate}",
             ]
+        )
+        bounded.append(
+            BoundedSection(name="possible duplicate", text=safe_duplicate, pointer=pointer)
         )
     lines.extend(["", "Original reviewer notes:"])
     for item in followup.items:
@@ -959,12 +963,18 @@ def _plan_followup_issue_body(
         for source in followup.sources
         if source.item_id
     ]
+    pointer = f"issue #{issue_number}'s canonical plan comment and its planning discussion"
+    bounded: list[BoundedSection] = []
+    safe_plan_subject = sanitize_historical_text(plan_subject)
+    bounded.append(
+        BoundedSection(name="approved plan subject", text=safe_plan_subject, pointer=pointer)
+    )
     lines = [
         f"Future follow-up from approved planning for issue #{issue_number}.",
         "",
         "Source context:",
         f"- Parent issue: #{issue_number}",
-        f"- Approved plan subject: {sanitize_historical_text(plan_subject)}",
+        f"- Approved plan subject: {safe_plan_subject}",
         f"- Approved plan hash: {plan_hash}",
     ]
     if rounds:
@@ -977,11 +987,10 @@ def _plan_followup_issue_body(
         lines.append("- Original plan item ID(s): " + ", ".join(item_ids))
     if source_context is not None:
         lines.append(f"- Lookup context: {source_context.render()}")
-    pointer = f"issue #{issue_number}'s canonical plan comment and its planning discussion"
     main_text = _safe_followup_main_text(followup.text)
-    bounded: list[BoundedSection] = [
+    bounded.append(
         BoundedSection(name="canonical follow-up text", text=main_text, pointer=pointer)
-    ]
+    )
     lines.extend(
         [
             "",
@@ -999,14 +1008,24 @@ def _plan_followup_issue_body(
             BoundedSection(name=f"original note from {label}", text=safe_text, pointer=pointer)
         )
         for note in source.notes:
-            lines.append(f"  - Update from {sanitize_historical_text(note)}")
+            safe_note = sanitize_historical_text(note)
+            lines.append(f"  - Update from {safe_note}")
+            bounded.append(
+                BoundedSection(
+                    name=f"update note from {label}", text=safe_note, pointer=pointer
+                )
+            )
     if possible_duplicate:
+        safe_duplicate = sanitize_historical_text(possible_duplicate)
         lines.extend(
             [
                 "",
                 "Possible duplicate (not suppressed because semantic confidence was not high):",
-                f"- {sanitize_historical_text(possible_duplicate)}",
+                f"- {safe_duplicate}",
             ]
+        )
+        bounded.append(
+            BoundedSection(name="possible duplicate", text=safe_duplicate, pointer=pointer)
         )
     lines.extend(
         [
