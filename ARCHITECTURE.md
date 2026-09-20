@@ -327,7 +327,10 @@ The plan-first lifecycle gains a **reviewer-only phase-advance round**. When no
 must-fix plan item remains but a required reviewer still lacks a qualifying
 exact-key approval, the loop posts a `plan-phase-advance` record, increments the
 round number, and runs the secondary panel (later the final sweep) against a
-byte-identical candidate plan with no planner turn. Resume anchors on the latest
+byte-identical candidate plan with no planner turn. The advance record and the
+round-budget diagnostic name the phase that is still outstanding, projected by
+running the scheduler over the unchanged candidate key and the post-round
+approvals, not the phase of the board that just finished. Resume anchors on the latest
 coder record and the highest round number for that plan subject, so a round with
 a phase-advance record and no coder record is a legitimate reviewer-only round
 and never synthesizes a planner turn. A planning round counts as reconciled only

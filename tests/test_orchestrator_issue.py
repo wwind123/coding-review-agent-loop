@@ -8713,6 +8713,15 @@ def test_staged_planning_primary_gate_then_reviewer_only_panel_round(tmp_path):
     # The panel round is reviewer-only: one planner turn in the whole run.
     advance = [record for record in records if record.phase == "plan-phase-advance"]
     assert [record.round_number for record in advance] == [2]
+    # The advance names the phase that is still pending, not the primary round
+    # that just finished.
+    advance_body = next(
+        comment["body"]
+        for comment in runner.issue_comments
+        if "Plan review phase advance to round 2." in comment["body"]
+    )
+    assert "Outstanding phase after this advance: `secondary-audit`" in advance_body
+    assert "`primary`" not in advance_body
     assert len([record for record in records if record.role == "coder"]) == 1
     assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "claude") == 1
     # Each reviewer ran exactly once, in its own round.
@@ -8841,6 +8850,8 @@ def test_staged_planning_round_budget_diagnostic_is_distinct(tmp_path):
 
     message = str(excinfo.value)
     assert "reviewer-only plan phase advance was still pending" in message
+    # The diagnostic names the outstanding phase, not the primary round that ran.
+    assert "Outstanding phase: secondary-audit" in message
     assert "Gemini" in message
     assert "--max-rounds" in message
     assert "still reported blocking plan issues" not in message
@@ -9079,6 +9090,136 @@ def test_staged_planning_panel_blocker_routes_to_owner_plus_primary(tmp_path):
     assert remediation.scheduler_force_full_source is None
     assert "narrow plan remediation" in " ".join(remediation.scheduler_reasons)
     assert "full-board" not in phases
+
+
+def _remediation_plan_fixtures():
+    """A fresh generation-1 plan plus a narrow plan-step remediation patch."""
+    fresh = structured_v1_plan_state()
+    base = orchestrator_module.AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(fresh), round_number=1
+    )
+    patch = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Name the rollout owner in the plan steps.",
+        "prior_plan_item_dispositions": [
+            {
+                "item_id": "item-1",
+                "disposition": "resolved",
+                "rationale": "The revised plan step names the rollout owner.",
+            }
+        ],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {
+                "op": "replace",
+                "field": "plan_steps",
+                "value": ["Implement the reviewed scope and name the rollout owner."],
+            }
+        ],
+    }
+    patch_text = (
+        json.dumps(patch) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    return fresh, patch_text
+
+
+def _remediation_runner():
+    """Primary gate, panel blocker, narrow remediation, then the final sweep."""
+    fresh, patch_text = _remediation_plan_fixtures()
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}]
+    return _FakeRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_plan_review(
+                state="approved", prior_plan_item_dispositions=resolved
+            ),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking",
+                reviewer="Google Gemini",
+                summary="One plan step omits the rollout owner.",
+                blocking_plan_issues=["Name the rollout owner in the plan steps."],
+            ),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+        antigravity_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Antigravity"),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Antigravity",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+    )
+
+
+def test_staged_planning_advance_after_remediation_names_the_final_sweep(tmp_path):
+    """`reviewer-only-phase-advance`: the advance names the pending phase.
+
+    After an owner-scoped remediation round the decision in hand still reads
+    `remediation`, but the outstanding reviewer-only round is the final
+    exact-plan sweep for the secondary that has no approval of the new key.
+    """
+    runner = _remediation_runner()
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    prelaunch = [
+        record
+        for record in _plan_round_records(runner)
+        if record.phase == "scheduler-prelaunch"
+    ]
+    phases = [record.scheduler_phase for record in prelaunch]
+    assert phases[:3] == ["primary", "secondary-audit", "remediation"]
+    assert "final-secondary-sweep" in phases, phases
+    advance_bodies = {
+        comment["body"].splitlines()[0]: comment["body"]
+        for comment in runner.issue_comments
+        if "Plan review phase advance to round" in comment["body"]
+    }
+    # The panel advance names the audit; the post-remediation advance names the
+    # sweep, never the remediation round that just ran.
+    assert (
+        "Outstanding phase after this advance: `secondary-audit`"
+        in advance_bodies["Plan review phase advance to round 2."]
+    )
+    post_remediation = advance_bodies["Plan review phase advance to round 4."]
+    assert (
+        "Outstanding phase after this advance: `final-secondary-sweep`"
+        in post_remediation
+    )
+    assert "`remediation`" not in post_remediation
+    assert "Antigravity" in post_remediation
+
+
+def test_staged_planning_round_budget_names_the_outstanding_final_sweep(tmp_path):
+    """`round-budget-diagnostic`: exhaustion after remediation names the sweep."""
+    runner = _remediation_runner()
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=3
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    message = str(excinfo.value)
+    assert "reviewer-only plan phase advance was still pending" in message
+    assert "Outstanding phase: final-secondary-sweep" in message
+    assert "Antigravity" in message
+    assert "still reported blocking plan issues" not in message
 
 
 def test_staged_planning_contract_drift_stops_a_default_policy_restart(tmp_path):

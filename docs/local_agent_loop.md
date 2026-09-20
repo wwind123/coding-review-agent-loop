@@ -1606,7 +1606,10 @@ turn. **Round budget:** each advance costs a round, so staged planning always
 consumes more rounds than full-board planning for the same plan. Raise
 `--max-rounds` when enabling it. Exhausting the budget while an advance is still
 pending reports that cause distinctly from "reviewers still reported blocking
-plan issues", naming the outstanding phase and reviewers.
+plan issues", naming the outstanding phase and reviewers. Both the advance
+record and that diagnostic name the phase that is still *pending* — the panel
+audit after a primary approval, the final sweep after a remediation round — not
+the phase of the board that just finished.
 
 #### Transition classifier
 

@@ -10014,6 +10014,35 @@ def _run_plan_first_loop(
             and not must_fix_items
             and plan_missing_approvals
         )
+        # The outstanding phase, not the one that just ran: both the durable
+        # phase-advance record and the round-budget diagnostic must name the
+        # round that is still pending.
+        plan_outstanding_phase = (
+            _outstanding_plan_phase(
+                plan_snapshot,
+                decision=plan_scheduler_decision,
+                current_key=current_plan_key,
+                obligations=_scheduler_obligations(
+                    unresolved_items,
+                    required_reviewers=plan_reviewer_names,
+                    active_statuses=frozenset({"blocking", "same-plan"}),
+                ),
+                qualifying_approvals=tuple(sorted(plan_round_qualifying)),
+                panel_evidence=(
+                    plan_panel_evidence.opened
+                    or (
+                        plan_scheduler_decision is not None
+                        and plan_scheduler_decision.records_panel_opening
+                    )
+                ),
+                force_full=plan_automatic_force_full,
+                force_full_source=(
+                    "automatic" if plan_automatic_force_full else None
+                ),
+            )
+            if plan_phase_advance_pending
+            else None
+        )
 
         if all_approved and not must_fix_items and not plan_missing_approvals:
             # Re-read both sides at the approval-to-implementation boundary so
@@ -10555,7 +10584,7 @@ def _run_plan_first_loop(
                 raise AgentLoopError(
                     f"Reached max planning rounds ({config.max_rounds}) for issue #{issue_number} "
                     "while a reviewer-only plan phase advance was still pending. Outstanding "
-                    f"phase: {plan_scheduler_decision.phase if plan_scheduler_decision is not None else 'secondary-audit'}; "
+                    f"phase: {plan_outstanding_phase or 'secondary-audit'}; "
                     "reviewer(s) still missing an exact-plan approval: "
                     f"{', '.join(plan_missing_approvals)}. No reviewer reported blocking plan "
                     "issues. Staged planning spends one round per phase advance; raise "
@@ -10585,11 +10614,7 @@ def _run_plan_first_loop(
                         next_round_number=round_number + 1,
                         plan_subject=current_plan_subject,
                         missing_reviewers=plan_missing_approvals,
-                        phase=(
-                            plan_scheduler_decision.phase
-                            if plan_scheduler_decision is not None
-                            else "secondary-audit"
-                        ),
+                        phase=plan_outstanding_phase or "secondary-audit",
                     ),
                     PostedRoundMetadata(
                         flow="plan",
@@ -12898,6 +12923,57 @@ def _plan_candidate_key_for(
         ),
         execution_strategy_contract_version=version,
     )
+
+
+def _outstanding_plan_phase(
+    snapshot: PlanSchedulerSnapshot,
+    *,
+    decision,
+    current_key: PlanCandidateKey | None,
+    obligations: Sequence[ReviewObligation],
+    qualifying_approvals: Sequence[str],
+    panel_evidence: bool,
+    force_full: bool,
+    force_full_source: str | None,
+) -> str:
+    """The phase the pending reviewer-only round will run.
+
+    The scheduler decision in hand describes the board that just ran, so it
+    still reads `primary` right after the primary's approval and `remediation`
+    right after an owner-scoped round.  The phase-advance record and the
+    round-budget diagnostic must instead name the outstanding phase, so project
+    the scheduler forward over the unchanged candidate key: the plan is
+    byte-identical (a `recheck` transition), the ledger is the post-round one,
+    the approvals are this round's settled set, and the round just wrote a valid
+    scheduler record, which is the next round's recovery boundary and clears the
+    readable degraded classes (#905, from #841).
+    """
+    projected = dataclasses_replace(
+        snapshot,
+        previous_key=current_key,
+        current_key=current_key,
+        obligations=tuple(obligations),
+        panel_evidence=panel_evidence,
+        force_full=force_full,
+        force_full_source=force_full_source,
+        phase=decision.phase if decision is not None else snapshot.phase,
+        degraded_history_class=PLAN_HISTORY_INTACT,
+        fallback_reasons=(),
+        premature_secondary_reviews=(
+            () if panel_evidence else snapshot.premature_secondary_reviews
+        ),
+    )
+    try:
+        return select_plan_reviewers(
+            projected,
+            classify_plan_transition(current_key, current_key),
+            qualifying_approvals=tuple(qualifying_approvals),
+            phase=projected.phase,
+        ).phase
+    except AgentLoopError:
+        # A projection is never allowed to break the advance itself; the
+        # independent panel audit is the conservative outstanding phase.
+        return "secondary-audit"
 
 
 def _plan_scheduler_contract_from_metadata(
