@@ -195,15 +195,40 @@ def _run_flow(value: object, label: str) -> str:
     return flow
 
 
-def _resolved_flows(runs: list[Mapping[str, object]]) -> list[tuple[Mapping[str, object], str]]:
-    """Pair each run with its validated flow, failing closed on a bad value.
+def _run_policy(value: object, flow: str, label: str) -> str:
+    """Return the run's policy, validated against the policies its flow runs.
 
-    Every path that partitions runs by flow resolves the value here, so an
-    unknown flow can never silently drop a run from every report and a
-    wrong-typed or blank flow can never be coerced into the ``pr`` default.
-    Only an absent or null ``flow`` defaults.
+    A policy name valid in one flow is not automatically valid in the other:
+    ``selective-intermediate`` is PR-only.  Resolving the policy here, rather
+    than matching the raw value against a flow's policy list during
+    partitioning, keeps a run that names a foreign policy from disappearing
+    from every policy row while still being counted in its flow.
     """
-    return [(run, _run_flow(run.get("flow"), f"run {index}")) for index, run in enumerate(runs)]
+    policy = _nonblank_string(value, f"{label} policy")
+    if policy not in FLOW_POLICIES[flow]:
+        raise AgentLoopError(
+            f"Frozen evaluation {label} has unsupported policy {policy!r} for flow {flow!r}; "
+            f"expected one of: {', '.join(FLOW_POLICIES[flow])}."
+        )
+    return policy
+
+
+def _resolved_runs(
+    runs: list[Mapping[str, object]],
+) -> list[tuple[Mapping[str, object], str, str]]:
+    """Pair each run with its validated flow and policy, failing closed.
+
+    Every path that partitions runs resolves both values here, so an unknown
+    flow or a policy foreign to that flow can never silently drop a run from
+    every report, and a wrong-typed or blank flow can never be coerced into
+    the ``pr`` default.  Only an absent or null ``flow`` defaults.
+    """
+    resolved: list[tuple[Mapping[str, object], str, str]] = []
+    for index, run in enumerate(runs):
+        label = f"run {index}"
+        flow = _run_flow(run.get("flow"), label)
+        resolved.append((run, flow, _run_policy(run.get("policy"), flow, label)))
+    return resolved
 
 
 def _reject_duplicate_runs(runs: list[Mapping[str, object]]) -> None:
@@ -215,8 +240,8 @@ def _reject_duplicate_runs(runs: list[Mapping[str, object]]) -> None:
     namespace, because PR and planning runs are compared independently.
     """
     seen: set[tuple[str, str, str]] = set()
-    for run, flow in _resolved_flows(runs):
-        key = (flow, str(run.get("policy")), str(run.get("run_id")))
+    for run, flow, policy in _resolved_runs(runs):
+        key = (flow, policy, str(run.get("run_id")))
         if key in seen:
             raise AgentLoopError(
                 f"Frozen evaluation artifacts repeat run ID {key[2]!r} for policy {key[1]!r} "
@@ -229,12 +254,7 @@ def _validate_run(run: object, index: int) -> dict[str, object]:
     if not isinstance(run, dict):
         raise AgentLoopError(f"Frozen evaluation run {index} must be an object.")
     flow = _run_flow(run.get("flow"), f"run {index}")
-    policy = _nonblank_string(run.get("policy"), f"run {index} policy")
-    if policy not in FLOW_POLICIES[flow]:
-        raise AgentLoopError(
-            f"Frozen evaluation run {index} has unsupported policy {policy!r} for flow {flow!r}; "
-            f"expected one of: {', '.join(FLOW_POLICIES[flow])}."
-        )
+    policy = _run_policy(run.get("policy"), flow, f"run {index}")
     run_id = _nonblank_string(run.get("run_id", str(index + 1)), f"run {index} ID")
     run_provenance = _provenance(run.get("provenance"), f"run {run_id}")
     label_provenance = _provenance(run.get("label_provenance"), f"run {run_id} label")
@@ -532,11 +552,12 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
     runs = artifacts.get("runs")
     if not isinstance(runs, list):
         raise AgentLoopError("Validated frozen artifacts require a runs array.")
-    # Resolve and validate every flow once, before duplicate detection and
-    # partitioning, so direct evaluation of an unvalidated artifact fails
-    # closed on a malformed flow exactly as loading does.
-    resolved = _resolved_flows([run for run in runs if isinstance(run, dict)])
-    _reject_duplicate_runs([run for run, _ in resolved])
+    # Resolve and validate every run's flow and policy once, before duplicate
+    # detection and partitioning, so direct evaluation of an unvalidated
+    # artifact fails closed exactly as loading does and no run can be counted
+    # in a flow while belonging to none of that flow's policy rows.
+    resolved = _resolved_runs([run for run in runs if isinstance(run, dict)])
+    _reject_duplicate_runs([run for run, _, _ in resolved])
     canonical = json.dumps(dict(artifacts), separators=(",", ":"), sort_keys=True, ensure_ascii=False)
     report: dict[str, object] = {
         "schema_version": 1,
@@ -545,13 +566,15 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
         "flows": {},
     }
     for flow in FLOWS:
-        flow_runs = [run for run, run_flow in resolved if run_flow == flow]
+        flow_runs = [
+            (run, run_policy) for run, run_flow, run_policy in resolved if run_flow == flow
+        ]
         report["flows"][flow] = {
             "title": FLOW_TITLES[flow],
             "run_count": len(flow_runs),
             "policies": {
                 policy: _policy_row(
-                    [run for run in flow_runs if run.get("policy") == policy]
+                    [run for run, run_policy in flow_runs if run_policy == policy]
                 )
                 for policy in FLOW_POLICIES[flow]
             },

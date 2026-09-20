@@ -617,3 +617,53 @@ def test_direct_evaluation_normalizes_flow_case_and_surrounding_space():
                 "runs": [_run(run_id="cased", flow="plan"), _run(run_id="cased", flow=" PLAN ")],
             }
         )
+
+
+def test_direct_evaluation_rejects_a_policy_foreign_to_its_flow_instead_of_dropping_it():
+    # A policy string valid in the pr flow must not be silently unassignable in
+    # the plan flow: counting the run in flows.plan.run_count while no plan
+    # policy row holds it would hide its calls, tokens, latency, findings, and
+    # escaped defects from every report.
+    with pytest.raises(AgentLoopError, match="unsupported policy 'selective-intermediate' for flow 'plan'"):
+        evaluate_frozen_artifacts(
+            {
+                "schema_version": 1,
+                "runs": [
+                    _plan_run(
+                        run_id="foreign-policy",
+                        policy="selective-intermediate",
+                        primary_reviewer=None,
+                    )
+                ],
+            }
+        )
+    with pytest.raises(AgentLoopError, match="policy"):
+        evaluate_frozen_artifacts(
+            {"schema_version": 1, "runs": [_plan_run(run_id="blank-policy", policy="   ")]}
+        )
+    # The same policy stays valid on the pr flow through the direct path.
+    pr_report = evaluate_frozen_artifacts(
+        {
+            "schema_version": 1,
+            "runs": [_run(run_id="pr-selective", policy="selective-intermediate", primary_reviewer=None)],
+        }
+    )
+    assert pr_report["flows"]["pr"]["policies"]["selective-intermediate"]["run_count"] == 1
+
+
+def test_every_counted_run_belongs_to_exactly_one_policy_row_of_its_flow():
+    report = evaluate_frozen_artifacts(
+        {
+            "schema_version": 1,
+            "runs": [
+                _run(run_id="pr-staged"),
+                _run(run_id="pr-full", policy="all-reviewers", primary_reviewer=None),
+                _plan_run(run_id="plan-staged"),
+                _plan_run(run_id="plan-full", policy="all-reviewers", primary_reviewer=None),
+            ],
+        }
+    )
+    for flow in FLOWS:
+        row = report["flows"][flow]
+        counted = sum(policy_row["run_count"] for policy_row in row["policies"].values())
+        assert counted == row["run_count"]
