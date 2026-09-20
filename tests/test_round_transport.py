@@ -1942,3 +1942,80 @@ def test_absent_planning_scheduler_metadata_stays_absent():
     decoded = _decode_round_metadata(encoded)
     assert decoded.scheduler_metadata_status == "absent"
     assert decoded.plan_candidate_key is None
+
+
+def test_planning_scheduler_record_with_a_partial_candidate_key_decodes_invalid():
+    """Generation-1 rule: a partial key can supply no approval or opening."""
+    from coding_review_agent_loop.plan_review_scheduling import (
+        PlanCandidateKey,
+        make_plan_contract,
+    )
+    from coding_review_agent_loop.round_state import _decode_round_metadata_mapping
+
+    complete = PlanCandidateKey(
+        subject="a" * 64,
+        aggregate_plan_identity="b" * 64,
+        execution_strategy_identity="c" * 32,
+        risk_test_matrix_identity="d" * 32,
+        surfaced_requirement_id_digest="e" * 16,
+    )
+
+    def _payload(**overrides):
+        base = {
+            "flow": "plan",
+            "role": "summary",
+            "agent": "Orchestrator",
+            "round_number": 2,
+            "subject": "a" * 64,
+            "scheduler_contract": make_plan_contract(
+                ("Codex", "Gemini"), "primary-then-panel", "Codex"
+            ).as_dict(),
+            "scheduler_obligation_digest": "0" * 16,
+            "scheduler_selected_reviewers": ["Gemini"],
+            "scheduler_paused_reviewers": [["Codex", "carried approval"]],
+            "scheduler_reasons": ["audit"],
+            "scheduler_final_sweep": False,
+            "scheduler_force_full": False,
+            "scheduler_calls_avoided": 1,
+            "plan_candidate_key": complete.as_dict(),
+        }
+        base.update(overrides)
+        return base
+
+    assert (
+        _decode_round_metadata_mapping(_payload()).scheduler_metadata_status == "valid"
+    )
+
+    # A missing key component.
+    missing = dict(complete.as_dict())
+    missing["execution_strategy_identity"] = None
+    assert (
+        _decode_round_metadata_mapping(
+            _payload(plan_candidate_key=missing)
+        ).scheduler_metadata_status
+        == "invalid"
+    )
+
+    # A non-generation-1 execution-strategy contract version.
+    legacy = dict(complete.as_dict())
+    legacy["execution_strategy_contract_version"] = 2
+    assert (
+        _decode_round_metadata_mapping(
+            _payload(plan_candidate_key=legacy)
+        ).scheduler_metadata_status
+        == "invalid"
+    )
+
+    # A partial previous-key field is rejected the same way.
+    assert (
+        _decode_round_metadata_mapping(
+            _payload(scheduler_plan_previous_key=missing)
+        ).scheduler_metadata_status
+        == "invalid"
+    )
+    assert (
+        _decode_round_metadata_mapping(
+            _payload(scheduler_plan_previous_key=complete.as_dict())
+        ).scheduler_metadata_status
+        == "valid"
+    )

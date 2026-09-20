@@ -1478,12 +1478,17 @@ def _decode_plan_scheduler_fields(payload: Mapping[str, object]) -> dict[str, ob
         current_key_payload = payload.get("plan_candidate_key")
         if not isinstance(current_key_payload, dict):
             raise ValueError("planning scheduler record is missing its candidate key")
-        PlanCandidateKey.from_mapping(current_key_payload)
+        # Generation-1 rule: a record missing any key component, or carrying a
+        # non-1 execution-strategy contract version, can supply neither an
+        # approval nor a panel opening, so it must not decode as valid.
+        if not PlanCandidateKey.from_mapping(current_key_payload).complete:
+            raise ValueError("incomplete planning candidate key")
         previous_key_payload = payload.get("scheduler_plan_previous_key")
         if previous_key_payload is not None:
             if not isinstance(previous_key_payload, dict):
                 raise ValueError("invalid previous planning candidate key")
-            PlanCandidateKey.from_mapping(previous_key_payload)
+            if not PlanCandidateKey.from_mapping(previous_key_payload).complete:
+                raise ValueError("incomplete previous planning candidate key")
         decoded = _decode_common_scheduler_lists(payload, contract.required_reviewers)
         phase = payload.get("scheduler_phase")
         if phase is not None and (

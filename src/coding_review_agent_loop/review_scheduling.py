@@ -358,9 +358,14 @@ class ReviewObligation:
     resolution_owners: tuple[str, ...]
     pending_owners: tuple[str, ...]
 
+    # ``same-plan`` is the planning flow's Same-PR counterpart (#905, from
+    # #841).  PR items never carry it, so accepting it here adds a planning
+    # status without changing any PR scheduling outcome.
+    ACTIVE_STATUSES = frozenset({"blocking", "same-pr", "same-plan"})
+
     @property
     def active(self) -> bool:
-        return self.status in {"blocking", "same-pr"}
+        return self.status in self.ACTIVE_STATUSES
 
 
 @dataclass(frozen=True)

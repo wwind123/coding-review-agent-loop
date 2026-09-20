@@ -344,7 +344,10 @@ partitioned into exactly four disjoint classes with one outcome each: absent,
 invalid, and contradictory-key history always continue under a conservative
 fallback (strict primary-only before a qualified opening, complete board with an
 automatic latch after one), and only a transport extraction failure stops the
-run, checked at startup and at every round boundary. A carried exact-key
+run, checked at startup and at every round boundary. Degradation is scoped to
+the latest valid planning scheduler checkpoint, so an older invalid record stays
+auditable without pinning later rounds to the fallback, and the persisted
+planning contract is immutable under both policies. A carried exact-key
 approval is honored only when it also carried the acknowledgement for exactly
 the currently surfaced planning-requirement ID set, so the signed-requirement
 gate cannot be satisfied vacuously. Discussion-mode and child-planning cycles

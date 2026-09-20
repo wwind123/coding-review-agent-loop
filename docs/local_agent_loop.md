@@ -1622,7 +1622,10 @@ all unchanged; and `broad` for everything else, including a full-state rewrite,
 a missing or unbindable sidecar, and an unreconstructible ledger. A routine
 remediation revision that edits plan steps and matrix rows therefore stays
 narrow and does not latch the complete board on the first revision. Ownership
-always comes from the canonical finding ledger, never from the patch.
+always comes from the canonical finding ledger, never from the patch: an active
+planning obligation is a `blocking` **or** `same-plan` finding, so a Same-plan
+panel follow-up keeps its durable owner and routes the next round to
+`remediation` rather than falling through to a final sweep.
 
 #### Qualified panel evidence
 
@@ -1651,6 +1654,19 @@ Before a qualified opening the fallback re-invokes only the primary with full
 context under a `strict pre-panel fallback:` reason and latches nothing; after
 one it selects the complete board under a `post-panel fallback:` reason and
 raises the durable `automatic` latch.
+
+Degradation is scoped to the current *recovery boundary*: the latest valid
+planning scheduler checkpoint. An invalid record written before that checkpoint
+stays listed in the audit but grants no phase authority and no longer degrades
+later rounds, so a class-B fallback costs one round and then the run advances on
+its next exact-plan primary approval instead of repeating the primary-only turn
+until `--max-rounds` is exhausted.
+
+The persisted planning scheduler contract is immutable for the run, and that is
+checked under **both** policies. Restarting an issue that already carries a
+staged planning contract with the compatibility default, with a different
+primary, or with a different reviewer board stops with an actionable message
+naming the persisted contract instead of silently continuing on a different one.
 
 The run stops with a plain `Plan review scheduling diagnostic` comment, and no
 reviewer and no planner turn, in exactly three cases: an active plan finding

@@ -52,6 +52,7 @@ from coding_review_agent_loop.issue_pr_handoff import (
 from coding_review_agent_loop.issue_pr_provenance import IssuePrProvenanceScope
 from coding_review_agent_loop.memory import AgentMemoryContext
 import coding_review_agent_loop.prompts as prompts_module
+from coding_review_agent_loop.plan_review_scheduling import PlanCandidateKey
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
     ValidatedAgentResponse,
@@ -8474,7 +8475,7 @@ def _staged_plan_history(tmp_path, *, reviewer_records=(), scheduler_record=True
     comments = [
         {
             "author": {"login": "bot"},
-            "createdAt": "2026-09-14T00:00:00Z",
+            "createdAt": "2026-01-01T00:00:00Z",
             "body": _attach_round_metadata(
                 canonical + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
                 PostedRoundMetadata(
@@ -8514,7 +8515,7 @@ def _staged_plan_history(tmp_path, *, reviewer_records=(), scheduler_record=True
         comments.append(
             {
                 "author": {"login": "bot"},
-                "createdAt": "2026-09-14T00:00:00Z",
+                "createdAt": "2026-01-01T00:00:00Z",
                 "body": _attach_round_metadata(
                     "Plan review scheduling audit.\n\n-- Orchestrator",
                     PostedRoundMetadata(
@@ -8543,7 +8544,7 @@ def _staged_plan_history(tmp_path, *, reviewer_records=(), scheduler_record=True
         comments.append(
             {
                 "author": {"login": "bot"},
-                "createdAt": f"2026-09-14T00:00:{index:02d}Z",
+                "createdAt": f"2026-01-01T00:00:{index:02d}Z",
                 "body": _attach_round_metadata(
                     f"{agent} plan review.\n<!-- AGENT_PLAN_STATE: {state} -->\n-- {agent}",
                     PostedRoundMetadata(
@@ -8754,7 +8755,7 @@ def test_staged_planning_stops_when_planning_history_cannot_be_extracted(tmp_pat
         comments=(
             IssueComment(
                 author="bot",
-                created_at="2026-09-14T00:00:00Z",
+                created_at="2026-01-01T00:00:30Z",
                 body="Plan round record.\n<!-- AGENT_LOOP_META: not-a-valid-payload -->",
             ),
         ),
@@ -8781,3 +8782,261 @@ def test_staged_planning_stops_when_planning_history_cannot_be_extracted(tmp_pat
         "Plan review scheduling diagnostic (startup)" in comment["body"]
         for comment in runner.issue_comments
     )
+
+
+def test_staged_planning_panel_blocker_routes_to_owner_plus_primary(tmp_path):
+    """`panel-blocker-remediation`: a `same-plan` panel finding keeps its owner.
+
+    Regression for the planning obligation status set: `same-plan` is the
+    planning counterpart of `same-pr`, so it must stay an active obligation or
+    the scheduler falls through to a final sweep instead of remediation.
+    """
+    fresh = structured_v1_plan_state()
+    base = orchestrator_module.AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(fresh), round_number=1
+    )
+    patch = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Name the rollout owner in the plan steps.",
+        "prior_plan_item_dispositions": [
+            {
+                "item_id": "item-1",
+                "disposition": "resolved",
+                "rationale": "The revised plan step names the rollout owner.",
+            }
+        ],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {
+                "op": "replace",
+                "field": "plan_steps",
+                "value": ["Implement the reviewed scope and name the rollout owner."],
+            }
+        ],
+    }
+    patch_text = (
+        json.dumps(patch) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}]
+    runner = _FakeRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_plan_review(
+                state="approved", prior_plan_item_dispositions=resolved
+            ),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking",
+                reviewer="Google Gemini",
+                summary="One plan step omits the rollout owner.",
+                same_plan_followups=["Name the rollout owner in the plan steps."],
+            ),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+        antigravity_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Antigravity"),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Antigravity",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+    )
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    prelaunch = [
+        record
+        for record in _plan_round_records(runner)
+        if record.phase == "scheduler-prelaunch"
+    ]
+    phases = [record.scheduler_phase for record in prelaunch]
+    assert phases[:2] == ["primary", "secondary-audit"]
+    assert "remediation" in phases, phases
+    remediation = prelaunch[phases.index("remediation")]
+    # Owner-scoped: the `same-plan` finding owner plus the primary, never the
+    # complete board, and no automatic full-board latch is raised.
+    assert set(remediation.scheduler_selected_reviewers) == {"Gemini", "Codex"}
+    assert [name for name, _why in remediation.scheduler_paused_reviewers] == [
+        "Antigravity"
+    ]
+    assert remediation.scheduler_active_owners == ("Gemini",)
+    assert remediation.scheduler_force_full is False
+    assert remediation.scheduler_force_full_source is None
+    assert "narrow plan remediation" in " ".join(remediation.scheduler_reasons)
+    assert "full-board" not in phases
+
+
+def test_staged_planning_contract_drift_stops_a_default_policy_restart(tmp_path):
+    """A persisted staged planning contract is immutable across a restart.
+
+    Restarting with the compatibility default must stop rather than silently
+    continue on a different contract.
+    """
+    comments, _canonical = _staged_plan_history(tmp_path)
+    runner = _FakeRunner(issue_comments=comments)
+
+    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=3),
+            plan_first=True,
+        )
+
+    assert not any(
+        cmd[0] in {"claude", "codex", "gemini"} for cmd, _cwd in runner.commands
+    )
+
+    # A restart that changes only the primary is rejected the same way.
+    drifted = _FakeRunner(issue_comments=comments)
+    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
+        run_issue_loop(
+            drifted,
+            issue_number=56,
+            config=_staged_plan_config(tmp_path, primary_plan_reviewer="gemini"),
+            plan_first=True,
+        )
+
+
+def _invalid_plan_scheduler_comment(subject, *, created_at="2026-01-01T00:00:30Z"):
+    """A planning scheduler record whose contract cannot be reconstructed."""
+    from coding_review_agent_loop.round_transport import encode_mapping
+
+    payload = {
+        "flow": "plan",
+        "role": "summary",
+        "agent": "Orchestrator",
+        "round_number": 1,
+        "subject": subject,
+        "phase": "scheduler-prelaunch",
+        # Missing `required_reviewers`: the planning branch reports `invalid`.
+        "scheduler_contract": {"policy": "primary-then-panel"},
+        "scheduler_obligation_digest": "0" * 16,
+        "scheduler_selected_reviewers": ["Codex"],
+        "scheduler_paused_reviewers": [["Gemini", "primary phase"]],
+        "scheduler_reasons": ["primary phase"],
+        "scheduler_final_sweep": False,
+        "scheduler_force_full": False,
+        "scheduler_calls_avoided": 1,
+    }
+    return {
+        "author": {"login": "bot"},
+        "createdAt": created_at,
+        "body": (
+            "Plan review scheduling audit.\n\n-- Orchestrator\n"
+            f"<!-- AGENT_LOOP_META: {encode_mapping(payload)} -->"
+        ),
+    }
+
+
+def test_invalid_planning_history_recovers_after_its_fallback_round(tmp_path):
+    """`legacy-planning-metadata-fallback`: class B continues and progresses.
+
+    An invalid scheduler record before the current recovery boundary must not
+    pin every later round to the strict pre-panel fallback, which would suppress
+    each fresh exact-key primary approval until the round budget ran out.
+    """
+    comments, canonical = _staged_plan_history(tmp_path, scheduler_record=False)
+    comments.append(_invalid_plan_scheduler_comment(_plan_subject(canonical)))
+    runner = _FakeRunner(
+        issue_comments=comments,
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Gemini")
+        ],
+    )
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=_staged_plan_config(tmp_path, max_rounds=6),
+        plan_first=True,
+    ) == 0
+
+    prelaunch = [
+        record
+        for record in _plan_round_records(runner)
+        if record.phase == "scheduler-prelaunch"
+        and record.scheduler_metadata_status == "valid"
+    ]
+    phases = [record.scheduler_phase for record in prelaunch]
+    # The invalid record degrades exactly one round, then the valid checkpoint
+    # it wrote becomes the recovery boundary and the run advances.
+    assert phases == ["primary", "secondary-audit"]
+    assert "strict pre-panel fallback:" in " ".join(prelaunch[0].scheduler_reasons)
+    assert "strict pre-panel fallback:" not in " ".join(prelaunch[1].scheduler_reasons)
+    # No planner turn was fabricated and no reviewer was invoked twice.
+    assert not any(cmd[0] == "claude" for cmd, _cwd in runner.commands)
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "codex") == 1
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "gemini") == 1
+
+
+def test_operator_opening_requires_a_complete_candidate_key(tmp_path):
+    """A partial-key record can never establish a qualified panel opening."""
+    from coding_review_agent_loop.round_state import PostedRoundRecord
+
+    partial = PlanCandidateKey(
+        subject="a" * 64,
+        aggregate_plan_identity="b" * 64,
+        execution_strategy_identity=None,
+        risk_test_matrix_identity="d" * 32,
+        surfaced_requirement_id_digest="e" * 16,
+    )
+    complete = replace(partial, execution_strategy_identity="c" * 32)
+
+    def _force_full_record(index, key):
+        return PostedRoundRecord(
+            index=index,
+            body="Plan review scheduling audit.",
+            metadata=PostedRoundMetadata(
+                flow="plan",
+                role="summary",
+                agent="Orchestrator",
+                round_number=1,
+                subject="a" * 64,
+                phase="scheduler-prelaunch",
+                scheduler_contract=orchestrator_module.make_plan_contract(
+                    ("Codex", "Gemini"), "primary-then-panel", "Codex"
+                ).as_dict(),
+                scheduler_obligation_digest="0" * 16,
+                scheduler_selected_reviewers=("Codex", "Gemini"),
+                scheduler_paused_reviewers=(),
+                scheduler_reasons=("operator force-full",),
+                scheduler_final_sweep=False,
+                scheduler_force_full=True,
+                scheduler_force_full_source="operator",
+                scheduler_calls_avoided=0,
+                scheduler_phase="full-board",
+                scheduler_primary_reviewer="Codex",
+                plan_candidate_key=key.as_dict(),
+            ),
+        )
+
+    partial_evidence = orchestrator_module._derive_plan_panel_evidence(
+        (_force_full_record(1, partial),),
+        primary_reviewer="Codex",
+        required_reviewers=("Codex", "Gemini"),
+    )
+    complete_evidence = orchestrator_module._derive_plan_panel_evidence(
+        (_force_full_record(1, complete),),
+        primary_reviewer="Codex",
+        required_reviewers=("Codex", "Gemini"),
+    )
+
+    assert partial_evidence.opened is False
+    assert complete_evidence.opened is True
+    assert complete_evidence.opening_source == "operator"

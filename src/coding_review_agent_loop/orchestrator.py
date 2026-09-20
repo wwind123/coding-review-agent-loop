@@ -8762,28 +8762,53 @@ def _run_plan_first_loop(
             )
             raise
 
-    if staged_planning:
-        for record in plan_history_records():
-            metadata = record.metadata
-            try:
-                persisted_contract = _plan_scheduler_contract_from_metadata(metadata)
-            except AgentLoopError:
-                persisted_contract = None
-            if persisted_contract is not None and persisted_contract != plan_scheduler_contract:
-                raise AgentLoopError(
-                    "Plan review scheduler contract changed during resume; the required "
-                    "reviewer board, the planning policy, and the primary plan reviewer "
-                    "must remain immutable for the run."
-                )
-            if (
-                metadata.scheduler_force_full
-                and metadata.scheduler_force_full_source == "operator"
-            ):
-                plan_operator_force_full = True
-            if metadata.scheduler_calls_avoided is not None:
-                plan_scheduler_calls_avoided = max(
-                    plan_scheduler_calls_avoided, metadata.scheduler_calls_avoided
-                )
+    def planning_contract_drift_records() -> tuple[PostedRoundRecord, ...]:
+        """Planning records inspected for an in-flight contract change.
+
+        Drift detection runs under *both* policies: restarting a run that
+        already persisted a staged planning contract with the compatibility
+        default would otherwise silently continue on a different contract.  The
+        default path keeps its historical behavior for an unreadable record set,
+        which ``_resume_plan_round`` already reports; only staged planning turns
+        that into the class-D diagnostic stop.
+        """
+        if staged_planning:
+            return plan_history_records()
+        try:
+            return _extract_round_metadata_records(issue_context.comments, flow="plan")
+        except AgentLoopError:
+            return ()
+
+    for record in planning_contract_drift_records():
+        metadata = record.metadata
+        try:
+            persisted_contract = _plan_scheduler_contract_from_metadata(metadata)
+        except AgentLoopError:
+            persisted_contract = None
+        if persisted_contract is not None and persisted_contract != plan_scheduler_contract:
+            raise AgentLoopError(
+                "Plan review scheduler contract changed during resume; the required "
+                "reviewer board, the planning policy, and the primary plan reviewer "
+                "must remain immutable for the run. This run is configured with "
+                f"--plan-review-policy {config.plan_review_policy} and primary "
+                f"{plan_primary_name or '(none)'}, but issue #{issue_number} already "
+                "carries a planning scheduler contract for policy "
+                f"{persisted_contract.policy} with primary "
+                f"{persisted_contract.primary_reviewer or '(none)'} and reviewer board "
+                f"{', '.join(persisted_contract.required_reviewers)}. Rerun with the "
+                "persisted planning policy, primary, and reviewer board."
+            )
+        if not staged_planning:
+            continue
+        if (
+            metadata.scheduler_force_full
+            and metadata.scheduler_force_full_source == "operator"
+        ):
+            plan_operator_force_full = True
+        if metadata.scheduler_calls_avoided is not None:
+            plan_scheduler_calls_avoided = max(
+                plan_scheduler_calls_avoided, metadata.scheduler_calls_avoided
+            )
     require_fresh_execution_contract = bool(
         getattr(config, "execution_strategy_contract_required", False)
     )
@@ -9150,8 +9175,18 @@ def _run_plan_first_loop(
                 and plan_previous_key.subject == current_plan_key.subject
                 and not plan_previous_key.matches(current_plan_key)
             )
+            # Degradation is scoped to the current recoverable boundary: the
+            # latest valid planning scheduler checkpoint.  An invalid record
+            # written before it is historical audit state that stays listed in
+            # the audit but must not pin every later round to the fallback
+            # forever, which would suppress each fresh exact-key primary
+            # approval until the round budget ran out.
+            recovery_boundary_index = (
+                latest_scheduler_record.index if latest_scheduler_record is not None else -1
+            )
             if any(
-                record.metadata.scheduler_metadata_status == "invalid"
+                record.index > recovery_boundary_index
+                and record.metadata.scheduler_metadata_status == "invalid"
                 for record in plan_records
             ):
                 plan_history_class = classify_plan_history("invalid")
@@ -9184,7 +9219,9 @@ def _run_plan_first_loop(
                 previous_key=plan_previous_key,
                 current_key=current_plan_key,
                 obligations=_scheduler_obligations(
-                    prior_unresolved_items, required_reviewers=plan_reviewer_names
+                    prior_unresolved_items,
+                    required_reviewers=plan_reviewer_names,
+                    active_statuses=frozenset({"blocking", "same-plan"}),
                 ),
                 force_full=plan_automatic_force_full,
                 force_full_source="automatic" if plan_automatic_force_full else None,
@@ -12194,11 +12231,20 @@ def _scheduler_obligations(
     items: Sequence[UnresolvedReviewItem],
     *,
     required_reviewers: Sequence[str] = (),
+    active_statuses: frozenset[str] = frozenset({"blocking", "same-pr"}),
 ) -> tuple[ReviewObligation, ...]:
+    """Build scheduler obligations from the canonical finding ledger.
+
+    ``active_statuses`` defaults to the PR statuses.  The planning flow retains
+    its follow-up findings as ``same-plan`` (#905, from #841), so it passes that
+    status instead; otherwise a post-panel narrow revision for a ``same-plan``
+    finding would lose its durable owner and the scheduler would fall through to
+    a final sweep instead of invoking that owner plus the primary.
+    """
     obligations: list[ReviewObligation] = []
     required = set(required_reviewers)
     for item in items:
-        if item.status not in {"blocking", "same-pr"}:
+        if item.status not in active_statuses:
             continue
         owners = item.resolution_owners or (item.reviewer,)
         raw_states = item.owner_states
@@ -12874,6 +12920,11 @@ def _derive_plan_panel_evidence(
             valid
             and metadata.scheduler_force_full
             and metadata.scheduler_force_full_source == "operator"
+            # Defensive: an operator opening is still bound to a complete
+            # generation-1 candidate key, so a partial-key record can never
+            # establish a qualified panel opening.
+            and record_key is not None
+            and record_key.complete
         ):
             opening, opening_source = record, "operator"
             break
@@ -12906,6 +12957,12 @@ def _derive_plan_panel_evidence(
         elif valid and metadata.scheduler_phase in PLAN_PANEL_OPENED_PHASES:
             artifacts.append(
                 f"{metadata.scheduler_phase} planning scheduler record "
+                f"(round {metadata.round_number}, plan {metadata.subject})"
+            )
+        elif metadata.scheduler_metadata_status == "invalid":
+            # Retained for audit even though it grants no phase authority.
+            artifacts.append(
+                "invalid planning scheduler record "
                 f"(round {metadata.round_number}, plan {metadata.subject})"
             )
         if valid and metadata.scheduler_force_full:
