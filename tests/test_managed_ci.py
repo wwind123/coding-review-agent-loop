@@ -76,6 +76,7 @@ from coding_review_agent_loop.orchestrator import (
     _render_ci_rerun_command,
     _stop_on_terminal_without_status,
 )
+from coding_review_agent_loop.protocol import UnresolvedReviewItem
 from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
 from coding_review_agent_loop.runner import CommandResult
 from coding_review_agent_loop.cli import build_parser
@@ -1272,6 +1273,64 @@ def test_continuity_publication_rejects_missing_correlated_round_metadata(tmp_pa
         publish_issue_created_continuity_authorization(
             runner, config=config, handoff=initial, predecessor_head="abc123",
             new_head="next-head", round_comment_ids=(initial.authorization_comment_id,),
+        )
+
+
+def _conflict_round_comment(comment_id, *, subject, round_number):
+    """A coder record carrying the tool-owned merge-conflict obligation."""
+    conflict = UnresolvedReviewItem(
+        item_id="item-merge-conflict",
+        reviewer="agent-loop",
+        source_round=round_number,
+        text="PR has a merge conflict with main.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="merge-conflict",
+        lifecycle="repair_required",
+    )
+    return {
+        "id": comment_id,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": _attach_round_metadata(
+            "coder round",
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="agent-loop",
+                round_number=round_number, subject=subject,
+                prior_items=(conflict,),
+            ),
+        ),
+    }
+
+
+def test_conflict_resolution_round_grants_continuity_without_a_reviewer_pair(tmp_path):
+    """#829: the orchestrator skips reviewers for a conflict round by design."""
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.append(
+        _conflict_round_comment(61, subject="merged-head", round_number=13)
+    )
+    config = make_config(tmp_path)
+
+    selected = managed_ci.find_actor_round_metadata_comment_ids(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        predecessor_head="abc123", new_head="merged-head", round_number=12,
+        after_comment_id=50,
+    )
+
+    assert selected == (61,)
+
+
+def test_head_advance_without_review_or_conflict_obligation_still_fails(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.append(
+        _round_comment(62, role="coder", subject="merged-head", round_number=13)
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+            predecessor_head="abc123", new_head="merged-head", round_number=12,
+            after_comment_id=50,
         )
 
 
