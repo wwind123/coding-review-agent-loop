@@ -231,7 +231,7 @@ def _resolved_runs(runs: list[object]) -> list[tuple[Mapping[str, object], str, 
     is not an object, carries an unknown flow, or names a policy foreign to
     that flow can never silently drop out of every report, and a wrong-typed
     or blank flow can never be coerced into the ``pr`` default.  Only an
-    absent or null ``flow`` defaults.
+    absent ``flow`` key defaults; an explicitly present null is rejected.
     """
     resolved: list[tuple[Mapping[str, object], str, str]] = []
     for index, run in enumerate(runs):
