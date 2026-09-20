@@ -555,7 +555,11 @@ def semantic_risk_claim_schema_text() -> str:
         "Every fact key ("
         + ", ".join(f"`{key}`" for key in SEMANTIC_RISK_CLAIM_FACT_KEYS)
         + ") must be present and non-empty for the row to verify; a missing, "
-        "null, or empty fact leaves the row unverified. `caveats` is optional. "
+        "null, or empty fact leaves the row unverified. Each fact list holds at "
+        f"most {RISK_MATRIX_MAX_LIST_ITEMS} items; a longer list keeps its "
+        f"first {RISK_MATRIX_MAX_LIST_ITEMS} entries and the row records a "
+        "caveat naming the loss, so split broader coverage across additional "
+        "approved rows instead of overflowing one list. `caveats` is optional. "
         "Complete example row: "
         + semantic_risk_claim_example_json()
     )
@@ -3139,24 +3143,18 @@ def _optional_semantic_fact_list(
     if value is None:
         return ()
     if isinstance(value, list) and len(value) > RISK_MATRIX_MAX_LIST_ITEMS:
-        kept = _risk_bounded_string_list(
-            value[:RISK_MATRIX_MAX_LIST_ITEMS], context=context
-        )
-        # Validate the discarded entries too, so a malformed tail is still a
+        # Validate the complete list before truncating, so a malformed or
+        # repeated entry anywhere -- including in the discarded tail -- stays a
         # defect rather than something truncation can hide.
-        _risk_bounded_string_list(
-            value[RISK_MATRIX_MAX_LIST_ITEMS:],
-            context=context,
-            max_items=len(value) - RISK_MATRIX_MAX_LIST_ITEMS,
-        )
-        if len(set(kept)) != len(kept):
+        rendered = _risk_bounded_string_list(value, context=context, max_items=len(value))
+        if len(set(rendered)) != len(rendered):
             raise AgentLoopError(f"{context} contains duplicate items.")
         if dropped is not None:
             dropped.append(
-                f"{context} listed {len(value)} items; the first "
+                f"{context} listed {len(rendered)} items; the first "
                 f"{RISK_MATRIX_MAX_LIST_ITEMS} are retained."
             )
-        return kept
+        return rendered[:RISK_MATRIX_MAX_LIST_ITEMS]
     rendered = _risk_bounded_string_list(value, context=context)
     if len(set(rendered)) != len(rendered):
         raise AgentLoopError(f"{context} contains duplicate items.")
@@ -3215,6 +3213,15 @@ def _dropped_execution_refs_caveat(dropped_refs: Sequence[str]) -> str:
             return _truncate_utf8(text, budget)
         parts.append(f"`{_dropped_ref_preview(ref)}`")
     return _truncate_utf8(prefix + ", ".join(parts) + ".", budget)
+
+
+def _truncated_fact_lists_caveat(entries: Sequence[str]) -> str:
+    """Name every truncated fact list in one bounded caveat (#913)."""
+    prefix = (
+        "Truncated over-long semantic fact lists to the "
+        f"{RISK_MATRIX_MAX_LIST_ITEMS}-item bound: "
+    )
+    return _truncate_utf8(prefix + " ".join(entries), SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES)
 
 
 def _parse_semantic_risk_coverage_claims(
@@ -3371,14 +3378,17 @@ def _parse_semantic_risk_coverage_claims(
             context=f"{claim_context}.caveats",
             max_items=SEMANTIC_RISK_CLAIMS_MAX_CAVEATS,
         )
+        bookkeeping: list[str] = []
         if dropped_refs:
-            caveats = (
-                *caveats[: SEMANTIC_RISK_CLAIMS_MAX_CAVEATS - 1],
-                _dropped_execution_refs_caveat(dropped_refs),
-            )
-        for truncation in truncated_facts:
-            # Keep the row's own caveats ahead of the bookkeeping ones (#913).
-            caveats = (*caveats[: SEMANTIC_RISK_CLAIMS_MAX_CAVEATS - 1], truncation)
+            bookkeeping.append(_dropped_execution_refs_caveat(dropped_refs))
+        if truncated_facts:
+            bookkeeping.append(_truncated_fact_lists_caveat(truncated_facts))
+        if bookkeeping:
+            # Reserve room for every bookkeeping caveat at once, so neither one
+            # overwrites the other and accepted content loss stays disclosed
+            # (#913).  The row's own caveats keep the remaining slots.
+            keep = max(SEMANTIC_RISK_CLAIMS_MAX_CAVEATS - len(bookkeeping), 0)
+            caveats = (*caveats[:keep], *bookkeeping)
         claim = SemanticRiskCoverageClaim(
             row_id=row_id,
             execution_refs=tuple(admissible_refs),
