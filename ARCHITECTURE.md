@@ -330,7 +330,12 @@ round number, and runs the secondary panel (later the final sweep) against a
 byte-identical candidate plan with no planner turn. Resume anchors on the latest
 coder record and the highest round number for that plan subject, so a round with
 a phase-advance record and no coder record is a legitimate reviewer-only round
-and never synthesizes a planner turn. Because each advance costs a round, staged
+and never synthesizes a planner turn. A planning round counts as reconciled only
+when it holds an actual reconciliation record: the `scheduler-prelaunch` and
+`plan-phase-advance` summaries are pre-reviewer checkpoints, so an interruption
+at either one resumes as an unsettled round that still reconstructs each
+published reviewer's numbered items, owners, and obligations. Because each
+advance costs a round, staged
 planning consumes strictly more rounds than full-board planning, and exhausting
 `--max-rounds` during a pending advance is reported distinctly from reviewer
 blocking issues.

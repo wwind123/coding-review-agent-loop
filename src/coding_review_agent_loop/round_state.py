@@ -2505,6 +2505,31 @@ def _select_current_round_records(
     )
 
 
+# Planning summary records that are posted *before* reviewer reconciliation.
+# Staged planning writes a `scheduler-prelaunch` record at the top of every
+# round and a `plan-phase-advance` record before a reviewer-only round, so an
+# interruption at either checkpoint must not be read as a settled round
+# (#905, from #841).
+PRE_RECONCILIATION_PLAN_SUMMARY_PHASES = frozenset(
+    {"scheduler-prelaunch", "plan-phase-advance"}
+)
+
+
+def _plan_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
+    """True when the round holds an actual planning reconciliation checkpoint.
+
+    The reconciliation record carries `phase="reconciliation"`.  A legacy
+    summary record written before the phase labels existed carries the default
+    `authoritative` phase and still counts, so historical rounds resume exactly
+    as they did before staged planning existed.
+    """
+    return any(
+        record.metadata.role == "summary"
+        and record.metadata.phase not in PRE_RECONCILIATION_PLAN_SUMMARY_PHASES
+        for record in records
+    )
+
+
 def _max_unresolved_item_number_from_records(records: Sequence[PostedRoundRecord]) -> int:
     max_number = 0
     for record in records:
@@ -3607,7 +3632,7 @@ def _resume_plan_round(
             + 1,
             ledger_may_be_incomplete=ledger_may_be_incomplete,
             compact_prior_summaries=latest_coder_record.metadata.compact_prior_summaries,
-            reconciled=any(record.metadata.role == "summary" for record in current_round_records),
+            reconciled=_plan_round_is_reconciled(current_round_records),
             coder_metadata=latest_coder_record.metadata,
             local_test_evidence=latest_coder_record.metadata.local_test_evidence,
             current_round_new_items=tuple(settled_new_items),

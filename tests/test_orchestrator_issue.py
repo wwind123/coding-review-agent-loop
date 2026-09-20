@@ -8909,16 +8909,16 @@ def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path
         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
     )
 
-    with pytest.raises(AgentLoopError) as excinfo:
-        run_issue_loop(
-            runner,
-            issue_number=56,
-            config=_staged_plan_config(tmp_path, plan_review_force_full=True, max_rounds=1),
-            plan_first=True,
-        )
+    # The override selects the complete board rather than stopping with the
+    # planning diagnostic, and the superseded review establishes no obligation,
+    # so the freshly invoked board settles the round.
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=_staged_plan_config(tmp_path, plan_review_force_full=True, max_rounds=1),
+        plan_first=True,
+    ) == 0
 
-    # The override selects the complete board rather than stopping.
-    assert not isinstance(excinfo.value, orchestrator_module.PlanPrePanelSafetyError)
     prelaunch = [
         record for record in _plan_round_records(runner) if record.phase == "scheduler-prelaunch"
     ]
@@ -8932,8 +8932,15 @@ def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path
         decision.scheduler_reasons
     )
     # The superseded review establishes no approval and no ownership: the same
-    # secondary is freshly invoked.
+    # secondary is freshly invoked, and its earlier blocking claim never
+    # becomes a durable obligation that outlives the override.
     assert any(cmd[0] == "gemini" for cmd, _cwd in runner.commands)
+    fresh_reviews = [
+        record
+        for record in _plan_round_records(runner)
+        if record.role == "reviewer" and not record.new_items
+    ]
+    assert {record.agent for record in fresh_reviews} == {"Codex", "Gemini"}
 
 
 def test_staged_planning_stops_when_planning_history_cannot_be_extracted(tmp_path):
