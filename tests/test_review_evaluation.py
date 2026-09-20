@@ -651,6 +651,15 @@ def test_direct_evaluation_rejects_a_policy_foreign_to_its_flow_instead_of_dropp
     assert pr_report["flows"]["pr"]["policies"]["selective-intermediate"]["run_count"] == 1
 
 
+@pytest.mark.parametrize("entry", ["oops", 3, None, ["run"], True])
+def test_direct_evaluation_rejects_a_non_object_run_instead_of_dropping_it(entry):
+    # The loading path already fails closed on a non-object run; the direct
+    # path must too, or the entry contributes to no flow run_count, no policy
+    # row, and no diagnostic.
+    with pytest.raises(AgentLoopError, match="must be an object"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [_run(), entry]})
+
+
 def test_every_counted_run_belongs_to_exactly_one_policy_row_of_its_flow():
     report = evaluate_frozen_artifacts(
         {

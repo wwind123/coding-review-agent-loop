@@ -213,19 +213,20 @@ def _run_policy(value: object, flow: str, label: str) -> str:
     return policy
 
 
-def _resolved_runs(
-    runs: list[Mapping[str, object]],
-) -> list[tuple[Mapping[str, object], str, str]]:
+def _resolved_runs(runs: list[object]) -> list[tuple[Mapping[str, object], str, str]]:
     """Pair each run with its validated flow and policy, failing closed.
 
-    Every path that partitions runs resolves both values here, so an unknown
-    flow or a policy foreign to that flow can never silently drop a run from
-    every report, and a wrong-typed or blank flow can never be coerced into
-    the ``pr`` default.  Only an absent or null ``flow`` defaults.
+    Every path that partitions runs resolves both values here, so a run that
+    is not an object, carries an unknown flow, or names a policy foreign to
+    that flow can never silently drop out of every report, and a wrong-typed
+    or blank flow can never be coerced into the ``pr`` default.  Only an
+    absent or null ``flow`` defaults.
     """
     resolved: list[tuple[Mapping[str, object], str, str]] = []
     for index, run in enumerate(runs):
         label = f"run {index}"
+        if not isinstance(run, dict):
+            raise AgentLoopError(f"Frozen evaluation {label} must be an object.")
         flow = _run_flow(run.get("flow"), label)
         resolved.append((run, flow, _run_policy(run.get("policy"), flow, label)))
     return resolved
@@ -552,11 +553,12 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
     runs = artifacts.get("runs")
     if not isinstance(runs, list):
         raise AgentLoopError("Validated frozen artifacts require a runs array.")
-    # Resolve and validate every run's flow and policy once, before duplicate
-    # detection and partitioning, so direct evaluation of an unvalidated
-    # artifact fails closed exactly as loading does and no run can be counted
-    # in a flow while belonging to none of that flow's policy rows.
-    resolved = _resolved_runs([run for run in runs if isinstance(run, dict)])
+    # Resolve and validate every run's shape, flow, and policy once, before
+    # duplicate detection and partitioning, so direct evaluation of an
+    # unvalidated artifact fails closed exactly as loading does and no run can
+    # be dropped from every report or counted in a flow while belonging to
+    # none of that flow's policy rows.
+    resolved = _resolved_runs(list(runs))
     _reject_duplicate_runs([run for run, _, _ in resolved])
     canonical = json.dumps(dict(artifacts), separators=(",", ":"), sort_keys=True, ensure_ascii=False)
     report: dict[str, object] = {
