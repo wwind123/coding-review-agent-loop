@@ -6,6 +6,7 @@ import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
+from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
     PlanPhase,
@@ -189,7 +190,7 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
 
     def fake_decompose(*_args, **kwargs):
         events.append("decompose")
-        return (
+        created = (
             CreatedPhaseIssue(
                     phase=PlanPhase(
                         title="Intermediate behavior",
@@ -215,6 +216,14 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
                 issue_url="https://github.com/OWNER/REPO/issues/101",
                 issue_number=101,
             ),
+        )
+        return StagedTopologyOutcome(
+            created=created,
+            stage_ids=("stage-1",),
+            automations=("agent-pr",),
+            plan_hash=kwargs["approved_plan"] and approved_plan_hash(kwargs["approved_plan"]),
+            mode=kwargs["mode"],
+            topology_source="approved-plan-v1",
         )
 
     def fake_implement(*_args, **kwargs):
@@ -245,7 +254,17 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         )
         assert f"requested policy `{execution_mode}`" in output
         assert f"resolved action `{expected_action}`" in output
-        assert "Remaining child work:" in output
+        if expected_action == "implement-by-phase":
+            # The staged dispatch path replaces the static remaining-topology
+            # line with resolved per-phase progress (#918).
+            assert "Remaining child work:" not in output
+            assert "staged child work:" in output
+        else:
+            assert "Remaining child work:" in output
+        if expected_action == "decompose-only":
+            # `decompose-only` never enters the phase dispatcher, so its
+            # topology-only stage listing is unchanged (#918).
+            assert "Remaining child work after the first phase:" in output
         assert runner.issues == []
         assert not any("AGENT_PLAN_TOPOLOGY_CHECKPOINT" in comment for comment in runner.comments)
         assert not any("AGENT_DISCUSS_SPLIT" in comment for comment in runner.comments)

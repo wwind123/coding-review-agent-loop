@@ -82,7 +82,9 @@ from coding_review_agent_loop.comment_rendering import (
 )
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
+    PlanPhase,
     RecordedPhase,
+    RetainedParentScope,
     approved_plan_hash,
     find_existing_phase_implementation_handoff,
     format_decomposition_parent_summary,
@@ -160,6 +162,7 @@ from coding_review_agent_loop.prompts import (
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     DiscussEvidenceClaim,
+    ExecutionAllocation,
     _expect_string_list,
     _extract_structured_coder_followup_payload,
     _extract_structured_plan_review_payload,
@@ -188,6 +191,7 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
     validate_structured_plan_revision,
 )
+from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.workdir_guard import (
     extract_reported_tests_from_response,
     validate_checkout_inspected_evidence,
@@ -258,6 +262,11 @@ class FakeRunner(Runner):
         pr_commit_pages=None,
         pr_commit_metadata_payloads=None,
         pr_commit_query_failures=None,
+        issue_payloads_by_number=None,
+        issue_comments_by_number=None,
+        pr_payloads_by_number=None,
+        malformed_issue_view_numbers=None,
+        malformed_pr_view_numbers=None,
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -290,6 +299,29 @@ class FakeRunner(Runner):
         }
         if pr_payload:
             self.pr_payload.update(pr_payload)
+        # Per-number overrides (#918): a staged parent and its children must be
+        # able to present distinct issue states, comment sets and PR states in
+        # one run.  Absent an entry the single-payload behavior is unchanged.
+        self.issue_payloads_by_number = {
+            int(number): dict(payload)
+            for number, payload in (issue_payloads_by_number or {}).items()
+        }
+        self.issue_comments_by_number = {
+            int(number): list(comments)
+            for number, comments in (issue_comments_by_number or {}).items()
+        }
+        self.pr_payloads_by_number = {
+            int(number): dict(payload)
+            for number, payload in (pr_payloads_by_number or {}).items()
+        }
+        # Unreadable `gh ... view --json` output for a specific number, so a
+        # caller's fail-closed boundary can be exercised (#918).
+        self.malformed_issue_view_numbers = {
+            int(number) for number in (malformed_issue_view_numbers or ())
+        }
+        self.malformed_pr_view_numbers = {
+            int(number) for number in (malformed_pr_view_numbers or ())
+        }
         self.pr_check_runs_payload = pr_check_runs_payload or {
             "check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]
         }
@@ -836,6 +868,41 @@ class FakeRunner(Runner):
 
         return self.run(args, cwd=cwd, check=check)
 
+    @staticmethod
+    def _requested_number(raw):
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _issue_payload_for(self, number):
+        """Return the issue projection for `number`, defaulting to today's payload.
+
+        The default payload's own number is rewritten to the requested issue so
+        the shared fail-closed reader sees a faithful response.
+        """
+        payload = dict(self.issue_payload)
+        if number is not None and number in self.issue_payloads_by_number:
+            payload.update(self.issue_payloads_by_number[number])
+        if number is not None:
+            payload.setdefault("url", f"https://github.com/OWNER/REPO/issues/{number}")
+            payload["number"] = number
+        return payload
+
+    def _issue_comments_for(self, number):
+        if number is not None and number in self.issue_comments_by_number:
+            return self.issue_comments_by_number[number]
+        return self.issue_comments
+
+    def _pr_payload_for(self, raw):
+        number = self._requested_number(raw)
+        if number is not None and number in self.pr_payloads_by_number:
+            payload = dict(self.pr_payload)
+            payload.update(self.pr_payloads_by_number[number])
+            payload["number"] = number
+            return payload
+        return self.pr_payload
+
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         with self._scripted_lock:
             cmd = [str(arg) for arg in args]
@@ -1031,15 +1098,19 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
 
         if cmd[:3] == ["gh", "pr", "view"]:
+            requested_pr = self._requested_number(cmd[3] if len(cmd) > 3 else None)
+            if requested_pr in self.malformed_pr_view_numbers:
+                return CommandResult(cmd, cwd_path, "not json at all", "", 0)
+            payload = self._pr_payload_for(cmd[3] if len(cmd) > 3 else None)
             if "--jq" in cmd and ".headRefOid" in cmd:
                 return CommandResult(
                     cmd,
                     cwd_path,
-                    f"{self.pr_payload.get('headRefOid', 'abc123')}\n",
+                    f"{payload.get('headRefOid', 'abc123')}\n",
                     "",
                     0,
                 )
-            return CommandResult(cmd, cwd_path, json_dumps(self.pr_payload), "", 0)
+            return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
 
         if cmd[:3] == ["gh", "repo", "view"] and "defaultBranchRef" in cmd:
             stdout = (
@@ -1056,19 +1127,27 @@ class FakeRunner(Runner):
             )
 
         if cmd[:3] == ["gh", "issue", "view"]:
+            number = self._requested_number(cmd[3] if len(cmd) > 3 else None)
+            if number in self.malformed_issue_view_numbers:
+                return CommandResult(cmd, cwd_path, "not json at all", "", 0)
+            source = self._issue_payload_for(number)
             payload = {
-                "number": self.issue_payload.get("number", 56),
-                "title": self.issue_payload.get("title"),
-                "body": self.issue_payload.get("body"),
-                "url": self.issue_payload.get("url"),
-                "author": self.issue_payload.get("author"),
-                "createdAt": self.issue_payload.get("createdAt"),
-                "comments": self.issue_comments,
+                "number": source.get("number", 56),
+                "title": source.get("title"),
+                "body": source.get("body"),
+                "url": source.get("url"),
+                "author": source.get("author"),
+                "createdAt": source.get("createdAt"),
+                "comments": self._issue_comments_for(number),
             }
             return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
 
         if cmd[:2] == ["gh", "api"] and "/issues/" in cmd[2]:
-            return CommandResult(cmd, cwd_path, json_dumps(self.issue_payload), "", 0)
+            match = re.search(r"/issues/(\d+)", cmd[2])
+            number = int(match.group(1)) if match else None
+            return CommandResult(
+                cmd, cwd_path, json_dumps(self._issue_payload_for(number)), "", 0
+            )
 
         if cmd[:3] == ["gh", "api", "graphql"]:
             self.pr_commit_calls += 1
@@ -1730,3 +1809,159 @@ def plan_decomposition_json(*phases):
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]
+
+
+# --- Staged (implement-by-phase) parent fixtures (#918) --------------------
+
+def staged_legacy_plan_records(*, stage_count=3, automations=None):
+    """A legacy (non-v1) implement-by-phase topology with `stage_count` children."""
+    plan = structured_plan_state(summary="Deliver the staged contracts.")
+    automations = automations or ("agent-pr",) * stage_count
+    created = tuple(
+        CreatedPhaseIssue(
+            phase=RecordedPhase(title=f"Stage {index}", automation=automations[index - 1]),
+            issue_url=f"https://github.com/OWNER/REPO/issues/{98 + index}",
+            issue_number=98 + index,
+        )
+        for index in range(1, stage_count + 1)
+    )
+    summary = format_decomposition_parent_summary(
+        parent_issue=56,
+        mode="implement-by-phase",
+        plan_hash=approved_plan_hash(plan),
+        created=created,
+    )
+    return plan, created, summary
+
+
+def staged_v1_recorded_plan_records(*, stage_count=2, automations=None):
+    """A recorded `approved-plan-v1` summary consumed on the legacy path.
+
+    The summary records stage ids and parent obligations (which only the v1
+    source serializes), while the run itself carries no live v1 recommendation,
+    so the dispatcher takes the legacy branch over recorded identities.
+    """
+    plan = structured_plan_state(summary="Deliver the recorded staged contracts.")
+    automations = automations or ("agent-pr",) * stage_count
+    created = tuple(
+        CreatedPhaseIssue(
+            phase=PlanPhase(
+                title=f"Stage {index}",
+                scope="Deliver the contract.",
+                non_goals="None.",
+                dependency_notes="None.",
+                rollout_risk="low",
+                validation="Tests pass.",
+                parent_context="Parent context.",
+                automation=automations[index - 1],
+                stage_id=f"recorded-stage-{index}",
+                position=index,
+                deliverables=("A deliverable.",),
+                non_goals_items=("No unrelated change.",),
+                acceptance_criteria=("It passes.",),
+                compatibility_constraints=("Preserve callers.",),
+                covered_scope_item_ids=(f"scope-{index}",),
+                execution_disposition="direct-implementation",
+                disposition_rationale="Reviewed route.",
+            ),
+            issue_url=f"https://github.com/OWNER/REPO/issues/{98 + index}",
+            issue_number=98 + index,
+        )
+        for index in range(1, stage_count + 1)
+    )
+    plan_hash = approved_plan_hash(plan)
+    summary = format_decomposition_parent_summary(
+        parent_issue=56,
+        mode="implement-by-phase",
+        plan_hash=plan_hash,
+        created=created,
+        topology_source="approved-plan-v1",
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="recorded-subject",
+            plan_hash=plan_hash,
+            excerpt="Keep the rollout note on the parent.",
+            status="required",
+            deliverables=("The recorded rollout note.",),
+            acceptance_criteria=("The recorded rollout note is published.",),
+        ),
+        final_integration_work=ExecutionAllocation(
+            status="required",
+            deliverables=("Wire the recorded stages together.",),
+            acceptance_criteria=("The recorded end-to-end behavior passes.",),
+            covered_scope_item_ids=("scope-final",),
+        ),
+        strategy="staged",
+        execution_strategy_contract_version=1,
+        recommendation_digest="d" * 64,
+        plan_subject="recorded-subject",
+    )
+    return plan, created, summary
+
+
+def approved_plan_comments(plan):
+    return [
+        {
+            "author": {"login": "bot"},
+            "createdAt": "2026-09-20T00:00:00Z",
+            "body": _attach_round_metadata(
+                plan,
+                PostedRoundMetadata(
+                    flow="plan", role="coder", agent="Claude", round_number=1,
+                    subject=_plan_subject(plan),
+                ),
+            ),
+        },
+        {
+            "author": {"login": "bot"},
+            "createdAt": "2026-09-20T00:00:01Z",
+            "body": _attach_round_metadata(
+                "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+                PostedRoundMetadata(
+                    flow="plan", role="reviewer", agent="Codex", round_number=1,
+                    subject=_plan_subject(plan), state="approved",
+                ),
+            ),
+        },
+    ]
+
+
+def phase_handoff_comment(plan, created, phase_index):
+    return {
+        "author": {"login": "bot"},
+        "createdAt": f"2026-09-20T00:01:0{phase_index}Z",
+        "body": format_phase_implementation_handoff_comment(
+            parent_issue=56,
+            mode="implement-by-phase",
+            plan_hash=approved_plan_hash(plan),
+            phase_index=phase_index,
+            created=created[phase_index - 1],
+        ),
+    }
+
+
+def child_pr_handoff_comment(issue_number, pr_number):
+    return {
+        "author": {"login": "bot"},
+        "createdAt": "2026-09-20T00:02:00Z",
+        "body": format_issue_pr_handoff_comment(
+            issue_number=issue_number,
+            pr_number=pr_number,
+            pr_url=f"https://github.com/OWNER/REPO/pull/{pr_number}",
+            pr_head_sha="abc123",
+            flow="issue-implementation",
+            plan_hash=None,
+        ),
+    }
+
+
+def pr_payload_for_state(pr_number, state):
+    return {
+        "number": pr_number,
+        "state": state,
+        "url": f"https://github.com/OWNER/REPO/pull/{pr_number}",
+        "headRefOid": "abc123",
+        "comments": [],
+        "reviews": [],
+    }
+
+

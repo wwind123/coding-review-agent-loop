@@ -325,6 +325,102 @@ def find_latest_issue_pr_handoff(
     return found
 
 
+@dataclass(frozen=True)
+class AuthenticatedCanonicalPr:
+    """A canonical issue-to-PR handoff whose identity and contract are verified.
+
+    Identity, URL, and closing-contract authentication are separated here
+    from the `OPEN`-only gate that resume applies, so a staged parent can
+    authenticate a *merged* child PR as completion evidence with exactly the
+    same checks resume uses.
+    """
+
+    record: IssuePrHandoffMetadata
+    state: str
+
+    @property
+    def pr_number(self) -> int:
+        return self.record.pr_number
+
+    @property
+    def pr_url(self) -> str:
+        return self.record.pr_url
+
+
+def authenticate_canonical_issue_pr(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    issue_context: IssueContext,
+) -> AuthenticatedCanonicalPr | None:
+    """Authenticate the canonical PR recorded for an issue, whatever its state.
+
+    Returns ``None`` when the issue carries no canonical
+    `AGENT_ISSUE_PR_HANDOFF` record. Otherwise the recorded PR number, URL and
+    expected-closing contract are reconciled against live GitHub state and the
+    live PR state is returned; any mismatch raises, so an unauthenticatable
+    record can never be read as evidence.
+    """
+    canonical = find_latest_issue_pr_handoff(
+        issue_context.comments, issue_number=issue_number, repo=config.repo
+    )
+    if canonical is None:
+        return None
+    try:
+        pr_context = get_pr_review_context(
+            runner, config=config, pr_number=canonical.pr_number
+        )
+        actual = pr_context.metadata
+        if actual.number != canonical.pr_number:
+            raise AgentLoopError(
+                f"GitHub returned PR #{actual.number} for canonical PR "
+                f"#{canonical.pr_number}."
+            )
+        if not actual.url:
+            raise AgentLoopError("GitHub returned no PR URL.")
+        _validate_issue_pr_handoff_url(
+            actual.url, repo=config.repo, pr_number=canonical.pr_number
+        )
+        if actual.url.casefold() != canonical.pr_url.casefold():
+            raise AgentLoopError(
+                f"recorded URL {canonical.pr_url!r} does not match GitHub URL "
+                f"{actual.url!r}"
+            )
+        pr_contract = find_latest_pr_contract(
+            pr_context.comments,
+            repository=config.repo,
+            pr_number=canonical.pr_number,
+        )
+        if pr_contract is not None and tuple(pr_contract.expected_closing_issue_ids) != tuple(
+            canonical.expected_closing_issue_ids
+        ):
+            raise AgentLoopError(
+                "issue-side and PR-side expected closing contracts diverge: "
+                f"issue side {canonical.expected_closing_issue_ids!r}, PR side "
+                f"{pr_contract.expected_closing_issue_ids!r}."
+            )
+        if pr_contract is not None and (
+            pr_contract.primary_issue_number != canonical.issue_number
+            or pr_contract.origin_flow != canonical.flow
+            or pr_contract.contract_hash != canonical.contract_hash
+            or pr_contract.supersedes_hash != canonical.supersedes_hash
+        ):
+            raise AgentLoopError(
+                "issue-side and PR-side expected closing contract metadata diverge: "
+                "primary issue, origin flow, hash, or supersession lineage differs."
+            )
+        state = get_pr_state(runner, config=config, pr_number=canonical.pr_number)
+    except AgentLoopError as exc:
+        raise AgentLoopError(
+            f"Canonical handoff record for issue #{issue_number} references PR "
+            f"#{canonical.pr_number}, but its state could not be determined in {config.repo} "
+            f"({exc}). Verify the PR exists and rerun `agent-loop pr {canonical.pr_number}` "
+            "directly to continue, or close/select the correct duplicate."
+        ) from exc
+    return AuthenticatedCanonicalPr(record=canonical, state=state)
+
+
 def resolve_canonical_pr_for_issue(
     runner: Runner,
     *,
@@ -343,70 +439,19 @@ def resolve_canonical_pr_for_issue(
     """
     if config.dry_run:
         return None
-    canonical = find_latest_issue_pr_handoff(
-        issue_context.comments, issue_number=issue_number, repo=config.repo
+    authenticated = authenticate_canonical_issue_pr(
+        runner, config=config, issue_number=issue_number, issue_context=issue_context
     )
-    if canonical is not None:
-        try:
-            pr_context = get_pr_review_context(
-                runner, config=config, pr_number=canonical.pr_number
-            )
-            actual = pr_context.metadata
-            if actual.number != canonical.pr_number:
-                raise AgentLoopError(
-                    f"GitHub returned PR #{actual.number} for canonical PR "
-                    f"#{canonical.pr_number}."
-                )
-            if not actual.url:
-                raise AgentLoopError("GitHub returned no PR URL.")
-            _validate_issue_pr_handoff_url(
-                actual.url, repo=config.repo, pr_number=canonical.pr_number
-            )
-            if actual.url.casefold() != canonical.pr_url.casefold():
-                raise AgentLoopError(
-                    f"recorded URL {canonical.pr_url!r} does not match GitHub URL "
-                    f"{actual.url!r}"
-                )
-            pr_contract = find_latest_pr_contract(
-                pr_context.comments,
-                repository=config.repo,
-                pr_number=canonical.pr_number,
-            )
-            if pr_contract is not None and tuple(pr_contract.expected_closing_issue_ids) != tuple(
-                canonical.expected_closing_issue_ids
-            ):
-                raise AgentLoopError(
-                    "issue-side and PR-side expected closing contracts diverge: "
-                    f"issue side {canonical.expected_closing_issue_ids!r}, PR side "
-                    f"{pr_contract.expected_closing_issue_ids!r}."
-                )
-            if pr_contract is not None and (
-                pr_contract.primary_issue_number != canonical.issue_number
-                or pr_contract.origin_flow != canonical.flow
-                or pr_contract.contract_hash != canonical.contract_hash
-                or pr_contract.supersedes_hash != canonical.supersedes_hash
-            ):
-                raise AgentLoopError(
-                    "issue-side and PR-side expected closing contract metadata diverge: "
-                    "primary issue, origin flow, hash, or supersession lineage differs."
-                )
-            state = get_pr_state(runner, config=config, pr_number=canonical.pr_number)
-        except AgentLoopError as exc:
+    if authenticated is not None:
+        if authenticated.state != "OPEN":
             raise AgentLoopError(
                 f"Canonical handoff record for issue #{issue_number} references PR "
-                f"#{canonical.pr_number}, but its state could not be determined in {config.repo} "
-                f"({exc}). Verify the PR exists and rerun `agent-loop pr {canonical.pr_number}` "
-                "directly to continue, or close/select the correct duplicate."
-            ) from exc
-        if state != "OPEN":
-            raise AgentLoopError(
-                f"Canonical handoff record for issue #{issue_number} references PR "
-                f"#{canonical.pr_number}, which is {state}, not OPEN. Rerun "
-                f"`agent-loop pr {canonical.pr_number}` directly if that PR should still be "
+                f"#{authenticated.pr_number}, which is {authenticated.state}, not OPEN. Rerun "
+                f"`agent-loop pr {authenticated.pr_number}` directly if that PR should still be "
                 "reviewed, or close/select the correct duplicate before rerunning the issue."
             )
         return ResolvedIssuePr(
-            pr_number=canonical.pr_number, source="canonical", evidence=canonical
+            pr_number=authenticated.pr_number, source="canonical", evidence=authenticated.record
         )
     if expected_fallback_scope is _UNSET_FALLBACK_SCOPE:
         expected_fallback_scope = IssuePrProvenanceScope(

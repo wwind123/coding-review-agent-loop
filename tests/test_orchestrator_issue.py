@@ -8,6 +8,8 @@ from unittest.mock import patch
 import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator_module
+import coding_review_agent_loop.phase_progress as phase_progress_module
+from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.comment_rendering import (
     _render_public_issue_implementation_comment,
@@ -19,6 +21,7 @@ from coding_review_agent_loop.decomposition import (
     PhaseImplementationHandoffMetadata,
     PlanPhase,
     RecordedPhase,
+    RetainedParentScope,
     approved_plan_hash,
     format_decomposition_parent_summary,
     format_one_shot_impl_handoff_comment,
@@ -33,6 +36,7 @@ from coding_review_agent_loop.github import (
     IssueComment,
     IssueContext,
     get_issue_context,
+    get_issue_state,
 )
 from coding_review_agent_loop.managed_ci import (
     AuthenticatedIssueCreatedHandoff,
@@ -74,6 +78,7 @@ import coding_review_agent_loop.test_runtime as runtime
 from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE, TrustedBody
 from coding_review_agent_loop.protocol import (
     EXECUTION_DISPOSITION_DIRECT,
+    ExecutionAllocation,
     EXECUTION_DISPOSITION_PLANNING,
     ApprovedFollowup,
     ParsedPlanReview,
@@ -248,11 +253,25 @@ def test_parent_rerun_resume_hint_follows_recorded_disposition(
         orchestrator_module, "find_existing_phase_implementation_handoff",
         lambda *_args, **_kwargs: handoff,
     )
-    result = orchestrator_module._dispatch_first_decomposition_phase(
+    monkeypatch.setattr(
+        phase_progress_module, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    monkeypatch.setattr(
+        phase_progress_module,
+        "find_phase_implementation_handoffs_for_parent",
+        lambda *_args, **_kwargs: (handoff,),
+    )
+    result = orchestrator_module._dispatch_current_decomposition_phase(
         _FakeRunner(), config=make_config(tmp_path), memory=None,
         usage_context=SimpleNamespace(), issue_number=55,
         current_plan="Approved parent plan", plan_subject="plan-subject",
-        created=(fresh.created,), recommendation=fresh.recommendation,
+        outcome=StagedTopologyOutcome(
+            created=(fresh.created,), stage_ids=("stage-one",),
+            automations=("agent-pr",), plan_hash="plan-hash",
+            mode="implement-by-phase", topology_source="approved-plan-v1",
+        ),
+        recommendation=fresh.recommendation,
         approved_plan_context=fresh.parent_plan_context, issue_context=parent,
         mode="implement-by-phase", coder_session_id=None,
     )
@@ -268,8 +287,10 @@ from coding_review_agent_loop.runner import CommandResult
 from coding_review_agent_loop.plan_assembly import AuthenticatedPlanState
 from agent_loop_helpers import (
     FakeRunner as _FakeRunner,
+    child_pr_handoff_comment,
     command_index,
     make_config,
+    pr_payload_for_state,
     prior_item_dispositions,
     prior_plan_item_dispositions,
     structured_plan_review,
@@ -9849,3 +9870,239 @@ def test_operator_opening_requires_a_complete_candidate_key(tmp_path):
     assert partial_evidence.opened is False
     assert complete_evidence.opened is True
     assert complete_evidence.opening_source == "operator"
+
+
+# --- Staged parent terminal state and human stages (#918) -----------------
+
+
+def _staged_created(automations):
+    return tuple(
+        CreatedPhaseIssue(
+            phase=RecordedPhase(title=f"Stage {index}", automation=automation),
+            issue_url=f"https://github.com/OWNER/REPO/issues/{98 + index}",
+            issue_number=98 + index,
+        )
+        for index, automation in enumerate(automations, start=1)
+    )
+
+
+def _staged_outcome(created, *, retained=None, final=None, plan_hash="staged-plan-hash"):
+    return StagedTopologyOutcome(
+        created=created,
+        stage_ids=tuple(f"stage-{index}" for index in range(1, len(created) + 1)),
+        automations=tuple(item.phase.automation for item in created),
+        plan_hash=plan_hash,
+        mode="implement-by-phase",
+        topology_source="model",
+        retained_parent_scope=retained,
+        final_integration_work=final,
+    )
+
+
+def _staged_handoff(phase_index, child_issue_number, *, plan_hash="staged-plan-hash"):
+    return PhaseImplementationHandoffMetadata(
+        parent_issue=55,
+        plan_hash=plan_hash,
+        mode="implement-by-phase",
+        phase_index=phase_index,
+        phase_title=f"Stage {phase_index}",
+        automation="agent-pr",
+        child_issue_number=child_issue_number,
+        child_issue_url=f"https://github.com/OWNER/REPO/issues/{child_issue_number}",
+        stage_id=f"stage-{phase_index}",
+    )
+
+
+def _merged_child_runner(states, *, pr_states=None):
+    """FakeRunner presenting per-child issue states and canonical merged PRs."""
+    pr_states = pr_states or {}
+    issue_payloads = {}
+    issue_comments = {}
+    pr_payloads = {}
+    for number, state in states.items():
+        issue_payloads[number] = {"state": state}
+        pr_number = pr_states.get(number)
+        if pr_number is None:
+            issue_comments[number] = []
+            continue
+        issue_comments[number] = [child_pr_handoff_comment(number, pr_number)]
+        pr_payloads[pr_number] = pr_payload_for_state(pr_number, "MERGED")
+    return _FakeRunner(
+        issue_payloads_by_number=issue_payloads,
+        issue_comments_by_number=issue_comments,
+        pr_payloads_by_number=pr_payloads,
+    )
+
+
+def _dispatch_staged(runner, tmp_path, outcome, handoffs, monkeypatch, **overrides):
+    monkeypatch.setattr(
+        phase_progress_module,
+        "find_phase_implementation_handoffs_for_parent",
+        lambda *_args, **_kwargs: tuple(handoffs),
+    )
+    parent = IssueContext(
+        number=55, repo="OWNER/REPO", title="Parent", body="Parent",
+        url="https://github.com/OWNER/REPO/issues/55", comments=(),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "get_issue_context",
+        lambda _runner, *, config, issue_number: parent,
+    )
+    kwargs = dict(
+        config=make_config(tmp_path), memory=None, usage_context=SimpleNamespace(),
+        issue_number=55, current_plan="Approved staged plan", plan_subject="plan-subject",
+        outcome=outcome, recommendation=None,
+        approved_plan_context=SimpleNamespace(matrix_available=False, risk_test_matrix_payload=None),
+        issue_context=parent, mode="implement-by-phase", coder_session_id=None,
+    )
+    kwargs.update(overrides)
+    return orchestrator_module._dispatch_current_decomposition_phase(runner, **kwargs)
+
+
+def test_staged_terminal_report_names_required_parent_obligations(tmp_path, monkeypatch, capsys):
+    """Matrix row `terminal-required-obligations`."""
+    created = _staged_created(("agent-pr", "agent-pr"))
+    outcome = _staged_outcome(
+        created,
+        retained=RetainedParentScope(
+            plan_subject="plan-subject", plan_hash="staged-plan-hash",
+            excerpt="Parent keeps the rollout note.", status="required",
+            deliverables=("The rollout note.",),
+            acceptance_criteria=("The rollout note is published.",),
+        ),
+        final=ExecutionAllocation(
+            status="required", deliverables=("Wire the stages together.",),
+            acceptance_criteria=("End-to-end behavior passes.",),
+            covered_scope_item_ids=("scope-3",),
+        ),
+    )
+    runner = _merged_child_runner(
+        {99: "closed", 100: "closed"}, pr_states={99: 912, 100: 913}
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_dispatch_decomposition_child",
+        lambda *_a, **_k: pytest.fail("a delivered topology must not dispatch a child"),
+    )
+
+    result = _dispatch_staged(
+        runner, tmp_path, outcome,
+        (_staged_handoff(1, 99), _staged_handoff(2, 100)), monkeypatch,
+    )
+
+    assert result == 0
+    output = capsys.readouterr().out
+    assert "all 2 staged phases are delivered" in output
+    assert "Retained-parent obligations: required; this is operator-owned parent work." in output
+    assert "The rollout note." in output
+    assert "Final-integration obligations: required" in output
+    assert "Wire the stages together." in output
+    assert "End-to-end behavior passes." in output
+    assert "remains open pending that operator-owned parent work" in output
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+def test_staged_terminal_report_renders_a_human_stage_without_a_pr(tmp_path, monkeypatch, capsys):
+    """Matrix row `terminal-human-stage-line`."""
+    created = _staged_created(("agent-pr", "human-action"))
+    outcome = _staged_outcome(created)
+    runner = _merged_child_runner({99: "closed", 100: "closed"}, pr_states={99: 912})
+
+    result = _dispatch_staged(runner, tmp_path, outcome, (_staged_handoff(1, 99),), monkeypatch)
+
+    assert result == 0
+    output = capsys.readouterr().out
+    assert "stage-1: delivered by child issue #99 with merged PR #912" in output
+    assert (
+        "stage-2: delivered by human work on child issue #100; "
+        "its closure is the operator attestation." in output
+    )
+    assert "PR #None" not in output
+    # No PR evidence is read for the human-owned stage.
+    assert not any(
+        cmd[:3] == ["gh", "pr", "view"] and "913" in cmd for cmd, _cwd in runner.commands
+    )
+
+
+def test_staged_pending_human_stage_stops_then_advances_when_closed(tmp_path, monkeypatch, capsys):
+    """Matrix rows `human-stage-pending-stops` and `closed-human-stage-advances`."""
+    created = _staged_created(("agent-pr", "human-action", "agent-pr"))
+    outcome = _staged_outcome(created)
+    handoffs = (_staged_handoff(1, 99),)
+    monkeypatch.setattr(
+        orchestrator_module, "_dispatch_decomposition_child",
+        lambda *_a, **_k: pytest.fail("a human-owned stage must not dispatch an agent"),
+    )
+    pending = _merged_child_runner({99: "closed", 100: "open"}, pr_states={99: 912})
+
+    assert _dispatch_staged(pending, tmp_path, outcome, handoffs, monkeypatch) == 0
+    output = capsys.readouterr().out
+    assert "phase 2 (`stage-2`) requires human work (human-action) on child issue #100" in output
+    assert not any(
+        "AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in pending.comments
+    )
+
+    dispatched = []
+    monkeypatch.setattr(
+        orchestrator_module, "_dispatch_decomposition_child",
+        lambda *_a, **kwargs: dispatched.append(kwargs) or 0,
+    )
+    advanced = _merged_child_runner(
+        {99: "closed", 100: "closed", 101: "open"}, pr_states={99: 912}
+    )
+
+    assert _dispatch_staged(advanced, tmp_path, outcome, handoffs, monkeypatch) == 0
+    assert len(dispatched) == 1
+    assert dispatched[0]["phase_index"] == 3
+    assert dispatched[0]["created"].issue_number == 101
+
+
+def test_get_issue_state_normalizes_lowercase_states(tmp_path):
+    """Matrix row `issue-state-read-fails-closed`: the accepted case."""
+    runner = _FakeRunner(issue_payloads_by_number={99: {"state": "closed"}})
+    assert get_issue_state(runner, config=make_config(tmp_path), issue_number=99) == "CLOSED"
+
+
+@pytest.mark.parametrize(
+    ("payload", "returncode", "message"),
+    [
+        ({"state": None}, 0, "Unable to determine the state of issue #99"),
+        ({"state": 7}, 0, "Unable to determine the state of issue #99"),
+        ({"state": "open"}, 1, "`gh` exited 1"),
+        ({"state": "open", "is_pr": True}, 0, "is a pull request, not an issue"),
+        ({"state": "merged"}, 0, "reported unexpected state"),
+    ],
+)
+def test_get_issue_state_fails_closed(tmp_path, payload, returncode, message):
+    """Matrix row `issue-state-read-fails-closed`: every rejected case.
+
+    The stub reproduces the real `Runner.run` check semantics, so a reader that
+    left `check` at its default would raise the generic command failure instead
+    of the contextual diagnostic and this test would fail.
+    """
+
+    class _Runner:
+        def run(self, cmd, *, check=True, **_kwargs):
+            if check and returncode != 0:
+                raise AgentLoopError(
+                    f"Command failed with exit {returncode}: {' '.join(cmd)}"
+                )
+            return CommandResult(cmd, None, json.dumps(payload), "", returncode)
+
+    with pytest.raises(AgentLoopError, match=re.escape(message)):
+        get_issue_state(_Runner(), config=make_config(tmp_path), issue_number=99)
+
+
+def test_get_issue_state_reads_with_check_disabled(tmp_path):
+    """A nonzero `gh` exit must reach the contextual diagnostic, not the generic one."""
+    seen = {}
+
+    class _Runner:
+        def run(self, cmd, *, check=True, **_kwargs):
+            seen["check"] = check
+            if check:
+                raise AgentLoopError("Command failed with exit 1: " + " ".join(cmd))
+            return CommandResult(cmd, None, "", "not found", 1)
+
+    with pytest.raises(AgentLoopError, match=re.escape("`gh` exited 1")):
+        get_issue_state(_Runner(), config=make_config(tmp_path), issue_number=99)
+    assert seen["check"] is False

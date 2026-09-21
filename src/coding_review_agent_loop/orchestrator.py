@@ -137,6 +137,14 @@ from .issue_pr_handoff import (
     resolve_canonical_pr_for_issue,
 )
 from .issue_pr_provenance import IssuePrProvenanceScope
+from .phase_progress import (
+    STATUS_HUMAN_PENDING,
+    PhaseProgress,
+    StagedTopologyOutcome,
+    render_phase_status_line,
+    resolve_staged_phase_progress,
+    select_current_phase,
+)
 from .pr_contract import (
     PR_EXPECTED_CLOSING_MARKER_RE,
     PrExpectedClosingContract,
@@ -6387,7 +6395,69 @@ def _dispatch_decomposition_child(
     )
 
 
-def _dispatch_first_decomposition_phase(
+def _print_staged_phase_progress(
+    issue_number: int, progress: Sequence[PhaseProgress]
+) -> None:
+    """Replace the static remaining-topology line with resolved progress."""
+    print(f"Issue #{issue_number} staged child work:")
+    for phase in progress:
+        print(f"  {phase.phase_index}. {render_phase_status_line(phase)}")
+
+
+def _print_parent_obligation(label: str, allocation) -> None:
+    status = getattr(allocation, "status", None) or "none"
+    if status == "none":
+        print(f"{label}: none.")
+        return
+    deliverables = ", ".join(getattr(allocation, "deliverables", ()) or ()) or "none"
+    criteria = ", ".join(getattr(allocation, "acceptance_criteria", ()) or ()) or "none"
+    print(
+        f"{label}: {status}; this is operator-owned parent work. "
+        f"Deliverables: {deliverables}; acceptance criteria: {criteria}."
+    )
+
+
+def _print_staged_terminal_report(
+    *,
+    issue_number: int,
+    progress: Sequence[PhaseProgress],
+    outcome: StagedTopologyOutcome,
+) -> None:
+    """Report the terminal state of a fully delivered staged topology.
+
+    Final-integration work is deliberately not implemented here and the parent
+    is deliberately not closed: both remain operator decisions.
+    """
+    print(
+        f"Issue #{issue_number}: all {len(progress)} staged phases are delivered; "
+        "no child is dispatched and no handoff is recorded."
+    )
+    for phase in progress:
+        if phase.is_human:
+            print(
+                f"  {phase.phase_index}. {phase.stage_id}: delivered by human work on child "
+                f"issue #{phase.child_issue_number}; its closure is the operator attestation."
+            )
+        else:
+            print(
+                f"  {phase.phase_index}. {phase.stage_id}: delivered by child issue "
+                f"#{phase.child_issue_number} with merged PR #{phase.pr_number}."
+            )
+    _print_parent_obligation("Retained-parent obligations", outcome.retained_parent_scope)
+    _print_parent_obligation("Final-integration obligations", outcome.final_integration_work)
+    if outcome.retained_parent_status == "none" and outcome.final_integration_status == "none":
+        print(
+            f"No parent-side work remains for issue #{issue_number}; it is left open for the "
+            "operator to close."
+        )
+    else:
+        print(
+            f"Issue #{issue_number} remains open pending that operator-owned parent work; "
+            "agent-loop neither implements it nor closes the parent."
+        )
+
+
+def _dispatch_current_decomposition_phase(
     runner: Runner,
     *,
     config: AgentLoopConfig,
@@ -6396,60 +6466,39 @@ def _dispatch_first_decomposition_phase(
     issue_number: int,
     current_plan: str,
     plan_subject: str,
-    created: Sequence[CreatedPhaseIssue],
+    outcome: StagedTopologyOutcome,
     recommendation: ExecutionStrategyRecommendation | None,
     approved_plan_context: ApprovedPlanContext,
     issue_context: IssueContext,
     mode: str,
     coder_session_id: str | None,
 ) -> int:
-    """Route and dispatch the first phase after implement-by-phase decomposition."""
-    first_agent_phase = next(
-        (item for item in created if item.phase.automation == "agent-pr"),
-        None,
-    )
-    first_phase = created[0] if created else None
-    if first_phase is None:
+    """Route and dispatch the *current* phase of an implement-by-phase topology.
+
+    The current phase is the first phase that is not complete, authenticated
+    from live child state (#918).  A completed stage-1 therefore advances to
+    stage-2 with its real ``phase_index``, and a fully delivered topology
+    reports a terminal state instead of pointing the operator at a finished
+    child.
+    """
+    created = outcome.created
+    if not created:
         raise AgentLoopError("Plan decomposition produced no phases.")
-    plan_hash = approved_plan_hash(current_plan)
+    plan_hash = outcome.plan_hash
     fresh = recommendation is not None
-    topology_stage_ids = tuple(
-        getattr(item.phase, "stage_id", None) or str(index)
-        for index, item in enumerate(created, start=1)
-    )
-    first_stage_id = topology_stage_ids[0]
-    if first_phase.phase.automation != "agent-pr":
-        if fresh and not config.dry_run:
-            # Stage-scoped validation: an override naming the human stage is a
-            # human-decision error; a valid override for another stage is
-            # neither an error nor an input here.
-            child_comments: Sequence[object] = ()
-            if first_phase.issue_number is not None:
-                child_comments = get_issue_context(
-                    runner, config=config, issue_number=first_phase.issue_number
-                ).comments
-            overrides = collect_child_disposition_overrides(
-                parent_comments=issue_context.comments,
-                child_comments=child_comments,
-                parent_issue=issue_number,
-                plan_hash=plan_hash,
-                topology_stage_ids=topology_stage_ids,
-                routed_stage_id=first_stage_id,
-                child_stage_id=first_stage_id,
-                child_issue_number=first_phase.issue_number,
-            )
-            resolve_child_execution_route(
-                first_phase.phase,
-                topology_source=EXECUTION_TOPOLOGY_SOURCE,
-                recorded_handoff=None,
-                overrides=overrides,
-            )
-        print(
-            f"Issue #{issue_number} approved plan decomposed; first phase requires human work "
-            f"({first_phase.phase.automation}), so implementation is stopping."
-        )
-        return 0
+    topology_stage_ids = outcome.stage_ids
+
     if config.dry_run:
+        # Dry run resolves no child state and issues no GitHub reads: it
+        # reports the first phase's declared disposition, exactly as today.
+        first_phase = created[0]
+        first_stage_id = topology_stage_ids[0]
+        if first_phase.phase.automation != "agent-pr":
+            print(
+                f"Issue #{issue_number} approved plan decomposed; first phase requires human work "
+                f"({first_phase.phase.automation}), so implementation is stopping."
+            )
+            return 0
         declared = getattr(first_phase.phase, "execution_disposition", None) or "legacy-ambiguous"
         print(
             f"Issue #{issue_number} dry-run decomposed the approved plan; "
@@ -6457,24 +6506,78 @@ def _dispatch_first_decomposition_phase(
             f"First phase `{first_stage_id}` declared disposition: {declared}."
         )
         return 0
-    if first_agent_phase is None or first_agent_phase.issue_number is None:
-        raise AgentLoopError(
-            "Cannot implement first decomposed phase because its child issue number "
-            "was not available from GitHub CLI output."
-        )
+
     parent_issue_context = get_issue_context(
         runner, config=config, issue_number=issue_number
     )
+    progress = resolve_staged_phase_progress(
+        runner,
+        config=config,
+        parent_issue=issue_number,
+        parent_comments=parent_issue_context.comments,
+        outcome=outcome,
+    )
+    _print_staged_phase_progress(issue_number, progress)
+    selected = select_current_phase(progress)
+    if selected is None:
+        _print_staged_terminal_report(
+            issue_number=issue_number, progress=progress, outcome=outcome
+        )
+        return 0
+
+    phase_index = selected.phase_index
+    stage_id = selected.stage_id
+    selected_created = selected.created
+    child_issue_number = selected.child_issue_number
+    if child_issue_number is None:
+        raise AgentLoopError(
+            "Cannot implement decomposed phase because its child issue number "
+            "was not available from GitHub CLI output."
+        )
+
+    if selected.status == STATUS_HUMAN_PENDING:
+        if fresh:
+            # Stage-scoped validation: an override naming the human stage is a
+            # human-decision error; a valid override for another stage is
+            # neither an error nor an input here.
+            child_comments = get_issue_context(
+                runner, config=config, issue_number=child_issue_number
+            ).comments
+            overrides = collect_child_disposition_overrides(
+                parent_comments=issue_context.comments,
+                child_comments=child_comments,
+                parent_issue=issue_number,
+                plan_hash=plan_hash,
+                topology_stage_ids=topology_stage_ids,
+                routed_stage_id=stage_id,
+                child_stage_id=stage_id,
+                child_issue_number=child_issue_number,
+            )
+            resolve_child_execution_route(
+                selected_created.phase,
+                topology_source=EXECUTION_TOPOLOGY_SOURCE,
+                recorded_handoff=None,
+                overrides=overrides,
+            )
+        print(
+            f"Issue #{issue_number} approved plan decomposed; phase {phase_index} "
+            f"(`{stage_id}`) requires human work ({selected.automation}) on child issue "
+            f"#{child_issue_number}, so implementation is stopping."
+        )
+        return 0
+
     handoff = find_existing_phase_implementation_handoff(
         parent_issue_context.comments,
         parent_issue=issue_number,
         plan_hash=plan_hash,
         mode=mode,
-        phase_index=1,
-        child_issue_number=first_agent_phase.issue_number,
+        phase_index=phase_index,
+        child_issue_number=child_issue_number,
     )
     if not fresh:
         if handoff is not None:
+            # Only an in-progress phase reaches here: a completed child is
+            # never advertised as a resume target (#918).
             print(
                 f"Issue #{issue_number} approved plan already handed off to child issue "
                 f"#{handoff.child_issue_number}; resume directly with "
@@ -6485,7 +6588,7 @@ def _dispatch_first_decomposition_phase(
         overrides: tuple[ChildDispositionOverride, ...] = ()
     else:
         child_issue_context = get_issue_context(
-            runner, config=config, issue_number=first_agent_phase.issue_number
+            runner, config=config, issue_number=child_issue_number
         )
         overrides = collect_child_disposition_overrides(
             parent_comments=parent_issue_context.comments,
@@ -6493,12 +6596,12 @@ def _dispatch_first_decomposition_phase(
             parent_issue=issue_number,
             plan_hash=plan_hash,
             topology_stage_ids=topology_stage_ids,
-            routed_stage_id=first_stage_id,
-            child_stage_id=first_stage_id,
-            child_issue_number=first_agent_phase.issue_number,
+            routed_stage_id=stage_id,
+            child_stage_id=stage_id,
+            child_issue_number=child_issue_number,
         )
         route = resolve_child_execution_route(
-            first_agent_phase.phase,
+            selected_created.phase,
             topology_source=EXECUTION_TOPOLOGY_SOURCE,
             recorded_handoff=handoff,
             overrides=overrides,
@@ -6514,7 +6617,7 @@ def _dispatch_first_decomposition_phase(
             return 0
     if not fresh:
         child_issue_context = get_issue_context(
-            runner, config=config, issue_number=first_agent_phase.issue_number
+            runner, config=config, issue_number=child_issue_number
         )
     return _dispatch_decomposition_child(
         runner,
@@ -6527,8 +6630,8 @@ def _dispatch_first_decomposition_phase(
         plan_subject=plan_subject,
         recommendation=recommendation,
         approved_plan_context=approved_plan_context,
-        created=first_agent_phase,
-        phase_index=1,
+        created=selected_created,
+        phase_index=phase_index,
         route=route,
         child_issue_context=child_issue_context,
         parent_issue_context=parent_issue_context,
@@ -6602,14 +6705,23 @@ def _print_execution_resolution_summary(
     issue_number: int,
     resolved: ResolvedExecution,
     normalized_topology,
+    defer_child_work: bool = False,
 ) -> None:
-    """Report the approval-bound action and the work it leaves behind."""
+    """Report the approval-bound action and the work it leaves behind.
+
+    ``defer_child_work`` suppresses only the static ``Remaining child work:``
+    line, and only on the one path that later prints a progress-derived
+    replacement: this summary runs before decomposition returns, with no
+    runner, config, or child comments, so it cannot resolve progress itself.
+    The policy and obligation lines are unaffected and remain true.
+    """
     print(
         f"Issue #{issue_number}: requested policy `{resolved.requested_policy}`; "
         f"resolved action `{resolved.action}`."
     )
     if normalized_topology is None:
-        print("Remaining child work: none.")
+        if not defer_child_work:
+            print("Remaining child work: none.")
         recommendation = resolved.recommendation
         retained_status = (
             recommendation.retained_parent_work.status
@@ -6627,8 +6739,9 @@ def _print_execution_resolution_summary(
         )
         return
     decomposition, retained_parent_scope = normalized_topology
-    remaining = [phase.stage_id or str(phase.position) for phase in decomposition.phases]
-    print(f"Remaining child work: {', '.join(remaining) or 'none'}.")
+    if not defer_child_work:
+        remaining = [phase.stage_id or str(phase.position) for phase in decomposition.phases]
+        print(f"Remaining child work: {', '.join(remaining) or 'none'}.")
     print(
         "Retained-parent obligations: "
         f"{retained_parent_scope.status}; final-integration obligations: "
@@ -8267,6 +8380,34 @@ def _implement_approved_issue(
     )
 
 
+def _resolved_stage_ids(
+    created: Sequence[CreatedPhaseIssue],
+    *,
+    normalized_topology=None,
+    recorded_stage_ids: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Resolve one stage identity per phase index, by a single rule.
+
+    The normalized topology is authoritative when the run is fresh; an adopted
+    or legacy summary supplies its recorded stage ids when it has them; and the
+    remaining case falls back to the 1-based ordinal already used by the
+    existing status lines.
+    """
+    phases = normalized_topology[0].phases if normalized_topology is not None else ()
+    resolved: list[str] = []
+    for index, item in enumerate(created, start=1):
+        if index <= len(phases):
+            phase = phases[index - 1]
+            resolved.append(phase.stage_id or str(phase.position or index))
+            continue
+        if len(recorded_stage_ids) == len(created) and recorded_stage_ids[index - 1]:
+            resolved.append(recorded_stage_ids[index - 1])
+            continue
+        stage_id = getattr(item.phase, "stage_id", None)
+        resolved.append(stage_id or str(getattr(item.phase, "position", None) or index))
+    return tuple(resolved)
+
+
 def _decompose_approved_plan(
     runner: Runner,
     *,
@@ -8280,7 +8421,7 @@ def _decompose_approved_plan(
     usage_context: RunUsageContext,
     execution_recommendation=None,
     normalized_topology=None,
-) -> tuple[CreatedPhaseIssue, ...] | NeedsHumanDecision:
+) -> StagedTopologyOutcome | NeedsHumanDecision:
     plan_hash = approved_plan_hash(approved_plan)
     plan_subject = _plan_subject(approved_plan)
     if execution_recommendation is not None and normalized_topology is None:
@@ -8338,7 +8479,7 @@ def _decompose_approved_plan(
     ) if normalized_topology is None else existing
     if existing is not None:
         log(config, f"Plan decomposition already exists for issue #{issue_number} ({mode}); not recreating children")
-        return tuple(
+        adopted = tuple(
             CreatedPhaseIssue(
                 phase=(
                     decomposition.phases[index]
@@ -8352,6 +8493,31 @@ def _decompose_approved_plan(
             for index, ((title, url, number), automation) in enumerate(
                 zip(existing.children, existing.automation, strict=False)
             )
+        )
+        # The recovered summary is the only source of stage identity and of
+        # the parent's own obligations on the adopted and legacy paths, so it
+        # is carried forward here instead of being discarded.
+        return StagedTopologyOutcome(
+            created=adopted,
+            stage_ids=_resolved_stage_ids(
+                adopted,
+                normalized_topology=normalized_topology,
+                recorded_stage_ids=existing.stage_ids,
+            ),
+            automations=tuple(item.phase.automation for item in adopted),
+            plan_hash=plan_hash,
+            mode=mode,
+            topology_source=existing.topology_source,
+            retained_parent_scope=(
+                retained_parent_scope
+                if normalized_topology is not None
+                else existing.retained_parent_scope
+            ),
+            final_integration_work=(
+                decomposition.final_integration_work
+                if normalized_topology is not None
+                else existing.final_integration_work
+            ),
         )
 
     checkpoint = None
@@ -8459,7 +8625,20 @@ def _decompose_approved_plan(
         plan_subject=plan_subject,
         **summary_allocation_kwargs,
     )
-    return created
+    return StagedTopologyOutcome(
+        created=tuple(created),
+        stage_ids=_resolved_stage_ids(created, normalized_topology=normalized_topology),
+        automations=tuple(item.phase.automation for item in created),
+        plan_hash=plan_hash,
+        mode=mode,
+        topology_source=topology_source,
+        retained_parent_scope=retained_parent_scope,
+        final_integration_work=(
+            decomposition.final_integration_work
+            if topology_source == EXECUTION_TOPOLOGY_SOURCE
+            else None
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -10362,6 +10541,14 @@ def _run_plan_first_loop(
                     issue_number=issue_number,
                     resolved=resolved_execution,
                     normalized_topology=normalized_topology,
+                    # The staged implement-by-phase dispatch path is the only
+                    # path that prints a progress-derived replacement for this
+                    # line; every other path keeps it.
+                    defer_child_work=(
+                        normalized_topology is not None
+                        and mode == "implement-by-phase"
+                        and not config.dry_run
+                    ),
                 )
             if config.dry_run and resolved_execution.is_automatic:
                 _print_dry_run_execution_preview(
@@ -10425,7 +10612,7 @@ def _run_plan_first_loop(
                 return 0
 
             if mode in {"decompose-only", "implement-by-phase"}:
-                created = _decompose_approved_plan(
+                staged_outcome = _decompose_approved_plan(
                     runner,
                     issue_number=issue_number,
                     approved_plan=current_plan,
@@ -10438,8 +10625,8 @@ def _run_plan_first_loop(
                     execution_recommendation=recommendation,
                     normalized_topology=normalized_topology,
                 )
-                if isinstance(created, NeedsHumanDecision):
-                    print(json.dumps(created.as_dict(), sort_keys=True))
+                if isinstance(staged_outcome, NeedsHumanDecision):
+                    print(json.dumps(staged_outcome.as_dict(), sort_keys=True))
                     return 2
                 if normalized_topology is not None:
                     final_integration = normalized_topology[0].final_integration_work
@@ -10452,18 +10639,21 @@ def _run_plan_first_loop(
                         "covered scope items: "
                         f"{', '.join(final_integration.covered_scope_item_ids) or 'none'}"
                     )
-                    remaining_stage_ids = tuple(
-                        phase.stage_id or str(phase.position)
-                        for phase in normalized_topology[0].phases[1:]
-                    )
-                    print(
-                        "Remaining child work after the first phase: "
-                        f"{', '.join(remaining_stage_ids) or 'none'}"
-                    )
+                    if mode == "decompose-only":
+                        # `decompose-only` never enters the phase dispatcher,
+                        # so it keeps today's topology-only stage listing.
+                        remaining_stage_ids = tuple(
+                            phase.stage_id or str(phase.position)
+                            for phase in normalized_topology[0].phases[1:]
+                        )
+                        print(
+                            "Remaining child work after the first phase: "
+                            f"{', '.join(remaining_stage_ids) or 'none'}"
+                        )
                 if mode == "decompose-only":
                     print(f"Issue #{issue_number} approved plan decomposed into child issues.")
                     return 0
-                return _dispatch_first_decomposition_phase(
+                return _dispatch_current_decomposition_phase(
                     runner,
                     config=config,
                     memory=memory,
@@ -10471,7 +10661,7 @@ def _run_plan_first_loop(
                     issue_number=issue_number,
                     current_plan=current_plan,
                     plan_subject=plan_subject,
-                    created=created,
+                    outcome=staged_outcome,
                     recommendation=recommendation,
                     approved_plan_context=approved_plan_context,
                     issue_context=issue_context,
