@@ -1942,3 +1942,231 @@ def test_marker_only_source_finding_is_still_neutralizable_in_both_kinds(builder
         state="blocking", summary="Findings.",
         **{bucket: ["[protocol LOOP_META record]"]},
     ))
+
+
+# --- #925: pre-repair near-miss normalization and the absence pin ------------
+
+from unittest.mock import patch  # noqa: E402
+
+from agent_loop_helpers import (  # noqa: E402
+    make_config as _deg_make_config,
+    structured_issue_implementation as _deg_issue_implementation,
+    structured_pr_review as _deg_pr_review,
+)
+from coding_review_agent_loop import orchestrator as _deg_orchestrator  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    validate_structured_issue_implementation as _deg_validate_issue_implementation,
+    parse_structured_pr_review as _deg_parse_pr_review,
+)
+from coding_review_agent_loop.repair_preservation import (  # noqa: E402
+    normalize_architecture_impact_near_miss,
+)
+from test_cli_repair import RepairRunner  # noqa: E402
+
+_DEG_CORROBORATED = {
+    "status": "modified",
+    "rationale": "The parser gains a degraded status.",
+    "affected_components": ["protocol parser"],
+    "dependencies": ["repair preservation"],
+    "execution_data_flows": ["response -> parser -> seam"],
+    "persistence": ["round metadata degradation records"],
+    "public_contracts": ["architecture_impact status"],
+    "security_boundaries": ["agent payload trust boundary"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the degraded status.",
+}
+_DEG_UNCORROBORATED = {"status": "modified", "rationale": "Something changed."}
+_DEG_FABRICATED_UNCHANGED = {"status": "unchanged", "rationale": "No architectural contract changed."}
+
+
+def _deg_text(impact, *, extra_key: bool = False, rendered: str | None = None) -> str:
+    rendered = rendered or _deg_issue_implementation()
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    if impact is None:
+        payload.pop("architecture_impact", None)
+    else:
+        payload["architecture_impact"] = impact
+    if extra_key:
+        # The unrelated, repairable second defect.
+        payload["notes"] = "unexpected key"
+    return json.dumps(payload) + rendered[split:]
+
+
+def _deg_payload(text: str) -> dict:
+    return json.loads(text[: text.index("}\n") + 1])
+
+
+def test_near_miss_normalization_rewrites_corroborated_status_to_changed():
+    result = normalize_architecture_impact_near_miss(
+        _deg_text(_DEG_CORROBORATED), required_contract=True, expected_kind="issue_implementation"
+    )
+    assert _deg_payload(result.raw)["architecture_impact"]["status"] == "changed"
+    assert result.record.outcome == "normalized-to-changed"
+    assert result.record.element_path == "issue_implementation.architecture_impact.status"
+    assert result.forbid_architecture_impact is False
+    assert "undetermined" not in result.raw
+
+
+def test_near_miss_normalization_removes_uncorroborated_assessment():
+    required = normalize_architecture_impact_near_miss(
+        _deg_text(_DEG_UNCORROBORATED), required_contract=True, expected_kind="issue_implementation"
+    )
+    assert "architecture_impact" not in _deg_payload(required.raw)
+    assert required.record.outcome == "degraded-to-undetermined"
+    assert required.forbid_architecture_impact is True
+    assert "undetermined" not in required.raw
+    optional = normalize_architecture_impact_near_miss(
+        _deg_text(_DEG_UNCORROBORATED), required_contract=False
+    )
+    assert optional.forbid_architecture_impact is False
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _deg_issue_implementation(),
+        '{"kind":"issue_implementation","architecture_impact":{"status":"modified"',
+        "plain prose with no JSON",
+    ],
+)
+def test_near_miss_normalization_leaves_other_payloads_byte_identical(raw):
+    result = normalize_architecture_impact_near_miss(raw, required_contract=True)
+    assert result.raw == raw
+    assert result.record is None
+
+
+def test_near_miss_normalization_pins_absence_of_a_genuine_omission():
+    result = normalize_architecture_impact_near_miss(
+        _deg_text(None), required_contract=True, expected_kind="issue_implementation"
+    )
+    assert result.record is None
+    assert result.forbid_architecture_impact is True
+
+
+def test_preservation_forbids_introducing_an_assessment_when_pinned():
+    source = _deg_text(None)
+    with pytest.raises(AgentLoopError, match="must not introduce one"):
+        validate_repair_preservation(
+            source, _deg_text(_DEG_FABRICATED_UNCHANGED), forbid_architecture_impact=True
+        )
+    validate_repair_preservation(source, _deg_text(None), forbid_architecture_impact=True)
+    # Without the pin (a non-required contract) today's behavior is unchanged.
+    validate_repair_preservation(source, _deg_text(_DEG_FABRICATED_UNCHANGED))
+
+
+def test_preservation_pins_the_rewritten_changed_status():
+    normalized = normalize_architecture_impact_near_miss(
+        _deg_text(_DEG_CORROBORATED), required_contract=True
+    ).raw
+    laundered = dict(_DEG_CORROBORATED, status="unchanged")
+    with pytest.raises(AgentLoopError, match="architecture_impact.status"):
+        validate_repair_preservation(normalized, _deg_text(laundered))
+
+
+def _deg_run_repair(tmp_path, source, repaired, *, path, required=True, kind="issue_implementation"):
+    refusals = []
+
+    def contract_refusal(parsed, text, records):
+        diagnostic = _deg_orchestrator._architecture_contract_diagnostic(parsed)
+        refusals.append((parsed, text, records, diagnostic))
+        return diagnostic
+
+    validate = (
+        (lambda text: _deg_validate_issue_implementation(text, required_architecture_impact_contract=1))
+        if kind == "issue_implementation"
+        else (lambda text: _deg_parse_pr_review(text, reviewer="OpenAI Codex"))
+    )
+    extra = (
+        {"require_architecture_impact_contract": True, "contract_refusal": contract_refusal}
+        if required else {}
+    )
+    if path == "legacy":
+        config = _deg_make_config(tmp_path)
+        with patch.object(_deg_orchestrator, "attempt_repair", lambda raw, cmd, **kw: repaired):
+            result = _deg_orchestrator._run_structured_repair(
+                source, runner=None, config=config, usage_context=None,
+                validate=validate, repair_kwargs={"expected_kind": kind}, **extra,
+            )
+    else:
+        config = _deg_make_config(
+            tmp_path, repair_backend="claude", repair_models=("repair-model",)
+        )
+        runner = RepairRunner([(repaired, 0)])
+        # conftest replaces attempt_repair globally; restore the original so
+        # _run_structured_repair takes the real execute_repair path.
+        with patch.object(
+            _deg_orchestrator, "attempt_repair", _deg_orchestrator._ORIGINAL_ATTEMPT_REPAIR
+        ), patch("coding_review_agent_loop.repair.AntigravityBackend.discover_models"):
+            result = _deg_orchestrator._run_structured_repair(
+                source, runner=runner, config=config, usage_context=None,
+                validate=validate, repair_kwargs={"expected_kind": kind}, **extra,
+            )
+    return result, refusals
+
+
+@pytest.mark.parametrize("path", ["legacy", "execute"])
+def test_repair_of_corroborated_near_miss_is_accepted_as_changed_with_record(tmp_path, path):
+    source = _deg_text(_DEG_CORROBORATED, extra_key=True)
+    repaired_text = _deg_text(dict(_DEG_CORROBORATED, status="changed"))
+    (repaired, parsed, attempts), refusals = _deg_run_repair(
+        tmp_path, source, repaired_text, path=path
+    )
+    assert repaired.strip() == repaired_text.strip()
+    assert parsed.architecture_impact.status == "changed"
+    (record,) = parsed.architecture_impact_degradations
+    assert record.outcome == "normalized-to-changed"
+    assert refusals[0][3] is None
+
+
+@pytest.mark.parametrize("path", ["legacy", "execute"])
+def test_repair_of_uncorroborated_near_miss_is_refused_after_records_attach(tmp_path, path):
+    source = _deg_text(_DEG_UNCORROBORATED, extra_key=True)
+    repaired_text = _deg_text(None)
+    (repaired, parsed, attempts), refusals = _deg_run_repair(
+        tmp_path, source, repaired_text, path=path
+    )
+    assert repaired.strip() == repaired_text.strip()
+    assert parsed is None
+    terminal = attempts[-1]
+    assert terminal.outcome == "architecture_contract_unsatisfied"
+    assert "architecture_impact" in terminal.diagnostic
+    assert [r.outcome for r in terminal.architecture_impact_degradations] == ["degraded-to-undetermined"]
+    # The record was attached before the refusal ran.
+    refused_parsed, _text, _records, diagnostic = refusals[0]
+    assert diagnostic is not None
+    assert [r.outcome for r in refused_parsed.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+    assert "undetermined" not in repaired
+
+
+@pytest.mark.parametrize("path", ["legacy", "execute"])
+@pytest.mark.parametrize("source_impact", [None, _DEG_UNCORROBORATED], ids=["omission", "removal"])
+def test_repair_cannot_fabricate_an_assessment_under_a_required_contract(
+    tmp_path, path, source_impact
+):
+    source = _deg_text(source_impact, extra_key=True)
+    (repaired, parsed, attempts), refusals = _deg_run_repair(
+        tmp_path, source, _deg_text(_DEG_FABRICATED_UNCHANGED), path=path
+    )
+    assert parsed is None
+    assert attempts[-1].outcome == "invalid_output"
+    assert "must not introduce one" in attempts[-1].diagnostic
+    assert refusals == []
+
+
+@pytest.mark.parametrize("path", ["legacy", "execute"])
+def test_non_required_review_repair_keeps_todays_behavior(tmp_path, path):
+    from agent_loop_helpers import malformed_pr_review_source
+
+    source = malformed_pr_review_source(state="approved", summary="Looks good overall.")
+    repaired_text = _deg_text(
+        _DEG_FABRICATED_UNCHANGED, rendered=_deg_pr_review(summary="Looks good overall.")
+    )
+    (repaired, parsed, attempts), _refusals = _deg_run_repair(
+        tmp_path, source, repaired_text, path=path, required=False, kind="pr_review"
+    )
+    assert parsed is not None
+    assert parsed.architecture_impact.status == "unchanged"

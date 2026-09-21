@@ -613,6 +613,56 @@ def render_human_requirement_dispositions(
     )
 
 
+PARSE_DEGRADATION_RENDER_LIMIT = 8
+
+
+def _degradation_cell(text: object) -> str:
+    return " ".join(
+        sanitize_historical_text(str(text))
+        .replace("`", "'")
+        .replace("<", "\u2039")
+        .replace(">", "\u203a")
+        .split()
+    )[:200]
+
+
+def render_parse_degradations_section(
+    records: Sequence[object], *, heading: str = "### Parse degradations"
+) -> str | None:
+    """Render bounded, sanitized parse degradation records (#924).
+
+    An operator sees reduced coverage rather than silent loss.  Renders
+    nothing when there are no records.
+    """
+    if not records:
+        return None
+    lines = [
+        heading,
+        "The orchestrator degraded these elements instead of rejecting the response:",
+    ]
+    for record in list(records)[:PARSE_DEGRADATION_RENDER_LIMIT]:
+        lines.append(
+            f"- `{_degradation_cell(getattr(record, 'element_path', ''))}` — rule "
+            f"`{_degradation_cell(getattr(record, 'rule', ''))}`; observed "
+            f"`{_degradation_cell(getattr(record, 'observed_preview', ''))}`; outcome "
+            f"`{_degradation_cell(getattr(record, 'outcome', ''))}`"
+        )
+    omitted = len(records) - PARSE_DEGRADATION_RENDER_LIMIT
+    if omitted > 0:
+        lines.append(f"- {omitted} more record(s) omitted.")
+    return "\n".join(lines)
+
+
+def render_decomposition_degradation_comment(records: Sequence[object]) -> str | None:
+    """Plain parent-issue comment for an accepted decomposition's records."""
+    section = render_parse_degradations_section(
+        records, heading="### Decomposition parse degradations"
+    )
+    if section is None:
+        return None
+    return section + "\n\n-- coding-review-agent-loop"
+
+
 def render_deferred_stages_section(deferred_stages: Sequence[DeferredStage]) -> str | None:
     """Render declared deferred stages so they carry into the plan's markdown.
 

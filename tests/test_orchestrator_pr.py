@@ -7487,6 +7487,11 @@ def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_ite
                 "checked_discussion_directly": False,
             },
             "human_requirement_dispositions": [],
+            # The source carries its own assessment: repair may fix the
+            # envelope but may not supply an omitted one (#925).
+            "architecture_impact": json.loads(
+                structured_coder_followup().split("\n<!--", 1)[0]
+            )["architecture_impact"],
         }
     )
     repaired_coder_response = structured_coder_followup(

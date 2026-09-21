@@ -700,6 +700,23 @@ paths, and fresh turns with an acquired architecture snapshot use the versioned
 architecture-impact assessment. Legacy records remain decodable without
 inventing a snapshot or assessment; source inspection remains required.
 
+Semantic-claim validation degrades the narrowest offending element instead of
+rejecting the whole response. For architecture impact, the status value
+`modified` is the only near miss accepted. It becomes `changed` when the
+payload itself corroborates a change (every changed-only list is non-empty and
+names a real canonical-document action). Otherwise it becomes the parser-only
+`undetermined` status, which has no wire form. A required assessment that is
+omitted, removed, or `undetermined` does not satisfy the contract. The
+validators return it without raising, and `_run_validated_agent` refuses it
+with a diagnostic that names the field. The refusal uses the ordinary retry
+budget, and the refused response is kept on the final error. Checkpoint decode,
+stored-plan re-authentication, and semantic patch values stay strict.
+Canonical plan assembly and topology checkpoint publication refuse a degraded
+status. Repair normalizes the near miss before the repair prompt is built and
+may not introduce an assessment that the source lacked. Every degradation
+produces a bounded, parser-derived record. Records travel on the parsed result
+and in an optional round-metadata field, and appear in the round summary.
+
 ## Semantic planning foundation
 
 Generation-1 planning remains the downstream wire contract. A semantic

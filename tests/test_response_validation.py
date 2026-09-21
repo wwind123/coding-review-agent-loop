@@ -60,10 +60,13 @@ def test_fresh_coder_contract_requires_architecture_impact():
     payload = json.loads(structured_coder_followup().split("\n<!--", 1)[0])
     payload.pop("architecture_impact")
     response = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
-    with pytest.raises(AgentLoopError, match="architecture_impact"):
-        validate_structured_coder_followup(
-            response, required_architecture_impact_contract=1
-        )
+    parsed = validate_structured_coder_followup(
+        response, required_architecture_impact_contract=1
+    )
+    assert parsed is not None
+    assert parsed.architecture_impact is None
+    assert parsed.architecture_impact_contract.required is True
+    assert parsed.architecture_impact_contract.satisfied is False
 
 
 def test_machine_obligation_must_be_dispositioned_but_resolution_is_advisory():

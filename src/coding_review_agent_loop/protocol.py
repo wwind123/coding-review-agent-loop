@@ -262,6 +262,7 @@ class ParsedReview:
     dispositions: tuple[ReviewItemDisposition, ...]
     raw_dispositions_text: str = ""
     architecture_impact: ArchitectureImpact | None = None
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -297,6 +298,7 @@ class ParsedPlanReview:
     raw_dispositions_text: str = ""
     human_requirement_dispositions: tuple["HumanRequirementDisposition", ...] = ()
     architecture_impact: ArchitectureImpact | None = None
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -359,8 +361,173 @@ class ArchitectureImpact:
     uncertainty: tuple[str, ...] = ()
 
 
-def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureImpact:
+ARCHITECTURE_IMPACT_DECLARED_STATUSES = frozenset({"changed", "unchanged"})
+# Parser-only status for a degraded assessment.  It has no wire form: the
+# response parsers reject it like any unknown status, strict decoders never
+# produce it, and approved-state writers refuse it.
+ARCHITECTURE_IMPACT_UNDETERMINED = "undetermined"
+# The only closed-enum near miss resolved deterministically (#916).  Every
+# other unknown status keeps raising exactly as before.
+ARCHITECTURE_IMPACT_STATUS_ALIASES = {"modified": "changed"}
+PARSE_DEGRADATION_FIELD_CHARS = 200
+PARSE_DEGRADATION_PREVIEW_CHARS = 120
+PARSE_DEGRADATION_OUTCOMES = frozenset({"normalized-to-changed", "degraded-to-undetermined"})
+ARCHITECTURE_IMPACT_NEAR_MISS_RULE = "architecture_impact.status-closed-enum-near-miss"
+
+
+def _bounded_single_line(text: str, limit: int) -> str:
+    # Records are rendered into round comments, so no angle bracket survives:
+    # an HTML comment opener can never reach a body as a protocol record.
+    flattened = " ".join(
+        sanitize_historical_text(text)
+        .replace("`", "'")
+        .replace("<", "\u2039")
+        .replace(">", "\u203a")
+        .split()
+    )
+    if len(flattened) <= limit:
+        return flattened
+    return flattened[:limit] + "\u2026"
+
+
+@dataclass(frozen=True)
+class ParseDegradation:
+    """A bounded, parser-derived record of one degraded element (#924).
+
+    Records are produced only by parser code from the element it reads; no
+    agent schema carries them, so an agent can never author one.
+    """
+
+    element_path: str
+    rule: str
+    observed_preview: str
+    outcome: str
+
+    @classmethod
+    def build(cls, *, element_path: str, rule: str, observed: object, outcome: str) -> "ParseDegradation":
+        observed_text = observed if isinstance(observed, str) else json.dumps(observed, sort_keys=True, default=str)
+        return cls(
+            element_path=_bounded_single_line(element_path, PARSE_DEGRADATION_FIELD_CHARS),
+            rule=_bounded_single_line(rule, PARSE_DEGRADATION_FIELD_CHARS),
+            observed_preview=_bounded_single_line(observed_text, PARSE_DEGRADATION_PREVIEW_CHARS),
+            outcome=_bounded_single_line(outcome, PARSE_DEGRADATION_FIELD_CHARS),
+        )
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "element_path": sanitize_historical_text(self.element_path),
+            "rule": sanitize_historical_text(self.rule),
+            "observed_preview": sanitize_historical_text(self.observed_preview),
+            "outcome": sanitize_historical_text(self.outcome),
+        }
+
+
+def parse_degradation_payload(value: object) -> ParseDegradation:
+    """Strictly decode one orchestrator-written record for metadata rehydration."""
+    if not isinstance(value, Mapping) or set(value) != {"element_path", "rule", "observed_preview", "outcome"}:
+        raise AgentLoopError("Parse degradation record must have exactly the documented keys.")
+    fields: dict[str, str] = {}
+    for key, limit in (
+        ("element_path", PARSE_DEGRADATION_FIELD_CHARS),
+        ("rule", PARSE_DEGRADATION_FIELD_CHARS),
+        ("observed_preview", PARSE_DEGRADATION_PREVIEW_CHARS),
+        ("outcome", PARSE_DEGRADATION_FIELD_CHARS),
+    ):
+        item = value[key]
+        if not isinstance(item, str) or not item.strip() or len(item) > limit + 1:
+            raise AgentLoopError(f"Parse degradation record field {key} is invalid.")
+        fields[key] = _bounded_single_line(item, limit)
+    if fields["outcome"] not in PARSE_DEGRADATION_OUTCOMES:
+        raise AgentLoopError("Parse degradation record outcome is invalid.")
+    return ParseDegradation(**fields)
+
+
+@dataclass(frozen=True)
+class ArchitectureImpactContract:
+    """Whether this turn required an assessment, and whether one was supplied.
+
+    A required contract is satisfied only by a declared `changed`/`unchanged`
+    status.  An omitted, normalization-removed, or `undetermined` assessment is
+    an unsatisfied result that the orchestration seam refuses (#925).
+    """
+
+    required: bool = False
+    satisfied: bool = False
+
+
+def architecture_impact_contract_for(
+    impact: ArchitectureImpact | None, *, required: bool
+) -> ArchitectureImpactContract:
+    return ArchitectureImpactContract(
+        required=required,
+        satisfied=impact is not None and impact.status in ARCHITECTURE_IMPACT_DECLARED_STATUSES,
+    )
+
+
+def _non_blank_string_entries(value: object) -> bool:
+    return isinstance(value, list) and any(isinstance(item, str) and item.strip() for item in value)
+
+
+def architecture_impact_near_miss_corroborated(payload: Mapping[str, object]) -> bool:
+    """Positive-evidence predicate: the payload itself settles `changed`.
+
+    Key presence is not evidence.  Every changed-only list must hold a
+    non-blank entry and the canonical-document fields must describe a real
+    document action; anything less leaves the status undetermined.
+    """
+    for key in ("affected_components", "dependencies", "persistence", "public_contracts", "security_boundaries"):
+        if not _non_blank_string_entries(payload.get(key)):
+            return False
+    if not (
+        _non_blank_string_entries(payload.get("execution_data_flows"))
+        or _non_blank_string_entries(payload.get("execution_flows"))
+        or _non_blank_string_entries(payload.get("data_flows"))
+    ):
+        return False
+    action = payload.get("canonical_document_action")
+    if not isinstance(action, str) or not action.strip() or action.strip() == "no-change":
+        return False
+    path = payload.get("canonical_document_path")
+    if not isinstance(path, str) or not path.strip():
+        return False
+    rationale = payload.get("canonical_document_rationale")
+    return isinstance(rationale, str) and bool(rationale.strip())
+
+
+def _parse_architecture_impact_degradable(
+    value: object, *, context: str
+) -> tuple[ArchitectureImpact, ParseDegradation | None]:
+    """Parse an agent-supplied assessment, degrading only the status near miss."""
     payload = _expect_object(value, context=context)
+    status_value = payload.get("status")
+    if isinstance(status_value, str) and status_value in ARCHITECTURE_IMPACT_STATUS_ALIASES:
+        corroborated = architecture_impact_near_miss_corroborated(payload)
+        resolved = ARCHITECTURE_IMPACT_STATUS_ALIASES[status_value] if corroborated else ARCHITECTURE_IMPACT_UNDETERMINED
+        record = ParseDegradation.build(
+            element_path=f"{context}.status",
+            rule=ARCHITECTURE_IMPACT_NEAR_MISS_RULE,
+            observed=status_value,
+            outcome="normalized-to-changed" if corroborated else "degraded-to-undetermined",
+        )
+        return _parse_architecture_impact_payload(payload, context=context, status=resolved), record
+    return _parse_architecture_impact_payload(payload, context=context), None
+
+
+def parse_architecture_impact_degradable(
+    value: object, *, context: str = "architecture_impact"
+) -> tuple[ArchitectureImpact, ParseDegradation | None]:
+    """Degradable parse for fresh agent responses outside protocol envelopes."""
+    return _parse_architecture_impact_degradable(value, context=context)
+
+
+def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureImpact:
+    """Strict parse: checkpoint decode, re-authentication and patch values."""
+    return _parse_architecture_impact_payload(_expect_object(value, context=context), context=context)
+
+
+def _parse_architecture_impact_payload(
+    payload: dict[str, object], *, context: str, status: str | None = None
+) -> ArchitectureImpact:
     _expect_exact_keys(
         payload,
         context=context,
@@ -372,9 +539,10 @@ def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureIm
             "canonical_document_path", "canonical_document_rationale", "uncertainty",
         },
     )
-    status = _expect_non_empty_string(payload["status"], context=f"{context}.status")
-    if status not in {"changed", "unchanged"}:
-        raise AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
+    if status is None:
+        status = _expect_non_empty_string(payload["status"], context=f"{context}.status")
+        if status not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+            raise AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
     action = _expect_non_empty_string(
         payload.get("canonical_document_action", "no-change"),
         context=f"{context}.canonical_document_action",
@@ -647,6 +815,8 @@ class StructuredCoderFollowup:
     risk_test_matrix_claims: SemanticRiskCoverageClaims | None = None
     risk_test_matrix_evidence: "RiskTestMatrixEvidence | None" = None
     risk_test_matrix_diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
+    architecture_impact_contract: ArchitectureImpactContract = ArchitectureImpactContract()
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -666,6 +836,8 @@ class StructuredIssueImplementation:
     risk_test_matrix_claims: SemanticRiskCoverageClaims | None = None
     risk_test_matrix_evidence: "RiskTestMatrixEvidence | None" = None
     risk_test_matrix_diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
+    architecture_impact_contract: ArchitectureImpactContract = ArchitectureImpactContract()
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -678,6 +850,8 @@ class StructuredTaskResult:
     pr_number: int | None = None
     clarification: tuple[str, ...] = ()
     architecture_impact: ArchitectureImpact | None = None
+    architecture_impact_contract: ArchitectureImpactContract = ArchitectureImpactContract()
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -964,6 +1138,8 @@ class StructuredPlanRevision:
     risk_test_matrix_contract_version: int | None = None
     risk_test_matrix: "RiskTestMatrix | None" = None
     risk_test_matrix_changes: tuple["RiskTestMatrixChange", ...] = ()
+    architecture_impact_contract: ArchitectureImpactContract = ArchitectureImpactContract()
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -985,6 +1161,8 @@ class StructuredPlanState:
     risk_test_matrix_contract_version: int | None = None
     risk_test_matrix: "RiskTestMatrix | None" = None
     risk_test_matrix_changes: tuple["RiskTestMatrixChange", ...] = ()
+    architecture_impact_contract: ArchitectureImpactContract = ArchitectureImpactContract()
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
 
 
 # The matrix is deliberately a structured, generation-gated contract.  It is
@@ -4491,6 +4669,16 @@ def _expect_disposition_list(
     )
 
 
+def _degradable_response_impact(
+    payload: Mapping[str, object], *, context: str
+) -> tuple[ArchitectureImpact | None, tuple[ParseDegradation, ...]]:
+    """Read an optional response assessment, degrading only its own status."""
+    if "architecture_impact" not in payload:
+        return None, ()
+    impact, record = _parse_architecture_impact_degradable(payload["architecture_impact"], context=context)
+    return impact, (() if record is None else (record,))
+
+
 def _finalize_parsed_review(
     *,
     state: str,
@@ -4500,6 +4688,7 @@ def _finalize_parsed_review(
     dispositions: tuple[ReviewItemDisposition, ...],
     raw_dispositions_text: str = "",
     architecture_impact: ArchitectureImpact | None = None,
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = (),
 ) -> ParsedReview:
     if state == "blocking" and followups.future:
         followups = ApprovedFollowups(same_pr=followups.same_pr, future=())
@@ -4525,6 +4714,7 @@ def _finalize_parsed_review(
         dispositions=dispositions,
         raw_dispositions_text=raw_dispositions_text,
         architecture_impact=architecture_impact,
+        architecture_impact_degradations=architecture_impact_degradations,
     )
 
 
@@ -4537,6 +4727,7 @@ def _finalize_parsed_plan_review(
     raw_dispositions_text: str = "",
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = (),
     architecture_impact: ArchitectureImpact | None = None,
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = (),
 ) -> ParsedPlanReview:
     if state == "blocking" and items.future:
         items = PlanReviewItems(blocking=items.blocking, same_plan=items.same_plan, future=())
@@ -4562,6 +4753,7 @@ def _finalize_parsed_plan_review(
         raw_dispositions_text=raw_dispositions_text,
         human_requirement_dispositions=human_requirement_dispositions,
         architecture_impact=architecture_impact,
+        architecture_impact_degradations=architecture_impact_degradations,
     )
 
 
@@ -4655,9 +4847,8 @@ def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | No
         allowed_same_status="same-pr",
         is_plan_review=False,
     )
-    architecture_impact = (
-        _parse_architecture_impact(payload["architecture_impact"], context="pr_review.architecture_impact")
-        if "architecture_impact" in payload else None
+    architecture_impact, architecture_impact_degradations = _degradable_response_impact(
+        payload, context="pr_review.architecture_impact"
     )
     structured_blocking_items = blocking_items
     followups = _dedupe_pr_review_items(
@@ -4674,6 +4865,7 @@ def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | No
         followups=followups,
         dispositions=dispositions,
         architecture_impact=architecture_impact,
+        architecture_impact_degradations=architecture_impact_degradations,
     )
 
 
@@ -4730,9 +4922,8 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
         payload.get("human_requirement_dispositions", []),
         context="plan_review.human_requirement_dispositions",
     )
-    architecture_impact = (
-        _parse_architecture_impact(payload["architecture_impact"], context="plan_review.architecture_impact")
-        if "architecture_impact" in payload else None
+    architecture_impact, architecture_impact_degradations = _degradable_response_impact(
+        payload, context="plan_review.architecture_impact"
     )
     items = _dedupe_plan_review_items(
         PlanReviewItems(
@@ -4748,6 +4939,7 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
         dispositions=dispositions,
         human_requirement_dispositions=human_requirement_dispositions,
         architecture_impact=architecture_impact,
+        architecture_impact_degradations=architecture_impact_degradations,
     )
 
 
@@ -4843,14 +5035,15 @@ def validate_structured_coder_followup(
     # A missing semantic claim set is recoverable after PR authentication: the
     # builder will emit complete non-verified rows.  Do not make absence hide a
     # PR or force a repair model to invent authority.
-    architecture_impact = (
-        _parse_architecture_impact(payload["architecture_impact"], context="coder_followup.architecture_impact")
-        if "architecture_impact" in payload else None
+    # An absent or undetermined required assessment is a field-scope defect:
+    # return the parsed result with an unsatisfied contract instead of
+    # rejecting the envelope.  The orchestration seam refuses it (#925).
+    architecture_impact, architecture_impact_degradations = _degradable_response_impact(
+        payload, context="coder_followup.architecture_impact"
     )
-    if required_architecture_impact_contract == 1 and architecture_impact is None:
-        raise AgentLoopError(
-            "coder_followup must include architecture_impact for this fresh contract turn."
-        )
+    architecture_impact_contract = architecture_impact_contract_for(
+        architecture_impact, required=required_architecture_impact_contract == 1
+    )
     addressed_items = _expect_item_id_list(
         payload["addressed_items"],
         context="coder_followup.addressed_items",
@@ -4928,6 +5121,8 @@ def validate_structured_coder_followup(
         architecture_impact=architecture_impact,
         risk_test_matrix_claims=risk_claims,
         risk_test_matrix_evidence=risk_evidence,
+        architecture_impact_contract=architecture_impact_contract,
+        architecture_impact_degradations=architecture_impact_degradations,
     )
 
 
@@ -5038,17 +5233,12 @@ def validate_structured_issue_implementation(
         )
     # Missing claims remain a bounded, complete non-verified result at the
     # post-head builder boundary; they are not a reason to discard a PR.
-    architecture_impact = (
-        _parse_architecture_impact(
-            payload["architecture_impact"], context="issue_implementation.architecture_impact"
-        )
-        if "architecture_impact" in payload
-        else None
+    architecture_impact, architecture_impact_degradations = _degradable_response_impact(
+        payload, context="issue_implementation.architecture_impact"
     )
-    if required_architecture_impact_contract == 1 and architecture_impact is None:
-        raise AgentLoopError(
-            "issue_implementation must include architecture_impact for this fresh contract turn."
-        )
+    architecture_impact_contract = architecture_impact_contract_for(
+        architecture_impact, required=required_architecture_impact_contract == 1
+    )
     parsed = StructuredIssueImplementation(
         schema_version=1,
         kind="issue_implementation",
@@ -5071,7 +5261,14 @@ def validate_structured_issue_implementation(
         architecture_impact=architecture_impact,
         risk_test_matrix_claims=risk_claims,
         risk_test_matrix_evidence=risk_evidence,
+        architecture_impact_contract=architecture_impact_contract,
+        architecture_impact_degradations=architecture_impact_degradations,
     )
+    # An unsatisfied required contract outranks the semantic conflict, as the
+    # former raise did: return it so the seam refuses it rather than letting a
+    # conflict wrapper hide the missing assessment.
+    if architecture_impact_contract.required and not architecture_impact_contract.satisfied:
+        return parsed
     # Keep this semantic contradiction visible to callers as a dedicated error
     # with the typed payload attached.  The orchestration adapter first
     # re-applies caller-specific requirement coverage before treating it as a
@@ -5145,19 +5342,18 @@ def validate_structured_task_result(
         raise AgentLoopError("task_result.clarification requires at least one question.")
     if outcome != "clarification" and questions:
         raise AgentLoopError("task_result.clarification is only valid for clarification.")
-    architecture_impact = (
-        _parse_architecture_impact(payload["architecture_impact"], context="task_result.architecture_impact")
-        if "architecture_impact" in payload else None
+    architecture_impact, architecture_impact_degradations = _degradable_response_impact(
+        payload, context="task_result.architecture_impact"
     )
-    if required_architecture_impact_contract == 1 and architecture_impact is None:
-        raise AgentLoopError(
-            "task_result must include architecture_impact for this fresh contract turn."
-        )
     return StructuredTaskResult(
         schema_version=1, kind="task_result", state=state, outcome=outcome,
         summary=_expect_non_empty_string(payload["summary"], context="task_result.summary"),
         pr_number=pr_number, clarification=questions,
         architecture_impact=architecture_impact,
+        architecture_impact_contract=architecture_impact_contract_for(
+            architecture_impact, required=required_architecture_impact_contract == 1
+        ),
+        architecture_impact_degradations=architecture_impact_degradations,
     )
 
 
@@ -5233,12 +5429,9 @@ def validate_structured_plan_revision(
         item_context="plan_revision.plan_steps",
         min_length=1,
     )
-    architecture_impact = (
-        _parse_architecture_impact(payload["architecture_impact"], context="plan_revision.architecture_impact")
-        if "architecture_impact" in payload else None
+    architecture_impact, architecture_impact_degradations = _degradable_response_impact(
+        payload, context="plan_revision.architecture_impact"
     )
-    if required_architecture_impact_contract == 1 and architecture_impact is None:
-        raise AgentLoopError("plan_revision must include architecture_impact for this fresh contract turn.")
     additional_closing_issue_ids = _expect_optional_issue_id_list(
         payload,
         "additional_closing_issue_ids",
@@ -5268,6 +5461,10 @@ def validate_structured_plan_revision(
         risk_test_matrix_contract_version=risk_version,
         risk_test_matrix=risk_matrix,
         risk_test_matrix_changes=risk_changes,
+        architecture_impact_contract=architecture_impact_contract_for(
+            architecture_impact, required=required_architecture_impact_contract == 1
+        ),
+        architecture_impact_degradations=architecture_impact_degradations,
     )
 
 
@@ -5320,12 +5517,9 @@ def validate_structured_plan_state(
     state = _expect_state(payload["state"], context="plan_state.state")
     if state != "blocking":
         raise AgentLoopError("plan_state.state must be `blocking`.")
-    architecture_impact = (
-        _parse_architecture_impact(payload["architecture_impact"], context="plan_state.architecture_impact")
-        if "architecture_impact" in payload else None
+    architecture_impact, architecture_impact_degradations = _degradable_response_impact(
+        payload, context="plan_state.architecture_impact"
     )
-    if required_architecture_impact_contract == 1 and architecture_impact is None:
-        raise AgentLoopError("plan_state must include architecture_impact for this fresh contract turn.")
     return StructuredPlanState(
         schema_version=int(payload.get("schema_version", 1)),
         kind="plan_state",
@@ -5356,6 +5550,10 @@ def validate_structured_plan_state(
         risk_test_matrix_contract_version=risk_version,
         risk_test_matrix=risk_matrix,
         risk_test_matrix_changes=risk_changes,
+        architecture_impact_contract=architecture_impact_contract_for(
+            architecture_impact, required=required_architecture_impact_contract == 1
+        ),
+        architecture_impact_degradations=architecture_impact_degradations,
     )
 
 
@@ -7027,6 +7225,16 @@ def _parse_plan_patch_field_value(field_name: str, value: object, *, context: st
     if field_name == "plan_steps":
         return _expect_string_list(value, context=context, item_context=context, min_length=1)
     if field_name == "architecture_impact":
+        # A patch writes approved plan state, so it stays strict: a degraded
+        # status must never persist.  Name the route forward instead of the
+        # generic enum message so the planner does not retry blindly (#924).
+        status_value = value.get("status") if isinstance(value, Mapping) else None
+        if isinstance(status_value, str) and status_value in ARCHITECTURE_IMPACT_STATUS_ALIASES:
+            raise AgentLoopError(
+                f"{context}.status must be `changed` or `unchanged`; "
+                f"`{status_value}` is not accepted in a patch. Replace architecture_impact "
+                "with a declared `changed` or `unchanged` assessment."
+            )
         return _parse_architecture_impact(value, context=context)
     if field_name == "additional_closing_issue_ids":
         return _expect_optional_issue_id_list({field_name: value}, field_name, context=context)

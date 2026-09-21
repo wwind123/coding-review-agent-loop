@@ -85,6 +85,7 @@ from .errors import (
     FreshContractIntegrityError,
     HumanDecisionRequiredError,
     IssueImplementationConflictError,
+    PreservedUnsatisfiedResponse,
     QuotaResetExceededError,
     ReviewSubstanceIntegrityError,
     UnknownPriorItemDispositionError,
@@ -327,6 +328,8 @@ from .protocol import (
     serialize_discuss_final_synthesis,
     parse_architecture_impact,
     sanitize_architecture_impact,
+    ARCHITECTURE_IMPACT_DECLARED_STATUSES,
+    ParseDegradation,
 )
 from .protocol import parse_review
 from .repair import (
@@ -342,7 +345,9 @@ from .repair import (
     require_recoverable_review_substance,
 )
 from .repair_preservation import (
+    normalize_architecture_impact_near_miss,
     require_recoverable_semantic_patch,
+    require_repair_architecture_impact_absent,
     validate_repair_preservation,
 )
 from .runner import Runner
@@ -406,6 +411,7 @@ from .ci_health import (
 )
 from .comment_rendering import (
     DEFERRED_STAGES_MARKER_RE,
+    render_decomposition_degradation_comment,
     render_plan_phase_advance,
     render_plan_scheduling_audit,
     EXECUTION_RECOMMENDATION_MARKER_RE,
@@ -689,14 +695,24 @@ def _freeze_prompt_architecture(
 
 
 def _architecture_metadata_fields(
-    config: AgentLoopConfig, *, impact: object | None = None
+    config: AgentLoopConfig, *, result: object | None = None
 ) -> dict[str, object]:
-    """Persist the complete acquisition identity, including unavailable states."""
+    """Persist the complete acquisition identity, including unavailable states.
+
+    Writers pass the whole parsed ``result`` rather than a bare assessment so
+    an assessment can never be persisted without its degradation records.
+    """
     context = config.architecture_context
     identity = context.identity() if hasattr(context, "identity") else None
+    impact, degradations = _architecture_result_fields(result)
+    if impact is not None and getattr(impact, "status", None) not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+        # Durable metadata never holds the parser-only degraded status, which
+        # strict rehydration would reject; the record explains the absence.
+        impact = None
     return {
         "architecture_identity": identity,
         "architecture_impact": sanitize_architecture_impact(impact),
+        "architecture_impact_degradations": degradations,
         # This records the response-contract generation, not document
         # availability. A fresh turn must remain distinguishable from a
         # legacy record even when architecture acquisition is opted out or
@@ -2418,8 +2434,16 @@ def _run_structured_repair(
     usage_context: RunUsageContext | None,
     validate: Callable[[str], object],
     repair_kwargs: dict[str, object],
+    require_architecture_impact_contract: bool = False,
+    contract_refusal: Callable[[object, str, tuple[ParseDegradation, ...]], str | None] | None = None,
 ) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
-    """Run configured repair, retaining compatibility with patched legacy test hooks."""
+    """Run configured repair, retaining compatibility with patched legacy test hooks.
+
+    ``validate`` must be the non-refusing parse.  A near miss is normalized in
+    the raw payload before the repair prompt is built; its record travels out
+    of band, is attached to the parsed repair result, and only then is
+    ``contract_refusal`` consulted (#925).
+    """
     if repair_kwargs.get("expected_kind") == "plan_revision_patch":
         try:
             require_recoverable_semantic_patch(raw)
@@ -2499,6 +2523,50 @@ def _run_structured_repair(
                         integrity_contract="risk_test_matrix",
                     )
                 ]
+    near_miss = normalize_architecture_impact_near_miss(
+        raw,
+        required_contract=require_architecture_impact_contract,
+        expected_kind=(
+            repair_kwargs.get("expected_kind")
+            if isinstance(repair_kwargs.get("expected_kind"), str) else None
+        ),
+    )
+    raw = near_miss.raw
+    degradation_records: tuple[ParseDegradation, ...] = (
+        (near_miss.record,) if near_miss.record is not None else ()
+    )
+
+    def finish(
+        repaired: str | None, parsed: object | None, attempts: list[RepairAttemptResult]
+    ) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
+        if repaired is None or parsed is None:
+            return repaired, parsed, attempts
+        parsed = _attach_architecture_degradations(parsed, degradation_records)
+        refusal = (
+            contract_refusal(parsed, repaired, degradation_records)
+            if contract_refusal is not None else None
+        )
+        if refusal is None:
+            return repaired, parsed, attempts
+        # Returned, not raised: the caller invokes repair from inside its own
+        # AgentLoopError handler and continues on the no-parsed-result path.
+        return repaired, None, [
+            *attempts,
+            RepairAttemptResult(
+                backend="none",
+                model="architecture-contract",
+                prompt="",
+                output=repaired,
+                returncode=None,
+                outcome="architecture_contract_unsatisfied",
+                diagnostic=refusal,
+                log_path=None,
+                fallback_planned=False,
+                validation_result=parsed,
+                architecture_impact_degradations=degradation_records,
+            ),
+        ]
+
     if attempt_repair is not _ORIGINAL_ATTEMPT_REPAIR:
         try:
             repaired = attempt_repair(raw, config.gemini_cmd, **repair_kwargs)
@@ -2531,7 +2599,10 @@ def _run_structured_repair(
                     raw,
                     repaired,
                     allowed_prior_item_ids=repair_kwargs.get("allowed_prior_item_ids"),
+                    forbid_architecture_impact=near_miss.forbid_architecture_impact,
                 )
+            elif near_miss.forbid_architecture_impact:
+                require_repair_architecture_impact_absent(repaired)
             parsed = validate(repaired)
         except AgentLoopError as exc:
             return repaired, None, [
@@ -2547,16 +2618,17 @@ def _run_structured_repair(
                     fallback_planned=False,
                 )
             ]
-        return repaired, parsed, []
-    return execute_repair(
+        return finish(repaired, parsed, [])
+    return finish(*execute_repair(
         raw,
         runner=runner,
         config=config,
         run_id=usage_context.run_id if usage_context is not None else None,
         usage_context=usage_context,
         validate=validate,
+        forbid_architecture_impact=near_miss.forbid_architecture_impact,
         **repair_kwargs,
-    )
+    ))
 
 
 @dataclass(frozen=True)
@@ -2906,6 +2978,7 @@ def _capture_terminal_plan_repair_rejection(
     *,
     repair_expected_kind: str | None,
     validate: Callable[[str], object],
+    contract_diagnostic: Callable[[object], str | None] | None = None,
 ) -> DeterministicPlanValidationExhaustion | None:
     """Capture a deterministically rejected final planning repair candidate.
 
@@ -2922,7 +2995,7 @@ def _capture_terminal_plan_repair_rejection(
     ):
         return None
     try:
-        validate(candidate)
+        parsed = validate(candidate)
     except AgentLoopError as exc:
         if "Current untrusted GitHub text contains reserved protocol marker(s):" in str(exc):
             return None
@@ -2930,6 +3003,16 @@ def _capture_terminal_plan_repair_rejection(
             candidate_kind=repair_expected_kind,
             candidate_text=candidate,
             diagnostic=str(exc),
+            candidate_digest=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+        )
+    # ``validate`` is the non-refusing parse on required-contract sites; the
+    # pure diagnostic check never mutates the retained unsatisfied candidate.
+    diagnostic = contract_diagnostic(parsed) if contract_diagnostic is not None else None
+    if diagnostic is not None:
+        return DeterministicPlanValidationExhaustion(
+            candidate_kind=repair_expected_kind,
+            candidate_text=candidate,
+            diagnostic=diagnostic,
             candidate_digest=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
         )
     return None
@@ -2994,14 +3077,53 @@ def _run_validated_agent(
     plan_validation_failure_handler: Callable[
         [DeterministicPlanValidationExhaustion, AgentInvocationError], None
     ] | None = None,
+    require_architecture_impact_contract: bool = False,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
     # the same provenance check before it can be accepted.
     response_validator = validate
     validation_acquisition: AgentResult | None = None
+    # The last response refused for an unsatisfied architecture-impact
+    # contract.  It is retained and surfaced, never silently discarded.
+    preserved_unsatisfied: PreservedUnsatisfiedResponse | None = None
+
+    def contract_refusal(
+        result: object, text: str, records: tuple[ParseDegradation, ...] = ()
+    ) -> str | None:
+        """Store an unsatisfied result as the preserved candidate; return its diagnostic."""
+        nonlocal preserved_unsatisfied
+        if not require_architecture_impact_contract:
+            return None
+        diagnostic = _architecture_contract_diagnostic(result)
+        if diagnostic is None:
+            return None
+        carrier = _unwrap_architecture_result(result)
+        preserved_unsatisfied = PreservedUnsatisfiedResponse(
+            text=text,
+            diagnostic=diagnostic,
+            architecture_impact_degradations=tuple(
+                getattr(carrier, "architecture_impact_degradations", ()) or records
+            ),
+        )
+        log(
+            config,
+            f"{agent_display_name(agent)}: retained a response refused for an unsatisfied "
+            f"architecture_impact contract ({len(text)} chars; "
+            f"{len(preserved_unsatisfied.architecture_impact_degradations)} degradation record(s))",
+        )
+        return diagnostic
 
     def validate(text: str) -> object:
+        # The refusing validator: parse, then refuse an unsatisfied contract
+        # uniformly for every call site that requires one (#925).
+        result = parse_response(text)
+        refusal = contract_refusal(result, text)
+        if refusal is not None:
+            raise _ArchitectureImpactContractUnsatisfied(refusal)
+        return result
+
+    def parse_response(text: str) -> object:
         TrustedBody.current_untrusted_visible(text)
         token = None
         if (
@@ -3486,7 +3608,14 @@ def _run_validated_agent(
                 last_error = str(exc)
                 marker_safety_failure = "Current untrusted GitHub text contains reserved protocol marker(s):" in str(exc)
                 structured_kind = _recognized_structured_public_response_kind(result.text)
-                if structured_kind is not None:
+                contract_unsatisfied = isinstance(exc, _ArchitectureImpactContractUnsatisfied)
+                if contract_unsatisfied and structured_kind is None:
+                    # A parsed-but-unsatisfied response is a deterministic
+                    # field-scope defect, whatever its envelope kind.
+                    classification_text = "structured response failed the architecture_impact contract"
+                    public_text_is_transient = False
+                    last_failure_category = "deterministic"
+                elif structured_kind is not None:
                     # Keep validation context authoritative. The structured
                     # payload's prose is untrusted content and must not be
                     # treated as evidence of provider auth, billing, credit,
@@ -3931,6 +4060,10 @@ def _run_validated_agent(
                         isinstance(exc, UnknownPriorItemDispositionError)
                         and ledger_incomplete
                     )
+                    # Repair may not supply an assessment the response lacks,
+                    # so a response whose only defect is the unsatisfied
+                    # contract has nothing left for a repair model to fix.
+                    and not contract_unsatisfied
                 ):
                     log(config, f"{agent_name}: schema validation failed ({exc}); attempting repair pass")
                     repair_kwargs: dict[str, object] = {"expected_kind": repair_expected_kind}
@@ -3983,13 +4116,24 @@ def _run_validated_agent(
                     original_validation_error = str(exc)
                     if marker_safety_failure:
                         marker_safety_repair_attempted = True
+                    contract_repair_kwargs: dict[str, object] = (
+                        {
+                            "require_architecture_impact_contract": True,
+                            "contract_refusal": contract_refusal,
+                        }
+                        if require_architecture_impact_contract
+                        else {}
+                    )
                     repaired, repaired_marker, repair_attempts = _run_structured_repair(
                         normalized if normalized is not None else text,
                         runner=runner,
                         config=config,
                         usage_context=usage_context,
-                        validate=validate,
+                        validate=(
+                            parse_response if require_architecture_impact_contract else validate
+                        ),
                         repair_kwargs=repair_kwargs,
+                        **contract_repair_kwargs,
                     )
                     _log_repair_attempts(config, agent_name, repair_attempts)
                     terminal_repair = repair_attempts[-1] if repair_attempts else None
@@ -4049,11 +4193,41 @@ def _run_validated_agent(
                         last_classification_text = (
                             "semantic patch is not mechanically recoverable; planner retry required"
                         )
+                    elif (
+                        terminal_repair is not None
+                        and terminal_repair.outcome == "architecture_contract_unsatisfied"
+                    ):
+                        # The repaired candidate parsed but still lacks a
+                        # declared assessment.  This is a deterministic
+                        # rejection, never a repair-provider failure; build the
+                        # planning capture from the refused candidate itself so
+                        # the retained candidate and its records are kept.
+                        last_failure_category = "deterministic"
+                        last_classification_text = (
+                            f"structured {repair_expected_kind} repair failed the "
+                            "architecture_impact contract"
+                        )
+                        if repair_expected_kind in {"plan_state", "plan_revision"}:
+                            plan_validation_exhaustion = DeterministicPlanValidationExhaustion(
+                                candidate_kind=repair_expected_kind,
+                                candidate_text=terminal_repair.output,
+                                diagnostic=terminal_repair.diagnostic,
+                                candidate_digest=hashlib.sha256(
+                                    terminal_repair.output.encode("utf-8")
+                                ).hexdigest(),
+                            )
+                            plan_validation_capture_eligible = True
                     elif terminal_repair is not None:
                         repaired_exhaustion = _capture_terminal_plan_repair_rejection(
                             terminal_repair,
                             repair_expected_kind=repair_expected_kind,
-                            validate=validate,
+                            validate=(
+                                parse_response if require_architecture_impact_contract else validate
+                            ),
+                            contract_diagnostic=(
+                                _architecture_contract_diagnostic
+                                if require_architecture_impact_contract else None
+                            ),
                         )
                         if repaired_exhaustion is not None:
                             # The repair candidate, rather than the source
@@ -4295,6 +4469,7 @@ def _run_validated_agent(
         terminal_public_response=terminal_public_response,
         containment=last_result.containment if last_result is not None else None,
         plan_validation_exhaustion=plan_validation_exhaustion,
+        preserved_unsatisfied_response=preserved_unsatisfied,
     )
     if (
         plan_validation_failure_handler is not None
@@ -4314,6 +4489,132 @@ class _TerminalIssueImplementationConflict:
     """A valid implementation payload rejected from handoff by semantics."""
 
     parsed: StructuredIssueImplementation
+
+
+# Every parsed result type that carries an architecture-impact contract.  The
+# unsatisfied check enumerates these explicitly rather than defaulting through
+# ``getattr``, so a new result wrapper cannot silently bypass the contract.
+_ARCHITECTURE_CONTRACT_CARRIERS = (
+    StructuredCoderFollowup,
+    StructuredIssueImplementation,
+    StructuredTaskResult,
+    StructuredPlanRevision,
+    StructuredPlanState,
+    PlanDecomposition,
+)
+# Review carriers hold records but never a required contract.
+_ARCHITECTURE_RECORD_CARRIERS = (*_ARCHITECTURE_CONTRACT_CARRIERS, ParsedReview, ParsedPlanReview)
+
+
+def _is_contract_free_result(result: object) -> bool:
+    """Results that carry no structured payload: clarification, legacy PR, no-PR."""
+    return isinstance(result, (str, int, _TerminalNoPrImplementation))
+
+
+def _unwrap_architecture_result(result: object) -> object:
+    if isinstance(result, _TerminalIssueImplementationConflict):
+        return result.parsed
+    return result
+
+
+def _architecture_result_fields(
+    result: object | None,
+) -> tuple[object | None, tuple[ParseDegradation, ...]]:
+    """Return the assessment and its degradation records for a metadata writer."""
+    result = _unwrap_architecture_result(result)
+    if result is None or _is_contract_free_result(result):
+        return None, ()
+    if isinstance(result, _ARCHITECTURE_RECORD_CARRIERS):
+        return result.architecture_impact, tuple(result.architecture_impact_degradations)
+    raise AgentLoopError(
+        f"Internal error: {type(result).__name__} is not an enumerated architecture-impact "
+        "result type for round metadata."
+    )
+
+
+def architecture_impact_contract_unsatisfied(result: object) -> bool:
+    """Whether a validated result fails a required architecture-impact contract.
+
+    Fails closed: an unknown result type raises rather than defaulting to
+    satisfied.
+    """
+    result = _unwrap_architecture_result(result)
+    if _is_contract_free_result(result):
+        return False
+    if isinstance(result, _ARCHITECTURE_CONTRACT_CARRIERS):
+        contract = result.architecture_impact_contract
+        return contract.required and not contract.satisfied
+    raise AgentLoopError(
+        f"Internal error: {type(result).__name__} is not an enumerated architecture-impact "
+        "contract result type."
+    )
+
+
+def _architecture_contract_diagnostic(result: object) -> str | None:
+    """Pure field-naming diagnostic for an unsatisfied contract, else None."""
+    if not architecture_impact_contract_unsatisfied(result):
+        return None
+    carrier = _unwrap_architecture_result(result)
+    kind = "plan_decomposition" if isinstance(carrier, PlanDecomposition) else carrier.kind
+    parts = [
+        f"{kind} must include architecture_impact for this fresh contract turn.",
+        "architecture_impact.status must be `changed` or `unchanged`; an omitted or "
+        "undetermined assessment does not satisfy the contract.",
+    ]
+    for record in carrier.architecture_impact_degradations:
+        parts.append(
+            f"Degraded element {record.element_path}: rule {record.rule}; observed "
+            f"'{record.observed_preview}'; outcome {record.outcome}."
+        )
+    return " ".join(parts)
+
+
+def _attach_architecture_degradations(result: object, records: Sequence[ParseDegradation]) -> object:
+    """Attach out-of-band repair records to the parsed result they explain."""
+    if not records:
+        return result
+    if isinstance(result, _TerminalIssueImplementationConflict):
+        return _TerminalIssueImplementationConflict(
+            _attach_architecture_degradations(result.parsed, records)
+        )
+    if isinstance(result, _ARCHITECTURE_RECORD_CARRIERS):
+        return dataclasses_replace(
+            result,
+            architecture_impact_degradations=(
+                *result.architecture_impact_degradations, *records,
+            ),
+        )
+    return result
+
+
+def _surface_decomposition_degradations(
+    runner: Runner, *, config: AgentLoopConfig, issue_number: int, decomposition: object
+) -> None:
+    """Make an accepted decomposition's degradation records operator-visible.
+
+    PlanDecomposition has no round metadata, and its topology checkpoint must
+    stay byte-identical, so records surface through a bounded log line and one
+    plain, marker-free parent-issue comment instead.
+    """
+    records = tuple(getattr(decomposition, "architecture_impact_degradations", ()) or ())
+    body = render_decomposition_degradation_comment(records)
+    if body is None:
+        return
+    summary = "; ".join(
+        f"{record.element_path} {record.outcome} (observed '{record.observed_preview}')"
+        for record in records[:4]
+    )
+    log(config, f"Plan decomposition for issue #{issue_number} parse degradations: {summary}"[:600])
+    post_issue_comment(runner, config=config, issue_number=issue_number, body=body)
+
+
+class _ArchitectureImpactContractUnsatisfied(AgentLoopError):
+    """Private attempt bookkeeping confined to ``_run_validated_agent``.
+
+    Validators never raise this; the seam raises it so every normalization,
+    stripping, recovery and repair branch treats an unsatisfied result as
+    not accepted.
+    """
 
 
 @dataclass(frozen=True)
@@ -4833,6 +5134,10 @@ def _require_task_implementation_result(
         if structured.outcome == "opened_pr":
             return structured
         if structured.outcome == "clarification":
+            return structured
+        if architecture_impact_contract_unsatisfied(structured):
+            # A blocking wrapper must never hide an unsatisfied contract;
+            # return the parsed result so the seam refuses it.
             return structured
         return _TerminalNoPrImplementation("blocking")
     if required_architecture_impact_contract == 1:
@@ -8071,6 +8376,7 @@ def _implement_approved_issue(
         ),
         session_id=implementation_session_id,
         marker_description="structured issue_implementation result, blocking, or clarification",
+        require_architecture_impact_contract=True,
         validate=lambda text: _validate_issue_implementation_response(
             text,
             human_requirements=implementation_requirements,
@@ -8353,7 +8659,7 @@ def _implement_approved_issue(
             **_metadata_identity_fields(coder_response),
             **_architecture_metadata_fields(
                 implementation_config,
-                impact=getattr(implementation_result, "architecture_impact", None),
+                result=implementation_result,
             ),
             acquisition_outcome=coder_response.acquisition_outcome,
             acquisition_returncode=coder_response.acquisition_returncode,
@@ -8537,7 +8843,9 @@ def _decompose_approved_plan(
             phases=checkpoint.phases,
             architecture_impact=(
                 parse_architecture_impact(
-                    checkpoint.architecture_impact,
+                    # The checkpoint decoder restores lists as tuples; give the
+                    # unchanged strict parser its JSON-array wire shape back.
+                    sanitize_architecture_impact(checkpoint.architecture_impact),
                     context="checkpoint.architecture_impact",
                 )
                 if checkpoint.architecture_impact is not None else None
@@ -8576,8 +8884,12 @@ def _decompose_approved_plan(
             ),
             usage_context=usage_context,
             operation_description="plan decomposition",
+            require_architecture_impact_contract=True,
         )
         decomposition = decomposition_response.marker_value
+        _surface_decomposition_degradations(
+            runner, config=config, issue_number=issue_number, decomposition=decomposition
+        )
     if topology_source == EXECUTION_TOPOLOGY_SOURCE and risk_matrix_payload is None:
         recovered_matrix_context = make_approved_plan_context(
             approved_plan,
@@ -9078,6 +9390,7 @@ def _run_plan_first_loop(
                 plan_validation_diagnostic=plan_validation_diagnostic,
             ),
             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking --> or <!-- AGENT_CLARIFY -->",
+            require_architecture_impact_contract=True,
             validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
                 text,
                 marker_validator=lambda text: _require_plan_state_or_clarification(
@@ -9189,7 +9502,7 @@ def _run_plan_first_loop(
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
                     **_architecture_metadata_fields(
-                        config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
+                        config, result=plan_response.marker_value
                     ),
                     execution_strategy_contract_version=(
                         1
@@ -9772,7 +10085,7 @@ def _run_plan_first_loop(
                         **(_metadata_identity_fields(identity) if identity is not None else {}),
                         acquisition_outcome=acquisition_outcome,
                         acquisition_returncode=acquisition_returncode,
-                        **_architecture_metadata_fields(config, impact=parsed.architecture_impact),
+                        **_architecture_metadata_fields(config, result=parsed),
                         canonical_reviewer_response=(review_output if phase == "publication" else None),
                     ),
                 ),
@@ -11032,6 +11345,9 @@ def _run_plan_first_loop(
             ),
             session_id=coder_session_id,
             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            # A semantic patch carries no assessment of its own; the assembled
+            # plan inherits the base or a strict patch replace.
+            require_architecture_impact_contract=not semantic_revision,
             validate=(
                 (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_response(
                     text,
@@ -11296,7 +11612,7 @@ def _run_plan_first_loop(
                         if current_plan_sidecar is not None else None
                     ),
                     **_architecture_metadata_fields(
-                        config, impact=getattr(metadata_plan, "architecture_impact", None)
+                        config, result=metadata_plan
                     ),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
@@ -11827,6 +12143,7 @@ def run_issue_loop(
                 parent_issue_context=parent_issue_context,
             ),
             marker_description="structured issue_implementation result, blocking, or clarification",
+            require_architecture_impact_contract=True,
             validate=lambda text: _validate_issue_implementation_response(
                 text,
                 human_requirements=implementation_requirements,
@@ -12070,7 +12387,7 @@ def run_issue_loop(
                 **_metadata_identity_fields(coder_response),
                 acquisition_outcome=coder_response.acquisition_outcome,
                 acquisition_returncode=coder_response.acquisition_returncode,
-                **_architecture_metadata_fields(config, impact=getattr(implementation_result, "architecture_impact", None)),
+                **_architecture_metadata_fields(config, result=implementation_result),
             ),
         )
         post_trusted_pr_comment(
@@ -12153,6 +12470,7 @@ def run_task_loop(
                 prompt=prompt,
                 session_id=session_id,
                 marker_description="structured task_result JSON, blocking, or clarification outcome",
+                require_architecture_impact_contract=True,
                 validate=lambda text: _require_task_implementation_result(
                     text,
                     # This is a fresh task turn even when architecture context
@@ -12224,7 +12542,7 @@ def run_task_loop(
                             **_metadata_identity_fields(coder_response),
                             acquisition_outcome=coder_response.acquisition_outcome,
                             acquisition_returncode=coder_response.acquisition_returncode,
-                            **_architecture_metadata_fields(config, impact=getattr(structured_task, "architecture_impact", None)),
+                            **_architecture_metadata_fields(config, result=structured_task),
                         ),
                     ),
                 )
@@ -16626,7 +16944,7 @@ def run_pr_loop(
                             acquisition_outcome=acquisition_outcome,
                             acquisition_returncode=acquisition_returncode,
                             surfaced_reviewer_requirement_ids=surfaced_reviewer_requirement_ids,
-                            **_architecture_metadata_fields(config, impact=parsed.architecture_impact),
+                            **_architecture_metadata_fields(config, result=parsed),
                             approved_plan_hash=(
                                 approved_plan_context.plan_hash
                                 if approved_plan_context is not None
@@ -19227,6 +19545,7 @@ def run_pr_loop(
                 prompt=followup_prompt,
                 session_id=coder_session_id,
                 marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                require_architecture_impact_contract=True,
                 validate=lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements: _validate_coder_followup_response(
                     text,
                     unresolved_items=items,
@@ -19475,7 +19794,7 @@ def run_pr_loop(
                 scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                 qualification_checkpoint=qualification_checkpoint,
                 **_architecture_metadata_fields(
-                    config, impact=getattr(coder_response.marker_value, "architecture_impact", None)
+                    config, result=coder_response.marker_value
                 ),
             )
             post_pr_comment(

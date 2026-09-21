@@ -36,6 +36,7 @@ from .protocol import (
     _expect_optional_issue_id_list,
     _expect_string_list,
     _expect_typed_plan_stages,
+    ARCHITECTURE_IMPACT_DECLARED_STATUSES,
     _parse_architecture_impact,
     _expect_deferred_stage_list,
     _extract_structured_plan_revision_payload,
@@ -83,6 +84,13 @@ def _typed_stage_payload(stages: TypedPlanStages) -> dict[str, object]:
 def _architecture_payload(value: ArchitectureImpact | None) -> dict[str, object] | None:
     if value is None:
         return None
+    if value.status not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+        # A degraded (parser-only) status must never reach a canonical payload
+        # or aggregate identity.  Fail closed rather than omitting the key.
+        raise AgentLoopError(
+            "Canonical plan assembly requires architecture_impact.status `changed` or "
+            f"`unchanged`; refusing degraded status {value.status!r}."
+        )
     # Keep all fields, including empty arrays, because the object is already a
     # parsed generation-1 value and canonical identity must include its full
     # contract rather than a display-only subset.

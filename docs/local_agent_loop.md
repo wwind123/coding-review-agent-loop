@@ -184,6 +184,30 @@ Use `--architecture-read-size`, `--architecture-snapshot-max-chars`, and
 an explicitly restrictive value fails before invocation if protected context
 cannot fit. The default expands as needed for the bounded architecture block.
 
+#### Degraded architecture-impact assessments
+
+Fresh coder turns must return an `architecture_impact` whose `status` is
+`changed` or `unchanged`. If a response uses the near miss `modified`, it is
+not discarded:
+
+- When the payload corroborates a change (non-empty affected components,
+  dependencies, flows, persistence, public contracts and security boundaries,
+  plus a canonical-document action, path and rationale), the status is read as
+  `changed`.
+- Otherwise the assessment is treated as undetermined. It never counts as
+  `unchanged`.
+
+An omitted or undetermined required assessment leaves the contract
+unsatisfied. The turn is refused with a message naming `architecture_impact`
+and its accepted values. The number of agent turns stays the same, and the
+refused response is kept for the operator. Planning turns carry that message
+into the next planner prompt. The repair pass cannot add an assessment that the
+agent did not supply. Each degradation is listed under **Parse degradations**
+in the round summary. An accepted decomposition reports its degradations in a
+separate parent-issue comment, and its topology checkpoint is unchanged. A
+semantic plan patch that replaces `architecture_impact` with `modified` is
+rejected with a message telling the planner to use `changed` or `unchanged`.
+
 ## Agent Backends
 
 Currently supported local agent CLIs:

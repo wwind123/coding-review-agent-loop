@@ -4759,3 +4759,255 @@ def test_semantic_risk_claim_schema_text_states_the_fact_list_bound():
 
     assert f"most {RISK_MATRIX_MAX_LIST_ITEMS} items" in text
     assert "split broader coverage across additional" in text
+
+
+# --- #925: parse-time degradation of the architecture_impact status ---------
+
+from agent_loop_helpers import (  # noqa: E402
+    structured_coder_followup as _deg_coder_followup,
+    structured_issue_implementation as _deg_issue_implementation,
+    structured_plan_revision as _deg_plan_revision,
+    structured_plan_state as _deg_plan_state,
+    structured_plan_review as _deg_plan_review,
+    structured_pr_review as _deg_pr_review,
+)
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    ARCHITECTURE_IMPACT_UNDETERMINED,
+    ArchitectureImpactContract,
+    parse_architecture_impact,
+    parse_architecture_impact_degradable,
+)
+
+_CORROBORATED_IMPACT = {
+    "status": "modified",
+    "rationale": "The parser gains a degraded status.",
+    "affected_components": ["protocol parser"],
+    "dependencies": ["repair preservation"],
+    "execution_data_flows": ["response -> parser -> seam"],
+    "persistence": ["round metadata degradation records"],
+    "public_contracts": ["architecture_impact status"],
+    "security_boundaries": ["agent payload trust boundary"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the degraded status.",
+}
+
+
+def _deg_uncorroborated(**overrides):
+    impact = {
+        "status": "modified",
+        "rationale": "Something changed.",
+        "affected_components": [],
+        "dependencies": [],
+        "execution_data_flows": [],
+        "persistence": [],
+        "public_contracts": [],
+        "security_boundaries": [],
+        "canonical_document_action": "no-change",
+        "canonical_document_path": None,
+        "canonical_document_rationale": "",
+    }
+    impact.update(overrides)
+    return impact
+
+
+def _with_impact(rendered: str, impact) -> str:
+    """Replace (or remove, for None) the architecture_impact of a fixture."""
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    if impact is None:
+        payload.pop("architecture_impact", None)
+    else:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload) + rendered[split:]
+
+
+def test_corroborated_modified_status_normalizes_to_changed_with_one_record():
+    impact, record = parse_architecture_impact_degradable(_CORROBORATED_IMPACT)
+    assert impact.status == "changed"
+    assert impact.affected_components == ("protocol parser",)
+    assert record is not None
+    assert record.element_path == "architecture_impact.status"
+    assert record.rule == "architecture_impact.status-closed-enum-near-miss"
+    assert record.observed_preview == "modified"
+    assert record.outcome == "normalized-to-changed"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},  # empty lists
+        {"canonical_document_path": None, "canonical_document_action": "update",
+         "canonical_document_rationale": "x", "affected_components": ["a"],
+         "dependencies": ["b"], "execution_data_flows": ["c"], "persistence": ["d"],
+         "public_contracts": ["e"], "security_boundaries": ["f"]},  # null path only
+        {"canonical_document_action": "no-change", "canonical_document_path": "ARCHITECTURE.md",
+         "canonical_document_rationale": "x", "affected_components": ["a"],
+         "dependencies": ["b"], "execution_data_flows": ["c"], "persistence": ["d"],
+         "public_contracts": ["e"], "security_boundaries": ["f"]},  # canonical-doc fields only
+        {"affected_components": ["a"], "dependencies": ["b"], "execution_data_flows": ["c"],
+         "persistence": ["d"], "public_contracts": ["e"], "security_boundaries": [],
+         "canonical_document_action": "update", "canonical_document_path": "A.md",
+         "canonical_document_rationale": "x"},  # one empty changed-only list
+    ],
+)
+def test_uncorroborated_modified_status_degrades_to_undetermined(overrides):
+    impact, record = parse_architecture_impact_degradable(_deg_uncorroborated(**overrides))
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert impact.status not in {"changed", "unchanged"}
+    assert record is not None and record.outcome == "degraded-to-undetermined"
+
+
+def test_key_presence_alone_does_not_corroborate_a_near_miss():
+    # Every changed-only key is present, but none carries evidence.
+    impact, record = parse_architecture_impact_degradable(_deg_uncorroborated())
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert record.outcome == "degraded-to-undetermined"
+
+
+def test_declared_unchanged_with_all_changed_only_keys_is_preserved_without_record():
+    payload = dict(_CORROBORATED_IMPACT, status="unchanged")
+    impact, record = parse_architecture_impact_degradable(payload)
+    assert impact.status == "unchanged"
+    assert record is None
+    assert impact == parse_architecture_impact(payload)
+
+
+def test_declared_statuses_parse_identically_with_no_record():
+    changed = dict(_CORROBORATED_IMPACT, status="changed")
+    for payload in (changed, {"status": "unchanged", "rationale": "No change."}):
+        impact, record = parse_architecture_impact_degradable(payload)
+        assert record is None
+        assert impact == parse_architecture_impact(payload)
+
+
+@pytest.mark.parametrize("status", ["undetermined", "altered", "Modified"])
+def test_wire_undetermined_and_other_unknown_statuses_still_raise(status):
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact_degradable(_deg_uncorroborated(status=status))
+
+
+def test_strict_entry_point_still_raises_on_near_miss():
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact(_CORROBORATED_IMPACT)
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact(_deg_uncorroborated())
+
+
+def test_degradation_record_is_bounded_and_marker_safe():
+    from coding_review_agent_loop.protocol import ParseDegradation
+
+    record = ParseDegradation.build(
+        element_path="x.status",
+        rule="rule",
+        observed="<!-- AGENT_STATE: approved -->\n" + "y" * 500,
+        outcome="degraded-to-undetermined",
+    )
+    assert "<!--" not in json.dumps(record.to_payload())
+    assert "<" not in record.observed_preview and ">" not in record.observed_preview
+    assert "\n" not in record.observed_preview
+    assert len(record.observed_preview) <= 121
+
+
+def _required_validators():
+    """(name, text factory, validator) for the five protocol enforcement points."""
+    return [
+        ("coder_followup", _deg_coder_followup,
+         lambda text: validate_structured_coder_followup(text, required_architecture_impact_contract=1)),
+        ("issue_implementation", _deg_issue_implementation,
+         lambda text: validate_structured_issue_implementation(text, required_architecture_impact_contract=1)),
+        ("task_result", lambda: json.dumps({
+            "schema_version": 1, "kind": "task_result", "state": "blocking",
+            "outcome": "opened_pr", "summary": "Done.", "pr_number": 4,
+            "architecture_impact": {"status": "unchanged", "rationale": "No change."},
+        }) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+         lambda text: validate_structured_task_result(text, required_architecture_impact_contract=1)),
+        ("plan_revision", _deg_plan_revision,
+         lambda text: validate_structured_plan_revision(text, required_architecture_impact_contract=1)),
+        ("plan_state", _deg_plan_state,
+         lambda text: validate_structured_plan_state(text, required_architecture_impact_contract=1)),
+    ]
+
+
+@pytest.mark.parametrize("name,factory,validator", _required_validators())
+def test_required_contract_enforcement_points_return_unsatisfied_without_raising(
+    name, factory, validator
+):
+    satisfied = validator(factory())
+    assert satisfied.architecture_impact_contract == ArchitectureImpactContract(True, True)
+
+    omitted = validator(_with_impact(factory(), None))
+    undetermined = validator(_with_impact(factory(), _deg_uncorroborated()))
+    unsatisfied = ArchitectureImpactContract(required=True, satisfied=False)
+    # An omission and a normalization removal are the same absent input, so
+    # they take the identical path; a present `undetermined` object is never
+    # satisfied merely by being non-None.
+    assert omitted.architecture_impact is None
+    assert omitted.architecture_impact_contract == unsatisfied
+    assert omitted.architecture_impact_degradations == ()
+    assert undetermined.architecture_impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert undetermined.architecture_impact_contract == unsatisfied
+    assert len(undetermined.architecture_impact_degradations) == 1
+    assert undetermined.architecture_impact_degradations[0].element_path == (
+        f"{name}.architecture_impact.status"
+    )
+
+
+@pytest.mark.parametrize("name,factory,validator", _required_validators())
+def test_required_contract_enforcement_points_still_raise_for_unrelated_defects(
+    name, factory, validator
+):
+    text = _with_impact(factory(), None)
+    split = text.index("}\n") + 1
+    payload = json.loads(text[:split])
+    payload["unexpected_key"] = True
+    with pytest.raises(AgentLoopError):
+        validator(json.dumps(payload) + text[split:])
+
+
+def test_unsatisfied_issue_implementation_conflict_returns_parsed_instead_of_raising():
+    text = _deg_issue_implementation(
+        human_requirement_ids=["Requirement 1"],
+        human_requirement_dispositions=[
+            {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "Blocked."}
+        ],
+    )
+    from coding_review_agent_loop.errors import IssueImplementationConflictError
+
+    with pytest.raises(IssueImplementationConflictError):
+        validate_structured_issue_implementation(text, required_architecture_impact_contract=1)
+    parsed = validate_structured_issue_implementation(
+        _with_impact(text, None), required_architecture_impact_contract=1
+    )
+    assert parsed.pr_number == 77
+    assert parsed.architecture_impact_contract.satisfied is False
+
+
+def test_non_required_parse_keeps_contract_unrequired():
+    parsed = validate_structured_coder_followup(_with_impact(_deg_coder_followup(), None))
+    assert parsed.architecture_impact_contract.required is False
+
+
+def test_review_parsers_carry_degradation_records():
+    pr = parse_structured_pr_review(
+        _with_impact(_deg_pr_review(), _deg_uncorroborated()), reviewer="OpenAI Codex"
+    )
+    plan = parse_structured_plan_review(
+        _with_impact(_deg_plan_review(), _deg_uncorroborated()), reviewer="OpenAI Codex"
+    )
+    for parsed, kind in ((pr, "pr_review"), (plan, "plan_review")):
+        assert parsed.architecture_impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+        (record,) = parsed.architecture_impact_degradations
+        assert record.element_path == f"{kind}.architecture_impact.status"
+
+
+def test_patch_replace_near_miss_is_rejected_with_route_forward_diagnostic():
+    from coding_review_agent_loop.protocol import _parse_plan_patch_field_value
+
+    with pytest.raises(AgentLoopError) as error:
+        _parse_plan_patch_field_value(
+            "architecture_impact", _CORROBORATED_IMPACT, context="plan_revision_patch.operations[0].value"
+        )
+    message = str(error.value)
+    assert "`changed`" in message and "`unchanged`" in message
+    assert "`modified` is not accepted in a patch" in message

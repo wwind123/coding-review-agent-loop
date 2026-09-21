@@ -2339,7 +2339,9 @@ def test_invalid_terminal_plan_repair_replaces_persisted_candidate_provenance(
     tmp_path, monkeypatch
 ):
     source_payload = json.loads(structured_plan_state().split("\n", 1)[0])
-    source_payload.pop("architecture_impact")
+    # An unrelated repairable defect: a sole missing assessment is refused
+    # without repair, because repair may not supply one (#925).
+    source_payload["unexpected_key"] = True
     source_candidate = (
         json.dumps(source_payload)
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -2394,7 +2396,9 @@ def test_terminal_plan_repair_provider_failure_does_not_persist_stale_diagnostic
     tmp_path, monkeypatch, outcome, returncode, expected_category
 ):
     payload = json.loads(structured_plan_state().split("\n", 1)[0])
-    payload.pop("architecture_impact")
+    # An unrelated repairable defect: a sole missing assessment is refused
+    # without repair, because repair may not supply one (#925).
+    payload["unexpected_key"] = True
     candidate = (
         json.dumps(payload)
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -2471,7 +2475,9 @@ def test_terminal_transient_plan_repair_is_resumable_provider_failure(
 ):
     """Issue #846: a chain ending in a transient agy failure is not deterministic."""
     payload = json.loads(structured_plan_state().split("\n", 1)[0])
-    payload.pop("architecture_impact")
+    # An unrelated repairable defect: a sole missing assessment is refused
+    # without repair, because repair may not supply one (#925).
+    payload["unexpected_key"] = True
     candidate = (
         json.dumps(payload)
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -10106,3 +10112,287 @@ def test_get_issue_state_reads_with_check_disabled(tmp_path):
     with pytest.raises(AgentLoopError, match=re.escape("`gh` exited 1")):
         get_issue_state(_Runner(), config=make_config(tmp_path), issue_number=99)
     assert seen["check"] is False
+
+
+# --- #925: the architecture_impact contract refusal seam ---------------------
+
+from coding_review_agent_loop.errors import AgentInvocationError as _DegInvocationError  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    validate_structured_coder_followup as _deg_validate_coder_followup,
+    validate_structured_plan_revision as _deg_validate_plan_revision,
+    validate_structured_task_result as _deg_validate_task_result,
+)
+from agent_loop_helpers import structured_coder_followup as _deg_coder_followup  # noqa: E402
+
+_DEG_CORROBORATED = {
+    "status": "modified",
+    "rationale": "The parser gains a degraded status.",
+    "affected_components": ["protocol parser"],
+    "dependencies": ["repair preservation"],
+    "execution_data_flows": ["response -> parser -> seam"],
+    "persistence": ["round metadata degradation records"],
+    "public_contracts": ["architecture_impact status"],
+    "security_boundaries": ["agent payload trust boundary"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the degraded status.",
+}
+_DEG_UNCORROBORATED = {"status": "modified", "rationale": "Something changed."}
+
+
+def _deg_with(rendered, impact, **extra):
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    if impact is None:
+        payload.pop("architecture_impact", None)
+    else:
+        payload["architecture_impact"] = impact
+    payload.update(extra)
+    return json.dumps(payload) + rendered[split:]
+
+
+def _deg_task_text(impact, outcome="opened_pr"):
+    payload = {
+        "schema_version": 1, "kind": "task_result", "state": "blocking",
+        "outcome": outcome, "summary": "Done.",
+    }
+    if outcome == "opened_pr":
+        payload["pr_number"] = 4
+    if impact is not None:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _deg_issue_validate(text):
+    return orchestrator_module._validate_issue_implementation_response(
+        text, human_requirements=(), require_architecture_impact=True
+    )
+
+
+@pytest.mark.parametrize(
+    "impact,records",
+    [(None, []), (_DEG_UNCORROBORATED, ["degraded-to-undetermined"])],
+    ids=["omitted", "uncorroborated"],
+)
+def test_seam_refuses_and_retains_an_unsatisfied_response(tmp_path, impact, records):
+    text = _deg_with(structured_issue_implementation(), impact)
+    runner = _FakeRunner(claude_outputs=[text])
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(_DegInvocationError) as error:
+        orchestrator_module._run_validated_agent(
+            runner, agent="claude", config=config, prompt="Implement.",
+            marker_description="structured issue_implementation result",
+            validate=_deg_issue_validate,
+            require_architecture_impact_contract=True,
+        )
+
+    preserved = error.value.preserved_unsatisfied_response
+    assert preserved is not None and preserved.text == text
+    assert "issue_implementation must include architecture_impact" in preserved.diagnostic
+    assert "`changed` or `unchanged`" in preserved.diagnostic
+    assert [r.outcome for r in preserved.architecture_impact_degradations] == records
+    assert error.value.failure_category == "deterministic"
+    assert "architecture_impact" in str(error.value)
+    # The same retry budget as the former raise: one agent turn, no extras.
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]) == 1
+
+
+def test_seam_accepts_a_corroborated_near_miss_with_its_record(tmp_path):
+    text = _deg_with(structured_issue_implementation(), _DEG_CORROBORATED)
+    runner = _FakeRunner(claude_outputs=[text])
+    response = orchestrator_module._run_validated_agent(
+        runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+        prompt="Implement.", marker_description="structured issue_implementation result",
+        validate=_deg_issue_validate, require_architecture_impact_contract=True,
+    )
+    assert response.marker_value.architecture_impact.status == "changed"
+    assert [r.outcome for r in response.marker_value.architecture_impact_degradations] == [
+        "normalized-to-changed"
+    ]
+
+
+def test_unsatisfied_conflict_payload_is_not_hidden_by_the_conflict_wrapper():
+    blocked = [{"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "Blocked."}]
+    text = _deg_with(
+        structured_issue_implementation(
+            human_requirement_ids=["Requirement 1"], human_requirement_dispositions=blocked
+        ),
+        None,
+    )
+    # The typed conflict is raised only for a satisfied contract; an
+    # unsatisfied one returns the parsed payload for the seam to refuse.
+    result = validate_structured_issue_implementation(text, required_architecture_impact_contract=1)
+    assert result.pr_number == 77
+    assert orchestrator_module.architecture_impact_contract_unsatisfied(result)
+    # A conflict wrapper around an unsatisfied payload is still unsatisfied.
+    wrapped = orchestrator_module._TerminalIssueImplementationConflict(result)
+    assert orchestrator_module.architecture_impact_contract_unsatisfied(wrapped)
+
+
+def test_unsatisfied_blocking_task_is_not_hidden_by_the_no_pr_wrapper(tmp_path):
+    result = orchestrator_module._require_task_implementation_result(
+        _deg_task_text(None, outcome="blocking"), required_architecture_impact_contract=1
+    )
+    assert not isinstance(result, orchestrator_module._TerminalNoPrImplementation)
+    assert orchestrator_module.architecture_impact_contract_unsatisfied(result)
+    satisfied = orchestrator_module._require_task_implementation_result(
+        _deg_task_text({"status": "unchanged", "rationale": "No change."}, outcome="blocking"),
+        required_architecture_impact_contract=1,
+    )
+    assert isinstance(satisfied, orchestrator_module._TerminalNoPrImplementation)
+
+    runner = _FakeRunner(claude_outputs=[_deg_task_text(None, outcome="blocking")])
+    with pytest.raises(_DegInvocationError) as error:
+        orchestrator_module._run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Task.", marker_description="structured task_result JSON",
+            validate=lambda text: orchestrator_module._require_task_implementation_result(
+                text, required_architecture_impact_contract=1
+            ),
+            require_architecture_impact_contract=True,
+        )
+    assert "task_result must include architecture_impact" in (
+        error.value.preserved_unsatisfied_response.diagnostic
+    )
+
+
+def test_unknown_result_type_fails_closed(tmp_path):
+    with pytest.raises(AgentLoopError, match="not an enumerated"):
+        orchestrator_module.architecture_impact_contract_unsatisfied(object())
+    with pytest.raises(AgentLoopError, match="not an enumerated"):
+        orchestrator_module._architecture_result_fields(object())
+    runner = _FakeRunner(claude_outputs=[structured_issue_implementation()])
+    with pytest.raises(_DegInvocationError, match="not an enumerated"):
+        orchestrator_module._run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Implement.", marker_description="result",
+            validate=lambda text: object(), require_architecture_impact_contract=True,
+        )
+    # Contract-free results pass through.
+    for value in ("clarification", 77, orchestrator_module._TerminalNoPrImplementation("clarification")):
+        assert orchestrator_module.architecture_impact_contract_unsatisfied(value) is False
+
+
+def test_metadata_writer_requires_the_whole_result():
+    config_like = SimpleNamespace(architecture_context=None)
+    with pytest.raises(TypeError):
+        orchestrator_module._architecture_metadata_fields(config_like, impact=None)
+
+
+@pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
+def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kind):
+    factory = structured_plan_state if kind == "plan_state" else structured_plan_revision
+    source = _deg_with(factory(), _DEG_UNCORROBORATED, unexpected_key=True)
+    repaired = _deg_with(factory(), None)
+    validator = (
+        (lambda text: validate_structured_plan_state(text, required_architecture_impact_contract=1))
+        if kind == "plan_state"
+        else (lambda text: _deg_validate_plan_revision(text, required_architecture_impact_contract=1))
+    )
+    persisted = []
+    runner = _FakeRunner(claude_outputs=[source])
+    with patch.object(orchestrator_module, "attempt_repair", lambda raw, cmd, **kw: repaired):
+        with pytest.raises(_DegInvocationError) as error:
+            orchestrator_module._run_validated_agent(
+                runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+                prompt="Plan.", marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+                validate=validator, use_repair=True, repair_expected_kind=kind,
+                require_architecture_impact_contract=True,
+                plan_validation_failure_handler=lambda exhaustion, err: persisted.append(exhaustion),
+            )
+
+    assert error.value.failure_category == "deterministic"
+    assert error.value.failure_category != "repair-provider-failure"
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None
+    assert exhaustion.candidate_kind == kind
+    assert exhaustion.candidate_text == repaired
+    assert exhaustion.candidate_digest == hashlib.sha256(repaired.encode()).hexdigest()
+    assert f"{kind} must include architecture_impact" in exhaustion.diagnostic
+    assert persisted == [exhaustion]
+    preserved = error.value.preserved_unsatisfied_response
+    # The retained candidate keeps its out-of-band record.
+    assert preserved.text == repaired
+    assert [r.outcome for r in preserved.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+    assert "undetermined" not in preserved.text
+
+
+def _deg_round_trip(result):
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+        **orchestrator_module._architecture_metadata_fields(
+            make_config_for_metadata(), result=result
+        ),
+    )
+    body = _attach_round_metadata("Coder round summary.\n-- Anthropic Claude", metadata)
+    return metadata, body, _decode_round_metadata(
+        re.search(r"AGENT_LOOP_META: ([A-Za-z0-9+/=_-]+)", body).group(1)
+    )
+
+
+def make_config_for_metadata():
+    return SimpleNamespace(architecture_context=None)
+
+
+@pytest.mark.parametrize(
+    "name,parse",
+    [
+        ("issue_implementation", lambda: validate_structured_issue_implementation(
+            _deg_with(structured_issue_implementation(), _DEG_CORROBORATED),
+            required_architecture_impact_contract=1)),
+        ("task_result", lambda: _deg_validate_task_result(
+            _deg_task_text(_DEG_CORROBORATED), required_architecture_impact_contract=1)),
+        ("plan_state", lambda: validate_structured_plan_state(
+            _deg_with(structured_plan_state(), _DEG_CORROBORATED),
+            required_architecture_impact_contract=1)),
+        ("plan_revision", lambda: _deg_validate_plan_revision(
+            _deg_with(structured_plan_revision(), _DEG_CORROBORATED),
+            required_architecture_impact_contract=1)),
+        ("coder_followup", lambda: _deg_validate_coder_followup(
+            _deg_with(_deg_coder_followup(), _DEG_CORROBORATED),
+            required_architecture_impact_contract=1)),
+    ],
+)
+def test_accepted_non_review_carrier_persists_and_renders_its_record(name, parse):
+    parsed = parse()
+    metadata, body, decoded = _deg_round_trip(parsed)
+    assert metadata.architecture_impact["status"] == "changed"
+    (record,) = decoded.architecture_impact_degradations
+    assert record == parsed.architecture_impact_degradations[0]
+    assert record.element_path == f"{name}.architecture_impact.status"
+    assert record.outcome == "normalized-to-changed"
+    assert "### Parse degradations" in body
+    assert "normalized-to-changed" in body
+
+
+def test_accepted_conflict_wrapper_persists_its_record():
+    parsed = validate_structured_issue_implementation(
+        _deg_with(structured_issue_implementation(), _DEG_CORROBORATED)
+    )
+    wrapped = orchestrator_module._TerminalIssueImplementationConflict(parsed)
+    fields = orchestrator_module._architecture_metadata_fields(make_config_for_metadata(), result=wrapped)
+    assert [r.outcome for r in fields["architecture_impact_degradations"]] == ["normalized-to-changed"]
+
+
+def test_plan_first_round_metadata_carries_a_corroborated_plan_state_record(tmp_path):
+    plan = _deg_with(structured_plan_state(summary="Add schema helpers."), _DEG_CORROBORATED)
+    runner = _FakeRunner(
+        claude_outputs=[plan],
+        codex_outputs=["Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path, plan_execution_mode="decompose-only", max_rounds=1)
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except (AgentLoopError, StopIteration, IndexError):
+        pass  # only the posted planning round matters here
+    bodies = [comment["body"] for comment in runner.issue_comments]
+    plan_rounds = [c for c in bodies if "AGENT_LOOP_META" in c and "### Parse degradations" in c]
+    assert plan_rounds, "the planning round must surface its degradation record"
+    decoded = _decode_round_metadata(
+        re.search(r"AGENT_LOOP_META: ([A-Za-z0-9+/=_-]+)", plan_rounds[0]).group(1)
+    )
+    assert [r.outcome for r in decoded.architecture_impact_degradations] == ["normalized-to-changed"]
+    assert decoded.architecture_impact["status"] == "changed"

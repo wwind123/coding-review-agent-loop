@@ -669,10 +669,14 @@ def test_fresh_plan_decomposition_requires_architecture_impact():
     payload_dict = json.loads(payload)
     payload_dict.pop("architecture_impact")
     payload_without_impact = json.dumps(payload_dict)
-    with pytest.raises(AgentLoopError, match="architecture_impact"):
-        parse_plan_decomposition(
-            payload_without_impact, required_architecture_impact_contract=1
-        )
+    # An absent required assessment is a field-scope defect (#925): the
+    # decomposition parses, carrying an unsatisfied contract for the seam.
+    parsed = parse_plan_decomposition(
+        payload_without_impact, required_architecture_impact_contract=1
+    )
+    assert parsed.architecture_impact is None
+    assert parsed.architecture_impact_contract.required is True
+    assert parsed.architecture_impact_contract.satisfied is False
 
 def test_parse_plan_decomposition_accepts_normalized_earlier_phase_dependency():
     parsed = parse_plan_decomposition(
@@ -3105,3 +3109,181 @@ def test_human_first_topology_reports_a_later_closed_human_stage(tmp_path, capsy
     )
     assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+# --- #925: degraded decomposition assessments --------------------------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    create_decomposition_child_issues as _deg_create_children,
+)
+from coding_review_agent_loop.errors import AgentInvocationError as _DegInvocationError  # noqa: E402
+
+_DEG_DECOMP_PHASE = {
+    "title": "Schema helpers",
+    "scope": "Add parser dataclasses and tests.",
+    "non_goals": "No live orchestrator switch.",
+    "dependency_notes": "First phase; no dependencies.",
+    "rollout_risk": "low - internal only.",
+    "validation": "Run python -m pytest tests/test_agent_loop.py.",
+    "parent_context": "Approved plan slice: add schema helpers and preserve behavior.",
+    "automation": "agent-pr",
+    "depends_on": [],
+}
+_DEG_DECOMP_IMPACT = {
+    "status": "modified",
+    "rationale": "Decomposition changes the parser.",
+    "affected_components": ["protocol parser"],
+    "dependencies": ["repair preservation"],
+    "execution_data_flows": ["response -> parser -> seam"],
+    "persistence": ["round metadata"],
+    "public_contracts": ["architecture_impact status"],
+    "security_boundaries": ["agent payload trust boundary"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the degraded status.",
+}
+
+
+def _deg_decomposition(impact):
+    payload = json.loads(plan_decomposition_json(_DEG_DECOMP_PHASE))
+    if impact is None:
+        payload.pop("architecture_impact")
+    else:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload)
+
+
+def _deg_decompose_runner(decomposition_outputs):
+    return FakeRunner(
+        claude_outputs=[structured_plan_state(summary="Add schema helpers."), *decomposition_outputs],
+        codex_outputs=["Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"],
+        issue_urls=["https://github.com/OWNER/REPO/issues/101"],
+    )
+
+
+@pytest.mark.parametrize(
+    "impact",
+    [None, {"status": "modified", "rationale": "Something changed."}],
+    ids=["omitted", "uncorroborated"],
+)
+def test_degraded_decomposition_publishes_no_child_issue_or_checkpoint(tmp_path, impact):
+    runner = _deg_decompose_runner([_deg_decomposition(impact)])
+    config = make_config(tmp_path, plan_execution_mode="decompose-only", agent_max_retries=0)
+
+    with pytest.raises(_DegInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert runner.issues == []
+    assert not any("Topology checkpoint recorded" in comment for comment in runner.comments)
+    preserved = error.value.preserved_unsatisfied_response
+    assert preserved is not None
+    assert "architecture_impact" in preserved.diagnostic
+    assert "`changed` or `unchanged`" in preserved.diagnostic
+    expected = [] if impact is None else ["degraded-to-undetermined"]
+    assert [r.outcome for r in preserved.architecture_impact_degradations] == expected
+    assert error.value.failure_category == "deterministic"
+
+
+def test_create_children_guard_refuses_an_unsatisfied_decomposition(tmp_path):
+    decomposition = parse_plan_decomposition(
+        _deg_decomposition(None), required_architecture_impact_contract=1
+    )
+    runner = FakeRunner()
+    with pytest.raises(AgentLoopError, match="absent or undetermined"):
+        _deg_create_children(
+            runner,
+            config=make_config(tmp_path),
+            parent_issue=56,
+            approved_plan=structured_plan_state(summary="Add schema helpers."),
+            decomposition=decomposition,
+        )
+    assert runner.issues == []
+    assert runner.comments == []
+
+
+def _deg_checkpoint_comment(runner):
+    (checkpoint,) = [c for c in runner.comments if "Topology checkpoint recorded" in c]
+    return checkpoint
+
+
+def test_accepted_corroborated_decomposition_surfaces_records_without_changing_checkpoint(tmp_path):
+    degraded_runner = _deg_decompose_runner([_deg_decomposition(_DEG_DECOMP_IMPACT)])
+    assert run_issue_loop(
+        degraded_runner, issue_number=56,
+        config=make_config(tmp_path / "degraded", plan_execution_mode="decompose-only"),
+        plan_first=True,
+    ) == 0
+    clean_runner = _deg_decompose_runner(
+        [_deg_decomposition(dict(_DEG_DECOMP_IMPACT, status="changed"))]
+    )
+    assert run_issue_loop(
+        clean_runner, issue_number=56,
+        config=make_config(tmp_path / "clean", plan_execution_mode="decompose-only"),
+        plan_first=True,
+    ) == 0
+
+    assert len(degraded_runner.issues) == 1
+    degradation_comments = [
+        c for c in degraded_runner.comments if "Decomposition parse degradations" in c
+    ]
+    assert len(degradation_comments) == 1
+    assert "normalized-to-changed" in degradation_comments[0]
+    assert "<!--" not in degradation_comments[0]
+    assert not any("parse degradations" in c for c in clean_runner.comments)
+    # The topology checkpoint payload and body are identical to an undegraded one.
+    assert _deg_checkpoint_comment(degraded_runner) == _deg_checkpoint_comment(clean_runner)
+
+
+def test_valid_checkpoint_reuses_unchanged_through_the_orchestrator_decode(tmp_path):
+    """A pre-existing checkpoint is reused with no contract check and no records."""
+    first = _deg_decompose_runner([_deg_decomposition(dict(_DEG_DECOMP_IMPACT, status="changed"))])
+    first.issue_urls = []  # child creation fails after the checkpoint is posted
+    plan = structured_plan_state(summary="Add schema helpers.")
+    with pytest.raises(Exception):
+        run_issue_loop(
+            first, issue_number=56,
+            config=make_config(tmp_path / "first", plan_execution_mode="decompose-only"),
+            plan_first=True,
+        )
+    checkpoint_body = _deg_checkpoint_comment(first)
+    restored = find_existing_topology_checkpoint(
+        (IssueComment(author="bot", created_at=None, body=checkpoint_body),),
+        parent_issue=56,
+        plan_hash=approved_plan_hash(plan),
+        mode="decompose-only",
+    )
+    assert restored is not None and restored.architecture_impact["status"] == "changed"
+
+    def plan_record(body, role, state=None):
+        return {
+            "author": {"login": "bot"},
+            "createdAt": "2026-05-23T00:00:00Z",
+            "body": _attach_round_metadata(
+                body,
+                PostedRoundMetadata(
+                    flow="plan", role=role, agent="Claude" if role == "coder" else "Codex",
+                    round_number=1, subject=_plan_subject(plan), state=state,
+                ),
+            ),
+        }
+
+    second = FakeRunner(
+        issue_comments=[
+            plan_record(plan, "coder"),
+            plan_record(
+                "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+                "reviewer", "approved",
+            ),
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:02Z", "body": checkpoint_body},
+        ],
+        issue_urls=["https://github.com/OWNER/REPO/issues/101"],
+    )
+    assert run_issue_loop(
+        second, issue_number=56,
+        config=make_config(tmp_path / "second", plan_execution_mode="decompose-only"),
+        plan_first=True,
+    ) == 0
+    # Reused without a new decomposition turn, with no degradation surfacing.
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in second.commands)
+    assert len(second.issues) == 1
+    assert not any("parse degradations" in c for c in second.comments)

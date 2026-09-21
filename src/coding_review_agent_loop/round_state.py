@@ -26,6 +26,7 @@ from .comment_rendering import (
     decode_execution_recommendation_marker,
     RISK_TEST_MATRIX_MARKER_RE,
     decode_risk_test_matrix_marker,
+    render_parse_degradations_section,
 )
 from .local_test_evidence import canonicalize_bounded_evidence
 from .protocol_markers import (
@@ -39,6 +40,8 @@ from .workdir_guard import validate_checkout_inspected_evidence
 from .protocol import (
     HTML_COMMENT_RE,
     SIGNATURE_RE,
+    ParseDegradation,
+    parse_degradation_payload,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
     ParsedDiscussFinalSynthesis,
@@ -201,6 +204,9 @@ class PostedRoundMetadata:
     qualification_checkpoint: "QualificationCheckpoint | None" = None
     architecture_identity: dict | None = None
     architecture_impact: dict | None = None
+    # Parser-derived degradation records for this round's assessment (#924).
+    # Only the orchestrator writes metadata, so agents cannot author these.
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
     architecture_contract_version: int | None = None
     # Planning generation discriminator.  Absent is intentionally legacy
     # undecided; generation 1 is required to resume a fresh recommendation.
@@ -1915,6 +1921,11 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
     }
     if any(value not in (None, (), []) for value in matrix_values.values()):
         payload.update(matrix_values)
+    if metadata.architecture_impact_degradations:
+        # Optional: omitted when empty so undegraded rounds keep their shape.
+        payload["architecture_impact_degradations"] = [
+            record.to_payload() for record in metadata.architecture_impact_degradations
+        ]
     if metadata.qualification_checkpoint is not None:
         payload["qualification_checkpoint"] = (
             metadata.qualification_checkpoint.as_dict()
@@ -1922,6 +1933,19 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             else metadata.qualification_checkpoint
         )
     return encode_mapping(payload)
+
+
+def _decode_architecture_impact_degradations(value: object) -> tuple[ParseDegradation, ...]:
+    """Rehydrate records strictly; historical or malformed entries yield none."""
+    if not isinstance(value, list):
+        return ()
+    records: list[ParseDegradation] = []
+    for item in value[:32]:
+        try:
+            records.append(parse_degradation_payload(item))
+        except AgentLoopError:
+            continue
+    return tuple(records)
 
 
 def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
@@ -2020,6 +2044,9 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             architecture_impact=(
                 payload.get("architecture_impact")
                 if isinstance(payload.get("architecture_impact"), dict) else None
+            ),
+            architecture_impact_degradations=_decode_architecture_impact_degradations(
+                payload.get("architecture_impact_degradations")
             ),
             architecture_contract_version=(
                 int(payload["architecture_contract_version"])
@@ -2165,6 +2192,11 @@ def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:
 
 def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
     marker = f"<!-- AGENT_LOOP_META: {_encode_round_metadata(metadata)} -->"
+    degradations = render_parse_degradations_section(metadata.architecture_impact_degradations)
+    if degradations is not None and degradations not in str(body):
+        # Surface degraded elements in the round summary so a degraded round
+        # never reads as fully assessed.
+        body = _insert_before_trailing_markers(str(body), degradations)
     lines = body.splitlines()
     index = len(lines)
     while index > 0 and not lines[index - 1].strip():
@@ -2188,6 +2220,20 @@ def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
     if "AGENT_LOOP_META" not in expected:
         expected = (*expected, "AGENT_LOOP_META")
     return TrustedBody.canonical(rendered, expected_tokens=expected)
+
+
+def _insert_before_trailing_markers(body: str, section: str) -> str:
+    lines = body.splitlines()
+    index = len(lines)
+    while index > 0:
+        candidate = lines[index - 1]
+        if not candidate.strip() or HTML_COMMENT_RE.match(candidate) or SIGNATURE_RE.match(candidate):
+            index -= 1
+            continue
+        break
+    prefix = "\n".join(lines[:index]).rstrip("\n")
+    suffix = "\n".join(lines[index:]).lstrip("\n")
+    return "\n\n".join(part for part in (prefix, section, suffix) if part)
 
 
 def _strip_round_metadata(body: str) -> str:

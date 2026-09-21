@@ -39,7 +39,12 @@ from .protocol import (
     ExecutionScopeItem,
     ExecutionStrategyRecommendation,
     RiskTestMatrix,
+    ARCHITECTURE_IMPACT_DECLARED_STATUSES,
+    ArchitectureImpactContract,
+    ParseDegradation,
+    architecture_impact_contract_for,
     parse_architecture_impact,
+    parse_architecture_impact_degradable,
     parse_risk_test_matrix,
     parse_execution_recommendation_payload,
     parse_signed_human_requirement_body,
@@ -132,6 +137,8 @@ class PlanDecomposition:
     final_integration_work: ExecutionAllocation | None = None
     rationale: str | None = None
     caveats: tuple[str, ...] = ()
+    architecture_impact_contract: ArchitectureImpactContract = ArchitectureImpactContract()
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -549,14 +556,19 @@ def parse_plan_decomposition(
     payload = _extract_json_object(text)
     if payload.get("kind") not in (None, "plan_decomposition"):
         raise AgentLoopError("Invalid plan decomposition: `kind` must be `plan_decomposition`.")
-    impact = (
-        parse_architecture_impact(payload["architecture_impact"], context="plan_decomposition.architecture_impact")
-        if "architecture_impact" in payload else None
-    )
-    if required_architecture_impact_contract == 1 and impact is None:
-        raise AgentLoopError(
-            "plan_decomposition must include architecture_impact for this fresh contract turn."
+    # Fresh decomposition responses degrade only the status near miss; an
+    # absent or undetermined required assessment is returned as an
+    # unsatisfied contract for the orchestration seam to refuse (#925).
+    impact = None
+    degradations: tuple[ParseDegradation, ...] = ()
+    if "architecture_impact" in payload:
+        impact, record = parse_architecture_impact_degradable(
+            payload["architecture_impact"], context="plan_decomposition.architecture_impact"
         )
+        degradations = () if record is None else (record,)
+    impact_contract = architecture_impact_contract_for(
+        impact, required=required_architecture_impact_contract == 1
+    )
     phases_payload = payload.get("phases")
     if not isinstance(phases_payload, list) or not phases_payload:
         raise AgentLoopError("Invalid plan decomposition: `phases` must be a non-empty list.")
@@ -620,7 +632,12 @@ def parse_plan_decomposition(
                 depends_on=tuple(value.strip() for value in depends_on_payload),
             )
         )
-    return PlanDecomposition(phases=tuple(phases), architecture_impact=impact)
+    return PlanDecomposition(
+        phases=tuple(phases),
+        architecture_impact=impact,
+        architecture_impact_contract=impact_contract,
+        architecture_impact_degradations=degradations,
+    )
 
 
 def _issue_number_from_url(issue_url: str | None) -> int | None:
@@ -1547,6 +1564,17 @@ def create_decomposition_child_issues(
     risk_test_matrix: RiskTestMatrix | dict[str, object] | None = None,
 ) -> tuple[CreatedPhaseIssue, ...] | NeedsHumanDecision:
     """Preflight, recover, and create one immutable decomposition topology."""
+    contract = decomposition.architecture_impact_contract
+    impact = decomposition.architecture_impact
+    if (contract.required and not contract.satisfied) or (
+        impact is not None and impact.status not in ARCHITECTURE_IMPACT_DECLARED_STATUSES
+    ):
+        # Defense in depth: the validation seam already refuses this, and no
+        # GitHub mutation or checkpoint may follow a degraded assessment.
+        raise AgentLoopError(
+            "Plan decomposition architecture_impact is absent or undetermined; "
+            "refusing to create child issues or publish a topology checkpoint."
+        )
     plan_hash = approved_plan_hash(approved_plan)
     phases = tuple(decomposition.phases)
     if not phases:

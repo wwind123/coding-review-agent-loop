@@ -1302,7 +1302,7 @@ RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
     "transient_provider_error", "fresh_contract_integrity", "semantic_patch_integrity",
-    "review_substance_integrity",
+    "review_substance_integrity", "architecture_contract_unsatisfied",
 ]
 
 
@@ -1319,6 +1319,9 @@ class RepairAttemptResult:
     fallback_planned: bool
     validation_result: object | None = None
     integrity_contract: Literal["execution_recommendation", "risk_test_matrix"] | None = None
+    # Out-of-band parse degradation records derived by pre-repair
+    # normalization.  They never appear in any text a repair model sees.
+    architecture_impact_degradations: tuple = ()
 
 
 _KNOWN_ERROR_RE = re.compile(
@@ -1703,6 +1706,7 @@ def execute_repair(
     run_id: str | None,
     usage_context: RunUsageContext | None,
     validate: Callable[[str], object],
+    forbid_architecture_impact: bool = False,
     **prompt_kwargs: object,
 ) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
     """Run the configured repair chain and validate each candidate."""
@@ -1879,6 +1883,7 @@ def execute_repair(
                         allow_legacy_matrix_removal=bool(
                             prompt_kwargs.get("reject_unsolicited_risk_test_matrix_contract")
                         ),
+                        forbid_architecture_impact=forbid_architecture_impact,
                     )
                 except Exception as exc:
                     if outcome == "succeeded":
