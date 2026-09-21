@@ -10106,3 +10106,110 @@ def test_get_issue_state_reads_with_check_disabled(tmp_path):
     with pytest.raises(AgentLoopError, match=re.escape("`gh` exited 1")):
         get_issue_state(_Runner(), config=make_config(tmp_path), issue_number=99)
     assert seen["check"] is False
+
+
+# ---------------------------------------------------------------------------
+# Approved child plan that fails the inherited check before any handoff (#936)
+# ---------------------------------------------------------------------------
+
+import test_child_plan_provenance as _m936_cpp  # noqa: E402
+
+
+def _m936_patch(base_plan_text, row, *, summary):
+    """Semantic revision with no reviewer item: the guard mints none."""
+    patch = json.loads(_m936_cpp._semantic_patch(base_plan_text, row, summary=summary).split("\n<!--", 1)[0])
+    patch["prior_plan_item_dispositions"] = []
+    return json.dumps(patch) + _m936_cpp.PLAN_FOOTER
+
+
+def _m936_historical_approved_plan(tmp_path, *, reviewers_kwargs=None):
+    """A weakened child plan approved before the inherited check existed."""
+    weak = _m936_cpp._child_plan_state(_m936_cpp._weak_child_row())
+    first = _m936_cpp._ChildPlanningRunner(
+        claude_outputs=[weak],
+        codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
+    )
+    assert orchestrator_module.run_issue_loop(
+        first, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
+    ) == 0
+    return weak, list(first.issue_comments)
+
+
+def test_m936_approved_inadmissible_plan_is_revised_instead_of_dead_ending(tmp_path, monkeypatch):
+    weak, history = _m936_historical_approved_plan(tmp_path)
+    _m936_cpp._bind_child_planning(monkeypatch)
+    good = _m936_patch(weak, _m936_cpp._child_row(), summary="Inherited rows restored.")
+    resumed = _m936_cpp._ChildPlanningRunner(
+        issue_comments=list(history),
+        claude_outputs=[good],
+        codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
+    )
+    assert orchestrator_module.run_issue_loop(
+        resumed, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
+    ) == 0
+
+    posted = [str(item["body"]) for item in resumed.issue_comments[len(history):]]
+    audits = [body for body in posted if "is inadmissible under the inherited-matrix contract" in body]
+    assert len(audits) == 1 and "AGENT_LOOP_META" not in audits[0]
+    planner_prompts = _m936_cpp._agent_prompts(resumed, "claude")
+    assert len(planner_prompts) == 1
+    assert "Trusted orchestration correction record" in planner_prompts[0]
+    assert "row-owned: forbidden_side_effects dropped" in planner_prompts[0]
+    assert "Orchestrator inherited-matrix check (not a reviewer finding)" in planner_prompts[0]
+    # No synthetic reviewer item and no signed record or digest is involved.
+    revised = [body for body in posted if "Inherited rows restored." in body]
+    assert revised
+    from coding_review_agent_loop.round_state import _decode_round_metadata
+    from coding_review_agent_loop.round_transport import ROUND_RESUME_MARKER_RE
+
+    metadata = _decode_round_metadata(ROUND_RESUME_MARKER_RE.search(revised[0]).group("payload"))
+    assert metadata.round_number == 2 and metadata.prior_items == ()
+    assert metadata.plan_supersession_digest is None
+    # The revised plan was reviewed again by the board and only then approved.
+    assert len(_m936_cpp._agent_prompts(resumed, "codex")) == 1
+    assert "Inherited coverage check FAILED" not in _m936_cpp._agent_prompts(resumed, "codex")[0]
+
+
+def test_m936_guard_audit_comment_is_not_duplicated_and_recheck_exhaustion_persists(
+    tmp_path, monkeypatch
+):
+    weak, history = _m936_historical_approved_plan(tmp_path)
+    _m936_cpp._bind_child_planning(monkeypatch)
+    still_weak = _m936_patch(weak, None, summary=_m936_cpp.WEAK_SUMMARY)
+    resumed = _m936_cpp._ChildPlanningRunner(
+        issue_comments=list(history), claude_outputs=[still_weak] * 3,
+    )
+    with pytest.raises(AgentLoopError, match="consecutive plan candidates that weaken"):
+        orchestrator_module.run_issue_loop(
+            resumed, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
+        )
+    assert len(_m936_cpp._agent_prompts(resumed, "claude")) == 3
+    assert _m936_cpp.WEAK_SUMMARY not in _m936_cpp._published(resumed)
+    assert len(resumed.diagnostic_posts) == 1
+    # A rerun finds the audit comment and does not post it again.
+    rerun = _m936_cpp._ChildPlanningRunner(
+        issue_comments=list(resumed.issue_comments), claude_outputs=[still_weak] * 3,
+    )
+    with pytest.raises(AgentLoopError):
+        orchestrator_module.run_issue_loop(
+            rerun, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
+        )
+    audits = [
+        item for item in rerun.issue_comments
+        if "is inadmissible under the inherited-matrix contract" in str(item["body"])
+    ]
+    assert len(audits) == 1
+
+
+def test_m936_guard_at_max_rounds_names_the_round_budget(tmp_path, monkeypatch):
+    _weak, history = _m936_historical_approved_plan(tmp_path)
+    _m936_cpp._bind_child_planning(monkeypatch)
+    resumed = _m936_cpp._ChildPlanningRunner(issue_comments=list(history))
+    config = make_config(
+        tmp_path, max_rounds=1, plan_execution_mode="plan-only",
+        execution_strategy_contract_required=True,
+    )
+    with pytest.raises(AgentLoopError, match="Raise --max-rounds"):
+        orchestrator_module.run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
+    assert _m936_cpp._agent_prompts(resumed, "claude") == []
+    assert len(resumed.issue_comments) == len(history)

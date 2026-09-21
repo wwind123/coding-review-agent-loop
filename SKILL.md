@@ -254,6 +254,13 @@ and then inspects phase 1:
   returned `resume_hint` to run the child with `--plan-first
   --plan-execution-mode auto`; implementation may begin only after that child
   plan is reviewed and approved.
+- If an already-approved child plan is reported as inadmissible under the
+  inherited-matrix contract, follow the route the diagnostic prints: rerun child
+  planning when no implementation PR exists yet, or have a human post the signed
+  `child-plan-supersession` record on the child issue and then rerun the
+  child's `--plan-first` command, which re-plans it and rebinds the same PR.
+  Never edit handoff records by hand. See "Re-planning an approved child plan"
+  in `docs/local_agent_loop.md`.
 - If phase 1 is `human-action` or `manual-close`, it prints JSON identifying the
   child issue and stops without posting a phase handoff or running the coder.
 - If a matching phase handoff marker already exists, it prints state

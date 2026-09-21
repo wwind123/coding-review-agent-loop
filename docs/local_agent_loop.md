@@ -115,6 +115,97 @@ validation applies the same comparison on parent dispatch, direct child
 invocation, and skill mode, so an already approved child plan that satisfies
 these rules resumes PR review without replanning.
 
+### Re-planning an approved child plan
+
+The planning-time check above prevents a *new* child plan from being approved
+while it weakens inherited rows. A plan approved earlier, for example before the
+contract tightened, is a historical artifact that can still fail the check. It
+is never grandfathered and the comparison is never relaxed; instead the failure
+names one of two supported routes.
+
+**Before any implementation handoff.** When a resumed, fully approved child
+plan fails the check, the loop posts one plain audit comment (keyed by the plan
+hash, so a rerun does not repeat it) and runs an enforced revision turn: the
+planner receives the field-level diagnostic attributed to the orchestrator, no
+reviewer item is invented, the revision is mechanically rechecked before it is
+published (at most two replans, with the usual persisted diagnostic on
+exhaustion), and the next round runs the complete reviewer board with no
+approval carried from the superseded plan. If the round budget is already
+spent, the run stops with a message naming `--max-rounds`. No signed record is
+needed here, because nothing downstream is bound to the plan.
+
+**After a handoff, with an open PR.** Issue mode judges the handed-off plan
+before it resolves the canonical PR. If the plan is inadmissible and no signed
+record matches, the run stops before any agent turn or write, printing the
+weakening diagnostic, this record pre-filled for the child, and the rerun
+command:
+
+````markdown
+Child plan supersession:
+
+```json
+{
+  "child_issue": 925,
+  "kind": "child-plan-supersession",
+  "parent_issue": 924,
+  "rationale": "Approved before the inherited-matrix contract tightened.",
+  "schema_version": 1,
+  "stage_id": "stage-1",
+  "superseded_plan_hash": "<16-hex plan hash printed by the diagnostic>"
+}
+```
+-- Human Reviewer
+````
+
+The record is read only from the child issue and only from a comment carrying
+the standalone human reviewer signature. Malformed or unsigned records are
+reported and ignored. A signed record naming another child, parent, or stage
+stops for a human decision. Identical duplicates collapse; records for different
+superseded hashes coexist (one per historical re-plan); two distinct records for
+the same superseded hash always stop for a human decision.
+
+With exactly one matching record and an open canonical PR, planning reopens:
+
+- The record's digest is written into the round metadata of every planner round
+  of the re-plan. Only a plan whose planner rounds start from the superseded
+  plan, chain to each other without a gap, all carry that digest, were posted
+  after the signed comment, and resolve to one discoverable signed record is
+  treated as produced by the authorized re-plan. A later plan that predates or
+  bypasses the authorization, a round bound to another record, a gap, or a
+  deleted record fails closed before any agent runs.
+- When the revision is approved, the existing PR is re-authenticated (open, same
+  number) and rebound by **one** issue comment containing the superseding
+  issue-to-PR handoff record and a rebind audit record (child, PR, both plan
+  hashes, digest, first re-plan round, approved round). The PR-side closing
+  contract is never rewritten, so an interruption leaves either the old binding
+  (the rerun performs the rebind only) or the new one (the rerun resumes the
+  PR). The write is skipped when it already exists. A plan-only invocation
+  stops after approval; the next rerun performs only the rebind.
+- The PR-side closing contract keeps authenticating against the closing-contract
+  lineage base: the most recent issue-side handoff record that is not a same-PR
+  equal-ID plan replacement. The plan hash comes from the latest record. The
+  closing-ID contract digest never identifies a plan replacement, since every
+  unchanged-ID rebind shares it.
+- Every path on which a replacement plan can become a PR's plan context, issue
+  entry, `agent-loop pr <n>` entry, and mid-run adoption at a qualification
+  gate, runs one verifier: the rebind audit record must be in the same comment
+  and agree with the handoff, the digest-bound rounds, and a discoverable signed
+  record, and the replacement plan must itself pass the inherited check.
+  Otherwise the run stops with a human-repair diagnostic and posts nothing.
+  PR reviewer approvals are keyed by plan hash and subject, so none recorded
+  before the rebind counts under the new plan.
+
+`agent-loop pr <n>` never re-plans or rebinds; it prints the issue-mode route.
+Keep the signed record on the child issue after the rebind. Re-planning
+continues the child's round numbering, so a higher `--max-rounds` may be needed.
+Not supported: abandoning or replacing the PR, re-planning direct-implementation
+or non-child issues, parent-plan revision, rewriting the PR-side contract, and
+any unsigned or flag-only bypass once a handoff exists.
+
+**Migration note.** A tightened inherited-matrix contract makes children
+approved under the looser contract inadmissible the next time the loop touches
+them. Both routes above are the intended migration path.
+
 ### Risk-based mode and transition matrices
 
 For planning work involving multiple modes, lifecycle transitions,

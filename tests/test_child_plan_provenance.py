@@ -1968,7 +1968,9 @@ def test_m931_historical_weakened_plan_is_blocked_in_review_and_never_approved(
         issue_comments=[first.issue_comments[0]],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    with pytest.raises(AgentLoopError, match="row-owned: forbidden_side_effects dropped"):
+    # The weakened plan is never approved for implementation: the guard sends
+    # it to an enforced revision turn (#936), which this script does not supply.
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
         orchestrator.run_issue_loop(
             resumed, issue_number=56, config=_plan_config(tmp_path), plan_first=True
         )
@@ -1976,6 +1978,8 @@ def test_m931_historical_weakened_plan_is_blocked_in_review_and_never_approved(
     assert "Inherited coverage check FAILED" in review_prompt
     assert "row-owned: forbidden_side_effects dropped" in review_prompt
     assert "plan approved" not in _published(resumed)
+    revision_prompt = _agent_prompts(resumed, "claude")[0]
+    assert "row-owned: forbidden_side_effects dropped" in revision_prompt
 
 
 def test_m931_parent_dispatch_and_direct_child_entry_bind_the_inherited_rows(
@@ -2086,3 +2090,511 @@ def test_m931_open_child_pr_is_readmitted_or_rejected_identically_on_both_paths(
         assert "Row row-stage-one" in prompt and "Row child-local" in prompt
     # Neither path replans the child or re-invokes the implementation coder.
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+# ---------------------------------------------------------------------------
+# Re-planning an approved child plan that is already bound to a PR (#936)
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    CHILD_PLAN_REBIND_MARKER_RE,
+    collect_child_plan_supersessions,
+    format_child_plan_supersession_comment,
+)
+from coding_review_agent_loop.issue_pr_handoff import (  # noqa: E402
+    AGENT_ISSUE_PR_HANDOFF_RE,
+    find_latest_issue_pr_handoff,
+)
+from coding_review_agent_loop.round_state import _extract_round_metadata_records  # noqa: E402
+
+PR_APPROVAL = "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+
+
+def _m936_parent_plan():
+    return fresh_staged_matrix_plan(first_disposition="requires-child-planning")
+
+
+def _m936_inherited_row(**overrides):
+    row = next(
+        row for row in json.JSONDecoder().raw_decode(_m936_parent_plan())[0]["risk_test_matrix"]["rows"]
+        if row["row_id"] == "row-stage-one"
+    )
+    return {**row, "execution_owner": "one-shot", **overrides}
+
+
+def _m936_child_state(row, *, summary="Child plan."):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["summary"] = summary
+    payload["risk_test_matrix"] = _matrix(row)
+    return json.dumps(payload) + PLAN_FOOTER
+
+
+def _m936_patch(base_plan_text, row, *, summary, base_round=1):
+    base = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(base_plan_text), round_number=base_round
+    )
+    operations = [{"op": "replace", "field": "summary", "value": summary}]
+    if row is not None:
+        operations.append({
+            "op": "matrix_edit", "row_id": "row-stage-one", "row": row,
+            "rationale": "Restore the inherited row.",
+        })
+    return json.dumps({
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking", "summary": "Patch.",
+        "prior_plan_item_dispositions": [],
+        "base_round_number": base_round, "base_state_identity": base.state_identity,
+        "operations": operations,
+    }) + PLAN_FOOTER
+
+
+class _M936World:
+    """A planning child whose approved plan is bound to open PR #77.
+
+    Comments the run posts are appended to the child issue, so every rerun
+    sees the durable state the previous one left behind.
+    """
+
+    def __init__(self, tmp_path, monkeypatch, *, weak=True, signed=True):
+        self.tmp_path = tmp_path
+        row = _m936_inherited_row(entry_path_or_mode="pr mode") if weak else _m936_inherited_row()
+        self.old_state = _m936_child_state(row)
+        history = _ChildPlanningRunner(
+            claude_outputs=[self.old_state],
+            codex_outputs=[structured_plan_review(state="approved")],
+        )
+        assert orchestrator.run_issue_loop(
+            history, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        ) == 0
+        plan_comments = [comment(str(item["body"])) for item in history.issue_comments]
+        records = _extract_round_metadata_records(plan_comments, flow="plan")
+        self.old_hash = approved_plan_hash(records[0].metadata.canonical_plan)
+        child, self.parent = fresh_child_contexts(
+            _m936_parent_plan(),
+            handoff_execution_disposition="requires-child-planning",
+            inherited_matrix_row_ids=("row-stage-one",),
+        )
+        self.child = child
+        self.comments = [
+            *plan_comments,
+            comment(format_issue_pr_handoff_comment(
+                issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
+                pr_head_sha="abc123", flow="approved-plan-implementation", plan_hash=self.old_hash,
+            )),
+        ]
+        if signed:
+            self.comments.append(comment(self.signed_record()))
+        self.runner = None
+        monkeypatch.setattr(orchestrator, "get_issue_context", self._issue_context)
+
+        def forbid_repair(*args, **kwargs):
+            raise AssertionError("the repair model must never see an inherited-row rejection")
+
+        monkeypatch.setattr(orchestrator, "_run_structured_repair", forbid_repair)
+
+    def signed_record(self, **overrides):
+        fields = dict(
+            child_issue=56, parent_issue=55, stage_id="stage-one",
+            superseded_plan_hash=self.old_hash, rationale="Contract tightened in #934.",
+        )
+        fields.update(overrides)
+        return format_child_plan_supersession_comment(**fields)
+
+    def _issue_context(self, _runner, *, config, issue_number):
+        if issue_number != 56:
+            return self.parent
+        posted = [comment(str(item["body"])) for item in (self.runner.issue_comments if self.runner else [])]
+        return dataclasses.replace(self.child, comments=(*self.comments, *posted))
+
+    def settle(self):
+        """Fold the finished run's comments into durable history."""
+        if self.runner is not None:
+            self.comments.extend(comment(str(item["body"])) for item in self.runner.issue_comments)
+            self.runner = None
+
+    def config(self, **kwargs):
+        kwargs.setdefault("max_rounds", 4)
+        kwargs.setdefault("plan_execution_mode", "auto")
+        return make_config(
+            self.tmp_path, execution_strategy_contract_required=True, **kwargs,
+        )
+
+    def run_issue(self, *, pr_state="OPEN", config=None, **outputs):
+        self.settle()
+        self.runner = _ChildPlanningRunner(
+            pr_payload={
+                "number": 77, "body": "Fixes #56", "state": pr_state,
+                "url": "https://github.com/OWNER/REPO/pull/77",
+            },
+            **outputs,
+        )
+        return orchestrator.run_issue_loop(
+            self.runner, issue_number=56, config=config or self.config(), plan_first=True
+        )
+
+    def run_pr(self, **outputs):
+        self.settle()
+        self.runner = _ChildPlanningRunner(
+            pr_payload={
+                "number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77",
+            },
+            **outputs,
+        )
+        return orchestrator.run_pr_loop(self.runner, pr_number=77, config=self.config())
+
+    def good_patch(self, *, summary="Inherited rows restored."):
+        return _m936_patch(self.old_state, _m936_inherited_row(), summary=summary)
+
+    def agent_calls(self, agent):
+        return _agent_prompts(self.runner, agent)
+
+    def posted(self):
+        return [str(item["body"]) for item in self.runner.issue_comments]
+
+    def all_comments(self):
+        return [*self.comments, *(comment(body) for body in self.posted())]
+
+
+def test_m936_admissible_handoff_resumes_its_pr_unchanged(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
+    assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
+    assert world.agent_calls("claude") == []
+    assert len(world.agent_calls("codex")) == 1
+    assert not any(
+        AGENT_ISSUE_PR_HANDOFF_RE.search(body) or CHILD_PLAN_REBIND_MARKER_RE.search(body)
+        for body in world.posted()
+    )
+
+
+def test_m936_inadmissible_handoff_without_record_gives_the_template_and_runs_nothing(
+    tmp_path, monkeypatch
+):
+    world = _M936World(tmp_path, monkeypatch, signed=False)
+    with pytest.raises(AgentLoopError) as excinfo:
+        world.run_issue()
+    message = str(excinfo.value)
+    assert "row-stage-one: entry_path_or_mode replaced" in message
+    assert '"kind": "child-plan-supersession"' in message
+    assert f'"superseded_plan_hash": "{world.old_hash}"' in message
+    assert '"child_issue": 56' in message and '"stage_id": "stage-one"' in message
+    assert "agent-loop issue 56 --plan-first --plan-execution-mode auto" in message
+    assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
+    assert world.posted() == [] and world.runner.comments == []
+    # A record for another plan hash, or an unsigned one, authorizes nothing.
+    world.comments.append(comment(world.signed_record(superseded_plan_hash="0" * 16)))
+    world.comments.append(comment(world.signed_record().replace("\n-- Human Reviewer", "")))
+    with pytest.raises(AgentLoopError, match="child-plan-supersession"):
+        world.run_issue()
+    assert world.agent_calls("claude") == [] and world.posted() == []
+
+
+def test_m936_signed_replan_rebinds_the_same_pr_and_reviews_under_the_new_plan(
+    tmp_path, monkeypatch
+):
+    world = _M936World(tmp_path, monkeypatch)
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+
+    comments = world.all_comments()
+    digest = collect_child_plan_supersessions(
+        comments, child_issue=56, parent_issue=55, stage_id="stage-one"
+    )[0].digest
+    coder_rounds = [
+        record.metadata for record in _extract_round_metadata_records(comments, flow="plan")
+        if record.metadata.role == "coder"
+    ]
+    assert [item.plan_supersession_digest for item in coder_rounds] == [None, digest]
+    assert coder_rounds[1].plan_supersession_superseded_hash == world.old_hash
+    new_hash = approved_plan_hash(coder_rounds[1].canonical_plan)
+    # Exactly one comment carries both records, for the same PR and closing IDs.
+    rebinds = [body for body in world.posted() if CHILD_PLAN_REBIND_MARKER_RE.search(body)]
+    assert len(rebinds) == 1 and AGENT_ISSUE_PR_HANDOFF_RE.search(rebinds[0])
+    assert sum(1 for body in world.posted() if AGENT_ISSUE_PR_HANDOFF_RE.search(body)) == 1
+    latest = find_latest_issue_pr_handoff(comments, issue_number=56, repo="OWNER/REPO")
+    assert (latest.pr_number, latest.plan_hash) == (77, new_hash)
+    assert latest.expected_closing_issue_ids == (56,)
+    # No second PR, no implementation turn, no PR-side contract write.
+    planner_prompts = world.agent_calls("claude")
+    assert len(planner_prompts) == 1 and "row-stage-one: entry_path_or_mode replaced" in planner_prompts[0]
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in world.runner.commands)
+    assert not any("AGENT_PR_EXPECTED_CLOSING_ISSUES" in body for body in world.runner.comments)
+    # The revised plan got a plan review, then the PR was reviewed under it.
+    reviewer_prompts = world.agent_calls("codex")
+    assert len(reviewer_prompts) == 2
+    assert "Inherited rows restored." in reviewer_prompts[1]
+
+
+def test_m936_each_restart_point_continues_from_durable_state(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+    # Interrupted after the digest-bound revised round: the reviewer never ran.
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        world.run_issue(claude_outputs=[world.good_patch()])
+    assert len(world.agent_calls("claude")) == 1
+    assert not any(CHILD_PLAN_REBIND_MARKER_RE.search(body) for body in world.posted())
+    # Rerun resumes inside the bound lineage; the planner turn is not repeated.
+    plan_only = world.config(plan_execution_mode="plan-only")
+    assert world.run_issue(
+        config=plan_only, codex_outputs=[structured_plan_review(state="approved")]
+    ) == 0
+    assert world.agent_calls("claude") == []
+    # Approved but not yet rebound: the old binding is still the binding.
+    assert not any(CHILD_PLAN_REBIND_MARKER_RE.search(body) for body in world.posted())
+    world.settle()
+    assert find_latest_issue_pr_handoff(
+        world.comments, issue_number=56, repo="OWNER/REPO"
+    ).plan_hash == world.old_hash
+    # Rebind-only rerun: no planner, no plan reviewer, one rebind comment.
+    assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
+    assert world.agent_calls("claude") == []
+    assert sum(1 for body in world.posted() if CHILD_PLAN_REBIND_MARKER_RE.search(body)) == 1
+    # After the rebind: plain PR resume with no second rebind write.
+    assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
+    assert world.agent_calls("claude") == []
+    assert not any(
+        AGENT_ISSUE_PR_HANDOFF_RE.search(body) or CHILD_PLAN_REBIND_MARKER_RE.search(body)
+        for body in world.posted()
+    )
+
+
+@pytest.mark.parametrize("pr_state", ["CLOSED", "MERGED"])
+def test_m936_closed_or_merged_canonical_pr_fails_closed_before_any_agent(
+    tmp_path, monkeypatch, pr_state
+):
+    world = _M936World(tmp_path, monkeypatch)
+    with pytest.raises(AgentLoopError, match="not OPEN"):
+        world.run_issue(pr_state=pr_state, claude_outputs=[world.good_patch()])
+    assert world.agent_calls("claude") == [] and world.posted() == []
+
+
+def test_m936_pr_closed_between_approval_and_rebind_posts_no_handoff(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+    assert world.run_issue(
+        config=world.config(plan_execution_mode="plan-only"),
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    ) == 0
+    with pytest.raises(AgentLoopError, match="not OPEN"):
+        world.run_issue(pr_state="CLOSED")
+    assert world.posted() == [] and world.agent_calls("claude") == []
+
+
+def test_m936_pr_mode_names_the_issue_route_and_proceeds_after_a_rebind(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+    with pytest.raises(AgentLoopError) as excinfo:
+        world.run_pr(codex_outputs=[PR_APPROVAL])
+    assert "row-stage-one: entry_path_or_mode replaced" in str(excinfo.value)
+    assert "agent-loop issue 56 --plan-first" in str(excinfo.value)
+    assert '"kind": "child-plan-supersession"' in str(excinfo.value)
+    assert world.agent_calls("codex") == [] and world.agent_calls("claude") == []
+    assert world.posted() == []
+    # A PR approval recorded under the old plan, before the rebind.
+    old_context = orchestrator.recover_approved_plan_context(
+        world.comments, expected_hash=world.old_hash
+    )
+    stale_approval = _attach_round_metadata(PR_APPROVAL, PostedRoundMetadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=1, subject="abc123",
+        state="approved", approved_plan_hash=world.old_hash,
+        approved_plan_subject=old_context.plan_subject,
+    ))
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    # The same PR command now proceeds, and the pre-rebind approval is not carried.
+    world.settle()
+    world.runner = None
+    runner_kwargs = dict(codex_outputs=[PR_APPROVAL])
+    assert world.run_pr(**runner_kwargs) == 0
+    assert len(world.agent_calls("codex")) == 1
+    from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
+
+    new_context = orchestrator.recover_approved_plan_context(
+        world.all_comments(),
+        expected_hash=find_latest_issue_pr_handoff(
+            world.all_comments(), issue_number=56, repo="OWNER/REPO"
+        ).plan_hash,
+    )
+    carried = _latest_pr_approved_reviews_for_head(
+        [comment(stale_approval)], head_sha="abc123", configured_reviewers=("codex",),
+        approved_plan_context=new_context,
+    )
+    assert carried == {}
+    # The same record would have carried under the plan it was recorded for.
+    assert list(_latest_pr_approved_reviews_for_head(
+        [comment(stale_approval)], head_sha="abc123", configured_reviewers=("codex",),
+        approved_plan_context=old_context,
+    )) == ["Codex"]
+
+
+def _m936_unbound_round(world, plan_state, *, number, digest=None):
+    """A genuine generation-1 plan round that did not come from the authorized re-plan."""
+    base = _extract_round_metadata_records(world.comments, flow="plan")[0].metadata
+    structured = validate_structured_plan_state(plan_state)
+    plan = orchestrator.render_canonical_plan_state(structured, world.config())
+    sidecar = orchestrator.make_assembled_plan_sidecar(
+        structured, round_number=number, response_form="fresh-plan-state", rendered_plan=plan
+    )
+    identity = orchestrator.risk_test_matrix_identity(
+        structured.risk_test_matrix, structured.risk_test_matrix_changes
+    )
+    return comment(_attach_round_metadata(plan, dataclasses.replace(
+        base, round_number=number, subject=_plan_subject(plan), prior_plan_subject=base.subject,
+        canonical_plan=plan, raw_structured_coder_response=plan_state,
+        response_form="fresh-plan-state", aggregate_plan_identity=sidecar.aggregate_identity,
+        assembled_plan_sidecar=sidecar.to_payload(),
+        risk_test_matrix_payload=structured.risk_test_matrix.to_payload(),
+        risk_test_matrix_identity=identity, risk_test_matrix_boundary_digest=identity,
+        plan_supersession_digest=digest,
+        plan_supersession_superseded_hash=world.old_hash if digest else None,
+    )))
+
+
+@pytest.mark.parametrize("variant", ["predates", "other-digest", "conflicting-records"])
+def test_m936_only_the_authorized_lineage_is_resumed(tmp_path, monkeypatch, variant):
+    world = _M936World(tmp_path, monkeypatch)
+    later_state = _m936_child_state(_m936_inherited_row(), summary="A later admissible plan.")
+    if variant == "predates":
+        # An admissible later plan that carries no digest bypasses the authorization.
+        record = _m936_unbound_round(world, later_state, number=2)
+        world.comments.insert(len(world.comments) - 1, record)
+        expected = "not part of the authorized re-plan"
+    elif variant == "other-digest":
+        record = _m936_unbound_round(world, later_state, number=2, digest="e" * 64)
+        world.comments.append(record)
+        expected = "not part of the authorized re-plan"
+    else:
+        world.comments.append(comment(world.signed_record(rationale="A second, different reason.")))
+        expected = "two distinct signed child-plan supersession records"
+    with pytest.raises(AgentLoopError, match=expected):
+        world.run_issue(
+            claude_outputs=[world.good_patch()],
+            codex_outputs=[structured_plan_review(state="approved")],
+        )
+    assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
+    assert world.posted() == []
+
+
+def _m936_rebound_world(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    world.settle()
+    return world
+
+
+def _m936_break_rebind(world, fault):
+    index = next(
+        position for position, item in enumerate(world.comments)
+        if CHILD_PLAN_REBIND_MARKER_RE.search(item.body)
+    )
+    body = world.comments[index].body
+    if fault == "missing-audit":
+        body = CHILD_PLAN_REBIND_MARKER_RE.sub("", body)
+    elif fault == "signed-record-deleted":
+        world.comments = [
+            item for item in world.comments if "child-plan-supersession" not in item.body
+        ]
+        return
+    else:
+        marker = CHILD_PLAN_REBIND_MARKER_RE.search(body)
+        payload = json.loads(base64.urlsafe_b64decode(marker.group("payload")).decode("utf-8"))
+        payload.update({
+            "wrong-pr": {"pr_number": 78},
+            "wrong-round": {"approved_round": payload["approved_round"] + 1},
+            "wrong-digest": {"plan_supersession_digest": "d" * 64},
+            "wrong-superseded": {"superseded_plan_hash": "0" * 16},
+        }[fault])
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).decode("ascii")
+        body = body[:marker.start("payload")] + encoded + body[marker.end("payload"):]
+    world.comments[index] = comment(body)
+
+
+@pytest.mark.parametrize("entry", ["issue", "pr"])
+@pytest.mark.parametrize(
+    "fault",
+    ["missing-audit", "wrong-pr", "wrong-round", "wrong-digest", "wrong-superseded",
+     "signed-record-deleted"],
+)
+def test_m936_unverifiable_rebind_fails_closed_on_both_entry_paths(
+    tmp_path, monkeypatch, entry, fault
+):
+    world = _m936_rebound_world(tmp_path, monkeypatch)
+    _m936_break_rebind(world, fault)
+    with pytest.raises(AgentLoopError, match="Human repair required"):
+        if entry == "issue":
+            world.run_issue(codex_outputs=[PR_APPROVAL])
+        else:
+            world.run_pr(codex_outputs=[PR_APPROVAL])
+    assert world.agent_calls("codex") == [] and world.agent_calls("claude") == []
+    assert world.posted() == [] and world.runner.comments == []
+
+
+def _m936_snapshot(world, *, binding, approved_plan_context):
+    world.settle()
+    world.runner = _ChildPlanningRunner(pr_payload={
+        "number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77",
+    })
+    child = world._issue_context(None, config=None, issue_number=56)
+    return orchestrator._fresh_pr_qualification_snapshot(
+        world.runner, config=world.config(), pr_number=77, issue_context=child,
+        parent_issue_context=world.parent, approved_plan_context=approved_plan_context,
+        allow_plan_handoff_change=True, planning_child_binding=binding,
+    )
+
+
+def _m936_binding(world):
+    parent_plan = orchestrator.recover_approved_plan_context(
+        world.parent.comments, expected_hash=approved_plan_hash(_m936_parent_plan())
+    )
+    return orchestrator._PlanningChildBinding(
+        child_issue=56, parent_issue=55, stage_id="stage-one", parent_plan_context=parent_plan
+    )
+
+
+@pytest.mark.parametrize("fault", [None, "missing-audit", "wrong-digest", "non-child"])
+def test_m936_mid_run_plan_adoption_is_verified_for_planning_children(
+    tmp_path, monkeypatch, fault
+):
+    world = _m936_rebound_world(tmp_path, monkeypatch)
+    # The PR run started under the old plan; the rebind arrived while it was active.
+    old_context = orchestrator.recover_approved_plan_context(
+        world.comments, expected_hash=world.old_hash
+    )
+    new_hash = find_latest_issue_pr_handoff(
+        world.comments, issue_number=56, repo="OWNER/REPO"
+    ).plan_hash
+    if fault in {"missing-audit", "wrong-digest"}:
+        _m936_break_rebind(world, fault)
+        with pytest.raises(AgentLoopError, match="Human repair required"):
+            _m936_snapshot(world, binding=_m936_binding(world), approved_plan_context=old_context)
+        return
+    if fault == "non-child":
+        # Without the binding the branch behaves exactly as before, audit record or not.
+        _m936_break_rebind(world, "missing-audit")
+        binding = None
+    else:
+        binding = _m936_binding(world)
+    _context, _ids, adopted, _config = _m936_snapshot(
+        world, binding=binding, approved_plan_context=old_context
+    )
+    # A changed plan identity is what triggers the existing fresh-sweep invalidation.
+    assert adopted.plan_hash == new_hash != old_context.plan_hash
+
+
+def test_m936_mid_run_adoption_rejects_an_inadmissible_replacement(tmp_path, monkeypatch):
+    world = _m936_rebound_world(tmp_path, monkeypatch)
+    old_context = orchestrator.recover_approved_plan_context(
+        world.comments, expected_hash=world.old_hash
+    )
+    monkeypatch.setattr(
+        orchestrator, "_child_plan_admissibility_failure",
+        lambda *args, **kwargs: "row-stage-one: entry_path_or_mode replaced",
+    )
+    with pytest.raises(AgentLoopError, match="replacement plan is itself inadmissible"):
+        _m936_snapshot(world, binding=_m936_binding(world), approved_plan_context=old_context)

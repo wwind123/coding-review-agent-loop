@@ -267,11 +267,46 @@ def _validate_issue_pr_handoff_url(url: str, *, repo: str, pr_number: int) -> No
         )
 
 
+@dataclass(frozen=True)
+class IssuePrHandoffLineage:
+    """The latest handoff record plus the record cross-side checks compare against.
+
+    A same-PR approved-plan replacement (#936) changes only the plan hash: it
+    is an issue-side record with no PR-side counterpart, and every such
+    replacement shares the closing-ID contract digest of the record it
+    replaces.  ``closing_base`` is therefore the most recent record that is
+    not such a replacement; the PR-side closing contract authenticates against
+    it, while the plan hash always comes from ``latest``.  A plan replacement
+    is identified only by ``replaced`` (plan hash plus its audit record), never
+    by the closing-ID contract digest.
+    """
+
+    latest: IssuePrHandoffMetadata
+    closing_base: IssuePrHandoffMetadata
+    # Set only when ``latest`` is a same-PR plan replacement.
+    replaced: IssuePrHandoffMetadata | None = None
+    latest_comment_index: int = -1
+
+    @property
+    def is_plan_replacement(self) -> bool:
+        return self.replaced is not None
+
+
 def find_latest_issue_pr_handoff(
     comments: Sequence[object], *, issue_number: int, repo: str
 ) -> IssuePrHandoffMetadata | None:
+    lineage = resolve_issue_pr_handoff_lineage(comments, issue_number=issue_number, repo=repo)
+    return lineage.latest if lineage is not None else None
+
+
+def resolve_issue_pr_handoff_lineage(
+    comments: Sequence[object], *, issue_number: int, repo: str
+) -> IssuePrHandoffLineage | None:
     found: IssuePrHandoffMetadata | None = None
-    for comment in comments:
+    closing_base: IssuePrHandoffMetadata | None = None
+    replaced: IssuePrHandoffMetadata | None = None
+    found_index = -1
+    for comment_index, comment in enumerate(comments):
         body = getattr(comment, "body", None)
         if not isinstance(body, str):
             continue
@@ -298,31 +333,47 @@ def find_latest_issue_pr_handoff(
                 continue
             _validate_issue_pr_handoff_url(metadata.pr_url, repo=repo, pr_number=metadata.pr_number)
             if found is not None and found.pr_number == metadata.pr_number and found != metadata:
+                if metadata.supersedes_hash == found.contract_hash and set(
+                    found.expected_closing_issue_ids
+                ) < set(metadata.expected_closing_issue_ids):
+                    found = closing_base = metadata
+                    replaced = None
+                    found_index = comment_index
+                    continue
                 if (
+                    # An approved implementation plan may be replaced
+                    # for the same PR without changing its closing
+                    # issue contract.  The explicit supersession still
+                    # prevents an unannotated divergent handoff from
+                    # silently replacing the authoritative identity.
                     metadata.supersedes_hash == found.contract_hash
-                    and (
-                        set(found.expected_closing_issue_ids) < set(metadata.expected_closing_issue_ids)
-                        or (
-                            # An approved implementation plan may be replaced
-                            # for the same PR without changing its closing
-                            # issue contract.  The explicit supersession still
-                            # prevents an unannotated divergent handoff from
-                            # silently replacing the authoritative identity.
-                            found.flow == metadata.flow == "approved-plan-implementation"
-                            and found.plan_hash != metadata.plan_hash
-                            and set(found.expected_closing_issue_ids)
-                            == set(metadata.expected_closing_issue_ids)
-                        )
-                    )
+                    and found.flow == metadata.flow == "approved-plan-implementation"
+                    and found.plan_hash != metadata.plan_hash
+                    and set(found.expected_closing_issue_ids)
+                    == set(metadata.expected_closing_issue_ids)
                 ):
+                    replaced = found
                     found = metadata
+                    found_index = comment_index
                     continue
                 raise AgentLoopError(
                     "Divergent AGENT_ISSUE_PR_HANDOFF records were found for "
                     f"issue #{issue_number}."
                 )
+            if found != metadata:
+                closing_base = metadata
+                replaced = None
+                found_index = comment_index
             found = metadata
-    return found
+    if found is None:
+        return None
+    assert closing_base is not None
+    return IssuePrHandoffLineage(
+        latest=found,
+        closing_base=closing_base,
+        replaced=replaced,
+        latest_comment_index=found_index,
+    )
 
 
 @dataclass(frozen=True)
@@ -362,11 +413,15 @@ def authenticate_canonical_issue_pr(
     live PR state is returned; any mismatch raises, so an unauthenticatable
     record can never be read as evidence.
     """
-    canonical = find_latest_issue_pr_handoff(
+    lineage = resolve_issue_pr_handoff_lineage(
         issue_context.comments, issue_number=issue_number, repo=config.repo
     )
-    if canonical is None:
+    if lineage is None:
         return None
+    canonical = lineage.latest
+    # The PR-side closing contract is never rewritten by a same-PR plan
+    # replacement, so it authenticates against the lineage base.
+    closing_base = lineage.closing_base
     try:
         pr_context = get_pr_review_context(
             runner, config=config, pr_number=canonical.pr_number
@@ -393,18 +448,18 @@ def authenticate_canonical_issue_pr(
             pr_number=canonical.pr_number,
         )
         if pr_contract is not None and tuple(pr_contract.expected_closing_issue_ids) != tuple(
-            canonical.expected_closing_issue_ids
+            closing_base.expected_closing_issue_ids
         ):
             raise AgentLoopError(
                 "issue-side and PR-side expected closing contracts diverge: "
-                f"issue side {canonical.expected_closing_issue_ids!r}, PR side "
+                f"issue side {closing_base.expected_closing_issue_ids!r}, PR side "
                 f"{pr_contract.expected_closing_issue_ids!r}."
             )
         if pr_contract is not None and (
-            pr_contract.primary_issue_number != canonical.issue_number
-            or pr_contract.origin_flow != canonical.flow
-            or pr_contract.contract_hash != canonical.contract_hash
-            or pr_contract.supersedes_hash != canonical.supersedes_hash
+            pr_contract.primary_issue_number != closing_base.issue_number
+            or pr_contract.origin_flow != closing_base.flow
+            or pr_contract.contract_hash != closing_base.contract_hash
+            or pr_contract.supersedes_hash != closing_base.supersedes_hash
         ):
             raise AgentLoopError(
                 "issue-side and PR-side expected closing contract metadata diverge: "
