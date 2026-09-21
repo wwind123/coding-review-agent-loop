@@ -180,12 +180,23 @@ nothing is written on the PR, so no partial cross-side state exists.
 Cross-side authentication compares the unchanged PR-side closing contract with
 the closing-contract lineage base (the latest issue-side record that is not a
 same-PR equal-ID plan replacement) and takes the plan hash from the latest
-record; the closing-ID digest never identifies a plan replacement. One verifier,
+record; the closing-ID digest never identifies a plan replacement. The resolver
+also keeps the most recent plan-changing handoff edge and its comment locator
+independently of that base, so a later closing-ID superset never hides a rebind
+from verification. One verifier,
 `verify_child_plan_rebind`, runs at issue entry, at both PR-loop provenance
 sites, and on the plan-identity-change branch of the PR qualification snapshot
 (through a planning-child binding captured once per PR run), so an unverified or
 inadmissible replacement never reaches review, final sweep, merge, or
-managed-CI gates. PR approvals stay keyed by plan hash and subject, so none
+managed-CI gates. Provenance and current-contract admissibility are separate
+checks: how a plan became the binding is verified first on every entry path,
+before any new signed authorization for that plan is accepted, so an unverified
+replacement cannot be laundered while a verified one that later became
+inadmissible can still be superseded. The complete-board latch for the round
+that reviews such a revision is reconstructed on resume from durable state (the
+supersession binding on the latest planner round, or the guard's audit comment
+for the plan it revises), so a restart right after the revised round cannot
+narrow the board. PR approvals stay keyed by plan hash and subject, so none
 recorded before a rebind is carried.
 
 The validated matrix wire schema is the canonical source for planner and

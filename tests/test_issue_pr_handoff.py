@@ -695,7 +695,12 @@ def test_m936_closing_superset_after_a_replacement_becomes_the_new_base(tmp_path
         _m936_handoff("plan-b", ids=(56, 60), supersedes=_m936_contract_hash((56,))),
     ]
     lineage = resolve_issue_pr_handoff_lineage(comments, issue_number=56, repo="OWNER/REPO")
-    assert lineage.closing_base is lineage.latest and lineage.replaced is None
+    assert lineage.closing_base is lineage.latest
+    # The superset moves the closing base but never erases the plan-changing
+    # edge, so the rebind stays verifiable.
+    assert lineage.replaced.plan_hash == "plan-a"
+    assert lineage.replacement.plan_hash == "plan-b"
+    assert (lineage.replacement_comment_index, lineage.latest_comment_index) == (1, 2)
     authenticated = _m936_authenticate(
         tmp_path, comments, pr_ids=(56, 60), pr_supersedes=_m936_contract_hash((56,))
     )
@@ -714,3 +719,21 @@ def test_m936_unannotated_divergent_plan_record_still_raises():
             [_m936_handoff("plan-a"), _m936_handoff("plan-b", supersedes="0" * 64)],
             issue_number=56, repo="OWNER/REPO",
         )
+
+
+def test_m936_plan_edge_tracks_the_latest_change_and_resets_for_another_pr():
+    superset_with_new_plan = _m936_handoff(
+        "plan-c", ids=(56, 60), supersedes=_m936_contract_hash((56,))
+    )
+    lineage = resolve_issue_pr_handoff_lineage(
+        [_m936_handoff("plan-a"), _m936_replacement("plan-b"), superset_with_new_plan],
+        issue_number=56, repo="OWNER/REPO",
+    )
+    # A superset that also changes the plan is itself the latest plan-changing edge.
+    assert (lineage.replaced.plan_hash, lineage.replacement.plan_hash) == ("plan-b", "plan-c")
+    assert lineage.replacement_comment_index == 2
+    plain = resolve_issue_pr_handoff_lineage(
+        [_m936_handoff("plan-a")], issue_number=56, repo="OWNER/REPO"
+    )
+    assert plain.replaced is None and plain.replacement is None
+    assert plain.replacement_comment_index == -1

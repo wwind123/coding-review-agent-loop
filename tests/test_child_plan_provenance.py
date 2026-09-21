@@ -2148,6 +2148,12 @@ def _m936_patch(base_plan_text, row, *, summary, base_round=1):
     }) + PLAN_FOOTER
 
 
+_M936_STAGED = dict(
+    reviewer=("codex", "gemini"), plan_review_policy="primary-then-panel",
+    primary_plan_reviewer="codex",
+)
+
+
 class _M936World:
     """A planning child whose approved plan is bound to open PR #77.
 
@@ -2155,16 +2161,20 @@ class _M936World:
     sees the durable state the previous one left behind.
     """
 
-    def __init__(self, tmp_path, monkeypatch, *, weak=True, signed=True):
+    def __init__(self, tmp_path, monkeypatch, *, weak=True, signed=True, staged=False):
         self.tmp_path = tmp_path
         row = _m936_inherited_row(entry_path_or_mode="pr mode") if weak else _m936_inherited_row()
         self.old_state = _m936_child_state(row)
         history = _ChildPlanningRunner(
             claude_outputs=[self.old_state],
             codex_outputs=[structured_plan_review(state="approved")],
+            gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
         )
+        # ``staged`` plans the history under primary-then-panel, so its panel
+        # opening and scheduler contract are already durable.
+        history_config = _plan_config(tmp_path, **(_M936_STAGED if staged else {}))
         assert orchestrator.run_issue_loop(
-            history, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+            history, issue_number=56, config=history_config, plan_first=True
         ) == 0
         plan_comments = [comment(str(item["body"])) for item in history.issue_comments]
         records = _extract_round_metadata_records(plan_comments, flow="plan")
@@ -2598,3 +2608,138 @@ def test_m936_mid_run_adoption_rejects_an_inadmissible_replacement(tmp_path, mon
     )
     with pytest.raises(AgentLoopError, match="replacement plan is itself inadmissible"):
         _m936_snapshot(world, binding=_m936_binding(world), approved_plan_context=old_context)
+
+
+def _m936_append_closing_superset(world):
+    """A closing-ID superset posted after the rebind, as the PR loop writes it."""
+    latest = find_latest_issue_pr_handoff(world.comments, issue_number=56, repo="OWNER/REPO")
+    world.comments.append(comment(format_issue_pr_handoff_comment(
+        issue_number=56, pr_number=77, pr_url=latest.pr_url, pr_head_sha=latest.pr_head_sha,
+        flow="approved-plan-implementation", plan_hash=latest.plan_hash,
+        expected_closing_issue_ids=(56, 60), supersedes_hash=latest.contract_hash,
+    )))
+
+
+@pytest.mark.parametrize("entry", ["issue", "pr"])
+@pytest.mark.parametrize("fault", ["missing-audit", "wrong-digest", "signed-record-deleted"])
+def test_m936_closing_superset_after_a_rebind_never_hides_an_unverifiable_rebind(
+    tmp_path, monkeypatch, entry, fault
+):
+    world = _m936_rebound_world(tmp_path, monkeypatch)
+    _m936_append_closing_superset(world)
+    lineage = orchestrator.resolve_issue_pr_handoff_lineage(
+        world.comments, issue_number=56, repo="OWNER/REPO"
+    )
+    assert lineage.closing_base is lineage.latest and lineage.replaced is not None
+    _m936_break_rebind(world, fault)
+    with pytest.raises(AgentLoopError, match="Human repair required"):
+        if entry == "issue":
+            world.run_issue(codex_outputs=[PR_APPROVAL])
+        else:
+            world.run_pr(codex_outputs=[PR_APPROVAL])
+    assert world.agent_calls("codex") == [] and world.agent_calls("claude") == []
+    assert world.posted() == [] and world.runner.comments == []
+
+
+def test_m936_intact_rebind_still_verifies_after_a_closing_superset(tmp_path, monkeypatch):
+    world = _m936_rebound_world(tmp_path, monkeypatch)
+    _m936_append_closing_superset(world)
+    parent_plan = _m936_binding(world).parent_plan_context
+    verified = orchestrator.verify_child_plan_rebind(
+        world.comments, repo="OWNER/REPO", parent_plan_context=parent_plan,
+        child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
+    )
+    assert verified is not None
+    assert verified.plan_hash == find_latest_issue_pr_handoff(
+        world.comments, issue_number=56, repo="OWNER/REPO"
+    ).plan_hash
+
+
+def test_m936_signed_record_cannot_launder_an_unverified_replacement(tmp_path, monkeypatch):
+    """An unaudited replacement to an inadmissible plan, plus a signed record for it."""
+    world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
+    weak_state = _m936_child_state(
+        _m936_inherited_row(entry_path_or_mode="pr mode"), summary="Swapped-in plan."
+    )
+    record = _m936_unbound_round(world, weak_state, number=2)
+    weak_hash = approved_plan_hash(
+        _extract_round_metadata_records([record], flow="plan")[0].metadata.canonical_plan
+    )
+    latest = find_latest_issue_pr_handoff(world.comments, issue_number=56, repo="OWNER/REPO")
+    world.comments.extend([
+        record,
+        # Annotated equal-ID replacement handoff, but with no rebind audit record.
+        comment(format_issue_pr_handoff_comment(
+            issue_number=56, pr_number=77, pr_url=latest.pr_url, pr_head_sha=latest.pr_head_sha,
+            flow="approved-plan-implementation", plan_hash=weak_hash,
+            supersedes_hash=latest.contract_hash,
+        )),
+        comment(world.signed_record(superseded_plan_hash=weak_hash)),
+    ])
+    with pytest.raises(AgentLoopError, match="Human repair required"):
+        world.run_issue(
+            claude_outputs=[world.good_patch()],
+            codex_outputs=[structured_plan_review(state="approved")],
+        )
+    assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
+    assert world.posted() == [] and world.runner.comments == []
+
+
+def test_m936_verified_replacement_that_became_inadmissible_can_still_be_superseded(
+    tmp_path, monkeypatch
+):
+    world = _m936_rebound_world(tmp_path, monkeypatch)
+    rebound_hash = find_latest_issue_pr_handoff(
+        world.comments, issue_number=56, repo="OWNER/REPO"
+    ).plan_hash
+    # The contract tightens again: the legitimately rebound plan is now inadmissible.
+    real = orchestrator._child_plan_admissibility_failure
+
+    def tightened(parent_plan_context, child_plan_context, *, stage_id):
+        if child_plan_context.plan_hash == rebound_hash:
+            return "row-stage-one: entry_path_or_mode replaced"
+        return real(parent_plan_context, child_plan_context, stage_id=stage_id)
+
+    monkeypatch.setattr(orchestrator, "_child_plan_admissibility_failure", tightened)
+    # Provenance verifies, so the route is the signed-record template, not human repair.
+    with pytest.raises(AgentLoopError) as excinfo:
+        world.run_issue()
+    assert "Human repair required" not in str(excinfo.value)
+    assert f'"superseded_plan_hash": "{rebound_hash}"' in str(excinfo.value)
+    assert world.agent_calls("claude") == [] and world.posted() == []
+    with pytest.raises(AgentLoopError) as pr_excinfo:
+        world.run_pr(codex_outputs=[PR_APPROVAL])
+    assert f'"superseded_plan_hash": "{rebound_hash}"' in str(pr_excinfo.value)
+    assert world.agent_calls("codex") == []
+
+
+def _m936_staged_config(world, **kwargs):
+    return world.config(max_rounds=8, **_M936_STAGED, **kwargs)
+
+
+def _m936_truncate_after_latest_coder_round(world):
+    """Durable state of a run that stopped right after the revised plan round."""
+    world.settle()
+    records = _extract_round_metadata_records(world.comments, flow="plan")
+    last_coder = max(r.index for r in records if r.metadata.role == "coder")
+    world.comments = world.comments[: last_coder + 1]
+
+
+def test_m936_full_board_latch_survives_a_restart_after_the_digest_bound_round(
+    tmp_path, monkeypatch
+):
+    world = _M936World(tmp_path, monkeypatch, staged=True)
+    # Narrow classification would otherwise select only the primary on restart.
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        world.run_issue(config=_m936_staged_config(world), claude_outputs=[world.good_patch()])
+    _m936_truncate_after_latest_coder_round(world)
+    assert orchestrator._resumed_inherited_replan_force_full(world.comments)
+    assert world.run_issue(
+        config=_m936_staged_config(world, plan_execution_mode="plan-only"),
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    ) == 0
+    assert world.agent_calls("claude") == []
+    audits = [body for body in world.posted() if "Plan review scheduling audit" in body]
+    assert "Force-full: True (source: automatic)" in audits[0]
+    assert "Selected reviewers: Codex, Gemini" in audits[0]

@@ -192,6 +192,15 @@ With exactly one matching record and an open canonical PR, planning reopens:
   and agree with the handoff, the digest-bound rounds, and a discoverable signed
   record, and the replacement plan must itself pass the inherited check.
   Otherwise the run stops with a human-repair diagnostic and posts nothing.
+  The verifier follows the most recent plan-changing handoff record, so a
+  closing-issue superset recorded after a rebind never hides it. How the
+  current plan became the binding is verified before a new signed record for
+  that plan is accepted: an unverified replacement cannot be re-planned away,
+  while a verified plan that a later contract tightening made inadmissible can
+  be superseded again with its own signed record.
+- The round that reviews the revision runs the complete reviewer board under
+  staged planning, including when the run restarted right after the revised
+  plan round was posted; the requirement is recomputed from the issue history.
   PR reviewer approvals are keyed by plan hash and subject, so none recorded
   before the rebind counts under the new plan.
 

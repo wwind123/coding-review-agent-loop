@@ -277,14 +277,22 @@ class IssuePrHandoffLineage:
     replaces.  ``closing_base`` is therefore the most recent record that is
     not such a replacement; the PR-side closing contract authenticates against
     it, while the plan hash always comes from ``latest``.  A plan replacement
-    is identified only by ``replaced`` (plan hash plus its audit record), never
-    by the closing-ID contract digest.
+    is identified only by its plan-changing edge (plan hash plus its audit
+    record), never by the closing-ID contract digest.
+
+    The most recent plan-changing edge for the current PR is tracked
+    independently of the closing base: ``replaced`` is the record whose plan
+    was replaced, ``replacement`` the record that first named the new plan,
+    and ``replacement_comment_index`` its comment.  A later closing-ID
+    superset moves the base but never erases that edge, so the rebind stays
+    verifiable for as long as the PR is bound to the replacement plan.
     """
 
     latest: IssuePrHandoffMetadata
     closing_base: IssuePrHandoffMetadata
-    # Set only when ``latest`` is a same-PR plan replacement.
     replaced: IssuePrHandoffMetadata | None = None
+    replacement: IssuePrHandoffMetadata | None = None
+    replacement_comment_index: int = -1
     latest_comment_index: int = -1
 
     @property
@@ -305,6 +313,8 @@ def resolve_issue_pr_handoff_lineage(
     found: IssuePrHandoffMetadata | None = None
     closing_base: IssuePrHandoffMetadata | None = None
     replaced: IssuePrHandoffMetadata | None = None
+    replacement: IssuePrHandoffMetadata | None = None
+    replacement_index = -1
     found_index = -1
     for comment_index, comment in enumerate(comments):
         body = getattr(comment, "body", None)
@@ -336,8 +346,12 @@ def resolve_issue_pr_handoff_lineage(
                 if metadata.supersedes_hash == found.contract_hash and set(
                     found.expected_closing_issue_ids
                 ) < set(metadata.expected_closing_issue_ids):
+                    if found.plan_hash != metadata.plan_hash:
+                        # A superset that also changes the plan is a
+                        # plan-changing edge in its own right.
+                        replaced, replacement = found, metadata
+                        replacement_index = comment_index
                     found = closing_base = metadata
-                    replaced = None
                     found_index = comment_index
                     continue
                 if (
@@ -352,7 +366,8 @@ def resolve_issue_pr_handoff_lineage(
                     and set(found.expected_closing_issue_ids)
                     == set(metadata.expected_closing_issue_ids)
                 ):
-                    replaced = found
+                    replaced, replacement = found, metadata
+                    replacement_index = comment_index
                     found = metadata
                     found_index = comment_index
                     continue
@@ -361,8 +376,10 @@ def resolve_issue_pr_handoff_lineage(
                     f"issue #{issue_number}."
                 )
             if found != metadata:
+                # First record, or a record for a different PR: a new lineage.
                 closing_base = metadata
-                replaced = None
+                replaced = replacement = None
+                replacement_index = -1
                 found_index = comment_index
             found = metadata
     if found is None:
@@ -372,6 +389,8 @@ def resolve_issue_pr_handoff_lineage(
         latest=found,
         closing_base=closing_base,
         replaced=replaced,
+        replacement=replacement,
+        replacement_comment_index=replacement_index,
         latest_comment_index=found_index,
     )
 

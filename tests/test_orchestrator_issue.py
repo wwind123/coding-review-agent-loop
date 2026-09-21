@@ -10213,3 +10213,75 @@ def test_m936_guard_at_max_rounds_names_the_round_budget(tmp_path, monkeypatch):
         orchestrator_module.run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
     assert _m936_cpp._agent_prompts(resumed, "claude") == []
     assert len(resumed.issue_comments) == len(history)
+
+
+_M936_STAGED = dict(
+    reviewer=("codex", "gemini"), plan_review_policy="primary-then-panel",
+    primary_plan_reviewer="codex",
+)
+
+
+def test_m936_guard_full_board_latch_survives_a_restart_after_the_revised_round(
+    tmp_path, monkeypatch
+):
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    def staged_config():
+        return make_config(
+            tmp_path, max_rounds=8, plan_execution_mode="plan-only",
+            execution_strategy_contract_required=True, **_M936_STAGED,
+        )
+
+    gemini_approval = _m936_cpp.structured_plan_review(state="approved", reviewer="Google Gemini")
+    weak = _m936_cpp._child_plan_state(_m936_cpp._weak_child_row())
+    first = _m936_cpp._ChildPlanningRunner(
+        claude_outputs=[weak],
+        codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
+        gemini_outputs=[gemini_approval],
+    )
+    assert orchestrator_module.run_issue_loop(
+        first, issue_number=56, config=staged_config(), plan_first=True
+    ) == 0
+    _m936_cpp._bind_child_planning(monkeypatch)
+    good = _m936_patch(weak, _m936_cpp._child_row(), summary="Inherited rows restored.")
+    # The run stops right after the revised round: no reviewer output is scripted.
+    interrupted = _m936_cpp._ChildPlanningRunner(
+        issue_comments=list(first.issue_comments), claude_outputs=[good],
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        orchestrator_module.run_issue_loop(
+            interrupted, issue_number=56, config=staged_config(), plan_first=True
+        )
+    comments = [
+        _m936_cpp.comment(str(item["body"])) for item in interrupted.issue_comments
+    ]
+    last_coder = max(
+        record.index for record in _extract_round_metadata_records(comments, flow="plan")
+        if record.metadata.role == "coder"
+    )
+    durable = list(interrupted.issue_comments[: last_coder + 1])
+    assert orchestrator_module._resumed_inherited_replan_force_full(comments[: last_coder + 1])
+    # No digest is involved on this path: the audit comment is the durable key.
+    assert _extract_round_metadata_records(
+        comments, flow="plan"
+    )[-1].metadata.plan_supersession_digest is None
+
+    restarted = _m936_cpp._ChildPlanningRunner(
+        issue_comments=durable,
+        codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
+        gemini_outputs=[gemini_approval],
+    )
+    assert orchestrator_module.run_issue_loop(
+        restarted, issue_number=56, config=staged_config(), plan_first=True
+    ) == 0
+    assert _m936_cpp._agent_prompts(restarted, "claude") == []
+    audits = [
+        str(item["body"]) for item in restarted.issue_comments[len(durable):]
+        if "Plan review scheduling audit" in str(item["body"])
+    ]
+    assert "Force-full: True (source: automatic)" in audits[0]
+    assert "Selected reviewers: Codex, Gemini" in audits[0]
+    # An ordinary revision round reconstructs no latch.
+    assert not orchestrator_module._resumed_inherited_replan_force_full(
+        [_m936_cpp.comment(str(item["body"])) for item in first.issue_comments]
+    )

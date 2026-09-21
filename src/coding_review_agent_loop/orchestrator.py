@@ -8818,21 +8818,29 @@ def verify_child_plan_rebind(
     parent_issue: int,
     stage_id: str,
     pr_number: int,
+    require_admissible: bool = True,
 ) -> ApprovedPlanContext | None:
     """Verify a planning child's same-PR plan-replacement handoff.
 
-    Returns ``None`` when the latest handoff is not a plan replacement, and
-    the verified, admissible replacement plan otherwise.  Every path on which
-    a replacement plan can become a PR's plan context calls this; a missing,
-    inconsistent, unauthorized, or inadmissible rebind raises a human-repair
-    diagnostic and nothing is ever posted to correct it.
+    Returns ``None`` when the PR's bound plan never came from a plan
+    replacement, and the verified replacement plan otherwise.  Every path on
+    which a replacement plan can become a PR's plan context calls this; a
+    missing, inconsistent, unauthorized, or inadmissible rebind raises a
+    human-repair diagnostic and nothing is ever posted to correct it.
+
+    The check follows the most recent plan-changing handoff edge, which a
+    later closing-ID superset never erases.  Provenance and current-contract
+    admissibility are separate: ``require_admissible=False`` verifies only how
+    the plan became the binding, so a legitimately rebound plan that a later
+    contract tightening made inadmissible can still be superseded, while an
+    unverified replacement can never be laundered through a new authorization.
     """
     lineage = resolve_issue_pr_handoff_lineage(
         child_comments, issue_number=child_issue, repo=repo
     )
-    if lineage is None or lineage.replaced is None:
+    if lineage is None or lineage.replaced is None or lineage.replacement is None:
         return None
-    handoff = lineage.latest
+    handoff = lineage.replacement
     replaced = lineage.replaced
 
     def fail(reason: str) -> AgentLoopError:
@@ -8850,7 +8858,7 @@ def verify_child_plan_rebind(
     records = [
         record
         for record in find_child_plan_rebind_records(child_comments)
-        if record.comment_index == lineage.latest_comment_index
+        if record.comment_index == lineage.replacement_comment_index
     ]
     if len(records) != 1:
         raise fail("its comment does not carry exactly one rebind audit record")
@@ -8889,6 +8897,8 @@ def verify_child_plan_rebind(
     replacement = recover_approved_plan_context(child_comments, expected_hash=record.new_plan_hash)
     if not replacement.is_available:
         raise fail(f"replacement plan {record.new_plan_hash} is not recoverable")
+    if not require_admissible:
+        return replacement
     inadmissible = _child_plan_admissibility_failure(
         parent_plan_context, replacement, stage_id=stage_id
     )
@@ -9086,19 +9096,23 @@ def _route_inadmissible_child_handoff(
     Inadmissible with exactly one matching signed record: authenticate the
     canonical PR and return the binding that reopens planning.
     """
+    # How the handed-off plan became the binding is verified first and on
+    # every branch: a signed authorization for the current hash never
+    # excuses an unverified replacement that produced that hash.
+    verify_child_plan_rebind(
+        issue_context.comments,
+        repo=config.repo,
+        parent_plan_context=fresh_child.parent_plan_context,
+        child_issue=issue_number,
+        parent_issue=fresh_child.parent_issue,
+        stage_id=fresh_child.stage_id,
+        pr_number=handoff.pr_number,
+        require_admissible=False,
+    )
     failure = _child_plan_admissibility_failure(
         fresh_child.parent_plan_context, child_plan_context, stage_id=fresh_child.stage_id
     )
     if failure is None:
-        verify_child_plan_rebind(
-            issue_context.comments,
-            repo=config.repo,
-            parent_plan_context=fresh_child.parent_plan_context,
-            child_issue=issue_number,
-            parent_issue=fresh_child.parent_issue,
-            stage_id=fresh_child.stage_id,
-            pr_number=handoff.pr_number,
-        )
         return None
     ignored: list[str] = []
     supersessions = collect_child_plan_supersessions(
@@ -9176,6 +9190,16 @@ def _require_admissible_pr_child_plan(
     closed naming the issue-mode supersession route, and a same-PR plan
     replacement must pass rebind verification before any reviewer runs.
     """
+    verify_child_plan_rebind(
+        child_comments,
+        repo=config.repo,
+        parent_plan_context=binding.parent_plan_context,
+        child_issue=binding.child_issue,
+        parent_issue=binding.parent_issue,
+        stage_id=binding.stage_id,
+        pr_number=pr_number,
+        require_admissible=False,
+    )
     failure = _child_plan_admissibility_failure(
         binding.parent_plan_context, child_plan_context, stage_id=binding.stage_id
     )
@@ -9190,15 +9214,51 @@ def _require_admissible_pr_child_plan(
                 superseded_plan_hash=child_plan_context.plan_hash or "",
             )
         )
-    verify_child_plan_rebind(
-        child_comments,
-        repo=config.repo,
-        parent_plan_context=binding.parent_plan_context,
-        child_issue=binding.child_issue,
-        parent_issue=binding.parent_issue,
-        stage_id=binding.stage_id,
-        pr_number=pr_number,
+
+
+def _inadmissible_plan_audit_line(plan_hash: str) -> str:
+    """The guard's audit sentence; also the durable key that stops a repeat."""
+    return (
+        f"Approved plan {plan_hash} is inadmissible under the inherited-matrix "
+        "contract and is being revised."
     )
+
+
+def _resumed_inherited_replan_force_full(comments: Sequence[object]) -> bool:
+    """Reconstruct the complete-board latch after an inherited-matrix re-plan.
+
+    The latch is set in memory just before the revision turn.  A run that
+    stops after the revised plan round is durable, but before the next
+    scheduling record, would otherwise lose it and let staged planning
+    narrow the board that must review the revision.  It is recomputed here
+    from durable state only: the latest plan coder round either carries a
+    signed supersession binding, or revises a plan for which the guard's
+    audit comment exists.  Once the next round has run, its scheduling
+    record carries the automatic latch through the existing recovery.
+    """
+    coder_records = [
+        record
+        for record in _extract_round_metadata_records(comments, flow="plan")
+        if record.metadata.role == "coder"
+    ]
+    if not coder_records:
+        return False
+    latest = coder_records[-1].metadata
+    if latest.plan_supersession_digest is not None:
+        return True
+    if latest.prior_plan_subject is None:
+        return False
+    bodies = [
+        body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
+    ]
+    for record in coder_records[:-1]:
+        plan = record.metadata.canonical_plan
+        if record.metadata.subject != latest.prior_plan_subject or plan is None:
+            continue
+        audit_line = _inadmissible_plan_audit_line(approved_plan_hash(plan))
+        if any(audit_line in body for body in bodies):
+            return True
+    return False
 
 
 def _recover_current_plan_validation_diagnostic(
@@ -9993,6 +10053,12 @@ def _run_plan_first_loop(
             for item in (*resumed_round.prior_items, *resumed_round.current_round_new_items)
         )
         log(config, f"Planning issue #{issue_number}: resuming round {start_round_number}")
+        if inherited_matrix_binding is not None and _resumed_inherited_replan_force_full(
+            issue_context.comments
+        ):
+            # The revision of an inadmissible approved plan gets the complete
+            # board even when the run restarted right after that round (#936).
+            plan_automatic_force_full = True
         # A resumed round carries its planning-generation discriminator in
         # durable coder metadata. Historical rounds intentionally have no
         # discriminator and must remain legacy-undecided; applying the fresh
@@ -11110,10 +11176,7 @@ def _run_plan_first_loop(
                     "--max-rounds and rerun; re-planning continues the existing round "
                     f"numbering.\n{inherited_review_failure}"
                 )
-            audit_line = (
-                f"Approved plan {inadmissible_hash} is inadmissible under the inherited-matrix "
-                "contract and is being revised."
-            )
+            audit_line = _inadmissible_plan_audit_line(inadmissible_hash)
             if not any(
                 isinstance(getattr(comment, "body", None), str)
                 and audit_line in comment.body
