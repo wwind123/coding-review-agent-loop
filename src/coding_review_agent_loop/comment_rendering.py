@@ -6,6 +6,7 @@ import json
 import re
 import shlex
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from .decomposition import _decode_json_payload, _encode_json_payload
@@ -15,6 +16,10 @@ from .agents.registry import agent_display_name, agent_signature
 from .protocol import (
     ANY_HEADING_RE,
     HTML_COMMENT_RE,
+    HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+    HUMAN_REQUIREMENTS_ADDRESSED_RE,
+    HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE,
+    HUMAN_REQUIREMENTS_HEADING_RE,
     PLAN_STATE_RE,
     PRIOR_UNRESOLVED_ITEM_DISPOSITIONS_HEADING_RE,
     PRIOR_UNRESOLVED_PLAN_ITEM_DISPOSITIONS_HEADING_RE,
@@ -47,6 +52,7 @@ from .protocol import (
     ExecutionStrategyRecommendation,
     EXECUTION_TOPOLOGY_SOURCE,
     UnresolvedReviewItem,
+    parse_human_requirements_acknowledgement,
     review_freeform_summary_text,
 )
 from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID
@@ -1330,12 +1336,15 @@ def _render_public_issue_implementation_comment(
     return "\n\n".join(section for section in sections if section)
 
 
-def _extract_plan_revision_human_requirements_block(text: str) -> str:
+def _extract_plan_human_requirements_block(text: str) -> str:
     stripped = text.lstrip()
     if not stripped.startswith("{"):
         return ""
     decoder = json.JSONDecoder()
-    payload, end = decoder.raw_decode(stripped)
+    try:
+        payload, end = decoder.raw_decode(stripped)
+    except ValueError:
+        return ""
     if not isinstance(payload, dict):
         return ""
     trailing = stripped[end:].lstrip()
@@ -1343,6 +1352,258 @@ def _extract_plan_revision_human_requirements_block(text: str) -> str:
     if state_match is None:
         return ""
     return trailing[: state_match.start()].strip()
+
+
+def _extract_plan_revision_human_requirements_block(text: str) -> str:
+    return _extract_plan_human_requirements_block(text)
+
+
+# Bounded visible digest for structured plan coder comments (#948).  The
+# complete plan always travels in authenticated round metadata; the digest only
+# bounds the human-facing prose.  Each budgeted section owns a fixed share that
+# already includes its heading and omitted-entry line, and unused share is never
+# redistributed, so the budgeted output is bounded by construction for any
+# entry count or string length.
+COMPACT_PLAN_DIGEST_BUDGET_CHARS = 12_000
+COMPACT_PLAN_DIGEST_NOTICE = (
+    "> **Compact plan digest.** The complete plan exceeded the comment budget, so this "
+    "comment shows a bounded summary. The complete canonical plan is preserved in this "
+    "round's authenticated attachments and is what reviewers, resume and approval use."
+)
+_COMPACT_ELLIPSIS = " …"
+_COMPACT_SUMMARY_SHARE = 2_000
+_COMPACT_STEPS_SHARE = 4_800
+_COMPACT_PRIOR_DISPOSITIONS_SHARE = 1_400
+_COMPACT_CLOSING_SHARE = 500
+_COMPACT_DEFERRED_SHARE = 900
+_COMPACT_TYPED_CATEGORY_SHARE = 400
+_COMPACT_ENTRY_CHARS = 300
+_COMPACT_TITLE_CHARS = 120
+_COMPACT_HUMAN_EVIDENCE_CHARS = 300
+_COMPACT_ACK_PROSE_LINES = 20
+_COMPACT_OMITTED_LINE = (
+    "- ... {omitted} more of {total} omitted; complete list in the authenticated attachments"
+)
+_COMPACT_REQUIREMENT_ID_RE = re.compile(
+    r"\b(?:Requirement\s+)?hr-[0-9a-f]{64}\b|\bRequirement\s+\d+\b", re.I
+)
+
+
+def _compact_clip(text: str, limit: int, *, keep_newlines: bool = False) -> str:
+    """Sanitize, flatten and clip ``text`` to at most ``limit`` characters."""
+    safe = sanitize_historical_text(text).strip()
+    if not keep_newlines:
+        safe = re.sub(r"\s+", " ", safe)
+    if len(safe) <= limit:
+        return safe
+    clipped = safe[: max(0, limit - len(_COMPACT_ELLIPSIS))].rstrip() + _COMPACT_ELLIPSIS
+    # Clipping sanitized text cannot normally create a reserved record; a second
+    # pass keeps that a checked property rather than an assumption.
+    return sanitize_historical_text(clipped)[:limit]
+
+
+def _compact_budgeted_section(
+    heading: str, entries: Sequence[str], *, share: int, entry_chars: int
+) -> str:
+    """Render entries in canonical order until the fixed section share is used."""
+    total = len(entries)
+    reserve = len(_COMPACT_OMITTED_LINE.format(omitted=total, total=total)) + 1
+    lines = [heading]
+    used = len(heading)
+    if used + reserve > share:
+        raise AgentLoopError("Compact plan digest section share is too small for its heading.")
+    shown = 0
+    for index, entry in enumerate(entries):
+        line = _compact_clip(entry, entry_chars)
+        cost = len(line) + 1
+        needed = reserve if index + 1 < total else 0
+        if used + cost + needed > share:
+            break
+        lines.append(line)
+        used += cost
+        shown += 1
+    if shown < total:
+        lines.append(_COMPACT_OMITTED_LINE.format(omitted=total - shown, total=total))
+    rendered = "\n".join(lines)
+    if len(rendered) > share:
+        raise AgentLoopError("Compact plan digest section exceeded its share.")
+    return rendered
+
+
+def _compact_human_requirement_dispositions(
+    dispositions: Sequence[HumanRequirementDisposition],
+) -> str | None:
+    """List every requirement ID; only explanatory evidence is clipped."""
+    if not dispositions:
+        return None
+    return "\n".join(
+        ["### Human requirement dispositions"]
+        + [
+            f"- **{item.requirement_id}** — `{item.disposition}`: "
+            f"{_compact_clip(item.evidence, _COMPACT_HUMAN_EVIDENCE_CHARS)}"
+            for item in dispositions
+        ]
+    )
+
+
+def _compact_acknowledgement_line(line: str) -> str:
+    safe = re.sub(r"[ \t]+$", "", sanitize_historical_text(line))
+    if len(safe) <= _COMPACT_HUMAN_EVIDENCE_CHARS:
+        return safe
+    cut = _COMPACT_HUMAN_EVIDENCE_CHARS
+    required = [
+        *_COMPACT_REQUIREMENT_ID_RE.finditer(safe),
+        *HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE.finditer(safe),
+    ]
+    # Never cut inside an ID or the acknowledgement sentence: a partial
+    # "Requirement 12" would otherwise read as a different requirement.
+    for match in required:
+        if match.start() < cut < match.end():
+            cut = match.start()
+    kept = safe[:cut].rstrip() + _COMPACT_ELLIPSIS
+    tail = [match.group(0) for match in required if match.start() >= cut]
+    if tail:
+        kept += " " + "; ".join(tail)
+    return kept
+
+
+def _compact_human_requirements_block(block: str) -> str:
+    """Keep the record, heading, every ID line and the direct-discussion sentence."""
+    if not block:
+        return ""
+    lines: list[str] = []
+    prose_lines = 0
+    dropped = 0
+    for line in block.splitlines():
+        if HUMAN_REQUIREMENTS_ADDRESSED_RE.search(line) and HTML_COMMENT_RE.match(line):
+            lines.append(HUMAN_REQUIREMENTS_ADDRESSED_MARKER)
+            continue
+        essential = (
+            HUMAN_REQUIREMENTS_HEADING_RE.match(line)
+            or _COMPACT_REQUIREMENT_ID_RE.search(line)
+            or HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE.search(line)
+        )
+        if not essential:
+            if not line.strip():
+                if lines and lines[-1]:
+                    lines.append("")
+                continue
+            prose_lines += 1
+            if prose_lines > _COMPACT_ACK_PROSE_LINES:
+                dropped += 1
+                continue
+        lines.append(_compact_acknowledgement_line(line))
+    if dropped:
+        lines.append(f"_{dropped} further explanatory line(s) omitted; no requirement ID was omitted._")
+    compact = "\n".join(lines).strip()
+    original = parse_human_requirements_acknowledgement(block)
+    rendered = parse_human_requirements_acknowledgement(compact)
+    direct = HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE.search
+    if (
+        original.addressed_ids != rendered.addressed_ids
+        or original.marker_present != rendered.marker_present
+        or original.section_present != rendered.section_present
+        or bool(direct(original.section_text)) != bool(direct(rendered.section_text))
+    ):
+        # Fail toward size, never toward a changed acknowledgement: the
+        # transport's attributed overflow then fails closed if this cannot fit.
+        return block
+    return compact
+
+
+def _render_compact_plan_digest(
+    parsed: StructuredPlanState | StructuredPlanRevision,
+    *,
+    title: str,
+    raw_text: str,
+    agent: str,
+    config: AgentLoopConfig | None,
+    model_used: str | None,
+) -> str:
+    budgeted: list[str] = [
+        COMPACT_PLAN_DIGEST_NOTICE,
+        _compact_clip(parsed.summary, _COMPACT_SUMMARY_SHARE, keep_newlines=True),
+    ]
+    prior_dispositions = getattr(parsed, "prior_plan_item_dispositions", ())
+    if prior_dispositions:
+        budgeted.append(
+            _compact_budgeted_section(
+                "### Prior plan item dispositions (digest)",
+                [
+                    f"- [{item.item_id}] {_render_disposition_status(replace(item, note=None))}"
+                    for item in prior_dispositions
+                ],
+                share=_COMPACT_PRIOR_DISPOSITIONS_SHARE,
+                entry_chars=_COMPACT_TITLE_CHARS,
+            )
+        )
+    budgeted.append(
+        _compact_budgeted_section(
+            "### Plan steps (digest)",
+            [f"{index}. {step}" for index, step in enumerate(parsed.plan_steps, start=1)],
+            share=_COMPACT_STEPS_SHARE,
+            entry_chars=_COMPACT_ENTRY_CHARS,
+        )
+    )
+    if parsed.additional_closing_issue_ids is not None:
+        budgeted.append(
+            _compact_budgeted_section(
+                "### Additional issues completed by this implementation PR (digest)",
+                [f"- #{item}" for item in parsed.additional_closing_issue_ids] or ["- none"],
+                share=_COMPACT_CLOSING_SHARE,
+                entry_chars=_COMPACT_TITLE_CHARS,
+            )
+        )
+    if parsed.deferred_stages:
+        budgeted.append(
+            _compact_budgeted_section(
+                "### Deferred stages (not in this plan; digest)",
+                [f"- {stage.title}" for stage in parsed.deferred_stages],
+                share=_COMPACT_DEFERRED_SHARE,
+                entry_chars=_COMPACT_TITLE_CHARS,
+            )
+        )
+    for heading, entries in (
+        ("#### Child stages (digest)", parsed.typed_stages.child_stages),
+        ("#### External dependencies (digest)", parsed.typed_stages.external_dependencies),
+        ("#### Deferred work (digest)", parsed.typed_stages.deferred_work),
+        ("#### Plan actions (digest)", parsed.typed_stages.plan_actions),
+    ):
+        if entries:
+            budgeted.append(
+                _compact_budgeted_section(
+                    heading,
+                    [f"- {entry.title}" for entry in entries],
+                    share=_COMPACT_TYPED_CATEGORY_SHARE,
+                    entry_chars=_COMPACT_TITLE_CHARS,
+                )
+            )
+    budgeted_text = "\n\n".join(section for section in budgeted if section)
+    if len(budgeted_text) > COMPACT_PLAN_DIGEST_BUDGET_CHARS:
+        raise AgentLoopError(
+            "Compact plan digest exceeded its aggregate budget of "
+            f"{COMPACT_PLAN_DIGEST_BUDGET_CHARS} characters."
+        )
+    sections = [title, budgeted_text]
+    # Visible-anchor records: emitted by the unchanged section renderers so the
+    # transport's authenticated reference rewrites keep applying to them.
+    if parsed.risk_test_matrix is not None:
+        sections.append(
+            render_risk_test_matrix_section(parsed.risk_test_matrix, parsed.risk_test_matrix_changes)
+        )
+    human_section = _compact_human_requirement_dispositions(parsed.human_requirement_dispositions)
+    if human_section:
+        sections.append(human_section)
+    if parsed.execution_recommendation is not None:
+        sections.append(render_execution_recommendation_section(parsed.execution_recommendation))
+    acknowledgement = _compact_human_requirements_block(
+        _extract_plan_human_requirements_block(raw_text)
+    )
+    if acknowledgement:
+        sections.append(acknowledgement)
+    sections.append(f"<!-- AGENT_PLAN_STATE: {parsed.state} -->")
+    sections.append(f"-- {_comment_signature(agent, config, model_used)}")
+    return "\n\n".join(section for section in sections if section)
 
 
 def _render_public_plan_revision_comment(
@@ -1353,7 +1614,17 @@ def _render_public_plan_revision_comment(
     agent: str,
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
+    compact: bool = False,
 ) -> str:
+    if compact:
+        return _render_compact_plan_digest(
+            parsed_revision,
+            title="## Revised plan",
+            raw_text=raw_text,
+            agent=agent,
+            config=config,
+            model_used=model_used,
+        )
     sections = ["## Revised plan", render_canonical_plan_revision(parsed_revision, prior_items, config)]
     human_requirements_block = _extract_plan_revision_human_requirements_block(raw_text)
     if human_requirements_block:
@@ -1369,7 +1640,21 @@ def _render_public_plan_state_comment(
     agent: str,
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
+    compact: bool = False,
+    raw_text: str = "",
 ) -> str:
+    # ``raw_text`` is read only by the compact digest: the parsed fresh plan
+    # does not retain the raw acknowledgement block.  The full rendering
+    # ignores it and stays byte-identical.
+    if compact:
+        return _render_compact_plan_digest(
+            parsed_plan,
+            title="## Plan",
+            raw_text=raw_text,
+            agent=agent,
+            config=config,
+            model_used=model_used,
+        )
     sections = [
         "## Plan",
         parsed_plan.summary.strip(),
@@ -1447,6 +1732,7 @@ def render_public_agent_comment(
     round_number: int = 1,
     local_test_evidence: str | None = None,
     current_test_turn_id: str | None = None,
+    compact: bool = False,
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -1513,6 +1799,7 @@ def render_public_agent_comment(
             agent=agent,
             config=config,
             model_used=model_used,
+            compact=compact,
         )
     if kind == "plan_state":
         if not isinstance(parsed, StructuredPlanState):
@@ -1522,6 +1809,8 @@ def render_public_agent_comment(
             agent=agent,
             config=config,
             model_used=model_used,
+            compact=compact,
+            raw_text=raw_text,
         )
     if kind == "discuss_review":
         if not isinstance(parsed, ParsedDiscussReview):

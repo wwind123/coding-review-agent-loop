@@ -2343,3 +2343,226 @@ def test_render_plan_phase_advance_names_the_outstanding_reviewers():
     assert "No planner turn is invoked" in rendered
     assert "`secondary-audit`" in rendered
     assert "Gemini" in rendered
+
+
+# --- #948: bounded visible plan digest ---
+
+import coding_review_agent_loop.comment_rendering as _m948_rendering  # noqa: E402
+from coding_review_agent_loop.comment_rendering import render_canonical_plan_state  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    validate_human_requirements_acknowledgement as _m948_validate_ack,
+    validate_structured_plan_revision as _m948_validate_revision,
+    validate_structured_plan_state as _m948_validate_state,
+)
+
+_M948_FOOTER = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+_M948_IDS = tuple(f"hr-{index:064x}" for index in range(1, 9))
+_M948_DIRECT = "I checked the relevant GitHub discussion directly before responding."
+_M948_CANONICAL_ONLY_RECORDS = (
+    "AGENT_DEFERRED_STAGES:",
+    "AGENT_TYPED_PLAN_STAGES:",
+    "AGENT_PLAN_EXPECTED_CLOSING_ISSUES:",
+)
+
+
+def _m948_payload(kind="plan_state", *, count=2_000, text="entry", hr_ids=()):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    stage = lambda prefix: [  # noqa: E731
+        {"title": f"{prefix} {index} {text}", "summary": f"summary {index} {text}"}
+        for index in range(count)
+    ]
+    payload.update(
+        kind=kind,
+        summary=f"Adversarial summary {text}",
+        plan_steps=[f"Step {index} {text}" for index in range(count)],
+        additional_closing_issue_ids=list(range(1_000, 1_000 + min(count, 500))),
+        deferred_stages=stage("Deferred"),
+        external_dependencies=stage("External"),
+        deferred_work=stage("Later"),
+        plan_actions=stage("Action"),
+        human_requirement_dispositions=[
+            {"requirement_id": item, "disposition": "addressed", "evidence": "EVIDENCE " * 400}
+            for item in hr_ids
+        ],
+    )
+    if kind == "plan_revision":
+        payload["prior_plan_item_dispositions"] = [
+            {"item_id": f"item-{index}", "disposition": "resolved", "note": f"note {text}"}
+            for index in range(1, count + 1)
+        ]
+    return payload
+
+
+def _m948_with_child_stages(parsed, *, count, text):
+    # A generation-1 response cannot declare top-level child stages, but the
+    # renderer is a pure function of the parsed plan and must bound that
+    # category too.
+    from dataclasses import replace
+    from coding_review_agent_loop.protocol import ChildStage
+
+    children = tuple(
+        ChildStage(title=f"Child {index} {text}", summary=f"summary {index} {text}")
+        for index in range(count)
+    )
+    return replace(parsed, typed_stages=replace(parsed.typed_stages, child_stages=children))
+
+
+def _m948_ack_block(ids, *, direct=False):
+    lines = ["", "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->", "### Human requirements"]
+    if direct:
+        lines.append(f"- {_M948_DIRECT}")
+    lines.extend(f"- {item}: addressed because " + "EVIDENCE " * 400 for item in ids)
+    return "\n".join(lines)
+
+
+def _m948_budgeted_part(digest):
+    start = digest.index(_m948_rendering.COMPACT_PLAN_DIGEST_NOTICE)
+    end = digest.index("<!-- risk-test-matrix-section:")
+    return digest[start:end].rstrip()
+
+
+def _m948_prior_items(count):
+    return [
+        UnresolvedReviewItem(f"item-{index}", "codex", 1, "Finding", "blocking")
+        for index in range(1, count + 1)
+    ]
+
+
+@pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
+@pytest.mark.parametrize(
+    ("count", "text"), [(2_000, "entry"), (3, "LONG" * 20_000)], ids=["many-entries", "long-strings"]
+)
+def test_m948_budgeted_digest_is_bounded_deterministic_and_counts_omissions(kind, count, text):
+    raw = json.dumps(_m948_payload(kind, count=count, text=text)) + _M948_FOOTER
+    if kind == "plan_state":
+        parsed = _m948_with_child_stages(_m948_validate_state(raw), count=count, text=text)
+        render = lambda **kw: render_public_agent_comment(  # noqa: E731
+            kind="plan_state", parsed=parsed, agent="claude", raw_text=raw, **kw
+        )
+        canonical = render_canonical_plan_state(parsed)
+    else:
+        parsed = _m948_with_child_stages(_m948_validate_revision(raw), count=count, text=text)
+        prior_items = _m948_prior_items(count)
+        render = lambda **kw: render_public_agent_comment(  # noqa: E731
+            kind="plan_revision", parsed=parsed, agent="claude", raw_text=raw,
+            prior_items=prior_items, **kw,
+        )
+        canonical = render_canonical_plan_revision(parsed, prior_items)
+
+    digest = render(compact=True)
+    assert digest == render(compact=True)
+    budgeted = _m948_budgeted_part(digest)
+    assert len(budgeted) <= _m948_rendering.COMPACT_PLAN_DIGEST_BUDGET_CHARS
+    full = render()
+    assert len(full) > len(digest)
+
+    # Canonical-metadata-only records: absent from the digest, present canonically.
+    for record in _M948_CANONICAL_ONLY_RECORDS:
+        assert record not in digest
+        assert record in canonical
+        assert record in full
+    # Visible-anchor set.
+    for record in (
+        "AGENT_RISK_TEST_MATRIX:", "risk-test-matrix-section:",
+        "AGENT_EXECUTION_RECOMMENDATION:", "execution-recommendation-section:",
+        "<!-- AGENT_PLAN_STATE: blocking -->", "-- Anthropic Claude",
+    ):
+        assert record in digest
+
+    if count > 100:
+        omitted = re.findall(r"- \.\.\. (\d+) more of (\d+) omitted; complete list", budgeted)
+        sections = 8 if kind == "plan_revision" else 7
+        assert len(omitted) == sections
+        steps_section = budgeted.split("### Plan steps (digest)\n", 1)[1].split("\n\n", 1)[0]
+        shown = len(re.findall(r"(?m)^\d+\. Step ", steps_section))
+        assert (str(count - shown), str(count)) in omitted
+        assert shown > 0
+    else:
+        assert "omitted; complete list" not in budgeted
+        assert "LONG" * 600 not in budgeted
+
+
+@pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
+@pytest.mark.parametrize("direct", [False, True], ids=["surfaced-ids", "direct-discussion"])
+def test_m948_digest_keeps_every_signed_requirement_id_and_revalidates(kind, direct):
+    payload = _m948_payload(kind, count=5, hr_ids=_M948_IDS)
+    raw = json.dumps(payload) + _m948_ack_block(_M948_IDS, direct=direct) + _M948_FOOTER
+    _m948_validate_ack(raw, surfaced_requirement_ids=_M948_IDS, requires_direct_discussion_ack=direct)
+    if kind == "plan_state":
+        parsed = _m948_validate_state(raw)
+        kwargs = {}
+    else:
+        parsed = _m948_validate_revision(raw)
+        kwargs = {"prior_items": _m948_prior_items(5)}
+
+    digest = render_public_agent_comment(
+        kind=kind, parsed=parsed, agent="claude", raw_text=raw, compact=True, **kwargs
+    )
+
+    assert digest.count("<!-- HUMAN_REQUIREMENTS_ADDRESSED -->") == 1
+    block = digest[digest.index("<!-- HUMAN_REQUIREMENTS_ADDRESSED -->"):]
+    _m948_validate_ack(block, surfaced_requirement_ids=_M948_IDS, requires_direct_discussion_ack=direct)
+    assert (_M948_DIRECT in block) is direct
+    dispositions = digest.split("### Human requirement dispositions\n", 1)[1].split("\n\n", 1)[0]
+    for item in _M948_IDS:
+        assert f"- **{item}** — `addressed`: " in dispositions
+        assert re.search(rf"(?m)^- {item}: addressed because ", block)
+    # Only evidence is clipped.
+    assert "EVIDENCE " * 100 not in digest
+    assert len(block) < 8 * 400 + 600
+
+
+def test_m948_acknowledgement_clip_never_shortens_a_numbered_requirement():
+    line = "- " + "x" * 290 + " Requirement 12 and Requirement 3 " + "y" * 400
+    block = "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n### Human requirements\n" + line
+    compact = _m948_rendering._compact_human_requirements_block(block)
+    assert len(compact) < len(block)
+    _m948_validate_ack(
+        compact,
+        surfaced_requirement_ids=("Requirement 12", "Requirement 3"),
+        requires_direct_discussion_ack=False,
+    )
+
+
+def test_m948_fresh_plan_state_without_acknowledgement_block_adds_none():
+    raw = json.dumps(_m948_payload(count=5, hr_ids=_M948_IDS)) + _M948_FOOTER
+    parsed = _m948_validate_state(raw)
+    digest = render_public_agent_comment(
+        kind="plan_state", parsed=parsed, agent="claude", raw_text=raw, compact=True
+    )
+    assert "HUMAN_REQUIREMENTS_ADDRESSED" not in digest
+    assert all(f"- **{item}** — `addressed`" in digest for item in _M948_IDS)
+
+
+def test_m948_default_rendering_is_byte_identical_and_ignores_raw_text():
+    ids = _M948_IDS[:2]
+    raw_state = json.dumps(_m948_payload(count=4, hr_ids=ids)) + _m948_ack_block(ids) + _M948_FOOTER
+    parsed_state = _m948_validate_state(raw_state)
+    without_raw = render_public_agent_comment(kind="plan_state", parsed=parsed_state, agent="claude")
+    with_raw = render_public_agent_comment(
+        kind="plan_state", parsed=parsed_state, agent="claude", raw_text=raw_state
+    )
+    assert with_raw == without_raw == render_public_agent_comment(
+        kind="plan_state", parsed=parsed_state, agent="claude", raw_text=raw_state, compact=False
+    )
+    assert "HUMAN_REQUIREMENTS_ADDRESSED" not in with_raw
+    assert with_raw.startswith("## Plan\n\n")
+    assert all(record in with_raw for record in _M948_CANONICAL_ONLY_RECORDS)
+    assert _m948_rendering.COMPACT_PLAN_DIGEST_NOTICE not in with_raw
+
+    raw_revision = (
+        json.dumps(_m948_payload("plan_revision", count=4, hr_ids=ids))
+        + _m948_ack_block(ids) + _M948_FOOTER
+    )
+    parsed_revision = _m948_validate_revision(raw_revision)
+    prior_items = _m948_prior_items(4)
+    assert render_public_agent_comment(
+        kind="plan_revision", parsed=parsed_revision, agent="claude",
+        raw_text=raw_revision, prior_items=prior_items,
+    ) == "\n\n".join([
+        "## Revised plan",
+        render_canonical_plan_revision(parsed_revision, prior_items),
+        _m948_ack_block(ids).strip(),
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        "-- Anthropic Claude",
+    ])

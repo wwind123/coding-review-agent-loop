@@ -2743,3 +2743,147 @@ def test_m936_full_board_latch_survives_a_restart_after_the_digest_bound_round(
     audits = [body for body in world.posted() if "Plan review scheduling audit" in body]
     assert "Force-full: True (source: automatic)" in audits[0]
     assert "Selected reviewers: Codex, Gemini" in audits[0]
+
+
+# --- #948: an oversized child re-plan posts as a bounded digest and resumes ---
+
+import hashlib  # noqa: E402
+
+import coding_review_agent_loop.round_transport as _m948_transport  # noqa: E402
+from coding_review_agent_loop.comment_rendering import (  # noqa: E402
+    COMPACT_PLAN_DIGEST_NOTICE,
+)
+
+M948_ROW_IDS = tuple(f"row-inherited-{index:02d}" for index in range(11))
+
+
+def _m948_noise(seed, chars=256):
+    text = ""
+    while len(text) < chars:
+        text += hashlib.sha256(f"{seed}-{len(text)}".encode()).hexdigest()
+    return text[:chars]
+
+
+def _m948_parent_rows():
+    return [_parent_row(row_id=row_id, label=row_id) for row_id in M948_ROW_IDS]
+
+
+def _m948_binding():
+    return InheritedMatrixBinding(
+        parent_issue=55, stage_id="api", parent_matrix=_matrix(*_m948_parent_rows())
+    )
+
+
+def _m948_child_payload(*, summary):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["summary"] = summary
+    payload["plan_steps"] = [f"Step {index}: {_m948_noise(index)}" for index in range(300)]
+    payload["risk_test_matrix"] = _matrix(
+        *[{**row, "execution_owner": "one-shot"} for row in _m948_parent_rows()]
+    )
+    return payload
+
+
+def _m948_anchors(comments):
+    return [
+        str(item["body"]) for item in comments
+        if not _m948_transport.is_round_transport_sidecar(str(item["body"]))
+    ]
+
+
+def _m948_coder_anchors(comments):
+    return [body for body in _m948_anchors(comments) if COMPACT_PLAN_DIGEST_NOTICE in body]
+
+
+@pytest.mark.parametrize("form", ["semantic-patch", "full-state"])
+def test_m948_oversized_child_revision_posts_digest_and_resumes_losslessly(
+    tmp_path, monkeypatch, form
+):
+    _bind_child_planning(monkeypatch, _m948_binding())
+    fresh_payload = _m948_child_payload(summary="Child plan.")
+    fresh = json.dumps(fresh_payload) + PLAN_FOOTER
+    if form == "semantic-patch":
+        base = AuthenticatedPlanState.from_plan(validate_structured_plan_state(fresh), round_number=1)
+        revision = json.dumps({
+            "schema_version": 1, "kind": "plan_revision_patch",
+            "semantic_patch_contract_version": 1, "state": "blocking", "summary": "Patch.",
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-1", "disposition": "resolved", "note": "Addressed."}
+            ],
+            "base_round_number": 1, "base_state_identity": base.state_identity,
+            "operations": [{"op": "replace", "field": "summary", "value": "Revised child plan."}],
+        }) + PLAN_FOOTER
+    else:
+        monkeypatch.setattr(orchestrator, "make_assembled_plan_sidecar", lambda *a, **k: None)
+        revised = {**fresh_payload, "kind": "plan_revision", "summary": "Revised child plan."}
+        revised["prior_plan_item_dispositions"] = [
+            {"item_id": "item-1", "disposition": "resolved", "note": "Addressed."}
+        ]
+        revision = json.dumps(revised) + PLAN_FOOTER
+
+    # The second reviewer turn has no output, so the run stops with the
+    # revision published and unreviewed; a new invocation must resume it.
+    first = _ChildPlanningRunner(
+        claude_outputs=[fresh, revision],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Tighten the plan."]),
+        ],
+    )
+    with pytest.raises(Exception):
+        orchestrator.run_issue_loop(
+            first, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        )
+
+    bodies = [str(item["body"]) for item in first.issue_comments]
+    assert all(len(body) <= _m948_transport.MAX_GITHUB_BODY_CHARS for body in bodies)
+    coder_anchors = _m948_coder_anchors(first.issue_comments)
+    assert len(coder_anchors) == 2
+    revision_anchor = coder_anchors[-1]
+    assert revision_anchor.startswith("## Revised plan")
+    # Sidecars precede the anchor they belong to.
+    revision_index = bodies.index(revision_anchor)
+    assert _m948_transport.is_round_transport_sidecar(bodies[revision_index - 1])
+    for record in (
+        "AGENT_RISK_TEST_MATRIX:", "AGENT_EXECUTION_RECOMMENDATION:", "AGENT_LOOP_META:",
+        "<!-- AGENT_PLAN_STATE: blocking -->", "-- Anthropic Claude",
+    ):
+        assert record in revision_anchor
+    assert "Step 299:" not in revision_anchor
+    assert "more of 300 omitted; complete list in the authenticated attachments" in revision_anchor
+
+    # Metadata carries the full canonical plan, unchanged by the digest.
+    match = list(_m948_transport.ROUND_RESUME_MARKER_RE.finditer(revision_anchor))[-1]
+    hydrated, missing = _m948_transport.hydrate_mapping(
+        _m948_transport.decode_mapping(match.group("payload")), bodies
+    )
+    assert missing == set()
+    canonical_plan = hydrated["canonical_plan"]
+    assert f"Step 299: {_m948_noise(299)}" in canonical_plan
+    assert all(row_id in canonical_plan for row_id in M948_ROW_IDS)
+    assert COMPACT_PLAN_DIGEST_NOTICE not in canonical_plan
+    assert hydrated["subject"] == orchestrator._plan_subject(canonical_plan)
+
+    # Resume: no planner turn, the reviewer sees the full plan, same subject.
+    second = _ChildPlanningRunner(
+        issue_comments=first.issue_comments,
+        claude_outputs=[],
+        codex_outputs=[
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert orchestrator.run_issue_loop(
+        second, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+    assert _agent_prompts(second, "claude") == []
+    assert len(_agent_prompts(second, "codex")) == 1
+    # A prompt this large is delivered on stdin; the reviewer turn is the only
+    # agent call of the resumed run.
+    review_prompt = second.last_input_text
+    assert f"Step 299: {_m948_noise(299)}" in review_prompt
+    assert "Revised child plan." in review_prompt
+    assert COMPACT_PLAN_DIGEST_NOTICE not in review_prompt
+    # No forked plan round: nothing new was published by the coder.
+    assert len(_m948_coder_anchors(second.issue_comments)) == 2

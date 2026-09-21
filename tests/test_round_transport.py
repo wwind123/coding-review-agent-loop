@@ -2019,3 +2019,95 @@ def test_planning_scheduler_record_with_a_partial_candidate_key_decodes_invalid(
         ).scheduler_metadata_status
         == "valid"
     )
+
+
+# --- #948: dedicated overflow error, fit check and size attribution ---
+
+
+def test_m948_round_comment_fits_agrees_with_prepare_and_posts_nothing() -> None:
+    fitting = _comment({"canonical_plan": _random_text(500)})
+    spilling = _comment({"canonical_plan": _random_text(60_000)})
+
+    assert transport.round_comment_fits(fitting) is True
+    assert transport.round_comment_fits(spilling) is True
+    # Agreement: the same inputs prepare without error, and the helper returns
+    # a bare bool (no sidecars, no publication seam is involved).
+    assert len(transport.prepare_round_comment(fitting)) == 1
+    assert len(transport.prepare_round_comment(spilling)) > 1
+
+
+def test_m948_residual_overflow_is_dedicated_and_size_attributed_without_content() -> None:
+    secret = "SECRET" + _random_text(70_000)
+    visible = "Visible response " + _random_text(1_000)
+    payload = {
+        "unspilled_big_field": secret,
+        "canonical_plan": _random_text(60_000),
+        "small": "x",
+    }
+    body = _comment(payload, body=visible)
+
+    assert transport.round_comment_fits(body) is False
+    with pytest.raises(transport.RoundCommentOverflowError) as excinfo:
+        transport.prepare_round_comment(body)
+    message = str(excinfo.value)
+    assert isinstance(excinfo.value, AgentLoopError)
+    assert message.startswith(
+        "Round comment exceeds 60000 characters even after metadata spill; "
+        "shorten the visible response or metadata."
+    )
+    assert "visible body outside round metadata" in message
+    assert "residual encoded round metadata" in message
+    assert "unspilled_big_field=" in message
+    # The spilled field is no longer residual, and no content leaks.
+    assert "canonical_plan=" not in message
+    assert "SECRET" not in message
+    assert secret[:40] not in message
+    assert visible[-40:] not in message
+    assert len(message) < 1_000
+
+
+def test_m948_freeform_oversized_body_raises_dedicated_overflow() -> None:
+    body = "free-form plan " + "x" * 61_000
+
+    assert transport.round_comment_fits(body) is False
+    with pytest.raises(transport.RoundCommentOverflowError, match="visible body 61015 characters"):
+        transport.prepare_round_comment(body)
+
+
+def test_m948_fit_check_propagates_malformed_matrix_record() -> None:
+    body = _comment(
+        {"canonical_plan": "p"},
+        body="x" * 51_000 + "\n<!-- AGENT_RISK_TEST_MATRIX: " + "A" * 4_100 + " -->",
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        transport.round_comment_fits(body)
+    assert not isinstance(excinfo.value, transport.RoundCommentOverflowError)
+
+
+def test_m948_fit_check_propagates_non_serializable_metadata(monkeypatch) -> None:
+    body = _comment({"canonical_plan": _random_text(70_000)})
+    original = transport.decode_mapping
+
+    def decode(encoded: str) -> dict[str, object]:
+        payload = original(encoded)
+        payload["assembled_plan_sidecar"] = {"bad": {1, 2}}
+        return payload
+
+    monkeypatch.setattr(transport, "decode_mapping", decode)
+    # The pre-existing failure for this input propagates unchanged and is
+    # never reported as "does not fit".
+    with pytest.raises((AgentLoopError, TypeError)) as excinfo:
+        transport.round_comment_fits(body)
+    assert not isinstance(excinfo.value, transport.RoundCommentOverflowError)
+
+
+def test_m948_fit_check_propagates_provenance_failure() -> None:
+    text = _comment({"canonical_plan": _random_text(70_000)})
+    # The carrier does not authorize the round metadata record, so the
+    # transport cannot rewrite it; that is a provenance failure, not a size one.
+    carrier = TrustedBody(text)
+
+    with pytest.raises(AgentLoopError, match="authorized marker segment was not found") as excinfo:
+        transport.round_comment_fits(carrier)
+    assert not isinstance(excinfo.value, transport.RoundCommentOverflowError)
