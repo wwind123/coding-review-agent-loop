@@ -15095,6 +15095,13 @@ def _fresh_pr_qualification_snapshot(
         else None
     )
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    # A transaction-era PR qualifies only a head its committed workflow
+    # transaction binds; a legacy-era PR returns None and is unchanged (#827).
+    from .workflow_transaction_publication import require_live_head_authority
+
+    require_live_head_authority(
+        runner, config, pr_number=pr_number, head_sha=context.metadata.head_sha
+    )
     approved_identity = _latest_pr_approval_architecture_identity(
         context.comments, head_sha=context.metadata.head_sha
     )

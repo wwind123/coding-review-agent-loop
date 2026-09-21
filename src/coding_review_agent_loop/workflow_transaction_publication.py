@@ -2139,17 +2139,17 @@ def gate_canonical_issue_pr(
     return gated
 
 
-def require_merge_authority(
+def require_live_head_authority(
     runner: Runner,
     config: AgentLoopConfig,
     *,
     pr_number: int,
     head_sha: str,
 ) -> CommittedTransaction | None:
-    """Gate a merge of exactly ``head_sha``.  Read-only.
+    """Gate an authority consumer that knows only the PR and its live head.  Read-only.
 
-    Returns ``None`` for a legacy-era PR, whose merge keeps today's checks.  A
-    transaction-era PR merges only when its committed canonical transaction
+    Returns ``None`` for a legacy-era PR, whose consumer keeps today's checks.
+    A transaction-era PR passes only when its committed canonical transaction
     binds ``head_sha``; a partial, deleted, or older-head transaction raises.
     """
     resolved = read_pr_transaction_views(runner, config, pr_number, None)
@@ -2182,6 +2182,17 @@ def require_merge_authority(
         authorization_codec=BoundAuthorizationCodec(),
         plan_candidate_key=plan_candidate_key,
     )
+
+
+def require_merge_authority(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str,
+) -> CommittedTransaction | None:
+    """Gate a merge of exactly ``head_sha``; see ``require_live_head_authority``."""
+    return require_live_head_authority(runner, config, pr_number=pr_number, head_sha=head_sha)
 
 
 def _binding(handoff: ResolvedHandoff) -> PredecessorBinding:

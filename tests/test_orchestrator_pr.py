@@ -2960,8 +2960,13 @@ def _m946_merge_runner(monkeypatch, tmp_path, *, boundary=None, live_head=None):
     head = live_head or HEAD_1
     runner = FakeRunner(pr_payload={"number": PR, "headRefOid": head})
     runner.authenticated_actor = ACTOR
-    runner.pr_payload["comments"] = list(github.threads.get(PR, []))
-    runner.issue_comments_by_number[ISSUE] = list(github.threads.get(ISSUE, []))
+
+    def dual(item):
+        # REST-shaped for the authenticated read, gh-shaped for the PR context.
+        return {**item, "author": {"login": item["user"]["login"]}, "createdAt": item["created_at"]}
+
+    runner.pr_payload["comments"] = [dual(item) for item in github.threads.get(PR, [])]
+    runner.issue_comments_by_number[ISSUE] = [dual(item) for item in github.threads.get(ISSUE, [])]
     merged = []
     monkeypatch.setattr(
         orchestrator, "merge_pr", lambda *args, **kwargs: merged.append(kwargs["expected_head_sha"])
@@ -3039,6 +3044,72 @@ def test_m946_merge_refuses_a_deleted_committed_record_and_never_goes_legacy(
         )
 
     assert merged == []
+
+
+def _m946_snapshot(runner, config, pr):
+    return orchestrator._fresh_pr_qualification_snapshot(
+        runner, config=config, pr_number=pr, issue_context=None, parent_issue_context=None,
+    )
+
+
+def _m946_comment_writes(runner):
+    return [
+        c for c, _cwd in runner.commands
+        if c[:3] in (["gh", "pr", "comment"], ["gh", "issue", "comment"])
+    ]
+
+
+def test_m946_qualification_snapshot_passes_the_gate_for_a_committed_live_head(
+    monkeypatch, tmp_path
+):
+    runner, config, _merged, pr, head = _m946_merge_runner(monkeypatch, tmp_path)
+
+    context, _ids, _plan, _config = _m946_snapshot(runner, config, pr)
+
+    assert context.metadata.head_sha == head
+    assert _m946_comment_writes(runner) == []  # the gate never writes
+
+
+@pytest.mark.parametrize("boundary", [2, 3, 4])
+def test_m946_qualification_snapshot_refuses_a_partial_transaction(
+    monkeypatch, tmp_path, boundary
+):
+    """Prepared record, handoff, and PR contract may all agree: no commit, no qualification."""
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, boundary=boundary
+    )
+
+    with pytest.raises(WorkflowTransactionError):
+        _m946_snapshot(runner, config, pr)
+    assert _m946_comment_writes(runner) == []
+
+
+def test_m946_qualification_snapshot_refuses_a_head_without_a_committed_successor(
+    monkeypatch, tmp_path
+):
+    """The H1 transaction is never authority for H2."""
+    from workflow_transaction_helpers import HEAD_2
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2
+    )
+
+    with pytest.raises(WorkflowTransactionError):
+        _m946_snapshot(runner, config, pr)
+    assert _m946_comment_writes(runner) == []
+
+
+def test_m946_qualification_snapshot_refuses_a_deleted_committed_record(monkeypatch, tmp_path):
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(monkeypatch, tmp_path)
+    runner.pr_payload["comments"] = runner.pr_payload["comments"][:-1]
+
+    with pytest.raises(WorkflowTransactionError):
+        _m946_snapshot(runner, config, pr)
 
 
 def test_m946_legacy_pr_merge_passes_the_gate_with_no_write(monkeypatch, tmp_path):
