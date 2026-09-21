@@ -352,3 +352,111 @@ def pr_review_comment(
 
 def with_created_at(item: AuthenticatedComment, created_at: str) -> AuthenticatedComment:
     return replace(item, created_at=created_at, updated_at=created_at)
+
+
+# ---------------------------------------------------------------------------
+# Failure-injection fake GitHub for the publication seam (#827 stage B)
+# ---------------------------------------------------------------------------
+
+FAIL_BEFORE_WRITE = "fail-before-write"
+WRITE_THEN_REPORT_FAILURE = "write-then-report-failure"
+
+
+class TransactionGitHub:
+    """In-memory issue/PR conversations served over the ``gh api`` REST shapes.
+
+    Writes are numbered from 1 across both surfaces.  ``fail_write`` injects a
+    failure at one write boundary; ``before_write`` runs a callback immediately
+    before one write, modelling a competing invocation that interleaves between
+    the seam's read and its write.
+    """
+
+    def __init__(self, *, actor=ACTOR):
+        self.actor = actor
+        self.threads: dict[int, list[dict]] = {}
+        self.next_id = 1000
+        self.write_count = 0
+        self.writes: list[tuple[int, str]] = []
+        self.failures: dict[int, str] = {}
+        self.hooks: dict[int, object] = {}
+        self.reads = 0
+
+    # -- seeding -------------------------------------------------------------
+
+    def seed(self, number: int, body, *, author=None) -> int:
+        author = author or self.actor
+        self.next_id += 1
+        created = stamp(self.next_id - 1000)
+        self.threads.setdefault(number, []).append(
+            {
+                "id": self.next_id,
+                "body": str(body),
+                "user": {"login": author[0], "id": author[1]},
+                "created_at": created,
+                "updated_at": created,
+            }
+        )
+        return self.next_id
+
+    def delete(self, comment_id: int) -> None:
+        for comments in self.threads.values():
+            comments[:] = [item for item in comments if item["id"] != comment_id]
+
+    def edit(self, comment_id: int, body: str) -> None:
+        for comments in self.threads.values():
+            for item in comments:
+                if item["id"] == comment_id:
+                    item["body"] = body
+                    item["updated_at"] = "2026-09-21T23:59:59Z"
+
+    def bodies(self, number: int) -> list[str]:
+        return [item["body"] for item in self.threads.get(number, [])]
+
+    def fail_write(self, index: int, mode: str) -> None:
+        self.failures[index] = mode
+
+    def before_write(self, index: int, callback) -> None:
+        self.hooks[index] = callback
+
+    # -- Runner protocol -----------------------------------------------------
+
+    def run(self, args, *, cwd=None, input_text=None, check=True, env=None):
+        from types import SimpleNamespace
+        import json
+        import re
+
+        args = [str(item) for item in args]
+        if args[1:3] == ["api", "user"]:
+            return SimpleNamespace(
+                returncode=0, stderr="",
+                stdout=json.dumps({"login": self.actor[0], "id": self.actor[1]}),
+            )
+        endpoint = next(item for item in args if item.startswith("repos/"))
+        number = int(re.search(r"/issues/(\d+)/comments", endpoint).group(1))
+        if "POST" not in args:
+            self.reads += 1
+            page = int(endpoint.rsplit("page=", 1)[1])
+            comments = sorted(self.threads.get(number, []), key=lambda item: item["id"])
+            return SimpleNamespace(
+                returncode=0, stderr="",
+                stdout=json.dumps(comments[(page - 1) * 100 : page * 100]),
+            )
+        if input_text is not None:
+            body = json.loads(input_text)["body"]
+        else:
+            body = next(item for item in args if item.startswith("body="))[len("body="):]
+        self.write_count += 1
+        index = self.write_count
+        hook = self.hooks.pop(index, None)
+        if hook is not None:
+            hook(self)
+        mode = self.failures.pop(index, None)
+        if mode == FAIL_BEFORE_WRITE:
+            return SimpleNamespace(returncode=1, stdout="", stderr="injected failure")
+        comment_id = self.seed(number, body)
+        self.writes.append((number, body))
+        if mode == WRITE_THEN_REPORT_FAILURE:
+            return SimpleNamespace(returncode=1, stdout="", stderr="injected failure")
+        stored = self.threads[number][-1]
+        assert stored["id"] == comment_id
+        return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(stored))

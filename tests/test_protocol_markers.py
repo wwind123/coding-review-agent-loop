@@ -437,7 +437,9 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
     }
     offenders: list[str] = []
     for path in sorted(source_root.rglob("*.py")):
-        if path.name == "workflow_transaction.py":
+        # Stage B adds the publication seam as the second sanctioned importer.
+        # No orchestration call site consumes either module yet.
+        if path.name in {"workflow_transaction.py", "workflow_transaction_publication.py"}:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
