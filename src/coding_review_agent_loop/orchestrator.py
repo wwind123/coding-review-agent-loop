@@ -514,7 +514,7 @@ from .round_state import (
     recover_plan_validation_diagnostic,
     sanitize_plan_validation_diagnostic,
 )
-from .round_transport import is_round_transport_sidecar, round_comment_fits
+from .round_transport import decode_mapping, is_round_transport_sidecar, round_comment_fits
 from .plan_assembly import (
     AssembledPlanSidecar,
     AuthenticatedPlanState,
@@ -20736,11 +20736,13 @@ def _is_bot_authored_discuss_comment(body: str) -> bool:
     match = ROUND_RESUME_MARKER_RE.search(body)
     if match is None:
         return False
+    # Read only ``flow``, which never spills: a full decode would reject a
+    # round comment whose growth fields are unhydrated spill references.
     try:
-        metadata = _decode_round_metadata(match.group("payload"))
+        payload = decode_mapping(match.group("payload"))
     except AgentLoopError:
         return False
-    return metadata.flow == "discuss"
+    return payload.get("flow") == "discuss"
 
 
 def _discuss_subject(issue_context: IssueContext) -> str:

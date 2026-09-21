@@ -6561,3 +6561,41 @@ def test_format_invalid_agent_response_error_no_suggestion_empty_response():
         category="empty-response",
     )
     assert "Suggestion:" not in msg
+
+
+def test_m953_discuss_round_comment_with_spilled_prior_items_is_bot_authored():
+    import coding_review_agent_loop.round_transport as transport
+    from coding_review_agent_loop.orchestrator import _discuss_subject, _is_bot_authored_discuss_comment
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.github import IssueContext
+
+    body = _attach_round_metadata(
+        "discuss vote",
+        PostedRoundMetadata(
+            flow="discuss", role="reviewer", agent="codex", round_number=1, subject="s",
+        ),
+    )
+    match = transport.ROUND_RESUME_MARKER_RE.search(body)
+    payload = transport.decode_mapping(match.group("payload"))
+    payload["prior_items"] = {
+        "$round_transport_spill": "abc", "field": "prior_items", "parts": 1,
+        "sha256": "0" * 64, "spill": "0" * 64, "encoding": "json",
+    }
+    spilled = (
+        body[: match.start("payload")]
+        + transport.encode_mapping(payload)
+        + body[match.end("payload"):]
+    )
+
+    assert _is_bot_authored_discuss_comment(spilled) is True
+    assert _is_bot_authored_discuss_comment("<!-- AGENT_LOOP_META: not-valid -->") is False
+
+    def context(*comments):
+        return IssueContext(
+            number=1, repo="OWNER/REPO", title="Issue", body="Body", url=None,
+            comments=tuple(
+                IssueComment(author="bot", created_at=None, body=text) for text in comments
+            ),
+        )
+
+    assert _discuss_subject(context(spilled)) == _discuss_subject(context())
