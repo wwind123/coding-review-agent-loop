@@ -1421,6 +1421,58 @@ def test_flow_correction_to_or_from_the_approved_plan_flow_over_a_predecessor_is
     assert swapped.outcome == "contradiction"
 
 
+def test_entering_managed_ci_is_representable_and_leaving_it_is_a_contradiction():
+    effective = {
+        ENTRY_HANDOFF: CommentRef(ISSUE_SURFACE, 11, DIGEST),
+        ENTRY_PR_CONTRACT: CommentRef(PR_SURFACE, 12, DIGEST),
+        ENTRY_AUTHORIZATION: CommentRef(PR_SURFACE, 14, DIGEST),
+    }
+    unmanaged = direct_intent()
+    managed = direct_intent(
+        managed_ci_generation="g1",
+        record_set=record_set(authorization=reissued(ENTRY_AUTHORIZATION)),
+    )
+
+    # None -> g1: the selection step chose managed CI.  All three functions agree.
+    entering = _inputs(unmanaged, managed_ci_generation="g1")
+    for stored in (unmanaged, _head_advance(unmanaged)):
+        result = compare_prepared_intent(stored, replace(entering, head_sha=stored.head_sha))
+        assert (result.outcome, result.abort_reason) == ("obsolete", ABORT_SUPERSEDED_INTENT)
+    assert successor_kind_for(unmanaged, entering) == KIND_MANAGED_CI_CONTINUITY
+    successor = plan_successor(
+        unmanaged,
+        entering,
+        effective_records={k: v for k, v in effective.items() if k != ENTRY_AUTHORIZATION},
+    )
+    assert successor.successor_kind == KIND_MANAGED_CI_CONTINUITY
+    assert successor.entry(ENTRY_AUTHORIZATION).disposition == "reissued"
+    assert successor.entry(ENTRY_HANDOFF).inherited == effective[ENTRY_HANDOFF]
+
+    # g1 -> None: no successor can represent it, so nothing may be written.
+    leaving = _inputs(managed, managed_ci_generation=None)
+    managed_successor = _head_advance(
+        managed,
+        record_set=record_set(
+            handoff=inherited(ENTRY_HANDOFF, CommentRef(ISSUE_SURFACE, 11, DIGEST)),
+            contract=inherited(ENTRY_PR_CONTRACT, CommentRef(PR_SURFACE, 12, DIGEST)),
+            authorization=reissued(ENTRY_AUTHORIZATION),
+            coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND),
+        ),
+    )
+    for stored in (managed, managed_successor):
+        result = compare_prepared_intent(stored, replace(leaving, head_sha=stored.head_sha))
+        assert result.outcome == "contradiction" and result.abort_reason is None
+        assert "cannot become unmanaged" in " ".join(result.contradictions)
+    with pytest.raises(AgentLoopError, match="managed transaction unmanaged"):
+        successor_kind_for(managed, leaving)
+    with pytest.raises(AgentLoopError, match="managed transaction unmanaged"):
+        plan_successor(managed, leaving, effective_records=effective)
+    # A different generation stays the legitimate continuity case.
+    assert successor_kind_for(managed, _inputs(managed, managed_ci_generation="g2")) == (
+        KIND_MANAGED_CI_CONTINUITY
+    )
+
+
 def test_successor_kind_follows_the_fixed_precedence():
     committed = plan_intent(managed_ci_generation="g1", record_set=record_set(authorization=reissued(ENTRY_AUTHORIZATION)))
     assert successor_kind_for(committed, _inputs(committed)) is None

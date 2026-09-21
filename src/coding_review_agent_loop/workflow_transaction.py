@@ -2674,6 +2674,33 @@ def resolve_handoff_lineage(
                     ),
                 )
             assert isinstance(group.record, IssuePrHandoffMetadataV2)
+            if (
+                current is not None
+                and isinstance(current.handoff, IssuePrHandoffMetadata)
+                and root is None
+            ):
+                # Only a legacy-root correction, whose hashed root names this
+                # exact record (checked above), may correct a version-1
+                # handoff.  Any other transaction may only restate or widen it.
+                prior = current.handoff
+                consistent = (
+                    prior.flow == group.record.flow
+                    and prior.plan_hash == group.record.plan_hash
+                    and prior.issue_number == group.record.issue_number
+                    and set(prior.expected_closing_issue_ids)
+                    <= set(group.record.expected_closing_issue_ids)
+                )
+                if not consistent:
+                    raise _transaction_error(
+                        "A version-2 handoff contradicts the authenticated version-1 handoff it "
+                        "replaces without a legacy root naming that record",
+                        states=(state,),
+                        problems=(
+                            f"contradictory handoff record in comment {named.comment_id} against "
+                            f"version-1 handoff comment {current.comment_id}",
+                        ),
+                        code="handoff-supersession-invalid",
+                    )
             current = ResolvedHandoff(
                 group.record,
                 named.comment_id,
@@ -2809,7 +2836,18 @@ def compare_prepared_intent(
         name == "origin_flow" for name, _b, _a in differing
     )
     for name, _before, _after in differing:
-        if name in {"head_sha", "managed_ci_generation"}:
+        if name == "head_sha":
+            continue
+        if name == "managed_ci_generation":
+            # The selection step producing a generation (first or different)
+            # is legitimate: the fresh transaction reissues the authorization.
+            # Losing the generation is not: a continuity successor must reissue
+            # an authorization that an unmanaged transition cannot declare, so
+            # no successor can represent it and nothing may be written.
+            if fresh.managed_ci_generation is None:
+                contradictions.append(
+                    "managed_ci_generation: a managed transaction cannot become unmanaged"
+                )
             continue
         if (
             name == "approved_plan_hash"
@@ -2887,6 +2925,8 @@ def successor_kind_for(committed: WorkflowTransition, fresh: TransitionInputs) -
         raise _fail(
             "no successor kind can change " + ", ".join(sorted(unsupported)) + "."
         )
+    if "managed_ci_generation" in names and fresh.managed_ci_generation is None:
+        raise _fail("no successor kind can make a managed transaction unmanaged.")
     kinds = {_FIELD_KIND[name] for name in names}
     return next((kind for kind in SUCCESSOR_KIND_PRECEDENCE if kind in kinds), None)
 

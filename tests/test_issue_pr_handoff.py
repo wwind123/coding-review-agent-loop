@@ -1104,3 +1104,120 @@ def test_handoff_must_be_published_between_the_bound_prepared_and_terminal_recor
         with pytest.raises(WorkflowTransactionError) as excinfo:
             resolve(handoff)
         assert excinfo.value.code == "record-unordered"
+
+
+def test_v2_handoff_may_only_restate_or_widen_an_authenticated_v1_handoff():
+    from workflow_transaction_helpers import (
+        HEAD_1,
+        ISSUE,
+        PLAN_HASH,
+        PR,
+        REPO,
+        direct_intent,
+        issue_view,
+        plan_intent,
+        plan_record_comment,
+        pr_review_comment,
+        pr_view,
+        prepared_comment,
+        record_set,
+        terminal_comment,
+        v1_contract,
+        v1_contract_comment,
+        v1_handoff_comment,
+        v2_handoff_comment,
+    )
+
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.issue_pr_handoff import issue_pr_handoff_record_hash
+    from coding_review_agent_loop.pr_contract import pr_contract_record_hash
+    from coding_review_agent_loop.workflow_transaction import (
+        ENTRY_HANDOFF,
+        ENTRY_INITIAL_CODER_ROUND,
+        ENTRY_PR_CONTRACT,
+        FLOW_APPROVED_PLAN,
+        KIND_LEGACY_ROOT_CORRECTION,
+        CommentRef,
+        LegacyRoot,
+        LegacyRootContext,
+        find_origin_evidence,
+        not_applicable,
+        resolve_handoff_lineage,
+        resolve_transaction_lineage,
+    )
+
+    published = {ENTRY_HANDOFF: 11, ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13}
+
+    def resolve(intent, v1, *, pr_extra=(), context=None, published=published):
+        prs = pr_view(
+            *pr_extra,
+            prepared_comment(110, intent),
+            terminal_comment(120, intent, prepared_id=110, published=published),
+        )
+        lineage = resolve_transaction_lineage(
+            prs, repository=REPO, pr_number=PR, legacy_root_context=context
+        )
+        issues = issue_view(v1, v2_handoff_comment(111, intent))
+        return resolve_handoff_lineage(issues, lineage, repository=REPO, issue_number=ISSUE)
+
+    new_ids = {ENTRY_HANDOFF: 111, ENTRY_PR_CONTRACT: 112, ENTRY_INITIAL_CODER_ROUND: 113}
+
+    # A consistent version-1 handoff is restated by the initial transaction.
+    intent = direct_intent()
+    resolved = resolve(intent, v1_handoff_comment(5), published=new_ids)
+    assert resolved.comment_id == 111 and resolved.transaction_id == intent.transaction_id
+    # ... and may be widened to a strict superset of its closing IDs.
+    widened = direct_intent(expected_closing_issue_ids=(ISSUE, 900))
+    assert resolve(widened, v1_handoff_comment(5), published=new_ids).comment_id == 111
+
+    def refused(intent, v1):
+        with pytest.raises(WorkflowTransactionError) as excinfo:
+            resolve(intent, v1, published=new_ids)
+        assert excinfo.value.code == "handoff-supersession-invalid"
+        return str(excinfo.value)
+
+    # A different flow (and with it the plan hash) is never silently relabelled.
+    message = refused(plan_intent(), v1_handoff_comment(5))
+    assert "comment 111" in message and "version-1 handoff comment 5" in message
+    refused(direct_intent(), v1_handoff_comment(5, flow=FLOW_APPROVED_PLAN, plan_hash=PLAN_HASH))
+    # Same flow, another plan.
+    refused(
+        plan_intent(approved_plan_hash="1" * 16),
+        v1_handoff_comment(5, flow=FLOW_APPROVED_PLAN, plan_hash=PLAN_HASH),
+    )
+    # Closing IDs that are not a superset of the version-1 record's.
+    refused(direct_intent(), v1_handoff_comment(5, ids=(ISSUE, 900)))
+    refused(
+        direct_intent(expected_closing_issue_ids=(ISSUE, 901)),
+        v1_handoff_comment(5, ids=(ISSUE, 900)),
+    )
+
+    # A legacy-root correction naming exactly that version-1 handoff may correct it.
+    v1 = v1_handoff_comment(5)
+    contract_comment, evidence_comment = v1_contract_comment(105), pr_review_comment(107)
+    plan_issue = issue_view(plan_record_comment(3), v1)
+    v1_lineage = resolve_issue_pr_handoff_lineage([v1], issue_number=ISSUE, repo=REPO)
+
+    def correction(handoff_ref):
+        return plan_intent(
+            successor_kind=KIND_LEGACY_ROOT_CORRECTION,
+            legacy_root=LegacyRoot(
+                contract=CommentRef(f"pr#{PR}", 105, pr_contract_record_hash(v1_contract())),
+                handoff=handoff_ref,
+                origin_evidence=find_origin_evidence(pr_view(contract_comment, evidence_comment)),
+            ),
+            record_set=record_set(coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND)),
+        )
+
+    named = correction(
+        CommentRef(f"issue#{ISSUE}", 5, issue_pr_handoff_record_hash(v1_lineage.latest))
+    )
+    context = LegacyRootContext(plan_issue, (HEAD_1,), primary_issue_view=plan_issue)
+    corrected = resolve(
+        named,
+        v1,
+        pr_extra=(contract_comment, evidence_comment),
+        context=context,
+        published={ENTRY_HANDOFF: 111, ENTRY_PR_CONTRACT: 112},
+    )
+    assert corrected.comment_id == 111 and corrected.handoff.flow == FLOW_APPROVED_PLAN

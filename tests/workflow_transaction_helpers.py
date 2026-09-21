@@ -223,7 +223,9 @@ def v1_contract_comment(comment_id: int, contract=None, *, author=ACTOR):
     return comment(comment_id, format_pr_contract_comment(contract or v1_contract()), author=author)
 
 
-def v1_handoff_comment(comment_id: int, *, flow=FLOW_ISSUE, plan_hash=None, author=ACTOR):
+def v1_handoff_comment(
+    comment_id: int, *, flow=FLOW_ISSUE, plan_hash=None, author=ACTOR, ids=None
+):
     body = format_issue_pr_handoff_comment(
         issue_number=ISSUE,
         pr_number=PR,
@@ -231,6 +233,7 @@ def v1_handoff_comment(comment_id: int, *, flow=FLOW_ISSUE, plan_hash=None, auth
         pr_head_sha=HEAD_1,
         flow=flow,
         plan_hash=plan_hash,
+        expected_closing_issue_ids=ids,
     )
     return comment(comment_id, body, surface=f"issue#{ISSUE}", author=author)
 
