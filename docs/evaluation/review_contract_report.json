@@ -1,162 +1,178 @@
 {
-  "artifact_sha256": "e128065a580570acfc8a5e0156c9a696cb7719cec509936414a2a52b6eaca7bc",
+  "artifact_sha256": "abbdd080bb9f98ac01bbc8e995ea9aa90d0f26925be9fea0a7b86af24685d057",
   "flows": {
     "plan": {
       "policies": {
         "all-reviewers": {
           "marginal_findings_beyond_primary": {
-            "status": "verified",
-            "value": {
-              "Anthropic Claude": [
-                "historical-plan-all-001:plan-untested-fallback"
-              ]
-            }
-          },
-          "metrics": {
-            "calls_avoided": {
-              "status": "verified",
-              "value": 0
-            },
-            "ci_failures": {
-              "status": "verified",
-              "value": 0
-            },
-            "coder_followup_rounds": {
-              "status": "verified",
-              "value": 2
-            },
-            "disagreements": {
-              "status": "verified",
-              "value": 1
-            },
-            "elapsed_seconds": {
-              "status": "verified",
-              "value": 300
-            },
-            "escaped_defects": {
-              "status": "verified",
-              "value": 1
-            },
-            "estimated_cost": {
-              "status": "verified",
-              "value": 2.1
-            },
-            "false_positives": {
-              "status": "verified",
-              "value": 0
-            },
-            "review_rounds": {
-              "status": "verified",
-              "value": 3
-            },
-            "reviewer_calls": {
-              "status": "verified",
-              "value": 6
-            },
-            "tokens": {
-              "status": "verified",
-              "value": 21000
-            },
-            "withdrawals": {
-              "status": "verified",
-              "value": 0
-            }
-          },
-          "primary_to_panel_approval_regressions": {
-            "reason": "approval-round measurement absent for runs: historical-plan-all-001",
-            "status": "unavailable",
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
             "value": null
           },
-          "run_count": 1,
-          "severity_weighted_marginal_findings": {
-            "status": "verified",
-            "value": {
-              "Anthropic Claude": 3
-            }
-          },
-          "status": "verified",
-          "valid_unique_findings": {
-            "status": "verified",
-            "value": 2
-          }
-        },
-        "primary-then-panel": {
-          "marginal_findings_beyond_primary": {
-            "status": "verified",
-            "value": {
-              "Anthropic Claude": [
-                "historical-plan-primary-panel-001:plan-untested-fallback"
-              ]
-            }
-          },
           "metrics": {
             "calls_avoided": {
-              "status": "verified",
-              "value": 3
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "ci_failures": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "coder_followup_rounds": {
-              "status": "verified",
-              "value": 2
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "disagreements": {
-              "status": "verified",
-              "value": 1
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "elapsed_seconds": {
-              "status": "verified",
-              "value": 260
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "escaped_defects": {
-              "reason": "measurement absent or without verified provenance for runs: historical-plan-primary-panel-001",
+              "reason": "no frozen runs for this policy",
               "status": "unavailable",
               "value": null
             },
             "estimated_cost": {
-              "status": "verified",
-              "value": 1.6
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "false_positives": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "review_rounds": {
-              "status": "verified",
-              "value": 3
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "reviewer_calls": {
-              "status": "verified",
-              "value": 4
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "tokens": {
-              "status": "verified",
-              "value": 16000
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "withdrawals": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             }
           },
           "primary_to_panel_approval_regressions": {
-            "status": "verified",
-            "value": [
-              1
-            ]
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
           },
-          "run_count": 1,
+          "run_count": 0,
           "severity_weighted_marginal_findings": {
-            "status": "verified",
-            "value": {
-              "Anthropic Claude": 3
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "status": "unavailable",
+          "valid_unique_findings": {
+            "reason": "no frozen runs for this policy",
+            "status": "unavailable",
+            "value": null
+          }
+        },
+        "primary-then-panel": {
+          "marginal_findings_beyond_primary": {
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "metrics": {
+            "calls_avoided": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "ci_failures": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "coder_followup_rounds": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "disagreements": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "elapsed_seconds": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "escaped_defects": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "estimated_cost": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "false_positives": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "review_rounds": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "reviewer_calls": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "tokens": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
+            },
+            "withdrawals": {
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             }
           },
-          "status": "verified",
+          "primary_to_panel_approval_regressions": {
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "run_count": 0,
+          "severity_weighted_marginal_findings": {
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
+          },
+          "status": "unavailable",
           "valid_unique_findings": {
-            "status": "verified",
-            "value": 2
+            "reason": "no frozen runs for this policy",
+            "status": "unavailable",
+            "value": null
           }
         }
       },
@@ -245,84 +261,84 @@
           "policies": {
             "all-reviewers": {
               "coder_followup_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
-              "run_count": 1
+              "run_count": 0
             },
             "primary-then-panel": {
               "coder_followup_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
-              "run_count": 1
+              "run_count": 0
             }
           }
         }
       },
-      "run_count": 2,
+      "run_count": 0,
       "title": "Frozen plan review policy evaluation"
     },
     "pr": {
@@ -335,52 +351,64 @@
           },
           "metrics": {
             "calls_avoided": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "ci_failures": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "coder_followup_rounds": {
-              "status": "verified",
-              "value": 1
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "disagreements": {
-              "status": "verified",
-              "value": 1
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "elapsed_seconds": {
-              "status": "verified",
-              "value": 180
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "escaped_defects": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "estimated_cost": {
-              "status": "verified",
-              "value": 1.2
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "false_positives": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "review_rounds": {
-              "status": "verified",
-              "value": 2
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "reviewer_calls": {
-              "status": "verified",
-              "value": 4
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "tokens": {
-              "status": "verified",
-              "value": 12000
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "withdrawals": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             }
           },
           "primary_to_panel_approval_regressions": {
@@ -388,94 +416,103 @@
             "status": "not-applicable",
             "value": null
           },
-          "run_count": 1,
+          "run_count": 0,
           "severity_weighted_marginal_findings": {
             "reason": "no run for this policy declares a primary reviewer",
             "status": "not-applicable",
             "value": null
           },
-          "status": "verified",
+          "status": "unavailable",
           "valid_unique_findings": {
-            "status": "verified",
-            "value": 2
+            "reason": "no frozen runs for this policy",
+            "status": "unavailable",
+            "value": null
           }
         },
         "primary-then-panel": {
           "marginal_findings_beyond_primary": {
-            "status": "verified",
-            "value": {
-              "Anthropic Claude": [
-                "historical-primary-panel-001:finding-escape"
-              ]
-            }
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
           },
           "metrics": {
             "calls_avoided": {
-              "status": "verified",
-              "value": 1
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "ci_failures": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "coder_followup_rounds": {
-              "status": "verified",
-              "value": 1
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "disagreements": {
-              "status": "verified",
-              "value": 1
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "elapsed_seconds": {
-              "status": "verified",
-              "value": 150
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "escaped_defects": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "estimated_cost": {
-              "status": "verified",
-              "value": 0.95
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "false_positives": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "review_rounds": {
-              "status": "verified",
-              "value": 2
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "reviewer_calls": {
-              "status": "verified",
-              "value": 3
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "tokens": {
-              "status": "verified",
-              "value": 9500
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "withdrawals": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             }
           },
           "primary_to_panel_approval_regressions": {
-            "status": "verified",
-            "value": [
-              1
-            ]
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
           },
-          "run_count": 1,
+          "run_count": 0,
           "severity_weighted_marginal_findings": {
-            "status": "verified",
-            "value": {
-              "Anthropic Claude": 5
-            }
+            "reason": "no run for this policy declares a primary reviewer",
+            "status": "not-applicable",
+            "value": null
           },
-          "status": "verified",
+          "status": "unavailable",
           "valid_unique_findings": {
-            "status": "verified",
-            "value": 2
+            "reason": "no frozen runs for this policy",
+            "status": "unavailable",
+            "value": null
           }
         },
         "selective-intermediate": {
@@ -486,53 +523,64 @@
           },
           "metrics": {
             "calls_avoided": {
-              "status": "verified",
-              "value": 1
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "ci_failures": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "coder_followup_rounds": {
-              "status": "verified",
-              "value": 1
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "disagreements": {
-              "status": "verified",
-              "value": 1
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "elapsed_seconds": {
-              "status": "verified",
-              "value": 140
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "escaped_defects": {
-              "reason": "measurement absent or without verified provenance for runs: historical-selective-001",
+              "reason": "no frozen runs for this policy",
               "status": "unavailable",
               "value": null
             },
             "estimated_cost": {
-              "status": "verified",
-              "value": 0.9
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "false_positives": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "review_rounds": {
-              "status": "verified",
-              "value": 2
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "reviewer_calls": {
-              "status": "verified",
-              "value": 3
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "tokens": {
-              "status": "verified",
-              "value": 9000
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             },
             "withdrawals": {
-              "status": "verified",
-              "value": 0
+              "reason": "no frozen runs for this policy",
+              "status": "unavailable",
+              "value": null
             }
           },
           "primary_to_panel_approval_regressions": {
@@ -540,16 +588,17 @@
             "status": "not-applicable",
             "value": null
           },
-          "run_count": 1,
+          "run_count": 0,
           "severity_weighted_marginal_findings": {
             "reason": "no run for this policy declares a primary reviewer",
             "status": "not-applicable",
             "value": null
           },
-          "status": "verified",
+          "status": "unavailable",
           "valid_unique_findings": {
-            "status": "verified",
-            "value": 2
+            "reason": "no frozen runs for this policy",
+            "status": "unavailable",
+            "value": null
           }
         }
       },
@@ -676,122 +725,122 @@
           "policies": {
             "all-reviewers": {
               "coder_followup_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
-              "run_count": 1
+              "run_count": 0
             },
             "primary-then-panel": {
               "coder_followup_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
-              "run_count": 1
+              "run_count": 0
             },
             "selective-intermediate": {
               "coder_followup_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "escaped_defects_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "review_rounds_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
               "reviewer_calls_per_run": {
-                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "reason": "no frozen runs for this review contract and policy",
                 "status": "unavailable",
                 "value": null
               },
-              "run_count": 1
+              "run_count": 0
             }
           }
         }
       },
-      "run_count": 3,
+      "run_count": 0,
       "title": "Frozen PR review policy evaluation"
     }
   },
@@ -805,52 +854,64 @@
       },
       "metrics": {
         "calls_avoided": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "ci_failures": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "coder_followup_rounds": {
-          "status": "verified",
-          "value": 1
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "disagreements": {
-          "status": "verified",
-          "value": 1
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "elapsed_seconds": {
-          "status": "verified",
-          "value": 180
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "escaped_defects": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "estimated_cost": {
-          "status": "verified",
-          "value": 1.2
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "false_positives": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "review_rounds": {
-          "status": "verified",
-          "value": 2
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "reviewer_calls": {
-          "status": "verified",
-          "value": 4
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "tokens": {
-          "status": "verified",
-          "value": 12000
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "withdrawals": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         }
       },
       "primary_to_panel_approval_regressions": {
@@ -858,94 +919,103 @@
         "status": "not-applicable",
         "value": null
       },
-      "run_count": 1,
+      "run_count": 0,
       "severity_weighted_marginal_findings": {
         "reason": "no run for this policy declares a primary reviewer",
         "status": "not-applicable",
         "value": null
       },
-      "status": "verified",
+      "status": "unavailable",
       "valid_unique_findings": {
-        "status": "verified",
-        "value": 2
+        "reason": "no frozen runs for this policy",
+        "status": "unavailable",
+        "value": null
       }
     },
     "primary-then-panel": {
       "marginal_findings_beyond_primary": {
-        "status": "verified",
-        "value": {
-          "Anthropic Claude": [
-            "historical-primary-panel-001:finding-escape"
-          ]
-        }
+        "reason": "no run for this policy declares a primary reviewer",
+        "status": "not-applicable",
+        "value": null
       },
       "metrics": {
         "calls_avoided": {
-          "status": "verified",
-          "value": 1
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "ci_failures": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "coder_followup_rounds": {
-          "status": "verified",
-          "value": 1
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "disagreements": {
-          "status": "verified",
-          "value": 1
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "elapsed_seconds": {
-          "status": "verified",
-          "value": 150
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "escaped_defects": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "estimated_cost": {
-          "status": "verified",
-          "value": 0.95
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "false_positives": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "review_rounds": {
-          "status": "verified",
-          "value": 2
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "reviewer_calls": {
-          "status": "verified",
-          "value": 3
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "tokens": {
-          "status": "verified",
-          "value": 9500
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "withdrawals": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         }
       },
       "primary_to_panel_approval_regressions": {
-        "status": "verified",
-        "value": [
-          1
-        ]
+        "reason": "no run for this policy declares a primary reviewer",
+        "status": "not-applicable",
+        "value": null
       },
-      "run_count": 1,
+      "run_count": 0,
       "severity_weighted_marginal_findings": {
-        "status": "verified",
-        "value": {
-          "Anthropic Claude": 5
-        }
+        "reason": "no run for this policy declares a primary reviewer",
+        "status": "not-applicable",
+        "value": null
       },
-      "status": "verified",
+      "status": "unavailable",
       "valid_unique_findings": {
-        "status": "verified",
-        "value": 2
+        "reason": "no frozen runs for this policy",
+        "status": "unavailable",
+        "value": null
       }
     },
     "selective-intermediate": {
@@ -956,53 +1026,64 @@
       },
       "metrics": {
         "calls_avoided": {
-          "status": "verified",
-          "value": 1
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "ci_failures": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "coder_followup_rounds": {
-          "status": "verified",
-          "value": 1
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "disagreements": {
-          "status": "verified",
-          "value": 1
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "elapsed_seconds": {
-          "status": "verified",
-          "value": 140
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "escaped_defects": {
-          "reason": "measurement absent or without verified provenance for runs: historical-selective-001",
+          "reason": "no frozen runs for this policy",
           "status": "unavailable",
           "value": null
         },
         "estimated_cost": {
-          "status": "verified",
-          "value": 0.9
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "false_positives": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "review_rounds": {
-          "status": "verified",
-          "value": 2
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "reviewer_calls": {
-          "status": "verified",
-          "value": 3
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "tokens": {
-          "status": "verified",
-          "value": 9000
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         },
         "withdrawals": {
-          "status": "verified",
-          "value": 0
+          "reason": "no frozen runs for this policy",
+          "status": "unavailable",
+          "value": null
         }
       },
       "primary_to_panel_approval_regressions": {
@@ -1010,16 +1091,17 @@
         "status": "not-applicable",
         "value": null
       },
-      "run_count": 1,
+      "run_count": 0,
       "severity_weighted_marginal_findings": {
         "reason": "no run for this policy declares a primary reviewer",
         "status": "not-applicable",
         "value": null
       },
-      "status": "verified",
+      "status": "unavailable",
       "valid_unique_findings": {
-        "status": "verified",
-        "value": 2
+        "reason": "no frozen runs for this policy",
+        "status": "unavailable",
+        "value": null
       }
     }
   },

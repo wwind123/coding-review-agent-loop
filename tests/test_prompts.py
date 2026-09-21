@@ -4655,3 +4655,144 @@ def test_m931_over_cap_delta_block_fails_closed_instead_of_truncating(monkeypatc
     monkeypatch.setattr(prompts_module, "INHERITED_COVERAGE_DELTA_MAX_BYTES", 16)
     with pytest.raises(_M931AgentLoopError, match="never truncated"):
         render_inherited_coverage_delta(binding, deltas)
+
+
+# --- Reviewer exhaustiveness rule (#894) -----------------------------------
+
+_EXHAUSTIVENESS_MARKER = "Review exhaustively: report every defect you can independently substantiate"
+
+
+def _exhaustiveness_clauses(flow):
+    blocking, followups, subject, full_pass, behind = {
+        "pr": ("blocking_items", "same_pr_followups", "reviewed head", "full diff", "code"),
+        "plan": ("blocking_plan_issues", "same_plan_followups", "reviewed plan", "full plan", "plan content"),
+    }[flow]
+    return (
+        f"report every defect you can independently substantiate on the {subject}, not only the first.",
+        "Substantiating one blocking defect does not end the review; "
+        f"finish the pass over the {full_pass} before responding.",
+        "re-read that whole function or path and enumerate every other independently evidenced "
+        f"defect there as separate `{blocking}` or `{followups}` entries in the same response.",
+        "Each entry still needs its own evidence; speculation, or padding the review with items "
+        "you cannot evidence, is forbidden.",
+        f"If a defect genuinely prevents you from evaluating {behind} behind it, say so in that "
+        "entry's text and in `summary`, naming what could not be evaluated, so the coder knows "
+        "another round is expected.",
+        "Do not claim masking merely to stop early.",
+    )
+
+
+def _exhaustive_reviewer_prompt(config, flow, compact):
+    if flow == "pr":
+        return build_review_prompt(77, 2, config, reviewer="codex", compact_context=compact)
+    return build_plan_review_prompt(56, 2, "Plan.", config, reviewer="codex", compact_context=compact)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("flow", ["pr", "plan"])
+def test_every_reviewer_prompt_form_carries_the_flow_correct_exhaustiveness_rule(tmp_path, flow, compact):
+    prompt = _exhaustive_reviewer_prompt(make_config(tmp_path), flow, compact)
+    assert prompt.count(_EXHAUSTIVENESS_MARKER) == 1
+    flat = " ".join(prompt.split())
+    for clause in _exhaustiveness_clauses(flow):
+        assert clause in flat
+    other = "plan" if flow == "pr" else "pr"
+    assert _exhaustiveness_clauses(other)[2] not in flat
+    # The full and compact forms share one helper, so they cannot drift.
+    assert prompts_module._reviewer_exhaustiveness_guidance(flow) in prompt
+
+
+def test_exhaustiveness_rule_is_static_per_flow_and_keeps_existing_review_rules(tmp_path):
+    assert prompts_module._reviewer_exhaustiveness_guidance("pr") == prompts_module._reviewer_exhaustiveness_guidance("pr")
+    with pytest.raises(KeyError):
+        prompts_module._reviewer_exhaustiveness_guidance("discuss")
+    config = make_config(tmp_path)
+    for compact in (False, True):
+        flat = " ".join(_exhaustive_reviewer_prompt(config, "pr", compact).split())
+        assert '"kind": "pr_review"' in flat
+        assert "Pending or unavailable GitHub checks are an external wait state" in flat
+        assert "Do not defer your review to wait for CI checks to finish." in flat
+        assert "Only items listed under `Prior unresolved review items from earlier rounds`" in flat
+        plan_flat = " ".join(_exhaustive_reviewer_prompt(config, "plan", compact).split())
+        assert '"kind": "plan_review"' in plan_flat
+        assert "A concern or paraphrase belongs in exactly one current-round list" in plan_flat
+        assert "Do not duplicate or reclassify the same concern across Same-plan and Future follow-up lists." in plan_flat
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize(
+    "approved_followups", ["ignore", "summarize", "issue", "fix-and-summarize", "fix-and-issue"]
+)
+def test_pr_exhaustiveness_rule_appears_for_every_followup_mode(tmp_path, approved_followups, compact):
+    config = make_config(tmp_path, approved_followups=approved_followups)
+    prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
+    assert prompt.count(_EXHAUSTIVENESS_MARKER) == 1
+    baseline = build_review_prompt(
+        77, 1, make_config(tmp_path, approved_followups="ignore"), reviewer="codex", compact_context=compact
+    )
+    assert prompts_module._build_followup_guidance(config) in prompt or approved_followups == "ignore"
+    assert (approved_followups == "ignore") == (prompt == baseline)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("reviewer", ["codex", "gemini"])
+def test_exhaustiveness_rule_appears_under_primary_then_panel(tmp_path, reviewer, compact):
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="primary-then-panel",
+        plan_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+        primary_plan_reviewer="codex",
+    )
+    pr_prompt = build_review_prompt(77, 3, config, reviewer=reviewer, compact_context=compact)
+    assert pr_prompt.count(_EXHAUSTIVENESS_MARKER) == 1
+    assert "primary-then-panel" in pr_prompt
+    plan_prompt = build_plan_review_prompt(56, 3, "Plan.", config, reviewer=reviewer, compact_context=compact)
+    assert plan_prompt.count(_EXHAUSTIVENESS_MARKER) == 1
+
+
+def test_exhaustiveness_rule_sits_inside_the_compact_stable_prefixes(tmp_path):
+    for plan_execution_mode in ("auto", "plan-only"):
+        config = make_config(tmp_path, plan_execution_mode=plan_execution_mode)
+        pr_prefixes, plan_prefixes = [], []
+        for round_number, head in ((2, "abc123"), (3, "def456")):
+            pr_prompt = build_review_prompt(
+                77, round_number, config, reviewer="codex", compact_context=True,
+                compact_tail=CompactPrReviewTailContext(
+                    head_sha=head, round_number=round_number, action=f"Review {head}."
+                ),
+            )
+            prefix, tail = pr_prompt.split(COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER, 1)
+            assert _EXHAUSTIVENESS_MARKER in prefix and _EXHAUSTIVENESS_MARKER not in tail
+            pr_prefixes.append(prefix)
+            plan_prompt = build_plan_review_prompt(
+                56, round_number, f"Plan {head}.", config, reviewer="codex", compact_context=True,
+                compact_tail=CompactPlanTailContext(subject=f"subject-{head}", action=f"Review {head}."),
+            )
+            prefix, tail = plan_prompt.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)
+            assert _EXHAUSTIVENESS_MARKER in prefix and _EXHAUSTIVENESS_MARKER not in tail
+            plan_prefixes.append(prefix)
+        assert pr_prefixes[0].encode() == pr_prefixes[1].encode()
+        assert plan_prefixes[0].encode() == plan_prefixes[1].encode()
+
+
+def test_non_reviewer_prompts_do_not_carry_the_exhaustiveness_rule(tmp_path):
+    import coding_review_agent_loop.repair as repair_module
+
+    config = make_config(tmp_path)
+    prompts = {
+        "coder-followup": build_followup_prompt(77, 1, "Needs tests.", config),
+        "same-pr-followup": build_same_pr_followup_prompt(77, 1, "Tighten docs.", config),
+        "plan-revision": build_plan_revision_prompt(783, 2, "Previous plan", "Blocking review", config),
+        "compact-plan-revision": build_plan_revision_prompt(
+            783, 2, "Previous plan", "Blocking review", config, compact_context=True
+        ),
+        "discuss-review": build_discuss_review_prompt(56, config, reviewer="codex", round_number=1),
+        "repair-pr-review": repair_module._build_repair_prompt("{}", expected_kind="pr_review"),
+        "repair-plan-review": repair_module._build_repair_prompt("{}", expected_kind="plan_review"),
+        "repair-coder": repair_module._build_repair_prompt("{}", expected_kind="coder_followup"),
+    }
+    for name, prompt in prompts.items():
+        assert "Review exhaustively" not in prompt, name
+        assert "Do not claim masking merely to stop early." not in " ".join(prompt.split()), name

@@ -501,6 +501,26 @@ run identities, validated severity labels, and validated non-empty contributor
 arrays (a valid finding is never silently dropped from coverage), and the
 evaluator has no GitHub or reviewer-call dependency.
 
+PR and plan reviewer prompts, in both full and compact forms, share one static
+exhaustiveness rule: report every independently substantiated defect on the
+reviewed head or plan in one response, enumerate same-path defects together,
+and state genuine masking in the finding text and `summary`. It changes no
+response schema and sits inside the compact stable prefixes. To measure it,
+runs may carry a validated `review_contract` label (`first-finding-permitted`,
+the absent-key default, or `exhaustive`) with optional
+`review_contract_provenance`. The report adds
+`flows.<flow>.review_contracts.<contract>.policies.<policy>` cells holding
+rounds, reviewer calls, and escaped defects per run; a cell is `verified` only
+when every run has verified metric provenance and verified label provenance,
+and there is deliberately no per-flow or cross-policy contract rollup, because
+scheduling policy itself drives calls, rounds, and escapes. Two artifact pairs
+are checked in under `docs/evaluation/`: the synthetic regression fixture
+(`frozen_review_artifacts.json` and `frozen_review_report.json`), which never
+receives real runs, and the real-run pair (`review_contract_runs.json` and
+`review_contract_report.json`), which ships empty and is extended only by the
+documented data-only
+[freezing procedure](docs/local_agent_loop.md#freezing-a-real-run).
+
 Findings have stable IDs, provenance, dispositions, and, where applicable,
 resolution ownership. The coder reports addressed, remaining, and disputed
 items; it does not silently redefine a finding or resolve another participant's
