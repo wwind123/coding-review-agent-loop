@@ -61,6 +61,7 @@ from .round_transport import prepare_round_comment
 from .runner import Runner
 from .workflow_transaction import (
     ABORT_SIBLING_CANONICAL,
+    ABSENCE_NO_PLAN_SCHEDULER_RECORDS,
     DISPOSITION_INHERITED,
     DISPOSITION_NOT_APPLICABLE,
     DISPOSITION_REISSUED,
@@ -928,6 +929,26 @@ class _Seam:
     def _scheduler_checkpoint(self, views: PublicationViews) -> SchedulerCheckpointRef:
         request = self.request
         plan = request.approved_plan
+        if (
+            plan is not None
+            and plan.plan_candidate_key is None
+            and request.origin_flow == FLOW_APPROVED_PLAN
+            and views.plan_issue_view is not None
+        ):
+            # A resume without the planning session (#827): with no scheduler
+            # record in the planning history the checkpoint is the absence
+            # reason whatever the key, so no key is needed.  Any scheduler
+            # record keeps the stage A requirement for the approved key.
+            resolve_approved_plan_anchor(
+                views.plan_issue_view, plan_hash=plan.plan_hash, plan_subject=plan.plan_subject
+            )
+            if all(
+                record.metadata.scheduler_metadata_status == "absent"
+                for record in _extract_round_metadata_records(
+                    views.plan_issue_view.authored, flow="plan"
+                )
+            ):
+                return SchedulerCheckpointRef(absence_reason=ABSENCE_NO_PLAN_SCHEDULER_RECORDS)
         return select_scheduler_checkpoint(
             views.plan_issue_view,
             origin_flow=request.origin_flow,
@@ -2411,6 +2432,62 @@ def recover_checkpoint_candidate_key(
     except AgentLoopError:
         return None
     return None
+
+
+def recover_approved_plan_input(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    plan_issue_number: int,
+    plan_hash: str,
+    plan_subject: str | None = None,
+) -> ApprovedPlanInput | None:
+    """The approved-plan input of a resume, recovered from durable records only.
+
+    An issue-command resume that no longer holds the planning session cannot
+    rebuild the approved plan's candidate key.  The key only selects the
+    scheduler checkpoint, so it is recovered only where that selection is
+    unambiguous: a planning history with no scheduler records needs no key
+    (the checkpoint is the ``no-plan-scheduler-records`` absence); otherwise
+    every scheduler-prelaunch summary for the approved subject after the
+    approved-plan anchor must carry the same complete key.  Anything else
+    returns ``None`` and the caller keeps its non-transaction path.  Never
+    writes.
+    """
+    from .workflow_transaction import comment_order
+
+    view = read_authenticated_protocol_comments(
+        runner, config=config, surface_kind=ISSUE_THREAD_SURFACE, number=plan_issue_number
+    )
+    try:
+        anchor = resolve_approved_plan_anchor(
+            view, plan_hash=plan_hash, plan_subject=plan_subject
+        )
+        records = _extract_round_metadata_records(view.authored, flow="plan")
+        if all(record.metadata.scheduler_metadata_status == "absent" for record in records):
+            return ApprovedPlanInput(plan_hash, anchor.plan_subject, None)
+        keys: set[PlanCandidateKey] = set()
+        for record in records:
+            metadata = record.metadata
+            if (
+                metadata.role != "summary"
+                or metadata.phase != "scheduler-prelaunch"
+                or metadata.subject != anchor.plan_subject
+                or metadata.scheduler_metadata_status != "valid"
+                or metadata.plan_candidate_key is None
+            ):
+                continue
+            if comment_order(anchor.comment, view.authored[record.index]) != "later":
+                continue
+            keys.add(PlanCandidateKey.from_mapping(metadata.plan_candidate_key))
+    except (AgentLoopError, WorkflowTransactionError):
+        return None
+    if len(keys) != 1:
+        return None
+    (key,) = keys
+    if key.incompleteness_reason() is not None:
+        return None
+    return ApprovedPlanInput(plan_hash, anchor.plan_subject, key)
 
 
 def gate_canonical_issue_pr(

@@ -39,7 +39,7 @@ from workflow_transaction_helpers import (
     v1_handoff_comment,
 )
 
-from coding_review_agent_loop.errors import WorkflowTransactionError
+from coding_review_agent_loop.errors import AgentLoopError, WorkflowTransactionError
 from coding_review_agent_loop.protocol_markers import TrustedBody
 from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
 from coding_review_agent_loop.workflow_transaction import (
@@ -1441,3 +1441,77 @@ def test_round_injected_at_the_terminal_write_boundary_is_never_reported_as_succ
         assert refused.value.code == "initial-coder-round-contradiction"
     with pytest.raises(WorkflowTransactionError):
         resolve_round_authority(lambda: None, lambda: gate(github, tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# #946: approved-plan resume without the planning session's candidate key
+# ---------------------------------------------------------------------------
+
+
+def test_recover_approved_plan_input_without_scheduler_records_needs_no_key(tmp_path):
+    from coding_review_agent_loop.workflow_transaction import ABSENCE_NO_PLAN_SCHEDULER_RECORDS
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        recover_approved_plan_input,
+    )
+
+    github = TransactionGitHub()
+    github.seed(ISSUE, plan_record_comment(1).body)
+    before = github.write_count
+    recovered = recover_approved_plan_input(
+        github, make_config(tmp_path), plan_issue_number=ISSUE, plan_hash=PLAN_HASH
+    )
+    assert recovered == ApprovedPlanInput(PLAN_HASH, PLAN_SUBJECT, None)
+    # Recovery is a pure read.
+    assert github.write_count == before
+    committed = publish(github, plan_request(approved_plan=recovered), tmp_path)
+    assert committed.intent.origin_flow == FLOW_APPROVED_PLAN
+    assert committed.intent.scheduler_checkpoint.absence_reason == ABSENCE_NO_PLAN_SCHEDULER_RECORDS
+    assert committed.intent.scheduler_checkpoint.reference is None
+    assert gate(github, tmp_path) is not None
+
+
+def test_recover_approved_plan_input_reads_the_unique_checkpoint_key(tmp_path):
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        recover_approved_plan_input,
+    )
+
+    github = TransactionGitHub()
+    checkpoint_id = seed_plan(github)
+    recovered = recover_approved_plan_input(
+        github, make_config(tmp_path), plan_issue_number=ISSUE, plan_hash=PLAN_HASH
+    )
+    assert recovered == ApprovedPlanInput(PLAN_HASH, PLAN_SUBJECT, plan_key())
+    committed = publish(github, plan_request(approved_plan=recovered), tmp_path)
+    assert committed.intent.scheduler_checkpoint.reference.comment_id == checkpoint_id
+
+
+def test_recover_approved_plan_input_refuses_an_ambiguous_subject(tmp_path):
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        recover_approved_plan_input,
+    )
+
+    github = TransactionGitHub()
+    seed_plan(github)
+    # A second same-subject candidate with a different strategy: the subject
+    # alone cannot pick the approved key, so nothing is recovered.
+    github.seed(
+        ISSUE,
+        scheduler_comment(3, key=plan_key(execution_strategy_identity="other"), round_number=2).body,
+    )
+    assert recover_approved_plan_input(
+        github, make_config(tmp_path), plan_issue_number=ISSUE, plan_hash=PLAN_HASH
+    ) is None
+
+
+def test_seam_refuses_a_keyless_approved_plan_when_the_history_scheduled(tmp_path):
+    github = TransactionGitHub()
+    seed_plan(github)
+    before = github.write_count
+    with pytest.raises(AgentLoopError, match="candidate key"):
+        publish(
+            github,
+            plan_request(approved_plan=ApprovedPlanInput(PLAN_HASH, PLAN_SUBJECT, None)),
+            tmp_path,
+        )
+    # Refused while building the intent: nothing was written.
+    assert github.write_count == before

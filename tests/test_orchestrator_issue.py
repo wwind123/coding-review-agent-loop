@@ -11007,14 +11007,17 @@ def test_m946_approved_plan_one_shot_publishes_one_transaction_then_parent_hando
     assert parent[0]["createdAt"] > committed[0]["createdAt"]
 
 
-@pytest.mark.parametrize("boundary", [3, 4, 5])
+@pytest.mark.parametrize("boundary", [1, 2, 3, 4, 5])
 def test_m946_approved_plan_one_shot_rerun_after_boundary_converges(tmp_path, boundary):
     """Writes: 1 prepared, 2 handoff, 3 contract, 4 tagged coder round, 5 committed.
 
-    After the handoff exists, an interruption stops the run with no parent
-    handoff and no reviewer; the issue-command rerun finishes the transaction
-    from its stored intent without the coder, then posts the parent phase
-    handoff once, and the PR loop resumes.
+    An interruption stops the run with no parent handoff and no reviewer.
+    After the handoff exists the issue-command rerun routes the partial
+    candidate to the seam; before it exists (boundaries 1-2) the rerun finds
+    the PR by closing reference and the approved-plan resume publishes (or
+    finishes) through the seam (#827, site a).  Either way the transaction is
+    finished without the coder, the parent phase handoff follows once, and
+    the PR loop resumes.
     """
     from coding_review_agent_loop.errors import WorkflowTransactionError
 
@@ -11024,8 +11027,19 @@ def test_m946_approved_plan_one_shot_rerun_after_boundary_converges(tmp_path, bo
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     assert not _m946_workflow_records(runner, "AGENT_PLAN_ONE_SHOT_IMPL")
     claude_calls = sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands[-3:])
 
     runner.rest_post_failures = ()
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    # The coder's commit carries the approved-plan provenance its prompt asked for,
+    # so the closing-reference candidate authenticates on the rerun.
+    provenance = re.search(
+        r"Agent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=approved plan=[0-9a-f]+",
+        "\n".join("\n".join(cmd) for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]),
+    ).group(0)
+    runner.pr_commit_pages = [
+        [{"commit": {"oid": "commit-1", "message": f"Implement issue.\n\n{provenance}"}}]
+    ] * 4
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
     assert sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands) == claude_calls

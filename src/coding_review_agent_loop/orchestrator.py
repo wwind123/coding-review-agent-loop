@@ -8145,11 +8145,78 @@ def _implement_approved_issue(
             resumed_pr_context = get_pr_review_context(
                 runner, config=implementation_config, pr_number=existing_pr_number
             )
+        # An unmanaged, non-staged approved plan with a complete candidate key
+        # resumes through the seam (#827, site a): one transaction restating or
+        # upgrading what the PR records, and never a version-1 record on a
+        # transaction-era PR.  Anything else keeps the version-1 writers.
+        resume_through_seam = (
+            resolved_pr.source == "legacy-closing-reference"
+            and plan_candidate_key is not None
+            and plan_candidate_key.incompleteness_reason() is None
+            and not implementation_config.managed_ci
+            and staged_parent_issue is None
+            and not implementation_config.dry_run
+        )
+        if resume_through_seam:
+            from . import workflow_transaction_publication as publication
+
+            if not _finish_pr_side_transaction(
+                runner, implementation_config, pr_number=existing_pr_number
+            ):
+                validate_pr_expected_closing_issues(
+                    runner,
+                    config=implementation_config,
+                    pr_number=existing_pr_number,
+                    expected_issue_ids=closing_contract.issue_ids,
+                    body=resumed_pr_context.metadata.body,
+                    reject_unexpected=False,
+                )
+                _pr_url, resumed_head_sha = require_pr_metadata_for_handoff(
+                    resumed_pr_context.metadata
+                )
+                publication.publish_transition(
+                    runner,
+                    config=implementation_config,
+                    request=publication.TransitionRequest(
+                        repository=implementation_config.repo,
+                        pr_number=existing_pr_number,
+                        base=str(
+                            resumed_pr_context.metadata.base_branch
+                            or implementation_config.base
+                        ),
+                        head_sha=resumed_head_sha,
+                        origin_path=publication.ORIGIN_APPROVED_PLAN,
+                        expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                        primary_issue=issue_number,
+                        approved_plan=publication.ApprovedPlanInput(
+                            plan_hash,
+                            plan_subject or approved_plan_context.plan_subject,
+                            plan_candidate_key,
+                        ),
+                    ),
+                )
+        # On a transaction-era PR the parent phase handoff is a follow-on write,
+        # only after the commit, and at most once across reruns.
+        parent_handoff_once = resume_through_seam or (
+            resolved_pr.source == "canonical"
+            and not isinstance(resolved_pr.evidence, IssuePrHandoffMetadata)
+        )
+        if parent_handoff_once and one_shot_parent_issue is not None:
+            _post_one_shot_parent_handoff_once(
+                runner,
+                implementation_config,
+                parent_issue=one_shot_parent_issue,
+                plan_hash=plan_hash,
+                plan_subject=plan_subject or "",
+                pr_number=existing_pr_number,
+                pr_head_sha=resumed_pr_context.metadata.head_sha,
+                recommendation=execution_recommendation,
+            )
         # Explicit managed recovery may be resuming a PR whose implementation
         # report was rejected before the canonical handoff checkpoint. Its
         # durable authorization is sufficient to enter the PR loop, but must
         # not launder that rejected report into a canonical handoff.
-        if resolved_pr.source == "legacy-closing-reference":
+        if resolved_pr.source == "legacy-closing-reference" and not resume_through_seam:
             pr_url, pr_head_sha = require_pr_metadata_for_handoff(resumed_pr_context.metadata)
             validate_pr_expected_closing_issues(
                 runner,
@@ -8189,7 +8256,7 @@ def _implement_approved_issue(
                     expected_closing_issue_ids=closing_contract.issue_ids,
                     supersedes_hash=closing_contract.supersedes_hash,
                 )
-        if one_shot_parent_issue is not None:
+        if one_shot_parent_issue is not None and not parent_handoff_once:
             post_one_shot_impl_handoff_comment(
                 runner,
                 config=implementation_config,
@@ -12983,7 +13050,44 @@ def run_issue_loop(
                     reject_unexpected=config.managed_ci,
                 )
                 pr_url, pr_head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
-                if not plan_first and not config.managed_ci and not config.dry_run:
+                # A plan-first resume of an unmanaged, non-staged approved plan
+                # whose candidate key is durably recoverable publishes through
+                # the seam as well (#827, site a); anything else keeps v1.
+                recovered_plan_input = None
+                if (
+                    plan_first
+                    and recovered_plan_hash is not None
+                    and recovered_plan_context is not None
+                    and recovered_plan_context.is_available
+                    and staged_parent_issue is None
+                    and not config.managed_ci
+                    and not config.dry_run
+                ):
+                    from . import workflow_transaction_publication as publication
+
+                    recovered_plan_input = publication.recover_approved_plan_input(
+                        runner,
+                        config,
+                        plan_issue_number=issue_number,
+                        plan_hash=recovered_plan_hash,
+                        plan_subject=recovered_plan_context.plan_subject,
+                    )
+                if recovered_plan_input is not None:
+                    publication.publish_transition(
+                        runner,
+                        config=config,
+                        request=publication.TransitionRequest(
+                            repository=config.repo,
+                            pr_number=resolved_pr.pr_number,
+                            base=str(pr_context.metadata.base_branch or config.base),
+                            head_sha=pr_head_sha,
+                            origin_path=publication.ORIGIN_APPROVED_PLAN,
+                            expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                            primary_issue=issue_number,
+                            approved_plan=recovered_plan_input,
+                        ),
+                    )
+                elif not plan_first and not config.managed_ci and not config.dry_run:
                     # Direct unmanaged resume (#827, site d): one transaction that
                     # restates or upgrades whatever the PR already records; a
                     # consistent legacy PR receives no write.
