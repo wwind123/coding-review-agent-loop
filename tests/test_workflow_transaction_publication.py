@@ -68,6 +68,7 @@ from coding_review_agent_loop.github import (
 from coding_review_agent_loop.workflow_transaction_publication import (
     CODE_MANAGED_UNAVAILABLE,
     ensure_live_head_transaction,
+    publish_closing_widening,
     is_recoverable,
     CODE_HEAD_NOT_COMMITTED,
     CODE_PARTIAL_CANDIDATE,
@@ -632,6 +633,41 @@ def test_ensure_live_head_transaction_derives_the_successor_from_the_committed_i
     # Equal head: nothing to write.
     assert not ensure_live_head_transaction(github, config, pr_number=PR, head_sha=HEAD_2)
     assert github.write_count == before + 2
+
+
+def test_publish_closing_widening_commits_a_widening_successor(tmp_path):
+    """The PR loop's widening on a transaction-era PR: a `closing-widening`
+    successor whose reissued contract names its predecessor, never a v1 write."""
+    github = TransactionGitHub()
+    first = publish(github, direct_request(), tmp_path)
+
+    widened = publish_closing_widening(
+        github, make_config(tmp_path), pr_number=PR, head_sha=HEAD_1,
+        expected_closing_issue_ids=(ISSUE, 901),
+    )
+
+    assert widened.intent.successor_kind == KIND_CLOSING_WIDENING
+    assert widened.intent.predecessor_transaction_id == first.transaction_id
+    assert widened.contract.contract.supersedes_record_hash == first.contract.record_hash
+    before = github.write_count
+    # Rerun with the same scope: already committed, nothing written.
+    publish_closing_widening(
+        github, make_config(tmp_path), pr_number=PR, head_sha=HEAD_1,
+        expected_closing_issue_ids=(ISSUE, 901),
+    )
+    assert github.write_count == before
+
+
+def test_publish_closing_widening_refuses_a_narrowing_without_writing(tmp_path):
+    github = TransactionGitHub()
+    publish(github, direct_request(expected_closing_issue_ids=(ISSUE, 901)), tmp_path)
+    before = github.write_count
+    with pytest.raises(WorkflowTransactionError):
+        publish_closing_widening(
+            github, make_config(tmp_path), pr_number=PR, head_sha=HEAD_1,
+            expected_closing_issue_ids=(ISSUE,),
+        )
+    assert github.write_count == before
 
 
 def test_ensure_live_head_transaction_leaves_legacy_and_equal_heads_untouched(tmp_path):

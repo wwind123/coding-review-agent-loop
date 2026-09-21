@@ -1550,10 +1550,33 @@ def ensure_live_head_transaction(
             recovery=RECOVERY_RERUN,
             code=CODE_MANAGED_UNAVAILABLE,
         )
+    ensure_head_transaction(
+        runner,
+        config=config,
+        request=_request_from_intent(runner, config, intent, head_sha=head_sha),
+    )
+    return True
+
+
+def _request_from_intent(
+    runner: Runner,
+    config: AgentLoopConfig,
+    intent: WorkflowTransition,
+    *,
+    head_sha: str,
+    expected_closing_issue_ids: Sequence[int] | None = None,
+) -> TransitionRequest:
+    """An unmanaged pr-resume request derived from a committed intent alone.
+
+    Only the head and, for a widening, the closing contract may differ; every
+    other field is copied, so the seam can name no successor kind other than
+    ``head-advance`` or ``closing-widening``.  The approved plan's candidate
+    key is recovered from the hashed checkpoint reference.
+    """
     plan = None
     if intent.approved_plan_hash is not None:
         plan_views = _read_views(
-            runner, config, pr_number=pr_number, issue_number=intent.primary_issue,
+            runner, config, pr_number=intent.pr_number, issue_number=intent.primary_issue,
             plan_issue_number=intent.plan_owning_issue,
         )
         plan = ApprovedPlanInput(
@@ -1561,23 +1584,150 @@ def ensure_live_head_transaction(
             None,
             recover_checkpoint_candidate_key(intent, plan_views.plan_issue_view),
         )
-    ensure_head_transaction(
+    return TransitionRequest(
+        repository=intent.repository,
+        pr_number=intent.pr_number,
+        base=intent.base,
+        head_sha=head_sha,
+        origin_path=ORIGIN_PR_RESUME,
+        expected_closing_issue_ids=tuple(
+            intent.expected_closing_issue_ids
+            if expected_closing_issue_ids is None
+            else expected_closing_issue_ids
+        ),
+        primary_issue=intent.primary_issue,
+        approved_plan=plan,
+        staged=intent.staged,
+        unowned_managed_pr=intent.origin_flow == FLOW_MANAGED_PR,
+    )
+
+
+@dataclass(frozen=True)
+class CommittedPrBinding:
+    """A committed transaction plus version-1-shaped views of its bound records.
+
+    The views let the PR loop's existing consumers of a PR contract and an
+    issue handoff read a transaction-era PR without the version-1 readers,
+    which reject version-2 records.  They carry no authority of their own.
+    """
+
+    transaction: CommittedTransaction
+    contract: PrExpectedClosingContract
+    handoff: IssuePrHandoffMetadata | None
+
+
+def committed_pr_binding(
+    runner: Runner, config: AgentLoopConfig, pr_number: int
+) -> CommittedPrBinding | None:
+    """Read-only.  ``None`` for a legacy-era PR; raises for a partial lineage."""
+    resolved = read_pr_transaction_views(runner, config, pr_number, None)
+    if resolved.era != ERA_TRANSACTION:
+        return None
+    committed = resolved.lineage.latest_committed
+    if committed is None or resolved.lineage.pending is not None:
+        raise _error(
+            "The PR has no committed workflow transaction to resume from",
+            intent=(resolved.lineage.pending or committed).intent
+            if (resolved.lineage.pending or committed) is not None else None,
+            problems=("pending or missing committed transaction",),
+            recovery=RECOVERY_RERUN,
+            code=CODE_UNCOMMITTED,
+        )
+    intent = committed.intent
+    if intent.primary_issue is not None:
+        resolved = read_pr_transaction_views(
+            runner, config, pr_number, intent.primary_issue,
+            plan_issue_number=intent.plan_owning_issue,
+        )
+        committed = resolved.lineage.latest_committed
+        assert committed is not None
+    # Imported here: ``pr_contract`` keeps the version-1 constructor.
+    from .pr_contract import make_pr_contract
+
+    contract = make_pr_contract(
+        repository=intent.repository,
+        pr_number=pr_number,
+        origin_flow=intent.origin_flow,
+        expected_closing_issue_ids=tuple(intent.expected_closing_issue_ids),
+        primary_issue_number=intent.primary_issue,
+    )
+    handoff = None
+    record = resolved.handoff.handoff if resolved.handoff is not None else None
+    if isinstance(record, IssuePrHandoffMetadataV2):
+        handoff = IssuePrHandoffMetadata(
+            schema_version=1,
+            issue_number=record.issue_number,
+            pr_number=record.pr_number,
+            pr_url=record.pr_url,
+            pr_head_sha=record.pr_head_sha,
+            flow=record.flow,
+            plan_hash=record.plan_hash,
+            expected_closing_issue_ids=tuple(record.expected_closing_issue_ids),
+        )
+    return CommittedPrBinding(
+        CommittedTransaction(committed, resolved.lineage, resolved.contract, resolved.handoff),
+        contract,
+        handoff,
+    )
+
+
+def publish_closing_widening(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str,
+    expected_closing_issue_ids: Sequence[int],
+) -> CommittedTransaction | None:
+    """Commit a ``closing-widening`` successor on a transaction-era PR.
+
+    Replaces the version-1 PR contract and handoff writes the PR loop makes for
+    a legacy PR.  Unmanaged only; a managed generation raises the recoverable
+    managed-unavailable error with no write, and a closing contract that is not
+    a strict superset is a contradiction the seam refuses.
+    """
+    resolved = read_pr_transaction_views(runner, config, pr_number, None)
+    committed = resolved.lineage.latest_committed
+    if resolved.era != ERA_TRANSACTION or committed is None:
+        raise _error(
+            "A closing widening needs a committed workflow transaction",
+            problems=("no committed transaction on the PR",),
+            recovery=RECOVERY_RERUN,
+            code=CODE_UNCOMMITTED,
+        )
+    intent = committed.intent
+    if intent.managed_ci_generation is not None:
+        raise _error(
+            "Widening a managed transaction's closing contract needs a managed-CI input; "
+            "nothing was written",
+            intent=intent,
+            problems=("managed widening is not derived from the committed intent",),
+            recovery=RECOVERY_RERUN,
+            code=CODE_MANAGED_UNAVAILABLE,
+        )
+    committed_ids = set(intent.expected_closing_issue_ids)
+    requested_ids = set(expected_closing_issue_ids)
+    if requested_ids != committed_ids and not (
+        committed_ids < requested_ids
+        and (intent.primary_issue is None or intent.primary_issue in requested_ids)
+    ):
+        raise _error(
+            "A closing contract may only be widened to a strict superset; nothing was written",
+            intent=intent,
+            problems=(
+                f"committed closing issues {sorted(committed_ids)}, "
+                f"requested {sorted(requested_ids)}",
+            ),
+            code="prepared-intent-contradiction",
+        )
+    return publish_transition(
         runner,
         config=config,
-        request=TransitionRequest(
-            repository=intent.repository,
-            pr_number=pr_number,
-            base=intent.base,
-            head_sha=head_sha,
-            origin_path=ORIGIN_PR_RESUME,
-            expected_closing_issue_ids=tuple(intent.expected_closing_issue_ids),
-            primary_issue=intent.primary_issue,
-            approved_plan=plan,
-            staged=intent.staged,
-            unowned_managed_pr=intent.origin_flow == FLOW_MANAGED_PR,
+        request=_request_from_intent(
+            runner, config, intent, head_sha=head_sha,
+            expected_closing_issue_ids=expected_closing_issue_ids,
         ),
     )
-    return True
 
 
 def _has_transaction_records(

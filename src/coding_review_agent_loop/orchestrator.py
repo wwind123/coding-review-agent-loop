@@ -143,6 +143,7 @@ from .github import (
     watch_pr_checks,
 )
 from .issue_pr_handoff import (
+    IssuePrHandoffMetadata,
     find_latest_issue_pr_handoff,
     authenticate_canonical_issue_pr,
     format_issue_pr_handoff_comment,
@@ -15108,6 +15109,43 @@ def _entry_head_transaction(
     )
 
 
+def _committed_pr_binding(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+):
+    """The committed transaction-era binding the PR loop reads, or ``None`` (#827).
+
+    ``None`` for a legacy-era PR and for a dry run, whose consumers keep the
+    version-1 readers.  Read-only.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run:
+        return None
+    return publication.committed_pr_binding(runner, config, pr_number)
+
+
+def _issue_handoff_for_pr_loop(
+    transaction_binding,
+    issue_context: IssueContext,
+    *,
+    config: AgentLoopConfig,
+) -> IssuePrHandoffMetadata | None:
+    """The issue handoff the PR loop checks: the committed version-2 handoff viewed
+    as version 1 on a transaction-era PR, else today's version-1 reader."""
+    if transaction_binding is None:
+        return find_latest_issue_pr_handoff(
+            issue_context.comments,
+            issue_number=issue_context.number,
+            repo=config.repo,
+        )
+    if issue_context.number != transaction_binding.contract.primary_issue_number:
+        return None
+    return transaction_binding.handoff
+
+
 def _entry_transaction_precheck(
     runner: Runner,
     config: AgentLoopConfig,
@@ -15893,10 +15931,17 @@ def run_pr_loop(
             runner, config, pr_number=pr_number,
             head_sha=initial_pr_context.metadata.head_sha,
         )
-        recorded_pr_contract = find_latest_pr_contract(
-            initial_pr_context.comments,
-            repository=config.repo,
-            pr_number=pr_number,
+        # A committed transaction-era PR is read through the seam: the
+        # version-1 readers reject version-2 records (#827).
+        transaction_binding = _committed_pr_binding(runner, config, pr_number=pr_number)
+        recorded_pr_contract = (
+            transaction_binding.contract
+            if transaction_binding is not None
+            else find_latest_pr_contract(
+                initial_pr_context.comments,
+                repository=config.repo,
+                pr_number=pr_number,
+            )
         )
         # A caller-provided issue snapshot may predate plan approval. Refresh
         # it before deriving requirements or handoff provenance.  The managed-CI
@@ -16091,10 +16136,8 @@ def run_pr_loop(
         )
         issue_handoff_to_update = None
         if issue_context is not None and recorded_pr_contract is not None:
-            issue_handoff_to_update = find_latest_issue_pr_handoff(
-                issue_context.comments,
-                issue_number=issue_context.number,
-                repo=config.repo,
+            issue_handoff_to_update = _issue_handoff_for_pr_loop(
+                transaction_binding, issue_context, config=config
             )
             if (
                 contract_needs_persisting
@@ -16160,10 +16203,8 @@ def run_pr_loop(
                         runner, config=config, issue_number=staged_parent_number
                     )
                     parent_issue_context_refreshed = True
-            issue_handoff = find_latest_issue_pr_handoff(
-                issue_context.comments,
-                issue_number=issue_context.number,
-                repo=config.repo,
+            issue_handoff = _issue_handoff_for_pr_loop(
+                transaction_binding, issue_context, config=config
             )
             # These values are populated only for a validated decomposition
             # phase marker.  Keep ordinary approved-plan resumes on the normal
@@ -16648,10 +16689,8 @@ def run_pr_loop(
             and issue_context is not None
             and issue_handoff_to_update is None
         ):
-            issue_handoff_to_update = find_latest_issue_pr_handoff(
-                issue_context.comments,
-                issue_number=issue_context.number,
-                repo=config.repo,
+            issue_handoff_to_update = _issue_handoff_for_pr_loop(
+                transaction_binding, issue_context, config=config
             )
             if (
                 issue_handoff_to_update is not None
@@ -16740,6 +16779,22 @@ def run_pr_loop(
                 body=initial_pr_context.metadata.body,
                 reject_unexpected=config.managed_ci and issue_context is not None,
             )
+            if contract_needs_persisting and transaction_binding is not None:
+                # Transaction era: no version-1 record is ever appended; a
+                # widened closing contract is a `closing-widening` successor.
+                if tuple(closing_contract.expected_closing_issue_ids) != tuple(
+                    transaction_binding.contract.expected_closing_issue_ids
+                ):
+                    from . import workflow_transaction_publication as publication
+
+                    publication.publish_closing_widening(
+                        runner,
+                        config,
+                        pr_number=pr_number,
+                        head_sha=str(initial_pr_context.metadata.head_sha or ""),
+                        expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
+                    )
+                contract_needs_persisting = False
             if contract_needs_persisting:
                 post_trusted_pr_comment(
                     runner,

@@ -3473,6 +3473,108 @@ def test_m946_dispatched_coder_head_integrity_failure_stops(monkeypatch, tmp_pat
         )
 
 
+def _m946_v1_records(runner):
+    return [
+        body for body in runner.comments
+        if "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body or "AGENT_ISSUE_PR_HANDOFF" in body
+    ]
+
+
+def test_m946_pr_loop_reviews_and_merges_a_committed_transaction_era_pr(monkeypatch, tmp_path):
+    """pr command on a committed transaction-era PR: the loop reads the committed
+    records through the seam (the version-1 readers reject version 2), reviews,
+    and merges the exact committed head with no transaction or version-1 write."""
+    runner, config, merged, pr, head = _m946_merge_runner(
+        monkeypatch, tmp_path, persist_writes=True
+    )
+    runner.pr_payload["body"] = "Fixes #813"
+    runner.codex_outputs = [
+        structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")
+    ]
+    config = make_config(
+        tmp_path, repo=config.repo, reviewer=("codex",), max_rounds=1, auto_merge=True
+    )
+
+    assert run_pr_loop(runner, pr_number=pr, config=config) == 0
+
+    assert merged == [head]
+    assert _m946_rest_comment_posts(runner) == []
+    assert _m946_v1_records(runner) == []
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 1
+
+
+def test_m946_pr_loop_commits_the_successor_for_an_external_push_then_merges(
+    monkeypatch, tmp_path
+):
+    """An external push after the commit: entry commits the head-advance
+    successor (inheriting handoff and PR contract), then the loop reviews and
+    merges the new head; no version-1 record is appended."""
+    from workflow_transaction_helpers import HEAD_2
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    runner, config, merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2, persist_writes=True
+    )
+    runner.pr_payload["body"] = "Fixes #813"
+    runner.codex_outputs = [
+        structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")
+    ]
+    config = make_config(
+        tmp_path, repo=config.repo, reviewer=("codex",), max_rounds=1, auto_merge=True
+    )
+
+    assert run_pr_loop(runner, pr_number=pr, config=config) == 0
+
+    assert merged == [HEAD_2]
+    assert len(_m946_rest_comment_posts(runner)) == 2  # prepared + committed only
+    gated = publication.require_live_head_authority(runner, config, pr_number=pr, head_sha=HEAD_2)
+    assert gated.intent.successor_kind == "head-advance"
+    assert _m946_v1_records(runner) == []
+
+
+def test_m946_pr_loop_does_not_merge_when_the_head_successor_cannot_commit(
+    monkeypatch, tmp_path
+):
+    """Entry is a writer path: a failed successor write stops the pr command before
+    any reviewer, and nothing merges."""
+    from workflow_transaction_helpers import HEAD_2
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2
+    )
+    runner.pr_payload["body"] = "Fixes #813"
+    runner.codex_outputs = [
+        structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")
+    ]
+    config = make_config(
+        tmp_path, repo=config.repo, reviewer=("codex",), max_rounds=1, auto_merge=True
+    )
+
+    with pytest.raises(WorkflowTransactionError):
+        run_pr_loop(runner, pr_number=pr, config=config)
+
+    assert merged == []
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    assert _m946_v1_records(runner) == []
+
+
+def test_m946_committed_pr_binding_views_the_committed_records(monkeypatch, tmp_path):
+    from workflow_transaction_helpers import ISSUE, HEAD_1
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(monkeypatch, tmp_path)
+
+    binding = orchestrator._committed_pr_binding(runner, config, pr_number=pr)
+
+    assert binding.contract.primary_issue_number == ISSUE
+    assert binding.contract.expected_closing_issue_ids == (ISSUE,)
+    assert binding.contract.origin_flow == "issue-implementation"
+    assert binding.handoff.pr_number == pr
+    assert binding.handoff.pr_head_sha == HEAD_1
+    assert binding.handoff.flow == binding.contract.origin_flow
+    assert orchestrator._committed_pr_binding(FakeRunner(), make_config(tmp_path), pr_number=77) is None
+
+
 @pytest.mark.parametrize("board", ["absent", "neutral", "skipped", "forbidden"])
 def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
     monkeypatch, tmp_path, board
