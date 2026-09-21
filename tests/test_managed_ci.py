@@ -6677,11 +6677,12 @@ def test_release_hook_is_not_run_for_the_not_recovery_capable_fallback(tmp_path)
     assert _label_delete_commands(runner) == []
 
 
-def _issue_created_resume_contract(**overrides):
+def _issue_created_resume_contract(*, transaction_bound=True, **overrides):
     handoff = managed_ci.AuthenticatedIssueCreatedHandoff(
         pr_number=826, issue_number=813, repository="OWNER/REPO", base_ref="main",
         head_sha="a" * 40, branch="agent-loop/managed-813", trusted_actor_login="agent-loop-bot",
         trusted_actor_id=4242, protection_mode="voluntary", override_nonce="nonce-1",
+        transaction_bound=transaction_bound,
     )
     resume = managed_ci.AuthenticatedManagedResume(
         origin="issue-created", lifecycle="draft-labeled", issue_created_handoff=handoff,
@@ -6698,6 +6699,18 @@ def test_pr_loop_binds_the_release_hook_only_for_an_issue_created_resume(tmp_pat
         FakeRunner(), config=config, pr_number=826, contract=bound
     )
     assert callable(bound.before_label_release)
+
+    # A legacy-era handoff (authenticated from an unbound record) gets no hook,
+    # so its release performs no transaction read before the label delete.
+    class NoReadRunner:
+        def run(self, args, **kwargs):
+            raise AssertionError(f"legacy release hook binding must not read: {args}")
+
+    legacy = _issue_created_resume_contract(transaction_bound=False)
+    orchestrator._bind_managed_release_hook(
+        NoReadRunner(), config=config, pr_number=826, contract=legacy
+    )
+    assert legacy.before_label_release is None
 
     source_managed = managed_ci.ManagedCiContract(origin="source-managed")
     orchestrator._bind_managed_release_hook(

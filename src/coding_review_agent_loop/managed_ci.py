@@ -223,6 +223,11 @@ class AuthenticatedIssueCreatedHandoff:
     authorization_kind: Literal["creation", "fresh", "continuity"] = "creation"
     authorization_comment_id: int | None = None
     approved_plan_hash: str | None = None
+    # True only when the proof was recovered from a committed transaction-bound
+    # authorization.  The unbound resume audit returns nothing on a
+    # transaction-era PR, so every handoff it authenticates is legacy era and
+    # carries no pre-deletion release hook (#827).
+    transaction_bound: bool = False
 
 
 @dataclass(frozen=True)

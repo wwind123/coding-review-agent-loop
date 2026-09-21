@@ -15380,13 +15380,19 @@ def _bind_managed_release_hook(
 ) -> None:
     """Commit a released workflow transaction before a dispatch-time label release.
 
-    Only an issue-created managed PR can carry a granted generation.  The hook
-    itself writes nothing for a legacy-era, null-generation, or already
-    released PR, so legacy managed PRs keep today's release unchanged (#827).
+    Only an issue-created managed PR whose handoff proof came from a committed
+    transaction-bound authorization can carry a granted generation.  A
+    legacy-era or null-generation PR gets no hook at all, so its release
+    performs no transaction read and stays exactly as today (#827).
     """
     resume = contract.authenticated_resume if contract is not None else None
     handoff = resume.issue_created_handoff if resume is not None else None
-    if contract is None or contract.origin != "issue-created" or handoff is None:
+    if (
+        contract is None
+        or contract.origin != "issue-created"
+        or handoff is None
+        or not handoff.transaction_bound
+    ):
         return
     from .workflow_transaction_publication import managed_release_hook
 
