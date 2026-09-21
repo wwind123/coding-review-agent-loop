@@ -423,6 +423,7 @@ from .ci_health import (
     is_wholly_infrastructure_blocked,
 )
 from .comment_rendering import (
+    _extract_plan_human_requirements_block,
     DEFERRED_STAGES_MARKER_RE,
     render_plan_phase_advance,
     render_plan_scheduling_audit,
@@ -513,7 +514,7 @@ from .round_state import (
     recover_plan_validation_diagnostic,
     sanitize_plan_validation_diagnostic,
 )
-from .round_transport import is_round_transport_sidecar
+from .round_transport import is_round_transport_sidecar, round_comment_fits
 from .plan_assembly import (
     AssembledPlanSidecar,
     AuthenticatedPlanState,
@@ -9371,6 +9372,92 @@ def _persist_exhausted_plan_validation_diagnostic(
         ) from exc
 
 
+def _assemble_structured_plan_round_body(
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    kind: Literal["plan_state", "plan_revision"],
+    parsed_plan: StructuredPlanState | StructuredPlanRevision,
+    full_comment: str,
+    metadata: PostedRoundMetadata,
+    raw_text: str,
+    prior_items: Sequence[UnresolvedReviewItem],
+    model_used: str | None,
+    surfaced_requirement_ids: Sequence[str],
+    requires_direct_discussion_ack: bool,
+) -> TrustedBody:
+    """Assemble a structured plan coder round, compacting only on body overflow (#948).
+
+    The full public comment is used whenever the transport can carry it.  Only
+    the dedicated body-budget overflow selects the bounded visible digest; any
+    other transport failure propagates and aborts publication.  Metadata is
+    always the one derived from the full canonical plan, so the digest changes
+    presentation only.
+    """
+    full_body = _attach_round_metadata(full_comment, metadata)
+    if round_comment_fits(full_body):
+        return full_body
+    compact_comment = render_public_agent_comment(
+        kind=kind,
+        parsed=parsed_plan,
+        agent=config.coder,
+        prior_items=prior_items,
+        raw_text=raw_text,
+        config=config,
+        model_used=model_used,
+        compact=True,
+    )
+    if surfaced_requirement_ids or requires_direct_discussion_ack:
+        # Never post a digest whose signed-requirement content differs from
+        # what validated the raw response.
+        if parse_human_requirements_acknowledgement(
+            _extract_plan_human_requirements_block(raw_text)
+        ).marker_present:
+            validate_human_requirements_acknowledgement(
+                _compact_digest_acknowledgement_text(compact_comment),
+                surfaced_requirement_ids=surfaced_requirement_ids,
+                requires_direct_discussion_ack=requires_direct_discussion_ack,
+            )
+        expected_ids = [item.requirement_id for item in parsed_plan.human_requirement_dispositions]
+        rendered_ids = _compact_digest_disposition_ids(compact_comment)
+        if rendered_ids != expected_ids:
+            raise AgentLoopError(
+                "Compact plan digest does not list exactly the plan's signed human "
+                "requirement dispositions; refusing to post it."
+            )
+    log(
+        config,
+        f"Planning issue #{issue_number}: full plan comment exceeds the comment budget; "
+        "posting the bounded visible digest (complete plan stays in authenticated round metadata)",
+    )
+    return _attach_round_metadata(compact_comment, metadata)
+
+
+_COMPACT_DIGEST_DISPOSITION_LINE_RE = re.compile(r"^- \*\*(?P<id>[^*]+)\*\* — `")
+
+
+def _compact_digest_disposition_ids(comment: str) -> list[str]:
+    ids: list[str] = []
+    active = False
+    for line in comment.splitlines():
+        if line.strip() == "### Human requirement dispositions":
+            active = True
+            continue
+        if not active:
+            continue
+        match = _COMPACT_DIGEST_DISPOSITION_LINE_RE.match(line)
+        if match is None:
+            break
+        ids.append(match.group("id"))
+    return ids
+
+
+def _compact_digest_acknowledgement_text(comment: str) -> str:
+    """Acknowledgement text of a rendered digest: the block after the dispositions."""
+    marker_index = comment.find(HUMAN_REQUIREMENTS_ADDRESSED_MARKER)
+    return comment[marker_index:] if marker_index >= 0 else ""
+
+
 def _post_plan_coder_round_comment(
     runner: Runner,
     *,
@@ -10012,7 +10099,24 @@ def _run_plan_first_loop(
                 "Could not record the plan round metadata for round 1 "
                 f"(response form {current_response_form or 'free-form'}): {exc}"
             ) from exc
-        plan_round_body = _attach_round_metadata(public_plan_output, plan_round_metadata)
+        if isinstance(structured_plan, StructuredPlanState):
+            plan_round_body = _assemble_structured_plan_round_body(
+                config=config,
+                issue_number=issue_number,
+                kind="plan_state",
+                parsed_plan=structured_plan,
+                full_comment=public_plan_output,
+                metadata=plan_round_metadata,
+                raw_text=plan_output,
+                prior_items=(),
+                model_used=plan_response.model_used,
+                surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
+                requires_direct_discussion_ack=(
+                    plan_human_requirements_context.requires_direct_discussion_ack
+                ),
+            )
+        else:
+            plan_round_body = _attach_round_metadata(public_plan_output, plan_round_metadata)
         if _post_plan_coder_round_comment(
             runner,
             config=config,
@@ -12213,7 +12317,26 @@ def _run_plan_first_loop(
                 f"{round_number + 1} (response form "
                 f"{current_response_form or 'free-form'}): {exc}"
             ) from exc
-        plan_round_body = _attach_round_metadata(public_comment, plan_round_metadata)
+        if metadata_plan is not None:
+            plan_round_body = _assemble_structured_plan_round_body(
+                config=config,
+                issue_number=issue_number,
+                kind="plan_revision",
+                parsed_plan=metadata_plan,
+                full_comment=public_comment,
+                metadata=plan_round_metadata,
+                raw_text=plan_response.text,
+                prior_items=must_fix_items,
+                model_used=plan_response.model_used,
+                surfaced_requirement_ids=(
+                    plan_revision_human_requirements_context.surfaced_requirement_ids
+                ),
+                requires_direct_discussion_ack=(
+                    plan_revision_human_requirements_context.requires_direct_discussion_ack
+                ),
+            )
+        else:
+            plan_round_body = _attach_round_metadata(public_comment, plan_round_metadata)
         if _post_plan_coder_round_comment(
             runner,
             config=config,

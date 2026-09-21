@@ -72,6 +72,44 @@ _RISK_MATRIX_COMPACT_AT_CHARS = 50_000
 _RISK_MATRIX_MARKER_COMPACT_AT_CHARS = 4_000
 
 
+class RoundCommentOverflowError(AgentLoopError):
+    """The assembled round comment cannot fit the GitHub body budget.
+
+    Raised only by the pure size checks of ``prepare_round_comment`` so a
+    caller can distinguish "too large" from malformed or unauthorized input.
+    """
+
+
+_OVERFLOW_ATTRIBUTED_FIELDS = 5
+
+
+def _overflow_attribution(
+    *, visible_chars: int, payload: Mapping[str, object] | None
+) -> str:
+    """Describe an overflow with sizes and field names only, never content."""
+    if payload is None:
+        return f" Size attribution: visible body {visible_chars} characters; no round metadata."
+    sizes: list[tuple[int, str]] = []
+    for name, value in payload.items():
+        if isinstance(value, Mapping) and "$round_transport_spill" in value:
+            continue
+        try:
+            size = len(encode_mapping({str(name): value}))
+        except (AgentLoopError, TypeError, ValueError):
+            continue
+        sizes.append((size, str(name)))
+    sizes.sort(key=lambda item: (-item[0], item[1]))
+    largest = ", ".join(
+        f"{sanitize_historical_text(name)[:64]}={size}"
+        for size, name in sizes[:_OVERFLOW_ATTRIBUTED_FIELDS]
+    )
+    return (
+        f" Size attribution: visible body outside round metadata {visible_chars} characters; "
+        f"residual encoded round metadata {len(encode_mapping(payload))} characters; "
+        f"largest unspilled metadata fields (encoded characters): {largest or 'none'}."
+    )
+
+
 def execution_recommendation_section_boundary(encoded: str) -> str:
     """Return the renderer-owned boundary for one recommendation marker."""
     digest = hashlib.sha256(encoded.encode("ascii")).hexdigest()
@@ -688,14 +726,16 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             )
     matches = list(ROUND_RESUME_MARKER_RE.finditer(body_text))
     if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches and not sidecars:
-        raise AgentLoopError(
+        raise RoundCommentOverflowError(
             f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response."
+            + _overflow_attribution(visible_chars=len(body_text), payload=None)
         )
     if not matches:
         if sidecars:
             if len(body_text) > MAX_GITHUB_BODY_CHARS:
-                raise AgentLoopError(
+                raise RoundCommentOverflowError(
                     f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters after execution sidecar spill."
+                    + _overflow_attribution(visible_chars=len(body_text), payload=None)
                 )
             return (*_label_sidecars(sidecars, "round"), trusted_anchor)
         # Preserve the caller's authorization when no transport rewrite was
@@ -778,9 +818,13 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
     sidecars = _label_sidecars(sidecars, kind)
     anchor = render_anchor(payload)
     if len(anchor) > MAX_GITHUB_BODY_CHARS:
-        raise AgentLoopError(
+        raise RoundCommentOverflowError(
             f"Round comment exceeds {MAX_GITHUB_BODY_CHARS} characters even after metadata spill; "
             "shorten the visible response or metadata."
+            + _overflow_attribution(
+                visible_chars=len(body_text) - len(match.group("payload")),
+                payload=payload,
+            )
         )
     if any(len(item) > MAX_GITHUB_BODY_CHARS for item in sidecars):
         raise AgentLoopError("Round metadata sidecar exceeds GitHub body budget.")
@@ -795,6 +839,20 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
         new_text=transported_round.group(0),
     )
     return (*sidecars, trusted_anchor)
+
+
+def round_comment_fits(body: str | TrustedBody) -> bool:
+    """Return whether ``body`` can be transported, without posting anything.
+
+    Runs exactly the preparation ``prepare_round_comment`` runs.  Only the
+    dedicated body-budget overflow yields ``False``; malformed records,
+    non-serializable metadata and provenance failures propagate unchanged.
+    """
+    try:
+        prepare_round_comment(body)
+    except RoundCommentOverflowError:
+        return False
+    return True
 
 
 def hydrate_mapping(

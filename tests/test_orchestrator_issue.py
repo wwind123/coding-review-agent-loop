@@ -10285,3 +10285,424 @@ def test_m936_guard_full_board_latch_survives_a_restart_after_the_revised_round(
     assert not orchestrator_module._resumed_inherited_replan_force_full(
         [_m936_cpp.comment(str(item["body"])) for item in first.issue_comments]
     )
+
+
+# --- #948: digest-on-overflow selection at the structured plan publication sites ---
+
+import coding_review_agent_loop.comment_rendering as _m948_rendering  # noqa: E402
+import coding_review_agent_loop.round_transport as _m948_transport  # noqa: E402
+from coding_review_agent_loop.comment_rendering import render_public_agent_comment  # noqa: E402,F811
+from coding_review_agent_loop.github import post_issue_comment as _m948_post_issue_comment  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    validate_human_requirements_acknowledgement as _m948_validate_ack,
+    validate_structured_plan_revision as _m948_validate_revision,
+    validate_structured_plan_state as _m948_validate_state,
+)
+from coding_review_agent_loop.round_state import PostedRoundMetadata as _M948Metadata  # noqa: E402
+
+_M948_FOOTER = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+_M948_NOTICE = _m948_rendering.COMPACT_PLAN_DIGEST_NOTICE
+_M948_DIRECT = "I checked the relevant GitHub discussion directly before responding."
+_M948_CANONICAL_ONLY_RECORDS = (
+    "AGENT_DEFERRED_STAGES:",
+    "AGENT_TYPED_PLAN_STAGES:",
+    "AGENT_PLAN_EXPECTED_CLOSING_ISSUES:",
+)
+
+
+def _m948_noise(seed, chars=256):
+    text = ""
+    while len(text) < chars:
+        text += hashlib.sha256(f"{seed}-{len(text)}".encode()).hexdigest()
+    return text[:chars]
+
+
+def _m948_stages(prefix, count=300):
+    return [
+        {"title": f"{prefix} {index}", "summary": _m948_noise(f"{prefix}-{index}")}
+        for index in range(count)
+    ]
+
+
+def _m948_plan_config(tmp_path):
+    return make_config(tmp_path, max_rounds=3, plan_execution_mode="plan-only")
+
+
+def _m948_bodies(runner):
+    return [str(item["body"]) for item in runner.issue_comments]
+
+
+def _m948_digest_anchor(runner):
+    anchors = [body for body in _m948_bodies(runner) if _M948_NOTICE in body]
+    assert len(anchors) == 1
+    return anchors[0]
+
+
+def _m948_hydrated_metadata(anchor, bodies):
+    match = list(_m948_transport.ROUND_RESUME_MARKER_RE.finditer(anchor))[-1]
+    hydrated, missing = _m948_transport.hydrate_mapping(
+        _m948_transport.decode_mapping(match.group("payload")), bodies
+    )
+    assert missing == set()
+    return hydrated
+
+
+@pytest.mark.parametrize(
+    "record_class", ["deferred-stages", "typed-stages", "expected-closing"]
+)
+def test_m948_oversized_collection_posts_digest_and_resume_recovers_it_from_metadata(
+    tmp_path, record_class
+):
+    payload = json.loads(structured_plan_state(summary="Collections plan.").split("\n", 1)[0])
+    if record_class == "deferred-stages":
+        payload["deferred_stages"] = _m948_stages("Deferred")
+    elif record_class == "typed-stages":
+        payload["external_dependencies"] = _m948_stages("External", 100)
+        payload["deferred_work"] = _m948_stages("Later", 100)
+        payload["plan_actions"] = _m948_stages("Action", 100)
+    else:
+        payload["additional_closing_issue_ids"] = list(range(100, 140))
+        payload["plan_steps"] = [f"Step {index}: {_m948_noise(index)}" for index in range(300)]
+    plan = json.dumps(payload) + _M948_FOOTER
+    parsed = _m948_validate_state(plan)
+    # The full visible body alone is over budget, embedded records included.
+    assert len(render_public_agent_comment(kind="plan_state", parsed=parsed, agent="claude")) > 60_000
+
+    # No reviewer output: the run stops with the plan published and unreviewed.
+    first = FakeRunner(claude_outputs=[plan], codex_outputs=[])
+    with pytest.raises(Exception):
+        run_issue_loop(first, issue_number=56, config=_m948_plan_config(tmp_path), plan_first=True)
+
+    bodies = _m948_bodies(first)
+    assert all(len(body) <= _m948_transport.MAX_GITHUB_BODY_CHARS for body in bodies)
+    anchor = _m948_digest_anchor(first)
+    assert not any(record in anchor for record in _M948_CANONICAL_ONLY_RECORDS)
+    assert "omitted; complete list in the authenticated attachments" in anchor
+    assert "<!-- AGENT_PLAN_STATE: blocking -->" in anchor
+
+    metadata = _m948_hydrated_metadata(anchor, bodies)
+    canonical_plan = metadata["canonical_plan"]
+    assert canonical_plan == orchestrator_module.render_canonical_plan_state(parsed) or (
+        parsed.execution_recommendation is None and canonical_plan == plan
+    )
+    assert metadata["subject"] == orchestrator_module._plan_subject(canonical_plan)
+    assert _M948_NOTICE not in canonical_plan
+
+    second = FakeRunner(
+        issue_comments=first.issue_comments,
+        claude_outputs=[],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert run_issue_loop(
+        second, issue_number=56, config=_m948_plan_config(tmp_path), plan_first=True
+    ) == 0
+    assert [cmd for cmd, _cwd in second.commands if cmd[:1] == ["claude"]] == []
+    # Large prompts are delivered on stdin; the reviewer turn is the only agent
+    # call of the resumed run.  The reviewer is prompted with the complete plan,
+    # whose tail the digest omitted.
+    codex_calls = [cmd for cmd, _cwd in second.commands if cmd[:2] == ["codex", "exec"]]
+    assert len(codex_calls) == 1
+    review_prompt = second.last_input_text or codex_calls[0][-1]
+    if record_class == "deferred-stages":
+        assert _m948_noise("Deferred-299") in review_prompt
+        assert _m948_noise("Deferred-299") not in anchor
+    elif record_class == "typed-stages":
+        assert _m948_noise("Action-99") in review_prompt
+        assert _m948_noise("Action-99") not in anchor
+    else:
+        assert _m948_noise(299) in review_prompt
+        assert _m948_noise(299) not in anchor
+    assert len([body for body in _m948_bodies(second) if _M948_NOTICE in body]) == 1
+
+
+def test_m948_resumed_collections_equal_the_full_form_publication():
+    payload = json.loads(structured_plan_state(summary="Collections plan.").split("\n", 1)[0])
+    payload["deferred_stages"] = _m948_stages("Deferred", 5)
+    payload["plan_actions"] = _m948_stages("Action", 5)
+    payload["additional_closing_issue_ids"] = [101, 102]
+    parsed = _m948_validate_state(json.dumps(payload) + _M948_FOOTER)
+    canonical_plan = orchestrator_module.render_canonical_plan_state(parsed)
+
+    # Stage and closing collections are read from the canonical plan only; the
+    # digest carries none of their records.
+    assert orchestrator_module._extract_current_deferred_stages(canonical_plan) == parsed.deferred_stages
+    assert orchestrator_module._extract_current_expected_closing_issue_ids(canonical_plan) == (101, 102)
+    digest = render_public_agent_comment(
+        kind="plan_state", parsed=parsed, agent="claude", compact=True
+    )
+    assert orchestrator_module._extract_current_deferred_stages(digest) == ()
+    assert orchestrator_module._extract_current_expected_closing_issue_ids(digest) is None
+
+
+def test_m948_fitting_plan_posts_the_full_form_byte_identically(tmp_path, monkeypatch):
+    compact_calls = []
+    real_render = orchestrator_module.render_public_agent_comment
+
+    full_renders = {}
+
+    def spy(**kwargs):
+        if kwargs.get("compact"):
+            compact_calls.append(kwargs["kind"])
+        rendered = real_render(**kwargs)
+        full_renders[kwargs["kind"]] = rendered
+        return rendered
+
+    monkeypatch.setattr(orchestrator_module, "render_public_agent_comment", spy)
+    plan = structured_plan_state(summary="Small plan.")
+    revision = structured_plan_revision(
+        summary="Small revision.",
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "resolved", "note": "Addressed."}
+        ],
+    )
+    runner = FakeRunner(
+        claude_outputs=[plan, revision],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Tighten the plan."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert run_issue_loop(
+        runner, issue_number=56, config=_m948_plan_config(tmp_path), plan_first=True
+    ) == 0
+
+    assert compact_calls == []
+    bodies = _m948_bodies(runner)
+    assert not any(_M948_NOTICE in body for body in bodies)
+    posted_plan = next(body for body in bodies if body.startswith("## Plan"))
+    posted_revision = next(body for body in bodies if body.startswith("## Revised plan"))
+    # The posted bodies are exactly the default renderings plus round metadata.
+    # Attaching round metadata replaces the blank line before the trailing
+    # footer with the metadata line; undo exactly that.
+    def without_metadata(body):
+        return re.sub(r"\n<!-- AGENT_LOOP_META: [^\n]* -->\n", "\n\n", body, count=1)
+
+    assert without_metadata(posted_plan) == full_renders["plan_state"]
+    assert without_metadata(posted_revision) == full_renders["plan_revision"]
+
+
+def test_m948_non_size_transport_failure_aborts_without_selecting_the_digest(
+    tmp_path, monkeypatch
+):
+    compact_calls = []
+    real_render = orchestrator_module.render_public_agent_comment
+
+    def spy(**kwargs):
+        if kwargs.get("compact"):
+            compact_calls.append(kwargs["kind"])
+        return real_render(**kwargs)
+
+    def malformed(_body_text):
+        raise AgentLoopError("Risk matrix marker is not a recoverable JSON object.")
+
+    monkeypatch.setattr(orchestrator_module, "render_public_agent_comment", spy)
+    monkeypatch.setattr(_m948_transport, "_prepare_risk_test_matrix_transport", malformed)
+    payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    payload["plan_steps"] = [f"Step {index}: {_m948_noise(index)}" for index in range(300)]
+    runner = FakeRunner(claude_outputs=[json.dumps(payload) + _M948_FOOTER], codex_outputs=[])
+
+    with pytest.raises(AgentLoopError, match="not a recoverable JSON object"):
+        run_issue_loop(runner, issue_number=56, config=_m948_plan_config(tmp_path), plan_first=True)
+
+    assert compact_calls == []
+    assert runner.issue_comments == []
+
+
+def _m948_requirement():
+    return HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Preserve backward compatibility.",
+    )
+
+
+def _m948_ack_block(requirement_ids, *, direct=False):
+    lines = ["", HUMAN_REQUIREMENTS_ADDRESSED_MARKER, "### Human requirements"]
+    if direct:
+        lines.append(f"- {_M948_DIRECT}")
+    lines.extend(f"- {item}: covered because " + "EVIDENCE " * 300 for item in requirement_ids)
+    return "\n".join(lines) + "\n"
+
+
+def _m948_signed_payload(kind, requirement_ids):
+    payload = json.loads(structured_plan_state(summary="Signed plan.").split("\n", 1)[0])
+    payload["kind"] = kind
+    payload["plan_steps"] = [f"Step {index}: {_m948_noise(index)}" for index in range(300)]
+    payload["human_requirement_dispositions"] = [
+        {"requirement_id": item, "disposition": "addressed", "evidence": "EVIDENCE " * 300}
+        for item in requirement_ids
+    ]
+    if kind == "plan_revision":
+        payload["prior_plan_item_dispositions"] = [
+            {"item_id": "item-1", "disposition": "resolved", "note": "Addressed."}
+        ]
+    return payload
+
+
+def _m948_assert_posted_acknowledgement(anchor, requirement_ids, *, direct):
+    # Re-parse the POSTED anchor body with the existing validator.
+    _m948_validate_ack(
+        anchor, surfaced_requirement_ids=requirement_ids, requires_direct_discussion_ack=direct
+    )
+    assert anchor.count(HUMAN_REQUIREMENTS_ADDRESSED_MARKER) == 1
+    assert (_M948_DIRECT in anchor) is direct
+    for item in requirement_ids:
+        assert f"- **{item}** — `addressed`: " in anchor
+    assert "EVIDENCE " * 100 not in anchor
+    assert len(anchor) <= _m948_transport.MAX_GITHUB_BODY_CHARS
+
+
+def test_m948_signed_requirements_fresh_and_revision_digests_revalidate_end_to_end(tmp_path):
+    requirement_id = _m948_requirement().requirement_id
+    ids = (requirement_id,)
+    fresh = json.dumps(_m948_signed_payload("plan_state", ids)) + _m948_ack_block(ids) + _M948_FOOTER
+    revision = (
+        json.dumps({**_m948_signed_payload("plan_revision", ids), "summary": "Signed revision."})
+        + _m948_ack_block(ids) + _M948_FOOTER
+    )
+    runner = FakeRunner(
+        issue_payload={
+            "author": {"login": "maintainer"},
+            "createdAt": "2026-05-17T08:00:00Z",
+            "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
+        },
+        claude_outputs=[fresh, revision],
+        codex_outputs=[
+            _add_default_requirement_disposition(
+                structured_plan_review(state="blocking", blocking_plan_issues=["Tighten the plan."]),
+                requirement_id=requirement_id,
+            ),
+            _add_default_requirement_disposition(
+                structured_plan_review(
+                    state="approved",
+                    prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                    human_requirements_resolved=True,
+                ),
+                requirement_id=requirement_id,
+            ),
+        ],
+    )
+    assert run_issue_loop(
+        runner, issue_number=56, config=_m948_plan_config(tmp_path), plan_first=True
+    ) == 0
+
+    anchors = [body for body in _m948_bodies(runner) if _M948_NOTICE in body]
+    assert [anchor.split("\n", 1)[0] for anchor in anchors] == ["## Plan", "## Revised plan"]
+    for anchor in anchors:
+        _m948_assert_posted_acknowledgement(anchor, ids, direct=False)
+
+
+def _m948_assemble(kind, parsed, raw_text, *, config, ids, direct, metadata=None):
+    full_comment = render_public_agent_comment(
+        kind=kind, parsed=parsed, agent=config.coder, raw_text=raw_text, config=config
+    )
+    canonical_plan = (
+        orchestrator_module.render_canonical_plan_state(parsed)
+        if kind == "plan_state"
+        else orchestrator_module.render_canonical_plan_revision(parsed, (), config)
+    )
+    return orchestrator_module._assemble_structured_plan_round_body(
+        config=config,
+        issue_number=56,
+        kind=kind,
+        parsed_plan=parsed,
+        full_comment=full_comment,
+        metadata=metadata or _M948Metadata(
+            flow="plan", role="coder", agent="Claude", round_number=1,
+            subject=orchestrator_module._plan_subject(canonical_plan),
+            canonical_plan=canonical_plan, raw_structured_coder_response=raw_text,
+        ),
+        raw_text=raw_text,
+        prior_items=(),
+        model_used=None,
+        surfaced_requirement_ids=ids,
+        requires_direct_discussion_ack=direct,
+    )
+
+
+@pytest.mark.parametrize("form", ["fresh-plan-state", "legacy-full-state", "semantic-patch-v1"])
+@pytest.mark.parametrize("direct", [False, True], ids=["surfaced-ids", "direct-discussion"])
+def test_m948_signed_requirements_digest_posted_body_revalidates(tmp_path, form, direct):
+    config = _m948_plan_config(tmp_path)
+    # Direct-discussion mode surfaces no IDs: the prompt omitted them all.
+    ids = () if direct else tuple(f"hr-{index:064x}" for index in range(1, 7))
+    kind = "plan_state" if form == "fresh-plan-state" else "plan_revision"
+    payload = _m948_signed_payload(kind, ids)
+    payload["prior_plan_item_dispositions"] = []
+    if kind == "plan_state":
+        payload.pop("prior_plan_item_dispositions")
+    structured = json.dumps(payload) + _M948_FOOTER
+    parsed = (_m948_validate_state if kind == "plan_state" else _m948_validate_revision)(structured)
+    block = _m948_ack_block(ids, direct=direct)
+    if form == "semantic-patch-v1":
+        # The semantic site renders the assembled plan but passes the raw patch
+        # response, which is where the acknowledgement block lives.
+        raw_text = json.dumps({"kind": "plan_revision_patch", "operations": []}) + block + _M948_FOOTER
+    else:
+        raw_text = json.dumps(payload) + block + _M948_FOOTER
+    _m948_validate_ack(raw_text, surfaced_requirement_ids=ids, requires_direct_discussion_ack=direct)
+
+    body = _m948_assemble(kind, parsed, raw_text, config=config, ids=ids, direct=direct)
+    runner = FakeRunner()
+    _m948_post_issue_comment(runner, config=config, issue_number=56, body=body)
+
+    anchor = _m948_digest_anchor(runner)
+    _m948_assert_posted_acknowledgement(anchor, ids, direct=direct)
+    metadata = _m948_hydrated_metadata(anchor, _m948_bodies(runner))
+    assert metadata["raw_structured_coder_response"] == raw_text
+
+
+def test_m948_fresh_plan_without_acknowledgement_block_posts_every_disposition_id(tmp_path):
+    config = _m948_plan_config(tmp_path)
+    ids = tuple(f"hr-{index:064x}" for index in range(1, 4))
+    raw_text = json.dumps(_m948_signed_payload("plan_state", ids)) + _M948_FOOTER
+    parsed = _m948_validate_state(raw_text)
+
+    body = _m948_assemble("plan_state", parsed, raw_text, config=config, ids=ids, direct=False)
+
+    assert _M948_NOTICE in body
+    assert HUMAN_REQUIREMENTS_ADDRESSED_MARKER not in body
+    assert all(f"- **{item}** — `addressed`: " in body for item in ids)
+
+
+def test_m948_digest_failing_revalidation_is_never_posted(tmp_path, monkeypatch):
+    config = _m948_plan_config(tmp_path)
+    ids = tuple(f"hr-{index:064x}" for index in range(1, 4))
+    raw_text = (
+        json.dumps(_m948_signed_payload("plan_state", ids)) + _m948_ack_block(ids) + _M948_FOOTER
+    )
+    parsed = _m948_validate_state(raw_text)
+    monkeypatch.setattr(
+        _m948_rendering, "_compact_human_requirements_block",
+        lambda block: block.replace(ids[1], "hr-" + "f" * 64),
+    )
+    with pytest.raises(AgentLoopError):
+        _m948_assemble("plan_state", parsed, raw_text, config=config, ids=ids, direct=False)
+
+
+def test_m948_overflow_the_digest_cannot_fix_fails_closed_and_posts_nothing(tmp_path):
+    config = _m948_plan_config(tmp_path)
+    raw_text = json.dumps(_m948_signed_payload("plan_state", ())) + _M948_FOOTER
+    parsed = _m948_validate_state(raw_text)
+    canonical_plan = orchestrator_module.render_canonical_plan_state(parsed)
+    metadata = _M948Metadata(
+        flow="plan", role="coder", agent="Claude", round_number=1,
+        subject=orchestrator_module._plan_subject(canonical_plan),
+        canonical_plan=canonical_plan,
+        # Not in the transport spill set, so no presentation change can help.
+        compact_prior_summaries=(_m948_noise("unspillable", 120_000),),
+    )
+    body = _m948_assemble(
+        "plan_state", parsed, raw_text, config=config, ids=(), direct=False, metadata=metadata
+    )
+    runner = FakeRunner()
+    with pytest.raises(_m948_transport.RoundCommentOverflowError) as excinfo:
+        _m948_post_issue_comment(runner, config=config, issue_number=56, body=body)
+    assert "compact_prior_summaries=" in str(excinfo.value)
+    assert _m948_noise("unspillable", 64) not in str(excinfo.value)
+    assert runner.issue_comments == []

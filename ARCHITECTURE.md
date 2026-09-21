@@ -65,7 +65,7 @@ Source paths below are relative to
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py`, `plan_review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head or a candidate plan. |
-| Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. |
+| Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. Structured plan coder comments additionally have a bounded visible digest, selected only when the full comment overflows the body budget (see *Compact-on-overflow plan presentation*). |
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier. |
 | Workflow transaction model (#827, stage A) | `workflow_transaction.py` | Typed transition intent whose canonical hash is the transaction ID; append-only prepared/terminal transaction record codec (PR-comment-only); version-2 handoff and PR contract derivation; lineage, era, approved-plan anchor, scheduler-checkpoint, and legacy-root resolvers. Every resolver accepts only the author-authenticated comment view read by `github.read_authenticated_protocol_comments`. Model only: no writer emits these records and no orchestration call site consumes them yet; the version-1 reader entry points are unchanged and still reject version 2. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
@@ -817,6 +817,85 @@ compact, retry, and restart paths all hydrate the same sidecar and invoke the
 same assembler. The response form is durable round metadata, so a legacy or
 in-flight round cannot silently switch forms. Matrix-less and pre-rollout
 records remain on the legacy path and are never backfilled.
+
+### Compact-on-overflow plan presentation (#948)
+
+The transport spills round *metadata* into authenticated sidecars, but the
+visible Markdown of a structured plan comment had no spill path, so a plan whose
+prose alone exceeded the 60,000-character body budget (typically a separately
+planned child that must preserve many inherited matrix rows verbatim) could not
+be posted. Structured `plan_state` and `plan_revision` coder comments therefore
+have two presentations of the same plan:
+
+- **Full form** (default). Unchanged and byte-identical to earlier releases. It
+  is used whenever `round_transport.round_comment_fits` reports that the
+  assembled comment can be transported, with or without the existing spills.
+- **Bounded visible digest.** Selected by the shared publication helper
+  `_assemble_structured_plan_round_body` only when the fit check reports the
+  dedicated `RoundCommentOverflowError`. Every other transport failure
+  (malformed structured record, non-serializable metadata, provenance failure,
+  oversized sidecar part) propagates and aborts publication; it never selects
+  the digest. Round metadata is always built from the full canonical rendering
+  before either presentation is chosen, so `canonical_plan`, the plan subject,
+  the rendered-plan identity, the assembled plan sidecar and the matrix identity
+  are identical for both forms.
+
+The digest is a pure deterministic function of the parsed plan. Its budgeted
+sections (summary, prior plan item dispositions as ID plus disposition, plan
+steps, additional closing issue IDs, deferred stages and each typed stage
+category by title) share one aggregate budget,
+`COMPACT_PLAN_DIGEST_BUDGET_CHARS` (12,000 characters). Each section owns a
+fixed share that already includes its heading and its omitted-entry line; entries
+are emitted in canonical order, each sanitized and clipped to a fixed per-entry
+ceiling, until the next entry would exceed the share, and the section then ends
+with one line stating how many of how many entries were omitted. Unused share is
+never redistributed, so the bound holds by construction for any entry count or
+string length, and the renderer asserts it.
+
+Record contract of the digest:
+
+- *Visible-anchor set* (always present): the risk-matrix record with its
+  renderer boundary, the execution-recommendation record with its renderer
+  boundary, the signed-requirements acknowledgement record when the raw response
+  carried one, the plan-state footer, the signature, and the round metadata
+  record. The matrix and recommendation sections come from the unchanged section
+  renderers; the transport's existing authenticated reference rewrites of those
+  two payloads and of the round metadata payload are the only rewrites allowed.
+- *Canonical-metadata-only set* (deliberately absent): the deferred-stage,
+  typed-stage and expected-closing payload records. Their sections appear only
+  as bounded indexes. They remain lossless because identical records stay inside
+  `canonical_plan` in authenticated (spillable) round metadata and the assembled
+  plan sidecar carries the same collections as structured state. Every reader of
+  these records (`_extract_current_deferred_stages`,
+  `_extract_current_expected_closing_issue_ids` and the typed-stage extractors
+  in `orchestrator.py`) takes the canonical plan text, never the visible body of
+  a plan coder round comment.
+- *Signed requirement IDs are never omitted.* The acknowledgement block keeps
+  its record, heading, every requirement ID line and the direct-discussion
+  sentence; the dispositions section lists every requirement ID. Only
+  explanatory evidence text is clipped, and a clip never cuts inside an ID. These
+  sections are outside the omitted-entry policy and bounded only by the prompt's
+  surfaced-ID cap. For a fresh `plan_state` the parsed plan does not retain the
+  raw acknowledgement, so the compact path alone reads the validated raw
+  response (`raw_text`); the full rendering ignores it. Before posting, the
+  helper revalidates the digest with the same surfaced IDs and direct-discussion
+  flag that validated the raw response, and refuses to post a digest that fails.
+
+On resume, authenticated round metadata and its sidecars are the sole source of
+everything the digest omitted: plan resume reads `metadata.canonical_plan`,
+reviewers are prompted with the complete plan, and child matrix validation reads
+the hydrated structured matrix. The digest is never parsed back as plan text.
+Free-form (unstructured) plans are not compacted, because their visible text is
+their only representation. Reviewer, PR-review and discuss comments keep their
+current rendering.
+
+When even the digest cannot fit (unspilled round metadata, the signed-requirement
+sections at their cap, or a free-form plan), publication fails before any
+comment or sidecar is posted. The overflow error keeps its leading sentence and
+adds size attribution: visible characters outside the round metadata record,
+residual encoded metadata characters, and the names and encoded sizes of the
+largest unspilled metadata fields. It reports names and integers only, never
+content.
 
 Repair runs before assembly and is lossless for semantic patches: it may fix
 only the response envelope and cannot add operations, change rationales, or

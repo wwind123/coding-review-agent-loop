@@ -1153,6 +1153,47 @@ GitHub renders as "No description provided.") remain valid. Keep those
 sidecars with the anchor: resume fails loudly if one is missing or corrupt, at
 which point restore the sidecars or remove the incomplete anchor and rerun.
 
+Sidecars carry metadata only. When the visible text of a structured plan comment
+(`plan_state` or `plan_revision`) would still push the comment over the
+60,000-character budget, the loop posts a **compact plan digest** instead of the
+full plan prose. This typically affects a separately planned child that must
+reproduce many inherited risk-matrix rows verbatim. The digest is chosen only
+for that size overflow and logs one line when selected; a plan that fits is
+posted exactly as before, and any other transport error still aborts
+publication.
+
+- The digest starts with a "Compact plan digest" notice and shows a bounded
+  summary: the plan summary, then plan steps, prior item dispositions, additional
+  closing issues, deferred stages and structured scope categories, each cut off
+  at a fixed share with a line such as `... 212 more of 300 omitted; complete
+  list in the authenticated attachments`. These sections together never exceed
+  12,000 characters.
+- Still visible in the comment: the risk/test matrix and execution
+  recommendation sections with their records (their payloads may be carried as
+  authenticated references, as before), the signed-requirements acknowledgement,
+  the plan-state footer, the signature and `AGENT_LOOP_META`. Signed requirement
+  IDs are never omitted or count-summarized; only their evidence text is
+  shortened, and the digest is revalidated against the surfaced IDs before it is
+  posted.
+- Only in authenticated metadata: the deferred-stage, typed-stage and
+  expected-closing records, along with every omitted entry. The complete plan
+  lives in `canonical_plan` and the assembled plan sidecar inside
+  `AGENT_LOOP_META` and its attachments. Resume, reviewer prompts, plan hashes
+  and child-plan validation read that complete plan, never the digest, so keep
+  the attachments with the anchor.
+
+Free-form (unstructured) plans cannot be compacted. If a comment still cannot
+fit, nothing is posted and the error explains where the size is, for example:
+
+```text
+Round comment exceeds 60000 characters even after metadata spill; shorten the
+visible response or metadata. Size attribution: visible body outside round
+metadata 9120 characters; residual encoded round metadata 71544 characters;
+largest unspilled metadata fields (encoded characters): prior_items=64012, ...
+```
+
+The attribution lists field names and sizes only, never their content.
+
 Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
 require multiple reviewers:
 
