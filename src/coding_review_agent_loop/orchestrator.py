@@ -15371,6 +15371,30 @@ def _recover_managed_ci_approved_plan(
     return candidate
 
 
+def _bind_managed_release_hook(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    contract: ManagedCiContract | None,
+) -> None:
+    """Commit a released workflow transaction before a dispatch-time label release.
+
+    Only an issue-created managed PR can carry a granted generation.  The hook
+    itself writes nothing for a legacy-era, null-generation, or already
+    released PR, so legacy managed PRs keep today's release unchanged (#827).
+    """
+    resume = contract.authenticated_resume if contract is not None else None
+    handoff = resume.issue_created_handoff if resume is not None else None
+    if contract is None or contract.origin != "issue-created" or handoff is None:
+        return
+    from .workflow_transaction_publication import managed_release_hook
+
+    contract.before_label_release = managed_release_hook(
+        runner, config, pr_number=pr_number, issue_number=handoff.issue_number
+    )
+
+
 def run_pr_loop(
     runner: Runner,
     *,
@@ -16543,6 +16567,9 @@ def run_pr_loop(
                 return 0
         else:
             managed_ci = activation
+            _bind_managed_release_hook(
+                runner, config=config, pr_number=pr_number, contract=managed_ci
+            )
         log(config, f"Validating PR #{pr_number}")
         validate_open_pr(runner, config=config, pr_number=pr_number)
         if closing_contract is not None:

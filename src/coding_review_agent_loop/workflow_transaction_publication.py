@@ -1519,6 +1519,83 @@ def _has_transaction_records(
     return classify_transaction_era(views.pr_view, views.issue_view) == ERA_TRANSACTION
 
 
+def managed_release_hook(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    issue_number: int,
+) -> Callable[[str], None]:
+    """The pre-deletion hook of a label-removing managed-CI release.
+
+    ``managed_ci`` calls it immediately before it deletes the managed label, so
+    the release is committed before the label goes and a seam failure leaves
+    the label untouched.  On a transaction-era PR whose committed generation is
+    granted it commits the released ``managed-ci-continuity`` successor for the
+    head being released; on a legacy-era, null-generation, or already released PR it
+    writes nothing.  ``managed_ci`` never imports this module: the PR loop
+    stores the returned callable on the managed contract.
+    """
+
+    def commit_release(head: str) -> None:
+        # Imported here: the bound codec module imports ``managed_ci``.
+        from .managed_ci_bound_authorization import (
+            BoundAuthorizationCodec,
+            ordinary_release_payload,
+            released_generation,
+        )
+
+        resolved = read_pr_transaction_views(runner, config, pr_number, issue_number)
+        committed = resolved.lineage.latest_committed
+        if resolved.era != ERA_TRANSACTION or committed is None:
+            return
+        intent = committed.intent
+        if intent.managed_ci_generation is None or intent.primary_issue is None:
+            return
+        view = resolved.views.pr_view
+        generation = released_generation(
+            repository=intent.repository, issue_number=intent.primary_issue,
+            pr_number=pr_number, base_ref=intent.base, actor_id=view.actor_id,
+        )
+        if intent.managed_ci_generation == generation:
+            return
+        plan = None
+        if intent.approved_plan_hash is not None:
+            plan_views = _read_views(
+                runner, config, pr_number=pr_number, issue_number=issue_number,
+                plan_issue_number=intent.plan_owning_issue,
+            )
+            plan = ApprovedPlanInput(
+                intent.approved_plan_hash,
+                None,
+                recover_checkpoint_candidate_key(intent, plan_views.plan_issue_view),
+            )
+        payload = ordinary_release_payload(
+            repository=intent.repository, issue_number=intent.primary_issue,
+            pr_number=pr_number, base_ref=intent.base, head_sha=head,
+            actor_login=view.actor_login, actor_id=view.actor_id,
+        )
+        publish_transition(
+            runner,
+            config=config,
+            request=TransitionRequest(
+                repository=intent.repository,
+                pr_number=pr_number,
+                base=intent.base,
+                head_sha=head,
+                origin_path=ORIGIN_PR_RESUME,
+                expected_closing_issue_ids=tuple(intent.expected_closing_issue_ids),
+                primary_issue=intent.primary_issue,
+                approved_plan=plan,
+                staged=intent.staged,
+                managed=Released(payload, generation),
+                authorization_codec=BoundAuthorizationCodec(),
+            ),
+        )
+
+    return commit_release
+
+
 # ---------------------------------------------------------------------------
 # Effective authorization
 # ---------------------------------------------------------------------------

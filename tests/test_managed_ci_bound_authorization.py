@@ -543,3 +543,85 @@ def test_accessor_never_reads_live_state_or_the_resume_audit():
         node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
     }
     assert "workflow_transaction_publication" not in imported
+
+
+# ---------------------------------------------------------------------------
+# Pre-deletion managed release hook (#946)
+# ---------------------------------------------------------------------------
+
+
+def _release_hook(github, tmp_path, head=HEAD_1):
+    from coding_review_agent_loop.workflow_transaction_publication import managed_release_hook
+
+    hook = managed_release_hook(github, make_config(tmp_path), pr_number=PR, issue_number=ISSUE)
+    return lambda: hook(head)
+
+
+def test_release_hook_commits_a_released_successor_on_a_granted_pr(tmp_path):
+    github = TransactionGitHub()
+    publish(github, creation(), tmp_path)
+
+    _release_hook(github, tmp_path)()
+
+    committed = gate(github, tmp_path)
+    assert committed.intent.successor_kind == KIND_MANAGED_CI_CONTINUITY
+    assert committed.intent.managed_ci_generation == release().generation()
+    records = [parse_bound_authorization_comment(item["body"]) for item in bound_comments(github)]
+    assert [record.kind for record in records] == ["creation", KIND_ORDINARY_RELEASE]
+    # A released PR grants no managed authority to the consumer accessor.
+    pr_view, lineage = lineage_of(github, tmp_path)
+    assert consumer_bound_authorization(pr_view, lineage, live_head=HEAD_1) is None
+
+
+def test_release_hook_is_convergent_and_writes_nothing_once_released(tmp_path):
+    github = TransactionGitHub()
+    publish(github, creation(), tmp_path)
+    hook = _release_hook(github, tmp_path)
+    hook()
+    writes = github.write_count
+
+    hook()
+
+    assert github.write_count == writes
+
+
+def test_release_hook_writes_nothing_on_a_legacy_or_unmanaged_pr(tmp_path):
+    legacy = TransactionGitHub()
+    _release_hook(legacy, tmp_path)()
+    assert legacy.write_count == 0
+
+    unmanaged = TransactionGitHub()
+    publish_transition(
+        unmanaged, config=make_config(tmp_path),
+        request=TransitionRequest(
+            repository=REPO, pr_number=PR, base="main", head_sha=HEAD_1,
+            origin_path=ORIGIN_DIRECT_ISSUE, expected_closing_issue_ids=(ISSUE,),
+            primary_issue=ISSUE,
+        ),
+    )
+    writes = unmanaged.write_count
+    _release_hook(unmanaged, tmp_path)()
+    assert unmanaged.write_count == writes
+
+
+@pytest.mark.parametrize("boundary", [1, 2, 3])
+def test_release_hook_failure_raises_and_a_rerun_converges(tmp_path, boundary):
+    github = TransactionGitHub()
+    publish(github, creation(), tmp_path)
+    github.fail_write(github.write_count + boundary, "fail-before-write")
+    hook = _release_hook(github, tmp_path)
+
+    with pytest.raises(AgentLoopError):
+        hook()
+    # The caller deletes the label only after the hook returns, so nothing was
+    # released: the granted transaction stays authoritative until a prepared
+    # record exists, and a prepared-only release grants nothing.
+    if boundary == 1:
+        assert gate(github, tmp_path).intent.managed_ci_generation == creation().generation()
+    else:
+        with pytest.raises(WorkflowTransactionError):
+            gate(github, tmp_path)
+
+    hook()
+    assert gate(github, tmp_path).intent.managed_ci_generation == release().generation()
+    assert len(bound_comments(github)) == 2

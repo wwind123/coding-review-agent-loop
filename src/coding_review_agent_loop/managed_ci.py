@@ -8,9 +8,9 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlparse
@@ -162,6 +162,13 @@ class ManagedCiContract:
         "creation", "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
     ] | None = None
     authenticated_resume: "AuthenticatedManagedResume | None" = None
+    # Set by the PR loop for a transaction-era PR with a granted generation:
+    # it commits the released successor before the dispatch-time release
+    # deletes the label (#827); it receives the head being released.  ``None``
+    # keeps today's release unchanged.
+    before_label_release: "Callable[[str], None] | None" = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -2942,6 +2949,7 @@ def _release_for_ordinary_recovery(
     recovery_capable: bool,
     fresh_issue_number: int | None = None,
     fresh_authorization_allowed: bool = False,
+    before_label_release: Callable[[str], None] | None = None,
 ) -> OrdinaryRecoveryCapability | None:
     """Release the exact active label and return a narrowly scoped capability.
 
@@ -2975,6 +2983,10 @@ def _release_for_ordinary_recovery(
                 f"PR #{pr_number} managed-label ownership changed before ordinary release; "
                 "leaving the label untouched and no merge will be attempted."
             )
+    if before_label_release is not None:
+        # Runs only for a release that really deletes the label.  When it
+        # raises, the label is untouched and a rerun repeats the release.
+        before_label_release(expected_head_sha)
     result = runner.run(
         [
             config.gh_cmd, "api", "--method", "DELETE",
@@ -4656,6 +4668,7 @@ def _dispatch_v2_qualification(
                 and contract.authenticated_resume is not None
                 and contract.authenticated_resume.origin == "issue-created"
             ),
+            before_label_release=contract.before_label_release,
         )
         contract.activation_path = "ordinary_fallback"
         contract.ordinary_recovery = recovery
