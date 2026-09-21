@@ -1705,6 +1705,53 @@ def committed_pr_binding(
     )
 
 
+def _grouped_committed_chain(
+    states: Sequence[TransactionState], *, pr_number: int
+) -> tuple[TransactionState, ...]:
+    """The committed chain from grouped transactions, below the strict resolver.
+
+    Prepared-only siblings do not stop it, so the rebind's recovery readers
+    reach the seam's sibling reconciliation; two committed roots or two
+    committed children of one transaction still raise.
+    """
+    committed = [state for state in states if state.committed]
+    children: dict[str | None, list[TransactionState]] = {}
+    for state in committed:
+        children.setdefault(state.intent.predecessor_transaction_id, []).append(state)
+    chain: list[TransactionState] = []
+    parent: str | None = None
+    while children.get(parent):
+        found = children[parent]
+        if len(found) != 1:
+            raise _error(
+                f"PR #{pr_number} has divergent committed workflow transactions; nothing "
+                "was written",
+                transaction_ids=[item.transaction_id for item in found],
+                problems=("two committed transactions share one predecessor",),
+                code="divergent-transactions",
+            )
+        chain.append(found[0])
+        parent = found[0].transaction_id
+    if len(chain) != len(committed):
+        raise _error(
+            f"PR #{pr_number} has a committed workflow transaction off its committed chain; "
+            "nothing was written",
+            transaction_ids=[item.transaction_id for item in committed if item not in chain],
+            problems=("committed transaction is not reachable from the committed root",),
+            code="divergent-transactions",
+        )
+    return tuple(chain)
+
+
+def _grouped_views(runner: Runner, config: AgentLoopConfig, pr_number: int, issue_number):
+    views = _read_views(runner, config, pr_number=pr_number, issue_number=issue_number)
+    foreign = actor_change_error(views.pr_view)
+    if foreign is not None:
+        raise foreign
+    states = collect_transactions(views.pr_view, repository=config.repo, pr_number=pr_number)
+    return views, states
+
+
 @dataclass(frozen=True)
 class CommittedPlanReplacement:
     """The most recent committed plan-replacement edge of a PR's lineage.
@@ -1726,34 +1773,32 @@ def committed_plan_replacement(
 
     A later closing widening or head advance never erases the edge: only a
     committed ``plan-replacement`` successor is one.  A legacy-era PR returns
-    no edge, and its caller keeps the version-1 lineage reader.
+    no edge, and its caller keeps the version-1 lineage reader.  Prepared-only
+    successors (including siblings) are not part of the edge and do not stop
+    the read: the committed predecessor stays the binding until they commit.
     """
-    resolved = read_pr_transaction_views(runner, config, pr_number, issue_number)
-    if resolved.era != ERA_TRANSACTION:
-        return resolved.era, None
-    lineage = resolved.lineage
+    views, states = _grouped_views(runner, config, pr_number, issue_number)
+    if not states:
+        return classify_transaction_era(views.pr_view, views.issue_view), None
+    chain = _grouped_committed_chain(states, pr_number=pr_number)
+    by_id = {state.transaction_id: state for state in chain}
     state = next(
-        (
-            item
-            for item in reversed(lineage.chain)
-            if item.committed and item.intent.successor_kind == KIND_PLAN_REPLACEMENT
-        ),
+        (item for item in reversed(chain) if item.intent.successor_kind == KIND_PLAN_REPLACEMENT),
         None,
     )
     if state is None:
-        return resolved.era, None
+        return ERA_TRANSACTION, None
     predecessor_id = state.intent.predecessor_transaction_id
-    predecessor = lineage.state(predecessor_id) if predecessor_id is not None else None
+    predecessor = by_id.get(predecessor_id) if predecessor_id is not None else None
     handoff_body = None
     outcomes = state.terminal.outcomes if state.terminal is not None else ()
     handoff_id = next(
         (item.comment_id for item in outcomes if item.name == ENTRY_HANDOFF), None
     )
-    issue_view = resolved.views.issue_view
-    if handoff_id is not None and issue_view is not None:
-        found = issue_view.comment(handoff_id)
+    if handoff_id is not None and views.issue_view is not None:
+        found = views.issue_view.comment(handoff_id)
         handoff_body = found.body if found is not None else None
-    return resolved.era, CommittedPlanReplacement(
+    return ERA_TRANSACTION, CommittedPlanReplacement(
         pr_number=pr_number,
         replaced_plan_hash=(
             predecessor.intent.approved_plan_hash if predecessor is not None else None
@@ -1763,6 +1808,19 @@ def committed_plan_replacement(
     )
 
 
+def latest_committed_intent(
+    runner: Runner, config: AgentLoopConfig, pr_number: int
+) -> WorkflowTransition | None:
+    """Read-only, sibling-tolerant: the last committed transaction's intent.
+
+    For a writer's own preconditions only (the child-plan rebind); not
+    authority.  ``None`` when nothing is committed.
+    """
+    _views, states = _grouped_views(runner, config, pr_number, None)
+    chain = _grouped_committed_chain(states, pr_number=pr_number)
+    return chain[-1].intent if chain else None
+
+
 def pending_plan_replacement(
     runner: Runner, config: AgentLoopConfig, pr_number: int
 ) -> TransactionState | None:
@@ -1770,21 +1828,31 @@ def pending_plan_replacement(
 
     Only the writer that can rebuild its audit-bearing handoff (the child-plan
     rebind) may finish it, so the issue command leaves it to that writer
-    instead of finishing it from the stored intent.  Grants no authority.
+    instead of finishing it from the stored intent.  Reads grouped
+    transactions below the strict resolver, so same-parent prepared-only
+    siblings are handed to the seam's reconciliation.  Grants no authority.
     """
-    resolved = read_pr_transaction_views(runner, config, pr_number, None)
-    if resolved.era != ERA_TRANSACTION:
+    _views, states = _grouped_views(runner, config, pr_number, None)
+    if not states:
         return None
-    pending = resolved.lineage.pending
-    committed = resolved.lineage.latest_committed
-    if (
-        pending is None
-        or committed is None
-        or pending.intent.successor_kind != KIND_PLAN_REPLACEMENT
-        or pending.intent.predecessor_transaction_id != committed.transaction_id
-    ):
+    chain = _grouped_committed_chain(states, pr_number=pr_number)
+    if not chain:
         return None
-    return pending
+    tip = chain[-1].transaction_id
+    pending = sorted(
+        (
+            state
+            for state in states
+            if not state.committed
+            and not state.aborted
+            and state.intent.predecessor_transaction_id == tip
+        ),
+        key=lambda item: item.prepared_comment.comment_id,
+    )
+    return next(
+        (item for item in pending if item.intent.successor_kind == KIND_PLAN_REPLACEMENT),
+        None,
+    )
 
 
 def publish_closing_widening(

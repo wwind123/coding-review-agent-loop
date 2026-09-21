@@ -9454,9 +9454,10 @@ def _rebind_superseded_child_plan(
         )
     from . import workflow_transaction_publication as publication
 
-    era = publication.read_pr_transaction_views(
-        runner, config, plan_supersession.pr_number, None
-    ).era
+    # Sibling-tolerant: prepared-only rebind siblings reach the seam.
+    era, _edge = publication.committed_plan_replacement(
+        runner, config, pr_number=plan_supersession.pr_number, issue_number=issue_number
+    )
     if era == publication.ERA_TRANSACTION:
         _rebind_transaction_era_child_plan(
             runner,
@@ -9591,13 +9592,12 @@ def _rebind_transaction_era_child_plan(
     from . import workflow_transaction_publication as publication
 
     pr_number = plan_supersession.pr_number
-    lineage = publication.read_pr_transaction_views(runner, config, pr_number, None).lineage
-    if lineage.latest_committed is None:
+    committed = publication.latest_committed_intent(runner, config, pr_number)
+    if committed is None:
         raise AgentLoopError(
             f"Human repair required: PR #{pr_number} has no committed workflow transaction; "
             "the re-planned child plan was not rebound and nothing was posted."
         )
-    committed = lineage.latest_committed.intent
     if committed.primary_issue != issue_number:
         raise AgentLoopError(
             f"Human repair required: PR #{pr_number}'s committed workflow transaction is bound "

@@ -3142,3 +3142,99 @@ def test_m946_interrupted_transaction_era_rebind_is_finished_by_an_issue_rerun(
         child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
         runner=world.runner, config=config,
     ).plan_hash == new_hash
+
+
+@pytest.mark.parametrize("competitor", ["higher-id", "lower-id"])
+def test_m946_prepared_rebind_siblings_are_reconciled_by_an_issue_rerun(
+    tmp_path, monkeypatch, competitor
+):
+    """#827: a second prepared-only plan replacement of the same committed
+    predecessor (a competing invocation that never resumes) does not stop the
+    issue command in routing: the seam reconciles the siblings and one rebind
+    commits."""
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.workflow_transaction import (
+        KIND_PLAN_REPLACEMENT, RECOVERY_RERUN, format_transaction_record_comment,
+        prepared_record,
+    )
+
+    world = _M946TxWorld(tmp_path, monkeypatch)
+    handed = []
+    monkeypatch.setattr(
+        orchestrator, "run_pr_loop",
+        lambda runner, *, pr_number, **kwargs: handed.append(pr_number) or 0,
+    )
+    real_write = publication._write_verified
+    writes = {"count": 0, "armed": True}
+
+    def flaky(*args, **kwargs):
+        writes["count"] += 1
+        if writes["armed"] and writes["count"] == 2:
+            raise publication._error(
+                "injected write failure", recovery=RECOVERY_RERUN,
+                code=publication.CODE_WRITE_FAILED,
+            )
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "_write_verified", flaky)
+    with pytest.raises(WorkflowTransactionError):
+        world.run_issue(
+            claude_outputs=[world.good_patch()],
+            codex_outputs=[structured_plan_review(state="approved")],
+        )
+    config = world.config()
+    ours = publication.read_pr_transaction_views(world.runner, config, 77, None).lineage.pending
+    rival_intent = dataclasses.replace(ours.intent, head_sha="d" * 40)
+    rival_body = str(format_transaction_record_comment(prepared_record(
+        rival_intent, writer_login="coding-review-agent-loop", writer_id=4242,
+    )))
+    ours_row = next(row for row in world.pr_rows if row.get("id") == ours.prepared_comment.comment_id)
+    stamp = ours_row["created_at"]
+    rival = {
+        "user": {"login": "coding-review-agent-loop", "id": 4242},
+        "author": {"login": "coding-review-agent-loop"},
+        "created_at": stamp, "createdAt": stamp, "body": rival_body,
+    }
+    if competitor == "higher-id":
+        rival["id"] = max(int(row["id"]) for row in world.pr_rows if "id" in row) + 1
+        world.pr_rows.append(rival)
+    else:
+        # The competitor's prepared record precedes ours in comment-ID order.
+        rival["id"] = ours_row["id"]
+        ours_row["id"] = rival["id"] + 1
+        world.pr_rows.insert(world.pr_rows.index(ours_row), rival)
+    # The authority form refuses the sibling state; nothing binds the new plan.
+    with pytest.raises(WorkflowTransactionError):
+        publication.discover_canonical_issue_pr(world._runner(), config, 56)
+
+    writes["armed"] = False
+    if competitor == "lower-id":
+        # Our transaction loses the tie-break and is aborted; the canonical
+        # rival names a head that is no longer live, so it is aborted as
+        # obsolete, and re-preparing our identical intent is refused by the
+        # aborted-intent rule.  The stop is non-mutating beyond the aborts and
+        # nothing ever binds the new plan.
+        with pytest.raises(WorkflowTransactionError, match="aborted-intent-reused"):
+            world.run_issue(codex_outputs=[])
+        lineage = publication.read_pr_transaction_views(world.runner, config, 77, 56).lineage
+        assert lineage.latest_committed.intent.approved_plan_hash == world.old_hash
+        assert lineage.pending is None
+        assert handed == [] and world.agent_calls("claude") == []
+        assert not any(
+            CHILD_PLAN_REBIND_MARKER_RE.search(str(row["body"])) for row in world.issue_rows
+        )
+        return
+    assert world.run_issue(codex_outputs=[]) == 0
+    assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
+    lineage = publication.read_pr_transaction_views(world.runner, config, 77, 56).lineage
+    assert lineage.pending is None
+    committed = [state for state in lineage.chain if state.committed]
+    assert [state.intent.successor_kind for state in committed] == ["initial", KIND_PLAN_REPLACEMENT]
+    assert committed[-1].intent.head_sha == _M946_HEAD
+    rival_state = lineage.state(rival_intent.transaction_id)
+    assert rival_state is not None and rival_state.aborted
+    assert handed == [77]
+    bodies = [str(row["body"]) for row in world.issue_rows]
+    rebinds = [body for body in bodies if CHILD_PLAN_REBIND_MARKER_RE.search(body)]
+    assert len(rebinds) == 1 and committed[-1].transaction_id in rebinds[0]
