@@ -1968,41 +1968,95 @@ def _filtered_views(
     repository: str,
     pr_number: int,
 ) -> tuple[
-    AuthenticatedCommentView, AuthenticatedCommentView, list[tuple[AuthenticatedComment, str]]
+    AuthenticatedCommentView,
+    AuthenticatedCommentView,
+    list[tuple[AuthenticatedComment, str, str, object]],
 ]:
     """Router-private views without the withheld transactions' records.
 
     Removal is decided by each record's decoded transaction ID.  v1 records,
     unbound comments, and committed or aborted transactions' records stay.
     """
-    removed: dict[int, tuple[AuthenticatedComment, str]] = {}
+    # Every withheld record keeps its entry name and decoded payload so the
+    # router can judge it against the stored intent it is bound to.
+    removed: list[tuple[AuthenticatedComment, str, str, object]] = []
 
-    def drop(comment: AuthenticatedComment, tx_id: str) -> None:
+    def drop(comment: AuthenticatedComment, tx_id: str, name: str, record: object) -> None:
         if tx_id in withheld:
-            removed[comment.comment_id] = (comment, tx_id)
+            removed.append((comment, tx_id, name, record))
 
     for comment, contract in _v2_contracts(pr_view):
-        drop(comment, contract.transaction_id)
+        drop(comment, contract.transaction_id, ENTRY_PR_CONTRACT, contract)
     for comment, tx_id in _authorization_comments(pr_view, codec):
-        drop(comment, tx_id)
+        drop(comment, tx_id, ENTRY_AUTHORIZATION, None)
     for comment, metadata in _tagged_coder_rounds(pr_view):
-        drop(comment, metadata.workflow_transaction_id)
+        drop(comment, metadata.workflow_transaction_id, ENTRY_INITIAL_CODER_ROUND, metadata)
     for comment, record in _v2_handoffs(issue_view):
-        if record.pr_number == pr_number:
-            drop(comment, record.transaction_id)
+        # Any handoff in this issue thread bound to a withheld transaction is
+        # withheld, whatever PR or issue it names: the mismatch is judged below.
+        drop(comment, record.transaction_id, ENTRY_HANDOFF, record)
     prepared_ids: set[int] = set()
     for state in collect_transactions(pr_view, repository=repository, pr_number=pr_number):
         if state.transaction_id in withheld:
             prepared_ids.add(state.prepared_comment.comment_id)
             prepared_ids.update(item.comment_id for item in state.prepared_duplicates)
-    gone = set(removed) | prepared_ids
+    gone = {comment.comment_id for comment, _tx, _name, _record in removed} | prepared_ids
     filtered_pr = dataclasses.replace(
         pr_view, authored=tuple(c for c in pr_view.authored if c.comment_id not in gone)
     )
     filtered_issue = dataclasses.replace(
         issue_view, authored=tuple(c for c in issue_view.authored if c.comment_id not in gone)
     )
-    return filtered_issue, filtered_pr, list(removed.values())
+    return filtered_issue, filtered_pr, removed
+
+
+def _removed_record_problem(
+    comment: AuthenticatedComment,
+    name: str,
+    record: object,
+    state: TransactionState,
+    *,
+    lineage: TransactionLineage,
+    pr_view: AuthenticatedCommentView,
+    codec: AuthorizationEntryCodec | None,
+) -> str | None:
+    """Why a withheld record contradicts the stored intent it is bound to, if it does.
+
+    This replaces, for withheld records, what stage A's bound-state and
+    derived-payload checks establish for records that stay in the views.
+    """
+    intent = state.intent
+    where = f"contradictory {name} record in comment {comment.comment_id}"
+    if intent.entry(name).disposition != DISPOSITION_REISSUED:
+        return f"{where}: its transaction does not reissue that entry"
+    if name == ENTRY_HANDOFF:
+        if record != derive_handoff_metadata(intent):
+            return f"{where}: it does not equal the handoff derived from its stored intent"
+    elif name == ENTRY_PR_CONTRACT:
+        assert isinstance(record, PrExpectedClosingContractV2)
+        if record != derive_pr_contract(
+            intent,
+            supersession_kind=record.supersession_kind,
+            supersedes_record_hash=record.supersedes_record_hash,
+        ):
+            return f"{where}: it does not equal the contract derived from its stored intent"
+    elif name == ENTRY_AUTHORIZATION:
+        assert codec is not None
+        try:
+            codec.validate(
+                comment, state=state, lineage=lineage, pr_view=pr_view, committed=False
+            )
+        except WorkflowTransactionError as exc:
+            return f"{where}: {exc.summary}"
+    else:
+        metadata = record
+        if (
+            metadata.role != "coder"  # type: ignore[attr-defined]
+            or metadata.round_number != 1  # type: ignore[attr-defined]
+            or metadata.subject != intent.head_sha  # type: ignore[attr-defined]
+        ):
+            return f"{where}: its round metadata contradicts the stored intent"
+    return None
 
 
 def _route_sibling_group(
@@ -2052,8 +2106,13 @@ def _route_sibling_group(
                     ids=ids,
                 )
     order_comment_id = handoff.comment_id if handoff is not None else None
-    for comment, tx_id in removed:
+    for comment, tx_id, name, record in removed:
         state = by_id[tx_id]
+        problem = _removed_record_problem(
+            comment, name, record, state, lineage=lineage, pr_view=pr_view, codec=codec
+        )
+        if problem is not None:
+            raise _router_refusal(issue_number, pr_number, problem, ids=ids)
         if not _unedited(comment):
             raise _router_refusal(
                 issue_number, pr_number,

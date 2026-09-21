@@ -1138,3 +1138,90 @@ def test_round_metadata_tag_is_encoded_only_when_set_and_rejects_malformed_value
     malformed = encode_mapping({**decode_mapping(encoded), "workflow_transaction_id": "nope"})
     with pytest.raises(AgentLoopError):
         _decode_round_metadata(malformed)
+
+
+# ---------------------------------------------------------------------------
+# Router: withheld records are judged against their stored intent
+# ---------------------------------------------------------------------------
+
+
+def _root_siblings(tmp_path, *, stop=2, request=direct_request):
+    """Two prepared-only root siblings, each interrupted before write ``stop``."""
+    github = TransactionGitHub()
+    for ids in ((ISSUE, 901), (ISSUE, 902)):
+        scratch = TransactionGitHub()
+        scratch.next_id = github.next_id
+        scratch.fail_write(stop, FAIL_BEFORE_WRITE)
+        with pytest.raises(WorkflowTransactionError):
+            publish(scratch, request(expected_closing_issue_ids=ids), tmp_path)
+        for number, body in scratch.writes:
+            github.seed(number, body)
+    return github, [item.intent for item in states(github, tmp_path)]
+
+
+def _assert_unroutable(github, tmp_path, **kwargs):
+    writes = github.write_count
+    with pytest.raises(WorkflowTransactionError) as raised:
+        route_issue_publication(github, make_config(tmp_path), ISSUE, **kwargs)
+    assert raised.value.code == "unroutable-candidate"
+    assert github.write_count == writes
+    return raised.value
+
+
+def test_router_rejects_a_withheld_handoff_that_names_another_issue(tmp_path):
+    from coding_review_agent_loop.expected_closure import contract_hash
+    from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_v2_comment
+    from coding_review_agent_loop.workflow_transaction import derive_handoff_metadata
+
+    # Both siblings published a genuine handoff, so the PR is a candidate; a further
+    # handoff bound to one sibling names another issue.
+    github, intents = _root_siblings(tmp_path, stop=3)
+    forged = replace(
+        derive_handoff_metadata(intents[0]), issue_number=999,
+        expected_closing_issue_ids=(999,), contract_hash=contract_hash((999,)),
+    )
+    github.seed(ISSUE, format_issue_pr_handoff_v2_comment(forged, repo=REPO))
+    error = _assert_unroutable(github, tmp_path)
+    assert "issue-pr-handoff" in " ".join(error.problems)
+
+
+def test_router_rejects_a_withheld_contract_that_contradicts_its_intent(tmp_path):
+    from coding_review_agent_loop.expected_closure import contract_hash
+    from coding_review_agent_loop.pr_contract import format_pr_contract_v2_comment
+    from coding_review_agent_loop.workflow_transaction import derive_pr_contract
+
+    github, intents = _root_siblings(tmp_path, stop=3)
+    forged = replace(
+        derive_pr_contract(intents[0]), expected_closing_issue_ids=(ISSUE, 950),
+        contract_hash=contract_hash((ISSUE, 950)),
+    )
+    github.seed(PR, format_pr_contract_v2_comment(forged))
+    error = _assert_unroutable(github, tmp_path)
+    assert "pr-expected-closing-contract" in " ".join(error.problems)
+
+
+def test_router_rejects_a_withheld_tagged_round_with_contradictory_metadata(tmp_path):
+    github, intents = _root_siblings(tmp_path, stop=3)
+    github.seed(PR, _attach_round_metadata(
+        "Forged.\n-- Claude",
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=1, subject=HEAD_2,
+            workflow_transaction_id=intents[0].transaction_id,
+        ),
+    ))
+    error = _assert_unroutable(github, tmp_path)
+    assert "initial-coder-round" in " ".join(error.problems)
+
+
+def test_router_validates_a_withheld_bound_authorization(tmp_path):
+    codec = StubAuthorizationCodec()
+    github, _intents = _root_siblings(
+        tmp_path, stop=5, request=lambda **kw: managed_request(codec, **kw)
+    )
+    route = route_issue_publication(
+        github, make_config(tmp_path), ISSUE, authorization_codec=codec
+    )
+    assert isinstance(route, Recoverable) and codec.validated
+    codec.invalid = True
+    error = _assert_unroutable(github, tmp_path, authorization_codec=codec)
+    assert "managed-ci-authorization" in " ".join(error.problems)
