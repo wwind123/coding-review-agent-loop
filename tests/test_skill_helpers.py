@@ -3045,6 +3045,100 @@ class TestSkillApprovedPlanRecovery:
             assert context.canonical_text == child_plan
             assert context.plan_hash == approved_plan_hash(child_plan)
 
+    @pytest.mark.parametrize("parent_handoff", [True, False])
+    @pytest.mark.parametrize("variant", ["refined", "weakened"])
+    def test_m931_inherited_row_comparison_matches_the_orchestrator_on_both_branches(
+        self, monkeypatch, parent_handoff, variant
+    ) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
+        from coding_review_agent_loop.decomposition import (
+            approved_plan_hash,
+            validate_separately_planned_child_matrix,
+        )
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+        from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+        from coding_review_agent_loop.protocol import parse_risk_test_matrix
+        from test_child_plan_provenance import (
+            _matrix, _matrix_row, fresh_child_contexts, fresh_staged_matrix_plan,
+        )
+
+        rendered_parent_plan = fresh_staged_matrix_plan(
+            first_disposition="requires-child-planning" if parent_handoff else None
+        )
+        parent_payload, json_end = json.JSONDecoder().raw_decode(rendered_parent_plan)
+        # A canonical approved plan is rendered Markdown whose recommendation
+        # and matrix travel in its bounded sidecars, not leading JSON.
+        parent_plan = "Approved parent plan." + rendered_parent_plan[json_end:].split(
+            "\n<!-- AGENT_PLAN_STATE:", 1
+        )[0]
+        parent_matrix = parent_payload["risk_test_matrix"]
+        inherited_row = next(
+            row for row in parent_matrix["rows"] if row["row_id"] == "row-stage-one"
+        )
+        child_row = {
+            **inherited_row,
+            "execution_owner": "one-shot",
+            "label": "Reworded label",
+            "applicability": "required",
+            "expected_outcome": inherited_row["expected_outcome"] + " Exactly once.",
+        }
+        if variant == "weakened":
+            child_row["forbidden_side_effects"] = ["no stale merge."]
+        child_matrix = _matrix(child_row, _matrix_row("child-local", "one-shot"))
+        child_plan = "Reviewed child plan.\n\n" + render_risk_test_matrix_section(
+            parse_risk_test_matrix(child_matrix)
+        )
+        child, parent = fresh_child_contexts(
+            parent_plan,
+            inherited_matrix_row_ids=("row-stage-one",),
+            child_plan=child_plan,
+            recommendation_payload=parent_payload["execution_recommendation"],
+            **(
+                {"handoff_execution_disposition": "requires-child-planning"}
+                if parent_handoff
+                else {"summary_mode": "decompose-only"}
+            ),
+        )
+        child_comments = [item.body for item in child.comments]
+        child_comments[-1] = format_issue_pr_handoff_comment(
+            issue_number=56, pr_number=7,
+            pr_url="https://github.com/owner/repo/pull/7", pr_head_sha="head-7",
+            flow="approved-plan-implementation", plan_hash=approved_plan_hash(child_plan),
+        )
+        parent_comments = [item.body for item in parent.comments]
+        if not parent_handoff:
+            parent_comments = parent_comments[:-1]
+        monkeypatch.setattr(
+            sr, "_fetch_issue_comments_raw",
+            lambda repo, issue: child_comments if issue == 56 else parent_comments,
+        )
+        monkeypatch.setattr(sr, "_fetch_issue_json", lambda repo, issue: {"body": child.body})
+        contract = make_pr_contract(
+            repository="owner/repo", pr_number=7,
+            origin_flow="approved-plan-implementation", primary_issue_number=56,
+            expected_closing_issue_ids=(56,),
+        )
+        pr_info = {
+            "body": "Fixes #56",
+            "comments": [{"body": format_pr_contract_comment(contract)}],
+        }
+        if variant == "weakened":
+            with pytest.raises(AgentLoopError) as orchestrator_error:
+                validate_separately_planned_child_matrix(
+                    parent_matrix, child_matrix, execution_owner="stage-one"
+                )
+            with pytest.raises(AgentLoopError) as error:
+                sr._recover_skill_pr_plan_context("owner/repo", 7, pr_info)
+            assert str(error.value) == str(orchestrator_error.value)
+            assert 'row-stage-one: forbidden_side_effects dropped "No stale merge."' in str(error.value)
+        else:
+            context = sr._recover_skill_pr_plan_context("owner/repo", 7, pr_info)
+            # Never the parent plan for a separately planned child.
+            assert context is not None
+            assert context.plan_hash == approved_plan_hash(child_plan)
+
     @pytest.mark.parametrize("legacy", [False, True])
     def test_direct_and_legacy_handoff_require_parent_phase_hash(
         self, monkeypatch, legacy

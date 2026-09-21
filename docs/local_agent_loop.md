@@ -88,6 +88,33 @@ checkpoint, handoff, child plan, implementation handoff, and canonical PR, so
 the route cannot change because context was truncated or the command was run
 again.
 
+A child plan does not have to reproduce its inherited rows byte for byte. For
+each inherited row it must keep the row ID, never lower applicability
+(`not-applicable` < `applicable` < `required`), copy every parent forbidden side
+effect exactly (case and whitespace included; additions and reordering are
+fine), and keep the text of the entry path or mode, initial state, event, and
+expected outcome verbatim, adding refinements after it. The label, scope links,
+and execution owner are free, child-local rows may be added, and the proposed
+test level and location may change. Every admissible difference other than
+label, scope links, and ordering is shown to the child plan reviewers as a
+parent-versus-child coverage delta, and reviewers block any extension or test
+placement change that narrows the inherited coverage.
+
+The child planner and reviewers are shown the inherited rows in full in every
+plan prompt form, in exactly the form the validator compares. The check runs
+during child planning, before a candidate plan is posted: a candidate that
+weakens an inherited row is never published or reviewed, and the planner is
+re-invoked with a diagnostic naming each row and field, at most two times per
+planning round. If every candidate is rejected, one authenticated diagnostic
+record is posted and the run stops before any reviewer or implementation turn;
+rerunning the same `--plan-first` command feeds that record to the next planner
+turn. Neither prompt block is ever truncated: inherited rows too large to show
+losslessly stop child planning with a sizing diagnostic that points at the
+parent plan, and a child whose deltas are too large to show is replanned. PR
+validation applies the same comparison on parent dispatch, direct child
+invocation, and skill mode, so an already approved child plan that satisfies
+these rules resumes PR review without replanning.
+
 ### Risk-based mode and transition matrices
 
 For planning work involving multiple modes, lifecycle transitions,

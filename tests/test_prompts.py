@@ -4449,3 +4449,209 @@ def test_superseded_prepanel_plan_review_context_block_is_non_authoritative(tmp_
             56, 2, "Plan.", staged_config, reviewer="gemini", compact_context=compact
         )
         assert "Superseded pre-panel plan review context" not in plain
+
+
+# --- #931: inherited-obligation and coverage-delta prompt blocks ------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    InheritedMatrixBinding,
+    inherited_matrix_reviewed_deltas,
+    validate_separately_planned_child_matrix,
+)
+from coding_review_agent_loop.errors import AgentLoopError as _M931AgentLoopError  # noqa: E402
+from coding_review_agent_loop.prompts import (  # noqa: E402
+    build_plan_revision_prompt as _m931_build_plan_revision_prompt,
+    render_inherited_coverage_delta,
+    render_inherited_matrix_obligations,
+)
+
+_M931_CASE = "Do not unset $HOME_Dir or write /Var/Agent/State."
+_M931_SPACE = "Do not run `git  push   --force origin main`."
+
+
+def _m931_row(row_id, owner="api", **overrides):
+    return {
+        "row_id": row_id, "label": f"Label {row_id}",
+        "entry_path_or_mode": "Issue  Mode via `agent-loop issue`",
+        "initial_state": "Review complete", "event": "Repaired head passes",
+        "expected_outcome": "The transition completes.",
+        "forbidden_side_effects": [_M931_CASE, _M931_SPACE],
+        "proposed_test_level": "orchestrator", "proposed_test_location": "tests/test_x.py",
+        "applicability": "required", "related_scope_item_ids": ["scope-1"],
+        "execution_owner": owner, **overrides,
+    }
+
+
+def _m931_matrix(*rows):
+    return {"applicability": "applicable", "rows": list(rows), "important_exclusions": []}
+
+
+def _m931_binding(*rows):
+    return InheritedMatrixBinding(
+        parent_issue=55, stage_id="api",
+        parent_matrix=_m931_matrix(*(rows or (_m931_row("row-owned"), _m931_row("row-later", "later")))),
+    )
+
+
+def _m931_prompt_forms(tmp_path, **bound):
+    config = make_config(tmp_path)
+    planner = {key: value for key, value in bound.items() if key == "inherited_matrix_binding"}
+    forms = {"plan": build_issue_plan_prompt(56, config, **planner)}
+    for name, kwargs in (
+        ("revision-full", {}),
+        ("revision-compact", {"compact_context": True}),
+        ("revision-semantic", {
+            "response_form": "semantic-patch-v1", "base_round_number": 1,
+            "base_state_identity": "a" * 64,
+        }),
+    ):
+        forms[name] = _m931_build_plan_revision_prompt(
+            56, 2, "Plan.", "Review.", config, **kwargs, **planner
+        )
+    for name, compact in (("review-full", False), ("review-compact", True)):
+        forms[name] = build_plan_review_prompt(
+            56, 1, "Plan.", config, reviewer="codex", compact_context=compact, **bound
+        )
+    return forms
+
+
+def test_m931_unbound_plan_prompts_are_byte_identical(tmp_path):
+    baseline = _m931_prompt_forms(tmp_path)
+    explicit = _m931_prompt_forms(
+        tmp_path, inherited_matrix_binding=None, inherited_reviewed_deltas=None,
+        inherited_check_failure=None,
+    )
+    assert explicit == baseline
+    assert all("Inherited" not in prompt for prompt in baseline.values())
+    assert render_inherited_matrix_obligations(None) == ""
+    # A binding whose stage owns no rows renders nothing either.
+    ownerless = InheritedMatrixBinding(55, "other", _m931_matrix(_m931_row("row-owned")))
+    assert render_inherited_matrix_obligations(ownerless) == ""
+    assert render_inherited_coverage_delta(ownerless, ()) == ""
+
+
+def test_m931_every_bound_plan_prompt_form_carries_the_shared_obligation_block(tmp_path):
+    binding = _m931_binding()
+    block = render_inherited_matrix_obligations(binding)
+    forms = _m931_prompt_forms(tmp_path, inherited_matrix_binding=binding)
+    assert len(forms) == 6
+    for name, prompt in forms.items():
+        assert block in prompt, name
+    assert "row-later" not in block
+    assert "parent issue #55, stage `api`" in block
+    for rule in ("never lower applicability", "copy every forbidden side effect exactly",
+                 "verbatim and add refinements after it", "child-local rows may be added"):
+        assert rule in block
+    # Case and internal whitespace survive exactly.
+    for value in (_M931_CASE, _M931_SPACE, "Issue  Mode via `agent-loop issue`", "required"):
+        assert json.dumps(value) in block
+
+
+def test_m931_prompt_shown_form_is_the_form_the_validator_compares():
+    binding = _m931_binding()
+    block = render_inherited_matrix_obligations(binding).split("Descriptive tier:", 1)[0]
+    shown = [json.loads(line.split(": ", 1)[1] if ": " in line and not line.lstrip().startswith("- \"")
+                        else line.strip()[2:])
+             for line in block.split("Enforceable tier:\n", 1)[1].strip().split("\n")
+             if not line.endswith("forbidden_side_effects:")]
+    row_id, applicability, entry, initial, event, outcome, *effects = shown
+    copied = _m931_row(
+        row_id, "one-shot", label="Anything", applicability=applicability,
+        entry_path_or_mode=entry, initial_state=initial, event=event,
+        expected_outcome=outcome, forbidden_side_effects=effects,
+        related_scope_item_ids=["child-scope"],
+    )
+    assert validate_separately_planned_child_matrix(
+        binding.parent_matrix, _m931_matrix(copied), execution_owner="api"
+    ) == ("row-owned",)
+    assert inherited_matrix_reviewed_deltas(
+        binding.parent_matrix, _m931_matrix(copied), execution_owner="api"
+    ) == ()
+
+
+def test_m931_maximum_matrix_under_the_cap_is_lossless_and_drops_only_the_descriptive_tier(
+    tmp_path, monkeypatch
+):
+    rows = [
+        _m931_row(
+            f"row-{index:02d}",
+            entry_path_or_mode=f"Mode {index}  " + "M" * 380,
+            forbidden_side_effects=[f"Effect {index}-{n}  " + "eE" * 190 for n in range(6)],
+        )
+        for index in range(24)
+    ]
+    binding = _m931_binding(*rows)
+    enforceable = prompts_module.inherited_obligations_enforceable_size(binding)
+    # Cap just above the enforceable tier: budget pressure drops the
+    # descriptive tier as a whole, never an enforceable value.
+    monkeypatch.setattr(prompts_module, "INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES", enforceable + 8)
+    forms = _m931_prompt_forms(tmp_path, inherited_matrix_binding=binding)
+    for name, prompt in forms.items():
+        assert "Descriptive tier (labels and proposed tests) omitted as a whole" in prompt, name
+        assert "Label row-00" not in prompt
+        for row in rows:
+            assert json.dumps(row["entry_path_or_mode"]) in prompt
+            for effect in row["forbidden_side_effects"]:
+                assert json.dumps(effect) in prompt
+    monkeypatch.setattr(prompts_module, "INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES", enforceable - 1)
+    with pytest.raises(_M931AgentLoopError) as error:
+        render_inherited_matrix_obligations(binding)
+    assert f"measure {enforceable} bytes" in str(error.value)
+    assert f"{enforceable - 1}-byte" in str(error.value) and "issue #55" in str(error.value)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_m931_review_prompts_render_every_reviewed_delta_with_the_per_dimension_duty(
+    tmp_path, compact
+):
+    binding = _m931_binding(_m931_row("row-owned", applicability="applicable"))
+    parent = binding.parent_matrix["rows"][0]
+    child = _m931_row(
+        "row-owned", "one-shot", applicability="required",
+        forbidden_side_effects=[_M931_CASE, _M931_SPACE, "No duplicate  Record."],
+        event=parent["event"] + "  on the SECOND attempt " + "detail " * 60,
+        proposed_test_level="unit",
+    )
+    deltas = inherited_matrix_reviewed_deltas(
+        binding.parent_matrix, _m931_matrix(child), execution_owner="api"
+    )
+    assert [delta.field for delta in deltas] == [
+        "applicability", "forbidden_side_effects", "event", "proposed_test_level",
+    ]
+    config = make_config(tmp_path)
+    prompt = build_plan_review_prompt(
+        56, 1, "Plan.", config, reviewer="codex", compact_context=compact,
+        inherited_matrix_binding=binding, inherited_reviewed_deltas=deltas,
+    )
+    assert render_inherited_coverage_delta(binding, deltas) in prompt
+    for delta in deltas:
+        assert f"row {json.dumps(delta.row_id)} field `{delta.field}`" in prompt
+        for value in (delta.parent_value, delta.child_value):
+            if value:
+                assert json.dumps(value) in prompt
+    for dimension in ("entry path or mode", "initial state", "event", "expected outcome",
+                      "forbidden side effects", "test reachability"):
+        assert dimension in prompt
+    assert "is a blocking plan issue naming the row and field" in prompt
+
+    no_delta = build_plan_review_prompt(
+        56, 1, "Plan.", config, reviewer="codex", compact_context=compact,
+        inherited_matrix_binding=binding, inherited_reviewed_deltas=(),
+    )
+    assert "Inherited coverage delta: none;" in no_delta
+    failed = build_plan_review_prompt(
+        56, 1, "Plan.", config, reviewer="codex", compact_context=compact,
+        inherited_matrix_binding=binding, inherited_check_failure="row-owned: event replaced",
+    )
+    assert "Inherited coverage check FAILED" in failed and "row-owned: event replaced" in failed
+
+
+def test_m931_over_cap_delta_block_fails_closed_instead_of_truncating(monkeypatch):
+    binding = _m931_binding()
+    child = _m931_row("row-owned", "one-shot", proposed_test_level="unit")
+    deltas = inherited_matrix_reviewed_deltas(
+        binding.parent_matrix, _m931_matrix(child), execution_owner="api"
+    )
+    monkeypatch.setattr(prompts_module, "INHERITED_COVERAGE_DELTA_MAX_BYTES", 16)
+    with pytest.raises(_M931AgentLoopError, match="never truncated"):
+        render_inherited_coverage_delta(binding, deltas)

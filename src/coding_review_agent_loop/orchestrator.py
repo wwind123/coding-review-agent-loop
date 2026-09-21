@@ -54,6 +54,9 @@ from .decomposition import (
     normalize_execution_recommendation,
     validate_risk_matrix_ownership,
     validate_separately_planned_child_matrix,
+    InheritedMatrixBinding,
+    InheritedRowDifference,
+    inherited_matrix_reviewed_deltas,
     risk_matrix_row_ids_for_owner,
     recover_execution_recommendation,
     ExecutionDecision,
@@ -227,7 +230,11 @@ from .prompts import (
     build_completion_recovery_prompt,
     build_followup_prompt,
     build_issue_implementation_prompt,
+    INHERITED_COVERAGE_DELTA_MAX_BYTES,
+    INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES,
     build_issue_plan_prompt,
+    inherited_coverage_delta_size,
+    inherited_obligations_enforceable_size,
     build_issue_prompt,
     build_plan_decomposition_prompt,
     build_plan_review_prompt,
@@ -6238,6 +6245,7 @@ def _run_child_planning_cycle(
     usage_context: RunUsageContext,
     parent_issue: int,
     child_issue_number: int,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> int:
     """Run the child's own plan/review cycle (policy ``auto``) after its handoff."""
     # Child plan review always runs the full board: staged planning scheduling
@@ -6265,6 +6273,7 @@ def _run_child_planning_cycle(
         issue_context=child_issue_context,
         requested_policy="auto",
         usage_context=usage_context,
+        inherited_matrix_binding=inherited_matrix_binding,
     )
 
 
@@ -6340,6 +6349,11 @@ def _dispatch_decomposition_child(
             usage_context=usage_context,
             parent_issue=parent_issue,
             child_issue_number=created.issue_number,
+            inherited_matrix_binding=_inherited_matrix_binding(
+                parent_issue=parent_issue,
+                stage_id=stage_id,
+                parent_plan_context=approved_plan_context,
+            ),
         )
     if existing_handoff is None:
         # Persist the parent-owned assignment before child execution so
@@ -8669,6 +8683,34 @@ def _plan_validation_contract_versions(
     )
 
 
+# Inherited-obligation replans per coder round: two replans, three candidates.
+MAX_INHERITED_MATRIX_REPLANS = 2
+
+
+@dataclass(frozen=True)
+class _InheritedReplanDiagnostic:
+    """In-memory correction context for an unpublished rejected candidate."""
+
+    diagnostic: str
+    failure_attempt: int
+    candidate_digest: str
+
+
+def _inherited_matrix_binding(
+    *, parent_issue: int, stage_id: str, parent_plan_context: ApprovedPlanContext
+) -> InheritedMatrixBinding | None:
+    """Binding for a child plan-first cycle, or ``None`` when nothing is inherited."""
+    payload = (
+        parent_plan_context.risk_test_matrix_payload
+        if parent_plan_context.matrix_available else None
+    )
+    if not isinstance(payload, dict) or not risk_matrix_row_ids_for_owner(payload, stage_id):
+        return None
+    return InheritedMatrixBinding(
+        parent_issue=parent_issue, stage_id=stage_id, parent_matrix=payload
+    )
+
+
 def _recover_current_plan_validation_diagnostic(
     runner: Runner,
     *,
@@ -8899,6 +8941,7 @@ def _run_plan_first_loop(
     requested_policy: str | None = None,
     implement_after_approval: bool = False,
     usage_context: RunUsageContext,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> int:
     if config.review_parallel:
         _ensure_parallel_reviewer_workdirs(config, flag_name="--review-parallel", role_label="reviewer")
@@ -8949,6 +8992,136 @@ def _run_plan_first_loop(
             body=f"Plan review scheduling diagnostic ({label}): {message}",
         )
         raise PlanPrePanelSafetyError(message)
+
+    if inherited_matrix_binding is not None:
+        inherited_measured = inherited_obligations_enforceable_size(inherited_matrix_binding)
+        if inherited_measured > INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES:
+            # Fail closed before any planner or reviewer turn: the block is
+            # never truncated, and the retention check is never relaxed.
+            stop_plan_pre_panel(
+                f"inherited parent matrix obligations for stage "
+                f"`{inherited_matrix_binding.stage_id}` measure {inherited_measured} bytes, above "
+                f"the permitted {INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES} bytes for a "
+                "lossless planning prompt; reduce or split the rows the approved plan on "
+                f"parent issue #{inherited_matrix_binding.parent_issue} allocates to this stage, "
+                "then rerun child planning.",
+                round_number=None,
+            )
+
+    def check_inherited_candidate(
+        child_matrix: object,
+    ) -> tuple[InheritedRowDifference, ...]:
+        """Mechanical inherited-row check plus the fail-closed delta cap."""
+        assert inherited_matrix_binding is not None
+        validate_separately_planned_child_matrix(
+            inherited_matrix_binding.parent_matrix,
+            child_matrix,  # type: ignore[arg-type]
+            execution_owner=inherited_matrix_binding.stage_id,
+        )
+        deltas = inherited_matrix_reviewed_deltas(
+            inherited_matrix_binding.parent_matrix,
+            child_matrix,  # type: ignore[arg-type]
+            execution_owner=inherited_matrix_binding.stage_id,
+        )
+        delta_measured = inherited_coverage_delta_size(deltas)
+        if delta_measured > INHERITED_COVERAGE_DELTA_MAX_BYTES:
+            raise AgentLoopError(
+                f"Separately planned child departs from its inherited parent matrix rows by "
+                f"{delta_measured} bytes of reviewed deltas, above the permitted "
+                f"{INHERITED_COVERAGE_DELTA_MAX_BYTES} bytes that reviewers can be shown without "
+                "truncation. Make fewer or smaller departures from the inherited text: keep "
+                "inherited rows closer to the parent values and move new coverage into "
+                "child-local rows."
+            )
+        return deltas
+
+    def inherited_review_context(
+        plan_text: str,
+    ) -> tuple[tuple[InheritedRowDifference, ...], str | None]:
+        """Reviewed deltas recomputed from the canonical plan; never persisted."""
+        if inherited_matrix_binding is None:
+            return (), None
+        matrix_match = RISK_TEST_MATRIX_MARKER_RE.search(plan_text)
+        try:
+            child_matrix = (
+                decode_risk_test_matrix_marker(matrix_match.group("payload"))["matrix"]
+                if matrix_match is not None
+                else None
+            )
+            return check_inherited_candidate(child_matrix), None
+        except AgentLoopError as exc:
+            # Only a historical plan published before this check can reach a
+            # reviewer in this state; reviewers are told to block it so the
+            # revision turn re-enters the enforced replan path.
+            return (), sanitize_plan_validation_diagnostic(str(exc))
+
+    def run_inherited_checked_planner_turn(
+        invoke: Callable[[object | None], ValidatedAgentResponse],
+        *,
+        derive_matrix: Callable[[ValidatedAgentResponse], object],
+        initial_diagnostic: object | None,
+        candidate_kind: Literal["plan_state", "plan_revision"],
+        target_coder_round: int,
+        prior_plan_subject: str | None,
+    ) -> ValidatedAgentResponse:
+        """Orchestrator-owned bounded replan over unpublished candidates.
+
+        Deliberately outside ``_run_validated_agent``: the envelope-only repair
+        model never sees an inherited-row rejection.  A rejected candidate
+        stays in local memory only, so the authenticated base is untouched.
+        """
+        diagnostic = initial_diagnostic
+        for replan_attempt in range(MAX_INHERITED_MATRIX_REPLANS + 1):
+            response = invoke(diagnostic)
+            if inherited_matrix_binding is None or is_clarification_request(response.text):
+                return response
+            child_matrix = derive_matrix(response)
+            try:
+                check_inherited_candidate(child_matrix)
+                return response
+            except AgentLoopError as exc:
+                rejection = sanitize_plan_validation_diagnostic(str(exc))
+            candidate_digest = hashlib.sha256(response.text.encode("utf-8")).hexdigest()
+            if replan_attempt >= MAX_INHERITED_MATRIX_REPLANS:
+                exhaustion = DeterministicPlanValidationExhaustion(
+                    candidate_kind=candidate_kind,
+                    candidate_text=response.text,
+                    diagnostic=rejection,
+                    candidate_digest=candidate_digest,
+                )
+                error = AgentInvocationError(
+                    f"{coder_name} produced {MAX_INHERITED_MATRIX_REPLANS + 1} consecutive plan "
+                    "candidates that weaken inherited parent matrix rows; stopping before any "
+                    f"reviewer or implementation turn.\n{rejection}",
+                    failure_category="deterministic",
+                    plan_validation_exhaustion=exhaustion,
+                )
+                _persist_exhausted_plan_validation_diagnostic(
+                    runner,
+                    config=config,
+                    issue_context=issue_context,
+                    issue_number=issue_number,
+                    original_error=error,
+                    exhaustion=exhaustion,
+                    target_coder_round=target_coder_round,
+                    prior_plan_subject=prior_plan_subject,
+                    candidate_kind=candidate_kind,
+                    require_execution_strategy_contract=require_fresh_execution_contract,
+                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                )
+                raise error
+            log(
+                config,
+                f"Planning issue #{issue_number}: unpublished candidate weakened inherited "
+                f"parent matrix rows; inherited-obligation replan {replan_attempt + 1} of "
+                f"{MAX_INHERITED_MATRIX_REPLANS}",
+            )
+            diagnostic = _InheritedReplanDiagnostic(
+                diagnostic=rejection,
+                failure_attempt=replan_attempt + 1,
+                candidate_digest=candidate_digest,
+            )
+        raise AssertionError("unreachable inherited replan state")
 
     def plan_history_records(
         *, refresh: bool = False, round_number: int | None = None
@@ -9066,58 +9239,81 @@ def _run_plan_first_loop(
             requirement_scope="planning requirements",
             full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
         )
-        plan_response = _run_validated_agent(
-            runner,
-            agent=config.coder,
-            config=config,
-            prompt=build_issue_plan_prompt(
-                issue_number,
-                config,
-                memory,
-                issue_context=issue_context,
-                plan_validation_diagnostic=plan_validation_diagnostic,
-            ),
-            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking --> or <!-- AGENT_CLARIFY -->",
-            validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
-                text,
-                marker_validator=lambda text: _require_plan_state_or_clarification(
-                    text,
-                    # Fresh planner turns always use the v1 impact contract.
-                    # Document availability controls prompt material, not the
-                    # response protocol or the assessment requirement.
-                    required_architecture_impact_contract=1,
-                    require_execution_strategy_contract=(
-                        1 if require_fresh_execution_contract else 0
-                    ),
-                    require_risk_test_matrix_contract=(
-                        1 if require_fresh_matrix_contract else 0
-                    ),
-                ),
-                human_requirements=human_requirements,
-                requirement_scope="planning requirements",
-                full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
-            ),
-            usage_context=usage_context,
-            use_repair=True,
-            repair_expected_kind="plan_state",
-            repair_surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
-            repair_requires_direct_discussion_ack=plan_human_requirements_context.requires_direct_discussion_ack,
-            require_execution_strategy_contract=require_fresh_execution_contract,
-            require_risk_test_matrix_contract=require_fresh_matrix_contract,
-            operation_description="planning",
-            plan_validation_failure_handler=lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
+        def invoke_fresh_planner(turn_diagnostic: object | None) -> ValidatedAgentResponse:
+            return _run_validated_agent(
                 runner,
+                agent=config.coder,
                 config=config,
-                issue_context=issue_context,
-                issue_number=issue_number,
-                original_error=error,
-                exhaustion=exhaustion,
-                target_coder_round=1,
-                prior_plan_subject=None,
-                candidate_kind="plan_state",
+                prompt=build_issue_plan_prompt(
+                    issue_number,
+                    config,
+                    memory,
+                    issue_context=issue_context,
+                    plan_validation_diagnostic=turn_diagnostic,
+                    inherited_matrix_binding=inherited_matrix_binding,
+                ),
+                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking --> or <!-- AGENT_CLARIFY -->",
+                validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
+                    text,
+                    marker_validator=lambda text: _require_plan_state_or_clarification(
+                        text,
+                        # Fresh planner turns always use the v1 impact contract.
+                        # Document availability controls prompt material, not the
+                        # response protocol or the assessment requirement.
+                        required_architecture_impact_contract=1,
+                        require_execution_strategy_contract=(
+                            1 if require_fresh_execution_contract else 0
+                        ),
+                        require_risk_test_matrix_contract=(
+                            1 if require_fresh_matrix_contract else 0
+                        ),
+                    ),
+                    human_requirements=human_requirements,
+                    requirement_scope="planning requirements",
+                    full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
+                ),
+                usage_context=usage_context,
+                use_repair=True,
+                repair_expected_kind="plan_state",
+                repair_surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
+                repair_requires_direct_discussion_ack=plan_human_requirements_context.requires_direct_discussion_ack,
                 require_execution_strategy_contract=require_fresh_execution_contract,
                 require_risk_test_matrix_contract=require_fresh_matrix_contract,
-            ),
+                operation_description="planning",
+                plan_validation_failure_handler=lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
+                    runner,
+                    config=config,
+                    issue_context=issue_context,
+                    issue_number=issue_number,
+                    original_error=error,
+                    exhaustion=exhaustion,
+                    target_coder_round=1,
+                    prior_plan_subject=None,
+                    candidate_kind="plan_state",
+                    require_execution_strategy_contract=require_fresh_execution_contract,
+                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                ),
+            )
+
+        def fresh_candidate_matrix(response: ValidatedAgentResponse) -> object:
+            candidate = validate_structured_plan_state(
+                response.text,
+                require_execution_strategy_contract=(
+                    1 if require_fresh_execution_contract else 0
+                ),
+                require_risk_test_matrix_contract=(
+                    1 if require_fresh_matrix_contract else 0
+                ),
+            )
+            return getattr(candidate, "risk_test_matrix", None)
+
+        plan_response = run_inherited_checked_planner_turn(
+            invoke_fresh_planner,
+            derive_matrix=fresh_candidate_matrix,
+            initial_diagnostic=plan_validation_diagnostic,
+            candidate_kind="plan_state",
+            target_coder_round=1,
+            prior_plan_subject=None,
         )
         plan_output = plan_response.text
         coder_session_id = plan_response.session_id
@@ -9688,6 +9884,10 @@ def _run_plan_first_loop(
                     + " as non-authoritative context only",
                 )
 
+        inherited_review_deltas, inherited_review_failure = inherited_review_context(
+            current_plan
+        )
+
         def _build_plan_review_prompt(reviewer: AgentName) -> str:
             # Built once per reviewer from pre-round state only, so the same
             # prompt is produced regardless of sequential or parallel launch.
@@ -9713,6 +9913,9 @@ def _run_plan_first_loop(
                 superseded_prepanel_review=_superseded_prepanel_plan_review(
                     superseded_plan_prepanel.get(agent_display_name(reviewer))
                 ),
+                inherited_matrix_binding=inherited_matrix_binding,
+                inherited_reviewed_deltas=inherited_review_deltas,
+                inherited_check_failure=inherited_review_failure,
             )
 
         plan_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -10384,6 +10587,10 @@ def _run_plan_first_loop(
         )
 
         if all_approved and not must_fix_items and not plan_missing_approvals:
+            if inherited_review_failure is not None:
+                # Only a historical candidate published before the
+                # planning-time check can reach this guard.
+                raise AgentLoopError(inherited_review_failure)
             # Re-read both sides at the approval-to-implementation boundary so
             # a human instruction posted during planning cannot be hidden by
             # the original snapshot. New signed IDs require a fresh planning
@@ -11005,111 +11212,139 @@ def _run_plan_first_loop(
             # Hydration is a pre-prompt gate. Missing or conflicting durable
             # authority must not be papered over with the visible Markdown.
             semantic_base = hydrate_authenticated_plan_state(current_plan_sidecar)
-        plan_response = _run_validated_agent(
-            runner,
-            agent=config.coder,
-            config=config,
-            prompt=build_plan_revision_prompt(
-                issue_number,
-                round_number,
-                current_plan,
-                combined_review,
-                config,
-                memory,
-                issue_context=issue_context,
-                unresolved_items=must_fix_items,
-                compact_context=use_compact_context,
-                compact_prior=CompactPriorContext(tuple(compact_prior_summaries)),
-                compact_tail=CompactPlanTailContext(
-                    subject=current_plan_subject,
-                    action="Revise the implementation plan to address the blocking plan review.",
-                ),
-                require_risk_test_matrix_contract=require_fresh_matrix_contract,
-                plan_validation_diagnostic=plan_validation_diagnostic,
-                response_form=("semantic-patch-v1" if semantic_revision else None),
-                base_round_number=(semantic_base.round_number if semantic_base is not None else None),
-                base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
-            ),
-            session_id=coder_session_id,
-            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-            validate=(
-                (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_response(
-                    text,
-                    unresolved_items=items,
-                    human_requirements=human_requirements,
-                    inherited_human_requirement_dispositions=(
-                        semantic_base.plan.human_requirement_dispositions
-                        if semantic_base is not None else None
+        def invoke_revision_planner(turn_diagnostic: object | None) -> ValidatedAgentResponse:
+            return _run_validated_agent(
+                runner,
+                agent=config.coder,
+                config=config,
+                prompt=build_plan_revision_prompt(
+                    issue_number,
+                    round_number,
+                    current_plan,
+                    combined_review,
+                    config,
+                    memory,
+                    issue_context=issue_context,
+                    unresolved_items=must_fix_items,
+                    compact_context=use_compact_context,
+                    compact_prior=CompactPriorContext(tuple(compact_prior_summaries)),
+                    compact_tail=CompactPlanTailContext(
+                        subject=current_plan_subject,
+                        action="Revise the implementation plan to address the blocking plan review.",
                     ),
-                ))
-                if semantic_revision
-                else (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_response_with_human_requirements(
-                    text,
-                    marker_validator=lambda revised_text: _validate_plan_revision_response(
-                        revised_text,
+                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                    plan_validation_diagnostic=turn_diagnostic,
+                    inherited_matrix_binding=inherited_matrix_binding,
+                    response_form=("semantic-patch-v1" if semantic_revision else None),
+                    base_round_number=(semantic_base.round_number if semantic_base is not None else None),
+                    base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
+                ),
+                session_id=coder_session_id,
+                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+                validate=(
+                    (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_response(
+                        text,
                         unresolved_items=items,
-                        require_architecture_impact=True,
+                        human_requirements=human_requirements,
+                        inherited_human_requirement_dispositions=(
+                            semantic_base.plan.human_requirement_dispositions
+                            if semantic_base is not None else None
+                        ),
+                    ))
+                    if semantic_revision
+                    else (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_response_with_human_requirements(
+                        text,
+                        marker_validator=lambda revised_text: _validate_plan_revision_response(
+                            revised_text,
+                            unresolved_items=items,
+                            require_architecture_impact=True,
+                            require_execution_strategy_contract=require_fresh_execution_contract,
+                            require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                            reject_unsolicited_risk_test_matrix_contract=(
+                                not require_fresh_matrix_contract
+                            ),
+                        ),
+                        human_requirements=human_requirements,
+                        requirement_scope="planning requirements",
+                        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+                    ))
+                ),
+                usage_context=usage_context,
+                use_repair=True,
+                repair_expected_kind=("plan_revision_patch" if semantic_revision else "plan_revision"),
+                repair_surfaced_requirement_ids=(
+                    plan_revision_human_requirements_context.surfaced_requirement_ids
+                ),
+                repair_requires_direct_discussion_ack=(
+                    plan_revision_human_requirements_context.requires_direct_discussion_ack
+                ),
+                require_execution_strategy_contract=(
+                    False if semantic_revision else require_fresh_execution_contract
+                ),
+                require_risk_test_matrix_contract=(
+                    False if semantic_revision else require_fresh_matrix_contract
+                ),
+                reject_unsolicited_risk_test_matrix_contract=(
+                    False if semantic_revision else not require_fresh_matrix_contract
+                ),
+                repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
+                ledger_incomplete=round_ledger_incomplete,
+                # The revision runs after this round's dispositions were applied,
+                # so its proof must cover the items this round resolved. The
+                # pre-round value still carries them, and the pre-loop comment
+                # snapshot cannot replay the round that cleared them, so the proof
+                # also reads this round's in-process dispositions (#874).
+                repair_resolved_history_item_ids=_post_round_resolved_history_item_ids(
+                    prior_unresolved_items=prior_unresolved_items,
+                    dispositions_by_item=prior_dispositions,
+                    carried_items=unresolved_items,
+                    comments=issue_context.comments,
+                    flow="plan",
+                    reconciliation_mode="aggregate",
+                    same_status="same-plan",
+                ),
+                operation_description="plan revision",
+                plan_validation_failure_handler=(
+                    None if semantic_revision else lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
+                        runner,
+                        config=config,
+                        issue_context=issue_context,
+                        issue_number=issue_number,
+                        original_error=error,
+                        exhaustion=exhaustion,
+                        target_coder_round=round_number + 1,
+                        prior_plan_subject=current_plan_subject,
+                        candidate_kind="plan_revision",
                         require_execution_strategy_contract=require_fresh_execution_contract,
                         require_risk_test_matrix_contract=require_fresh_matrix_contract,
-                        reject_unsolicited_risk_test_matrix_contract=(
-                            not require_fresh_matrix_contract
-                        ),
-                    ),
-                    human_requirements=human_requirements,
-                    requirement_scope="planning requirements",
-                    full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
-                ))
-            ),
-            usage_context=usage_context,
-            use_repair=True,
-            repair_expected_kind=("plan_revision_patch" if semantic_revision else "plan_revision"),
-            repair_surfaced_requirement_ids=(
-                plan_revision_human_requirements_context.surfaced_requirement_ids
-            ),
-            repair_requires_direct_discussion_ack=(
-                plan_revision_human_requirements_context.requires_direct_discussion_ack
-            ),
-            require_execution_strategy_contract=(
-                False if semantic_revision else require_fresh_execution_contract
-            ),
-            require_risk_test_matrix_contract=(
-                False if semantic_revision else require_fresh_matrix_contract
-            ),
-            reject_unsolicited_risk_test_matrix_contract=(
-                False if semantic_revision else not require_fresh_matrix_contract
-            ),
-            repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
-            ledger_incomplete=round_ledger_incomplete,
-            # The revision runs after this round's dispositions were applied,
-            # so its proof must cover the items this round resolved. The
-            # pre-round value still carries them, and the pre-loop comment
-            # snapshot cannot replay the round that cleared them, so the proof
-            # also reads this round's in-process dispositions (#874).
-            repair_resolved_history_item_ids=_post_round_resolved_history_item_ids(
-                prior_unresolved_items=prior_unresolved_items,
-                dispositions_by_item=prior_dispositions,
-                carried_items=unresolved_items,
-                comments=issue_context.comments,
-                flow="plan",
-                reconciliation_mode="aggregate",
-                same_status="same-plan",
-            ),
-            operation_description="plan revision",
-            plan_validation_failure_handler=(
-                None if semantic_revision else lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
-                    runner,
-                    config=config,
-                    issue_context=issue_context,
-                    issue_number=issue_number,
-                    original_error=error,
-                    exhaustion=exhaustion,
-                    target_coder_round=round_number + 1,
-                    prior_plan_subject=current_plan_subject,
-                    candidate_kind="plan_revision",
-                    require_execution_strategy_contract=require_fresh_execution_contract,
-                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                    )
+                ),
+            )
+
+        def revision_candidate_matrix(response: ValidatedAgentResponse) -> object:
+            if semantic_revision:
+                if not isinstance(response.marker_value, PlanRevisionPatch):
+                    raise AgentLoopError(
+                        "Semantic planning response crossed the pinned response form."
+                    )
+                assert semantic_base is not None
+                # Assembled against the unchanged authenticated base; the
+                # result stays local until the candidate passes.
+                assembled_candidate, _ = assemble_authenticated_plan_revision(
+                    semantic_base,
+                    response.marker_value,
+                    result_round_number=round_number + 1,
                 )
-            ),
+                return assembled_candidate.risk_test_matrix
+            return getattr(response.marker_value, "risk_test_matrix", None)
+
+        plan_response = run_inherited_checked_planner_turn(
+            invoke_revision_planner,
+            derive_matrix=revision_candidate_matrix,
+            initial_diagnostic=plan_validation_diagnostic,
+            candidate_kind="plan_revision",
+            target_coder_round=round_number + 1,
+            prior_plan_subject=current_plan_subject,
         )
         canonical_plan: str | None = None
         public_comment = plan_response.text
@@ -11756,6 +11991,15 @@ def run_issue_loop(
                 requested_policy=requested_policy,
                 implement_after_approval=implement_after_approval,
                 usage_context=usage_context,
+                inherited_matrix_binding=(
+                    _inherited_matrix_binding(
+                        parent_issue=fresh_child.parent_issue,
+                        stage_id=fresh_child.stage_id,
+                        parent_plan_context=fresh_child.parent_plan_context,
+                    )
+                    if fresh_child is not None and fresh_child.route.is_planning
+                    else None
+                ),
             )
 
         closing_contract = resolve_issue_contract(
