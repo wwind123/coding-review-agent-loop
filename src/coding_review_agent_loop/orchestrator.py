@@ -563,6 +563,12 @@ from .review_scheduling import (
     select_reviewers,
     undecodable_history_message,
 )
+from .workflow_transaction_publication import (
+    LegacyEra,
+    NoLiveHeadAuthority,
+    RoundAuthority,
+    resolve_round_authority,
+)
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
     CODER_DISPUTE_NOTE_PREFIX,
@@ -15076,6 +15082,37 @@ def _is_completed_full_board_scheduler_record(
         return False
 
 
+def _round_live_head_authority(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str | None,
+) -> RoundAuthority:
+    """Resolve the per-round head binding (#827, point 2).  Never writes.
+
+    A legacy-era PR yields ``LegacyEra`` and keeps today's reuse rules.  A
+    transaction-era PR yields its committed transaction for the live head, or
+    ``NoLiveHeadAuthority`` for a recoverable gap (pending, uncommitted, or an
+    older committed head), under which the round runs with fresh reviewers and
+    reuses nothing.  Integrity failures raise and stop the round.
+
+    A dry run has no authenticated actor, never qualifies, and never merges,
+    so it previews under today's rules.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run:
+        return LegacyEra()
+
+    def gate() -> object:
+        return publication.require_live_head_authority(
+            runner, config, pr_number=pr_number, head_sha=str(head_sha or "")
+        )
+
+    return resolve_round_authority(lambda: None, gate)
+
+
 def _fresh_pr_qualification_snapshot(
     runner: Runner,
     *,
@@ -16988,6 +17025,26 @@ def run_pr_loop(
                 parent_issue_context=parent_issue_context,
             )
             human_requirements = requirements_context.effective_requirements
+            # Per-round head binding (#827, point 2): a transaction-era PR may
+            # reuse a qualification checkpoint, an interrupted round's reviews,
+            # or unchanged-head approvals only when a committed transaction
+            # binds the live head.  A recoverable gap keeps the round running
+            # with fresh reviewers; an integrity failure stops it.
+            round_authority = _round_live_head_authority(
+                runner, config, pr_number=pr_number, head_sha=pr_metadata.head_sha
+            )
+            round_reuse_allowed = not isinstance(round_authority, NoLiveHeadAuthority)
+            if not round_reuse_allowed:
+                log(
+                    config,
+                    f"Round {round_number}: PR #{pr_number} head {pr_metadata.head_sha} has no "
+                    "committed workflow transaction; reviewing without checkpoint or approval "
+                    f"reuse. {round_authority.diagnostic}",
+                )
+                if qualification_checkpoint is not None and qualification_checkpoint.valid:
+                    qualification_checkpoint = QualificationCheckpoint.invalid(
+                        "live head has no committed workflow transaction"
+                    )
             if qualification_checkpoint is not None and qualification_checkpoint.valid:
                 checkpoint_plan = (
                     approved_plan_context.plan_hash
@@ -17097,7 +17154,11 @@ def run_pr_loop(
             approved_review_outputs: list[tuple[str, str]] = []
             completed_by_name = {
                 record.metadata.agent: record
-                for record in (current_resume.completed_reviews if current_resume is not None else ())
+                for record in (
+                    current_resume.completed_reviews
+                    if current_resume is not None and round_reuse_allowed
+                    else ()
+                )
             }
             resumed_by_name = {
                 name: record
@@ -17199,16 +17260,20 @@ def run_pr_loop(
                     )
                 )
             }
-            unchanged_head_approvals = _latest_pr_approved_reviews_for_head(
-                pr_comments,
-                head_sha=pr_metadata.head_sha,
-                configured_reviewers=configured_reviewers,
-                approved_plan_context=approved_plan_context,
-                human_requirements=human_requirements,
-                require_architecture_contract=config.architecture_context_enabled,
-                reviewer_acquisition_contract=(
-                    reviewer_acquisition_contract if selective_policy else None
-                ),
+            unchanged_head_approvals = (
+                _latest_pr_approved_reviews_for_head(
+                    pr_comments,
+                    head_sha=pr_metadata.head_sha,
+                    configured_reviewers=configured_reviewers,
+                    approved_plan_context=approved_plan_context,
+                    human_requirements=human_requirements,
+                    require_architecture_contract=config.architecture_context_enabled,
+                    reviewer_acquisition_contract=(
+                        reviewer_acquisition_contract if selective_policy else None
+                    ),
+                )
+                if round_reuse_allowed
+                else {}
             )
             if panel_evidence is not None:
                 # Causal approval eligibility: a secondary approval counts only

@@ -1165,6 +1165,13 @@ class FakeRunner(Runner):
             for index, comment in enumerate(source, start=1):
                 if "user" in comment:
                     # Already REST-shaped (seeded from a transaction fixture).
+                    # GitHub always stamps a comment; fixtures often omit it.
+                    if not comment.get("created_at"):
+                        comment = {
+                            **comment,
+                            "created_at": comment.get("createdAt")
+                            or f"2026-05-23T00:{index // 60:02d}:{index % 60:02d}Z",
+                        }
                     rows.append(comment)
                     continue
                 login = (comment.get("author") or {}).get("login") or "ghost"

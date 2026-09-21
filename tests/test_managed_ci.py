@@ -356,7 +356,13 @@ class V2ManagedRunner(ManagedRunner):
             return CommandResult(cmd, cwd_path, json.dumps({"sha": "base-sha"}), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
             cmd, cwd_path = self._record_command(args, cwd)
-            return CommandResult(cmd, cwd_path, json.dumps(self.intent_comments), "", 0)
+            # GitHub always stamps a comment; fixtures often omit it.
+            stamped = [
+                {**item, "created_at": item.get("created_at") or "2026-05-23T00:00:00Z"}
+                if isinstance(item, dict) else item
+                for item in self.intent_comments
+            ]
+            return CommandResult(cmd, cwd_path, json.dumps(stamped), "", 0)
         if endpoint == "repos/OWNER/REPO/issues/7/comments" and "POST" in cmd:
             cmd, cwd_path = self._record_command(args, cwd)
             body = self._form_value(cmd, "body")

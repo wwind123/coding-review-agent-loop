@@ -3139,6 +3139,152 @@ def test_m946_legacy_pr_merge_passes_the_gate_with_no_write(monkeypatch, tmp_pat
     assert not [c for c, _cwd in runner.commands if c[:3] in (["gh", "pr", "comment"], ["gh", "issue", "comment"])]
 
 
+def test_m946_round_authority_is_the_committed_transaction_for_its_head(monkeypatch, tmp_path):
+    from coding_review_agent_loop.workflow_transaction_publication import CommittedTransaction
+
+    runner, config, _merged, pr, head = _m946_merge_runner(monkeypatch, tmp_path)
+
+    authority = orchestrator._round_live_head_authority(
+        runner, config, pr_number=pr, head_sha=head
+    )
+
+    assert isinstance(authority, CommittedTransaction)
+    assert authority.intent.head_sha == head
+    assert _m946_comment_writes(runner) == []
+
+
+@pytest.mark.parametrize("boundary", [2, 3, 4])
+def test_m946_round_authority_is_withheld_for_a_partial_transaction(
+    monkeypatch, tmp_path, boundary
+):
+    """A pending prepared record met mid-loop: no reuse, and no raise from the round."""
+    from coding_review_agent_loop.workflow_transaction_publication import NoLiveHeadAuthority
+
+    runner, config, _merged, pr, head = _m946_merge_runner(
+        monkeypatch, tmp_path, boundary=boundary
+    )
+
+    authority = orchestrator._round_live_head_authority(
+        runner, config, pr_number=pr, head_sha=head
+    )
+
+    assert isinstance(authority, NoLiveHeadAuthority)
+    assert authority.diagnostic.transaction_ids
+    assert _m946_comment_writes(runner) == []
+
+
+def test_m946_round_authority_is_withheld_for_a_head_without_a_committed_successor(
+    monkeypatch, tmp_path
+):
+    """The H1 transaction is never reuse authority for H2."""
+    from workflow_transaction_helpers import HEAD_2
+    from coding_review_agent_loop.workflow_transaction_publication import NoLiveHeadAuthority
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2
+    )
+
+    authority = orchestrator._round_live_head_authority(
+        runner, config, pr_number=pr, head_sha=HEAD_2
+    )
+
+    assert isinstance(authority, NoLiveHeadAuthority)
+    assert _m946_comment_writes(runner) == []
+
+
+def test_m946_round_authority_is_legacy_era_for_a_pr_without_v2_records(tmp_path):
+    from coding_review_agent_loop.workflow_transaction_publication import LegacyEra
+
+    runner = FakeRunner()
+    config = make_config(tmp_path)
+
+    authority = orchestrator._round_live_head_authority(
+        runner, config, pr_number=77, head_sha="abc123"
+    )
+
+    assert isinstance(authority, LegacyEra)
+
+
+def test_m946_pr_loop_reuses_no_unchanged_head_approval_without_live_head_authority(
+    monkeypatch, tmp_path
+):
+    """Twin of the unchanged-head reuse test: with no committed transaction for the
+    live head, the round keeps running with fresh reviewers and reuses nothing."""
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.workflow_transaction_publication import NoLiveHeadAuthority
+
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved", summary="Codex approves the initial head.",
+                reviewer="OpenAI Codex",
+            ),
+            structured_pr_review(
+                state="approved", summary="Codex re-reviews the same head.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                reviewer="OpenAI Codex",
+            ),
+        ],
+        claude_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Claude needs one fix.",
+                blocking_items=["Fix the admission cleanup race."],
+                reviewer="Anthropic Claude",
+            ),
+            structured_pr_review(
+                state="approved", summary="Claude accepts the follow-up.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                reviewer="Anthropic Claude",
+            ),
+        ],
+        gemini_outputs=[
+            structured_coder_followup(
+                addressed_items=["item-1"], remaining_items=[], reviewer="Google Gemini",
+            )
+        ],
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, coder="gemini", reviewer=("codex", "claude"), max_rounds=2)
+    rounds = []
+
+    def no_authority(*_args, **kwargs):
+        rounds.append(kwargs["head_sha"])
+        return NoLiveHeadAuthority(
+            WorkflowTransactionError("pending", transaction_ids=("t",), code="pending")
+        )
+
+    monkeypatch.setattr(orchestrator, "_round_live_head_authority", no_authority)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    codex_reviews = [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    # The round-1 approval on the unchanged head is not reused in round 2.
+    assert len(codex_reviews) == 2
+    assert len(rounds) == 2
+
+
+def test_m946_pr_loop_stops_on_an_integrity_failure_at_the_round_binding(
+    monkeypatch, tmp_path
+):
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")],
+    )
+    config = make_config(tmp_path, reviewer=("codex",), max_rounds=1)
+
+    def integrity(*_args, **_kwargs):
+        raise WorkflowTransactionError(
+            "divergent", transaction_ids=("a", "b"), code="divergent-transactions"
+        )
+
+    monkeypatch.setattr(orchestrator, "_round_live_head_authority", integrity)
+
+    with pytest.raises(WorkflowTransactionError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+
+
 @pytest.mark.parametrize("board", ["absent", "neutral", "skipped", "forbidden"])
 def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
     monkeypatch, tmp_path, board

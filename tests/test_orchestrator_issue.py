@@ -6820,9 +6820,12 @@ class _IssueRecoveryWorkflowRunner(FakeRunner):
             )
         if endpoint.startswith("repos/OWNER/REPO/issues/77/comments?"):
             recorded, cwd_path = self._record_command(args, cwd)
-            return CommandResult(
-                recorded, cwd_path, json.dumps(self.authorization_comments), "", 0
-            )
+            # GitHub always stamps a comment; fixtures often omit it.
+            stamped = [
+                {**comment, "created_at": comment.get("created_at") or "2026-05-23T00:00:00Z"}
+                for comment in self.authorization_comments
+            ]
+            return CommandResult(recorded, cwd_path, json.dumps(stamped), "", 0)
         if endpoint == "repos/OWNER/REPO/issues/77/comments" and "POST" in command:
             recorded, cwd_path = self._record_command(args, cwd)
             body = self._form_value(command, "body") or ""
