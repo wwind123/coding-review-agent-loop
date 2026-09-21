@@ -1225,3 +1225,66 @@ def test_router_validates_a_withheld_bound_authorization(tmp_path):
     codec.invalid = True
     error = _assert_unroutable(github, tmp_path, authorization_codec=codec)
     assert "managed-ci-authorization" in " ".join(error.problems)
+
+
+# ---------------------------------------------------------------------------
+# Pre-terminal re-validation of reissued entries
+# ---------------------------------------------------------------------------
+
+
+def _contradictory_round(github, tmp_path):
+    tx = states(github, tmp_path)[0].transaction_id
+    github.seed(PR, _attach_round_metadata(
+        "Divergent.\n-- Claude",
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=1, subject=HEAD_1,
+            workflow_transaction_id=tx,
+        ),
+    ))
+
+
+def test_contradictory_round_seen_by_the_final_reread_prevents_the_commit(tmp_path):
+    github = TransactionGitHub()
+
+    def refresh():
+        # Runs after every entry was published and before the final re-read.
+        _contradictory_round(github, tmp_path)
+        return direct_request()
+
+    with pytest.raises(WorkflowTransactionError) as raised:
+        publish_transaction(github, direct_request(), tmp_path, refresh=refresh)
+    assert raised.value.code == "initial-coder-round-contradiction"
+    assert github.write_count == 4  # prepared + three entries; no terminal record
+    assert [item.status for item in states(github, tmp_path)] == ["prepared"]
+    with pytest.raises(WorkflowTransactionError):
+        gate(github, tmp_path)
+
+
+def test_edited_handoff_seen_by_the_final_reread_prevents_the_commit(tmp_path):
+    github = TransactionGitHub()
+
+    def refresh():
+        handoff = github.threads[ISSUE][-1]
+        github.edit(handoff["id"], handoff["body"])
+        return direct_request()
+
+    with pytest.raises(WorkflowTransactionError) as raised:
+        publish_transaction(github, direct_request(), tmp_path, refresh=refresh)
+    assert raised.value.code == "record-contradiction"
+    assert [item.status for item in states(github, tmp_path)] == ["prepared"]
+
+
+def test_round_injected_at_the_terminal_write_boundary_is_never_reported_as_success(tmp_path):
+    github = TransactionGitHub()
+    github.before_write(5, lambda fake: _contradictory_round(fake, tmp_path))
+    with pytest.raises(WorkflowTransactionError) as raised:
+        publish(github, direct_request(), tmp_path)
+    assert raised.value.code == "initial-coder-round-contradiction"
+    # The terminal record landed (GitHub has no compare-and-swap), but it grants
+    # nothing: the seam, a rerun, and the gate all refuse the state.
+    for call in (lambda: publish(github, direct_request(), tmp_path), lambda: gate(github, tmp_path)):
+        with pytest.raises(WorkflowTransactionError) as refused:
+            call()
+        assert refused.value.code == "initial-coder-round-contradiction"
+    with pytest.raises(WorkflowTransactionError):
+        resolve_round_authority(lambda: None, lambda: gate(github, tmp_path))

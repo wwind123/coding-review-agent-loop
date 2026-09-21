@@ -1119,6 +1119,45 @@ class _Seam:
             )
         return min((comment.comment_id for comment in bound), default=None)
 
+    def adopt_entry(
+        self, name: str, state: TransactionState, resolved: PrTransactionViews
+    ) -> int | None:
+        """The canonical comment ID of an already-published entry, or ``None``.
+
+        This is the one adoption rule.  It runs read-first before every entry
+        write and again over the final re-read immediately before the terminal
+        write, so a contradictory, edited, or divergent record bound to this
+        transaction stops the seam instead of being committed over.
+        """
+        intent = state.intent
+        views = resolved.views
+        tx_id = intent.transaction_id
+        if name == ENTRY_HANDOFF:
+            bound = [c for c, r in _v2_handoffs(views.issue_view) if r.transaction_id == tx_id]
+            return self._adopt_exact(
+                intent, state.prepared_comment, bound,
+                str(self._expected_handoff_body(intent)), what="handoff",
+            )
+        if name == ENTRY_PR_CONTRACT:
+            bound = [c for c, r in _v2_contracts(views.pr_view) if r.transaction_id == tx_id]
+            return self._adopt_exact(
+                intent, state.prepared_comment, bound,
+                str(self._expected_contract_body(intent, resolved.contract)),
+                what="PR contract",
+            )
+        if name == ENTRY_AUTHORIZATION:
+            return self._adopt_authorization(state, resolved)
+        expected = self._expected_coder_round(tx_id)
+        candidates = _coder_round_candidates(
+            intent, state.prepared_comment, views.pr_view,
+            expected_body=str(expected) if expected is not None else None,
+        )
+        return candidates[0].comment_id if candidates else None
+
+    def _expected_coder_round(self, tx_id: str) -> TrustedBody | None:
+        supplied = self.request.initial_coder_round
+        return supplied.render(tx_id) if supplied is not None else None
+
     def publish_entry(
         self,
         name: str,
@@ -1127,34 +1166,24 @@ class _Seam:
     ) -> PublicationViews | None:
         """Read-first adoption or a verified write.  Returns fresh views after a write."""
         intent = state.intent
-        views = resolved.views
         tx_id = intent.transaction_id
-        actor = self._actor(views)
+        actor = self._actor(resolved.views)
+        if self.adopt_entry(name, state, resolved) is not None:
+            return None
         if name == ENTRY_HANDOFF:
             assert intent.primary_issue is not None
-            body = self._expected_handoff_body(intent)
-            bound = [c for c, r in _v2_handoffs(views.issue_view) if r.transaction_id == tx_id]
-            if self._adopt_exact(intent, state.prepared_comment, bound, str(body), what="handoff"):
-                return None
             _write_verified(
                 self.runner, self.config, surface=ISSUE_THREAD_SURFACE,
-                number=intent.primary_issue, body=body, actor=actor, intent=intent,
-                what="issue-to-PR handoff",
+                number=intent.primary_issue, body=self._expected_handoff_body(intent),
+                actor=actor, intent=intent, what="issue-to-PR handoff",
             )
         elif name == ENTRY_PR_CONTRACT:
-            body = self._expected_contract_body(intent, resolved.contract)
-            bound = [c for c, r in _v2_contracts(views.pr_view) if r.transaction_id == tx_id]
-            if self._adopt_exact(
-                intent, state.prepared_comment, bound, str(body), what="PR contract"
-            ):
-                return None
             _write_verified(
                 self.runner, self.config, surface=PR_THREAD_SURFACE, number=intent.pr_number,
-                body=body, actor=actor, intent=intent, what="PR expected-closing contract",
+                body=self._expected_contract_body(intent, resolved.contract),
+                actor=actor, intent=intent, what="PR expected-closing contract",
             )
         elif name == ENTRY_AUTHORIZATION:
-            if self._adopt_authorization(state, resolved) is not None:
-                return None
             managed = self.request.managed
             assert isinstance(managed, (Granted, Released)) and self.codec is not None
             _write_verified(
@@ -1163,13 +1192,7 @@ class _Seam:
                 actor=actor, intent=intent, what="bound managed-CI authorization",
             )
         else:
-            supplied = self.request.initial_coder_round
-            expected = supplied.render(tx_id) if supplied is not None else None
-            if _coder_round_candidates(
-                intent, state.prepared_comment, views.pr_view,
-                expected_body=str(expected) if expected is not None else None,
-            ):
-                return None
+            expected = self._expected_coder_round(tx_id)
             if expected is None:
                 return None  # waived: the coder response is unavailable
             _write_verified(
@@ -1222,9 +1245,15 @@ class _Seam:
     # -- (8) terminal -------------------------------------------------------
 
     def commit_outcomes(
-        self, state: TransactionState, views: PublicationViews
+        self, state: TransactionState, resolved: PrTransactionViews
     ) -> tuple[EntryOutcome, ...]:
-        published = _published_entry_ids(state, views, self.codec)
+        """Re-validate every reissued entry from the final view and state its outcome."""
+        published = {
+            entry.name: comment_id
+            for entry in state.intent.record_set
+            if entry.disposition == DISPOSITION_REISSUED
+            and (comment_id := self.adopt_entry(entry.name, state, resolved)) is not None
+        }
         outcomes = []
         for entry in state.intent.record_set:
             if entry.disposition == DISPOSITION_INHERITED:
@@ -1294,9 +1323,7 @@ class _Seam:
                     committed = resolved.lineage.latest_committed
                     if committed is None:
                         return None
-                    return CommittedTransaction(
-                        committed, resolved.lineage, resolved.contract, resolved.handoff
-                    )
+                    return self._verified_commit(committed, resolved)
                 if resolved.lineage.latest_committed is None and self._legacy_needs_no_write(
                     resolved
                 ):
@@ -1328,6 +1355,21 @@ class _Seam:
             code=CODE_WRITE_FAILED,
         )
 
+    def _verified_commit(
+        self, committed: TransactionState, resolved: PrTransactionViews
+    ) -> CommittedTransaction:
+        """Never report a commit as a success unless the gate's entry rules hold.
+
+        GitHub offers no compare-and-swap, so a record can still land between the
+        final re-read and the terminal write; the same rules the gate applies
+        refuse that state here, on this run and on every rerun.
+        """
+        _gate_authorization(committed, resolved, self.codec)
+        _gate_initial_coder_round(resolved.lineage, resolved.views.pr_view)
+        return CommittedTransaction(
+            committed, resolved.lineage, resolved.contract, resolved.handoff
+        )
+
     def _finish(
         self, state: TransactionState, resolved: PrTransactionViews
     ) -> CommittedTransaction | None:
@@ -1354,9 +1396,7 @@ class _Seam:
         if current is None or current.aborted:
             return None
         if current.committed:
-            return CommittedTransaction(
-                current, resolved.lineage, resolved.contract, resolved.handoff
-            )
+            return self._verified_commit(current, resolved)
         comparison = self.compare(views, current.intent)
         if comparison.outcome == "contradiction":
             self._refuse_contradiction(current, comparison)
@@ -1367,7 +1407,7 @@ class _Seam:
             phase=PHASE_COMMITTED,
             transaction_id=current.transaction_id,
             prepared_comment_id=current.prepared_comment.comment_id,
-            outcomes=self.commit_outcomes(current, views),
+            outcomes=self.commit_outcomes(current, resolved),
         )
         _write_verified(
             self.runner, self.config, surface=PR_THREAD_SURFACE,
@@ -1384,7 +1424,7 @@ class _Seam:
                 recovery=RECOVERY_RERUN,
                 code=CODE_WRITE_FAILED,
             )
-        return CommittedTransaction(final, resolved.lineage, resolved.contract, resolved.handoff)
+        return self._verified_commit(final, resolved)
 
 
 def contract_supersession(
