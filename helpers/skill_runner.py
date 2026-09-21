@@ -1744,6 +1744,14 @@ def _recover_skill_pr_plan_context(
                         f"PR #{pr} child issue #{issue_number} has no recoverable approved "
                         f"child plan {expected_hash}; repair the issue-to-PR handoff."
                     )
+                # Same inherited-row comparison as the planning branch and
+                # the orchestrator, so every admissibility path agrees.
+                validate_separately_planned_child_matrix(
+                    context.risk_test_matrix_payload if context.matrix_available else None,
+                    child_context.risk_test_matrix_payload
+                    if child_context.matrix_available else None,
+                    execution_owner=phase.stage_id,
+                )
                 return child_context
             return context
 

@@ -132,7 +132,33 @@ row-level incomplete and test-receipt caveats. During staged execution, the
 approved topology assigns each applicable row to one owner: a generated child
 enforces only its owned rows while retaining sibling, later, and final rows as
 read-only pending obligations, and a separately planned child must link its
-rows to inherited parent obligations or surface a provenance conflict.
+rows to inherited parent obligations or surface a provenance conflict. That
+link is a field-classified preserve-or-strengthen contract, compared on exact
+sanitized strings with no case or whitespace normalization: applicability is
+ordered (`not-applicable` < `applicable` < `required`) and may only stay or
+rise; every parent forbidden side effect must survive as an exactly equal
+entry; the scenario coverage fields (entry path or mode, initial state, event,
+expected outcome) must retain the parent text verbatim and may only extend it;
+proposed test level and location may change but are always surfaced; the label,
+scope links, ordering, child-local rows, and the execution owner are free. A
+rejection names each weakened row and field with a route forward and fits the
+plan-validation diagnostic bound by construction. Admissible differences are
+reviewed deltas: child plan reviewers receive a deterministic parent-versus-child
+coverage delta, recomputed on resume and never persisted, with a duty to block
+any narrowing of coverage or test reachability. The same comparison runs inside
+the child plan-first cycle, from both parent dispatch and the direct child
+entry, as an orchestrator-owned bounded replan that is independent of structured
+repair: a weakening candidate stays unpublished in memory, the planner is
+re-invoked with the field-level diagnostic over the unchanged authenticated
+base, and exhausting `MAX_INHERITED_MATRIX_REPLANS` persists one authenticated
+plan-validation diagnostic record and stops deterministically before any
+reviewer or implementation turn; the next invocation recovers that record for
+its first planner turn. Every plan prompt form carries the inherited obligations
+through one shared lossless renderer that shows exactly the compared form. Both
+prompt blocks fail closed rather than truncate: oversized parent obligations
+stop child planning before any planner turn, and an oversized delta set rejects
+the candidate into the replan loop. Parent dispatch, direct child invocation,
+and both skill-runner PR-validation branches apply the same function.
 
 The validated matrix wire schema is the canonical source for planner and
 repair prompt key lists and minimal applicable/not-applicable examples. Repair

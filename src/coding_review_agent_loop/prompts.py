@@ -20,7 +20,12 @@ from .architecture_context import (
     render_architecture_snapshot,
 )
 from .config import AgentLoopConfig, reviewers
-from .decomposition import approved_plan_hash
+from .decomposition import (
+    INHERITED_SCENARIO_FIELDS,
+    InheritedMatrixBinding,
+    InheritedRowDifference,
+    approved_plan_hash,
+)
 from .errors import AgentLoopError
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provenance
@@ -2381,6 +2386,149 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
 
 
+# Fail-closed caps: neither block is ever truncated.  The enforceable tier
+# stops child planning before any planner turn when the parent rows exceed
+# it; an over-cap delta set rejects the candidate into the replan loop.
+INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES = 96 * 1024
+INHERITED_COVERAGE_DELTA_MAX_BYTES = 64 * 1024
+_INHERITED_PRESERVATION_RULES = (
+    "Preservation rules for every inherited row: keep the row ID; never lower "
+    "applicability (not-applicable < applicable < required); copy every forbidden side "
+    "effect exactly, case and whitespace included (additions and reordering are "
+    "allowed); keep the text of entry_path_or_mode, initial_state, event, and "
+    "expected_outcome verbatim and add refinements after it; proposed test level and "
+    "location may change with justification and are shown to reviewers; the label, "
+    "scope links, and execution owner are free; child-local rows may be added."
+)
+
+
+def _inherited_literal(value: object) -> str:
+    # A JSON string literal is lossless: decoding it yields exactly the
+    # sanitized text the validator compares, case and whitespace included.
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _inherited_enforceable_tier(binding: InheritedMatrixBinding) -> str:
+    lines: list[str] = []
+    for row in binding.inherited_rows():
+        payload = row.to_payload()
+        lines.append(f"- row_id: {_inherited_literal(payload['row_id'])}")
+        lines.append(f"  applicability: {_inherited_literal(payload['applicability'])}")
+        for field in INHERITED_SCENARIO_FIELDS:
+            lines.append(f"  {field}: {_inherited_literal(payload[field])}")
+        lines.append("  forbidden_side_effects:")
+        for effect in payload["forbidden_side_effects"]:  # type: ignore[union-attr]
+            lines.append(f"    - {_inherited_literal(effect)}")
+    return "\n".join(lines)
+
+
+def inherited_obligations_enforceable_size(binding: InheritedMatrixBinding) -> int:
+    """UTF-8 size of the never-shortened enforceable tier."""
+    return len(_inherited_enforceable_tier(binding).encode("utf-8"))
+
+
+def render_inherited_matrix_obligations(binding: InheritedMatrixBinding | None) -> str:
+    """Shared lossless inherited-obligation block for every plan prompt form."""
+    if binding is None:
+        return ""
+    enforceable = _inherited_enforceable_tier(binding)
+    if not enforceable:
+        return ""
+    measured = len(enforceable.encode("utf-8"))
+    if measured > INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES:
+        raise AgentLoopError(
+            f"Inherited parent matrix obligations for stage `{binding.stage_id}` measure "
+            f"{measured} bytes, above the {INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES}-byte "
+            "lossless prompt cap; they are never truncated. Reduce or split the rows the "
+            f"parent plan on issue #{binding.parent_issue} allocates to this stage."
+        )
+    descriptive_lines = []
+    for row in binding.inherited_rows():
+        payload = row.to_payload()
+        descriptive_lines.append(
+            f"- {_inherited_literal(payload['row_id'])}: label={_inherited_literal(payload['label'])}; "
+            f"proposed_test_level={_inherited_literal(payload['proposed_test_level'])}; "
+            f"proposed_test_location={_inherited_literal(payload['proposed_test_location'])}"
+        )
+    descriptive = "\n".join(descriptive_lines)
+    if measured + len(descriptive.encode("utf-8")) > INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES:
+        descriptive = (
+            "[Descriptive tier (labels and proposed tests) omitted as a whole for prompt "
+            "size; every enforceable value above is complete.]"
+        )
+    return (
+        f"Inherited parent risk-matrix obligations (authenticated approved plan of parent "
+        f"issue #{binding.parent_issue}, stage `{sanitize_historical_text(binding.stage_id)}`; "
+        "not issue prose):\n"
+        f"{_INHERITED_PRESERVATION_RULES}\n"
+        "Each value is a JSON string literal; the decoded text is exactly what the "
+        "deterministic validator compares.\n"
+        "Enforceable tier:\n"
+        f"{enforceable}\n"
+        "Descriptive tier:\n"
+        f"{descriptive}\n"
+    )
+
+
+def _inherited_coverage_delta_entries(deltas: Sequence[InheritedRowDifference]) -> str:
+    return "\n".join(
+        f"- row {_inherited_literal(sanitize_historical_text(delta.row_id))} field `{delta.field}` "
+        f"({delta.reason}):\n"
+        f"  parent: {_inherited_literal(delta.parent_value) if delta.parent_value else '(none)'}\n"
+        f"  child: {_inherited_literal(delta.child_value) if delta.child_value else '(none)'}"
+        for delta in deltas
+    )
+
+
+def inherited_coverage_delta_size(deltas: Sequence[InheritedRowDifference]) -> int:
+    """UTF-8 size of the never-shortened reviewer coverage-delta entries."""
+    return len(_inherited_coverage_delta_entries(deltas).encode("utf-8"))
+
+
+def render_inherited_coverage_delta(
+    binding: InheritedMatrixBinding | None,
+    deltas: Sequence[InheritedRowDifference] | None,
+    *,
+    check_failure: str | None = None,
+) -> str:
+    """Deterministic parent-versus-child coverage delta for plan reviewers."""
+    if binding is None or not binding.inherited_rows():
+        return ""
+    if check_failure:
+        return (
+            "Inherited coverage check FAILED for this candidate (published before the "
+            "planning-time check existed). It cannot be approved: report a blocking plan "
+            "issue naming each row and field below so the revision restores the inherited "
+            "obligations.\n"
+            f"{sanitize_historical_text(check_failure)}\n"
+        )
+    if not deltas:
+        return (
+            "Inherited coverage delta: none; every inherited row is identical to the parent "
+            "in all reviewed fields.\n"
+        )
+    entries = _inherited_coverage_delta_entries(deltas)
+    measured = len(entries.encode("utf-8"))
+    if measured > INHERITED_COVERAGE_DELTA_MAX_BYTES:
+        raise AgentLoopError(
+            f"Inherited coverage delta measures {measured} bytes, above the "
+            f"{INHERITED_COVERAGE_DELTA_MAX_BYTES}-byte lossless prompt cap; it is never "
+            "truncated. Make fewer or smaller departures from the inherited text."
+        )
+    return (
+        "Inherited coverage delta (deterministic parent-versus-child comparison of this "
+        "candidate; these differences passed the mechanical check and are admissible only "
+        "under your review):\n"
+        f"{entries}\n"
+        "For every listed delta, decide whether the child value is equivalent to or stronger "
+        "than the parent value for entry path or mode, initial state, event, expected "
+        "outcome, forbidden side effects, and test reachability. An extension that narrows, "
+        "conditions, or negates the retained parent text, or a test level/location change "
+        "that makes the scenario less reachable, is a blocking plan issue naming the row "
+        "and field.\n"
+    )
+
+
 def build_issue_plan_prompt(
     issue_number: int,
     config: AgentLoopConfig,
@@ -2388,6 +2536,7 @@ def build_issue_plan_prompt(
     issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     plan_validation_diagnostic: object | None = None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -2466,7 +2615,7 @@ prose between the JSON object and footer.
         "Each bullet must explain how the plan covers that item or what remains risky or blocked."
     ),
 )}
-{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 {_issue_context_block(issue_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -2503,6 +2652,9 @@ def build_plan_review_prompt(
     compact_tail: CompactPlanTailContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     superseded_prepanel_review: SupersededPrepanelReview | None = None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
+    inherited_check_failure: str | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2518,6 +2670,9 @@ def build_plan_review_prompt(
             compact_prior=compact_prior,
             compact_tail=compact_tail,
             superseded_prepanel_review=superseded_prepanel_review,
+            inherited_matrix_binding=inherited_matrix_binding,
+            inherited_reviewed_deltas=inherited_reviewed_deltas,
+            inherited_check_failure=inherited_check_failure,
         )
         return compact_prompt
     coder_name = agent_display_name(config.coder)
@@ -2554,7 +2709,7 @@ branch, commit, push, or open a pull request during this planning review.
 Plan from {coder_name}:
 
 {plan}
-{superseded_prepanel_block}
+{render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
 Review the plan for correctness, architecture fit, missing edge cases, test
 strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -2636,6 +2791,9 @@ def _build_compact_plan_review_prompt(
     compact_prior: CompactPriorContext | None,
     compact_tail: CompactPlanTailContext | None,
     superseded_prepanel_review: SupersededPrepanelReview | None = None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
+    inherited_check_failure: str | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_name = agent_display_name(reviewer)
@@ -2695,7 +2853,7 @@ Action for this call: {action}
 Current implementation plan from {coder_name}:
 
 {plan}
-{superseded_prepanel_block}
+{render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
 {_agent_unavailable_guidance(reviewer_signature)}
 {_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
@@ -2801,6 +2959,7 @@ def _build_semantic_plan_revision_prompt(
     base_round_number: int,
     base_state_identity: str,
     plan_validation_diagnostic: object | None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> str:
     """Prompt for the revision-only semantic contract.
 
@@ -2829,7 +2988,7 @@ authenticated base and assemble the complete generation-1 plan.
 {human_requirements_context.block}
 {_issue_context_block(issue_context)}
 {_memory_block(memory, config, include_runtime=True)}
-{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 
 Authenticated base binding:
 - base_round_number: {base_round_number}
@@ -2899,6 +3058,7 @@ def build_plan_revision_prompt(
     response_form: str | None = None,
     base_round_number: int | None = None,
     base_state_identity: str | None = None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if response_form == "semantic-patch-v1":
@@ -2916,6 +3076,7 @@ def build_plan_revision_prompt(
             base_round_number=base_round_number,
             base_state_identity=base_state_identity,
             plan_validation_diagnostic=plan_validation_diagnostic,
+            inherited_matrix_binding=inherited_matrix_binding,
         )
     if compact_context:
         return _build_compact_plan_revision_prompt(
@@ -2931,6 +3092,7 @@ def build_plan_revision_prompt(
             compact_tail=compact_tail,
             require_risk_test_matrix_contract=require_risk_test_matrix_contract,
             plan_validation_diagnostic=plan_validation_diagnostic,
+            inherited_matrix_binding=inherited_matrix_binding,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2957,7 +3119,7 @@ branch, commit, push, or open a pull request during this planning stage.
         "Each bullet must explain how the revised plan covers that item or what remains risky or blocked."
     ),
 )}
-{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, previous_plan))}
 {_issue_context_block(issue_context)}
 {unresolved_items_block}{_memory_block(memory, config, include_runtime=True)}
@@ -3061,6 +3223,7 @@ def _build_compact_plan_revision_prompt(
     compact_tail: CompactPlanTailContext | None,
     require_risk_test_matrix_contract: bool,
     plan_validation_diagnostic: object | None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3111,7 +3274,7 @@ Reviewers: {reviewer_name}
 {subject_line}
 Action for this call: {action}
 
-{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 
 Previous implementation plan:
 

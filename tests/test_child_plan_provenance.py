@@ -1,6 +1,7 @@
 import base64
 import dataclasses
 import json
+import re
 
 import pytest
 
@@ -153,9 +154,9 @@ def fresh_staged_plan(*, first_disposition=None):
     )
 
 
-def fresh_staged_matrix_plan():
+def fresh_staged_matrix_plan(*, first_disposition=None):
     """Fresh staged parent fixture with explicit owned transition rows."""
-    plan = fresh_staged_plan()
+    plan = fresh_staged_plan(first_disposition=first_disposition)
     payload, end = json.JSONDecoder().raw_decode(plan)
     rows = []
     for row_id, owner in (("row-stage-one", "stage-one"), ("row-stage-two", "stage-two")):
@@ -203,8 +204,15 @@ def fresh_child_contexts(
     handoff_execution_disposition=None,
     handoff_override_digest=None,
     child_plan=None,
+    recommendation_payload=None,
 ):
-    raw_payload, _ = json.JSONDecoder().raw_decode(plan)
+    # A rendered canonical plan carries no leading JSON; callers supply the
+    # recommendation its sidecar encodes.
+    raw_payload = (
+        {"execution_recommendation": recommendation_payload}
+        if recommendation_payload is not None
+        else json.JSONDecoder().raw_decode(plan)[0]
+    )
     from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
 
     recommendation = parse_execution_recommendation_payload(
@@ -1378,3 +1386,703 @@ def test_child_planning_cycle_resets_the_staged_planning_policy(tmp_path, monkey
     assert child_config.primary_plan_reviewer is None
     assert child_config.plan_review_force_full is False
     assert child_config.reviewer == parent_config.reviewer
+
+
+# --- #931: field-classified inherited-row comparison -----------------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    INHERITED_MATRIX_ROUTE_FORWARD,
+    InheritedMatrixBinding,
+    InheritedRowDifference,
+    inherited_matrix_reviewed_deltas,
+)
+from coding_review_agent_loop.round_state import sanitize_plan_validation_diagnostic  # noqa: E402
+
+CASE_SENSITIVE_EFFECT = "Do not unset $HOME_Dir or write /Var/Agent/State."
+WHITESPACE_SENSITIVE_EFFECT = "Do not run `git  push   --force origin main`."
+
+
+def _matrix(*rows):
+    return {"applicability": "applicable", "rows": list(rows), "important_exclusions": []}
+
+
+def _parent_row(**overrides):
+    return {
+        **_matrix_row("row-owned", "api"),
+        "forbidden_side_effects": [CASE_SENSITIVE_EFFECT, WHITESPACE_SENSITIVE_EFFECT],
+        **overrides,
+    }
+
+
+def _check(child_row, *, parent_row=None):
+    # The child-local row keeps the child matrix parseable when the inherited
+    # row is lowered to not-applicable.
+    return validate_separately_planned_child_matrix(
+        _matrix(parent_row or _parent_row()),
+        _matrix(child_row, _matrix_row("child-local", "api")),
+        execution_owner="api",
+    )
+
+
+def _deltas(child_row, *, parent_row=None):
+    return inherited_matrix_reviewed_deltas(
+        _matrix(parent_row or _parent_row()),
+        _matrix(child_row, _matrix_row("child-local", "api")),
+        execution_owner="api",
+    )
+
+
+def test_m931_identical_and_free_field_differences_pass_without_reviewed_deltas():
+    for child in (
+        _parent_row(),
+        _parent_row(label="A reworded, clearer label"),
+        _parent_row(execution_owner="one-shot", related_scope_item_ids=["child-scope-9"]),
+        _parent_row(
+            forbidden_side_effects=[WHITESPACE_SENSITIVE_EFFECT, CASE_SENSITIVE_EFFECT]
+        ),
+    ):
+        assert _check(child) == ("row-owned",)
+        assert _deltas(child) == ()
+
+
+def test_m931_refined_row_passes_and_reports_exactly_the_reviewed_deltas():
+    parent = _parent_row()
+    child = _parent_row(
+        label="Reworded",
+        applicability="required",
+        forbidden_side_effects=[
+            "No duplicate comment.", WHITESPACE_SENSITIVE_EFFECT, CASE_SENSITIVE_EFFECT,
+        ],
+        entry_path_or_mode=parent["entry_path_or_mode"] + " via parent dispatch",
+        initial_state="Given a draft PR: " + parent["initial_state"],
+        event="first " + parent["event"] + " twice",
+        expected_outcome=parent["expected_outcome"] + " Exactly one record is written.",
+        proposed_test_level="unit",
+        proposed_test_location="tests/test_other.py",
+    )
+    assert _check(child) == ("row-owned",)
+    assert _deltas(child) == (
+        InheritedRowDifference("row-owned", "applicability", "applicable", "required", "applicability raised"),
+        InheritedRowDifference(
+            "row-owned", "forbidden_side_effects", "", "No duplicate comment.",
+            "forbidden side effect added",
+        ),
+        *(
+            InheritedRowDifference("row-owned", field, parent[field], child[field], "coverage text extended")
+            for field in ("entry_path_or_mode", "initial_state", "event", "expected_outcome")
+        ),
+        InheritedRowDifference("row-owned", "proposed_test_level", "orchestrator", "unit", "proposed test changed"),
+        InheritedRowDifference(
+            "row-owned", "proposed_test_location", "tests/test_child_plan_provenance.py",
+            "tests/test_other.py", "proposed test changed",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "parent_applicability, child_applicability",
+    [("required", "applicable"), ("required", "not-applicable"), ("applicable", "not-applicable")],
+)
+def test_m931_lowered_applicability_names_row_field_values_and_route(
+    parent_applicability, child_applicability
+):
+    with pytest.raises(AgentLoopError) as error:
+        _check(
+            _parent_row(applicability=child_applicability),
+            parent_row=_parent_row(applicability=parent_applicability),
+        )
+    text = str(error.value)
+    assert (
+        f"row-owned: applicability weakened (parent={parent_applicability}, "
+        f"child={child_applicability})"
+    ) in text
+    assert text.endswith(INHERITED_MATRIX_ROUTE_FORWARD)
+
+
+@pytest.mark.parametrize(
+    "child_effects, dropped",
+    [
+        ([CASE_SENSITIVE_EFFECT, "An unrelated added entry."], [WHITESPACE_SENSITIVE_EFFECT]),
+        (
+            [CASE_SENSITIVE_EFFECT.replace("$HOME_Dir", "$home_dir"), WHITESPACE_SENSITIVE_EFFECT,
+             "An unrelated added entry."],
+            [CASE_SENSITIVE_EFFECT],
+        ),
+        (
+            [CASE_SENSITIVE_EFFECT, WHITESPACE_SENSITIVE_EFFECT.replace("git  push   --force", "git push --force")],
+            [WHITESPACE_SENSITIVE_EFFECT],
+        ),
+        (["Something else entirely."], [CASE_SENSITIVE_EFFECT, WHITESPACE_SENSITIVE_EFFECT]),
+    ],
+)
+def test_m931_dropped_or_normalized_forbidden_side_effect_is_rejected(child_effects, dropped):
+    with pytest.raises(AgentLoopError) as error:
+        _check(_parent_row(forbidden_side_effects=child_effects))
+    text = str(error.value)
+    for effect in dropped:
+        assert f'row-owned: forbidden_side_effects dropped "{effect}"' in text
+    assert text.count("forbidden_side_effects dropped") == len(dropped)
+    assert sanitize_plan_validation_diagnostic(text) == text
+
+
+def test_m931_diagnostic_neutralizes_reserved_marker_text():
+    marker = "Never post <!-- AGENT_LOOP_META: abc --> early."
+    with pytest.raises(AgentLoopError) as error:
+        _check(
+            _parent_row(forbidden_side_effects=["kept"]),
+            parent_row=_parent_row(forbidden_side_effects=[marker, "kept"]),
+        )
+    assert "AGENT_LOOP_META" not in str(error.value)
+    assert "row-owned: forbidden_side_effects dropped" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "field", ["entry_path_or_mode", "initial_state", "event", "expected_outcome"]
+)
+@pytest.mark.parametrize("rewrite", ["substitute", "case", "whitespace"])
+def test_m931_substituted_scenario_coverage_is_rejected_per_field(field, rewrite):
+    parent = _parent_row(
+        entry_path_or_mode="issue mode", initial_state="Review  complete",
+        event="Repaired head passes", expected_outcome="The Transition completes.",
+    )
+    replacement = {
+        "substitute": {"entry_path_or_mode": "pr mode"}.get(field, "something different"),
+        "case": parent[field].swapcase(),
+        "whitespace": parent[field].replace(" ", "  ", 1) if "  " not in parent[field]
+        else parent[field].replace("  ", " "),
+    }[rewrite]
+    assert replacement != parent[field]
+    with pytest.raises(AgentLoopError) as error:
+        _check({**parent, field: replacement}, parent_row=parent)
+    text = str(error.value)
+    assert f"row-owned: {field} replaced" in text
+    assert "must be kept verbatim and refinements added after it" in text
+    # An unchanged applicability and side-effect list masks nothing.
+    assert text.count("row-owned:") == 1
+
+
+def test_m931_parent_scenario_field_at_the_size_bound_admits_only_the_identical_value():
+    full = "x" * 1024
+    parent = _parent_row(event=full)
+    assert _check(dict(parent), parent_row=parent) == ("row-owned",)
+    with pytest.raises(AgentLoopError, match="row-owned: event replaced"):
+        _check({**parent, "event": "y" + full[1:]}, parent_row=parent)
+    # Extending would exceed the wire bound, so no extension is expressible.
+    with pytest.raises(AgentLoopError, match="1024-byte bound"):
+        _check({**parent, "event": full + "!"}, parent_row=parent)
+
+
+def test_m931_many_weakened_rows_fit_the_diagnostic_bound_with_whole_entries():
+    parents, children = [], []
+    for index in range(24):
+        row = {
+            **_matrix_row(f"row-{index:02d}", "api"),
+            "forbidden_side_effects": [f"effect {index}-{n} " + "z" * 400 for n in range(6)],
+            "event": f"event {index} " + "e" * 400,
+        }
+        parents.append(row)
+        children.append({**row, "forbidden_side_effects": ["other"], "event": "replaced"})
+    with pytest.raises(AgentLoopError) as error:
+        validate_separately_planned_child_matrix(
+            _matrix(*parents), _matrix(*children), execution_owner="api"
+        )
+    text = str(error.value)
+    assert len(text) <= 4096
+    assert sanitize_plan_validation_diagnostic(text) == text
+    lines = text.split("\n")
+    assert lines[-1] == INHERITED_MATRIX_ROUTE_FORWARD
+    assert re.fullmatch(r"- and \d+ more weakened fields in \d+ rows", lines[-2])
+    for entry in lines[1:-2]:
+        assert entry.startswith("- row-") and entry.endswith(("(no exactly equal child entry)", "after it"))
+    emitted = len(lines) - 3
+    remainder = int(lines[-2].split()[2])
+    assert emitted + remainder == 24 * 7
+
+
+def test_m931_omission_checks_are_unchanged():
+    parent = _matrix(_parent_row())
+    with pytest.raises(AgentLoopError, match="omitted the approved parent risk matrix"):
+        validate_separately_planned_child_matrix(parent, None, execution_owner="api")
+    with pytest.raises(
+        AgentLoopError, match="missing inherited parent matrix row IDs: row-owned"
+    ):
+        validate_separately_planned_child_matrix(
+            parent, _matrix(_matrix_row("child-local", "api")), execution_owner="api"
+        )
+    assert validate_separately_planned_child_matrix(parent, None, execution_owner="other") == ()
+
+
+# --- #931: planning-time enforcement through a bounded replan ---------------
+
+from agent_loop_helpers import structured_plan_review  # noqa: E402
+from coding_review_agent_loop.errors import AgentInvocationError  # noqa: E402
+from coding_review_agent_loop.plan_assembly import AuthenticatedPlanState  # noqa: E402
+from coding_review_agent_loop.protocol import validate_structured_plan_state  # noqa: E402
+from coding_review_agent_loop.runner import CommandResult  # noqa: E402
+
+PLAN_FOOTER = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+WEAK_SUMMARY = "WEAKENED-CANDIDATE-SUMMARY"
+
+
+def _child_row(**overrides):
+    return _parent_row(execution_owner="one-shot", **overrides)
+
+
+def _weak_child_row():
+    return _child_row(forbidden_side_effects=[CASE_SENSITIVE_EFFECT])
+
+
+def _child_plan_payload(row, *, summary="Child plan."):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["summary"] = summary
+    payload["risk_test_matrix"] = _matrix(row)
+    return payload
+
+
+def _child_plan_state(row, **kwargs):
+    return json.dumps(_child_plan_payload(row, **kwargs)) + PLAN_FOOTER
+
+
+def _binding():
+    return InheritedMatrixBinding(
+        parent_issue=55, stage_id="api", parent_matrix=_matrix(_parent_row())
+    )
+
+
+class _ChildPlanningRunner(FakeRunner):
+    """FakeRunner that also serves the authenticated diagnostic-record seam."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.diagnostic_posts = []
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = list(args)
+        if command == ["gh", "api", "user"]:
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(recorded, cwd_path, json.dumps({"login": "agent", "id": 7}), "", 0)
+        if command[:4] == ["gh", "api", "--method", "POST"] and command[4:5] == [
+            "repos/OWNER/REPO/issues/56/comments"
+        ]:
+            recorded, cwd_path = self._record_command(args, cwd)
+            body = json.loads(input_text or "{}")["body"]
+            self.diagnostic_posts.append(body)
+            return CommandResult(
+                recorded, cwd_path,
+                json.dumps({
+                    "id": 901, "created_at": "2026-09-17T05:30:00Z", "body": body,
+                    "user": {"login": "agent", "id": 7},
+                }),
+                "", 0,
+            )
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def _bind_child_planning(monkeypatch, binding=None):
+    """Run the plan-first loop as the child cycle of a bound stage."""
+    real = orchestrator._run_plan_first_loop
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_plan_first_loop",
+        lambda runner, **kwargs: real(
+            runner, **{**kwargs, "inherited_matrix_binding": binding or _binding()}
+        ),
+    )
+
+    def forbid_repair(*args, **kwargs):
+        raise AssertionError("a rejected inherited candidate must never reach the repair model")
+
+    monkeypatch.setattr(orchestrator, "_run_structured_repair", forbid_repair)
+
+
+def _agent_prompts(runner, agent):
+    head = [agent] if agent == "claude" else [agent, "exec"]
+    return [cmd[-1] for cmd, _cwd in runner.commands if cmd[: len(head)] == head]
+
+
+def _plan_config(tmp_path, **kwargs):
+    return make_config(
+        tmp_path, max_rounds=3, plan_execution_mode="plan-only",
+        execution_strategy_contract_required=True, **kwargs,
+    )
+
+
+def _published(runner):
+    return "\n".join(str(item["body"]) for item in runner.issue_comments)
+
+
+def test_m931_weakened_fresh_candidate_is_replanned_before_publication(tmp_path, monkeypatch):
+    _bind_child_planning(monkeypatch)
+    good_row = _child_row(expected_outcome=_parent_row()["expected_outcome"] + " Once only.")
+    runner = _ChildPlanningRunner(
+        claude_outputs=[
+            _child_plan_state(_weak_child_row(), summary=WEAK_SUMMARY),
+            _child_plan_state(good_row),
+        ],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert orchestrator.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+
+    planner_prompts = _agent_prompts(runner, "claude")
+    assert len(planner_prompts) == 2
+    for prompt in planner_prompts:
+        assert "Inherited parent risk-matrix obligations" in prompt
+        assert json.dumps(WHITESPACE_SENSITIVE_EFFECT) in prompt
+    assert "forbidden_side_effects dropped" not in planner_prompts[0]
+    assert f'row-owned: forbidden_side_effects dropped "{WHITESPACE_SENSITIVE_EFFECT}"' in planner_prompts[1]
+    assert "Trusted orchestration correction record" in planner_prompts[1]
+    # The rejected candidate is never rendered, posted, recorded, or reviewed.
+    assert WEAK_SUMMARY not in _published(runner)
+    assert runner.diagnostic_posts == []
+    review_prompts = _agent_prompts(runner, "codex")
+    assert len(review_prompts) == 1
+    assert WEAK_SUMMARY not in review_prompts[0]
+    assert "Inherited coverage delta" in review_prompts[0]
+    assert "field `expected_outcome` (coverage text extended)" in review_prompts[0]
+    assert json.dumps(good_row["expected_outcome"]) in review_prompts[0]
+
+
+def _revision_payload(row, *, summary, changes=()):
+    payload = _child_plan_payload(row, summary=summary)
+    payload["kind"] = "plan_revision"
+    payload["prior_plan_item_dispositions"] = [
+        {"item_id": "item-1", "disposition": "resolved", "note": "Addressed."}
+    ]
+    payload["risk_test_matrix_changes"] = list(changes)
+    return json.dumps(payload) + PLAN_FOOTER
+
+
+def _semantic_patch(base_plan_text, row, *, summary):
+    base = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(base_plan_text), round_number=1
+    )
+    operations = [{"op": "replace", "field": "summary", "value": summary}]
+    if row is not None:
+        operations.append({
+            "op": "matrix_edit", "row_id": "row-owned", "row": row,
+            "rationale": "Revise the inherited row.",
+        })
+    return json.dumps({
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking",
+        "summary": "Patch.",
+        "prior_plan_item_dispositions": [
+            {"item_id": "item-1", "disposition": "resolved", "note": "Addressed."}
+        ],
+        "base_round_number": 1, "base_state_identity": base.state_identity,
+        "operations": operations,
+    }) + PLAN_FOOTER
+
+
+@pytest.mark.parametrize("form", ["semantic-patch", "full-state"])
+def test_m931_weakened_revision_candidate_is_replanned_over_the_unchanged_base(
+    tmp_path, monkeypatch, form
+):
+    _bind_child_planning(monkeypatch)
+    fresh = _child_plan_state(_child_row())
+    if form == "semantic-patch":
+        weak = _semantic_patch(fresh, _weak_child_row(), summary=WEAK_SUMMARY)
+        good = _semantic_patch(fresh, None, summary="Corrected revision.")
+    else:
+        # Without an assembled sidecar the revision uses the full-state form.
+        monkeypatch.setattr(orchestrator, "make_assembled_plan_sidecar", lambda *a, **k: None)
+        weak = _revision_payload(
+            _weak_child_row(), summary=WEAK_SUMMARY,
+            changes=[{"operation": "change", "row_ids": ["row-owned"], "rationale": "Trim."}],
+        )
+        good = _revision_payload(_child_row(), summary="Corrected revision.")
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, weak, good],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Tighten the plan."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert orchestrator.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+
+    planner_prompts = _agent_prompts(runner, "claude")
+    assert len(planner_prompts) == 3
+    assert "forbidden_side_effects dropped" not in planner_prompts[1]
+    assert "row-owned: forbidden_side_effects dropped" in planner_prompts[2]
+    assert "Inherited parent risk-matrix obligations" in planner_prompts[2]
+    if form == "semantic-patch":
+        # Same authenticated base binding on the replan turn.
+        binding_line = re.search(r"- base_state_identity: (\S+)", planner_prompts[1]).group(0)
+        assert binding_line in planner_prompts[2]
+    assert WEAK_SUMMARY not in _published(runner)
+    assert "Corrected revision." in _published(runner)
+    assert runner.diagnostic_posts == []
+    review_prompts = _agent_prompts(runner, "codex")
+    assert len(review_prompts) == 2
+    assert all(WEAK_SUMMARY not in prompt for prompt in review_prompts)
+    assert "Inherited coverage delta: none" in review_prompts[1]
+
+
+def test_m931_replan_exhaustion_persists_one_record_and_resume_feeds_the_next_turn(
+    tmp_path, monkeypatch
+):
+    _bind_child_planning(monkeypatch)
+    weak = _child_plan_state(_weak_child_row(), summary=WEAK_SUMMARY)
+    runner = _ChildPlanningRunner(claude_outputs=[weak] * 5)
+    with pytest.raises(AgentInvocationError) as error:
+        orchestrator.run_issue_loop(
+            runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        )
+    assert error.value.failure_category == "deterministic"
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None and exhaustion.candidate_kind == "plan_state"
+    assert "row-owned: forbidden_side_effects dropped" in exhaustion.diagnostic
+    assert len(_agent_prompts(runner, "claude")) == orchestrator.MAX_INHERITED_MATRIX_REPLANS + 1 == 3
+    assert _agent_prompts(runner, "codex") == []
+    assert len(runner.diagnostic_posts) == 1
+    assert WEAK_SUMMARY not in runner.diagnostic_posts[0]
+    assert WEAK_SUMMARY not in _published(runner)
+
+    # A new invocation recovers the record, feeds it to the first planner turn,
+    # and proceeds from the last canonical state with a fresh replan budget.
+    resumed = _ChildPlanningRunner(
+        issue_comments=[{
+            "author": {"login": "agent"}, "authorId": 7, "id": 901, "databaseId": 901,
+            "createdAt": "2026-09-17T05:30:00Z", "body": runner.diagnostic_posts[0],
+        }],
+        claude_outputs=[weak, _child_plan_state(_child_row())],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda r, *, config, issue_number: IssueContext(
+            number=56, repo="OWNER/REPO", title="Child", body="Child", url="child-url",
+            comments=(IssueComment(
+                author="agent", author_id=7, comment_id=901,
+                created_at="2026-09-17T05:30:00Z", body=runner.diagnostic_posts[0],
+            ),),
+        ),
+    )
+    assert orchestrator.run_issue_loop(
+        resumed, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+    resumed_prompts = _agent_prompts(resumed, "claude")
+    assert len(resumed_prompts) == 2
+    assert "- Failed validation attempt: 1" in resumed_prompts[0]
+    assert "row-owned: forbidden_side_effects dropped" in resumed_prompts[0]
+    assert len(_agent_prompts(resumed, "codex")) == 1
+
+
+def test_m931_over_cap_delta_set_rejects_the_candidate_into_the_replan_loop(
+    tmp_path, monkeypatch
+):
+    _bind_child_planning(monkeypatch)
+    monkeypatch.setattr(orchestrator, "INHERITED_COVERAGE_DELTA_MAX_BYTES", 64)
+    extended = _child_row(event=_parent_row()["event"] + " " + "with detail " * 20)
+    runner = _ChildPlanningRunner(
+        claude_outputs=[_child_plan_state(extended, summary=WEAK_SUMMARY), _child_plan_state(_child_row())],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert orchestrator.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+    planner_prompts = _agent_prompts(runner, "claude")
+    assert len(planner_prompts) == 2
+    assert "Make fewer or smaller departures from the inherited text" in planner_prompts[1]
+    assert WEAK_SUMMARY not in _published(runner)
+
+
+def test_m931_oversized_inherited_obligations_stop_before_any_planner_turn(tmp_path, monkeypatch):
+    _bind_child_planning(monkeypatch)
+    monkeypatch.setattr(orchestrator, "INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES", 32)
+    runner = _ChildPlanningRunner(claude_outputs=[_child_plan_state(_child_row())])
+    with pytest.raises(orchestrator.PlanPrePanelSafetyError) as error:
+        orchestrator.run_issue_loop(
+            runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        )
+    text = str(error.value)
+    assert "stage `api`" in text and "permitted 32 bytes" in text and "parent issue #55" in text
+    assert re.search(r"measure \d+ bytes", text)
+    assert _agent_prompts(runner, "claude") == [] and _agent_prompts(runner, "codex") == []
+
+
+def test_m931_ordinary_plan_first_issue_is_unchanged(tmp_path):
+    runner = _ChildPlanningRunner(
+        claude_outputs=[_child_plan_state(_weak_child_row())],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert orchestrator.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+    assert len(_agent_prompts(runner, "claude")) == 1
+    assert "Inherited" not in _agent_prompts(runner, "claude")[0]
+    assert "Inherited" not in _agent_prompts(runner, "codex")[0]
+
+
+def test_m931_resumed_review_round_recomputes_the_identical_delta_block(tmp_path, monkeypatch):
+    _bind_child_planning(monkeypatch)
+    refined = _child_row(
+        applicability="required", proposed_test_location="tests/test_elsewhere.py"
+    )
+
+    def delta_block(prompt):
+        return prompt.split("Inherited coverage delta", 1)[1].split("test reachability", 1)[0]
+
+    first = _ChildPlanningRunner(
+        claude_outputs=[_child_plan_state(refined)],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert orchestrator.run_issue_loop(
+        first, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+    resumed = _ChildPlanningRunner(
+        issue_comments=[first.issue_comments[0]],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert orchestrator.run_issue_loop(
+        resumed, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+    assert _agent_prompts(resumed, "claude") == []
+    fresh_block = delta_block(_agent_prompts(first, "codex")[0])
+    assert "field `applicability` (applicability raised)" in fresh_block
+    assert "field `proposed_test_location` (proposed test changed)" in fresh_block
+    assert delta_block(_agent_prompts(resumed, "codex")[0]) == fresh_block
+
+
+def test_m931_historical_weakened_plan_is_blocked_in_review_and_never_approved(
+    tmp_path, monkeypatch
+):
+    # Publish the weakened plan without a binding, as a run before this check would.
+    first = _ChildPlanningRunner(
+        claude_outputs=[_child_plan_state(_weak_child_row())],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert orchestrator.run_issue_loop(
+        first, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+    _bind_child_planning(monkeypatch)
+    resumed = _ChildPlanningRunner(
+        issue_comments=[first.issue_comments[0]],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    with pytest.raises(AgentLoopError, match="row-owned: forbidden_side_effects dropped"):
+        orchestrator.run_issue_loop(
+            resumed, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        )
+    review_prompt = _agent_prompts(resumed, "codex")[0]
+    assert "Inherited coverage check FAILED" in review_prompt
+    assert "row-owned: forbidden_side_effects dropped" in review_prompt
+    assert "plan approved" not in _published(resumed)
+
+
+def test_m931_parent_dispatch_and_direct_child_entry_bind_the_inherited_rows(
+    tmp_path, monkeypatch
+):
+    captured = []
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_plan_first_loop",
+        lambda runner, **kwargs: captured.append(kwargs["inherited_matrix_binding"]) or 0,
+    )
+    plan = fresh_staged_matrix_plan().replace(
+        '"execution_disposition": "direct-implementation"',
+        '"execution_disposition": "requires-child-planning"',
+        1,
+    )
+    child, parent = fresh_child_contexts(
+        plan,
+        inherited_matrix_row_ids=("row-stage-one",),
+        handoff_execution_disposition="requires-child-planning",
+    )
+    child = dataclasses.replace(child, comments=())
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    # Direct child `--plan-first` entry.
+    assert orchestrator.run_issue_loop(
+        FakeRunner(), issue_number=56, config=make_config(tmp_path), plan_first=True
+    ) == 0
+    # Parent dispatch entry.
+    fresh_child = orchestrator._resolve_fresh_child_provenance(
+        issue_context=child, parent_issue_context=parent
+    )
+    assert fresh_child is not None and fresh_child.route.is_planning
+    config = make_config(tmp_path)
+    assert orchestrator._dispatch_decomposition_child(
+        FakeRunner(), config=config, memory=None,
+        usage_context=orchestrator._new_usage_context(config),
+        parent_issue=55, approved_plan=fresh_child.approved_plan,
+        plan_hash=fresh_child.plan_hash, plan_subject=fresh_child.plan_subject,
+        recommendation=fresh_child.recommendation,
+        approved_plan_context=fresh_child.parent_plan_context,
+        created=fresh_child.created, phase_index=fresh_child.phase_index,
+        route=fresh_child.route, child_issue_context=child, parent_issue_context=parent,
+        coder_session_id=None, existing_handoff=fresh_child.handoff,
+    ) == 0
+    assert len(captured) == 2 and captured[0] == captured[1]
+    binding = captured[0]
+    assert (binding.parent_issue, binding.stage_id) == (55, "stage-one")
+    assert [row.row_id for row in binding.inherited_rows()] == ["row-stage-one"]
+
+
+@pytest.mark.parametrize("entry", ["issue", "pr"])
+@pytest.mark.parametrize("variant", ["refined", "weakened"])
+def test_m931_open_child_pr_is_readmitted_or_rejected_identically_on_both_paths(
+    tmp_path, monkeypatch, entry, variant
+):
+    from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
+
+    parent_plan = fresh_staged_matrix_plan()
+    inherited_row = next(
+        row for row in json.JSONDecoder().raw_decode(parent_plan)[0]["risk_test_matrix"]["rows"]
+        if row["row_id"] == "row-stage-one"
+    )
+    child_row = {
+        **inherited_row,
+        "execution_owner": "one-shot",
+        "label": "Reworded label",
+        "applicability": "required",
+        "forbidden_side_effects": ["No duplicate record.", *inherited_row["forbidden_side_effects"]],
+        "event": inherited_row["event"] + " on the second attempt",
+        "proposed_test_location": "tests/test_elsewhere.py",
+    }
+    if variant == "weakened":
+        child_row["entry_path_or_mode"] = "pr mode"
+    child_plan = "Approved child plan.\n\n" + render_risk_test_matrix_section(
+        parse_risk_test_matrix(_matrix(child_row, _matrix_row("child-local", "one-shot")))
+    )
+    child, parent = fresh_child_contexts(
+        parent_plan, summary_mode="decompose-only", handoff_mode="implement-by-phase",
+        inherited_matrix_row_ids=("row-stage-one",), child_plan=child_plan,
+    )
+    parent = dataclasses.replace(parent, comments=parent.comments[:-1])
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={"number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77"},
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    def run():
+        if entry == "issue":
+            return orchestrator.run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        return orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+
+    if variant == "weakened":
+        with pytest.raises(AgentLoopError, match="row-stage-one: entry_path_or_mode replaced"):
+            run()
+        assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    else:
+        assert run() == 0
+        prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+        assert "Row row-stage-one" in prompt and "Row child-local" in prompt
+    # Neither path replans the child or re-invokes the implementation coder.
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)

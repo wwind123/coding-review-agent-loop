@@ -458,7 +458,10 @@ readiness fields and approved-parent provenance; it does not infer readiness
 from issue size or file count. A direct child uses the parent stage contract
 without duplicate planning. A planning-required child records its route first,
 then must run with `--plan-first` and complete its own reviewed plan before
-implementation. Recorded routes survive reruns and cannot be switched with CLI
+implementation. That child plan may refine or strengthen the risk-matrix rows it
+inherits from the parent but may not weaken them; weakening is caught and
+replanned during child planning rather than after implementation. Recorded
+routes survive reruns and cannot be switched with CLI
 flags. See the detailed
 [child execution disposition contract](docs/local_agent_loop.md#child-execution-dispositions).
 
