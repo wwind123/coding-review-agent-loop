@@ -485,6 +485,9 @@ INHERITED_MATRIX_ROUTE_FORWARD = (
     "allowed), and keeps each scenario field (entry_path_or_mode, initial_state, event, "
     "expected_outcome) containing the parent text verbatim with refinements added after "
     "it; a parent scenario field already at the size bound admits only the identical value."
+    " An already-approved child plan is revised by rerunning child planning; once it is "
+    "bound to an implementation PR, post a signed child-plan-supersession record on the "
+    "child issue first (see 'Re-planning an approved child plan' in the README)."
 )
 _INHERITED_DIAGNOSTIC_VALUE_CHARS = 96
 # Entries are emitted whole under this budget so the storage sanitizer's
@@ -3379,6 +3382,416 @@ def collect_child_disposition_overrides(
         seen.add(record.digest)
         scoped.append(record)
     return tuple(scoped)
+
+
+# ---------------------------------------------------------------------------
+# Signed child-plan supersession and the same-PR rebind audit record (#936)
+# ---------------------------------------------------------------------------
+
+CHILD_PLAN_SUPERSESSION_KIND = "child-plan-supersession"
+CHILD_PLAN_SUPERSESSION_SCHEMA_VERSION = 1
+_SUPERSESSION_RECORD_KEYS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "child_issue",
+        "parent_issue",
+        "stage_id",
+        "superseded_plan_hash",
+        "rationale",
+    }
+)
+CHILD_PLAN_REBIND_MARKER_RE = re.compile(
+    r"<!--\s*AGENT_CHILD_PLAN_REBIND:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I
+)
+_REBIND_RECORD_KEYS = frozenset(
+    {
+        "schema_version",
+        "child_issue",
+        "pr_number",
+        "superseded_plan_hash",
+        "new_plan_hash",
+        "plan_supersession_digest",
+        "first_replan_round",
+        "approved_round",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ChildPlanSupersession:
+    """One signed human authorization to re-plan an approved child plan."""
+
+    child_issue: int
+    parent_issue: int
+    stage_id: str
+    superseded_plan_hash: str
+    rationale: str
+    digest: str
+    comment_locator: str
+    comment_index: int
+
+
+@dataclass(frozen=True)
+class ChildPlanRebindRecord:
+    """Audit record posted in the same comment as a same-PR plan replacement."""
+
+    child_issue: int
+    pr_number: int
+    superseded_plan_hash: str
+    new_plan_hash: str
+    plan_supersession_digest: str
+    first_replan_round: int
+    approved_round: int
+    comment_index: int = -1
+
+
+@dataclass(frozen=True)
+class AuthorizedReplanLineage:
+    """The contiguous digest-bound coder rounds of one authorized re-plan."""
+
+    round_numbers: tuple[int, ...]
+    latest_plan_hash: str
+
+    @property
+    def first_round(self) -> int:
+        return self.round_numbers[0]
+
+    @property
+    def latest_round(self) -> int:
+        return self.round_numbers[-1]
+
+
+def child_plan_supersession_digest(record: dict[str, object]) -> str:
+    """The one digest shared by discovery, round metadata, and rebind verification."""
+    canonical = json.dumps(
+        {key: record[key] for key in sorted(_SUPERSESSION_RECORD_KEYS)},
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def format_child_plan_supersession_comment(
+    *,
+    child_issue: int,
+    parent_issue: int,
+    stage_id: str,
+    superseded_plan_hash: str,
+    rationale: str,
+) -> str:
+    """Render the signed supersession record format documented for human reviewers."""
+    record = {
+        "kind": CHILD_PLAN_SUPERSESSION_KIND,
+        "schema_version": CHILD_PLAN_SUPERSESSION_SCHEMA_VERSION,
+        "child_issue": child_issue,
+        "parent_issue": parent_issue,
+        "stage_id": stage_id,
+        "superseded_plan_hash": superseded_plan_hash,
+        "rationale": rationale,
+    }
+    return (
+        "Child plan supersession:\n\n```json\n"
+        + json.dumps(record, indent=2, sort_keys=True)
+        + "\n```\n-- Human Reviewer"
+    )
+
+
+def _supersession_record_problem(payload: dict[str, object]) -> str | None:
+    keys = set(payload)
+    if keys != _SUPERSESSION_RECORD_KEYS:
+        missing = sorted(_SUPERSESSION_RECORD_KEYS - keys)
+        unknown = sorted(keys - _SUPERSESSION_RECORD_KEYS)
+        return f"missing keys {missing}, unknown keys {unknown}"
+    if (
+        isinstance(payload.get("schema_version"), bool)
+        or payload.get("schema_version") != CHILD_PLAN_SUPERSESSION_SCHEMA_VERSION
+    ):
+        return "schema_version must be 1"
+    for key in ("child_issue", "parent_issue"):
+        value = payload.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            return f"{key} must be a positive integer"
+    for key in ("stage_id", "superseded_plan_hash", "rationale"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return f"{key} must be a non-empty string"
+    return None
+
+
+def parse_child_plan_supersession_records(
+    body: str | None, *, comment_locator: str, comment_index: int = -1
+) -> tuple[tuple[ChildPlanSupersession, ...], tuple[str, ...]]:
+    """Return (signed valid records, ignored-record diagnostics) for one comment.
+
+    Same contract as the disposition override parser: only a body with the
+    standalone human reviewer signature counts, and a malformed record is
+    reported and ignored so it can never reopen planning.
+    """
+    signed = parse_signed_human_requirement_body(body)
+    if signed is None:
+        return (), ()
+    records: list[ChildPlanSupersession] = []
+    ignored: list[str] = []
+    for match in _FENCED_JSON_RE.finditer(signed):
+        try:
+            payload = json.loads(match.group("body"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("kind") != CHILD_PLAN_SUPERSESSION_KIND:
+            continue
+        problem = _supersession_record_problem(payload)
+        if problem is not None:
+            ignored.append(
+                f"{comment_locator}: malformed child-plan supersession record ignored ({problem})"
+            )
+            continue
+        records.append(
+            ChildPlanSupersession(
+                child_issue=int(payload["child_issue"]),
+                parent_issue=int(payload["parent_issue"]),
+                stage_id=str(payload["stage_id"]),
+                superseded_plan_hash=str(payload["superseded_plan_hash"]),
+                rationale=str(payload["rationale"]),
+                digest=child_plan_supersession_digest(payload),
+                comment_locator=comment_locator,
+                comment_index=comment_index,
+            )
+        )
+    return tuple(records), tuple(ignored)
+
+
+def collect_child_plan_supersessions(
+    child_comments: Sequence[object],
+    *,
+    child_issue: int,
+    parent_issue: int,
+    stage_id: str,
+    ignored_sink: list[str] | None = None,
+) -> tuple[ChildPlanSupersession, ...]:
+    """Signed supersession discovery on the child issue only.
+
+    A signed record naming another child, parent, or stage fails closed.
+    Identical duplicates collapse by digest (the earliest comment is kept).
+    Records for different superseded hashes coexist, but two distinct records
+    for one superseded hash always fail closed: the orchestrator never
+    chooses between them by comment order.
+    """
+    by_digest: dict[str, ChildPlanSupersession] = {}
+    for index, comment in enumerate(child_comments):
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        locator = f"child issue #{child_issue} comment {index + 1}"
+        records, ignored = parse_child_plan_supersession_records(
+            body, comment_locator=locator, comment_index=index
+        )
+        if ignored_sink is not None:
+            ignored_sink.extend(ignored)
+        for record in records:
+            if (
+                record.child_issue != child_issue
+                or record.parent_issue != parent_issue
+                or record.stage_id != stage_id
+            ):
+                raise AgentLoopError(
+                    "Human decision required: signed child-plan supersession at "
+                    f"{record.comment_locator} names child #{record.child_issue} / parent "
+                    f"#{record.parent_issue} / stage `{record.stage_id}`, but this issue is child "
+                    f"#{child_issue} / parent #{parent_issue} / stage `{stage_id}`. Remove or "
+                    "correct the record before rerunning."
+                )
+            by_digest.setdefault(record.digest, record)
+    by_hash: dict[str, ChildPlanSupersession] = {}
+    for record in by_digest.values():
+        other = by_hash.get(record.superseded_plan_hash)
+        if other is not None:
+            raise AgentLoopError(
+                "Human decision required: two distinct signed child-plan supersession records "
+                f"name superseded plan {record.superseded_plan_hash} "
+                f"({other.comment_locator} and {record.comment_locator}). Keep exactly one "
+                "record per superseded plan hash before rerunning; records are never chosen "
+                "by comment order."
+            )
+        by_hash[record.superseded_plan_hash] = record
+    return tuple(by_digest.values())
+
+
+def _rebind_record_payload(record: ChildPlanRebindRecord) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "child_issue": record.child_issue,
+        "pr_number": record.pr_number,
+        "superseded_plan_hash": record.superseded_plan_hash,
+        "new_plan_hash": record.new_plan_hash,
+        "plan_supersession_digest": record.plan_supersession_digest,
+        "first_replan_round": record.first_replan_round,
+        "approved_round": record.approved_round,
+    }
+
+
+def format_child_plan_rebind_section(record: ChildPlanRebindRecord) -> str:
+    """Visible audit text plus the rebind audit record for the rebind comment."""
+    encoded = _encode_json_payload(_rebind_record_payload(record))
+    return "\n".join(
+        [
+            f"Child plan rebind: PR #{record.pr_number} is rebound from approved plan "
+            f"{record.superseded_plan_hash} to approved plan {record.new_plan_hash}.",
+            f"Signed supersession digest: {record.plan_supersession_digest}",
+            f"Re-plan rounds: {record.first_replan_round} through {record.approved_round}.",
+            "No PR-side record changed; reviewer approvals recorded before this comment "
+            "do not count under the new plan.",
+            f"<!-- AGENT_CHILD_PLAN_REBIND: {encoded} -->",
+        ]
+    )
+
+
+def find_child_plan_rebind_records(
+    comments: Sequence[object],
+) -> tuple[ChildPlanRebindRecord, ...]:
+    """Every decodable rebind audit record, tagged with its comment index."""
+    found: list[ChildPlanRebindRecord] = []
+    for index, comment in enumerate(comments):
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in CHILD_PLAN_REBIND_MARKER_RE.finditer(body):
+            payload = _decode_json_payload(
+                match.group("payload"), marker_name="AGENT_CHILD_PLAN_REBIND"
+            )
+            if set(payload) != _REBIND_RECORD_KEYS or payload.get("schema_version") != 1:
+                raise AgentLoopError("Invalid AGENT_CHILD_PLAN_REBIND payload: unexpected keys.")
+            for key in ("child_issue", "pr_number", "first_replan_round", "approved_round"):
+                value = payload.get(key)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise AgentLoopError(
+                        f"Invalid AGENT_CHILD_PLAN_REBIND payload: `{key}` must be a positive integer."
+                    )
+            for key in ("superseded_plan_hash", "new_plan_hash", "plan_supersession_digest"):
+                value = payload.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    raise AgentLoopError(
+                        f"Invalid AGENT_CHILD_PLAN_REBIND payload: `{key}` must be a non-empty string."
+                    )
+            found.append(
+                ChildPlanRebindRecord(
+                    child_issue=int(payload["child_issue"]),
+                    pr_number=int(payload["pr_number"]),
+                    superseded_plan_hash=str(payload["superseded_plan_hash"]),
+                    new_plan_hash=str(payload["new_plan_hash"]),
+                    plan_supersession_digest=str(payload["plan_supersession_digest"]),
+                    first_replan_round=int(payload["first_replan_round"]),
+                    approved_round=int(payload["approved_round"]),
+                    comment_index=index,
+                )
+            )
+    return tuple(found)
+
+
+def authorized_replan_lineage(
+    comments: Sequence[object],
+    *,
+    superseded_hash: str,
+    digest: str,
+    supersessions: Sequence[ChildPlanSupersession],
+    through_round: int | None = None,
+) -> AuthorizedReplanLineage | str:
+    """The digest-bound re-plan lineage, or the reason it is not authorized.
+
+    Single authority for resume, rebind eligibility, and rebind verification.
+    ``through_round`` bounds the inspected history to one historical re-plan
+    (a later re-plan of the replacement plan is a different lineage); when it
+    is ``None`` the lineage must reach the latest plan coder round.
+    """
+    from .round_state import _extract_round_metadata_records
+
+    matching = [
+        record
+        for record in supersessions
+        if record.digest == digest and record.superseded_plan_hash == superseded_hash
+    ]
+    if len(matching) != 1:
+        return (
+            f"signed child-plan supersession {digest} for superseded plan {superseded_hash} "
+            "is not discoverable on the child issue (exactly one signed record is required)"
+        )
+    signed = matching[0]
+    coder_rounds: dict[int, object] = {}
+    for record in _extract_round_metadata_records(comments, flow="plan"):
+        if record.metadata.role != "coder":
+            continue
+        if through_round is not None and record.metadata.round_number > through_round:
+            continue
+        # The latest record for a round number is the authoritative plan round.
+        coder_rounds[record.metadata.round_number] = record
+    ordered = [coder_rounds[number] for number in sorted(coder_rounds)]
+    bound = [
+        record
+        for record in ordered
+        if record.metadata.plan_supersession_digest == digest
+        and record.metadata.plan_supersession_superseded_hash == superseded_hash
+    ]
+    if not bound:
+        return (
+            f"no plan round carries signed supersession digest {digest} for superseded plan "
+            f"{superseded_hash}"
+        )
+    first = bound[0]
+    first_round = first.metadata.round_number
+    if first.index <= signed.comment_index:
+        return (
+            f"plan round {first_round} carries the supersession digest but was posted before "
+            f"the signed record at {signed.comment_locator}"
+        )
+    # Reviewer-only phase advances consume round numbers without a coder
+    # round, so contiguity is judged on the coder-round chain: each bound
+    # round must revise exactly the plan subject of the coder round before it.
+    first_position = ordered.index(first)
+    previous = ordered[first_position - 1] if first_position > 0 else None
+    previous_plan = previous.metadata.canonical_plan if previous is not None else None
+    if (
+        previous is None
+        or previous_plan is None
+        or approved_plan_hash(previous_plan) != superseded_hash
+    ):
+        return (
+            f"plan round {first_round} is the first digest-bound round, but the plan round "
+            f"immediately before it is not superseded plan {superseded_hash}"
+        )
+    chain_subject = previous.metadata.subject
+    round_numbers: list[int] = []
+    for record in ordered[first_position:]:
+        number = record.metadata.round_number
+        if record.metadata.prior_plan_subject != chain_subject:
+            return (
+                f"the digest-bound re-plan lineage has a gap before plan round {number}: it "
+                "does not revise the plan of the preceding plan round"
+            )
+        chain_subject = record.metadata.subject
+        round_numbers.append(number)
+        if (
+            record.metadata.plan_supersession_digest != digest
+            or record.metadata.plan_supersession_superseded_hash != superseded_hash
+        ):
+            return (
+                f"plan round {number} follows the authorized re-plan but is "
+                + (
+                    "bound to a different supersession record"
+                    if record.metadata.plan_supersession_digest is not None
+                    else "not bound to the signed supersession digest"
+                )
+            )
+    latest = ordered[-1]
+    if through_round is not None and latest.metadata.round_number != through_round:
+        return f"no digest-bound plan round {through_round} exists"
+    latest_plan = latest.metadata.canonical_plan
+    if latest_plan is None:
+        return f"plan round {latest.metadata.round_number} has no canonical plan record"
+    return AuthorizedReplanLineage(
+        round_numbers=tuple(round_numbers),
+        latest_plan_hash=approved_plan_hash(latest_plan),
+    )
 
 
 def reconcile_handoff_disposition(

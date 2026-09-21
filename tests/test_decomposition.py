@@ -3105,3 +3105,221 @@ def test_human_first_topology_reports_a_later_closed_human_stage(tmp_path, capsy
     )
     assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+# ---------------------------------------------------------------------------
+# Signed child-plan supersession, digest-bound re-plan lineage (#936)
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    AuthorizedReplanLineage,
+    ChildPlanRebindRecord,
+    authorized_replan_lineage,
+    child_plan_supersession_digest,
+    collect_child_plan_supersessions,
+    find_child_plan_rebind_records,
+    format_child_plan_rebind_section,
+    format_child_plan_supersession_comment,
+    parse_child_plan_supersession_records,
+)
+from coding_review_agent_loop.decomposition import approved_plan_hash as _m936_plan_hash  # noqa: E402
+from coding_review_agent_loop.round_state import (  # noqa: E402
+    PostedRoundMetadata as _M936Metadata,
+    _attach_round_metadata as _m936_attach,
+    _decode_round_metadata as _m936_decode,
+    _encode_round_metadata as _m936_encode,
+    _plan_subject as _m936_subject,
+)
+
+
+class _M936Comment:
+    def __init__(self, body):
+        self.body = body
+
+
+def _m936_signed(superseded="aaaa000000000001", **overrides):
+    fields = dict(
+        child_issue=56, parent_issue=55, stage_id="stage-one",
+        superseded_plan_hash=superseded, rationale="Contract tightened.",
+    )
+    fields.update(overrides)
+    return format_child_plan_supersession_comment(**fields)
+
+
+def _m936_collect(comments):
+    return collect_child_plan_supersessions(
+        [_M936Comment(body) for body in comments],
+        child_issue=56, parent_issue=55, stage_id="stage-one",
+    )
+
+
+def test_m936_supersession_record_round_trips_with_a_stable_digest():
+    body = _m936_signed()
+    records, ignored = parse_child_plan_supersession_records(
+        body, comment_locator="child issue #56 comment 1", comment_index=0
+    )
+    assert ignored == () and len(records) == 1
+    record = records[0]
+    assert (record.child_issue, record.parent_issue, record.stage_id) == (56, 55, "stage-one")
+    assert record.superseded_plan_hash == "aaaa000000000001"
+    payload = json.loads(body.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert record.digest == child_plan_supersession_digest(payload)
+    assert re.fullmatch(r"[0-9a-f]{64}", record.digest)
+    # Key order in the posted JSON never changes the digest.
+    assert record.digest == child_plan_supersession_digest(dict(reversed(list(payload.items()))))
+
+
+def test_m936_unsigned_and_malformed_records_never_authorize():
+    unsigned = _m936_signed().replace("\n-- Human Reviewer", "")
+    malformed = _m936_signed().replace('"rationale": "Contract tightened."', '"rationale": ""')
+    extra_key = _m936_signed().replace('"kind"', '"surprise": 1,\n  "kind"')
+    ignored = []
+    found = collect_child_plan_supersessions(
+        [_M936Comment(unsigned), _M936Comment(malformed), _M936Comment(extra_key)],
+        child_issue=56, parent_issue=55, stage_id="stage-one", ignored_sink=ignored,
+    )
+    assert found == ()
+    assert len(ignored) == 2 and all("ignored" in note for note in ignored)
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"child_issue": 57}, {"parent_issue": 54}, {"stage_id": "stage-two"}]
+)
+def test_m936_signed_record_for_another_identity_fails_closed(overrides):
+    with pytest.raises(AgentLoopError, match="Human decision required"):
+        _m936_collect([_m936_signed(**overrides)])
+
+
+def test_m936_duplicates_collapse_and_distinct_hashes_coexist():
+    found = _m936_collect(
+        [_m936_signed(), _m936_signed(), _m936_signed(superseded="bbbb000000000002")]
+    )
+    assert [record.superseded_plan_hash for record in found] == [
+        "aaaa000000000001", "bbbb000000000002",
+    ]
+    # The earliest identical record keeps its comment position.
+    assert found[0].comment_index == 0
+
+
+def test_m936_two_distinct_records_for_one_hash_fail_closed_naming_both():
+    with pytest.raises(AgentLoopError) as excinfo:
+        _m936_collect([_m936_signed(), _m936_signed(rationale="A different reason.")])
+    message = str(excinfo.value)
+    assert "comment 1" in message and "comment 2" in message
+    assert "never chosen by comment order" in message
+
+
+def _m936_round(plan, number, *, prior=None, digest=None, superseded=None):
+    return _m936_attach(plan, _M936Metadata(
+        flow="plan", role="coder", agent="Claude", round_number=number,
+        subject=_m936_subject(plan),
+        prior_plan_subject=_m936_subject(prior) if prior is not None else None,
+        canonical_plan=plan,
+        plan_supersession_digest=digest, plan_supersession_superseded_hash=superseded,
+    ))
+
+
+def _m936_lineage(bodies, *, through_round=None, signed_bodies=None):
+    comments = [_M936Comment(body) for body in bodies]
+    supersessions = collect_child_plan_supersessions(
+        [_M936Comment(body) for body in (signed_bodies if signed_bodies is not None else bodies)],
+        child_issue=56, parent_issue=55, stage_id="stage-one",
+    )
+    old_hash = _m936_plan_hash("Old plan.")
+    digest = _m936_collect([_m936_signed(superseded=old_hash)])[0].digest
+    return authorized_replan_lineage(
+        comments, superseded_hash=old_hash, digest=digest,
+        supersessions=supersessions, through_round=through_round,
+    ), digest, old_hash
+
+
+def test_m936_valid_lineage_spans_reviewer_only_round_gaps():
+    old_hash = _m936_plan_hash("Old plan.")
+    signed = _m936_signed(superseded=old_hash)
+    digest = _m936_collect([signed])[0].digest
+    bodies = [
+        _m936_round("Old plan.", 1),
+        signed,
+        _m936_round("New plan.", 3, prior="Old plan.", digest=digest, superseded=old_hash),
+        _m936_round("Newer plan.", 5, prior="New plan.", digest=digest, superseded=old_hash),
+    ]
+    lineage, _digest, _old = _m936_lineage(bodies)
+    assert isinstance(lineage, AuthorizedReplanLineage)
+    assert lineage.round_numbers == (3, 5)
+    assert lineage.latest_plan_hash == _m936_plan_hash("Newer plan.")
+    bounded, _digest, _old = _m936_lineage(bodies, through_round=3)
+    assert isinstance(bounded, AuthorizedReplanLineage) and bounded.round_numbers == (3,)
+
+
+def test_m936_lineage_rejects_every_unauthorized_shape():
+    old_hash = _m936_plan_hash("Old plan.")
+    signed = _m936_signed(superseded=old_hash)
+    digest = _m936_collect([signed])[0].digest
+    other = "f" * 64
+    bound = dict(digest=digest, superseded=old_hash)
+    cases = {
+        "no digest": [_m936_round("Old plan.", 1), _m936_round("Later plan.", 2, prior="Old plan."), signed],
+        "different record": [
+            _m936_round("Old plan.", 1), signed,
+            _m936_round("New plan.", 2, prior="Old plan.", **bound),
+            _m936_round("Newer plan.", 3, prior="New plan.", digest=other, superseded=old_hash),
+        ],
+        "unbound follower": [
+            _m936_round("Old plan.", 1), signed,
+            _m936_round("New plan.", 2, prior="Old plan.", **bound),
+            _m936_round("Newer plan.", 3, prior="New plan."),
+        ],
+        "gap": [
+            _m936_round("Old plan.", 1), signed,
+            _m936_round("New plan.", 2, prior="Old plan.", **bound),
+            _m936_round("Newest plan.", 4, prior="Deleted middle plan.", **bound),
+        ],
+        "not based on superseded": [
+            _m936_round("Old plan.", 1), _m936_round("Other plan.", 2, prior="Old plan."), signed,
+            _m936_round("New plan.", 3, prior="Other plan.", **bound),
+        ],
+        "before signed comment": [
+            _m936_round("Old plan.", 1),
+            _m936_round("New plan.", 2, prior="Old plan.", **bound),
+            signed,
+        ],
+    }
+    for name, bodies in cases.items():
+        lineage, _digest, _old = _m936_lineage(bodies)
+        assert isinstance(lineage, str), name
+    # The bound signed record was deleted after binding.
+    deleted, _digest, _old = _m936_lineage(
+        [_m936_round("Old plan.", 1), _m936_round("New plan.", 2, prior="Old plan.", **bound)],
+        signed_bodies=[],
+    )
+    assert isinstance(deleted, str) and "not discoverable" in deleted
+
+
+def test_m936_round_metadata_encoding_is_byte_stable_without_the_binding():
+    legacy = _M936Metadata(
+        flow="plan", role="coder", agent="Claude", round_number=1, subject="s",
+        canonical_plan="Plan.",
+    )
+    from coding_review_agent_loop.round_transport import decode_mapping
+
+    assert not any(key.startswith("plan_supersession") for key in decode_mapping(_m936_encode(legacy)))
+    assert _m936_decode(_m936_encode(legacy)) == legacy
+    bound = dataclasses.replace(
+        legacy, plan_supersession_digest="a" * 64, plan_supersession_superseded_hash="b" * 16
+    )
+    decoded = _m936_decode(_m936_encode(bound))
+    assert decoded.plan_supersession_digest == "a" * 64
+    assert decoded.plan_supersession_superseded_hash == "b" * 16
+    with pytest.raises(ValueError):
+        dataclasses.replace(legacy, plan_supersession_digest="a" * 64)
+
+
+def test_m936_rebind_audit_record_round_trips_with_its_comment_index():
+    record = ChildPlanRebindRecord(
+        child_issue=56, pr_number=77, superseded_plan_hash="a" * 16, new_plan_hash="b" * 16,
+        plan_supersession_digest="c" * 64, first_replan_round=2, approved_round=3,
+    )
+    found = find_child_plan_rebind_records(
+        [_M936Comment("noise"), _M936Comment(format_child_plan_rebind_section(record))]
+    )
+    assert found == (dataclasses.replace(record, comment_index=1),)

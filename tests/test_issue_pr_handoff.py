@@ -597,3 +597,143 @@ def test_commit_connection_rejects_count_truncation(tmp_path):
 
     with pytest.raises(AgentLoopError, match="truncated"):
         read_pull_request_commit_metadata(runner, config=config, pr_number=77)
+
+
+# ---------------------------------------------------------------------------
+# Closing-contract lineage base across same-PR plan replacements (#936)
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.expected_closure import contract_hash as _m936_contract_hash  # noqa: E402
+from coding_review_agent_loop.github import IssueContext as _M936IssueContext  # noqa: E402
+from coding_review_agent_loop.issue_pr_handoff import (  # noqa: E402
+    authenticate_canonical_issue_pr,
+    resolve_issue_pr_handoff_lineage,
+)
+from coding_review_agent_loop.pr_contract import (  # noqa: E402
+    format_pr_contract_comment,
+    make_pr_contract,
+)
+
+_M936_URL = "https://github.com/OWNER/REPO/pull/77"
+
+
+def _m936_handoff(plan_hash, *, ids=(56,), supersedes=None):
+    return _comment(format_issue_pr_handoff_comment(
+        issue_number=56, pr_number=77, pr_url=_M936_URL, pr_head_sha="abc123",
+        flow="approved-plan-implementation", plan_hash=plan_hash,
+        expected_closing_issue_ids=ids, supersedes_hash=supersedes,
+    ))
+
+
+def _m936_replacement(plan_hash, *, ids=(56,)):
+    # Unchanged-ID replacements all carry the same closing-ID digest.
+    return _m936_handoff(plan_hash, ids=ids, supersedes=_m936_contract_hash(ids))
+
+
+def _m936_authenticate(tmp_path, comments, *, pr_ids=(56,), pr_supersedes=None):
+    contract = make_pr_contract(
+        repository="OWNER/REPO", pr_number=77, origin_flow="approved-plan-implementation",
+        primary_issue_number=56, expected_closing_issue_ids=pr_ids,
+        supersedes_hash=pr_supersedes,
+    )
+    runner = FakeRunner(pr_payload={
+        "number": 77, "body": "Fixes #56", "url": _M936_URL,
+        "comments": [{
+            "author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:00Z",
+            "body": format_pr_contract_comment(contract),
+        }],
+    })
+    issue = _M936IssueContext(
+        number=56, repo="OWNER/REPO", title="Child", body="", url="", comments=tuple(comments)
+    )
+    return authenticate_canonical_issue_pr(
+        runner, config=make_config(tmp_path), issue_number=56, issue_context=issue
+    )
+
+
+@pytest.mark.parametrize("replacements", [1, 2])
+def test_m936_pr_contract_authenticates_against_the_lineage_base(tmp_path, replacements):
+    comments = [_m936_handoff("plan-a")] + [
+        _m936_replacement(f"plan-{index}") for index in range(replacements)
+    ]
+    lineage = resolve_issue_pr_handoff_lineage(comments, issue_number=56, repo="OWNER/REPO")
+    assert lineage.latest.plan_hash == f"plan-{replacements - 1}"
+    assert lineage.closing_base.plan_hash == "plan-a"
+    assert lineage.closing_base.supersedes_hash is None
+    assert lineage.replaced.plan_hash == ("plan-a" if replacements == 1 else "plan-0")
+    assert lineage.latest_comment_index == replacements
+    # The unchanged PR-side contract (no supersession) still authenticates,
+    # and the plan hash comes from the latest record.
+    authenticated = _m936_authenticate(tmp_path, comments)
+    assert authenticated.record.plan_hash == f"plan-{replacements - 1}"
+    assert authenticated.state == "OPEN"
+
+
+def test_m936_closing_superset_before_a_replacement_keeps_superset_rules(tmp_path):
+    comments = [
+        _m936_handoff("plan-a"),
+        _m936_handoff("plan-a", ids=(56, 60), supersedes=_m936_contract_hash((56,))),
+        _m936_replacement("plan-b", ids=(56, 60)),
+    ]
+    lineage = resolve_issue_pr_handoff_lineage(comments, issue_number=56, repo="OWNER/REPO")
+    assert lineage.latest.plan_hash == "plan-b"
+    assert lineage.closing_base.expected_closing_issue_ids == (56, 60)
+    assert lineage.closing_base.supersedes_hash == _m936_contract_hash((56,))
+    authenticated = _m936_authenticate(
+        tmp_path, comments, pr_ids=(56, 60), pr_supersedes=_m936_contract_hash((56,))
+    )
+    assert authenticated.record.plan_hash == "plan-b"
+    # The PR-side contract must still match the superset base, not the old one.
+    with pytest.raises(AgentLoopError, match="diverge"):
+        _m936_authenticate(tmp_path, comments)
+
+
+def test_m936_closing_superset_after_a_replacement_becomes_the_new_base(tmp_path):
+    comments = [
+        _m936_handoff("plan-a"),
+        _m936_replacement("plan-b"),
+        _m936_handoff("plan-b", ids=(56, 60), supersedes=_m936_contract_hash((56,))),
+    ]
+    lineage = resolve_issue_pr_handoff_lineage(comments, issue_number=56, repo="OWNER/REPO")
+    assert lineage.closing_base is lineage.latest
+    # The superset moves the closing base but never erases the plan-changing
+    # edge, so the rebind stays verifiable.
+    assert lineage.replaced.plan_hash == "plan-a"
+    assert lineage.replacement.plan_hash == "plan-b"
+    assert (lineage.replacement_comment_index, lineage.latest_comment_index) == (1, 2)
+    authenticated = _m936_authenticate(
+        tmp_path, comments, pr_ids=(56, 60), pr_supersedes=_m936_contract_hash((56,))
+    )
+    assert authenticated.record.plan_hash == "plan-b"
+
+
+def test_m936_unannotated_divergent_plan_record_still_raises():
+    with pytest.raises(AgentLoopError, match="Divergent AGENT_ISSUE_PR_HANDOFF"):
+        resolve_issue_pr_handoff_lineage(
+            [_m936_handoff("plan-a"), _m936_handoff("plan-b")],
+            issue_number=56, repo="OWNER/REPO",
+        )
+    # A closing-ID digest that does not name the replaced contract is no annotation.
+    with pytest.raises(AgentLoopError, match="Divergent AGENT_ISSUE_PR_HANDOFF"):
+        find_latest_issue_pr_handoff(
+            [_m936_handoff("plan-a"), _m936_handoff("plan-b", supersedes="0" * 64)],
+            issue_number=56, repo="OWNER/REPO",
+        )
+
+
+def test_m936_plan_edge_tracks_the_latest_change_and_resets_for_another_pr():
+    superset_with_new_plan = _m936_handoff(
+        "plan-c", ids=(56, 60), supersedes=_m936_contract_hash((56,))
+    )
+    lineage = resolve_issue_pr_handoff_lineage(
+        [_m936_handoff("plan-a"), _m936_replacement("plan-b"), superset_with_new_plan],
+        issue_number=56, repo="OWNER/REPO",
+    )
+    # A superset that also changes the plan is itself the latest plan-changing edge.
+    assert (lineage.replaced.plan_hash, lineage.replacement.plan_hash) == ("plan-b", "plan-c")
+    assert lineage.replacement_comment_index == 2
+    plain = resolve_issue_pr_handoff_lineage(
+        [_m936_handoff("plan-a")], issue_number=56, repo="OWNER/REPO"
+    )
+    assert plain.replaced is None and plain.replacement is None
+    assert plain.replacement_comment_index == -1

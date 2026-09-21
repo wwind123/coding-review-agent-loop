@@ -160,6 +160,45 @@ stop child planning before any planner turn, and an oversized delta set rejects
 the candidate into the replan loop. Parent dispatch, direct child invocation,
 and both skill-runner PR-validation branches apply the same function.
 
+A historical approved child plan that fails this comparison has two audited
+recovery edges instead of a dead end. Before any implementation handoff, the
+approval-to-implementation guard in the plan-first loop posts one plain audit
+comment and re-enters the enforced, mechanically checked revision turn with the
+diagnostic attributed to the orchestrator, no synthetic reviewer item, and a
+latched complete board for the next round. After a handoff, issue routing judges
+the handed-off plan through the shared admissibility helper before resolving
+the canonical PR, and reopens planning only under a signed
+`child-plan-supersession` record discovered on the child issue (exact keys,
+standalone human signature, child/parent/stage identity, one record per
+superseded plan hash). The record digest is carried in two optional planning
+round-metadata fields, omitted from the encoding when absent, and
+`authorized_replan_lineage` is the single authority that accepts only a chained,
+digest-bound planner-round lineage starting from the superseded plan. On
+approval the existing open PR is rebound by one atomic issue-side comment
+holding the superseding issue-to-PR handoff record and a rebind audit record;
+nothing is written on the PR, so no partial cross-side state exists.
+Cross-side authentication compares the unchanged PR-side closing contract with
+the closing-contract lineage base (the latest issue-side record that is not a
+same-PR equal-ID plan replacement) and takes the plan hash from the latest
+record; the closing-ID digest never identifies a plan replacement. The resolver
+also keeps the most recent plan-changing handoff edge and its comment locator
+independently of that base, so a later closing-ID superset never hides a rebind
+from verification. One verifier,
+`verify_child_plan_rebind`, runs at issue entry, at both PR-loop provenance
+sites, and on the plan-identity-change branch of the PR qualification snapshot
+(through a planning-child binding captured once per PR run), so an unverified or
+inadmissible replacement never reaches review, final sweep, merge, or
+managed-CI gates. Provenance and current-contract admissibility are separate
+checks: how a plan became the binding is verified first on every entry path,
+before any new signed authorization for that plan is accepted, so an unverified
+replacement cannot be laundered while a verified one that later became
+inadmissible can still be superseded. The complete-board latch for the round
+that reviews such a revision is reconstructed on resume from durable state (the
+supersession binding on the latest planner round, or the guard's audit comment
+for the plan it revises), so a restart right after the revised round cannot
+narrow the board. PR approvals stay keyed by plan hash and subject, so none
+recorded before a rebind is carried.
+
 The validated matrix wire schema is the canonical source for planner and
 repair prompt key lists and minimal applicable/not-applicable examples. Repair
 is bounded format recovery: it preserves a complete fresh matrix and rejects

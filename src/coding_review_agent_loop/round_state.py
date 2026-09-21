@@ -225,10 +225,25 @@ class PostedRoundMetadata:
     aggregate_plan_identity: str | None = None
     raw_patch_provenance: dict | None = None
     assembled_plan_sidecar: dict | None = None
+    # Causal binding of a signed child-plan re-plan (#936).  Both are absent
+    # on every historical record and omitted from the encoding when absent.
+    plan_supersession_digest: str | None = None
+    plan_supersession_superseded_hash: str | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
+        if (self.plan_supersession_digest is None) != (
+            self.plan_supersession_superseded_hash is None
+        ):
+            raise ValueError("plan supersession digest and superseded hash must be set together")
+        if self.plan_supersession_digest is not None and (
+            not isinstance(self.plan_supersession_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.plan_supersession_digest)
+            or not isinstance(self.plan_supersession_superseded_hash, str)
+            or not self.plan_supersession_superseded_hash.strip()
+        ):
+            raise ValueError("invalid plan supersession binding")
         if self.scheduler_force_full_source is not None and (
             self.scheduler_force_full_source not in FORCE_FULL_SOURCES
             or self.scheduler_force_full is not True
@@ -1900,9 +1915,14 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
                 if key not in _SCHEDULER_AUXILIARY_KEYS or value not in (None, [])
             }
         )
+    if metadata.plan_supersession_digest is not None:
+        payload["plan_supersession_digest"] = metadata.plan_supersession_digest
+        payload["plan_supersession_superseded_hash"] = (
+            metadata.plan_supersession_superseded_hash
+        )
     if metadata.plan_candidate_key is not None:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
-    matrix_present = _risk_test_matrix_metadata_present(metadata)
+    matrix_present =_risk_test_matrix_metadata_present(metadata)
     matrix_values = {
         "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,
         "risk_test_matrix_payload": _matrix_json(metadata.risk_test_matrix_payload),
@@ -1922,6 +1942,16 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             else metadata.qualification_checkpoint
         )
     return encode_mapping(payload)
+
+
+def _decode_plan_supersession_field(payload: Mapping[str, object], key: str) -> str | None:
+    # A present-but-malformed binding must not decode as legacy absence.
+    if key not in payload:
+        return None
+    value = payload[key]
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{key} must be a non-empty string")
+    return value
 
 
 def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
@@ -2152,6 +2182,12 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 payload["plan_candidate_key"]
                 if isinstance(payload.get("plan_candidate_key"), dict)
                 else None
+            ),
+            plan_supersession_digest=_decode_plan_supersession_field(
+                payload, "plan_supersession_digest"
+            ),
+            plan_supersession_superseded_hash=_decode_plan_supersession_field(
+                payload, "plan_supersession_superseded_hash"
             ),
             **_decode_scheduler_fields(payload),
         )

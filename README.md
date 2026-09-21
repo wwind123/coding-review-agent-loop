@@ -465,6 +465,63 @@ routes survive reruns and cannot be switched with CLI
 flags. See the detailed
 [child execution disposition contract](docs/local_agent_loop.md#child-execution-dispositions).
 
+### Re-planning an approved child plan
+
+An approved child plan can stop satisfying the inherited-matrix contract, most
+often because the contract tightened after the plan was approved. The failure
+always names a supported route, and which route depends on how far the child
+got:
+
+1. **No implementation handoff yet.** Rerun the same `--plan-first` command.
+   The loop posts one audit comment, sends the approved plan back to the
+   planner with the field-level diagnostic, mechanically rechecks the revision
+   before it is posted, and has the complete reviewer board review it. No
+   signed record is needed, because nothing is bound to the plan yet.
+2. **A handoff and an open PR already exist.** The plan can only be re-planned
+   under a signed human authorization. Without it the run stops before any
+   agent turn and prints this record pre-filled for the child. Post it as a
+   comment on the **child** issue, then rerun
+   `agent-loop issue <child> --plan-first --plan-execution-mode auto`:
+
+````markdown
+Child plan supersession:
+
+```json
+{
+  "child_issue": 925,
+  "kind": "child-plan-supersession",
+  "parent_issue": 924,
+  "rationale": "Approved before the inherited-matrix contract tightened.",
+  "schema_version": 1,
+  "stage_id": "stage-1",
+  "superseded_plan_hash": "<16-hex plan hash printed by the diagnostic>"
+}
+```
+-- Human Reviewer
+````
+
+   The child is re-planned, and once the revision is approved the **same PR**
+   is rebound to the new plan hash by one issue comment. No second PR is
+   opened, no implementation turn runs, nothing is written on the PR, and
+   reviewer approvals recorded before the rebind do not count under the new
+   plan. `agent-loop pr <n>` never re-plans or rebinds; on an inadmissible
+   binding it fails closed and prints the same route.
+
+Rules: keep exactly one signed record per superseded plan hash (two distinct
+records for one hash always stop for a human decision; records are never
+chosen by comment order), and leave the record in place afterwards because the
+rebound PR re-verifies it on every run. Re-planning continues the child's
+existing round numbering, so raise `--max-rounds` if the budget is exhausted.
+Abandoning or replacing the existing PR, re-planning direct-implementation or
+non-child issues, revising the parent plan, and any unsigned or flag-only
+bypass are not supported.
+
+**Migration note.** When the inherited-matrix contract tightens, children
+approved under the looser contract are reported as inadmissible the next time
+the loop touches them. That is expected: follow the route above rather than
+hand-editing issue records. See
+[the detailed contract](docs/local_agent_loop.md#re-planning-an-approved-child-plan).
+
 ### Approved follow-up dedupe
 
 When approved future follow-ups are summarized or filed, semantic reuse is
