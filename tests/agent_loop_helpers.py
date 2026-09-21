@@ -740,6 +740,19 @@ class FakeRunner(Runner):
         self._agent_pr_counter += 1
         self.git_head = _next_fake_head(self.git_head, f"agent-{self._agent_pr_counter}")
 
+    def _next_write_stamp(self) -> str:
+        """One monotonic clock for every comment write in persisted-REST mode (#827).
+
+        REST writes and ``gh pr/issue comment`` writes must order by time the
+        way they were issued, later than every seeded fixture.
+        """
+        self._write_clock = getattr(self, "_write_clock", 0) + 1
+        sequence = self._write_clock
+        return (
+            f"2030-01-01T{sequence // 3600 % 24:02d}:"
+            f"{sequence // 60 % 60:02d}:{sequence % 60:02d}Z"
+        )
+
     def _maybe_advance_pr_head_for_coder_followup(self, cmd) -> None:
         if not self.advance_pr_head_on_coder_followup:
             return
@@ -1038,7 +1051,11 @@ class FakeRunner(Runner):
             self.pr_payload.setdefault("comments", []).append(
                 {
                     "author": {"login": "coding-review-agent-loop"},
-                    "createdAt": f"2026-05-23T00:00:{len(self.pr_payload.get('comments', [])):02d}Z",
+                    "createdAt": (
+                        self._next_write_stamp()
+                        if getattr(self, "persist_rest_comment_posts", False)
+                        else f"2026-05-23T00:00:{len(self.pr_payload.get('comments', [])):02d}Z"
+                    ),
                     "body": raw_body,
                 }
             )
@@ -1056,7 +1073,11 @@ class FakeRunner(Runner):
             self.issue_comments.append(
                 {
                     "author": {"login": "coding-review-agent-loop"},
-                    "createdAt": f"2026-05-23T00:00:{len(self.issue_comments):02d}Z",
+                    "createdAt": (
+                        self._next_write_stamp()
+                        if getattr(self, "persist_rest_comment_posts", False)
+                        else f"2026-05-23T00:00:{len(self.issue_comments):02d}Z"
+                    ),
                     "body": raw_body,
                 }
             )
@@ -1215,12 +1236,8 @@ class FakeRunner(Runner):
             # A separate high ID range: gh-shaped comments are listed with
             # positional IDs, which must never collide with a REST write.
             comment_id = max(known + [_REST_POST_ID_BASE]) + 1
-            sequence = comment_id - _REST_POST_ID_BASE
-            # Later than every seeded fixture, ordered by the monotonic ID.
-            stamp = (
-                f"2030-01-01T{sequence // 3600 % 24:02d}:"
-                f"{sequence // 60 % 60:02d}:{sequence % 60:02d}Z"
-            )
+            # Later than every seeded fixture; one clock orders REST and gh writes.
+            stamp = self._next_write_stamp()
             comment = {
                 "id": comment_id,
                 "user": {"login": actor_login, "id": actor_id},

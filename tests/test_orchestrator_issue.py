@@ -5673,6 +5673,8 @@ def test_issue_loop_plan_first_one_shot_posts_handoff_after_pr_creation(tmp_path
 def test_issue_loop_fresh_one_shot_publishes_decision_before_handoff(tmp_path):
     plan = structured_v1_plan_state()
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             plan,
             "Implemented the approved fresh plan.\n<!-- AGENT_PR: 77 -->\n"
@@ -5708,6 +5710,8 @@ def test_issue_loop_fresh_one_shot_rerun_reuses_decision_and_handoff(tmp_path):
     """A real issue entry-point rerun must not rematerialize fresh state."""
     plan = structured_v1_plan_state()
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             plan,
             "Implemented the approved fresh plan.\n<!-- AGENT_PR: 77 -->\n"
@@ -10930,3 +10934,110 @@ def test_m946_direct_issue_rerun_after_each_boundary_converges_without_the_coder
     _m946_assert_no_embedded_contract(runner)
     # The reviewer ran only on the rerun, after the commit.
     assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+
+
+# --- #946: approved-plan one-shot publication goes through the transaction seam ---
+
+
+def _m946_one_shot_runner(boundary=None):
+    runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
+        pr_payload={"body": "Fixes #56"},
+        claude_outputs=[
+            structured_v1_plan_state(),
+            "Implemented the approved fresh plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+    )
+    if boundary is not None:
+        runner.rest_post_failures = (boundary,)
+    return runner
+
+
+def _m946_one_shot_config(tmp_path):
+    return make_config(
+        tmp_path,
+        plan_execution_mode="implement-one-shot",
+        execution_strategy_contract_required=True,
+    )
+
+
+def _m946_workflow_records(runner, marker):
+    threads = [runner.issue_comments, *runner.issue_comments_by_number.values()]
+    return [c for items in threads for c in items if marker in c["body"]] + [
+        c for c in runner.pr_payload.get("comments", []) if marker in c["body"]
+    ]
+
+
+def test_m946_approved_plan_one_shot_publishes_one_transaction_then_parent_handoff(tmp_path):
+    """Fresh approved-plan one-shot: one committed transaction with the approved
+    flow and plan hash on both surfaces, no embedded contract, and the parent
+    phase handoff posted once, after the committed record."""
+
+    runner = _m946_one_shot_runner()
+    assert run_issue_loop(
+        runner, issue_number=56, config=_m946_one_shot_config(tmp_path), plan_first=True
+    ) == 0
+
+    kinds = _m946_record_kinds(runner)
+    assert kinds["issue"] == ["handoff"]
+    assert kinds["pr"] == ["transaction", "contract", "tagged-coder-round", "transaction"]
+    handoff = _m946_workflow_records(runner, "AGENT_ISSUE_PR_HANDOFF")
+    assert len(handoff) == 1
+    assert "Flow: approved-plan-implementation" in handoff[0]["body"]
+    assert "Flow: issue-implementation" not in handoff[0]["body"]
+    _m946_assert_no_embedded_contract(runner)
+    assert not [
+        body for body in runner.comments
+        if "AGENT_ISSUE_PR_HANDOFF" in body or "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body
+    ]
+    parent = _m946_workflow_records(runner, "AGENT_PLAN_ONE_SHOT_IMPL")
+    assert len(parent) == 1
+    committed = [
+        c for c in runner.pr_payload["comments"]
+        if "AGENT_WORKFLOW_TRANSACTION" in c["body"] and "Committed:" in c["body"]
+    ]
+    assert len(committed) == 1
+    # The follow-on parent handoff is written only after the terminal record.
+    assert parent[0]["createdAt"] > committed[0]["createdAt"]
+
+
+@pytest.mark.parametrize("boundary", [3, 4, 5])
+def test_m946_approved_plan_one_shot_rerun_after_boundary_converges(tmp_path, boundary):
+    """Writes: 1 prepared, 2 handoff, 3 contract, 4 tagged coder round, 5 committed.
+
+    After the handoff exists, an interruption stops the run with no parent
+    handoff and no reviewer; the issue-command rerun finishes the transaction
+    from its stored intent without the coder, then posts the parent phase
+    handoff once, and the PR loop resumes.
+    """
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner = _m946_one_shot_runner(boundary)
+    config = _m946_one_shot_config(tmp_path)
+    with pytest.raises(WorkflowTransactionError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not _m946_workflow_records(runner, "AGENT_PLAN_ONE_SHOT_IMPL")
+    claude_calls = sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+    runner.rest_post_failures = ()
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands) == claude_calls
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+    kinds = _m946_record_kinds(runner)
+    assert kinds["issue"] == ["handoff"]
+    assert kinds["pr"].count("contract") == 1
+    assert kinds["pr"].count("transaction") == 2
+    assert kinds["pr"].count("tagged-coder-round") == (1 if boundary == 5 else 0)
+    assert len(_m946_workflow_records(runner, "AGENT_PLAN_ONE_SHOT_IMPL")) == 1
+    assert not [
+        body for body in runner.comments
+        if "AGENT_ISSUE_PR_HANDOFF" in body or "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body
+    ]
+    _m946_assert_no_embedded_contract(runner)

@@ -607,6 +607,78 @@ from .unresolved_items import (
 )
 
 
+def _post_one_shot_parent_handoff_once(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    parent_issue: int,
+    plan_hash: str,
+    plan_subject: str,
+    pr_number: int,
+    pr_head_sha: str | None,
+    recommendation=None,
+) -> None:
+    """Post the one-shot parent phase handoff after the commit, at most once (#827).
+
+    It is a follow-on write, never a transaction entry: it runs only once the
+    PR's transaction committed, and the same-plan lookup keeps a rerun (after
+    this write failed, or after an interrupted publication was finished) from
+    posting a second one.
+    """
+    comments = get_issue_context(runner, config=config, issue_number=parent_issue).comments
+    if find_existing_one_shot_impl_handoff(
+        comments, parent_issue=parent_issue, plan_hash=plan_hash, mode="implement-one-shot"
+    ) is not None:
+        return
+    identity = recommendation.identity() if recommendation is not None else None
+    post_one_shot_impl_handoff_comment(
+        runner,
+        config=config,
+        parent_issue=parent_issue,
+        mode="implement-one-shot",
+        plan_hash=plan_hash,
+        plan_subject=plan_subject,
+        pr_number=pr_number,
+        pr_head_sha=pr_head_sha,
+        strategy=recommendation.strategy if recommendation is not None else None,
+        topology_source=str(identity["topology_source"]) if identity is not None else None,
+        execution_strategy_contract_version=1 if recommendation is not None else None,
+        recommendation_digest=(
+            str(identity["recommendation_sha256"]) if identity is not None else None
+        ),
+    )
+
+
+def _recorded_issue_handoff(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    issue_context: IssueContext,
+):
+    """The issue's recorded handoff (flow and plan hash), across versions (#827).
+
+    A transaction-era handoff is read through authenticated discovery after an
+    interrupted publication is finished from its stored intent; the version-1
+    comment reader would reject it.  A legacy issue keeps today's reader.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if not config.dry_run:
+        _finish_interrupted_issue_publication(
+            runner, config, issue_number=issue_context.number
+        )
+        discovered = publication.discover_canonical_issue_pr(
+            runner, config, issue_context.number
+        )
+        if discovered is not None and discovered.era == publication.ERA_TRANSACTION:
+            return discovered.handoff
+    return find_latest_issue_pr_handoff(
+        issue_context.comments,
+        issue_number=issue_context.number,
+        repo=config.repo,
+    )
+
+
 def _finish_interrupted_issue_publication(
     runner: Runner,
     config: AgentLoopConfig,
@@ -7968,6 +8040,7 @@ def _implement_approved_issue(
     approved_plan_context: ApprovedPlanContext | None = None,
     parent_issue_context: IssueContext | None = None,
     execution_recommendation=None,
+    plan_candidate_key: PlanCandidateKey | None = None,
 ) -> int:
     implementation_config, reuse_planning_session = _approved_implementation_config(config)
     coder_name = agent_display_name(implementation_config.coder)
@@ -8367,58 +8440,72 @@ def _implement_approved_issue(
         ),
     )
     initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_context.metadata)
-    pr_contract = make_pr_contract(
-        repository=implementation_config.repo,
-        pr_number=pr_number,
-        origin_flow="approved-plan-implementation",
-        primary_issue_number=issue_number,
-        expected_closing_issue_ids=closing_contract.issue_ids,
-        supersedes_hash=closing_contract.supersedes_hash,
+    # An unmanaged, non-staged approved plan with a complete candidate key
+    # publishes one transaction (#827, site b); the one-shot parent phase
+    # handoff then follows the commit.  Anything else keeps the version-1
+    # writers until its path is on the seam.
+    publish_through_seam = (
+        plan_candidate_key is not None
+        and plan_candidate_key.incompleteness_reason() is None
+        and managed_ci_handoff is None
+        and staged_parent_issue is None
+        and not implementation_config.dry_run
     )
-    post_trusted_pr_contract_record(
-        runner,
-        config=implementation_config,
-        pr_number=pr_number,
-        body=TrustedBody.canonical(
-            format_pr_contract_comment(pr_contract),
-            expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
-        ),
-    )
-    post_issue_pr_handoff_comment(
-        runner,
-        config=implementation_config,
-        issue_number=issue_number,
-        pr_number=pr_number,
-        pr_url=initial_pr_url,
-        pr_head_sha=initial_pr_head_sha,
-        flow="approved-plan-implementation",
-        plan_hash=plan_hash,
-        expected_closing_issue_ids=closing_contract.issue_ids,
-        supersedes_hash=closing_contract.supersedes_hash,
-    )
-    if one_shot_parent_issue is not None:
-        post_one_shot_impl_handoff_comment(
+    def _post_parent_phase_handoff() -> None:
+        if one_shot_parent_issue is not None:
+            post_one_shot_impl_handoff_comment(
+                runner,
+                config=implementation_config,
+                parent_issue=one_shot_parent_issue,
+                mode="implement-one-shot",
+                plan_hash=plan_hash,
+                plan_subject=plan_subject or "",
+                pr_number=pr_number,
+                pr_head_sha=initial_pr_context.metadata.head_sha,
+                strategy=(execution_recommendation.strategy if execution_recommendation is not None else None),
+                topology_source=(
+                    str(execution_identity["topology_source"])
+                    if execution_identity is not None else None
+                ),
+                execution_strategy_contract_version=(
+                    1 if execution_recommendation is not None else None
+                ),
+                recommendation_digest=(
+                    str(execution_identity["recommendation_sha256"])
+                    if execution_identity is not None else None
+                ),
+            )
+    if not publish_through_seam:
+        pr_contract = make_pr_contract(
+            repository=implementation_config.repo,
+            pr_number=pr_number,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=issue_number,
+            expected_closing_issue_ids=closing_contract.issue_ids,
+            supersedes_hash=closing_contract.supersedes_hash,
+        )
+        post_trusted_pr_contract_record(
             runner,
             config=implementation_config,
-            parent_issue=one_shot_parent_issue,
-            mode="implement-one-shot",
-            plan_hash=plan_hash,
-            plan_subject=plan_subject or "",
             pr_number=pr_number,
-            pr_head_sha=initial_pr_context.metadata.head_sha,
-            strategy=(execution_recommendation.strategy if execution_recommendation is not None else None),
-            topology_source=(
-                str(execution_identity["topology_source"])
-                if execution_identity is not None else None
-            ),
-            execution_strategy_contract_version=(
-                1 if execution_recommendation is not None else None
-            ),
-            recommendation_digest=(
-                str(execution_identity["recommendation_sha256"])
-                if execution_identity is not None else None
+            body=TrustedBody.canonical(
+                format_pr_contract_comment(pr_contract),
+                expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
             ),
         )
+        post_issue_pr_handoff_comment(
+            runner,
+            config=implementation_config,
+            issue_number=issue_number,
+            pr_number=pr_number,
+            pr_url=initial_pr_url,
+            pr_head_sha=initial_pr_head_sha,
+            flow="approved-plan-implementation",
+            plan_hash=plan_hash,
+            expected_closing_issue_ids=closing_contract.issue_ids,
+            supersedes_hash=closing_contract.supersedes_hash,
+        )
+        _post_parent_phase_handoff()
     implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
         implementation_result,
         approved_plan_context=approved_plan_context,
@@ -8439,50 +8526,91 @@ def _implement_approved_issue(
         legacy_tests_run=implementation_result.tests_run,
         cwd=active_workdir(implementation_config),
     )
-    initial_coder_body = _attach_round_metadata(
-        render_public_agent_comment(
-            kind="issue_implementation",
-            parsed=implementation_result,
-            agent=implementation_config.coder,
+    def _render_initial_coder_body(workflow_transaction_id: str | None) -> str:
+        return _attach_round_metadata(
+            render_public_agent_comment(
+                kind="issue_implementation",
+                parsed=implementation_result,
+                agent=implementation_config.coder,
+                config=implementation_config,
+                model_used=coder_response.model_used,
+                local_test_evidence=initial_local_test_evidence,
+                current_test_turn_id=coder_response.acquisition_test_turn_id,
+            ),
+            PostedRoundMetadata(
+                flow="pr",
+                role="coder",
+                agent=coder_name,
+                round_number=1,
+                subject=str(initial_pr_context.metadata.head_sha or "unknown"),
+                prior_items=(),
+                workflow_transaction_id=workflow_transaction_id,
+                raw_structured_coder_response=coder_output,
+                local_test_evidence=initial_local_test_evidence,
+                risk_test_matrix_evidence=(
+                    implementation_result.risk_test_matrix_evidence.to_payload()
+                    if implementation_result.risk_test_matrix_evidence is not None
+                    else None
+                ),
+                risk_test_matrix_diagnostics=tuple(
+                    diagnostic.to_payload()
+                    for diagnostic in implementation_result.risk_test_matrix_diagnostics
+                ),
+                model_used=coder_response.model_used,
+                **_metadata_identity_fields(coder_response),
+                **_architecture_metadata_fields(
+                    implementation_config,
+                    impact=getattr(implementation_result, "architecture_impact", None),
+                ),
+                acquisition_outcome=coder_response.acquisition_outcome,
+                acquisition_returncode=coder_response.acquisition_returncode,
+            ),
+        )
+    if publish_through_seam:
+        from . import workflow_transaction_publication as publication
+
+        publication.publish_transition(
+            runner,
             config=implementation_config,
-            model_used=coder_response.model_used,
-            local_test_evidence=initial_local_test_evidence,
-            current_test_turn_id=coder_response.acquisition_test_turn_id,
-        ),
-        PostedRoundMetadata(
-            flow="pr",
-            role="coder",
-            agent=coder_name,
-            round_number=1,
-            subject=str(initial_pr_context.metadata.head_sha or "unknown"),
-            prior_items=(),
-            raw_structured_coder_response=coder_output,
-            local_test_evidence=initial_local_test_evidence,
-            risk_test_matrix_evidence=(
-                implementation_result.risk_test_matrix_evidence.to_payload()
-                if implementation_result.risk_test_matrix_evidence is not None
-                else None
+            request=publication.TransitionRequest(
+                repository=implementation_config.repo,
+                pr_number=pr_number,
+                base=str(initial_pr_context.metadata.base_branch or implementation_config.base),
+                head_sha=initial_pr_head_sha,
+                origin_path=publication.ORIGIN_APPROVED_PLAN,
+                expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                primary_issue=issue_number,
+                approved_plan=publication.ApprovedPlanInput(
+                    plan_hash,
+                    plan_subject or approved_plan_context.plan_subject,
+                    plan_candidate_key,
+                ),
+                initial_coder_round=publication.InitialCoderRound(
+                    lambda transaction_id: _canonical_trusted_body(
+                        _render_initial_coder_body(transaction_id)
+                    )
+                ),
             ),
-            risk_test_matrix_diagnostics=tuple(
-                diagnostic.to_payload()
-                for diagnostic in implementation_result.risk_test_matrix_diagnostics
-            ),
-            model_used=coder_response.model_used,
-            **_metadata_identity_fields(coder_response),
-            **_architecture_metadata_fields(
+        )
+        # The parent phase handoff is a follow-on write, only after the commit.
+        if one_shot_parent_issue is not None:
+            _post_one_shot_parent_handoff_once(
+                runner,
                 implementation_config,
-                impact=getattr(implementation_result, "architecture_impact", None),
-            ),
-            acquisition_outcome=coder_response.acquisition_outcome,
-            acquisition_returncode=coder_response.acquisition_returncode,
-        ),
-    )
-    post_trusted_pr_comment(
-        runner,
-        config=implementation_config,
-        pr_number=pr_number,
-        body=_embed_pr_contract_marker(initial_coder_body, pr_contract),
-    )
+                parent_issue=one_shot_parent_issue,
+                plan_hash=plan_hash,
+                plan_subject=plan_subject or "",
+                pr_number=pr_number,
+                pr_head_sha=initial_pr_context.metadata.head_sha,
+                recommendation=execution_recommendation,
+            )
+    else:
+        post_trusted_pr_comment(
+            runner,
+            config=implementation_config,
+            pr_number=pr_number,
+            body=_embed_pr_contract_marker(_render_initial_coder_body(None), pr_contract),
+        )
     return run_pr_loop(
         runner,
         pr_number=pr_number,
@@ -11955,6 +12083,7 @@ def _run_plan_first_loop(
                     plan_subject=plan_subject,
                     staged_parent_issue=staged_parent_issue,
                     execution_recommendation=recommendation,
+                    plan_candidate_key=current_plan_key,
                 )
             raise AgentLoopError(f"Unknown plan execution mode: {mode}")
 
@@ -12569,10 +12698,8 @@ def run_issue_loop(
             # resuming the newest plan would silently change the implementation
             # contract. Fall back to the latest reconstructable round only when
             # no approved-plan handoff has selected a plan yet.
-            recorded_plan_handoff = find_latest_issue_pr_handoff(
-                issue_context.comments,
-                issue_number=issue_number,
-                repo=config.repo,
+            recorded_plan_handoff = _recorded_issue_handoff(
+                runner, config, issue_context=issue_context
             )
             if (
                 recorded_plan_handoff is not None
@@ -12914,6 +13041,40 @@ def run_issue_loop(
                             expected_closing_issue_ids=closing_contract.issue_ids,
                             supersedes_hash=closing_contract.supersedes_hash,
                         )
+            if (
+                plan_first
+                and not config.dry_run
+                and staged_parent_issue is None
+                and recovered_execution is not None
+                and recovered_execution.recommendation is not None
+                and recovered_execution.strategy == "one-shot"
+                and recovered_plan_hash is not None
+                and recovered_plan_context is not None
+                and recovered_plan_context.is_available
+            ):
+                # A committed transaction-era one-shot PR whose follow-on parent
+                # phase handoff was never posted (the publication was finished
+                # by this rerun, or that write failed) gets it now, once (#827).
+                from . import workflow_transaction_publication as publication
+
+                if publication.committed_pr_binding(
+                    runner, config, resolved_pr.pr_number
+                ) is not None:
+                    _post_one_shot_parent_handoff_once(
+                        runner,
+                        config,
+                        parent_issue=issue_number,
+                        plan_hash=recovered_plan_hash,
+                        plan_subject=(
+                            recovered_plan_context.plan_subject
+                            or _plan_subject(recovered_plan_context.canonical_text or "")
+                        ),
+                        pr_number=resolved_pr.pr_number,
+                        pr_head_sha=get_pr_review_context(
+                            runner, config=config, pr_number=resolved_pr.pr_number
+                        ).metadata.head_sha,
+                        recommendation=recovered_execution.recommendation,
+                    )
             return run_pr_loop(
                 runner,
                 pr_number=resolved_pr.pr_number,

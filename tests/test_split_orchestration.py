@@ -38,6 +38,9 @@ from coding_review_agent_loop.split_materialization import (
     format_split_stage_handoff_comment,
     split_stage_proposal_from_text,
 )
+# A full commit SHA: workflow transactions bind only full SHAs (#827).
+FULL_HEAD = "abc123" + "0" * 34
+
 from agent_loop_helpers import (
     FakeRunner,
     command_index,
@@ -360,6 +363,8 @@ def test_fresh_one_shot_materialization_rerun_reuses_split_child_and_pr(
         ),
     )
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             plan,
             "Implemented the approved one-shot plan.\n"
