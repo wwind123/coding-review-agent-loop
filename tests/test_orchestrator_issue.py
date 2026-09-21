@@ -11129,3 +11129,4 @@ def test_m946_approved_plan_resume_with_bad_scheduler_history_writes_nothing(tmp
     assert sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands) == claude_calls
     assert sum(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands) == codex_calls
     assert not _m946_workflow_records(runner, "AGENT_PLAN_ONE_SHOT_IMPL")
+

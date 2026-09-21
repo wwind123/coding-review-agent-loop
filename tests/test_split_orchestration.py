@@ -1508,3 +1508,116 @@ def test_plan_first_one_shot_selected_child_valid_canonical_record_resumes(tmp_p
     assert not any(
         "<!-- AGENT_ISSUE_PR_HANDOFF:" in comment for comment in runner.comments
     )
+
+
+# --- #946: staged child resume publishes one staged transaction ---
+
+_M946_ACTOR = "coding-review-agent-loop"
+_M946_HEAD = "abc123" + "0" * 34
+
+
+def _m946_actor_authored(comments):
+    return [{**comment, "author": {"login": _M946_ACTOR}} for comment in comments]
+
+
+def _m946_kinds(runner, number):
+    def kind(body):
+        if "AGENT_WORKFLOW_TRANSACTION" in body:
+            return "transaction"
+        if "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body:
+            return "contract"
+        if "AGENT_ISSUE_PR_HANDOFF" in body:
+            return "handoff"
+        return "other"
+
+    rest = lambda items: [c for c in items if isinstance(c.get("id"), int) and "user" in c]
+    if number == "pr":
+        return [kind(c["body"]) for c in rest(runner.pr_payload.get("comments", []))]
+    threads = [runner.issue_comments, *runner.issue_comments_by_number.values()]
+    return {
+        n: [kind(c["body"]) for c in rest(items)]
+        for n, items in [(56, runner.issue_comments), *runner.issue_comments_by_number.items()]
+    }
+
+
+@pytest.mark.parametrize("boundary", [None, 1, 2, 3, 4])
+def test_m946_selected_child_resume_by_closing_reference_publishes_staged_transaction(
+    tmp_path, boundary
+):
+    """Staged child resume (#827, site c): a split-stage child's PR found by closing
+    reference is published as one staged transaction that binds parent #56 and
+    child #101 (parent-owned plan), reissues both the handoff (on the child) and
+    the PR contract with a child-only closing scope, invokes no coder, opens no
+    PR, writes no version-1 record, and a rerun writes nothing new.
+
+    Writes: 1 prepared, 2 child handoff, 3 PR contract, 4 committed.  An
+    interruption at any of them stops the run before any reviewer; the rerun
+    finishes the same transaction and converges on the same records.
+    """
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        read_pr_transaction_views,
+    )
+    from coding_review_agent_loop.workflow_transaction import StagedIdentity
+
+    plan = "Plan:\n- Auth flow change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    plan_subject = _plan_subject(plan)
+    plan_hash = approved_plan_hash(plan)
+    issue_comments = _m946_actor_authored(
+        _approved_plan_round_comments(plan, plan_subject=plan_subject)
+        + _selected_child_split_setup(plan_hash=plan_hash, plan_subject=plan_subject)
+    )
+    provenance = (
+        "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=101 "
+        f"flow=approved plan={plan_hash}"
+    )
+    runner = FakeRunner(
+        git_head=_M946_HEAD,
+        persist_rest_comment_posts=True,
+        pr_payload={"number": 77, "state": "OPEN", "body": "Fixes #101"},
+        open_prs_payload=[{"number": 77, "body": "Fixes #101"}],
+        issue_comments=issue_comments,
+        pr_commit_pages=[[{"commit": {"oid": "commit-1", "message": provenance}}]] * 8,
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="LGTM."),
+            structured_pr_review(state="approved", summary="LGTM."),
+        ],
+    )
+    config = make_config(tmp_path, materialize_split_issues=True)
+
+    if boundary is not None:
+        runner.rest_post_failures = (boundary,)
+        with pytest.raises(WorkflowTransactionError):
+            run_issue_loop(
+                runner, issue_number=56, config=config, plan_first=True,
+                implement_after_approval=True,
+            )
+        assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+        assert "transaction" not in _m946_kinds(runner, "pr")[1:]
+        runner.rest_post_failures = ()
+    assert run_issue_loop(
+        runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True
+    ) == 0
+
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+    assert _m946_kinds(runner, "pr") == ["transaction", "contract", "transaction"]
+    issue_kinds = _m946_kinds(runner, "issue")
+    # The handoff lives on the child only; the parent gets no handoff.
+    assert issue_kinds.get(101) == ["handoff"]
+    assert "handoff" not in issue_kinds.get(56, [])
+    assert not [
+        body for body in runner.comments
+        if "AGENT_ISSUE_PR_HANDOFF" in body or "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body
+    ]
+    resolved = read_pr_transaction_views(runner, config, 77, 101)
+    intent = resolved.lineage.latest_committed.intent
+    assert intent.staged == StagedIdentity(56, 101, "parent")
+    assert intent.expected_closing_issue_ids == (101,)
+    assert intent.approved_plan_hash == plan_hash
+
+    before = (_m946_kinds(runner, "pr"), _m946_kinds(runner, "issue"))
+    assert run_issue_loop(
+        runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True
+    ) == 0
+    assert (_m946_kinds(runner, "pr"), _m946_kinds(runner, "issue")) == before

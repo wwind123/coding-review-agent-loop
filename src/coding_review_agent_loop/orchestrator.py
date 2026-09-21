@@ -737,6 +737,107 @@ def _finish_pr_side_transaction(
     return True
 
 
+def _publish_handed_off_plan_resume(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    issue_number: int,
+    pr_number: int,
+    plan_hash: str,
+    plan_subject: str | None,
+    plan_candidate_key: PlanCandidateKey | None,
+    plan_additions: tuple[int, ...],
+    staged=None,
+) -> bool:
+    """Publish an already-handed-off approved plan's resume through the seam (#827).
+
+    Returns whether the seam owns the PR: a transaction-era PR (whose pending
+    transaction is finished here) or a legacy PR published as one approved-plan
+    transaction.  False only when the authenticated actor never recorded the
+    plan, so no approved-plan intent can bind it and the caller keeps today's
+    version-1 handoff.  A malformed or unmatched scheduler history raises
+    before any write.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if _finish_pr_side_transaction(runner, config, pr_number=pr_number):
+        return True
+    plan_input = (
+        publication.ApprovedPlanInput(plan_hash, plan_subject, plan_candidate_key)
+        if plan_candidate_key is not None and plan_candidate_key.incompleteness_reason() is None
+        else publication.recover_approved_plan_input(
+            runner,
+            config,
+            plan_issue_number=(
+                staged.parent_issue
+                if staged is not None and staged.plan_owner == "parent"
+                else issue_number
+            ),
+            plan_hash=plan_hash,
+            plan_subject=plan_subject,
+        )
+    )
+    if plan_input is None:
+        return False
+    closing_contract = resolve_issue_contract(
+        primary_issue=issue_number,
+        cli_additions=config.expected_closing_issue_ids,
+        plan_additions=plan_additions,
+        recovered=None,
+        supersede=config.supersede_expected_closing_contract,
+    )
+    if staged is not None:
+        reject_parent_from_contract(closing_contract, parent_issue=staged.parent_issue)
+    pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    validate_pr_expected_closing_issues(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        expected_issue_ids=closing_contract.issue_ids,
+        body=pr_context.metadata.body,
+        reject_unexpected=False,
+    )
+    _pr_url, head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
+    publication.publish_transition(
+        runner,
+        config=config,
+        request=publication.TransitionRequest(
+            repository=config.repo,
+            pr_number=pr_number,
+            base=str(pr_context.metadata.base_branch or config.base),
+            head_sha=head_sha,
+            origin_path=(
+                publication.ORIGIN_STAGED_CHILD
+                if staged is not None
+                else publication.ORIGIN_APPROVED_PLAN
+            ),
+            expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+            primary_issue=issue_number,
+            staged=staged,
+            approved_plan=plan_input,
+        ),
+    )
+    return True
+
+
+def _staged_plan_owner(plan_issue: int, target_issue: int) -> str:
+    """Which staged issue owns the approved plan (#827).
+
+    A materialized split stage implements a child from the parent's plan, so the
+    parent owns it; a separately planned decomposition child owns its own plan.
+    """
+    return "parent" if plan_issue != target_issue else "child"
+
+
+def _staged_identity(parent_issue: int | None, child_issue: int, plan_owner: str | None):
+    """The transaction's staged identity, or None for a non-staged publication."""
+    if parent_issue is None:
+        return None
+    from .workflow_transaction import StagedIdentity
+
+    return StagedIdentity(parent_issue, child_issue, plan_owner or "child")
+
+
 def _canonical_trusted_body(text: str) -> TrustedBody:
     expected = tuple(item.definition.token for item in scan_reserved_markers(text))
     return TrustedBody.canonical(text, expected_tokens=expected)
@@ -8041,6 +8142,7 @@ def _implement_approved_issue(
     parent_issue_context: IssueContext | None = None,
     execution_recommendation=None,
     plan_candidate_key: PlanCandidateKey | None = None,
+    staged_plan_owner: str | None = None,
 ) -> int:
     implementation_config, reuse_planning_session = _approved_implementation_config(config)
     coder_name = agent_display_name(implementation_config.coder)
@@ -8154,10 +8256,11 @@ def _implement_approved_issue(
         # never recorded (no approved-plan intent can bind it) keeps today's
         # version-1 writers.
         resume_through_seam = False
+        resume_staged = _staged_identity(staged_parent_issue, issue_number, staged_plan_owner)
         if (
             resolved_pr.source == "legacy-closing-reference"
             and not implementation_config.managed_ci
-            and staged_parent_issue is None
+            and (staged_parent_issue is None or staged_plan_owner is not None)
             and not implementation_config.dry_run
         ):
             from . import workflow_transaction_publication as publication
@@ -8177,7 +8280,11 @@ def _implement_approved_issue(
                     else publication.recover_approved_plan_input(
                         runner,
                         implementation_config,
-                        plan_issue_number=issue_number,
+                        plan_issue_number=(
+                            resume_staged.parent_issue
+                            if resume_staged is not None and resume_staged.plan_owner == "parent"
+                            else issue_number
+                        ),
                         plan_hash=plan_hash,
                         plan_subject=plan_subject or approved_plan_context.plan_subject,
                     )
@@ -8206,9 +8313,14 @@ def _implement_approved_issue(
                                 or implementation_config.base
                             ),
                             head_sha=resumed_head_sha,
-                            origin_path=publication.ORIGIN_APPROVED_PLAN,
+                            origin_path=(
+                                publication.ORIGIN_STAGED_CHILD
+                                if resume_staged is not None
+                                else publication.ORIGIN_APPROVED_PLAN
+                            ),
                             expected_closing_issue_ids=tuple(closing_contract.issue_ids),
                             primary_issue=issue_number,
+                            staged=resume_staged,
                             approved_plan=resume_plan_input,
                         ),
                     )
@@ -8524,15 +8636,17 @@ def _implement_approved_issue(
         ),
     )
     initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_context.metadata)
-    # An unmanaged, non-staged approved plan with a complete candidate key
-    # publishes one transaction (#827, site b); the one-shot parent phase
-    # handoff then follows the commit.  Anything else keeps the version-1
-    # writers until its path is on the seam.
+    # An unmanaged approved plan with a complete candidate key publishes one
+    # transaction (#827, site b); a staged child does so with its staged
+    # identity (both handoff and PR contract, child-only closing scope) when
+    # the caller names the plan owner.  The one-shot parent phase handoff then
+    # follows the commit.  Anything else keeps the version-1 writers until its
+    # path is on the seam.
     publish_through_seam = (
         plan_candidate_key is not None
         and plan_candidate_key.incompleteness_reason() is None
         and managed_ci_handoff is None
-        and staged_parent_issue is None
+        and (staged_parent_issue is None or staged_plan_owner is not None)
         and not implementation_config.dry_run
     )
     def _post_parent_phase_handoff() -> None:
@@ -8661,9 +8775,14 @@ def _implement_approved_issue(
                 pr_number=pr_number,
                 base=str(initial_pr_context.metadata.base_branch or implementation_config.base),
                 head_sha=initial_pr_head_sha,
-                origin_path=publication.ORIGIN_APPROVED_PLAN,
+                origin_path=(
+                    publication.ORIGIN_STAGED_CHILD
+                    if staged_parent_issue is not None
+                    else publication.ORIGIN_APPROVED_PLAN
+                ),
                 expected_closing_issue_ids=tuple(closing_contract.issue_ids),
                 primary_issue=issue_number,
+                staged=_staged_identity(staged_parent_issue, issue_number, staged_plan_owner),
                 approved_plan=publication.ApprovedPlanInput(
                     plan_hash,
                     plan_subject or approved_plan_context.plan_subject,
@@ -12003,7 +12122,14 @@ def _run_plan_first_loop(
                 # plan-hash-scoped) one-shot handoff lookup below, so a stale
                 # canonical record fails safely instead of being bypassed by
                 # it (#589). It is scoped to the selected target issue, since
-                # a split-stage plan implements a child, not the parent.
+                # a split-stage plan implements a child, not the parent.  An
+                # interrupted publication on the target (for example a staged
+                # child's) is finished first, so the authority lookup sees it
+                # committed instead of refusing a partial candidate (#827).
+                if target_issue_number != issue_number:
+                    _finish_interrupted_issue_publication(
+                        runner, config, issue_number=target_issue_number
+                    )
                 resolved_pr = resolve_canonical_pr_for_issue(
                     runner,
                     config=config,
@@ -12043,7 +12169,42 @@ def _run_plan_first_loop(
                             pr_number=resolved_pr.pr_number,
                             issue_number=staged_parent_issue,
                         )
-                    if resolved_pr.source == "legacy-closing-reference":
+                    # An unmanaged, non-staged already-handed-off resume goes
+                    # through the seam (#827, site c): a transaction-era PR has
+                    # its pending transaction finished and never receives a
+                    # version-1 record; a legacy PR is published as one
+                    # approved-plan transaction (handoff and PR contract).  A
+                    # plan the authenticated actor never recorded keeps v1.
+                    handed_off_through_seam = False
+                    if (
+                        resolved_pr.source == "legacy-closing-reference"
+                        and not config.managed_ci
+                        and not config.dry_run
+                    ):
+                        handed_off_through_seam = _publish_handed_off_plan_resume(
+                            runner,
+                            config,
+                            issue_number=target_issue_number,
+                            pr_number=resolved_pr.pr_number,
+                            plan_hash=plan_hash,
+                            plan_subject=current_plan_subject,
+                            plan_candidate_key=current_plan_key,
+                            # A staged child's closing scope is the child only.
+                            plan_additions=(
+                                ()
+                                if staged_parent_issue is not None
+                                else _extract_current_expected_closing_issue_ids(current_plan)
+                            ),
+                            staged=_staged_identity(
+                                staged_parent_issue,
+                                target_issue_number,
+                                _staged_plan_owner(issue_number, target_issue_number),
+                            ),
+                        )
+                    if (
+                        resolved_pr.source == "legacy-closing-reference"
+                        and not handed_off_through_seam
+                    ):
                         resumed_pr_context = get_pr_review_context(
                             runner, config=config, pr_number=resolved_pr.pr_number
                         )
@@ -12168,6 +12329,11 @@ def _run_plan_first_loop(
                     staged_parent_issue=staged_parent_issue,
                     execution_recommendation=recommendation,
                     plan_candidate_key=current_plan_key,
+                    staged_plan_owner=(
+                        _staged_plan_owner(issue_number, target_issue_number)
+                        if staged_parent_issue is not None
+                        else None
+                    ),
                 )
             raise AgentLoopError(f"Unknown plan execution mode: {mode}")
 
