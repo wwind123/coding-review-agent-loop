@@ -1512,7 +1512,6 @@ def test_recover_approved_plan_input_binds_the_earliest_checkpoint(tmp_path):
         ("unmatched", "scheduler-checkpoint-unmatched"),
         ("before-anchor", "scheduler-checkpoint-unmatched"),
         ("invalid", "scheduler-metadata-invalid"),
-        ("no-anchor", "approved-plan-anchor-missing"),
     ],
 )
 def test_recover_approved_plan_input_fails_closed_on_a_bad_history(tmp_path, history, code):
@@ -1527,18 +1526,32 @@ def test_recover_approved_plan_input_fails_closed_on_a_bad_history(tmp_path, his
     elif history == "before-anchor":
         github.seed(ISSUE, scheduler_comment(1).body)
         github.seed(ISSUE, plan_record_comment(2).body)
-    elif history == "invalid":
+    else:
         seed_plan(github)
         body = scheduler_comment(3, round_number=2).body
         github.seed(ISSUE, _corrupt_scheduler_digest(body))
-    else:
-        github.seed(ISSUE, scheduler_comment(2).body)
     before = github.write_count
     with pytest.raises(WorkflowTransactionError) as refused:
         recover_approved_plan_input(
             github, make_config(tmp_path), plan_issue_number=ISSUE, plan_hash=PLAN_HASH
         )
     assert refused.value.code == code
+    assert github.write_count == before
+
+
+def test_recover_approved_plan_input_without_an_actor_plan_record_binds_nothing(tmp_path):
+    """A plan only another identity recorded has no anchor to bind: None, no write."""
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        recover_approved_plan_input,
+    )
+
+    github = TransactionGitHub()
+    github.seed(ISSUE, plan_record_comment(1).body, author=FOREIGN)
+    github.seed(ISSUE, scheduler_comment(2).body)
+    before = github.write_count
+    assert recover_approved_plan_input(
+        github, make_config(tmp_path), plan_issue_number=ISSUE, plan_hash=PLAN_HASH
+    ) is None
     assert github.write_count == before
 
 

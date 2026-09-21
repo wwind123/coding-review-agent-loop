@@ -2442,7 +2442,7 @@ def recover_approved_plan_input(
     plan_issue_number: int,
     plan_hash: str,
     plan_subject: str | None = None,
-) -> ApprovedPlanInput:
+) -> ApprovedPlanInput | None:
     """The approved-plan input of a sessionless resume, from durable records only.
 
     An issue-command resume that no longer holds the planning session cannot
@@ -2454,11 +2454,15 @@ def recover_approved_plan_input(
     * otherwise the key is read from the earliest authenticated
       scheduler-prelaunch summary for the approved subject strictly after the
       approved-plan anchor, which is the checkpoint stage A binds;
-    * a missing or ambiguous anchor, undecodable scheduler metadata, a
+    * a divergent or unordered anchor, undecodable scheduler metadata, a
       scheduled history with no checkpoint for the approved subject, or an
-      incomplete key raise a non-mutating ``WorkflowTransactionError``.
+      incomplete key raise a non-mutating ``WorkflowTransactionError``;
+    * only when the authenticated actor authored no plan record carrying the
+      approved hash at all (a planning history written by another identity,
+      which no approved-plan intent can bind) does it return ``None``, and
+      the caller keeps today's pre-transaction behaviour.
 
-    It never falls back to a caller's non-transaction path and never writes.
+    Never writes.
     """
     from .workflow_transaction import comment_order
 
@@ -2479,10 +2483,12 @@ def recover_approved_plan_input(
         anchor = resolve_approved_plan_anchor(
             view, plan_hash=plan_hash, plan_subject=plan_subject
         )
-    except WorkflowTransactionError:
+    except WorkflowTransactionError as exc:
+        if exc.code == "approved-plan-anchor-missing":
+            return None
         raise
     except AgentLoopError as exc:
-        raise refuse(str(exc), code="approved-plan-anchor-missing") from exc
+        raise refuse(str(exc), code="approved-plan-anchor-invalid") from exc
     records = _extract_round_metadata_records(view.authored, flow="plan")
     invalid = [
         view.authored[record.index].comment_id

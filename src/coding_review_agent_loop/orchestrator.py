@@ -8145,36 +8145,27 @@ def _implement_approved_issue(
             resumed_pr_context = get_pr_review_context(
                 runner, config=implementation_config, pr_number=existing_pr_number
             )
-        # An unmanaged, non-staged approved plan with a complete candidate key
-        # resumes through the seam (#827, site a): one transaction restating or
-        # upgrading what the PR records, and never a version-1 record on a
-        # transaction-era PR.  Anything else keeps the version-1 writers.
-        resume_through_seam = (
+        # An unmanaged, non-staged approved-plan resume of a PR found by closing
+        # reference goes through the seam (#827, site a): a transaction-era PR
+        # has its pending transaction finished and never receives a version-1
+        # record; a legacy PR is published with the session's complete key or
+        # the durable recovery, which stops non-mutating on a malformed or
+        # unmatched scheduler history.  Only a plan the authenticated actor
+        # never recorded (no approved-plan intent can bind it) keeps today's
+        # version-1 writers.
+        resume_through_seam = False
+        if (
             resolved_pr.source == "legacy-closing-reference"
             and not implementation_config.managed_ci
             and staged_parent_issue is None
             and not implementation_config.dry_run
-        )
-        if resume_through_seam:
+        ):
             from . import workflow_transaction_publication as publication
 
-            if not _finish_pr_side_transaction(
+            resume_through_seam = _finish_pr_side_transaction(
                 runner, implementation_config, pr_number=existing_pr_number
-            ):
-                validate_pr_expected_closing_issues(
-                    runner,
-                    config=implementation_config,
-                    pr_number=existing_pr_number,
-                    expected_issue_ids=closing_contract.issue_ids,
-                    body=resumed_pr_context.metadata.body,
-                    reject_unexpected=False,
-                )
-                _pr_url, resumed_head_sha = require_pr_metadata_for_handoff(
-                    resumed_pr_context.metadata
-                )
-                # The session's complete key when it has one; otherwise the
-                # durable recovery, which stops non-mutating on a malformed or
-                # unmatched scheduler history.
+            )
+            if not resume_through_seam:
                 resume_plan_input = (
                     publication.ApprovedPlanInput(
                         plan_hash,
@@ -8191,23 +8182,36 @@ def _implement_approved_issue(
                         plan_subject=plan_subject or approved_plan_context.plan_subject,
                     )
                 )
-                publication.publish_transition(
-                    runner,
-                    config=implementation_config,
-                    request=publication.TransitionRequest(
-                        repository=implementation_config.repo,
+                if resume_plan_input is not None:
+                    resume_through_seam = True
+                    validate_pr_expected_closing_issues(
+                        runner,
+                        config=implementation_config,
                         pr_number=existing_pr_number,
-                        base=str(
-                            resumed_pr_context.metadata.base_branch
-                            or implementation_config.base
+                        expected_issue_ids=closing_contract.issue_ids,
+                        body=resumed_pr_context.metadata.body,
+                        reject_unexpected=False,
+                    )
+                    _pr_url, resumed_head_sha = require_pr_metadata_for_handoff(
+                        resumed_pr_context.metadata
+                    )
+                    publication.publish_transition(
+                        runner,
+                        config=implementation_config,
+                        request=publication.TransitionRequest(
+                            repository=implementation_config.repo,
+                            pr_number=existing_pr_number,
+                            base=str(
+                                resumed_pr_context.metadata.base_branch
+                                or implementation_config.base
+                            ),
+                            head_sha=resumed_head_sha,
+                            origin_path=publication.ORIGIN_APPROVED_PLAN,
+                            expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                            primary_issue=issue_number,
+                            approved_plan=resume_plan_input,
                         ),
-                        head_sha=resumed_head_sha,
-                        origin_path=publication.ORIGIN_APPROVED_PLAN,
-                        expected_closing_issue_ids=tuple(closing_contract.issue_ids),
-                        primary_issue=issue_number,
-                        approved_plan=resume_plan_input,
-                    ),
-                )
+                    )
         # On a transaction-era PR the parent phase handoff is a follow-on write,
         # only after the commit, and at most once across reruns.
         parent_handoff_once = resume_through_seam or (
@@ -13067,7 +13071,8 @@ def run_issue_loop(
                 # publishes through the seam as well (#827, site a).  The
                 # candidate key is recovered from durable records; a malformed,
                 # unmatched, or unordered scheduler history stops here before
-                # any write and never falls back to version-1 records.
+                # any write and never falls back to version-1 records.  Only a
+                # plan the authenticated actor never recorded keeps today's path.
                 recovered_plan_input = None
                 if (
                     plan_first
