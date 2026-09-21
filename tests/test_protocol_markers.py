@@ -439,7 +439,6 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
     offenders: list[str] = []
     for path in sorted(source_root.rglob("*.py")):
         # Stage B adds the publication seam as the second sanctioned importer.
-        # No orchestration call site consumes either module yet.
         # The bound managed-CI authorization rule judges a record against its
         # transaction, so it is the third.  ``managed_ci`` is the fourth: its single
         # authorization accessor classifies the era with the stage A body rule and
@@ -461,7 +460,12 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
                 imported = {alias.name for alias in node.names}
                 if module_name.endswith("workflow_transaction") or "workflow_transaction" in imported:
                     offenders.append(f"{path.name} imports workflow_transaction")
-                for name in sorted(imported & v2_names):
+                allowed = (
+                    # The PR loop's head-advance points classify the seam's
+                    # error; they read and write only through the seam.
+                    {"WorkflowTransactionError"} if path.name == "orchestrator.py" else set()
+                )
+                for name in sorted((imported & v2_names) - allowed):
                     offenders.append(f"{path.name} imports {name}")
             elif isinstance(node, ast.Import):
                 for alias in node.names:

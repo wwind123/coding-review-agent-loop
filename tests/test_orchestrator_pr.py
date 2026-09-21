@@ -3366,6 +3366,113 @@ def test_m946_pr_loop_stops_on_an_integrity_failure_at_the_round_binding(
     assert not [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
 
 
+@pytest.mark.parametrize("boundary", [2, 3, 4])
+def test_m946_pr_loop_entry_stops_on_a_partial_transaction_before_any_round(
+    monkeypatch, tmp_path, boundary
+):
+    """Point 1: a pr-command resume on a prepared-only transaction raises the
+    diagnostic at entry; no reviewer or coder runs and nothing is written."""
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, boundary=boundary
+    )
+    runner.codex_outputs = [structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")]
+    config = make_config(tmp_path, repo=config.repo, reviewer=("codex",), max_rounds=1)
+
+    with pytest.raises(WorkflowTransactionError) as raised:
+        run_pr_loop(runner, pr_number=pr, config=config)
+
+    assert raised.value.transaction_ids
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    assert _m946_rest_comment_posts(runner) == []
+    assert _m946_comment_writes(runner) == []
+    assert merged == []
+
+
+def test_m946_entry_commits_the_head_successor_then_gates(monkeypatch, tmp_path):
+    from workflow_transaction_helpers import HEAD_2
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2, persist_writes=True
+    )
+
+    orchestrator._entry_head_transaction(runner, config, pr_number=pr, head_sha=HEAD_2)
+
+    gated = publication.require_live_head_authority(runner, config, pr_number=pr, head_sha=HEAD_2)
+    assert gated.intent.successor_kind == "head-advance"
+    assert len(_m946_rest_comment_posts(runner)) == 2
+    orchestrator._entry_head_transaction(runner, config, pr_number=pr, head_sha=HEAD_2)
+    assert len(_m946_rest_comment_posts(runner)) == 2
+
+
+def test_m946_entry_leaves_a_legacy_pr_untouched(tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path)
+
+    orchestrator._entry_head_transaction(runner, config, pr_number=77, head_sha="abc123")
+
+    assert not [c for c, _cwd in runner.commands if c[:4] == ["gh", "api", "--method", "POST"]]
+
+
+def test_m946_dispatched_coder_head_commits_its_successor(monkeypatch, tmp_path):
+    """Point 4: the head a dispatched coder produced gets its head-advance successor."""
+    from workflow_transaction_helpers import HEAD_2
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2, persist_writes=True
+    )
+
+    orchestrator._dispatched_coder_head_transaction(runner, config, pr_number=pr, head_sha=HEAD_2)
+
+    gated = publication.require_live_head_authority(runner, config, pr_number=pr, head_sha=HEAD_2)
+    assert gated.intent.head_sha == HEAD_2
+    assert len(_m946_rest_comment_posts(runner)) == 2
+
+
+def test_m946_dispatched_coder_head_failure_is_recoverable_and_retried_by_the_round(
+    monkeypatch, tmp_path
+):
+    """A failed successor write at point 4 does not raise; point 2 then gives no
+    live-head authority, so nothing is reused until a later round commits it."""
+    from workflow_transaction_helpers import HEAD_2
+    from coding_review_agent_loop.workflow_transaction_publication import NoLiveHeadAuthority
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2
+    )
+
+    orchestrator._dispatched_coder_head_transaction(runner, config, pr_number=pr, head_sha=HEAD_2)
+
+    authority = orchestrator._round_live_head_authority(
+        runner, config, pr_number=pr, head_sha=HEAD_2
+    )
+    assert isinstance(authority, NoLiveHeadAuthority)
+    # Once writes succeed, the next round commits the successor and grants it.
+    runner.persist_rest_comment_posts = True
+    authority = orchestrator._round_live_head_authority(
+        runner, config, pr_number=pr, head_sha=HEAD_2
+    )
+    assert authority.intent.head_sha == HEAD_2
+
+
+def test_m946_dispatched_coder_head_integrity_failure_stops(monkeypatch, tmp_path):
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    def integrity(*_args, **_kwargs):
+        raise WorkflowTransactionError("divergent", code="divergent-transactions")
+
+    monkeypatch.setattr(publication, "ensure_live_head_transaction", integrity)
+
+    with pytest.raises(WorkflowTransactionError):
+        orchestrator._dispatched_coder_head_transaction(
+            FakeRunner(), make_config(tmp_path), pr_number=77, head_sha="abc123"
+        )
+
+
 @pytest.mark.parametrize("board", ["absent", "neutral", "skipped", "forbidden"])
 def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
     monkeypatch, tmp_path, board

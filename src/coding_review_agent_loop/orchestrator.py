@@ -98,6 +98,7 @@ from .errors import (
     QuotaResetExceededError,
     ReviewSubstanceIntegrityError,
     UnknownPriorItemDispositionError,
+    WorkflowTransactionError,
 )
 from .expected_closure import (
     ExpectedClosingContract,
@@ -15082,6 +15083,89 @@ def _is_completed_full_board_scheduler_record(
         return False
 
 
+def _entry_head_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str | None,
+) -> None:
+    """Head-advance point 1 (#827): loop entry is a writer path and keeps raising.
+
+    Commits the ``head-advance`` successor a new live head needs, then gates:
+    a prepared-only, deleted, or contradictory transaction stops the PR command
+    with the diagnostic before any round starts.  A legacy-era PR is untouched.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run or not head_sha:
+        return
+    publication.ensure_live_head_transaction(
+        runner, config, pr_number=pr_number, head_sha=head_sha
+    )
+    publication.require_live_head_authority(
+        runner, config, pr_number=pr_number, head_sha=head_sha
+    )
+
+
+def _entry_transaction_precheck(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str | None,
+) -> None:
+    """Read-only entry check (#827) that runs before any version-1 PR reader.
+
+    A transaction-era PR whose lineage is partial (no committed transaction,
+    or a pending prepared record) stops the PR command here with the
+    transaction diagnostic, before any round, selection, or write.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run or not head_sha:
+        return
+    resolved = publication.read_pr_transaction_views(runner, config, pr_number, None)
+    if resolved.era != publication.ERA_TRANSACTION:
+        return
+    lineage = resolved.lineage
+    if lineage.latest_committed is None or lineage.pending is not None:
+        publication.require_live_head_authority(
+            runner, config, pr_number=pr_number, head_sha=head_sha
+        )
+
+
+def _dispatched_coder_head_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str | None,
+) -> None:
+    """Head-advance point 4 (#827): a head produced by a dispatched coder turn.
+
+    Commits its ``head-advance`` successor.  A recoverable failure does not
+    raise: the next round's head binding (point 2) retries it and meanwhile
+    reuses nothing.  An integrity failure stops the loop.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run or not head_sha:
+        return
+    try:
+        publication.ensure_live_head_transaction(
+            runner, config, pr_number=pr_number, head_sha=head_sha
+        )
+    except WorkflowTransactionError as exc:
+        if not publication.is_recoverable(exc):
+            raise
+        log(
+            config,
+            f"PR #{pr_number}: head {head_sha} successor not committed yet; the next "
+            f"round retries it. {exc}",
+        )
+
+
 def _round_live_head_authority(
     runner: Runner,
     config: AgentLoopConfig,
@@ -15805,6 +15889,10 @@ def run_pr_loop(
                     managed_branch=managed_branch,
                     override_nonce=override_nonce,
                 )
+        _entry_transaction_precheck(
+            runner, config, pr_number=pr_number,
+            head_sha=initial_pr_context.metadata.head_sha,
+        )
         recorded_pr_contract = find_latest_pr_contract(
             initial_pr_context.comments,
             repository=config.repo,
@@ -16688,6 +16776,10 @@ def run_pr_loop(
                     expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
                     supersedes_hash=closing_contract.supersedes_hash,
                 )
+        _entry_head_transaction(
+            runner, config, pr_number=pr_number,
+            head_sha=initial_pr_context.metadata.head_sha,
+        )
         def managed_ci_active(metadata: PullRequestMetadata) -> bool:
             """Drop adopted filtering immediately when its live handshake changes."""
             nonlocal managed_ci
@@ -20777,6 +20869,10 @@ def run_pr_loop(
                         issue_created_handoff=managed_ci_handoff,
                         override_nonce=managed_ci_handoff.override_nonce,
                     )
+            _dispatched_coder_head_transaction(
+                runner, config, pr_number=pr_number,
+                head_sha=updated_pr_context.metadata.head_sha,
+            )
             log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")
             pre_review_test_pending = True
             if external_recovery_full_board:
