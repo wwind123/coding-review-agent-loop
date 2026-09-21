@@ -83,6 +83,7 @@ from .workflow_transaction import (
     RECORD_SET_ENTRY_NAMES,
     RECOVERY_OPERATOR_REVIEW,
     RECOVERY_RERUN,
+    RECOVERY_RERUN_PLAN_REVIEW,
     STATUS_INHERITED,
     STATUS_NOT_APPLICABLE,
     STATUS_UNPUBLISHED,
@@ -2441,53 +2442,106 @@ def recover_approved_plan_input(
     plan_issue_number: int,
     plan_hash: str,
     plan_subject: str | None = None,
-) -> ApprovedPlanInput | None:
-    """The approved-plan input of a resume, recovered from durable records only.
+) -> ApprovedPlanInput:
+    """The approved-plan input of a sessionless resume, from durable records only.
 
     An issue-command resume that no longer holds the planning session cannot
-    rebuild the approved plan's candidate key.  The key only selects the
-    scheduler checkpoint, so it is recovered only where that selection is
-    unambiguous: a planning history with no scheduler records needs no key
-    (the checkpoint is the ``no-plan-scheduler-records`` absence); otherwise
-    every scheduler-prelaunch summary for the approved subject after the
-    approved-plan anchor must carry the same complete key.  Anything else
-    returns ``None`` and the caller keeps its non-transaction path.  Never
-    writes.
+    rebuild the approved plan's candidate key, and the key only selects the
+    scheduler checkpoint.  So:
+
+    * a planning history with no scheduler record needs no key (the
+      checkpoint is the ``no-plan-scheduler-records`` absence);
+    * otherwise the key is read from the earliest authenticated
+      scheduler-prelaunch summary for the approved subject strictly after the
+      approved-plan anchor, which is the checkpoint stage A binds;
+    * a missing or ambiguous anchor, undecodable scheduler metadata, a
+      scheduled history with no checkpoint for the approved subject, or an
+      incomplete key raise a non-mutating ``WorkflowTransactionError``.
+
+    It never falls back to a caller's non-transaction path and never writes.
     """
     from .workflow_transaction import comment_order
 
     view = read_authenticated_protocol_comments(
         runner, config=config, surface_kind=ISSUE_THREAD_SURFACE, number=plan_issue_number
     )
+
+    def refuse(problem: str, *, code: str, recovery: str = RECOVERY_OPERATOR_REVIEW):
+        return WorkflowTransactionError(
+            f"The approved plan {plan_hash} of issue #{plan_issue_number} cannot be "
+            "recovered for publication",
+            problems=(problem,),
+            recovery_action=recovery,
+            code=code,
+        )
+
     try:
         anchor = resolve_approved_plan_anchor(
             view, plan_hash=plan_hash, plan_subject=plan_subject
         )
-        records = _extract_round_metadata_records(view.authored, flow="plan")
-        if all(record.metadata.scheduler_metadata_status == "absent" for record in records):
-            return ApprovedPlanInput(plan_hash, anchor.plan_subject, None)
-        keys: set[PlanCandidateKey] = set()
-        for record in records:
-            metadata = record.metadata
-            if (
-                metadata.role != "summary"
-                or metadata.phase != "scheduler-prelaunch"
-                or metadata.subject != anchor.plan_subject
-                or metadata.scheduler_metadata_status != "valid"
-                or metadata.plan_candidate_key is None
-            ):
-                continue
-            if comment_order(anchor.comment, view.authored[record.index]) != "later":
-                continue
-            keys.add(PlanCandidateKey.from_mapping(metadata.plan_candidate_key))
-    except (AgentLoopError, WorkflowTransactionError):
-        return None
-    if len(keys) != 1:
-        return None
-    (key,) = keys
-    if key.incompleteness_reason() is not None:
-        return None
-    return ApprovedPlanInput(plan_hash, anchor.plan_subject, key)
+    except WorkflowTransactionError:
+        raise
+    except AgentLoopError as exc:
+        raise refuse(str(exc), code="approved-plan-anchor-missing") from exc
+    records = _extract_round_metadata_records(view.authored, flow="plan")
+    invalid = [
+        view.authored[record.index].comment_id
+        for record in records
+        if record.metadata.scheduler_metadata_status == "invalid"
+    ]
+    if invalid:
+        raise refuse(
+            "contradictory scheduler metadata in comment(s) "
+            + ", ".join(str(item) for item in invalid),
+            code="scheduler-metadata-invalid",
+        )
+    if all(record.metadata.scheduler_metadata_status == "absent" for record in records):
+        return ApprovedPlanInput(plan_hash, anchor.plan_subject, None)
+    for record in records:
+        metadata = record.metadata
+        if (
+            metadata.role != "summary"
+            or metadata.phase != "scheduler-prelaunch"
+            or metadata.subject != anchor.plan_subject
+            or metadata.scheduler_metadata_status != "valid"
+        ):
+            continue
+        comment = view.authored[record.index]
+        order = comment_order(anchor.comment, comment)
+        if order == "unordered":
+            raise refuse(
+                f"unordered scheduler checkpoint in comment {comment.comment_id} against "
+                f"anchor comment {anchor.comment.comment_id}",
+                code="scheduler-checkpoint-unordered",
+            )
+        if order != "later":
+            continue
+        # The earliest checkpoint after the anchor is the one stage A binds.
+        try:
+            key = (
+                PlanCandidateKey.from_mapping(metadata.plan_candidate_key)
+                if metadata.plan_candidate_key is not None
+                else None
+            )
+        except AgentLoopError as exc:
+            raise refuse(
+                f"undecodable candidate key in scheduler checkpoint comment {comment.comment_id}",
+                code="scheduler-metadata-invalid",
+            ) from exc
+        reason = key.incompleteness_reason() if key is not None else "absent"
+        if reason is not None:
+            raise refuse(
+                f"incomplete candidate key in scheduler checkpoint comment "
+                f"{comment.comment_id}: {reason}",
+                code="scheduler-metadata-invalid",
+            )
+        return ApprovedPlanInput(plan_hash, anchor.plan_subject, key)
+    raise refuse(
+        f"missing scheduler checkpoint for plan subject {anchor.plan_subject} after anchor "
+        f"comment {anchor.comment.comment_id}",
+        code="scheduler-checkpoint-unmatched",
+        recovery=RECOVERY_RERUN_PLAN_REVIEW,
+    )
 
 
 def gate_canonical_issue_pr(

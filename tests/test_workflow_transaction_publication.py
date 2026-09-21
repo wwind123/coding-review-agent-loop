@@ -1485,22 +1485,76 @@ def test_recover_approved_plan_input_reads_the_unique_checkpoint_key(tmp_path):
     assert committed.intent.scheduler_checkpoint.reference.comment_id == checkpoint_id
 
 
-def test_recover_approved_plan_input_refuses_an_ambiguous_subject(tmp_path):
+def test_recover_approved_plan_input_binds_the_earliest_checkpoint(tmp_path):
     from coding_review_agent_loop.workflow_transaction_publication import (
         recover_approved_plan_input,
     )
 
     github = TransactionGitHub()
-    seed_plan(github)
-    # A second same-subject candidate with a different strategy: the subject
-    # alone cannot pick the approved key, so nothing is recovered.
+    checkpoint_id = seed_plan(github)
+    # A later same-subject checkpoint with a different strategy never
+    # displaces the earliest one after the anchor, which stage A binds.
     github.seed(
         ISSUE,
         scheduler_comment(3, key=plan_key(execution_strategy_identity="other"), round_number=2).body,
     )
-    assert recover_approved_plan_input(
+    recovered = recover_approved_plan_input(
         github, make_config(tmp_path), plan_issue_number=ISSUE, plan_hash=PLAN_HASH
-    ) is None
+    )
+    assert recovered == ApprovedPlanInput(PLAN_HASH, PLAN_SUBJECT, plan_key())
+    committed = publish(github, plan_request(approved_plan=recovered), tmp_path)
+    assert committed.intent.scheduler_checkpoint.reference.comment_id == checkpoint_id
+
+
+@pytest.mark.parametrize(
+    "history, code",
+    [
+        ("unmatched", "scheduler-checkpoint-unmatched"),
+        ("before-anchor", "scheduler-checkpoint-unmatched"),
+        ("invalid", "scheduler-metadata-invalid"),
+        ("no-anchor", "approved-plan-anchor-missing"),
+    ],
+)
+def test_recover_approved_plan_input_fails_closed_on_a_bad_history(tmp_path, history, code):
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        recover_approved_plan_input,
+    )
+
+    github = TransactionGitHub()
+    if history == "unmatched":
+        github.seed(ISSUE, plan_record_comment(1).body)
+        github.seed(ISSUE, scheduler_comment(2, "A different plan.").body)
+    elif history == "before-anchor":
+        github.seed(ISSUE, scheduler_comment(1).body)
+        github.seed(ISSUE, plan_record_comment(2).body)
+    elif history == "invalid":
+        seed_plan(github)
+        body = scheduler_comment(3, round_number=2).body
+        github.seed(ISSUE, _corrupt_scheduler_digest(body))
+    else:
+        github.seed(ISSUE, scheduler_comment(2).body)
+    before = github.write_count
+    with pytest.raises(WorkflowTransactionError) as refused:
+        recover_approved_plan_input(
+            github, make_config(tmp_path), plan_issue_number=ISSUE, plan_hash=PLAN_HASH
+        )
+    assert refused.value.code == code
+    assert github.write_count == before
+
+
+def _corrupt_scheduler_digest(body: str) -> str:
+    """Re-encode the round metadata with an undecodable scheduler digest."""
+    from coding_review_agent_loop.round_transport import (
+        ROUND_RESUME_MARKER_RE,
+        decode_mapping,
+        encode_mapping,
+    )
+
+    match = ROUND_RESUME_MARKER_RE.search(body)
+    payload = decode_mapping(match.group("payload"))
+    payload["scheduler_obligation_digest"] = "not-a-digest"
+    encoded = encode_mapping(payload)
+    return body[: match.start("payload")] + encoded + body[match.end("payload") :]
 
 
 def test_seam_refuses_a_keyless_approved_plan_when_the_history_scheduled(tmp_path):

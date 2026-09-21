@@ -11055,3 +11055,77 @@ def test_m946_approved_plan_one_shot_rerun_after_boundary_converges(tmp_path, bo
         if "AGENT_ISSUE_PR_HANDOFF" in body or "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body
     ]
     _m946_assert_no_embedded_contract(runner)
+
+
+@pytest.mark.parametrize("history", ["unmatched", "invalid"])
+def test_m946_approved_plan_resume_with_bad_scheduler_history_writes_nothing(tmp_path, history):
+    """A sessionless approved-plan resume stops non-mutating on a bad history (#827).
+
+    The first run is interrupted before any record exists, so the rerun finds
+    the PR by closing reference and has to recover the approved candidate key
+    from durable scheduler records.  A scheduled history with no checkpoint for
+    the approved subject, or with undecodable scheduler metadata, stops the
+    rerun with the transaction diagnostic: no transaction record, no
+    version-1 handoff or contract, no reviewer, and no coder.
+    """
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from coding_review_agent_loop.round_transport import (
+        ROUND_RESUME_MARKER_RE,
+        decode_mapping,
+        encode_mapping,
+    )
+    from workflow_transaction_helpers import scheduler_comment
+
+    runner = _m946_one_shot_runner(1)
+    config = _m946_one_shot_config(tmp_path)
+    with pytest.raises(WorkflowTransactionError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    claude_calls = sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    codex_calls = sum(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+
+    # The planning history gains an actor-authored scheduler record.
+    plan_subject = next(
+        record.metadata.subject
+        for record in _extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in runner.issue_comments], flow="plan"
+        )
+        if record.metadata.role == "coder"
+    )
+    body = str(scheduler_comment(1, "A different plan.").body)
+    if history == "invalid":
+        match = ROUND_RESUME_MARKER_RE.search(body)
+        payload = decode_mapping(match.group("payload"))
+        payload["subject"] = plan_subject
+        payload["scheduler_obligation_digest"] = "not-a-digest"
+        body = body[: match.start("payload")] + encode_mapping(payload) + body[match.end("payload"):]
+    stamp = runner._next_write_stamp()
+    runner.issue_comments.append(
+        {"author": {"login": "coding-review-agent-loop"}, "body": body, "createdAt": stamp}
+    )
+
+    runner.rest_post_failures = ()
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    provenance = re.search(
+        r"Agent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=approved plan=[0-9a-f]+",
+        "\n".join("\n".join(cmd) for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]),
+    ).group(0)
+    runner.pr_commit_pages = [
+        [{"commit": {"oid": "commit-1", "message": f"Implement issue.\n\n{provenance}"}}]
+    ] * 4
+    before_rest = getattr(runner, "rest_post_count", 0)
+    before_gh = len(runner.comments)
+    with pytest.raises(WorkflowTransactionError) as refused:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    expected = (
+        "scheduler-checkpoint-unmatched" if history == "unmatched" else "scheduler-metadata-invalid"
+    )
+    assert refused.value.code == expected
+    # Zero writes on either surface, and no agent was invoked.
+    assert getattr(runner, "rest_post_count", 0) == before_rest
+    assert len(runner.comments) == before_gh
+    assert _m946_record_kinds(runner) == {"pr": [], "issue": []}
+    assert sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands) == claude_calls
+    assert sum(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands) == codex_calls
+    assert not _m946_workflow_records(runner, "AGENT_PLAN_ONE_SHOT_IMPL")
