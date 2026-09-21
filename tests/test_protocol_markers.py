@@ -59,6 +59,7 @@ MARKERS = (
         f"<!-- AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1: {_b64({'actor': 'agent-loop', 'actor_id': 1, 'base': 'main', 'head': 'abc', 'issue': 1, 'kind': 'creation', 'label_event_id': 1, 'nonce': 'n', 'pr': 1, 'protection': 'voluntary', 'repository': 'OWNER/REPO', 'version': 1, 'waiver': 'allow-unprotected-managed-ci'})} -->",
         PR_COMMENT_SURFACE,
     ),
+    ("AGENT_MANAGED_CI_BOUND_AUTHORIZATION_V2", f"<!-- AGENT_MANAGED_CI_BOUND_AUTHORIZATION_V2: {_b64({'kind': 'ordinary-release', 'version': 2})} -->", PR_COMMENT_SURFACE),
     ("AGENT_WORKFLOW_TRANSACTION", f"<!-- AGENT_WORKFLOW_TRANSACTION: {_b64({'phase': 'prepared', 'schema_version': 1})} -->", PR_COMMENT_SURFACE),
     ("AGENT_MANAGED_PR_SOURCE_V1", f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {_b64({'source_branch': 'fix', 'source_sha': 'a'})} -->", PR_BODY_SURFACE),
     ("AGENT_SPLIT_CHILD", "<!-- AGENT_SPLIT_CHILD: parent=1 key=" + "a" * 64 + " -->", ISSUE_BODY_SURFACE),
@@ -159,7 +160,7 @@ def test_ordinary_issue_comment_writer_enforces_issue_comment_surface():
 
 def test_source_inventory_has_no_unregistered_protocol_literals():
     assert_source_inventory(Path(__file__).parents[1])
-    assert len(RESERVED_MARKER_REGISTRY) == 31
+    assert len(RESERVED_MARKER_REGISTRY) == 32
 
 
 def test_issue_provenance_trailer_is_not_a_reserved_marker_or_forged_body_record():
@@ -439,7 +440,13 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
     for path in sorted(source_root.rglob("*.py")):
         # Stage B adds the publication seam as the second sanctioned importer.
         # No orchestration call site consumes either module yet.
-        if path.name in {"workflow_transaction.py", "workflow_transaction_publication.py"}:
+        # The bound managed-CI authorization rule judges a record against its
+        # transaction, so it is the third; ``managed_ci`` itself stays out.
+        if path.name in {
+            "workflow_transaction.py",
+            "workflow_transaction_publication.py",
+            "managed_ci_bound_authorization.py",
+        }:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):

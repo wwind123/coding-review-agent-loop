@@ -287,6 +287,12 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
             "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1",
             surfaces=frozenset({PR_COMMENT_SURFACE}),
         ),
+        # Transaction-bound managed-CI authorization (#827, stage B).  A new
+        # token, so the v1 parser and its substring scans never see it.
+        _b64_definition(
+            "AGENT_MANAGED_CI_BOUND_AUTHORIZATION_V2",
+            surfaces=frozenset({PR_COMMENT_SURFACE}),
+        ),
         # Cross-surface workflow transaction record (#827).  Prepared and
         # terminal records live only in trusted PR comments.
         MarkerDefinition(
@@ -866,6 +872,8 @@ _RECORD_LABEL_NAMES: dict[tuple[str, str], str] = {
     ("managed_ci_authorization", "creation"): "managed-CI authorization record",
     ("managed_ci_authorization", "fresh"): "managed-CI fresh re-authorization record",
     ("managed_ci_authorization", "continuity"): "managed-CI authorization continuity record",
+    ("managed_ci_authorization", "plan-rebind"): "managed-CI authorization plan-rebind record",
+    ("managed_ci_authorization", "ordinary-release"): "managed-CI ordinary-recovery release record",
     ("managed_ci_intent", ""): "managed exact-head CI intent record",
     ("managed_ci_override_audit", ""): "managed-CI unprotected-override audit record",
     ("managed_ci_resume_audit", ""): "managed-CI resume provenance audit record",
@@ -936,7 +944,12 @@ def protocol_record_label(
         )
     head = _record_label_field(head_sha, field="head")
     head_text = f" at head {head[:7]}" if head is not None else ""
-    if family == "managed_ci_authorization":
+    if family == "managed_ci_authorization" and kind == "ordinary-release":
+        role = (
+            f"Records that {_record_label_pr(pr_number)}{head_text} was released to "
+            "ordinary recovery; it grants nothing."
+        )
+    elif family == "managed_ci_authorization":
         role = (
             f"Binds {_record_label_issue(issue_number)} to "
             f"{_record_label_pr(pr_number)}{head_text}."
