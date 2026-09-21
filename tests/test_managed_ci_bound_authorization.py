@@ -33,11 +33,14 @@ from coding_review_agent_loop.managed_ci_bound_authorization import (
     BoundAuthorizationCodec,
     bind_v1_authorization,
     build_plan_rebind_payload,
+    builder_authorization_view,
+    consumer_bound_authorization,
     decode_bound_authorization,
     format_bound_authorization_comment,
     granted_generation,
     ordinary_release_payload,
     parse_bound_authorization_comment,
+    pending_bound_authorization,
     released_generation,
 )
 from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE, TrustedBody
@@ -46,6 +49,7 @@ from coding_review_agent_loop.workflow_transaction import (
     KIND_HEAD_ADVANCE,
     KIND_MANAGED_CI_CONTINUITY,
     collect_transactions,
+    resolve_transaction_lineage,
 )
 from coding_review_agent_loop.workflow_transaction_publication import (
     ORIGIN_DIRECT_ISSUE,
@@ -437,3 +441,105 @@ def test_upgrade_is_refused_on_a_successor(tmp_path):
     )
     with pytest.raises(WorkflowTransactionError, match="not a plain initial root"):
         publish(github, upgraded(second, v1(head=HEAD_2, nonce="n2")), tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Transaction-era accessor modes
+# ---------------------------------------------------------------------------
+
+
+def lineage_of(github, tmp_path):
+    pr_view = views(github, tmp_path).pr_view
+    return pr_view, resolve_transaction_lineage(pr_view, repository=REPO, pr_number=PR)
+
+
+def test_consumer_mode_returns_only_the_committed_record_at_the_live_head(tmp_path):
+    github = TransactionGitHub()
+    # An unbound record grants nothing once the PR is transaction era.
+    github.seed(PR, str(format_issue_created_authorization_comment(v1(nonce="unbound"))))
+    first = publish(github, creation(), tmp_path)
+    pr_view, lineage = lineage_of(github, tmp_path)
+    granted = consumer_bound_authorization(pr_view, lineage, live_head=HEAD_1)
+    assert granted.comment_id == first.entry_comment_id(ENTRY_AUTHORIZATION)
+    assert granted.record.nonce == "nonce-1"
+    assert consumer_bound_authorization(pr_view, lineage, live_head=HEAD_2) is None
+    publish(github, release(), tmp_path)
+    pr_view, lineage = lineage_of(github, tmp_path)
+    # An ordinary-release record is never managed authority.
+    assert consumer_bound_authorization(pr_view, lineage, live_head=HEAD_1) is None
+
+
+def test_consumer_and_builder_modes_raise_on_an_invalid_committed_record(tmp_path):
+    github = TransactionGitHub()
+    publish(github, creation(), tmp_path)
+    rewrite_bound(github, bound_comments(github)[0], grant_anchor_event_id=EVENT + 1)
+    pr_view, lineage = lineage_of(github, tmp_path)
+    for read in (
+        lambda: consumer_bound_authorization(pr_view, lineage, live_head=HEAD_1),
+        lambda: builder_authorization_view(pr_view, lineage),
+    ):
+        with pytest.raises(WorkflowTransactionError) as raised:
+            read()
+        assert raised.value.code == "authorization-invalid"
+
+
+@pytest.mark.parametrize("mode", [FAIL_BEFORE_WRITE, WRITE_THEN_REPORT_FAILURE])
+def test_uncommitted_bound_record_is_pending_input_and_never_authority(tmp_path, mode):
+    github = TransactionGitHub()
+    github.fail_write(5, mode)  # the terminal write
+    if mode == WRITE_THEN_REPORT_FAILURE:
+        github.fail_write(4, mode)  # stop right after the bound record landed
+    with pytest.raises(WorkflowTransactionError):
+        publish(github, creation(), tmp_path)
+    pr_view, lineage = lineage_of(github, tmp_path)
+    assert lineage.pending is not None and lineage.latest_committed is None
+    assert consumer_bound_authorization(pr_view, lineage, live_head=HEAD_1) is None
+    view = builder_authorization_view(pr_view, lineage)
+    assert view.effective is None and view.nearest_granted is None
+    assert view.pending == pending_bound_authorization(pr_view, lineage, lineage.pending)
+    assert view.pending.record.kind == "creation"
+    # The same rule runs in pending mode, without the terminal-ID check.
+    rewrite_bound(github, bound_comments(github)[0], protection="plan_limited")
+    pr_view, lineage = lineage_of(github, tmp_path)
+    with pytest.raises(WorkflowTransactionError):
+        pending_bound_authorization(pr_view, lineage, lineage.pending)
+
+
+def test_builder_view_names_effective_nearest_granted_and_superseded(tmp_path):
+    github = TransactionGitHub()
+    first = publish(github, creation(), tmp_path)
+    first_id = first.entry_comment_id(ENTRY_AUTHORIZATION)
+    pr_view, lineage = lineage_of(github, tmp_path)
+    view = builder_authorization_view(pr_view, lineage)
+    assert view.effective.comment_id == view.nearest_granted.comment_id == first_id
+    assert view.pending is None and view.superseded == ()
+    released = publish(github, release(), tmp_path)
+    pr_view, lineage = lineage_of(github, tmp_path)
+    view = builder_authorization_view(pr_view, lineage)
+    # After a release at the same head the granted record is superseded, not
+    # effective, and it is still the nearest granted ancestor for a regrant.
+    assert view.effective.comment_id == released.entry_comment_id(ENTRY_AUTHORIZATION)
+    assert view.effective.record.kind == KIND_ORDINARY_RELEASE
+    assert view.nearest_granted.comment_id == first_id
+    assert [item.comment_id for item in view.superseded] == [first_id]
+
+
+def test_accessor_never_reads_live_state_or_the_resume_audit():
+    import ast
+    import inspect
+
+    from coding_review_agent_loop import managed_ci_bound_authorization as module
+
+    tree = ast.parse(inspect.getsource(module))
+    called = {
+        node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+        for node in ast.walk(tree) if isinstance(node, ast.Call)
+    }
+    assert not called & {
+        "_find_resume_audit", "_api_list", "_api_json", "_active_managed_label_event",
+        "_historical_managed_label_event", "_authorization_comment_records",
+    }
+    imported = {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+    }
+    assert "workflow_transaction_publication" not in imported

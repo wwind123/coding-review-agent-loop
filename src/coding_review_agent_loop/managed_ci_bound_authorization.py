@@ -775,6 +775,137 @@ def _native_problem(
 
 
 # ---------------------------------------------------------------------------
+# Transaction-era accessor
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BoundAuthorizationRecord:
+    """One validated bound record under its canonical comment ID."""
+
+    comment_id: int
+    record: BoundManagedCiAuthorization
+
+
+@dataclass(frozen=True)
+class BuilderAuthorizationView:
+    """What a transaction-era builder may select, compare, and extend.
+
+    ``superseded`` is for diagnostics only: builders never select, compare, or
+    count it, so an earlier record at the same head never conflicts.
+    """
+
+    effective: BoundAuthorizationRecord | None = None
+    nearest_granted: BoundAuthorizationRecord | None = None
+    pending: BoundAuthorizationRecord | None = None
+    superseded: tuple[BoundAuthorizationRecord, ...] = ()
+
+
+def _validated(
+    pair: tuple[AuthenticatedComment, BoundManagedCiAuthorization] | None,
+    lineage: TransactionLineage,
+    pr_view: AuthenticatedCommentView,
+) -> BoundAuthorizationRecord | None:
+    """Judge a committed record against the transaction that issued it."""
+    if pair is None:
+        return None
+    comment, record = pair
+    issuing = lineage.state(record.transaction_id)
+    if issuing is None or not issuing.committed:
+        raise WorkflowTransactionError(
+            "A bound managed-CI authorization names a transaction that did not commit",
+            transaction_ids=(record.transaction_id,),
+            problems=(f"contradictory bound authorization in comment {comment.comment_id}",),
+            recovery_action=RECOVERY_OPERATOR_REVIEW,
+            code=CODE_AUTHORIZATION_INVALID,
+        )
+    validate_bound_authorization(comment, record, issuing, lineage, pr_view, committed=True)
+    return BoundAuthorizationRecord(comment.comment_id, record)
+
+
+def pending_bound_authorization(
+    pr_view: AuthenticatedCommentView,
+    lineage: TransactionLineage,
+    transaction: TransactionState,
+) -> BoundAuthorizationRecord | None:
+    """Pending mode: the uncommitted record of one prepared-only transaction.
+
+    It is a seam and selection input only, never authority.
+    """
+    if transaction.committed or transaction.aborted:
+        return None
+    bound = [
+        (comment, record)
+        for comment, record in _bound_records(pr_view)
+        if record.transaction_id == transaction.transaction_id
+    ]
+    if not bound:
+        return None
+    comment, record = min(bound, key=lambda item: item[0].comment_id)
+    validate_bound_authorization(comment, record, transaction, lineage, pr_view, committed=False)
+    return BoundAuthorizationRecord(comment.comment_id, record)
+
+
+def builder_authorization_view(
+    pr_view: AuthenticatedCommentView, lineage: TransactionLineage
+) -> BuilderAuthorizationView:
+    """Builder mode: every committed canonical bound record, validated.
+
+    Unbound records are never returned on a transaction-era PR, and there is no
+    selection of a record by head.
+    """
+    committed = lineage.latest_committed
+    effective = (
+        _validated(effective_authorization(committed, lineage, pr_view), lineage, pr_view)
+        if committed is not None
+        else None
+    )
+    nearest = effective if effective is not None and effective.record.granted else None
+    if nearest is None and committed is not None:
+        nearest = _validated(
+            nearest_granted_ancestor(committed, lineage, pr_view), lineage, pr_view
+        )
+    superseded: list[BoundAuthorizationRecord] = []
+    for state in lineage.chain:
+        if not state.committed:
+            continue
+        if state.intent.entry(ENTRY_AUTHORIZATION).disposition != DISPOSITION_REISSUED:
+            continue
+        item = _validated(effective_authorization(state, lineage, pr_view), lineage, pr_view)
+        if item is not None and (effective is None or item.comment_id != effective.comment_id):
+            superseded.append(item)
+    pending_state = lineage.pending
+    return BuilderAuthorizationView(
+        effective=effective,
+        nearest_granted=nearest,
+        pending=(
+            pending_bound_authorization(pr_view, lineage, pending_state)
+            if pending_state is not None
+            else None
+        ),
+        superseded=tuple(superseded),
+    )
+
+
+def consumer_bound_authorization(
+    pr_view: AuthenticatedCommentView, lineage: TransactionLineage, *, live_head: str
+) -> BoundAuthorizationRecord | None:
+    """Consumer mode: managed authority for the live head, or nothing.
+
+    Only the latest committed transaction's record, only at the live head, never
+    while a prepared transaction is pending, and never an ``ordinary-release``
+    record.  An invalid record raises; it is never skipped as if absent.
+    """
+    committed = lineage.latest_committed
+    if committed is None or lineage.pending is not None:
+        return None
+    effective = _validated(effective_authorization(committed, lineage, pr_view), lineage, pr_view)
+    if effective is None or committed.intent.head_sha != live_head:
+        return None
+    return effective if effective.record.granted else None
+
+
+# ---------------------------------------------------------------------------
 # Seam codec
 # ---------------------------------------------------------------------------
 
