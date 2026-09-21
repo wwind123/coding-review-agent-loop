@@ -6288,6 +6288,8 @@ def test_issue_loop_direct_mode_legacy_search_resumes_and_backfills_canonical_re
     the exactly-one-open-PR GitHub search, and the resume should backfill a
     canonical record so later reruns hit the fast canonical path (#589)."""
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
         pr_payload={"body": "Fixes #56"},
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
@@ -6297,7 +6299,16 @@ def test_issue_loop_direct_mode_legacy_search_resumes_and_backfills_canonical_re
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
-    handoff_comments = [c for c in runner.comments if "<!-- AGENT_ISSUE_PR_HANDOFF:" in c]
+    # The backfill is one committed transaction (#827), not version-1 records.
+    kinds = _m946_record_kinds(runner)
+    assert kinds["issue"] == ["handoff"]
+    assert kinds["pr"] == ["transaction", "contract", "transaction"]
+    handoff_comments = [
+        c["body"]
+        for items in (runner.issue_comments, *runner.issue_comments_by_number.values())
+        for c in items
+        if "<!-- AGENT_ISSUE_PR_HANDOFF:" in c["body"]
+    ]
     assert len(handoff_comments) == 1
     assert "Flow: issue-implementation" in handoff_comments[0]
     assert "PR #77" in handoff_comments[0]
@@ -6312,7 +6323,11 @@ def test_rejected_legacy_evidence_response_resumes_same_pr_without_reimplementat
         "mappings": {"row-1": ["receipt-from-model"]},
     }
     rejected = json.dumps(payload) + legacy[end:]
-    runner = FakeRunner(claude_outputs=[rejected, rejected])
+    runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
+        claude_outputs=[rejected, rejected],
+    )
     config = make_config(tmp_path, agent_max_retries=0)
 
     with pytest.raises(AgentInvocationError):
@@ -10865,3 +10880,53 @@ def test_m946_direct_issue_publication_interrupted_at_each_boundary_grants_nothi
         if "AGENT_ISSUE_PR_HANDOFF" in body or "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body
     ]
     _m946_assert_no_embedded_contract(runner)
+
+
+@pytest.mark.parametrize("boundary", [1, 2, 3, 4, 5])
+def test_m946_direct_issue_rerun_after_each_boundary_converges_without_the_coder(
+    tmp_path, boundary
+):
+    """An issue-command rerun finishes the interrupted publication (#827).
+
+    The rerun routes the partial candidate to the seam (or, before any issue
+    record exists, resumes the PR it finds by closing reference and publishes
+    through the seam): exactly one prepared and one committed record per
+    transaction, one handoff and one PR contract, the coder invoked once
+    across both runs, no second PR, no version-1 record, no embedded copy.
+    """
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    runner.rest_post_failures = (boundary,)
+    config = make_config(tmp_path)
+    with pytest.raises(WorkflowTransactionError):
+        run_issue_loop(runner, issue_number=56, config=config)
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+
+    # The rerun: no injected failure; the PR the coder opened is listed.
+    runner.rest_post_failures = ()
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    assert sum(cmd[:2] == ["claude", "--print"] for cmd, _cwd in runner.commands) == 1
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+    kinds = _m946_record_kinds(runner)
+    assert kinds["issue"] == ["handoff"]
+    assert kinds["pr"].count("contract") == 1
+    # One transaction: its prepared record and its committed record.
+    assert kinds["pr"].count("transaction") == 2
+    # The initial coder round is written only when this session held it.
+    assert kinds["pr"].count("tagged-coder-round") == (1 if boundary == 5 else 0)
+    assert not [
+        body for body in runner.comments
+        if "AGENT_ISSUE_PR_HANDOFF" in body or "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body
+    ]
+    _m946_assert_no_embedded_contract(runner)
+    # The reviewer ran only on the rerun, after the commit.
+    assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)

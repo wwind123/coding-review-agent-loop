@@ -607,6 +607,64 @@ from .unresolved_items import (
 )
 
 
+def _finish_interrupted_issue_publication(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    issue_number: int,
+) -> int | None:
+    """Finish an issue-origin publication a previous run interrupted (#827).
+
+    The routing form (never the authority form) classifies the issue's
+    candidate PRs.  A ``Recoverable`` or ``RecoverableSuccessor`` route is
+    finished from the stored intent without invoking the coder or opening a
+    PR: the seam adopts every entry already published and waives an initial
+    coder round this session cannot supply.  Returns the PR it finished, or
+    ``None`` when nothing was interrupted.  Writes nothing otherwise.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run:
+        return None
+    route = publication.route_issue_publication(runner, config, issue_number)
+    if not isinstance(route, (publication.Recoverable, publication.RecoverableSuccessor)):
+        return None
+    log(
+        config,
+        f"Issue #{issue_number}: finishing the interrupted workflow transaction on "
+        f"PR #{route.pr_number} before resuming.",
+    )
+    validate_open_pr(runner, config=config, pr_number=route.pr_number)
+    _finish_pr_side_transaction(runner, config, pr_number=route.pr_number)
+    return route.pr_number
+
+
+def _finish_pr_side_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+) -> bool:
+    """Whether the PR is transaction-era; a pending transaction on it is finished.
+
+    A transaction-era PR never receives a version-1 record (#827), so the
+    legacy closing-reference resume writes nothing there; a transaction the
+    previous run left prepared-only is finished from its stored intent.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run:
+        return False
+    resolved = publication.read_pr_transaction_views(runner, config, pr_number, None)
+    if resolved.era != publication.ERA_TRANSACTION:
+        return False
+    head_sha = get_pr_review_context(runner, config=config, pr_number=pr_number).metadata.head_sha
+    publication.finish_pending_transaction(
+        runner, config, pr_number=pr_number, head_sha=str(head_sha or "")
+    )
+    return True
+
+
 def _canonical_trusted_body(text: str) -> TrustedBody:
     expected = tuple(item.definition.token for item in scan_reserved_markers(text))
     return TrustedBody.canonical(text, expected_tokens=expected)
@@ -12597,6 +12655,11 @@ def run_issue_loop(
                 plan_supersession=plan_supersession,
             )
 
+        # An interrupted transaction publication is finished from its stored
+        # intent before the authority lookup below, which refuses it (#827).
+        _finish_interrupted_issue_publication(
+            runner, config, issue_number=issue_number
+        )
         # Resolve the canonical AGENT_ISSUE_PR_HANDOFF record (or, failing
         # that, the legacy exactly-one-open-PR search) before invoking a
         # coder in either direct or plan-first mode, so a rerun after an
@@ -12780,7 +12843,9 @@ def run_issue_loop(
             # Keep rejected issue-implementation evidence rejected during an
             # explicit managed recovery. The PR loop authenticates the
             # authorization record independently of this legacy association.
-            if resolved_pr.source == "legacy-closing-reference":
+            if resolved_pr.source == "legacy-closing-reference" and not _finish_pr_side_transaction(
+                runner, config, pr_number=resolved_pr.pr_number
+            ):
                 pr_context = get_pr_review_context(runner, config=config, pr_number=resolved_pr.pr_number)
                 validate_pr_expected_closing_issues(
                     runner,
@@ -12791,44 +12856,64 @@ def run_issue_loop(
                     reject_unexpected=config.managed_ci,
                 )
                 pr_url, pr_head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
-                pr_contract = make_pr_contract(
-                    repository=config.repo,
-                    pr_number=resolved_pr.pr_number,
-                    origin_flow=(
-                        "approved-plan-implementation"
-                        if plan_first and recovered_plan_hash is not None
-                        else "issue-implementation"
-                    ),
-                    primary_issue_number=issue_number,
-                    expected_closing_issue_ids=closing_contract.issue_ids,
-                    supersedes_hash=closing_contract.supersedes_hash,
-                )
-                post_trusted_pr_comment(
-                    runner,
-                    config=config,
-                    pr_number=resolved_pr.pr_number,
-                    body=TrustedBody.canonical(
-                        format_pr_contract_comment(pr_contract),
-                        expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
-                    ),
-                )
-                if not config.managed_ci:
-                    post_issue_pr_handoff_comment(
+                if not plan_first and not config.managed_ci and not config.dry_run:
+                    # Direct unmanaged resume (#827, site d): one transaction that
+                    # restates or upgrades whatever the PR already records; a
+                    # consistent legacy PR receives no write.
+                    from . import workflow_transaction_publication as publication
+
+                    publication.publish_transition(
                         runner,
                         config=config,
-                        issue_number=issue_number,
+                        request=publication.TransitionRequest(
+                            repository=config.repo,
+                            pr_number=resolved_pr.pr_number,
+                            base=str(pr_context.metadata.base_branch or config.base),
+                            head_sha=pr_head_sha,
+                            origin_path=publication.ORIGIN_DIRECT_ISSUE,
+                            expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                            primary_issue=issue_number,
+                        ),
+                    )
+                else:
+                    pr_contract = make_pr_contract(
+                        repository=config.repo,
                         pr_number=resolved_pr.pr_number,
-                        pr_url=pr_url,
-                        pr_head_sha=pr_head_sha,
-                        flow=(
+                        origin_flow=(
                             "approved-plan-implementation"
                             if plan_first and recovered_plan_hash is not None
                             else "issue-implementation"
                         ),
-                        plan_hash=recovered_plan_hash if plan_first else None,
+                        primary_issue_number=issue_number,
                         expected_closing_issue_ids=closing_contract.issue_ids,
                         supersedes_hash=closing_contract.supersedes_hash,
                     )
+                    post_trusted_pr_comment(
+                        runner,
+                        config=config,
+                        pr_number=resolved_pr.pr_number,
+                        body=TrustedBody.canonical(
+                            format_pr_contract_comment(pr_contract),
+                            expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+                        ),
+                    )
+                    if not config.managed_ci:
+                        post_issue_pr_handoff_comment(
+                            runner,
+                            config=config,
+                            issue_number=issue_number,
+                            pr_number=resolved_pr.pr_number,
+                            pr_url=pr_url,
+                            pr_head_sha=pr_head_sha,
+                            flow=(
+                                "approved-plan-implementation"
+                                if plan_first and recovered_plan_hash is not None
+                                else "issue-implementation"
+                            ),
+                            plan_hash=recovered_plan_hash if plan_first else None,
+                            expected_closing_issue_ids=closing_contract.issue_ids,
+                            supersedes_hash=closing_contract.supersedes_hash,
+                        )
             return run_pr_loop(
                 runner,
                 pr_number=resolved_pr.pr_number,
