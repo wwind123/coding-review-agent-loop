@@ -1763,6 +1763,30 @@ def committed_plan_replacement(
     )
 
 
+def pending_plan_replacement(
+    runner: Runner, config: AgentLoopConfig, pr_number: int
+) -> TransactionState | None:
+    """Read-only: a prepared-only plan replacement pending on the committed chain.
+
+    Only the writer that can rebuild its audit-bearing handoff (the child-plan
+    rebind) may finish it, so the issue command leaves it to that writer
+    instead of finishing it from the stored intent.  Grants no authority.
+    """
+    resolved = read_pr_transaction_views(runner, config, pr_number, None)
+    if resolved.era != ERA_TRANSACTION:
+        return None
+    pending = resolved.lineage.pending
+    committed = resolved.lineage.latest_committed
+    if (
+        pending is None
+        or committed is None
+        or pending.intent.successor_kind != KIND_PLAN_REPLACEMENT
+        or pending.intent.predecessor_transaction_id != committed.transaction_id
+    ):
+        return None
+    return pending
+
+
 def publish_closing_widening(
     runner: Runner,
     config: AgentLoopConfig,

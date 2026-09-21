@@ -2949,6 +2949,9 @@ class _M946TxWorld(_M936World):
         # Share the durable threads, so every write lands in the history.
         runner.issue_comments = self.issue_rows
         runner.pr_payload["comments"] = self.pr_rows
+        # One write clock across sessions: every stored row came from at most
+        # one earlier write, so a later session's writes are strictly later.
+        runner._write_clock = len(self.issue_rows) + len(self.pr_rows)
         self.runner = runner
         return runner
 
@@ -3058,3 +3061,84 @@ def test_m946_transaction_era_replacement_without_its_audit_record_fails_closed(
         world.run_issue(codex_outputs=[PR_APPROVAL])
     assert (len(world.issue_rows), len(world.pr_rows)) == rows_before
     assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
+
+
+@pytest.mark.parametrize("mode", ["fail-before-write", "write-then-report-failure"])
+@pytest.mark.parametrize("boundary", [1, 2, 3, 4])
+def test_m946_interrupted_transaction_era_rebind_is_finished_by_an_issue_rerun(
+    tmp_path, monkeypatch, boundary, mode
+):
+    """#827: a rebind interrupted at any of its four writes (prepared, handoff with
+    the audit record, PR contract, committed) is adopted and finished by a plain
+    issue-command rerun; until then the committed predecessor stays the binding."""
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.workflow_transaction import (
+        KIND_PLAN_REPLACEMENT, RECOVERY_RERUN,
+    )
+
+    world = _M946TxWorld(tmp_path, monkeypatch)
+    handed = []
+    monkeypatch.setattr(
+        orchestrator, "run_pr_loop",
+        lambda runner, *, pr_number, **kwargs: handed.append(
+            (pr_number, kwargs["approved_plan_context"].plan_hash)
+        ) or 0,
+    )
+    real_write = publication._write_verified
+    writes = {"count": 0, "armed": True}
+
+    def flaky(*args, **kwargs):
+        writes["count"] += 1
+        if writes["armed"] and writes["count"] == boundary:
+            if mode == "write-then-report-failure":
+                real_write(*args, **kwargs)
+            raise publication._error(
+                "injected write failure", recovery=RECOVERY_RERUN,
+                code=publication.CODE_WRITE_FAILED,
+            )
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "_write_verified", flaky)
+    with pytest.raises(WorkflowTransactionError):
+        world.run_issue(
+            claude_outputs=[world.good_patch()],
+            codex_outputs=[structured_plan_review(state="approved")],
+        )
+    assert handed == []
+    config = world.config()
+    landed_commit = boundary == 4 and mode == "write-then-report-failure"
+    prepared = not (boundary == 1 and mode == "fail-before-write")
+    if prepared and not landed_commit:
+        # The authority form refuses the interrupted state; nothing binds P2 yet.
+        with pytest.raises(WorkflowTransactionError):
+            publication.discover_canonical_issue_pr(world.runner, config, 56)
+        lineage = publication.read_pr_transaction_views(world.runner, config, 77, 56).lineage
+        assert lineage.latest_committed.intent.approved_plan_hash == world.old_hash
+        assert lineage.pending.intent.successor_kind == KIND_PLAN_REPLACEMENT
+
+    writes["armed"] = False
+    assert world.run_issue(codex_outputs=[]) == 0
+    # No planner, plan reviewer, or coder turn on the rerun, and no second PR.
+    assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in world.runner.commands)
+    lineage = publication.read_pr_transaction_views(world.runner, config, 77, 56).lineage
+    assert lineage.pending is None
+    committed = [state for state in lineage.chain if state.committed]
+    assert [state.intent.successor_kind for state in committed] == ["initial", KIND_PLAN_REPLACEMENT]
+    assert not any(state.aborted for state in lineage.transactions)
+    new_hash = committed[-1].intent.approved_plan_hash
+    assert handed == [(77, new_hash)]
+    # Exactly one audit-bearing handoff, and one reissued PR contract.
+    bodies = [str(row["body"]) for row in world.issue_rows]
+    rebinds = [body for body in bodies if CHILD_PLAN_REBIND_MARKER_RE.search(body)]
+    assert len(rebinds) == 1 and committed[-1].transaction_id in rebinds[0]
+    assert sum(1 for body in bodies if AGENT_ISSUE_PR_HANDOFF_RE.search(body)) == 2
+    pr_bodies = [str(row["body"]) for row in world.pr_rows]
+    assert sum("AGENT_PR_EXPECTED_CLOSING_ISSUES" in body for body in pr_bodies) == 2
+    assert orchestrator.verify_child_plan_rebind(
+        world._issue_context(None, config=config, issue_number=56).comments,
+        repo="OWNER/REPO", parent_plan_context=_m936_binding(world).parent_plan_context,
+        child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
+        runner=world.runner, config=config,
+    ).plan_hash == new_hash

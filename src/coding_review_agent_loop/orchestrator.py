@@ -669,6 +669,23 @@ def _recorded_issue_handoff(
         _finish_interrupted_issue_publication(
             runner, config, issue_number=issue_context.number
         )
+        route = publication.route_issue_publication(runner, config, issue_context.number)
+        if isinstance(route, publication.RecoverableSuccessor) and (
+            publication.pending_plan_replacement(runner, config, route.pr_number) is not None
+        ):
+            # An interrupted child-plan rebind: only the rebind writer can
+            # finish it, so its preconditions read the committed predecessor
+            # binding.  Not authority; every authority consumer still refuses.
+            binding = route.predecessor
+            return SimpleNamespace(
+                issue_number=issue_context.number,
+                pr_number=route.pr_number,
+                flow=binding.flow,
+                plan_hash=binding.plan_hash,
+                expected_closing_issue_ids=binding.expected_closing_issue_ids,
+                pr_head_sha=binding.pr_head_sha,
+                contract_hash=binding.contract_hash,
+            )
         discovered = publication.discover_canonical_issue_pr(
             runner, config, issue_context.number
         )
@@ -702,6 +719,12 @@ def _finish_interrupted_issue_publication(
         return None
     route = publication.route_issue_publication(runner, config, issue_number)
     if not isinstance(route, (publication.Recoverable, publication.RecoverableSuccessor)):
+        return None
+    if isinstance(route, publication.RecoverableSuccessor) and (
+        publication.pending_plan_replacement(runner, config, route.pr_number) is not None
+    ):
+        # Its handoff carries the rebind audit record, which only the
+        # child-plan rebind can rebuild; that writer adopts and finishes it.
         return None
     log(
         config,
@@ -9534,6 +9557,20 @@ def _rebind_superseded_child_plan(
     )
 
 
+def _interrupted_rebind_pr_is_open(runner: Runner, config: AgentLoopConfig, pr_number: int) -> bool:
+    """Whether the PR carries an interrupted plan-replacement rebind (#827).
+
+    True only when a prepared-only plan replacement is pending on the
+    committed chain; the PR must then still be OPEN, or nothing proceeds.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if publication.pending_plan_replacement(runner, config, pr_number) is None:
+        return False
+    validate_open_pr(runner, config=config, pr_number=pr_number)
+    return True
+
+
 def _rebind_transaction_era_child_plan(
     runner: Runner,
     *,
@@ -9554,18 +9591,27 @@ def _rebind_transaction_era_child_plan(
     from . import workflow_transaction_publication as publication
 
     pr_number = plan_supersession.pr_number
-    binding = publication.committed_pr_binding(runner, config, pr_number)
-    assert binding is not None
-    committed = binding.transaction.intent
+    lineage = publication.read_pr_transaction_views(runner, config, pr_number, None).lineage
+    if lineage.latest_committed is None:
+        raise AgentLoopError(
+            f"Human repair required: PR #{pr_number} has no committed workflow transaction; "
+            "the re-planned child plan was not rebound and nothing was posted."
+        )
+    committed = lineage.latest_committed.intent
     if committed.primary_issue != issue_number:
         raise AgentLoopError(
             f"Human repair required: PR #{pr_number}'s committed workflow transaction is bound "
             f"to issue #{committed.primary_issue}, not child issue #{issue_number}; the "
             "re-planned child plan was not rebound and nothing was posted."
         )
-    authenticated = authenticate_canonical_issue_pr(
-        runner, config=config, issue_number=issue_number, issue_context=issue_context
-    )
+    if _interrupted_rebind_pr_is_open(runner, config, pr_number):
+        # Resuming an interrupted rebind: the seam adopts the stored
+        # plan-replacement intent (or aborts it as obsolete) below.
+        authenticated = SimpleNamespace(pr_number=pr_number, state="OPEN")
+    else:
+        authenticated = authenticate_canonical_issue_pr(
+            runner, config=config, issue_number=issue_number, issue_context=issue_context
+        )
     if (
         authenticated is None
         or authenticated.pr_number != pr_number
@@ -9716,6 +9762,10 @@ def _route_inadmissible_child_handoff(
         )
     signed = matching[0]
     if config.dry_run:
+        pr_number = handoff.pr_number
+    elif _interrupted_rebind_pr_is_open(runner, config, handoff.pr_number):
+        # An interrupted rebind: the committed predecessor stays the binding
+        # and the authority form refuses until the rebind writer commits.
         pr_number = handoff.pr_number
     else:
         authenticated = authenticate_canonical_issue_pr(
