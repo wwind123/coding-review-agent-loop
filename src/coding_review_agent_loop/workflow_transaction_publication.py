@@ -73,6 +73,8 @@ from .workflow_transaction import (
     FLOW_DIRECT_PR,
     FLOW_ISSUE,
     FLOW_MANAGED_PR,
+    KIND_CLOSING_WIDENING,
+    KIND_HEAD_ADVANCE,
     KIND_INITIAL,
     PHASE_ABORTED,
     PHASE_COMMITTED,
@@ -1726,6 +1728,105 @@ def publish_closing_widening(
         request=_request_from_intent(
             runner, config, intent, head_sha=head_sha,
             expected_closing_issue_ids=expected_closing_issue_ids,
+        ),
+    )
+
+
+_ENTRY_FINISHABLE_KINDS = frozenset({KIND_INITIAL, KIND_HEAD_ADVANCE, KIND_CLOSING_WIDENING})
+
+
+def finish_pending_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str,
+) -> bool:
+    """Finish the pending transaction a previous run left on the PR (#827, point 1).
+
+    The PR loop's entry is a writer path, so a pr-command rerun converges an
+    interrupted publication instead of only refusing it.  The request is
+    derived from the stored intent alone: the seam adopts that intent and
+    finishes it (an initial coder round entry nobody can supply is waived), or
+    aborts it as obsolete when the live head moved and prepares a fresh one.
+    Returns whether anything was pending.  A managed pending transaction, and
+    a successor kind the PR loop cannot re-derive, raise without writing.
+    """
+    resolved = read_pr_transaction_views(runner, config, pr_number, None)
+    pending = resolved.lineage.pending if resolved.era == ERA_TRANSACTION else None
+    if pending is None:
+        return False
+    intent = pending.intent
+    if intent.managed_ci_generation is not None:
+        raise _error(
+            "Finishing a managed transaction needs a managed-CI input; nothing was written",
+            intent=intent,
+            problems=("managed pending transaction is not finished from the PR loop",),
+            recovery=RECOVERY_RERUN,
+            code=CODE_MANAGED_UNAVAILABLE,
+        )
+    if intent.successor_kind not in _ENTRY_FINISHABLE_KINDS:
+        raise _error(
+            "The pending transaction is not one the PR loop can finish; nothing was written",
+            intent=intent,
+            problems=(
+                f"pending {intent.successor_kind} transaction in comment "
+                f"{pending.prepared_comment.comment_id}",
+            ),
+            recovery=RECOVERY_RERUN,
+            code=CODE_PENDING,
+        )
+    publish_transition(
+        runner,
+        config=config,
+        request=_request_from_intent(runner, config, intent, head_sha=head_sha),
+    )
+    return True
+
+
+LEGACY_UPGRADE_FLOWS = frozenset({FLOW_ISSUE, FLOW_DIRECT_PR, FLOW_MANAGED_PR})
+
+
+def publish_legacy_upgrade(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    base: str,
+    head_sha: str,
+    origin_flow: str,
+    primary_issue: int | None,
+    expected_closing_issue_ids: Sequence[int],
+) -> CommittedTransaction | None:
+    """Upgrade a legacy-era PR that needs a PR-loop write by one ``initial`` transaction.
+
+    Replaces the version-1 PR contract and handoff writes of ``run_pr_loop``'s
+    persistence block (site f).  The seam restates or widens the version-1
+    records: the reissued PR contract's supersession is derived from the
+    resolved version-1 contract, and a version-1 flow that disagrees with the
+    derived flow keeps today's fail-closed refusal.  Unmanaged only; an
+    approved-plan flow needs the approved candidate key and is not upgraded here.
+    """
+    if origin_flow not in LEGACY_UPGRADE_FLOWS:
+        raise AgentLoopError(
+            f"A {origin_flow} PR is not upgraded by the PR loop's legacy upgrade."
+        )
+    if (origin_flow == FLOW_ISSUE) != (primary_issue is not None):
+        raise AgentLoopError(
+            "A legacy upgrade names a primary issue exactly for issue-implementation PRs."
+        )
+    return publish_transition(
+        runner,
+        config=config,
+        request=TransitionRequest(
+            repository=config.repo,
+            pr_number=pr_number,
+            base=base,
+            head_sha=head_sha,
+            origin_path=ORIGIN_PR_RESUME,
+            expected_closing_issue_ids=tuple(expected_closing_issue_ids),
+            primary_issue=primary_issue,
+            unowned_managed_pr=origin_flow == FLOW_MANAGED_PR,
         ),
     )
 

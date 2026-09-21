@@ -3370,13 +3370,16 @@ def test_m946_pr_loop_stops_on_an_integrity_failure_at_the_round_binding(
 def test_m946_pr_loop_entry_stops_on_a_partial_transaction_before_any_round(
     monkeypatch, tmp_path, boundary
 ):
-    """Point 1: a pr-command resume on a prepared-only transaction raises the
-    diagnostic at entry; no reviewer or coder runs and nothing is written."""
+    """Point 1: a pr-command resume on a prepared-only transaction whose
+    finishing write fails raises the diagnostic at entry; no reviewer or coder
+    runs, nothing is stored, and nothing merges."""
     from coding_review_agent_loop.errors import WorkflowTransactionError
+    import coding_review_agent_loop.workflow_transaction_publication as publication
 
     runner, config, merged, pr, _head = _m946_merge_runner(
-        monkeypatch, tmp_path, boundary=boundary
+        monkeypatch, tmp_path, boundary=boundary, persist_writes=True
     )
+    runner.rest_post_failures = frozenset(range(1, 50))
     runner.codex_outputs = [structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")]
     config = make_config(tmp_path, repo=config.repo, reviewer=("codex",), max_rounds=1)
 
@@ -3385,9 +3388,49 @@ def test_m946_pr_loop_entry_stops_on_a_partial_transaction_before_any_round(
 
     assert raised.value.transaction_ids
     assert not [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
-    assert _m946_rest_comment_posts(runner) == []
     assert _m946_comment_writes(runner) == []
     assert merged == []
+    resolved = publication.read_pr_transaction_views(runner, config, pr, None)
+    assert resolved.lineage.latest_committed is None
+    assert resolved.lineage.pending is not None
+
+
+@pytest.mark.parametrize("boundary", [2, 3, 4])
+def test_m946_pr_loop_entry_finishes_an_interrupted_publication_then_merges(
+    monkeypatch, tmp_path, boundary
+):
+    """pr-resume-each-boundary: a pr-command rerun after write N failed adopts the
+    stored intent, finishes exactly the missing writes, and converges to one
+    committed transaction before any reviewer runs; no coder, no second PR."""
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    runner, config, merged, pr, head = _m946_merge_runner(
+        monkeypatch, tmp_path, boundary=boundary, persist_writes=True
+    )
+    runner.pr_payload["body"] = "Fixes #813"
+    runner.codex_outputs = [structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")]
+    config = make_config(
+        tmp_path, repo=config.repo, reviewer=("codex",), max_rounds=1, auto_merge=True
+    )
+    before = publication.read_pr_transaction_views(runner, config, pr, 813)
+    pending_id = before.lineage.pending.transaction_id
+
+    assert run_pr_loop(runner, pr_number=pr, config=config) == 0
+
+    resolved = publication.read_pr_transaction_views(runner, config, pr, 813)
+    committed = resolved.lineage.latest_committed
+    assert committed is not None and resolved.lineage.pending is None
+    assert committed.transaction_id == pending_id
+    assert len(resolved.lineage.transactions) == 1
+    assert merged == [head]
+    assert _m946_v1_records(runner) == []
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "create"]]
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    # A plain rerun finds nothing pending and writes no transaction record.
+    posts = len(_m946_rest_comment_posts(runner))
+    runner.codex_outputs = [structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")]
+    publication.finish_pending_transaction(runner, config, pr_number=pr, head_sha=head)
+    assert len(_m946_rest_comment_posts(runner)) == posts
 
 
 def test_m946_entry_commits_the_head_successor_then_gates(monkeypatch, tmp_path):
@@ -13288,3 +13331,143 @@ def test_pr_fresh_authorization_without_parent_context_still_fails_closed(tmp_pa
         match="could not recover the canonical approved plan for the explicit issue scope",
     ):
         run_pr_loop(_managed_resume_runner(), pr_number=77, config=config)
+
+
+def _m946_legacy_direct_pr_runner(tmp_path, *, v1_contract_ids=None):
+    """A legacy-era direct PR (#946): no version-2 record, optionally one v1 contract."""
+    from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")
+            for _ in range(3)
+        ],
+        pr_payload={"body": "Closes #847\nCloses #848", "headRefOid": "a" * 40},
+    )
+    runner.persist_rest_comment_posts = True
+    if v1_contract_ids is not None:
+        runner.pr_payload["comments"] = [
+            {
+                "author": {"login": "coding-review-agent-loop"},
+                "createdAt": "2026-05-01T00:00:00Z",
+                "body": format_pr_contract_comment(
+                    make_pr_contract(
+                        repository="OWNER/REPO",
+                        pr_number=77,
+                        origin_flow="direct-pr",
+                        expected_closing_issue_ids=v1_contract_ids,
+                    )
+                ),
+            }
+        ]
+    return runner
+
+
+def _m946_contract_bodies(runner):
+    return [
+        comment["body"]
+        for comment in runner.pr_payload.get("comments", [])
+        if "AGENT_PR_EXPECTED_CLOSING_ISSUES" in comment["body"]
+    ]
+
+
+def test_m946_pr_loop_upgrades_a_record_less_legacy_pr_by_one_initial_transaction(tmp_path):
+    """pr-resume-each-boundary (legacy PR needing a write): one `initial`
+    transaction replaces the version-1 contract write; a rerun writes nothing."""
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    runner = _m946_legacy_direct_pr_runner(tmp_path)
+    config = make_config(tmp_path, expected_closing_issue_ids=(847, 848), reviewer=("codex",))
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    resolved = publication.read_pr_transaction_views(runner, config, 77, None)
+    committed = resolved.lineage.latest_committed
+    assert committed is not None and resolved.lineage.pending is None
+    assert committed.intent.successor_kind == "initial"
+    assert committed.intent.origin_flow == "direct-pr"
+    assert tuple(committed.intent.expected_closing_issue_ids) == (847, 848)
+    contracts = _m946_contract_bodies(runner)
+    assert len(contracts) == 1 and "Workflow transaction: " in contracts[0]
+    # No version-1 contract went through the ordinary trusted-comment writer.
+    assert not [
+        cmd for cmd, _cwd in runner.commands
+        if cmd[:2] == ["gh", "api"] and cmd[2].startswith("repos/") and "--input" in cmd
+    ]
+
+    posts = len(_m946_rest_comment_posts(runner))
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer=("codex",))) == 0
+    assert len(_m946_rest_comment_posts(runner)) == posts
+    assert len(_m946_contract_bodies(runner)) == 1
+
+
+@pytest.mark.parametrize("failing_write", [1, 2, 3])
+def test_m946_pr_loop_legacy_upgrade_converges_after_each_failed_write(
+    tmp_path, failing_write
+):
+    """pr-resume-each-boundary: write N (prepared, PR contract, committed) fails,
+    the pr command stops before any reviewer, and a rerun converges to exactly
+    one committed transaction with one PR contract and no version-1 record."""
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    runner = _m946_legacy_direct_pr_runner(tmp_path)
+    runner.rest_post_failures = frozenset({failing_write})
+    config = make_config(tmp_path, expected_closing_issue_ids=(847, 848), reviewer=("codex",))
+
+    with pytest.raises(WorkflowTransactionError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    interrupted = publication.read_pr_transaction_views(runner, config, 77, None)
+    assert interrupted.lineage.latest_committed is None
+
+    runner.rest_post_failures = frozenset()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    resolved = publication.read_pr_transaction_views(runner, config, 77, None)
+    assert resolved.lineage.pending is None
+    assert len(resolved.lineage.transactions) == 1
+    assert resolved.lineage.latest_committed.intent.successor_kind == "initial"
+    contracts = _m946_contract_bodies(runner)
+    assert len(contracts) == 1 and "Workflow transaction: " in contracts[0]
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "create"]]
+
+
+def test_m946_pr_loop_upgrade_widens_a_consistent_legacy_contract(tmp_path):
+    """A legacy PR whose v1 contract is widened is upgraded by an `initial`
+    transaction whose contract supersedes the v1 record as `closing-widening`;
+    no second version-1 contract is appended."""
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    runner = _m946_legacy_direct_pr_runner(tmp_path, v1_contract_ids=(847,))
+    config = make_config(
+        tmp_path,
+        expected_closing_issue_ids=(847, 848),
+        supersede_expected_closing_contract=True,
+        reviewer=("codex",),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    resolved = publication.read_pr_transaction_views(runner, config, 77, None)
+    committed = resolved.lineage.latest_committed
+    assert committed.intent.successor_kind == "initial"
+    assert tuple(committed.intent.expected_closing_issue_ids) == (847, 848)
+    contracts = _m946_contract_bodies(runner)
+    assert len(contracts) == 2
+    assert "Workflow transaction: " not in contracts[0]
+    assert "Workflow transaction: " in contracts[1] and "(closing-widening)" in contracts[1]
+
+
+def test_m946_pr_loop_leaves_a_consistent_legacy_pr_without_writes(tmp_path):
+    """legacy-pr-unchanged: a consistent v1 PR that needs no write gets no transaction."""
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    runner = _m946_legacy_direct_pr_runner(tmp_path, v1_contract_ids=(847, 848))
+    config = make_config(tmp_path, expected_closing_issue_ids=(847, 848), reviewer=("codex",))
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert _m946_rest_comment_posts(runner) == []
+    resolved = publication.read_pr_transaction_views(runner, config, 77, None)
+    assert resolved.era == publication.ERA_LEGACY

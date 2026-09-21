@@ -698,6 +698,69 @@ def test_ensure_live_head_transaction_refuses_a_managed_generation_without_writi
     assert github.write_count == before
 
 
+def test_finish_pending_transaction_adopts_the_stored_intent_and_waives_the_round(tmp_path):
+    """PR-loop entry (point 1): an interrupted issue-origin publication is finished
+    from its stored intent alone; the coder response is not in session, so the
+    initial coder round is waived and no coder comment is fabricated."""
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        finish_pending_transaction,
+    )
+
+    github = TransactionGitHub()
+    github.fail_write(4, FAIL_BEFORE_WRITE)
+    with pytest.raises(WorkflowTransactionError):
+        publish(github, direct_request(), tmp_path)
+    pending = read_pr_transaction_views(github, make_config(tmp_path), PR, ISSUE)
+    stored_id = pending.lineage.pending.transaction_id
+
+    assert finish_pending_transaction(
+        github, make_config(tmp_path), pr_number=PR, head_sha=HEAD_1
+    ) is True
+
+    resolved = read_pr_transaction_views(github, make_config(tmp_path), PR, ISSUE)
+    committed = resolved.lineage.latest_committed
+    assert committed.transaction_id == stored_id and resolved.lineage.pending is None
+    assert committed.outcome(ENTRY_INITIAL_CODER_ROUND).status == STATUS_WAIVED_CODER_RESPONSE
+    assert not any("Implemented the change." in body for body in github.bodies(PR))
+    before = github.write_count
+    assert finish_pending_transaction(
+        github, make_config(tmp_path), pr_number=PR, head_sha=HEAD_1
+    ) is False
+    assert github.write_count == before
+
+
+def test_finish_pending_transaction_refuses_a_managed_pending_transaction(tmp_path):
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        finish_pending_transaction,
+    )
+
+    github, codec = TransactionGitHub(), StubAuthorizationCodec()
+    github.fail_write(2, FAIL_BEFORE_WRITE)
+    with pytest.raises(WorkflowTransactionError):
+        publish(github, managed_request(codec), tmp_path)
+    before = github.write_count
+    with pytest.raises(WorkflowTransactionError) as raised:
+        finish_pending_transaction(
+            github, make_config(tmp_path), pr_number=PR, head_sha=HEAD_1
+        )
+    assert raised.value.code == CODE_MANAGED_UNAVAILABLE
+    assert github.write_count == before
+
+
+def test_publish_legacy_upgrade_refuses_an_approved_plan_flow(tmp_path):
+    from coding_review_agent_loop.errors import AgentLoopError
+    from coding_review_agent_loop.workflow_transaction_publication import publish_legacy_upgrade
+
+    github = TransactionGitHub()
+    with pytest.raises(AgentLoopError):
+        publish_legacy_upgrade(
+            github, make_config(tmp_path), pr_number=PR, base="main", head_sha=HEAD_1,
+            origin_flow="approved-plan-implementation", primary_issue=ISSUE,
+            expected_closing_issue_ids=(ISSUE,),
+        )
+    assert github.write_count == 0
+
+
 def test_ensure_head_transaction_leaves_a_legacy_pr_untouched(tmp_path):
     github = TransactionGitHub()
     github.seed(PR, v1_contract_comment(1).body)

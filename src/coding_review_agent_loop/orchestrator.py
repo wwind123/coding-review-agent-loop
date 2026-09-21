@@ -15127,6 +15127,32 @@ def _committed_pr_binding(
     return publication.committed_pr_binding(runner, config, pr_number)
 
 
+def _legacy_upgrade_applies(
+    config: AgentLoopConfig,
+    *,
+    closing_contract: PrExpectedClosingContract,
+    managed_resume,
+    managed_ci,
+    ordinary_recovery_selected: bool,
+) -> bool:
+    """Whether the PR loop upgrades a legacy PR through the seam (#827, site f).
+
+    Unmanaged direct-issue, direct-PR, and managed-source PRs are upgraded by an
+    ``initial`` transaction.  Approved-plan PRs (which need the approved
+    candidate key) and PRs carrying a managed authorization or selection keep
+    the version-1 writes until the managed lifecycle is on the seam.
+    """
+    from . import workflow_transaction_publication as publication
+
+    return (
+        not config.dry_run
+        and closing_contract.origin_flow in publication.LEGACY_UPGRADE_FLOWS
+        and managed_resume is None
+        and managed_ci is None
+        and not ordinary_recovery_selected
+    )
+
+
 def _issue_handoff_for_pr_loop(
     transaction_binding,
     issue_context: IssueContext,
@@ -15153,11 +15179,14 @@ def _entry_transaction_precheck(
     pr_number: int,
     head_sha: str | None,
 ) -> None:
-    """Read-only entry check (#827) that runs before any version-1 PR reader.
+    """Entry check (#827) that runs before any version-1 PR reader.
 
-    A transaction-era PR whose lineage is partial (no committed transaction,
-    or a pending prepared record) stops the PR command here with the
-    transaction diagnostic, before any round, selection, or write.
+    A pending prepared record left by an interrupted publication is finished
+    (or superseded) through the seam from its stored intent.  A transaction-era
+    PR whose lineage is still partial afterwards (no committed transaction, or
+    a finishing write that failed) stops the PR command here with the
+    transaction diagnostic, before any round or selection.  Writes nothing
+    when nothing is pending.
     """
     from . import workflow_transaction_publication as publication
 
@@ -15167,6 +15196,14 @@ def _entry_transaction_precheck(
     if resolved.era != publication.ERA_TRANSACTION:
         return
     lineage = resolved.lineage
+    if lineage.pending is not None:
+        # Entry is a writer path: finish (or supersede) the interrupted
+        # publication from its stored intent.  A write that still fails keeps
+        # the transaction prepared-only and stops the command here.
+        validate_open_pr(runner, config=config, pr_number=pr_number)
+        publication.finish_pending_transaction(
+            runner, config, pr_number=pr_number, head_sha=head_sha
+        )
     if lineage.latest_committed is None or lineage.pending is not None:
         publication.require_live_head_authority(
             runner, config, pr_number=pr_number, head_sha=head_sha
@@ -16794,6 +16831,39 @@ def run_pr_loop(
                         head_sha=str(initial_pr_context.metadata.head_sha or ""),
                         expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
                     )
+                contract_needs_persisting = False
+            if contract_needs_persisting and _legacy_upgrade_applies(
+                config,
+                closing_contract=closing_contract,
+                managed_resume=authenticated_managed_resume,
+                managed_ci=managed_ci,
+                ordinary_recovery_selected=ordinary_recovery_selected,
+            ):
+                # Legacy era that needs a write: one `initial` transaction
+                # restates or widens the version-1 records instead of
+                # appending more of them.
+                upgrade_issue = closing_contract.primary_issue_number
+                if (
+                    upgrade_issue is not None
+                    and issue_context is not None
+                    and issue_context.number != upgrade_issue
+                ):
+                    raise AgentLoopError(
+                        "The linked issue context does not match the issue-origin PR contract; "
+                        "resume with the authoritative issue or PR metadata."
+                    )
+                from . import workflow_transaction_publication as publication
+
+                publication.publish_legacy_upgrade(
+                    runner,
+                    config,
+                    pr_number=pr_number,
+                    base=str(initial_pr_context.metadata.base_branch or ""),
+                    head_sha=str(initial_pr_context.metadata.head_sha or ""),
+                    origin_flow=closing_contract.origin_flow,
+                    primary_issue=upgrade_issue,
+                    expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
+                )
                 contract_needs_persisting = False
             if contract_needs_persisting:
                 post_trusted_pr_comment(

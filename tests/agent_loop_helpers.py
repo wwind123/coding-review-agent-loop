@@ -202,6 +202,9 @@ from coding_review_agent_loop.workdir_guard import (
 from unittest.mock import MagicMock, patch
 
 
+
+_REST_POST_ID_BASE = 1_000_000
+
 class FakeRunner(Runner):
     def __init__(
         self,
@@ -1161,7 +1164,15 @@ class FakeRunner(Runner):
             # Opt-in (#827): persist a REST comment write so a real seam
             # publication can read its own record back.
             number = int(rest_post.group(1))
-            body = cmd[6].removeprefix("body=")
+            if cmd[5:7] == ["--input", "-"]:
+                body = json.loads(input_text or "{}").get("body", "")
+            else:
+                body = cmd[6].removeprefix("body=")
+            # Opt-in failure injection: 1-based ordinals of REST writes that
+            # fail before anything is stored.
+            self.rest_post_count = getattr(self, "rest_post_count", 0) + 1
+            if self.rest_post_count in getattr(self, "rest_post_failures", ()):
+                return CommandResult(cmd, cwd_path, "", "injected write failure", 1)
             if number == self._pr_payload_for(str(number)).get("number"):
                 thread = self._pr_payload_for(str(number)).setdefault("comments", [])
             else:
@@ -1175,11 +1186,14 @@ class FakeRunner(Runner):
                 for item in items
                 if isinstance(item, dict) and isinstance(item.get("id"), int)
             ]
-            comment_id = max(known, default=0) + 1
+            # A separate high ID range: gh-shaped comments are listed with
+            # positional IDs, which must never collide with a REST write.
+            comment_id = max(known + [_REST_POST_ID_BASE]) + 1
+            sequence = comment_id - _REST_POST_ID_BASE
             # Later than every seeded fixture, ordered by the monotonic ID.
             stamp = (
-                f"2030-01-01T{comment_id // 3600 % 24:02d}:"
-                f"{comment_id // 60 % 60:02d}:{comment_id % 60:02d}Z"
+                f"2030-01-01T{sequence // 3600 % 24:02d}:"
+                f"{sequence // 60 % 60:02d}:{sequence % 60:02d}Z"
             )
             comment = {
                 "id": comment_id,

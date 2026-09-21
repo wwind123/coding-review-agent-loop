@@ -229,8 +229,11 @@ def test_direct_pr_without_metadata_remains_contract_unknown(tmp_path):
 def test_direct_pr_explicit_metadata_uses_managed_origin_and_all_ids(tmp_path):
     runner = FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
-        pr_payload={"body": "Closes #847\nCloses #848"},
+        pr_payload={"body": "Closes #847\nCloses #848", "headRefOid": "a" * 40},
     )
+    # A PR with no records that needs a contract is upgraded by one `initial`
+    # workflow transaction (#827) rather than a version-1 contract.
+    runner.persist_rest_comment_posts = True
     config = make_config(
         tmp_path,
         expected_closing_issue_ids=(847, 848),
@@ -245,6 +248,7 @@ def test_direct_pr_explicit_metadata_uses_managed_origin_and_all_ids(tmp_path):
     ]
     assert len(contract_comments) == 1
     assert "Origin flow: managed-pr" in contract_comments[0]["body"]
+    assert "Workflow transaction: " in contract_comments[0]["body"]
 
 
 def test_direct_pr_supersession_lineage_survives_plain_reruns(tmp_path):
@@ -254,8 +258,11 @@ def test_direct_pr_supersession_lineage_survives_plain_reruns(tmp_path):
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
-        pr_payload={"body": "Closes #847\nCloses #848"},
+        pr_payload={"body": "Closes #847\nCloses #848", "headRefOid": "a" * 40},
     )
+    # The first run upgrades the record-less PR by an `initial` transaction;
+    # the widening is then a `closing-widening` successor (#827).
+    runner.persist_rest_comment_posts = True
 
     assert run_pr_loop(
         runner,
