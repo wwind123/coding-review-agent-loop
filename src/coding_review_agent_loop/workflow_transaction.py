@@ -2148,6 +2148,21 @@ def _declares_v2(encoded: str, peek) -> bool:
         return False
 
 
+def pr_comment_body_declares_transaction_era(body: str) -> bool:
+    """Return whether one actor-authored PR comment body makes the PR transaction-era.
+
+    The caller owns author authentication; this is only the PR-side body rule of
+    ``classify_transaction_era``, shared with readers that hold a raw comment
+    snapshot instead of an authenticated view.
+    """
+    if WORKFLOW_TRANSACTION_MARKER_RE.search(body):
+        return True
+    return any(
+        _declares_v2(match.group("payload"), pr_contract_payload_schema_version)
+        for match in PR_EXPECTED_CLOSING_MARKER_RE.finditer(body)
+    )
+
+
 def classify_transaction_era(
     pr_view: AuthenticatedCommentView,
     issue_view: AuthenticatedCommentView | None = None,
@@ -2161,11 +2176,8 @@ def classify_transaction_era(
     """
     view = _require_view(pr_view, kind=PR_THREAD_SURFACE)
     for comment in view.authored:
-        if WORKFLOW_TRANSACTION_MARKER_RE.search(comment.body):
+        if pr_comment_body_declares_transaction_era(comment.body):
             return ERA_TRANSACTION
-        for match in PR_EXPECTED_CLOSING_MARKER_RE.finditer(comment.body):
-            if _declares_v2(match.group("payload"), pr_contract_payload_schema_version):
-                return ERA_TRANSACTION
     if issue_view is not None:
         _, pr_number = parse_comment_thread_surface(view.surface)
         for comment in _require_view(issue_view, kind=ISSUE_THREAD_SURFACE).authored:

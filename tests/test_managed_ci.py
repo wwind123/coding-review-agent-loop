@@ -6450,3 +6450,150 @@ def test_unverified_resume_audit_falls_back_to_ordinary_recovery(tmp_path):
     assert not any(
         command[:4] == ["gh", "pr", "merge", "7"] for command, _cwd in runner.commands
     )
+
+
+# ---------------------------------------------------------------------------
+# Single managed-CI authorization accessor (#827 / #946)
+# ---------------------------------------------------------------------------
+
+_ACCESSOR_ACTOR = ("agent-loop", 4242)
+
+
+def _accessor_record(**overrides) -> ManagedCiIssueAuthorization:
+    fields = dict(
+        kind="creation", repository="OWNER/REPO", issue_number=7, pr_number=11,
+        base_ref="main", head_sha="a" * 40, actor_login=_ACCESSOR_ACTOR[0],
+        actor_id=_ACCESSOR_ACTOR[1], protection="voluntary",
+        waiver="allow-unprotected-managed-ci", nonce="nonce-1", label_event_id=9001,
+    )
+    fields.update(overrides)
+    return ManagedCiIssueAuthorization(**fields)
+
+
+def _accessor_comment(comment_id, body, *, author=_ACCESSOR_ACTOR):
+    return {"id": comment_id, "body": str(body), "user": {"login": author[0], "id": author[1]}}
+
+
+def _accessor_scan(tmp_path, comments, **kwargs):
+    return managed_ci.read_managed_ci_authorizations(
+        FakeRunner(), config=make_config(tmp_path), pr_number=11,
+        actor_login=_ACCESSOR_ACTOR[0], actor_id=_ACCESSOR_ACTOR[1],
+        comments=comments, **kwargs,
+    )
+
+
+def _transaction_era_comment(comment_id, *, author=_ACCESSOR_ACTOR):
+    from workflow_transaction_helpers import direct_intent, prepared_comment
+
+    prepared = prepared_comment(comment_id, direct_intent())
+    return _accessor_comment(comment_id, prepared.body, author=author)
+
+
+def test_accessor_legacy_era_returns_actor_records_in_comment_order(tmp_path):
+    record = _accessor_record()
+    later = _accessor_record(kind="fresh", nonce="nonce-2")
+    scan = _accessor_scan(tmp_path, [
+        _accessor_comment(1, "ordinary comment"),
+        _accessor_comment(2, format_issue_created_authorization_comment(record)),
+        _accessor_comment(3, format_issue_created_authorization_comment(later)),
+    ])
+    assert scan.era == "legacy"
+    assert scan.records == ((2, record), (3, later))
+    assert scan.claimed == frozenset({1, 2})
+    assert scan.rejected is False
+
+
+def test_accessor_strict_read_raises_and_lenient_read_rejects_a_foreign_record(tmp_path):
+    forged = _accessor_comment(
+        2, format_issue_created_authorization_comment(_accessor_record()), author=("mallory", 666)
+    )
+    with pytest.raises(AgentLoopError, match="not authored by the authenticated actor"):
+        _accessor_scan(tmp_path, [forged])
+    scan = _accessor_scan(tmp_path, [forged], lenient=True)
+    assert scan.records == ()
+    assert scan.rejected is True
+
+
+def test_accessor_returns_no_unbound_record_on_a_transaction_era_pr(tmp_path):
+    unbound = _accessor_comment(2, format_issue_created_authorization_comment(_accessor_record()))
+    scan = _accessor_scan(tmp_path, [unbound, _transaction_era_comment(3)])
+    assert scan.era == "transaction"
+    assert scan.records == ()
+
+
+def test_accessor_ignores_a_forged_transaction_record_for_era_classification(tmp_path):
+    record = _accessor_record()
+    unbound = _accessor_comment(2, format_issue_created_authorization_comment(record))
+    scan = _accessor_scan(
+        tmp_path, [unbound, _transaction_era_comment(3, author=("mallory", 666))]
+    )
+    assert scan.era == "legacy"
+    assert scan.records == ((2, record),)
+
+
+def test_v1_publisher_refuses_to_extend_a_transaction_era_pr(tmp_path, monkeypatch):
+    unbound = _accessor_comment(2, format_issue_created_authorization_comment(_accessor_record()))
+    monkeypatch.setattr(
+        managed_ci, "_api_list", lambda *_a, **_k: [unbound, _transaction_era_comment(3)]
+    )
+    with pytest.raises(AgentLoopError, match="unbound managed-CI authorization grants nothing"):
+        managed_ci._legacy_authorization_records(
+            FakeRunner(), config=make_config(tmp_path), pr_number=11,
+            actor_login=_ACCESSOR_ACTOR[0], actor_id=_ACCESSOR_ACTOR[1],
+        )
+
+
+def test_resume_audit_grants_nothing_from_unbound_records_on_a_transaction_era_pr(
+    tmp_path, monkeypatch
+):
+    unbound = _accessor_comment(2, format_issue_created_authorization_comment(_accessor_record()))
+    comments = [unbound]
+    monkeypatch.setattr(managed_ci, "_api_list", lambda *_a, **_k: list(comments))
+    kwargs = dict(
+        config=make_config(tmp_path), pr_number=11, actor_login=_ACCESSOR_ACTOR[0],
+        actor_id=_ACCESSOR_ACTOR[1], base_ref="main", issue_number=7,
+    )
+    legacy = managed_ci._find_resume_audit(FakeRunner(), **kwargs)
+    assert legacy is not None and legacy[0] == 2
+    comments.append(_transaction_era_comment(3))
+    assert managed_ci._find_resume_audit(FakeRunner(), **kwargs) is None
+
+
+def test_no_authorization_scan_exists_outside_the_accessor():
+    """The v1 authorization token and parser are referenced only by the codec and the accessor."""
+    allowed = {
+        "format_issue_created_authorization_comment",
+        "parse_issue_created_authorization_comment",
+        "read_managed_ci_authorizations",
+    }
+    tokens = {"ISSUE_AUTHORIZATION_MARKER", "parse_issue_created_authorization_comment"}
+    for module in (managed_ci, orchestrator):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name in allowed:
+                continue
+            used = {
+                child.id for child in ast.walk(node)
+                if isinstance(child, ast.Name) and child.id in tokens
+            } | {
+                child.attr for child in ast.walk(node)
+                if isinstance(child, ast.Attribute) and child.attr in tokens
+            }
+            assert not used, f"{module.__name__}.{node.name} references {sorted(used)}"
+    source = Path(managed_ci.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    publishers = {
+        "publish_issue_created_authorization",
+        "publish_issue_created_continuity_authorization",
+        "authorize_fresh_issue_created_resume",
+        "_find_resume_audit",
+    }
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in publishers:
+            called = {
+                child.func.id for child in ast.walk(node)
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+            }
+            assert called & {"read_managed_ci_authorizations", "_legacy_authorization_records"}, node.name

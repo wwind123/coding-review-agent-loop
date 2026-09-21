@@ -1288,7 +1288,113 @@ def _authorization_actor(
     return login, actor_id
 
 
-def _authorization_comment_records(
+@dataclass(frozen=True)
+class ManagedCiAuthorizationScan:
+    """One read of a PR's unbound issue-created authorization records.
+
+    ``records`` holds actor-authored unbound records in comment order and is
+    always empty for a transaction-era PR, where an unbound record grants
+    nothing (#827).  ``rejected`` is set only by a lenient read that met a
+    malformed, foreign-authored, or identity-less authorization comment.
+    ``claimed`` lists the positions, in the scanned snapshot, of every comment
+    that names an authorization record.
+    """
+
+    era: str
+    records: tuple[tuple[int, ManagedCiIssueAuthorization], ...]
+    rejected: bool = False
+    claimed: frozenset[int] = frozenset()
+
+    @property
+    def transaction_era(self) -> bool:
+        return self.era != "legacy"
+
+
+def read_managed_ci_authorizations(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    actor_login: str,
+    actor_id: int,
+    comments: list[dict[str, object]] | None = None,
+    lenient: bool = False,
+) -> ManagedCiAuthorizationScan:
+    """The only scan of managed-CI authorization comments (#827).
+
+    Legacy era keeps today's semantics: a strict read raises on a malformed,
+    foreign-authored, or identity-less record, and a lenient read (resume
+    audit) reports the same conditions through ``rejected``.  A PR that carries
+    any actor-authored version-2 record is transaction-era: unbound records are
+    never returned, so no builder can extend or idempotently return one.
+    """
+    # Imported here: ``workflow_transaction`` reaches this module through
+    # ``prompts``, and the bound codec imports this module.
+    from .managed_ci_bound_authorization import BOUND_AUTHORIZATION_MARKER
+    from .workflow_transaction import (
+        ERA_LEGACY,
+        ERA_TRANSACTION,
+        pr_comment_body_declares_transaction_era,
+    )
+
+    if comments is None:
+        comments = _api_list(
+            runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+        )
+    if comments is None:
+        raise AgentLoopError("Managed-CI authorization comments could not be inspected.")
+    era = ERA_LEGACY
+    records: list[tuple[int, ManagedCiIssueAuthorization]] = []
+    claimed: set[int] = set()
+    rejected = False
+    for position, comment in enumerate(comments):
+        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        if user.get("id") == actor_id and (
+            BOUND_AUTHORIZATION_MARKER in body
+            or pr_comment_body_declares_transaction_era(body)
+        ):
+            era = ERA_TRANSACTION
+        if ISSUE_AUTHORIZATION_MARKER not in body:
+            continue
+        claimed.add(position)
+        try:
+            parsed = parse_issue_created_authorization_comment(body)
+        except AgentLoopError as exc:
+            if lenient:
+                rejected = True
+                continue
+            raise AgentLoopError(
+                "Managed-CI authorization comment is malformed; refusing to infer authority."
+            ) from exc
+        if parsed is None:
+            rejected = True
+            continue
+        if user.get("login") != actor_login or user.get("id") != actor_id:
+            if lenient:
+                rejected = True
+                continue
+            raise AgentLoopError(
+                "Managed-CI authorization comment is not authored by the authenticated actor."
+            )
+        comment_id = comment.get("id")
+        if not isinstance(comment_id, int):
+            if lenient:
+                rejected = True
+                continue
+            raise AgentLoopError("Managed-CI authorization comment has no stable identity.")
+        records.append((comment_id, parsed))
+    if era == ERA_TRANSACTION:
+        records = []
+    return ManagedCiAuthorizationScan(
+        era=era,
+        records=tuple(records),
+        rejected=rejected,
+        claimed=frozenset(claimed),
+    )
+
+
+def _legacy_authorization_records(
     runner: Runner,
     *,
     config: AgentLoopConfig,
@@ -1296,34 +1402,21 @@ def _authorization_comment_records(
     actor_login: str,
     actor_id: int,
 ) -> list[tuple[int, ManagedCiIssueAuthorization]]:
-    comments = _api_list(
-        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+    """Records for a v1 publisher; refuses to extend a transaction-era PR."""
+    scan = read_managed_ci_authorizations(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        actor_login=actor_login,
+        actor_id=actor_id,
     )
-    if comments is None:
-        raise AgentLoopError("Managed-CI authorization comments could not be inspected.")
-    records: list[tuple[int, ManagedCiIssueAuthorization]] = []
-    for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
-        if ISSUE_AUTHORIZATION_MARKER not in body:
-            continue
-        try:
-            parsed = parse_issue_created_authorization_comment(body)
-        except AgentLoopError as exc:
-            raise AgentLoopError(
-                "Managed-CI authorization comment is malformed; refusing to infer authority."
-            ) from exc
-        if parsed is None:
-            continue
-        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
-        if user.get("login") != actor_login or user.get("id") != actor_id:
-            raise AgentLoopError(
-                "Managed-CI authorization comment is not authored by the authenticated actor."
-            )
-        comment_id = comment.get("id")
-        if not isinstance(comment_id, int):
-            raise AgentLoopError("Managed-CI authorization comment has no stable identity.")
-        records.append((comment_id, parsed))
-    return records
+    if scan.transaction_era:
+        raise AgentLoopError(
+            f"PR #{pr_number} carries workflow-transaction records; an unbound managed-CI "
+            "authorization grants nothing there and none was written. Managed-CI authority "
+            "for this PR must come from a transaction-bound authorization."
+        )
+    return list(scan.records)
 
 
 def _github_proves_descendant(
@@ -1594,7 +1687,7 @@ def publish_issue_created_authorization(
         raise AgentLoopError(
             "Managed-CI issue-created authorization label provenance changed before publication."
         )
-    records = _authorization_comment_records(
+    records = _legacy_authorization_records(
         runner,
         config=config,
         pr_number=handoff.pr_number,
@@ -1715,7 +1808,7 @@ def publish_issue_created_continuity_authorization(
         handoff=handoff,
         new_head=new_head,
     )
-    records = _authorization_comment_records(
+    records = _legacy_authorization_records(
         runner,
         config=config,
         pr_number=handoff.pr_number,
@@ -1786,7 +1879,7 @@ def publish_issue_created_continuity_authorization(
             raise AgentLoopError(
                 "Managed-CI head continuity requires authenticated, correlated round metadata."
             )
-        current_records = _authorization_comment_records(
+        current_records = _legacy_authorization_records(
             runner,
             config=config,
             pr_number=handoff.pr_number,
@@ -2089,7 +2182,7 @@ def authorize_fresh_issue_created_resume(
                 "no authorization record was written."
             )
 
-    records = _authorization_comment_records(
+    records = _legacy_authorization_records(
         runner,
         config=config,
         pr_number=pr_number,
@@ -2240,7 +2333,7 @@ def authorize_fresh_issue_created_resume(
         approved_plan_hash=approved_plan_hash,
     )
     revalidate_live_authorization_tuple()
-    latest_records = _authorization_comment_records(
+    latest_records = _legacy_authorization_records(
         runner,
         config=config,
         pr_number=pr_number,
@@ -3129,49 +3222,50 @@ def _find_resume_audit(
         return True
     candidates: list[tuple[int, dict[str, str]]] = []
     authorization_candidates: list[tuple[int, ManagedCiIssueAuthorization]] = []
-    malformed = False
-    for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
-        if ISSUE_AUTHORIZATION_MARKER in body:
-            try:
-                authorization = parse_issue_created_authorization_comment(body)
-            except AgentLoopError:
-                malformed = True
-                continue
-            user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
-            cid = comment.get("id")
-            if (
-                authorization is None
-                or user.get("login") != actor_login
-                or user.get("id") != actor_id
-                or authorization.repository.casefold() != config.repo.casefold()
-                or authorization.base_ref != base_ref
-                or authorization.pr_number != pr_number
-                or (issue_number is not None and authorization.issue_number != issue_number)
-                or not authorization_matches(authorization, cid)
-                or not isinstance(cid, int)
-            ):
-                malformed = True
-                continue
-            candidates.append(
-                (
-                    cid,
-                    {
-                        "nonce": authorization.nonce,
-                        "repo": authorization.repository,
-                        "base": authorization.base_ref,
-                        "head": authorization.head_sha,
-                        "protection": authorization.protection,
-                        "active_label_event_id": str(authorization.label_event_id),
-                        "kind": authorization.kind,
-                        "issue": str(authorization.issue_number),
-                        "pr": str(authorization.pr_number),
-                    },
-                )
-            )
-            authorization_candidates.append((cid, authorization))
+    scan = read_managed_ci_authorizations(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        actor_login=actor_login,
+        actor_id=actor_id,
+        comments=comments,
+        lenient=True,
+    )
+    if scan.transaction_era:
+        # Unbound records and trailer audits grant nothing once the PR carries
+        # workflow-transaction records; bound authority is read elsewhere.
+        return None
+    malformed = scan.rejected
+    for cid, authorization in scan.records:
+        if (
+            authorization.repository.casefold() != config.repo.casefold()
+            or authorization.base_ref != base_ref
+            or authorization.pr_number != pr_number
+            or (issue_number is not None and authorization.issue_number != issue_number)
+            or not authorization_matches(authorization, cid)
+        ):
+            malformed = True
             continue
-        if UNPROTECTED_OVERRIDE_TRAILER not in body:
+        candidates.append(
+            (
+                cid,
+                {
+                    "nonce": authorization.nonce,
+                    "repo": authorization.repository,
+                    "base": authorization.base_ref,
+                    "head": authorization.head_sha,
+                    "protection": authorization.protection,
+                    "active_label_event_id": str(authorization.label_event_id),
+                    "kind": authorization.kind,
+                    "issue": str(authorization.issue_number),
+                    "pr": str(authorization.pr_number),
+                },
+            )
+        )
+        authorization_candidates.append((cid, authorization))
+    for position, comment in enumerate(comments):
+        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        if position in scan.claimed or UNPROTECTED_OVERRIDE_TRAILER not in body:
             continue
         parsed = _parse_override_audit(body)
         user = comment.get("user") if isinstance(comment.get("user"), dict) else {}

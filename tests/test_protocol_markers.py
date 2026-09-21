@@ -441,11 +441,14 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
         # Stage B adds the publication seam as the second sanctioned importer.
         # No orchestration call site consumes either module yet.
         # The bound managed-CI authorization rule judges a record against its
-        # transaction, so it is the third; ``managed_ci`` itself stays out.
+        # transaction, so it is the third.  ``managed_ci`` is the fourth: its single
+        # authorization accessor classifies the era with the stage A body rule and
+        # imports nothing that interprets or produces a version-2 record.
         if path.name in {
             "workflow_transaction.py",
             "workflow_transaction_publication.py",
             "managed_ci_bound_authorization.py",
+            "managed_ci.py",
         }:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
