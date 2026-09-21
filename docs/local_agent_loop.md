@@ -792,6 +792,11 @@ allowed GitHub surfaces. Trusted producers compose immutable `TrustedBody`
 segments, and writers verify a one-to-one match between every visible
 occurrence and its authorized canonical segment before posting.
 
+The workflow transaction record (#827) is registered as a PR-comment-only
+record. Nothing reads or writes it yet; the visible effect today is that
+look-alike text in untrusted prose or agent output is neutralized like any
+other reserved record.
+
 Naming a reserved record in issue or pull-request prose is safe. Untrusted
 GitHub text — an issue title or body, a pull-request title or body, a comment,
 or the body of a signed human requirement, which is itself an ordinary

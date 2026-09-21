@@ -19,6 +19,49 @@ class HumanDecisionRequiredError(AgentLoopError):
     EXIT_CODE = 4
 
 
+class WorkflowTransactionError(AgentLoopError):
+    """A cross-surface workflow transaction is missing, partial, or contradictory (#827).
+
+    The message always names the transaction(s), the expected record set, each
+    offending record, and the one supported recovery action, so an operator can
+    act without reading protocol payloads.
+    """
+
+    def __init__(
+        self,
+        summary: str,
+        *,
+        transaction_ids: tuple[str, ...] = (),
+        successor_kind: str | None = None,
+        expected_record_set: tuple[str, ...] = (),
+        problems: tuple[str, ...] = (),
+        recovery_action: str = "rerun to finish the transaction",
+        code: str | None = None,
+    ) -> None:
+        self.summary = summary
+        self.transaction_ids = tuple(transaction_ids)
+        self.successor_kind = successor_kind
+        self.expected_record_set = tuple(expected_record_set)
+        self.problems = tuple(problems)
+        self.recovery_action = recovery_action
+        self.code = code
+        parts = [summary.rstrip(".") + "."]
+        if code:
+            parts.append(f"Code: {code}.")
+        parts.append(
+            "Transaction(s): " + (", ".join(self.transaction_ids) or "(none)") + "."
+        )
+        if successor_kind:
+            parts.append(f"Successor kind: {successor_kind}.")
+        parts.append(
+            "Expected record set: " + (", ".join(self.expected_record_set) or "(none)") + "."
+        )
+        if self.problems:
+            parts.append("Records: " + "; ".join(self.problems) + ".")
+        parts.append(f"Recovery: {recovery_action}.")
+        super().__init__(" ".join(parts))
+
+
 class FreshContractIntegrityError(AgentLoopError):
     """A fresh plan cannot be format-repaired without recoverable v1 data."""
 

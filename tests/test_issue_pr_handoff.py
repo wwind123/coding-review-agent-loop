@@ -737,3 +737,215 @@ def test_m936_plan_edge_tracks_the_latest_change_and_resets_for_another_pr():
     )
     assert plain.replaced is None and plain.replacement is None
     assert plain.replacement_comment_index == -1
+
+
+# --- Version 2: transaction-bound handoff records (#827, stage A) -----------
+
+
+def _v2_handoff(**overrides):
+    from coding_review_agent_loop.expected_closure import contract_hash
+    from coding_review_agent_loop.issue_pr_handoff import IssuePrHandoffMetadataV2
+
+    fields = dict(
+        issue_number=813,
+        pr_number=826,
+        pr_url="https://github.com/OWNER/REPO/pull/826",
+        pr_head_sha="a" * 40,
+        flow="issue-implementation",
+        plan_hash=None,
+        expected_closing_issue_ids=(813,),
+        contract_hash=contract_hash((813,)),
+        transaction_id="b" * 64,
+    )
+    fields.update(overrides)
+    return IssuePrHandoffMetadataV2(**fields)
+
+
+def test_v2_handoff_round_trips_and_renders_one_trusted_issue_comment_record():
+    from coding_review_agent_loop.issue_pr_handoff import (
+        decode_issue_pr_handoff_v2,
+        encode_issue_pr_handoff_v2,
+        format_issue_pr_handoff_v2_comment,
+    )
+    from coding_review_agent_loop.protocol_markers import ISSUE_COMMENT_SURFACE, TrustedBody
+
+    metadata = _v2_handoff(flow="approved-plan-implementation", plan_hash="0123456789abcdef")
+    assert decode_issue_pr_handoff_v2(encode_issue_pr_handoff_v2(metadata)) == metadata
+    body = TrustedBody.canonical(
+        format_issue_pr_handoff_v2_comment(metadata, repo="OWNER/REPO"),
+        surface=ISSUE_COMMENT_SURFACE,
+        expected_tokens=("AGENT_ISSUE_PR_HANDOFF",),
+    )
+    assert "b" * 64 in body and "Plan hash: 0123456789abcdef" in body
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"transaction_id": "short"},
+        {"transaction_id": None},
+        {"flow": "direct-pr"},
+        {"plan_hash": "0123456789abcdef"},
+        {"flow": "approved-plan-implementation"},
+        {"expected_closing_issue_ids": (900,)},
+        {"contract_hash": "0" * 64},
+        {"issue_number": True},
+        {"pr_head_sha": ""},
+    ],
+)
+def test_v2_handoff_codec_is_strict(overrides):
+    from coding_review_agent_loop.issue_pr_handoff import (
+        decode_issue_pr_handoff_v2,
+        encode_issue_pr_handoff_v2,
+    )
+
+    with pytest.raises(AgentLoopError):
+        decode_issue_pr_handoff_v2(encode_issue_pr_handoff_v2(_v2_handoff(**overrides)))
+
+
+def test_existing_handoff_entry_point_still_rejects_a_v2_payload():
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop.issue_pr_handoff import (
+        AGENT_ISSUE_PR_HANDOFF_RE,
+        decode_issue_pr_handoff_v2,
+        format_issue_pr_handoff_v2_comment,
+        resolve_issue_pr_handoff_lineage,
+    )
+
+    body = format_issue_pr_handoff_v2_comment(_v2_handoff(), repo="OWNER/REPO")
+    with pytest.raises(AgentLoopError, match="unsupported schema_version 2"):
+        resolve_issue_pr_handoff_lineage(
+            [SimpleNamespace(body=body)], issue_number=813, repo="OWNER/REPO"
+        )
+    # And the version-2 decoder does not accept a version-1 record either.
+    v1_body = format_issue_pr_handoff_comment(
+        issue_number=813,
+        pr_number=826,
+        pr_url="https://github.com/OWNER/REPO/pull/826",
+        pr_head_sha="a" * 40,
+        flow="issue-implementation",
+        plan_hash=None,
+    )
+    encoded = AGENT_ISSUE_PR_HANDOFF_RE.search(v1_body).group("payload")
+    with pytest.raises(AgentLoopError, match="expected exactly"):
+        decode_issue_pr_handoff_v2(encoded)
+
+
+def test_envelope_only_handoff_lineage_resolves_v1_v2_inherited_and_inert_records():
+    from dataclasses import replace
+
+    from workflow_transaction_helpers import (
+        FOREIGN,
+        HEAD_2,
+        ISSUE,
+        PR,
+        REPO,
+        direct_intent,
+        issue_view,
+        pr_view,
+        prepared_comment,
+        record_set,
+        terminal_comment,
+        v1_handoff_comment,
+        v2_handoff_comment,
+    )
+
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.issue_pr_handoff import issue_pr_handoff_record_hash
+    from coding_review_agent_loop.workflow_transaction import (
+        ENTRY_HANDOFF,
+        ENTRY_INITIAL_CODER_ROUND,
+        ENTRY_PR_CONTRACT,
+        ERA_LEGACY,
+        ERA_TRANSACTION,
+        KIND_HEAD_ADVANCE,
+        PHASE_ABORTED,
+        CommentRef,
+        derive_handoff_metadata,
+        handoff_candidate_pr_numbers,
+        inherited,
+        not_applicable,
+        resolve_handoff_lineage,
+        resolve_transaction_lineage,
+    )
+
+    def resolve(pr_comments, issue_comments):
+        lineage = resolve_transaction_lineage(
+            pr_view(*pr_comments), repository=REPO, pr_number=PR
+        )
+        return resolve_handoff_lineage(
+            issue_view(*issue_comments), lineage, repository=REPO, issue_number=ISSUE
+        )
+
+    # Legacy: exactly the version-1 result.
+    legacy = resolve([], [v1_handoff_comment(5)])
+    assert legacy.era == ERA_LEGACY and legacy.comment_id == 5
+    assert legacy.handoff == legacy.v1_lineage.latest
+    assert resolve([], []) is None
+
+    intent = direct_intent()
+    published = {ENTRY_HANDOFF: 11, ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13}
+    prepared = prepared_comment(10, intent)
+    committed = terminal_comment(20, intent, prepared_id=10, published=published)
+    handoff = v2_handoff_comment(11, intent)
+
+    # Prepared only: the published handoff grants nothing yet.
+    pending = resolve([prepared], [handoff])
+    assert pending.handoff is None and pending.era == ERA_TRANSACTION
+    assert pending.pending_transaction_id == intent.transaction_id
+
+    resolved = resolve([prepared, committed], [handoff])
+    assert resolved.handoff == derive_handoff_metadata(intent)
+    assert resolved.transaction_id == intent.transaction_id and resolved.comment_id == 11
+    assert handoff_candidate_pr_numbers(issue_view(handoff), issue_number=ISSUE) == (PR,)
+
+    # A byte-exact forged copy from another author is never counted.
+    forged = replace(handoff, author_login=FOREIGN[0], author_id=FOREIGN[1])
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        resolve([prepared, committed], [forged])
+    assert excinfo.value.code == "record-missing"
+
+    # Records bound to an aborted transaction are inert.
+    aborted = terminal_comment(
+        20, intent, prepared_id=10, phase=PHASE_ABORTED, abort_reason="stale-head",
+        published={ENTRY_HANDOFF: 11},
+    )
+    inert = resolve([prepared, aborted], [handoff])
+    assert inert.handoff is None and inert.pending_transaction_id is None
+
+    # Transaction records deleted or hidden: fail closed, never the legacy path.
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        resolve([], [handoff])
+    assert excinfo.value.code == "transaction-record-missing"
+
+    # A head-advance successor inherits the handoff by authenticated reference.
+    digest = issue_pr_handoff_record_hash(derive_handoff_metadata(intent))
+
+    def advance(handoff_digest):
+        return replace(
+            intent,
+            head_sha=HEAD_2,
+            successor_kind=KIND_HEAD_ADVANCE,
+            predecessor_transaction_id=intent.transaction_id,
+            record_set=record_set(
+                handoff=inherited(ENTRY_HANDOFF, CommentRef(f"issue#{ISSUE}", 11, handoff_digest)),
+                contract=inherited(ENTRY_PR_CONTRACT, CommentRef(f"pr#{PR}", 12, "d" * 64)),
+                coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND),
+            ),
+        )
+
+    good = advance(digest)
+    through_chain = resolve(
+        [prepared, committed, prepared_comment(30, good), terminal_comment(40, good, prepared_id=30)],
+        [handoff],
+    )
+    assert through_chain.transaction_id == good.transaction_id
+    assert through_chain.handoff.pr_head_sha == intent.head_sha
+    bad = advance("0" * 64)
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        resolve(
+            [prepared, committed, prepared_comment(30, bad), terminal_comment(40, bad, prepared_id=30)],
+            [handoff],
+        )
+    assert excinfo.value.code == "inherited-mismatch"
