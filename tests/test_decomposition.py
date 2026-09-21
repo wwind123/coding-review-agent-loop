@@ -2268,6 +2268,176 @@ def test_staged_parent_advances_to_the_next_phase_after_the_first_completes(
     assert "GitHub issue #99" not in claude_calls[0][-1]
 
 
+def _fresh_staged_phase(index, disposition=EXECUTION_DISPOSITION_DIRECT):
+    """One reviewed `approved-plan-v1` child stage at `index`."""
+    return PlanPhase(
+        title=f"Stage {index}",
+        scope="Implement the reviewed slice.",
+        non_goals="No unrelated work.",
+        dependency_notes="No dependencies." if index == 1 else f"Depends on stage-{index - 1}.",
+        rollout_risk="low",
+        validation="Run focused tests.",
+        parent_context="Approved parent slice.",
+        automation="agent-pr",
+        stage_id=f"stage-{index}",
+        position=index,
+        deliverables=(f"Stage {index} deliverable",),
+        non_goals_items=("Unrelated work",),
+        acceptance_criteria=("Focused tests pass",),
+        compatibility_constraints=("Preserve callers",),
+        covered_scope_item_ids=(f"scope-{index}",),
+        execution_disposition=disposition,
+        disposition_rationale="Reviewed route.",
+    )
+
+
+def test_fresh_staged_parent_advances_to_the_next_phase_after_the_first_completes(
+    tmp_path, monkeypatch
+):
+    """Matrix row `advance-next-phase` on its declared fresh (v1) entry path.
+
+    The legacy sibling above covers the recovered-summary branch; this drives
+    the `recommendation is not None` branch, where override collection, route
+    resolution and the child dispatch seam must all key off stage-2.
+    """
+    from types import SimpleNamespace
+
+    phases = (_fresh_staged_phase(1), _fresh_staged_phase(2))
+    created = tuple(
+        CreatedPhaseIssue(
+            phase=phase,
+            issue_url=f"https://github.com/OWNER/REPO/issues/{55 + index}",
+            issue_number=55 + index,
+        )
+        for index, phase in enumerate(phases, start=1)
+    )
+    recommendation = SimpleNamespace(
+        strategy="staged",
+        identity=lambda: {"recommendation_sha256": "digest"},
+        child_stages=phases,
+    )
+    outcome = StagedTopologyOutcome(
+        created=created,
+        stage_ids=("stage-1", "stage-2"),
+        automations=("agent-pr", "agent-pr"),
+        plan_hash="plan-hash",
+        mode="implement-by-phase",
+        topology_source="approved-plan-v1",
+    )
+    stage_one_handoff = {
+        "author": {"login": "bot"},
+        "createdAt": "2026-09-20T00:01:01Z",
+        "body": format_phase_implementation_handoff_comment(
+            parent_issue=55,
+            mode="implement-by-phase",
+            plan_hash="plan-hash",
+            phase_index=1,
+            created=created[0],
+            strategy="staged",
+            topology_source="approved-plan-v1",
+            execution_strategy_contract_version=1,
+            recommendation_digest="digest",
+            plan_subject="plan-subject",
+            execution_disposition=EXECUTION_DISPOSITION_DIRECT,
+        ),
+    }
+    runner = FakeRunner(
+        issue_comments=[stage_one_handoff],
+        issue_comments_by_number={
+            55: [stage_one_handoff],
+            56: [child_pr_handoff_comment(56, 912)],
+            57: [],
+        },
+        issue_payloads_by_number={
+            55: {"state": "open"},
+            56: {"state": "closed"},
+            57: {"state": "open"},
+        },
+        pr_payloads_by_number={912: pr_payload_for_state(912, "MERGED")},
+    )
+    parent_context = IssueContext(
+        number=55,
+        repo="OWNER/REPO",
+        title="Parent",
+        body="Parent",
+        url="https://github.com/OWNER/REPO/issues/55",
+        comments=(
+            IssueComment(
+                author="bot",
+                body=stage_one_handoff["body"],
+                created_at="2026-09-20T00:01:01Z",
+            ),
+        ),
+    )
+
+    events = []
+    override_calls = []
+    route_calls = []
+    handoff_calls = []
+    real_overrides = orchestrator_module.collect_child_disposition_overrides
+    real_route = orchestrator_module.resolve_child_execution_route
+    real_post = orchestrator_module.post_phase_implementation_handoff_comment
+
+    def _record_overrides(*args, **kwargs):
+        override_calls.append(kwargs)
+        return real_overrides(*args, **kwargs)
+
+    def _record_route(phase, **kwargs):
+        route_calls.append(phase)
+        return real_route(phase, **kwargs)
+
+    def _record_post(*args, **kwargs):
+        handoff_calls.append(kwargs)
+        events.append(f"handoff-{kwargs['phase_index']}")
+        return real_post(*args, **kwargs)
+
+    monkeypatch.setattr(
+        orchestrator_module, "collect_child_disposition_overrides", _record_overrides
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "resolve_child_execution_route", _record_route
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "post_phase_implementation_handoff_comment", _record_post
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_implement_approved_issue",
+        lambda *_args, **kwargs: events.append(f"coder-{kwargs['issue_context'].number}") or 0,
+    )
+
+    result = _dispatch_current_decomposition_phase(
+        runner,
+        config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+        memory=None,
+        usage_context=SimpleNamespace(),
+        issue_number=55,
+        current_plan="Approved parent plan",
+        plan_subject="plan-subject",
+        outcome=outcome,
+        recommendation=recommendation,
+        approved_plan_context=SimpleNamespace(
+            matrix_available=False, risk_test_matrix_payload=None
+        ),
+        issue_context=parent_context,
+        mode="implement-by-phase",
+        coder_session_id=None,
+    )
+
+    assert result == 0
+    # Stage-2 is dispatched with its real index, and its handoff is durable
+    # before any coder runs.  Stage-1 is neither re-dispatched nor re-recorded.
+    assert events == ["handoff-2", "coder-57"]
+    assert len(handoff_calls) == 1
+    assert handoff_calls[0]["phase_index"] == 2
+    assert handoff_calls[0]["created"].issue_number == 57
+    # Override collection and route resolution are driven by stage-2.
+    assert [call["routed_stage_id"] for call in override_calls] == ["stage-2"]
+    assert [call["child_stage_id"] for call in override_calls] == ["stage-2"]
+    assert [call["child_issue_number"] for call in override_calls] == [57]
+    assert [phase.stage_id for phase in route_calls] == ["stage-2"]
+
+
 def test_staged_parent_reports_a_terminal_state_when_every_phase_is_complete(tmp_path, capsys):
     """Matrix row `all-phases-complete-terminal`."""
     plan, created, summary = staged_legacy_plan_records()
