@@ -664,6 +664,12 @@ class WorkflowTransition:
             self.entry(ENTRY_HANDOFF).disposition != DISPOSITION_NOT_APPLICABLE
         ):
             raise _fail(f"{self.origin_flow} has no issue-to-PR handoff.")
+        if self.origin_flow in _ISSUE_ORIGIN_FLOWS and (
+            self.entry(ENTRY_HANDOFF).disposition == DISPOSITION_NOT_APPLICABLE
+        ):
+            # Without it a committed transaction would leave no discoverable
+            # issue-to-PR record.
+            raise _fail(f"{self.origin_flow} requires the issue-to-PR handoff entry.")
         authorization = self.entry(ENTRY_AUTHORIZATION)
         if self.managed_ci_generation is None:
             if authorization.disposition != DISPOSITION_NOT_APPLICABLE:
@@ -1276,6 +1282,21 @@ def collect_transactions(
                     ),
                     code="contradictory-terminal",
                 )
+            divergent = [
+                (comment, record) for comment, record in ordered if record != terminal_record
+            ]
+            if divergent:
+                # Only byte-identical duplicates canonicalize; a transaction has
+                # at most one terminal outcome.
+                raise _transaction_error(
+                    "A transaction has divergent terminal records of the same phase",
+                    transaction_ids=(tx_id,),
+                    problems=tuple(
+                        f"contradictory {record.phase} record in comment {comment.comment_id}"
+                        for comment, record in ordered
+                    ),
+                    code="contradictory-terminal",
+                )
             for comment, record in ordered:
                 if record.prepared_comment_id not in prepared_ids:
                     raise _transaction_error(
@@ -1774,13 +1795,36 @@ def find_origin_evidence(
 def _plan_carrying_pr_records(
     view: AuthenticatedCommentView,
 ) -> list[tuple[PostedRoundRecord, AuthenticatedComment]]:
-    records = _extract_round_metadata_records(view.authored, flow="pr")
-    return [
-        (record, view.authored[record.index])
-        for record in records
-        if record.metadata.approved_plan_hash is not None
-        and record.metadata.approved_plan_subject is not None
-    ]
+    """PR reviewer records carrying a complete approved-plan identity.
+
+    Only a PR reviewer round that ran with approved-plan context is evidence.
+    A record that carries either plan field without being such a complete
+    reviewer record is malformed evidence and fails closed; it is never
+    silently dropped from the agreement check.
+    """
+    carrying: list[tuple[PostedRoundRecord, AuthenticatedComment]] = []
+    for record in _extract_round_metadata_records(view.authored, flow="pr"):
+        metadata = record.metadata
+        if metadata.approved_plan_hash is None and metadata.approved_plan_subject is None:
+            continue
+        comment = view.authored[record.index]
+        if (
+            metadata.role != "reviewer"
+            or not metadata.approved_plan_hash
+            or not metadata.approved_plan_subject
+        ):
+            raise WorkflowTransactionError(
+                "An authenticated PR round-metadata record carries an approved-plan identity "
+                "but is not a complete PR reviewer record",
+                problems=(
+                    f"contradictory approved-plan identity in comment {comment.comment_id} "
+                    f"(role {metadata.role})",
+                ),
+                recovery_action=RECOVERY_OPERATOR_REVIEW,
+                code="origin-evidence-conflict",
+            )
+        carrying.append((record, comment))
+    return carrying
 
 
 def _require_evidence_agreement(
@@ -1892,7 +1936,10 @@ def validate_legacy_root(
         raise refuse(
             f"contradictory digest for origin-evidence comment {evidence_comment.comment_id}"
         )
-    carrying = _plan_carrying_pr_records(pr)
+    try:
+        carrying = _plan_carrying_pr_records(pr)
+    except WorkflowTransactionError as exc:
+        raise refuse("; ".join(exc.problems)) from exc
     record = next(
         (item for item, comment in carrying if comment is evidence_comment), None
     )

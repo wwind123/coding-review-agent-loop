@@ -355,7 +355,7 @@ def decode_pr_contract_v2(encoded: str) -> PrExpectedClosingContractV2:
         not isinstance(supersedes, str) or _HEX64_RE.match(supersedes) is None
     ):
         raise AgentLoopError(f"{prefix}: supersedes_record_hash is invalid.")
-    return PrExpectedClosingContractV2(
+    contract = PrExpectedClosingContractV2(
         repository=repository,
         pr_number=pr_number,
         origin_flow=str(origin),
@@ -366,6 +366,9 @@ def decode_pr_contract_v2(encoded: str) -> PrExpectedClosingContractV2:
         supersession_kind=kind if isinstance(kind, str) else None,
         supersedes_record_hash=supersedes if isinstance(supersedes, str) else None,
     )
+    if encode_pr_contract_v2(contract) != encoded:
+        raise AgentLoopError(f"{prefix}: record is not canonically encoded.")
+    return contract
 
 
 def pr_contract_record_hash(

@@ -1454,3 +1454,131 @@ def test_reader_under_a_different_actor_grants_no_authority(tmp_path):
     assert error is not None
     assert ACTOR[0] in str(error) and "new-bot" in str(error)
     assert "rerun under the original GitHub actor" in str(error)
+
+
+# --- review round 1 regressions ------------------------------------------------
+
+
+def test_same_phase_terminal_records_that_differ_fail_closed():
+    base, comments = _committed_initial()
+    # Same phase, different entry outcomes.
+    other_outcomes = terminal_comment(
+        21,
+        base,
+        prepared_id=10,
+        published={ENTRY_HANDOFF: 91, ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13},
+    )
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _resolve(*comments, other_outcomes)
+    assert excinfo.value.code == "contradictory-terminal"
+    assert "comment 20" in str(excinfo.value) and "comment 21" in str(excinfo.value)
+    # Same phase, different prepared binding (a duplicate prepared record).
+    rebound = terminal_comment(
+        21,
+        base,
+        prepared_id=14,
+        published={ENTRY_HANDOFF: 11, ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13},
+    )
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _resolve(*comments, prepared_comment(14, base), rebound)
+    assert excinfo.value.code == "contradictory-terminal"
+    # Two aborted records with different reasons.
+    intent = direct_intent()
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _resolve(
+            prepared_comment(10, intent),
+            terminal_comment(
+                20, intent, prepared_id=10, phase=PHASE_ABORTED, abort_reason=ABORT_STALE_HEAD
+            ),
+            terminal_comment(
+                21, intent, prepared_id=10, phase=PHASE_ABORTED,
+                abort_reason=ABORT_SUPERSEDED_INTENT,
+            ),
+        )
+    assert excinfo.value.code == "contradictory-terminal"
+    # A byte-identical duplicate still canonicalizes to the earliest comment.
+    duplicate = terminal_comment(
+        21,
+        base,
+        prepared_id=10,
+        published={ENTRY_HANDOFF: 11, ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13},
+    )
+    lineage = _resolve(*comments, duplicate)
+    assert lineage.latest_committed.terminal_comment.comment_id == 20
+
+
+def test_issue_origin_intent_cannot_omit_the_issue_side_handoff():
+    for build in (direct_intent, plan_intent):
+        with pytest.raises(AgentLoopError, match="requires the issue-to-PR handoff entry"):
+            build(record_set=record_set(handoff=not_applicable(ENTRY_HANDOFF)))
+    base, _ = _committed_initial()
+    with pytest.raises(AgentLoopError, match="requires the issue-to-PR handoff entry"):
+        _head_advance(
+            base,
+            record_set=record_set(
+                handoff=not_applicable(ENTRY_HANDOFF),
+                contract=inherited(ENTRY_PR_CONTRACT, CommentRef(PR_SURFACE, 12, DIGEST)),
+                coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND),
+            ),
+        )
+    # Such a payload is equally unreadable from a prepared record.
+    payload = direct_intent().to_payload()
+    payload["record_set"][0] = {
+        "name": ENTRY_HANDOFF, "disposition": "not-applicable", "inherited": None
+    }
+    with pytest.raises(AgentLoopError, match="requires the issue-to-PR handoff entry"):
+        WorkflowTransition.from_payload(payload)
+    # A staged child may still be handoff-only on the PR side.
+    staged = direct_intent(
+        staged=StagedIdentity(827, ISSUE, "parent"),
+        record_set=record_set(contract=not_applicable(ENTRY_PR_CONTRACT)),
+    )
+    assert staged.entry(ENTRY_HANDOFF).disposition == "reissued"
+
+
+def _pr_round_comment(comment_id, *, role, plan_hash, plan_subject):
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+
+    body = _attach_round_metadata(
+        f"Round {comment_id}.\n-- Claude",
+        PostedRoundMetadata(
+            flow="pr",
+            role=role,
+            agent="Claude",
+            round_number=1,
+            subject=HEAD_1,
+            approved_plan_hash=plan_hash,
+            approved_plan_subject=plan_subject,
+        ),
+    )
+    return comment(comment_id, body)
+
+
+def test_only_complete_reviewer_records_are_origin_evidence():
+    coder = _pr_round_comment(107, role="coder", plan_hash=PLAN_HASH, plan_subject=PLAN_SUBJECT)
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        find_origin_evidence(pr_view(v1_contract_comment(105), coder))
+    assert excinfo.value.code == "origin-evidence-conflict"
+    assert "role coder" in str(excinfo.value)
+
+    for partial in (
+        _pr_round_comment(108, role="reviewer", plan_hash=PLAN_HASH, plan_subject=None),
+        _pr_round_comment(108, role="reviewer", plan_hash=None, plan_subject=PLAN_SUBJECT),
+    ):
+        # Alone, and beside otherwise valid reviewer evidence.
+        for others in ((), (pr_review_comment(107),)):
+            with pytest.raises(WorkflowTransactionError) as excinfo:
+                find_origin_evidence(pr_view(*others, partial))
+            assert excinfo.value.code == "origin-evidence-conflict"
+
+    intent, pr, plan = _legacy_state()
+    hash_only = _pr_round_comment(108, role="reviewer", plan_hash=PLAN_HASH, plan_subject=None)
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _validate(intent, pr_view(*pr.authored, hash_only), plan)
+    assert excinfo.value.code == "legacy-root-invalid"
+    assert "contradictory approved-plan identity in comment 108" in str(excinfo.value)
+    coder_beside = _pr_round_comment(
+        108, role="coder", plan_hash=PLAN_HASH, plan_subject=PLAN_SUBJECT
+    )
+    with pytest.raises(WorkflowTransactionError, match="role coder"):
+        _validate(intent, pr_view(*pr.authored, coder_beside), plan)

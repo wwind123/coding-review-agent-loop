@@ -670,6 +670,11 @@ def post_issue_pr_handoff_comment(
 
 HANDOFF_V2_SCHEMA_VERSION = 2
 _TRANSACTION_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_V2_HEAD_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_V2_PLAN_HASH_RE = re.compile(r"\A[0-9a-f]{16}\Z")
+_V2_PR_URL_RE = re.compile(
+    r"\Ahttps://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/(?P<number>[1-9][0-9]*)\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -731,12 +736,17 @@ def decode_issue_pr_handoff_v2(encoded: str) -> IssuePrHandoffMetadataV2:
         numbers[key] = value
     pr_url = _require_non_empty_str(payload, "pr_url")
     pr_head_sha = _require_non_empty_str(payload, "pr_head_sha")
+    url_match = _V2_PR_URL_RE.match(pr_url)
+    if url_match is None or int(url_match.group("number")) != numbers["pr_number"]:
+        raise AgentLoopError(f"{prefix}: `pr_url` is not this PR's canonical GitHub URL.")
+    if _V2_HEAD_SHA_RE.match(pr_head_sha) is None:
+        raise AgentLoopError(f"{prefix}: `pr_head_sha` must be a full lowercase commit SHA.")
     flow = payload["flow"]
     if flow not in _VALID_FLOWS:
         raise AgentLoopError(f"{prefix}: unknown flow {flow!r}.")
     plan_hash = payload["plan_hash"]
     if flow == "approved-plan-implementation":
-        if not isinstance(plan_hash, str) or not plan_hash.strip():
+        if not isinstance(plan_hash, str) or _V2_PLAN_HASH_RE.match(plan_hash) is None:
             raise AgentLoopError(
                 f"{prefix}: `plan_hash` is required for approved-plan-implementation flow."
             )
@@ -764,7 +774,7 @@ def decode_issue_pr_handoff_v2(encoded: str) -> IssuePrHandoffMetadataV2:
     transaction_id = payload["transaction_id"]
     if not isinstance(transaction_id, str) or _TRANSACTION_ID_RE.match(transaction_id) is None:
         raise AgentLoopError(f"{prefix}: `transaction_id` is invalid.")
-    return IssuePrHandoffMetadataV2(
+    metadata = IssuePrHandoffMetadataV2(
         issue_number=numbers["issue_number"],
         pr_number=numbers["pr_number"],
         pr_url=pr_url,
@@ -775,6 +785,9 @@ def decode_issue_pr_handoff_v2(encoded: str) -> IssuePrHandoffMetadataV2:
         contract_hash=digest,
         transaction_id=transaction_id,
     )
+    if encode_issue_pr_handoff_v2(metadata) != encoded:
+        raise AgentLoopError(f"{prefix}: record is not canonically encoded.")
+    return metadata
 
 
 def issue_pr_handoff_payload_schema_version(encoded: str) -> object:

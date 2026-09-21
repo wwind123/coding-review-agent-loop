@@ -403,3 +403,35 @@ def test_contract_lineage_rejects_an_unauthenticated_snapshot():
     with pytest.raises(AgentLoopError, match="only an authenticated comment view"):
         resolve_pr_contract_lineage(snapshot, None, repository=REPO, pr_number=PR)
     assert isinstance(_v2(), PrExpectedClosingContractV2)
+
+
+# --- review round 1: canonical wire form ---------------------------------------
+
+
+def _reencode(encoded, **dumps_kwargs):
+    import base64
+    import json
+
+    value = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode())
+    return base64.urlsafe_b64encode(json.dumps(value, **dumps_kwargs).encode()).decode()
+
+
+def test_v2_contract_decoder_and_lineage_reject_a_noncanonical_wire_record():
+    canonical = encode_pr_contract_v2(_v2())
+    assert decode_pr_contract_v2(canonical) == _v2()
+    for noncanonical in (
+        _reencode(canonical, sort_keys=True),  # default separators add whitespace
+        _reencode(canonical, separators=(",", ":"), sort_keys=False),
+        _reencode(canonical, indent=1, sort_keys=True),
+    ):
+        if noncanonical == canonical:
+            continue
+        with pytest.raises(AgentLoopError, match="not canonically encoded"):
+            decode_pr_contract_v2(noncanonical)
+
+    base, comments = _initial()
+    spaced = _reencode(encode_pr_contract_v2(derive_pr_contract(base)), sort_keys=True)
+    body = comments[1].body.replace(encode_pr_contract_v2(derive_pr_contract(base)), spaced)
+    assert body != comments[1].body
+    with pytest.raises(AgentLoopError, match="not canonically encoded"):
+        _resolve(comments[0], comment(12, body), comments[2])

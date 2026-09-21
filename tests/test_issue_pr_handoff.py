@@ -949,3 +949,99 @@ def test_envelope_only_handoff_lineage_resolves_v1_v2_inherited_and_inert_record
             [handoff],
         )
     assert excinfo.value.code == "inherited-mismatch"
+
+
+# --- review round 1: strict and canonical v2 handoff wire form ------------------
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"pr_head_sha": "x"},
+        {"pr_head_sha": "A" * 40},
+        {"pr_head_sha": "a" * 39},
+        {"pr_url": "https://example.com/OWNER/REPO/pull/826"},
+        {"pr_url": "http://github.com/OWNER/REPO/pull/826"},
+        {"pr_url": "https://github.com/OWNER/REPO/pull/827"},
+        {"pr_url": "https://github.com/OWNER/REPO/pull/826?x=1"},
+        {"pr_url": "https://github.com/OWNER/REPO/pull/826/files"},
+        {"flow": "approved-plan-implementation", "plan_hash": "latest"},
+        {"flow": "approved-plan-implementation", "plan_hash": "0123456789ABCDEF"},
+        {"flow": "approved-plan-implementation", "plan_hash": "0123456789abcde"},
+    ],
+)
+def test_v2_handoff_codec_rejects_semantically_malformed_fields(overrides):
+    from coding_review_agent_loop.issue_pr_handoff import (
+        decode_issue_pr_handoff_v2,
+        encode_issue_pr_handoff_v2,
+    )
+
+    with pytest.raises(AgentLoopError):
+        decode_issue_pr_handoff_v2(encode_issue_pr_handoff_v2(_v2_handoff(**overrides)))
+
+
+def test_v2_handoff_decoder_and_lineage_reject_a_noncanonical_wire_record():
+    import json
+
+    from workflow_transaction_helpers import (
+        ISSUE,
+        PR,
+        REPO,
+        comment,
+        direct_intent,
+        issue_view,
+        pr_view,
+        prepared_comment,
+        terminal_comment,
+        v2_handoff_comment,
+    )
+
+    from coding_review_agent_loop.issue_pr_handoff import (
+        decode_issue_pr_handoff_v2,
+        encode_issue_pr_handoff_v2,
+    )
+    from coding_review_agent_loop.workflow_transaction import (
+        ENTRY_HANDOFF,
+        ENTRY_INITIAL_CODER_ROUND,
+        ENTRY_PR_CONTRACT,
+        derive_handoff_metadata,
+        resolve_handoff_lineage,
+        resolve_transaction_lineage,
+    )
+
+    def reencode(encoded, **kwargs):
+        value = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode())
+        return base64.urlsafe_b64encode(json.dumps(value, **kwargs).encode()).decode()
+
+    canonical = encode_issue_pr_handoff_v2(_v2_handoff())
+    assert decode_issue_pr_handoff_v2(canonical) == _v2_handoff()
+    for noncanonical in (
+        reencode(canonical, sort_keys=True),
+        reencode(canonical, separators=(",", ":"), sort_keys=False),
+    ):
+        if noncanonical == canonical:
+            continue
+        with pytest.raises(AgentLoopError, match="not canonically encoded"):
+            decode_issue_pr_handoff_v2(noncanonical)
+
+    intent = direct_intent()
+    encoded = encode_issue_pr_handoff_v2(derive_handoff_metadata(intent))
+    handoff = v2_handoff_comment(11, intent)
+    spaced = comment(
+        11, handoff.body.replace(encoded, reencode(encoded, sort_keys=True)),
+        surface=f"issue#{ISSUE}",
+    )
+    assert spaced.body != handoff.body
+    published = {ENTRY_HANDOFF: 11, ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13}
+    lineage = resolve_transaction_lineage(
+        pr_view(
+            prepared_comment(10, intent),
+            terminal_comment(20, intent, prepared_id=10, published=published),
+        ),
+        repository=REPO,
+        pr_number=PR,
+    )
+    with pytest.raises(AgentLoopError, match="not canonically encoded"):
+        resolve_handoff_lineage(
+            issue_view(spaced), lineage, repository=REPO, issue_number=ISSUE
+        )
