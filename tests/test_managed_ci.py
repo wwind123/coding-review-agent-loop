@@ -6782,3 +6782,107 @@ def test_bound_release_hook_commits_the_release_before_the_label_delete(tmp_path
     )
 
     assert order == [("delete", ("creation", KIND_ORDINARY_RELEASE))]
+
+
+# --- #953: a spilled prior_items still carries the merge-conflict obligation ---
+
+
+def _spilled_conflict_round_comments(*, subject, round_number, first_id):
+    """A conflict coder record whose prior_items spilled into sidecar comments."""
+    import base64 as _base64
+    import os as _os
+
+    import coding_review_agent_loop.round_transport as transport
+
+    conflict = UnresolvedReviewItem(
+        item_id="item-merge-conflict",
+        reviewer="agent-loop",
+        source_round=round_number,
+        text="PR has a merge conflict with main. "
+        + _base64.urlsafe_b64encode(_os.urandom(50_000)).decode("ascii"),
+        status="blocking",
+        authority="machine",
+        obligation_kind="merge-conflict",
+        lifecycle="repair_required",
+    )
+    prepared = transport.prepare_round_comment(
+        _attach_round_metadata(
+            "coder round",
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="agent-loop",
+                round_number=round_number, subject=subject,
+                prior_items=(conflict,),
+            ),
+        )
+    )
+    anchor = transport.ROUND_RESUME_MARKER_RE.search(str(prepared[-1]))
+    reference = transport.decode_mapping(anchor.group("payload"))["prior_items"]
+    assert isinstance(reference, dict) and "$round_transport_spill" in reference
+    return [
+        {"id": first_id + index, "user": {"login": "agent-loop", "id": 1}, "body": str(body)}
+        for index, body in enumerate(prepared)
+    ]
+
+
+def _spilled_conflict_continuity():
+    comments = _spilled_conflict_round_comments(
+        subject="merged-head", round_number=13, first_id=58
+    )
+    anchor_id = comments[-1]["id"]
+    authorization = ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="merged-head", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
+        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=50,
+        round_comment_ids=(anchor_id,),
+    )
+    return comments, anchor_id, authorization
+
+
+def test_m953_spilled_conflict_obligation_grants_continuity(tmp_path):
+    comments, anchor_id, authorization = _spilled_conflict_continuity()
+
+    records = managed_ci._continuity_round_records(comments)
+    assert records[len(comments) - 1]["resolves_merge_conflict"] is True
+    assert managed_ci._continuity_round_metadata_is_valid(
+        comments, authorization=authorization
+    ) is True
+
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.extend(comments)
+    selected = managed_ci.find_actor_round_metadata_comment_ids(
+        runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+        actor_id=1, predecessor_head="abc123", new_head="merged-head", round_number=12,
+        after_comment_id=50,
+    )
+    assert selected == (anchor_id,)
+
+
+def test_m953_legacy_reader_declines_spilled_conflict_continuity(tmp_path, monkeypatch):
+    """An older binary cannot see the spilled obligation and so denies, never grants."""
+    import coding_review_agent_loop.round_transport as transport
+
+    comments, _anchor_id, authorization = _spilled_conflict_continuity()
+    monkeypatch.setattr(
+        transport,
+        "_SPILL_FIELDS",
+        tuple(
+            field for field in transport._SPILL_FIELDS
+            if field not in transport._GROWTH_SPILL_FIELDS
+        ),
+    )
+
+    records = managed_ci._continuity_round_records(comments)
+    assert records[len(comments) - 1]["resolves_merge_conflict"] is False
+    assert managed_ci._continuity_round_metadata_is_valid(
+        comments, authorization=authorization
+    ) is False
+
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.extend(comments)
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+            actor_id=1, predecessor_head="abc123", new_head="merged-head",
+            round_number=12, after_comment_id=50,
+        )

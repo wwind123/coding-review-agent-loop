@@ -2051,9 +2051,10 @@ def test_m948_residual_overflow_is_dedicated_and_size_attributed_without_content
         transport.prepare_round_comment(body)
     message = str(excinfo.value)
     assert isinstance(excinfo.value, AgentLoopError)
+    # The residual metadata alone exceeds the budget here (#953).
     assert message.startswith(
         "Round comment exceeds 60000 characters even after metadata spill; "
-        "shorten the visible response or metadata."
+        "the derived round metadata alone needs "
     )
     assert "visible body outside round metadata" in message
     assert "residual encoded round metadata" in message
@@ -2111,3 +2112,271 @@ def test_m948_fit_check_propagates_provenance_failure() -> None:
     with pytest.raises(AgentLoopError, match="authorized marker segment was not found") as excinfo:
         transport.round_comment_fits(carrier)
     assert not isinstance(excinfo.value, transport.RoundCommentOverflowError)
+
+
+# --- #953: review-state growth fields spill, with reader safety ---
+
+_PRE_953_SPILL_FIELDS = tuple(
+    field for field in transport._SPILL_FIELDS if field not in transport._GROWTH_SPILL_FIELDS
+)
+
+
+def _sidecar_fields(prepared) -> list[str]:
+    fields = []
+    for sidecar in prepared[:-1]:
+        match = transport.ROUND_TRANSPORT_SIDECAR_RE.search(str(sidecar))
+        assert match is not None
+        fields.append(json.loads(base64.urlsafe_b64decode(match.group("payload")))["field"])
+    return fields
+
+
+def _is_reference(value) -> bool:
+    return isinstance(value, dict) and "$round_transport_spill" in value
+
+
+def _growth_payload(*, prior_bytes: int, evidence_bytes: int, flow: str = "pr") -> dict:
+    return {
+        "flow": flow,
+        "prior_items": [
+            {"item_id": f"item-{index}", "text": _random_text(prior_bytes // 4)}
+            for index in range(4)
+        ],
+        "risk_test_matrix_evidence": {
+            "rows": [{"row_id": "row-1", "evidence": _random_text(evidence_bytes)}],
+        },
+    }
+
+
+def _body_over_budget_by(payload: dict, excess: int) -> str:
+    marker_only = len(_comment(payload, body=""))
+    visible = "V" * (transport.MAX_GITHUB_BODY_CHARS + excess - marker_only)
+    body = _comment(payload, body=visible)
+    assert len(body) == transport.MAX_GITHUB_BODY_CHARS + excess
+    return body
+
+
+def test_m953_pr_952_shape_spills_prior_items_only() -> None:
+    payload = _growth_payload(prior_bytes=7_300, evidence_bytes=8_000)
+    body = _body_over_budget_by(payload, 413)
+    assert len(body) - len(transport.encode_mapping(payload)) > 37_000
+
+    prepared = transport.prepare_round_comment(body)
+
+    anchor = str(prepared[-1])
+    assert len(anchor) <= transport.MAX_GITHUB_BODY_CHARS
+    posted = _anchor_payload(anchor)
+    assert _is_reference(posted["prior_items"])
+    assert posted["risk_test_matrix_evidence"] == payload["risk_test_matrix_evidence"]
+    assert set(_sidecar_fields(prepared)) == {"prior_items"}
+    hydrated, missing = transport.hydrate_mapping(posted, [str(item) for item in prepared])
+    assert missing == set()
+    assert hydrated["prior_items"] == payload["prior_items"]
+    assert isinstance(hydrated["prior_items"], list)
+
+
+def test_m953_larger_payload_spills_both_growth_fields_losslessly() -> None:
+    payload = _growth_payload(prior_bytes=40_000, evidence_bytes=50_000)
+
+    prepared = transport.prepare_round_comment(_comment(payload))
+
+    posted = _anchor_payload(str(prepared[-1]))
+    assert len(str(prepared[-1])) <= transport.MAX_GITHUB_BODY_CHARS
+    assert _is_reference(posted["prior_items"])
+    assert _is_reference(posted["risk_test_matrix_evidence"])
+    assert list(dict.fromkeys(_sidecar_fields(prepared))) == [
+        "prior_items", "risk_test_matrix_evidence",
+    ]
+    hydrated, missing = transport.hydrate_mapping(posted, [str(item) for item in prepared])
+    assert missing == set()
+    assert hydrated["prior_items"] == payload["prior_items"]
+    assert isinstance(hydrated["prior_items"], list)
+    assert hydrated["risk_test_matrix_evidence"] == payload["risk_test_matrix_evidence"]
+    assert isinstance(hydrated["risk_test_matrix_evidence"], dict)
+
+
+def test_m953_evidence_spill_forces_prior_items_reference(monkeypatch) -> None:
+    from coding_review_agent_loop.round_state import _deserialize_unresolved_item
+
+    payload = {
+        "flow": "pr",
+        "prior_items": [],
+        "risk_test_matrix_evidence": {"bulk": _random_text(50_000)},
+    }
+
+    prepared = transport.prepare_round_comment(_comment(payload))
+
+    posted = _anchor_payload(str(prepared[-1]))
+    assert _is_reference(posted["prior_items"])
+    assert _is_reference(posted["risk_test_matrix_evidence"])
+    bodies = [str(item) for item in prepared]
+    hydrated, missing = transport.hydrate_mapping(posted, bodies)
+    assert missing == set()
+    assert hydrated["prior_items"] == []
+    assert hydrated["risk_test_matrix_evidence"] == payload["risk_test_matrix_evidence"]
+
+    # Simulated older binary: its hydrate ignores the new fields, and its full
+    # decoder iterates prior_items, reaching the string keys of the reference.
+    monkeypatch.setattr(transport, "_SPILL_FIELDS", _PRE_953_SPILL_FIELDS)
+    legacy, legacy_missing = transport.hydrate_mapping(posted, bodies)
+    assert legacy_missing == set()
+    assert _is_reference(legacy["prior_items"])
+    with pytest.raises(AgentLoopError, match="unresolved-item payload"):
+        tuple(_deserialize_unresolved_item(item) for item in legacy["prior_items"])
+
+
+def test_m953_evidence_spill_without_prior_items_raises() -> None:
+    payload = {"flow": "pr", "risk_test_matrix_evidence": {"bulk": _random_text(50_000)}}
+
+    with pytest.raises(AgentLoopError, match="without a spillable prior_items"):
+        transport.prepare_round_comment(_comment(payload))
+
+
+def test_m953_discuss_flow_never_spills_growth_fields() -> None:
+    overflowing = {
+        "flow": "discuss",
+        "canonical_plan": _random_text(60_000),
+        "prior_items": [{"item_id": "item-1", "text": _random_text(50_000)}],
+    }
+    with pytest.raises(transport.RoundCommentOverflowError) as excinfo:
+        transport.prepare_round_comment(_comment(overflowing))
+    assert "prior_items=" in str(excinfo.value)
+
+    spilled_earlier = {
+        "flow": "discuss",
+        "canonical_plan": _random_text(60_000),
+        "prior_items": [{"item_id": "item-1", "text": _random_text(1_000)}],
+    }
+    prepared = transport.prepare_round_comment(_comment(spilled_earlier))
+    posted = _anchor_payload(str(prepared[-1]))
+    assert posted["prior_items"] == spilled_earlier["prior_items"]
+    assert set(_sidecar_fields(prepared)) == {"canonical_plan"}
+
+    fitting = _comment({"flow": "discuss", "prior_items": [{"item_id": "item-1"}]})
+    assert [str(item) for item in transport.prepare_round_comment(fitting)] == [fitting]
+
+
+@pytest.mark.parametrize("spill_earlier", [False, True])
+def test_m953_fitting_payload_is_byte_identical_to_pre_change_order(
+    monkeypatch, spill_earlier
+) -> None:
+    payload = _growth_payload(prior_bytes=2_000, evidence_bytes=2_000)
+    if spill_earlier:
+        payload["canonical_plan"] = _random_text(60_000)
+    body = _comment(payload)
+
+    current = [str(item) for item in transport.prepare_round_comment(body)]
+    monkeypatch.setattr(transport, "_SPILL_FIELDS", _PRE_953_SPILL_FIELDS)
+    legacy = [str(item) for item in transport.prepare_round_comment(body)]
+
+    assert current == legacy
+    posted = _anchor_payload(current[-1])
+    assert posted["prior_items"] == payload["prior_items"]
+    assert posted["risk_test_matrix_evidence"] == payload["risk_test_matrix_evidence"]
+
+
+def _spilled_round_record_comments():
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="codex",
+        source_round=3,
+        text=_random_text(40_000),
+        status="blocking",
+    )
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="claude", round_number=4, subject="head-sha",
+        prior_items=(item,),
+        risk_test_matrix_evidence={"rows": [{"evidence": _random_text(50_000)}]},
+    )
+    prepared = transport.prepare_round_comment(_attach_round_metadata("coder round", metadata))
+    posted = _anchor_payload(str(prepared[-1]))
+    assert _is_reference(posted["prior_items"])
+    assert _is_reference(posted["risk_test_matrix_evidence"])
+    return metadata, prepared
+
+
+def test_m953_spilled_growth_fields_resume_exactly() -> None:
+    metadata, prepared = _spilled_round_record_comments()
+
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=str(item)) for item in prepared], flow="pr"
+    )
+
+    assert len(records) == 1
+    assert records[0].metadata.prior_items == metadata.prior_items
+    assert records[0].metadata.risk_test_matrix_evidence == metadata.risk_test_matrix_evidence
+
+
+@pytest.mark.parametrize("field", ["prior_items", "risk_test_matrix_evidence"])
+def test_m953_missing_growth_field_sidecar_fails_resume_closed(field) -> None:
+    _metadata, prepared = _spilled_round_record_comments()
+    kept = [
+        str(item) for item in prepared[:-1]
+        if json.loads(base64.urlsafe_b64decode(
+            transport.ROUND_TRANSPORT_SIDECAR_RE.search(str(item)).group("payload")
+        ))["field"] != field
+    ]
+    bodies = [*kept, str(prepared[-1])]
+
+    _hydrated, missing = transport.hydrate_mapping(_anchor_payload(bodies[-1]), bodies)
+    assert missing == {field}
+    with pytest.raises(AgentLoopError, match=f"Incomplete round metadata: {field} sidecars"):
+        _extract_round_metadata_records(
+            [SimpleNamespace(body=body) for body in bodies], flow="pr"
+        )
+
+
+@pytest.mark.parametrize("field", ["prior_items", "risk_test_matrix_evidence"])
+def test_m953_decoder_rejects_unhydrated_growth_reference(field) -> None:
+    payload = transport.decode_mapping(_encode_round_metadata(PostedRoundMetadata(
+        flow="pr", role="coder", agent="claude", round_number=2, subject="head",
+    )))
+    payload[field] = {
+        "$round_transport_spill": "abc", "field": field, "parts": 1,
+        "sha256": "0" * 64, "spill": "0" * 64, "encoding": "json",
+    }
+
+    with pytest.raises(AgentLoopError, match="unhydrated transport reference"):
+        _decode_round_metadata(transport.encode_mapping(payload))
+    with pytest.raises(AgentLoopError, match="unhydrated transport reference"):
+        _decode_round_metadata_mapping(payload)
+
+
+def test_m953_derived_metadata_overflow_is_reported_as_such() -> None:
+    payload = {"flow": "pr", "unspilled_big_field": "SECRET" + _random_text(50_000)}
+
+    with pytest.raises(transport.RoundCommentOverflowError) as excinfo:
+        transport.prepare_round_comment(_comment(payload, body="short"))
+
+    message = str(excinfo.value)
+    assert "derived round metadata alone needs" in message
+    assert "shortening the visible response cannot fix it" in message
+    assert "shorten the visible response or metadata" not in message
+    assert "residual encoded round metadata" in message
+    assert "unspilled_big_field=" in message
+    assert "SECRET" not in message
+
+
+def test_m953_derived_overflow_threshold_uses_the_framed_marker(monkeypatch) -> None:
+    payload = {"flow": "pr", "unspilled_big_field": _random_text(3_000)}
+    body = _comment(payload, body="Visible response")
+    marker = transport.ROUND_RESUME_MARKER_RE.search(body).group(0)
+    minimal = transport._minimal_metadata_anchor_chars(marker, payload)
+    encoded_only = len(transport.encode_mapping(payload))
+    assert minimal == len(marker) > encoded_only
+
+    def overflow_message(budget: int) -> str:
+        monkeypatch.setattr(transport, "MAX_GITHUB_BODY_CHARS", budget)
+        with pytest.raises(transport.RoundCommentOverflowError) as excinfo:
+            transport.prepare_round_comment(body)
+        message = str(excinfo.value)
+        assert "Size attribution: visible body outside round metadata" in message
+        assert "unspilled_big_field=" in message
+        return message
+
+    at_minimum = overflow_message(minimal)
+    assert "shorten the visible response or metadata." in at_minimum
+    assert "derived round metadata alone" not in at_minimum
+    for budget in (minimal - 1, encoded_only + 1, encoded_only):
+        message = overflow_message(budget)
+        assert "derived round metadata alone" in message
+        assert "shorten the visible response or metadata." not in message

@@ -43,6 +43,14 @@ _RISK_TEST_MATRIX_SECTION_BOUNDARY_RE = re.compile(
     r"(?m)^<!--\s*risk-test-matrix-section:\s*(?P<identity>[0-9a-f]{64})\s*-->\r?$",
     re.I,
 )
+# Growth fields spill only outside discuss rounds, and the evidence never
+# spills unless prior_items is already a spill reference.  An older binary
+# ignores spill fields it does not know and its full decoder accepts any dict
+# as matrix evidence, but it rejects a prior_items reference; the coupling
+# makes that older decoder raise instead of misreading an evidence reference.
+# Older discuss classifiers treat a decode failure as human discussion, so
+# discuss rounds never carry these references at all.
+_GROWTH_SPILL_FIELDS = ("prior_items", "risk_test_matrix_evidence")
 # Spill reviewer checkpoints first: they are often the largest metadata field
 # and are required to safely resume a provisional parallel-review round.
 _SPILL_FIELDS = (
@@ -64,6 +72,13 @@ _SPILL_FIELDS = (
     "risk_test_matrix_payload",
     "risk_test_matrix_changes_payload",
     "risk_test_matrix_marker",
+    # Review-state growth fields go last (#953).  They grow with review
+    # history and matrix size rather than with the change under review, so a
+    # long review would otherwise become unpostable.  The loop stops as soon
+    # as the anchor fits, so comments that fit today keep byte-identical
+    # anchors and sidecars.  See _GROWTH_SPILL_FIELDS for the coupling and
+    # the discuss-flow exclusion.
+    *_GROWTH_SPILL_FIELDS,
 )
 _MAX_COMPRESSED = 8_000_000
 _MAX_DECOMPRESSED = 16_000_000
@@ -107,6 +122,23 @@ def _overflow_attribution(
         f" Size attribution: visible body outside round metadata {visible_chars} characters; "
         f"residual encoded round metadata {len(encode_mapping(payload))} characters; "
         f"largest unspilled metadata fields (encoded characters): {largest or 'none'}."
+    )
+
+
+def _minimal_metadata_anchor_chars(marker: str, payload: Mapping[str, object]) -> int:
+    """Return the length of the round-metadata marker alone for ``payload``.
+
+    This is the complete framed marker comment, exactly what the anchor would
+    be with an empty visible body.  When it exceeds the budget, shortening the
+    visible response cannot make the round postable.
+    """
+    match = ROUND_RESUME_MARKER_RE.search(marker)
+    if match is None:
+        raise AgentLoopError("Minimal metadata anchor requires a round metadata marker.")
+    return len(
+        marker[: match.start("payload")]
+        + encode_mapping(payload)
+        + marker[match.end("payload") :]
     )
 
 
@@ -753,13 +785,9 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
     def render_anchor(mapping: Mapping[str, object]) -> str:
         return body_text[: match.start("payload")] + encode_mapping(mapping) + body_text[match.end("payload") :]
 
-    for field in _SPILL_FIELDS:
-        current_anchor = render_anchor(payload)
-        if len(current_anchor) <= MAX_GITHUB_BODY_CHARS:
-            break
-        if field not in payload:
-            continue
-        value = payload.get(field)
+    def build_spill(
+        field: str, value: object
+    ) -> tuple[dict[str, object], list[str]] | None:
         if isinstance(value, str):
             raw_value = value.encode("utf-8")
             value_encoding = "text"
@@ -774,7 +802,7 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
                 ) from exc
             value_encoding = "json"
         else:
-            continue
+            return None
         packed = zlib.compress(raw_value, 9)
         if len(packed) > _MAX_COMPRESSED:
             raise AgentLoopError(f"Round metadata field {field} is too large to spill safely.")
@@ -785,7 +813,7 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             encoded_packed[index : index + _PART_CHARS]
             for index in range(0, len(encoded_packed), _PART_CHARS)
         ]
-        reference = {
+        reference: dict[str, object] = {
             "$round_transport_spill": anchor_id,
             "field": field,
             "parts": len(chunks),
@@ -793,34 +821,74 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             "spill": packed_digest,
             "encoding": value_encoding,
         }
-        trial = dict(payload)
-        trial[field] = reference
-        if len(render_anchor(trial)) >= len(current_anchor):
-            continue
-        payload[field] = reference
-        for index, chunk in enumerate(chunks):
-            sidecars.append(
-                _sidecar(
-                    {
-                        "v": 1,
-                        "anchor": anchor_id,
-                        "spill": packed_digest,
-                        "field": field,
-                        "index": index,
+        field_sidecars = [
+            _sidecar(
+                {
+                    "v": 1,
+                    "anchor": anchor_id,
+                    "spill": packed_digest,
+                    "field": field,
+                    "index": index,
                     "count": len(chunks),
                     "sha256": raw_digest,
                     "data": chunk,
                     "encoding": value_encoding,
                 }
-                )
             )
+            for index, chunk in enumerate(chunks)
+        ]
+        return reference, field_sidecars
+
+    growth_spill_allowed = payload.get("flow") != "discuss"
+    for field in _SPILL_FIELDS:
+        current_anchor = render_anchor(payload)
+        if len(current_anchor) <= MAX_GITHUB_BODY_CHARS:
+            break
+        if field in _GROWTH_SPILL_FIELDS and not growth_spill_allowed:
+            continue
+        if field not in payload:
+            continue
+        spill = build_spill(field, payload.get(field))
+        if spill is None:
+            continue
+        reference, field_sidecars = spill
+        trial = dict(payload)
+        trial[field] = reference
+        if len(render_anchor(trial)) >= len(current_anchor):
+            continue
+        if field == "risk_test_matrix_evidence" and not _is_spill_reference(
+            payload.get("prior_items")
+        ):
+            # Never emit an evidence-only spill: force prior_items to a
+            # reference first so an older full decoder raises (#953).
+            forced = (
+                build_spill("prior_items", payload["prior_items"])
+                if "prior_items" in payload
+                else None
+            )
+            if forced is None:
+                raise AgentLoopError(
+                    "Round metadata cannot spill risk_test_matrix_evidence without "
+                    "a spillable prior_items field."
+                )
+            payload["prior_items"], prior_sidecars = forced
+            sidecars.extend(prior_sidecars)
+        payload[field] = reference
+        sidecars.extend(field_sidecars)
 
     sidecars = _label_sidecars(sidecars, kind)
     anchor = render_anchor(payload)
     if len(anchor) > MAX_GITHUB_BODY_CHARS:
+        minimal_chars = _minimal_metadata_anchor_chars(match.group(0), payload)
+        guidance = (
+            f"the derived round metadata alone needs {minimal_chars} characters, "
+            "so shortening the visible response cannot fix it."
+            if minimal_chars > MAX_GITHUB_BODY_CHARS
+            else "shorten the visible response or metadata."
+        )
         raise RoundCommentOverflowError(
             f"Round comment exceeds {MAX_GITHUB_BODY_CHARS} characters even after metadata spill; "
-            "shorten the visible response or metadata."
+            + guidance
             + _overflow_attribution(
                 visible_chars=len(body_text) - len(match.group("payload")),
                 payload=payload,
@@ -853,6 +921,10 @@ def round_comment_fits(body: str | TrustedBody) -> bool:
     except RoundCommentOverflowError:
         return False
     return True
+
+
+def _is_spill_reference(value: object) -> bool:
+    return isinstance(value, Mapping) and "$round_transport_spill" in value
 
 
 def hydrate_mapping(

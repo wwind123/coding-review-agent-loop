@@ -516,7 +516,7 @@ from .round_state import (
     recover_plan_validation_diagnostic,
     sanitize_plan_validation_diagnostic,
 )
-from .round_transport import is_round_transport_sidecar, round_comment_fits
+from .round_transport import decode_mapping, is_round_transport_sidecar, round_comment_fits
 from .plan_assembly import (
     AssembledPlanSidecar,
     AuthenticatedPlanState,
@@ -15964,6 +15964,11 @@ def run_pr_loop(
                     managed_branch=managed_branch,
                     override_nonce=override_nonce,
                 )
+        # The authenticated transaction reads below run in the agent workdir,
+        # so the workdirs must exist (and be validated) first.
+        if not workdirs_ready:
+            ensure_agent_workdirs(config, runner)
+            workdirs_ready = True
         _entry_transaction_precheck(
             runner, config, pr_number=pr_number,
             head_sha=initial_pr_context.metadata.head_sha,
@@ -21083,11 +21088,13 @@ def _is_bot_authored_discuss_comment(body: str) -> bool:
     match = ROUND_RESUME_MARKER_RE.search(body)
     if match is None:
         return False
+    # Read only ``flow``, which never spills: a full decode would reject a
+    # round comment whose growth fields are unhydrated spill references.
     try:
-        metadata = _decode_round_metadata(match.group("payload"))
+        payload = decode_mapping(match.group("payload"))
     except AgentLoopError:
         return False
-    return metadata.flow == "discuss"
+    return payload.get("flow") == "discuss"
 
 
 def _discuss_subject(issue_context: IssueContext) -> str:

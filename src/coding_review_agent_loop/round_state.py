@@ -1972,6 +1972,12 @@ def _decode_workflow_transaction_id(payload: Mapping[str, object]) -> str | None
 
 def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
     try:
+        for key in ("prior_items", "risk_test_matrix_evidence"):
+            # A spill reference must be hydrated first; never read it as
+            # review items or canonical matrix evidence (#953).
+            value = payload.get(key)
+            if isinstance(value, Mapping) and "$round_transport_spill" in value:
+                raise ValueError(f"{key} is an unhydrated transport reference")
         semantic_keys_present = _SEMANTIC_METADATA_FIELDS.intersection(payload)
         if semantic_keys_present:
             # Do not coerce malformed new authority to None: None is reserved
