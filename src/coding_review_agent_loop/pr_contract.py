@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -218,3 +219,233 @@ def find_latest_pr_contract(
                 )
             found = contract
     return found
+
+
+# ---------------------------------------------------------------------------
+# Version 2: transaction-bound contract records (#827).
+#
+# The functions below are a separate codec.  ``find_latest_pr_contract`` and
+# ``decode_pr_contract`` are deliberately not taught version 2: they keep
+# rejecting it, so a comment snapshot that was not read through the
+# author-authenticated reader can never be interpreted as a version-2 record.
+# ---------------------------------------------------------------------------
+
+PR_CONTRACT_V2_SCHEMA_VERSION = 2
+# One successor transaction can change both the origin flow and the closing
+# scope (its kind is the higher-precedence one), and a record carries exactly
+# one supersession kind, so the combined change has its own atomic kind.
+PR_CONTRACT_SUPERSESSION_COMBINED = "flow-correction-with-closing-widening"
+PR_CONTRACT_SUPERSESSION_KINDS = frozenset(
+    {"closing-widening", "flow-correction", PR_CONTRACT_SUPERSESSION_COMBINED}
+)
+_HEX64_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_V2_REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
+_V2_ISSUE_ORIGIN_FLOWS = frozenset({"issue-implementation", "approved-plan-implementation"})
+_V2_APPROVED_PLAN_FLOW = "approved-plan-implementation"
+_V2_PLAN_HASH_RE = re.compile(r"\A[0-9a-f]{16}\Z")
+
+
+@dataclass(frozen=True)
+class PrExpectedClosingContractV2:
+    repository: str
+    pr_number: int
+    origin_flow: str
+    primary_issue_number: int | None
+    expected_closing_issue_ids: tuple[int, ...]
+    contract_hash: str
+    transaction_id: str
+    supersession_kind: str | None = None
+    supersedes_record_hash: str | None = None
+    # Present exactly when the origin flow is the approved-plan flow, so the PR
+    # surface carries the same plan identity as the issue-side handoff.
+    approved_plan_hash: str | None = None
+    schema_version: int = PR_CONTRACT_V2_SCHEMA_VERSION
+
+
+def _v2_payload(contract: PrExpectedClosingContractV2) -> dict[str, object]:
+    return {
+        "schema_version": contract.schema_version,
+        "repository": contract.repository,
+        "pr_number": contract.pr_number,
+        "origin_flow": contract.origin_flow,
+        "approved_plan_hash": contract.approved_plan_hash,
+        "primary_issue_number": contract.primary_issue_number,
+        "expected_closing_issue_ids": list(contract.expected_closing_issue_ids),
+        "contract_hash": contract.contract_hash,
+        "transaction_id": contract.transaction_id,
+        "supersession_kind": contract.supersession_kind,
+        "supersedes_record_hash": contract.supersedes_record_hash,
+    }
+
+
+def make_pr_contract_v2(
+    *,
+    repository: str,
+    pr_number: int,
+    origin_flow: str,
+    expected_closing_issue_ids: Sequence[int],
+    transaction_id: str,
+    primary_issue_number: int | None = None,
+    supersession_kind: str | None = None,
+    supersedes_record_hash: str | None = None,
+    approved_plan_hash: str | None = None,
+) -> PrExpectedClosingContractV2:
+    ids = normalize_issue_ids(expected_closing_issue_ids, field_name="expected_closing_issue_ids")
+    assert ids is not None
+    contract = PrExpectedClosingContractV2(
+        repository=repository,
+        pr_number=pr_number,
+        origin_flow=origin_flow,
+        primary_issue_number=primary_issue_number,
+        expected_closing_issue_ids=ids,
+        contract_hash=contract_hash(ids),
+        transaction_id=transaction_id,
+        supersession_kind=supersession_kind,
+        supersedes_record_hash=supersedes_record_hash,
+        approved_plan_hash=approved_plan_hash,
+    )
+    # Validate through the strict decoder so construction and parsing agree.
+    return decode_pr_contract_v2(encode_pr_contract_v2(contract))
+
+
+def encode_pr_contract_v2(contract: PrExpectedClosingContractV2) -> str:
+    return _encode_payload(_v2_payload(contract))
+
+
+def decode_pr_contract_v2(encoded: str) -> PrExpectedClosingContractV2:
+    payload = _decode_payload(encoded)
+    required = {
+        "schema_version",
+        "repository",
+        "pr_number",
+        "origin_flow",
+        "approved_plan_hash",
+        "primary_issue_number",
+        "expected_closing_issue_ids",
+        "contract_hash",
+        "transaction_id",
+        "supersession_kind",
+        "supersedes_record_hash",
+    }
+    prefix = f"Invalid {PR_EXPECTED_CLOSING_MARKER} v2 payload"
+    if set(payload) != required:
+        raise AgentLoopError(f"{prefix}: expected exactly {', '.join(sorted(required))}.")
+    version = payload["schema_version"]
+    if isinstance(version, bool) or version != PR_CONTRACT_V2_SCHEMA_VERSION:
+        raise AgentLoopError(f"{prefix}: schema_version must be 2.")
+    pr_number = payload["pr_number"]
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise AgentLoopError(f"{prefix}: pr_number must be positive.")
+    primary = payload["primary_issue_number"]
+    if primary is not None and (
+        isinstance(primary, bool) or not isinstance(primary, int) or primary <= 0
+    ):
+        raise AgentLoopError(f"{prefix}: primary_issue_number is invalid.")
+    repository = payload["repository"]
+    if not isinstance(repository, str) or _V2_REPOSITORY_RE.match(repository) is None:
+        raise AgentLoopError(f"{prefix}: repository must be OWNER/NAME.")
+    origin = payload["origin_flow"]
+    if origin not in _VALID_ORIGINS:
+        raise AgentLoopError(f"{prefix}: origin_flow is invalid.")
+    if origin in _V2_ISSUE_ORIGIN_FLOWS and primary is None:
+        raise AgentLoopError(f"{prefix}: {origin} requires primary_issue_number.")
+    plan_hash = payload["approved_plan_hash"]
+    if origin == _V2_APPROVED_PLAN_FLOW:
+        if not isinstance(plan_hash, str) or _V2_PLAN_HASH_RE.match(plan_hash) is None:
+            raise AgentLoopError(
+                f"{prefix}: approved_plan_hash is required for {_V2_APPROVED_PLAN_FLOW}."
+            )
+    elif plan_hash is not None:
+        raise AgentLoopError(f"{prefix}: approved_plan_hash must be absent for {origin}.")
+    ids = normalize_issue_ids(
+        payload["expected_closing_issue_ids"],
+        field_name=f"{PR_EXPECTED_CLOSING_MARKER}.expected_closing_issue_ids",
+    )
+    assert ids is not None
+    if list(ids) != payload["expected_closing_issue_ids"]:
+        raise AgentLoopError(f"{prefix}: expected_closing_issue_ids are not canonical.")
+    if primary is not None and primary not in ids:
+        raise AgentLoopError(
+            f"{prefix}: expected_closing_issue_ids must retain primary issue #{primary}."
+        )
+    digest = payload["contract_hash"]
+    if not isinstance(digest, str) or digest != contract_hash(ids):
+        raise AgentLoopError(f"{prefix}: contract_hash is invalid.")
+    transaction_id = payload["transaction_id"]
+    if not isinstance(transaction_id, str) or _HEX64_RE.match(transaction_id) is None:
+        raise AgentLoopError(f"{prefix}: transaction_id is invalid.")
+    kind = payload["supersession_kind"]
+    supersedes = payload["supersedes_record_hash"]
+    if (kind is None) != (supersedes is None):
+        raise AgentLoopError(
+            f"{prefix}: supersession_kind and supersedes_record_hash must be set together."
+        )
+    if kind is not None and kind not in PR_CONTRACT_SUPERSESSION_KINDS:
+        raise AgentLoopError(f"{prefix}: supersession_kind is invalid.")
+    if supersedes is not None and (
+        not isinstance(supersedes, str) or _HEX64_RE.match(supersedes) is None
+    ):
+        raise AgentLoopError(f"{prefix}: supersedes_record_hash is invalid.")
+    contract = PrExpectedClosingContractV2(
+        repository=repository,
+        pr_number=pr_number,
+        origin_flow=str(origin),
+        primary_issue_number=primary,
+        expected_closing_issue_ids=ids,
+        contract_hash=digest,
+        transaction_id=transaction_id,
+        supersession_kind=kind if isinstance(kind, str) else None,
+        supersedes_record_hash=supersedes if isinstance(supersedes, str) else None,
+        approved_plan_hash=plan_hash if isinstance(plan_hash, str) else None,
+    )
+    if encode_pr_contract_v2(contract) != encoded:
+        raise AgentLoopError(f"{prefix}: record is not canonically encoded.")
+    return contract
+
+
+def pr_contract_record_hash(
+    contract: PrExpectedClosingContract | PrExpectedClosingContractV2,
+) -> str:
+    """Hash the full canonical payload, so the digest identifies flow too.
+
+    ``expected_closure.contract_hash`` covers closing IDs only and therefore
+    cannot distinguish two records that differ in origin flow.
+    """
+    encoded = (
+        encode_pr_contract_v2(contract)
+        if isinstance(contract, PrExpectedClosingContractV2)
+        else encode_pr_contract(contract)
+    )
+    return hashlib.sha256(base64.urlsafe_b64decode(encoded.encode("ascii"))).hexdigest()
+
+
+def pr_contract_payload_schema_version(encoded: str) -> object:
+    """Peek at a payload's declared version without interpreting the record."""
+    return _decode_payload(encoded).get("schema_version")
+
+
+def format_pr_contract_v2_comment(contract: PrExpectedClosingContractV2) -> str:
+    encoded = encode_pr_contract_v2(contract)
+    if encode_pr_contract_v2(decode_pr_contract_v2(encoded)) != encoded:
+        raise AgentLoopError("PR expected-closing contract failed canonical rendering validation.")
+    issue_text = ", ".join(f"#{item}" for item in contract.expected_closing_issue_ids) or "(none)"
+    lines = [
+        f"Expected closing issues for PR #{contract.pr_number}: {issue_text}.",
+        "",
+        f"Origin flow: {contract.origin_flow}",
+        f"Contract hash: {contract.contract_hash}",
+        f"Workflow transaction: {contract.transaction_id}",
+    ]
+    if contract.approved_plan_hash is not None:
+        lines.append(f"Plan hash: {contract.approved_plan_hash}")
+    if contract.supersession_kind is not None:
+        lines.append(
+            f"Supersedes record {contract.supersedes_record_hash} ({contract.supersession_kind})."
+        )
+    lines.extend(
+        [
+            f"<!-- {PR_EXPECTED_CLOSING_MARKER}: {encoded} -->",
+            "-- coding-review-agent-loop",
+        ]
+    )
+    return "\n".join(lines)

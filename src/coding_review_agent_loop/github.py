@@ -2136,6 +2136,254 @@ def reset_authenticated_github_actor(runner: Runner) -> None:
         delattr(runner, "_agent_loop_authenticated_actor")
 
 
+ISSUE_THREAD_SURFACE = "issue"
+PR_THREAD_SURFACE = "pr"
+_THREAD_SURFACE_RE = re.compile(r"\A(?P<kind>issue|pr)#(?P<number>[1-9][0-9]*)\Z")
+
+
+def comment_thread_surface(kind: str, number: int) -> str:
+    """Name one issue or PR conversation thread, for example ``issue#827``."""
+    if kind not in {ISSUE_THREAD_SURFACE, PR_THREAD_SURFACE}:
+        raise AgentLoopError(f"Unknown comment thread surface kind {kind!r}.")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise AgentLoopError("Comment thread surface number must be a positive integer.")
+    return f"{kind}#{number}"
+
+
+def parse_comment_thread_surface(surface: object) -> tuple[str, int]:
+    match = _THREAD_SURFACE_RE.match(surface) if isinstance(surface, str) else None
+    if match is None:
+        raise AgentLoopError(f"Invalid comment thread surface {surface!r}.")
+    return match.group("kind"), int(match.group("number"))
+
+
+def parse_comment_timestamp(value: object) -> datetime.datetime:
+    """Parse one immutable GitHub comment timestamp; never default it."""
+    if not isinstance(value, str) or not value.strip():
+        raise AgentLoopError("Comment timestamp is missing.")
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise AgentLoopError(f"Comment timestamp {value!r} is not parseable.") from exc
+    if parsed.tzinfo is None:
+        raise AgentLoopError(f"Comment timestamp {value!r} carries no UTC offset.")
+    return parsed
+
+
+@dataclass(frozen=True)
+class AuthenticatedComment:
+    """One REST comment envelope with its immutable identity and ordering fields.
+
+    The envelope is the only input the transaction-aware lineage entry points
+    accept (#827), so a comment snapshot without a numeric ID, an immutable
+    author user ID, or a parseable ``created_at`` cannot reach them.
+    """
+
+    surface: str
+    comment_id: int
+    author_login: str
+    author_id: int
+    created_at: str
+    updated_at: str | None
+    body: str
+
+    def __post_init__(self) -> None:
+        parse_comment_thread_surface(self.surface)
+        for name in ("comment_id", "author_id"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise AgentLoopError(
+                    f"Authenticated comment envelope {name} must be a positive integer."
+                )
+        if not isinstance(self.author_login, str) or not self.author_login:
+            raise AgentLoopError("Authenticated comment envelope lacks an author login.")
+        parse_comment_timestamp(self.created_at)
+        if self.updated_at is not None:
+            parse_comment_timestamp(self.updated_at)
+        if not isinstance(self.body, str):
+            raise AgentLoopError("Authenticated comment envelope body must be text.")
+
+    @property
+    def id(self) -> int:
+        return self.comment_id
+
+    @property
+    def author(self) -> str:
+        return self.author_login
+
+    @property
+    def created(self) -> datetime.datetime:
+        return parse_comment_timestamp(self.created_at)
+
+
+@dataclass(frozen=True)
+class AuthenticatedCommentView:
+    """A complete read of one thread, split by the invocation's actor.
+
+    ``authored`` holds every comment written by the authenticated actor, in
+    comment-ID order.  ``ignored_foreign`` holds comments from any other author
+    that name a reserved protocol record; they grant nothing, are never
+    adoptable, and exist only so diagnostics can list them.
+    """
+
+    surface: str
+    actor_login: str
+    actor_id: int
+    authored: tuple[AuthenticatedComment, ...]
+    ignored_foreign: tuple[AuthenticatedComment, ...] = ()
+
+    def __post_init__(self) -> None:
+        parse_comment_thread_surface(self.surface)
+        if (
+            isinstance(self.actor_id, bool)
+            or not isinstance(self.actor_id, int)
+            or self.actor_id < 1
+            or not isinstance(self.actor_login, str)
+            or not self.actor_login
+        ):
+            raise AgentLoopError("Authenticated comment view lacks an actor identity.")
+        seen: set[int] = set()
+        for group, own in ((self.authored, True), (self.ignored_foreign, False)):
+            if not isinstance(group, tuple):
+                raise AgentLoopError("Authenticated comment view groups must be tuples.")
+            for comment in group:
+                if not isinstance(comment, AuthenticatedComment):
+                    raise AgentLoopError(
+                        "Authenticated comment view accepts only authenticated envelopes."
+                    )
+                if comment.surface != self.surface:
+                    raise AgentLoopError(
+                        "Authenticated comment view mixes comment thread surfaces."
+                    )
+                if (comment.author_id == self.actor_id) != own:
+                    raise AgentLoopError(
+                        "Authenticated comment view author partition is inconsistent."
+                    )
+                if comment.comment_id in seen:
+                    raise AgentLoopError("Authenticated comment view repeats a comment ID.")
+                seen.add(comment.comment_id)
+        if list(self.authored) != sorted(self.authored, key=lambda item: item.comment_id):
+            raise AgentLoopError("Authenticated comment view is not in comment-ID order.")
+
+    def comment(self, comment_id: int) -> AuthenticatedComment | None:
+        for comment in self.authored:
+            if comment.comment_id == comment_id:
+                return comment
+        return None
+
+    def foreign_diagnostics(self) -> tuple[str, ...]:
+        return tuple(
+            f"ignored-foreign comment {comment.comment_id} on {comment.surface} by "
+            f"{comment.author_login} (user ID {comment.author_id})"
+            for comment in self.ignored_foreign
+        )
+
+
+def _authenticated_comment_from_rest(raw: object, *, surface: str) -> AuthenticatedComment:
+    if not isinstance(raw, dict):
+        raise AgentLoopError(f"Authenticated comment read of {surface} returned an incomplete page.")
+    user = raw.get("user")
+    if not isinstance(user, dict):
+        raise AgentLoopError(
+            f"Authenticated comment read of {surface} returned a comment without an author."
+        )
+    body = raw.get("body")
+    return AuthenticatedComment(
+        surface=surface,
+        comment_id=raw.get("id"),  # type: ignore[arg-type]
+        author_login=user.get("login"),  # type: ignore[arg-type]
+        author_id=user.get("id"),  # type: ignore[arg-type]
+        created_at=raw.get("created_at"),  # type: ignore[arg-type]
+        updated_at=raw.get("updated_at") if raw.get("updated_at") is not None else None,  # type: ignore[arg-type]
+        body=body if body is not None else "",
+    )
+
+
+def read_authenticated_protocol_comments(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    surface_kind: str,
+    number: int,
+) -> AuthenticatedCommentView:
+    """Read one issue or PR conversation completely, bound to the invocation actor.
+
+    Pagination is exhaustive and fail-closed: a failed, malformed, or
+    self-contradictory page raises instead of returning a partial view.  Only
+    comments whose immutable author user ID equals the authenticated actor are
+    authoritative; a byte-exact record from anyone else is reported as
+    ignored-foreign and can never be adopted (#827).
+    """
+    surface = comment_thread_surface(surface_kind, number)
+    actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    page_size = 100
+    # Loop guard only; see _merge_issue_comment_transport_identity.
+    max_pages = 10_000
+    page = 1
+    envelopes: list[AuthenticatedComment] = []
+    seen_ids: set[int] = set()
+    while page <= max_pages:
+        result = runner.run(
+            [
+                config.gh_cmd,
+                "api",
+                f"repos/{config.repo}/issues/{number}/comments?per_page={page_size}&page={page}",
+            ],
+            cwd=active_workdir(config),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AgentLoopError(
+                f"Authenticated comment read of {surface} failed on page {page}; "
+                "a partial view is never used."
+            )
+        try:
+            raw_page = json.loads(result.stdout or "")
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError(
+                f"Authenticated comment read of {surface} returned malformed JSON on page {page}."
+            ) from exc
+        if not isinstance(raw_page, list):
+            raise AgentLoopError(
+                f"Authenticated comment read of {surface} returned a non-list page {page}."
+            )
+        if len(raw_page) > page_size:
+            raise AgentLoopError(
+                f"Authenticated comment read of {surface} returned an oversized page {page}."
+            )
+        for raw_comment in raw_page:
+            envelope = _authenticated_comment_from_rest(raw_comment, surface=surface)
+            if envelope.comment_id in seen_ids:
+                raise AgentLoopError(
+                    f"Authenticated comment read of {surface} repeated comment ID "
+                    f"{envelope.comment_id}."
+                )
+            seen_ids.add(envelope.comment_id)
+            envelopes.append(envelope)
+        if len(raw_page) < page_size:
+            break
+        page += 1
+    else:
+        raise AgentLoopError(
+            f"Authenticated comment read of {surface} exceeded its pagination bound."
+        )
+    envelopes.sort(key=lambda item: item.comment_id)
+    return AuthenticatedCommentView(
+        surface=surface,
+        actor_login=actor_login,
+        actor_id=actor_id,
+        authored=tuple(item for item in envelopes if item.author_id == actor_id),
+        ignored_foreign=tuple(
+            item
+            for item in envelopes
+            if item.author_id != actor_id and named_reserved_marker_tokens(item.body)
+        ),
+    )
+
+
 def _post_trusted_protocol_comment(
     runner: Runner,
     *,

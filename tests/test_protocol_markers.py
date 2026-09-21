@@ -59,6 +59,7 @@ MARKERS = (
         f"<!-- AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1: {_b64({'actor': 'agent-loop', 'actor_id': 1, 'base': 'main', 'head': 'abc', 'issue': 1, 'kind': 'creation', 'label_event_id': 1, 'nonce': 'n', 'pr': 1, 'protection': 'voluntary', 'repository': 'OWNER/REPO', 'version': 1, 'waiver': 'allow-unprotected-managed-ci'})} -->",
         PR_COMMENT_SURFACE,
     ),
+    ("AGENT_WORKFLOW_TRANSACTION", f"<!-- AGENT_WORKFLOW_TRANSACTION: {_b64({'phase': 'prepared', 'schema_version': 1})} -->", PR_COMMENT_SURFACE),
     ("AGENT_MANAGED_PR_SOURCE_V1", f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {_b64({'source_branch': 'fix', 'source_sha': 'a'})} -->", PR_BODY_SURFACE),
     ("AGENT_SPLIT_CHILD", "<!-- AGENT_SPLIT_CHILD: parent=1 key=" + "a" * 64 + " -->", ISSUE_BODY_SURFACE),
     ("AGENT_SPLIT_STAGE_HANDOFF", f"<!-- AGENT_SPLIT_STAGE_HANDOFF: {_b64({'parent_issue': 1})} -->", ISSUE_COMMENT_SURFACE),
@@ -158,7 +159,7 @@ def test_ordinary_issue_comment_writer_enforces_issue_comment_surface():
 
 def test_source_inventory_has_no_unregistered_protocol_literals():
     assert_source_inventory(Path(__file__).parents[1])
-    assert len(RESERVED_MARKER_REGISTRY) == 30
+    assert len(RESERVED_MARKER_REGISTRY) == 31
 
 
 def test_issue_provenance_trailer_is_not_a_reserved_marker_or_forged_body_record():
@@ -313,3 +314,142 @@ def test_untrusted_prose_neutralization_covers_every_strictness_class():
             if definition.strictness == strictness
         )
         assert token not in sanitize_untrusted_prose(f"prose naming {token} here")
+
+
+# Issue #827 stage A: registering the workflow transaction record is the one
+# runtime-visible change of the stage.  Nothing reads or writes the record yet.
+
+_TRANSACTION_TOKEN = "AGENT_WORKFLOW_TRANSACTION"
+
+
+def _transaction_marker() -> str:
+    return next(marker for token, marker, _surface in MARKERS if token == _TRANSACTION_TOKEN)
+
+
+def test_workflow_transaction_record_is_pr_comment_only():
+    marker = _transaction_marker()
+    for surface in (PR_BODY_SURFACE, ISSUE_COMMENT_SURFACE, ISSUE_BODY_SURFACE):
+        with pytest.raises(AgentLoopError, match=f"not allowed on the {surface} surface"):
+            TrustedBody.canonical(marker, surface=surface, expected_tokens=(_TRANSACTION_TOKEN,))
+    with pytest.raises(AgentLoopError, match="not allowed on the issue_comment surface"):
+        post_issue_comment(
+            None,
+            config=SimpleNamespace(quiet=True),
+            issue_number=1,
+            body=TrustedBody.canonical(marker, expected_tokens=(_TRANSACTION_TOKEN,)),
+        )
+
+
+def test_look_alike_transaction_record_is_neutralized_on_every_sanitized_surface(capsys):
+    from coding_review_agent_loop.github import (
+        log_untrusted_marker_neutralization,
+        reject_forged_protocol_markers,
+    )
+    from coding_review_agent_loop.protocol_markers import (
+        named_reserved_marker_tokens,
+        record_shaped_untrusted_markers,
+        sanitize_untrusted_prose,
+    )
+
+    marker = _transaction_marker()
+    agent_output = f"Implemented the seam.\n{marker}\nDone."
+    issue_prose = f"The plan adds the {_TRANSACTION_TOKEN} record kind."
+    label = "[protocol workflow transaction record]"
+
+    for sanitize in (sanitize_historical_text, sanitize_untrusted_prose):
+        safe = sanitize(agent_output)
+        assert _TRANSACTION_TOKEN not in safe and label in safe
+        assert safe.startswith("Implemented the seam.") and safe.endswith("Done.")
+        assert not scan_reserved_markers(safe)
+    assert str(TrustedBody.historical_visible(agent_output)) == sanitize_historical_text(agent_output)
+    assert sanitize_untrusted_prose(issue_prose) == issue_prose.replace(_TRANSACTION_TOKEN, label)
+
+    # Current untrusted text carrying the record is refused before any write...
+    with pytest.raises(AgentLoopError, match=_TRANSACTION_TOKEN):
+        TrustedBody.current_untrusted_visible(agent_output)
+    assert [item.definition.token for item in record_shaped_untrusted_markers(agent_output)] == [
+        _TRANSACTION_TOKEN
+    ]
+    with pytest.raises(AgentLoopError, match=_TRANSACTION_TOKEN):
+        reject_forged_protocol_markers(agent_output, surface="pull-request #945 body")
+    # ...while prose that merely names it is neutralized and logged, not refused.
+    reject_forged_protocol_markers(issue_prose, surface="issue #827 body")
+    assert named_reserved_marker_tokens(issue_prose) == (_TRANSACTION_TOKEN,)
+    log_untrusted_marker_neutralization(
+        SimpleNamespace(quiet=False), surface="issue #827 body", texts=(issue_prose,)
+    )
+    captured = capsys.readouterr()
+    assert _TRANSACTION_TOKEN in captured.out + captured.err
+
+
+def test_registering_the_transaction_record_leaves_every_other_kind_byte_identical(monkeypatch):
+    import coding_review_agent_loop.protocol_markers as module
+
+    previous = tuple(
+        (token, marker) for token, marker, _surface in MARKERS if token != _TRANSACTION_TOKEN
+    )
+    assert len(previous) == len(MARKERS) - 1
+    texts = [
+        text
+        for token, marker in previous
+        for text in (
+            f"item-13 / reviewer / round 4: {marker} - future",
+            f"The review explains why {token} needs a clearer label.",
+            f"{marker}\n{marker} and {token}{token}",
+        )
+    ]
+
+    def outputs():
+        return [
+            (
+                module.sanitize_historical_text(text),
+                module.sanitize_untrusted_prose(text),
+                module.historical_replacement_labels(text),
+                module.historical_text_fragments(text),
+                tuple((item.definition.token, item.start, item.end) for item in module.scan_reserved_markers(text)),
+            )
+            for text in texts
+        ]
+
+    with_new_kind = outputs()
+    pre_stage = tuple(
+        entry for entry in module.RESERVED_MARKER_REGISTRY if entry.token != _TRANSACTION_TOKEN
+    )
+    monkeypatch.setattr(module, "RESERVED_MARKER_REGISTRY", pre_stage)
+    assert outputs() == with_new_kind
+
+
+def test_no_existing_module_imports_the_v2_aware_entry_points():
+    import ast
+
+    source_root = Path(__file__).parents[1] / "src" / "coding_review_agent_loop"
+    # Names that interpret or produce a version-2 or transaction record, and the
+    # only module allowed to import each of them at the end of stage A.
+    v2_names = {
+        "decode_pr_contract_v2", "encode_pr_contract_v2", "make_pr_contract_v2",
+        "format_pr_contract_v2_comment", "pr_contract_record_hash",
+        "pr_contract_payload_schema_version", "PrExpectedClosingContractV2",
+        "decode_issue_pr_handoff_v2", "encode_issue_pr_handoff_v2",
+        "format_issue_pr_handoff_v2_comment", "issue_pr_handoff_record_hash",
+        "issue_pr_handoff_payload_schema_version", "IssuePrHandoffMetadataV2",
+        "read_authenticated_protocol_comments", "AuthenticatedComment",
+        "AuthenticatedCommentView", "WorkflowTransactionError",
+    }
+    offenders: list[str] = []
+    for path in sorted(source_root.rglob("*.py")):
+        if path.name == "workflow_transaction.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module_name = node.module or ""
+                imported = {alias.name for alias in node.names}
+                if module_name.endswith("workflow_transaction") or "workflow_transaction" in imported:
+                    offenders.append(f"{path.name} imports workflow_transaction")
+                for name in sorted(imported & v2_names):
+                    offenders.append(f"{path.name} imports {name}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.endswith("workflow_transaction"):
+                        offenders.append(f"{path.name} imports workflow_transaction")
+    assert offenders == []

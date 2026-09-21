@@ -12,6 +12,7 @@ predating this marker) before any coder invocation.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -656,3 +657,179 @@ def post_issue_pr_handoff_comment(
             expected_tokens=("AGENT_ISSUE_PR_HANDOFF",),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Version 2: transaction-bound handoff records (#827).
+#
+# A separate codec.  ``resolve_issue_pr_handoff_lineage`` and the version-1
+# decoder are deliberately not taught version 2 and keep rejecting it, so a
+# comment snapshot that was not read through the author-authenticated reader
+# can never be interpreted as a version-2 record.
+# ---------------------------------------------------------------------------
+
+HANDOFF_V2_SCHEMA_VERSION = 2
+_TRANSACTION_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_V2_HEAD_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_V2_PLAN_HASH_RE = re.compile(r"\A[0-9a-f]{16}\Z")
+_V2_PR_URL_RE = re.compile(
+    r"\Ahttps://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/(?P<number>[1-9][0-9]*)\Z"
+)
+
+
+@dataclass(frozen=True)
+class IssuePrHandoffMetadataV2:
+    issue_number: int
+    pr_number: int
+    pr_url: str
+    pr_head_sha: str
+    flow: str
+    plan_hash: str | None
+    expected_closing_issue_ids: tuple[int, ...]
+    contract_hash: str
+    transaction_id: str
+    schema_version: int = HANDOFF_V2_SCHEMA_VERSION
+
+
+def encode_issue_pr_handoff_v2(metadata: IssuePrHandoffMetadataV2) -> str:
+    return _encode_json_payload(
+        {
+            "schema_version": metadata.schema_version,
+            "issue_number": metadata.issue_number,
+            "pr_number": metadata.pr_number,
+            "pr_url": metadata.pr_url,
+            "pr_head_sha": metadata.pr_head_sha,
+            "flow": metadata.flow,
+            "plan_hash": metadata.plan_hash,
+            "expected_closing_issue_ids": list(metadata.expected_closing_issue_ids),
+            "contract_hash": metadata.contract_hash,
+            "transaction_id": metadata.transaction_id,
+        }
+    )
+
+
+def decode_issue_pr_handoff_v2(encoded: str) -> IssuePrHandoffMetadataV2:
+    payload = _decode_json_payload(encoded)
+    required = {
+        "schema_version",
+        "issue_number",
+        "pr_number",
+        "pr_url",
+        "pr_head_sha",
+        "flow",
+        "plan_hash",
+        "expected_closing_issue_ids",
+        "contract_hash",
+        "transaction_id",
+    }
+    prefix = "Invalid AGENT_ISSUE_PR_HANDOFF v2 payload"
+    if set(payload) != required:
+        raise AgentLoopError(f"{prefix}: expected exactly {', '.join(sorted(required))}.")
+    version = payload["schema_version"]
+    if isinstance(version, bool) or version != HANDOFF_V2_SCHEMA_VERSION:
+        raise AgentLoopError(f"{prefix}: schema_version must be 2.")
+    numbers: dict[str, int] = {}
+    for key in ("issue_number", "pr_number"):
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise AgentLoopError(f"{prefix}: `{key}` must be a positive integer.")
+        numbers[key] = value
+    pr_url = _require_non_empty_str(payload, "pr_url")
+    pr_head_sha = _require_non_empty_str(payload, "pr_head_sha")
+    url_match = _V2_PR_URL_RE.match(pr_url)
+    if url_match is None or int(url_match.group("number")) != numbers["pr_number"]:
+        raise AgentLoopError(f"{prefix}: `pr_url` is not this PR's canonical GitHub URL.")
+    if _V2_HEAD_SHA_RE.match(pr_head_sha) is None:
+        raise AgentLoopError(f"{prefix}: `pr_head_sha` must be a full lowercase commit SHA.")
+    flow = payload["flow"]
+    if flow not in _VALID_FLOWS:
+        raise AgentLoopError(f"{prefix}: unknown flow {flow!r}.")
+    plan_hash = payload["plan_hash"]
+    if flow == "approved-plan-implementation":
+        if not isinstance(plan_hash, str) or _V2_PLAN_HASH_RE.match(plan_hash) is None:
+            raise AgentLoopError(
+                f"{prefix}: `plan_hash` is required for approved-plan-implementation flow."
+            )
+    elif plan_hash is not None:
+        raise AgentLoopError(
+            f"{prefix}: `plan_hash` must be absent for issue-implementation flow."
+        )
+    expected_ids = normalize_issue_ids(
+        payload["expected_closing_issue_ids"],
+        field_name="AGENT_ISSUE_PR_HANDOFF.expected_closing_issue_ids",
+    )
+    assert expected_ids is not None
+    if list(expected_ids) != payload["expected_closing_issue_ids"]:
+        raise AgentLoopError(f"{prefix}: expected closing IDs are not canonical.")
+    if numbers["issue_number"] not in expected_ids:
+        raise AgentLoopError(
+            f"{prefix}: expected closing IDs must retain the primary issue "
+            f"#{numbers['issue_number']}."
+        )
+    digest = payload["contract_hash"]
+    if not isinstance(digest, str) or digest != contract_hash(expected_ids):
+        raise AgentLoopError(
+            f"{prefix}: `contract_hash` does not match expected_closing_issue_ids."
+        )
+    transaction_id = payload["transaction_id"]
+    if not isinstance(transaction_id, str) or _TRANSACTION_ID_RE.match(transaction_id) is None:
+        raise AgentLoopError(f"{prefix}: `transaction_id` is invalid.")
+    metadata = IssuePrHandoffMetadataV2(
+        issue_number=numbers["issue_number"],
+        pr_number=numbers["pr_number"],
+        pr_url=pr_url,
+        pr_head_sha=pr_head_sha,
+        flow=str(flow),
+        plan_hash=plan_hash if isinstance(plan_hash, str) else None,
+        expected_closing_issue_ids=expected_ids,
+        contract_hash=digest,
+        transaction_id=transaction_id,
+    )
+    if encode_issue_pr_handoff_v2(metadata) != encoded:
+        raise AgentLoopError(f"{prefix}: record is not canonically encoded.")
+    return metadata
+
+
+def issue_pr_handoff_payload_schema_version(encoded: str) -> object:
+    """Peek at a payload's declared version without interpreting the record."""
+    return _decode_json_payload(encoded).get("schema_version")
+
+
+def issue_pr_handoff_record_hash(
+    metadata: IssuePrHandoffMetadata | IssuePrHandoffMetadataV2,
+) -> str:
+    """Hash the full canonical payload of one handoff record."""
+    encoded = (
+        encode_issue_pr_handoff_v2(metadata)
+        if isinstance(metadata, IssuePrHandoffMetadataV2)
+        else _encode_issue_pr_handoff_metadata(metadata)
+    )
+    return hashlib.sha256(base64.urlsafe_b64decode(encoded.encode("ascii"))).hexdigest()
+
+
+def format_issue_pr_handoff_v2_comment(metadata: IssuePrHandoffMetadataV2, *, repo: str) -> str:
+    encoded = encode_issue_pr_handoff_v2(metadata)
+    if encode_issue_pr_handoff_v2(decode_issue_pr_handoff_v2(encoded)) != encoded:
+        raise AgentLoopError("Issue-to-PR handoff failed canonical rendering validation.")
+    _validate_issue_pr_handoff_url(metadata.pr_url, repo=repo, pr_number=metadata.pr_number)
+    lines = [
+        f"Issue #{metadata.issue_number} implementation handed off to PR #{metadata.pr_number}.",
+        "",
+        f"Flow: {metadata.flow}",
+        f"PR: {metadata.pr_url}",
+        f"PR head SHA: {metadata.pr_head_sha}",
+    ]
+    if metadata.plan_hash:
+        lines.append(f"Plan hash: {metadata.plan_hash}")
+    lines.extend(
+        [
+            "Expected closing issues: "
+            + ", ".join(f"#{item}" for item in metadata.expected_closing_issue_ids)
+            + ".",
+            f"Workflow transaction: {metadata.transaction_id}",
+            "",
+            f"<!-- AGENT_ISSUE_PR_HANDOFF: {encoded} -->",
+            "-- coding-review-agent-loop",
+        ]
+    )
+    return "\n".join(lines)

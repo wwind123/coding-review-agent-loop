@@ -287,6 +287,22 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
             "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1",
             surfaces=frozenset({PR_COMMENT_SURFACE}),
         ),
+        # Cross-surface workflow transaction record (#827).  Prepared and
+        # terminal records live only in trusted PR comments.
+        MarkerDefinition(
+            token="AGENT_WORKFLOW_TRANSACTION",
+            pattern=re.compile(
+                r"<!--\s*AGENT_WORKFLOW_TRANSACTION:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+                re.I,
+            ),
+            strictness="well-formed-only",
+            codec="b64-json",
+            surfaces=frozenset({PR_COMMENT_SURFACE}),
+            safe_label="[protocol workflow transaction record]",
+            canonicalizer=lambda match: _canonical_b64_json(
+                match, prefix="AGENT_WORKFLOW_TRANSACTION"
+            ),
+        ),
         MarkerDefinition(
             token="AGENT_MANAGED_PR_SOURCE_V1",
             pattern=re.compile(r"<!--\s*AGENT_MANAGED_PR_SOURCE_V1\s+(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I),
