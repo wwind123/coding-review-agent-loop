@@ -444,11 +444,14 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
         # transaction, so it is the third.  ``managed_ci`` is the fourth: its single
         # authorization accessor classifies the era with the stage A body rule and
         # imports nothing that interprets or produces a version-2 record.
+        # ``issue_pr_handoff`` is the fifth: its canonical-PR authentication hands an
+        # issue whose handoff is version 2 to discovery and the committed gate.
         if path.name in {
             "workflow_transaction.py",
             "workflow_transaction_publication.py",
             "managed_ci_bound_authorization.py",
             "managed_ci.py",
+            "issue_pr_handoff.py",
         }:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

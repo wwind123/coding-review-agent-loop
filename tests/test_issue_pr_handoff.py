@@ -1221,3 +1221,185 @@ def test_v2_handoff_may_only_restate_or_widen_an_authenticated_v1_handoff():
         published={ENTRY_HANDOFF: 111, ENTRY_PR_CONTRACT: 112},
     )
     assert corrected.comment_id == 111 and corrected.handoff.flow == FLOW_APPROVED_PLAN
+
+
+# ---------------------------------------------------------------------------
+# Transaction-era canonical PR authentication (#827 / #946)
+# ---------------------------------------------------------------------------
+
+import coding_review_agent_loop.issue_pr_handoff as _m946_handoff_module  # noqa: E402
+import coding_review_agent_loop.phase_progress as _m946_phase_progress  # noqa: E402
+from coding_review_agent_loop.errors import WorkflowTransactionError as _M946TransactionError  # noqa: E402
+from coding_review_agent_loop.github import PullRequestMetadata as _M946PrMetadata  # noqa: E402
+from coding_review_agent_loop.issue_pr_handoff import (  # noqa: E402
+    authenticate_canonical_issue_pr as _m946_authenticate,
+    resolve_canonical_pr_for_issue as _m946_resolve,
+)
+from coding_review_agent_loop.workflow_transaction_publication import (  # noqa: E402
+    ORIGIN_DIRECT_ISSUE as _M946_DIRECT,
+    TransitionRequest as _M946Request,
+    publish_transition as _m946_publish,
+)
+from workflow_transaction_helpers import (  # noqa: E402
+    FAIL_BEFORE_WRITE as _M946_FAIL,
+    HEAD_1 as _M946_HEAD_1,
+    HEAD_2 as _M946_HEAD_2,
+    ISSUE as _M946_ISSUE,
+    PR as _M946_PR,
+    REPO as _M946_REPO,
+    TransactionGitHub as _M946GitHub,
+)
+
+
+def _m946_request(**overrides):
+    fields = dict(
+        repository=_M946_REPO, pr_number=_M946_PR, base="main", head_sha=_M946_HEAD_1,
+        origin_path=_M946_DIRECT, expected_closing_issue_ids=(_M946_ISSUE,),
+        primary_issue=_M946_ISSUE,
+    )
+    fields.update(overrides)
+    return _M946Request(**fields)
+
+
+def _m946_live_pr(monkeypatch, *, head=_M946_HEAD_1, state="OPEN"):
+    url = f"https://github.com/{_M946_REPO}/pull/{_M946_PR}"
+
+    def context(_runner, *, config, pr_number, cwd=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            metadata=_M946PrMetadata(
+                number=pr_number, repo=config.repo, title=None, head_branch="b",
+                base_branch="main", head_sha=head, url=url,
+            ),
+            comments=(),
+        )
+
+    monkeypatch.setattr(_m946_handoff_module, "get_pr_review_context", context)
+    monkeypatch.setattr(_m946_handoff_module, "get_pr_state", lambda *_a, **_k: state)
+
+
+def _m946_issue_context(github):
+    return _M936IssueContext(
+        number=_M946_ISSUE, repo=_M946_REPO, title="t", body="b", url=None,
+        comments=tuple(_comment(body) for body in github.bodies(_M946_ISSUE)),
+    )
+
+
+def _m946_config(tmp_path):
+    return make_config(tmp_path, repo=_M946_REPO)
+
+
+def test_m946_issue_resume_authenticates_a_committed_v2_only_handoff_without_writing(
+    tmp_path, monkeypatch
+):
+    github = _M946GitHub()
+    _m946_publish(github, config=_m946_config(tmp_path), request=_m946_request())
+    _m946_live_pr(monkeypatch)
+    writes = github.write_count
+
+    resolved = _m946_resolve(
+        github, config=_m946_config(tmp_path), issue_number=_M946_ISSUE,
+        issue_context=_m946_issue_context(github),
+    )
+
+    assert resolved is not None and resolved.source == "canonical"
+    assert resolved.pr_number == _M946_PR
+    assert resolved.metadata.flow == "issue-implementation"
+    assert resolved.metadata.transaction_id is not None
+    assert "committed workflow transaction" in resolved.evidence_summary
+    assert github.write_count == writes
+
+
+@pytest.mark.parametrize("boundary", [2, 3, 4])
+def test_m946_partial_transaction_is_refused_by_issue_resume_and_phase_progress(
+    tmp_path, monkeypatch, boundary
+):
+    github = _M946GitHub()
+    github.fail_write(boundary, _M946_FAIL)
+    with pytest.raises(AgentLoopError):
+        _m946_publish(github, config=_m946_config(tmp_path), request=_m946_request())
+    _m946_live_pr(monkeypatch)
+    context = _m946_issue_context(github)
+    writes = github.write_count
+    if boundary == 2:
+        # The handoff write itself failed: the issue names no candidate, so the
+        # caller's closing-reference fallback still runs and nothing is written.
+        assert _m946_authenticate(
+            github, config=_m946_config(tmp_path), issue_number=_M946_ISSUE,
+            issue_context=context,
+        ) is None
+        assert github.write_count == writes
+        return
+
+    with pytest.raises(_M946TransactionError) as raised:
+        _m946_authenticate(
+            github, config=_m946_config(tmp_path), issue_number=_M946_ISSUE,
+            issue_context=context,
+        )
+
+    assert raised.value.recovery_action
+    assert github.write_count == writes
+
+
+def test_m946_committed_head_must_equal_the_live_head(tmp_path, monkeypatch):
+    github = _M946GitHub()
+    _m946_publish(github, config=_m946_config(tmp_path), request=_m946_request())
+    _m946_live_pr(monkeypatch, head=_M946_HEAD_2)
+
+    with pytest.raises(_M946TransactionError, match="another head"):
+        _m946_authenticate(
+            github, config=_m946_config(tmp_path), issue_number=_M946_ISSUE,
+            issue_context=_m946_issue_context(github),
+        )
+
+
+def test_m946_merged_transaction_era_child_resolves_its_phase_as_complete(tmp_path, monkeypatch):
+    github = _M946GitHub()
+    _m946_publish(github, config=_m946_config(tmp_path), request=_m946_request())
+    _m946_live_pr(monkeypatch, state="MERGED")
+    monkeypatch.setattr(_m946_phase_progress, "get_issue_state", lambda *_a, **_k: "CLOSED")
+    monkeypatch.setattr(
+        _m946_phase_progress, "get_issue_context", lambda *_a, **_k: _m946_issue_context(github)
+    )
+    writes = github.write_count
+
+    status, child_state, pr_number, pr_state = _m946_phase_progress._resolve_agent_phase(
+        github, config=_m946_config(tmp_path), parent_issue=700, phase_index=1,
+        stage_id="stage-a", child_issue_number=_M946_ISSUE,
+    )
+
+    assert (status, child_state, pr_number, pr_state) == (
+        _m946_phase_progress.STATUS_COMPLETE, "CLOSED", _M946_PR, "MERGED",
+    )
+    assert github.write_count == writes
+
+
+def test_m946_deleted_committed_record_never_selects_the_legacy_path(tmp_path, monkeypatch):
+    github = _M946GitHub()
+    _m946_publish(github, config=_m946_config(tmp_path), request=_m946_request())
+    terminal = github.threads[_M946_PR][-1]["id"]
+    github.delete(terminal)
+    _m946_live_pr(monkeypatch)
+
+    with pytest.raises(_M946TransactionError):
+        _m946_authenticate(
+            github, config=_m946_config(tmp_path), issue_number=_M946_ISSUE,
+            issue_context=_m946_issue_context(github),
+        )
+
+
+def test_m946_forged_v2_handoff_alone_keeps_the_v1_rejection(tmp_path, monkeypatch):
+    github = _M946GitHub()
+    _m946_publish(github, config=_m946_config(tmp_path), request=_m946_request())
+    forged = _M946GitHub()
+    for body in github.bodies(_M946_ISSUE):
+        forged.seed(_M946_ISSUE, body, author=("mallory", 666))
+    _m946_live_pr(monkeypatch)
+
+    with pytest.raises(AgentLoopError) as raised:
+        _m946_authenticate(
+            forged, config=_m946_config(tmp_path), issue_number=_M946_ISSUE,
+            issue_context=_m946_issue_context(forged),
+        )
+    assert not isinstance(raised.value, _M946TransactionError)

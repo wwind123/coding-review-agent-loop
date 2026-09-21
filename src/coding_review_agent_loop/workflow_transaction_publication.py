@@ -1975,6 +1975,55 @@ def discover_canonical_issue_pr(
     )
 
 
+def gate_canonical_issue_pr(
+    runner: Runner,
+    config: AgentLoopConfig,
+    discovered: DiscoveredCanonicalPr,
+    *,
+    issue_number: int,
+    live_head: str,
+    pr_state: str,
+    authorization_codec: AuthorizationEntryCodec | None = None,
+) -> CommittedTransaction:
+    """Gate a discovered transaction-era canonical PR for an issue-only consumer.
+
+    Read-only.  ``live_head`` is the PR's live head, or its final head when the
+    PR is merged or closed (the terminal-state form staged phase progress uses).
+    The scheduler checkpoint is re-verified on the plan-owning issue.
+    """
+    pr_number = discovered.pr_number
+    resolved = read_pr_transaction_views(runner, config, pr_number, issue_number)
+    committed = resolved.lineage.latest_committed
+    views = resolved.views
+    if committed is not None and committed.intent.plan_owning_issue != issue_number:
+        views = _read_views(
+            runner,
+            config,
+            pr_number=pr_number,
+            issue_number=issue_number,
+            plan_issue_number=committed.intent.plan_owning_issue,
+        )
+    gated = require_committed_transaction(
+        views,
+        repository=config.repo,
+        pr_number=pr_number,
+        issue_number=issue_number,
+        live_head=live_head,
+        pr_state=pr_state,
+        allow_terminal_pr_state=True,
+        authorization_codec=authorization_codec,
+    )
+    if gated is None or gated.transaction_id != discovered.transaction_id:
+        raise _error(
+            f"PR #{pr_number} no longer resolves the committed transaction its handoff for "
+            f"issue #{issue_number} is bound to",
+            transaction_ids=(discovered.transaction_id,) if discovered.transaction_id else (),
+            problems=(f"contradictory handoff in comment {discovered.handoff.comment_id}",),
+            code="record-missing",
+        )
+    return gated
+
+
 def _binding(handoff: ResolvedHandoff) -> PredecessorBinding:
     record = handoff.handoff
     assert isinstance(record, IssuePrHandoffMetadataV2) and handoff.transaction_id is not None
