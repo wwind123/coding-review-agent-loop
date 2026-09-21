@@ -524,6 +524,8 @@ def authenticate_canonical_issue_pr(
     live PR state is returned; any mismatch raises, so an unauthenticatable
     record can never be read as evidence.
     """
+    # ``get_issue_context`` merges every REST handoff record into the snapshot,
+    # so a capped comment projection cannot hide a version-2 handoff here.
     if _names_version_2_handoff(issue_context.comments):
         transaction_era = _authenticate_transaction_era_issue_pr(
             runner, config=config, issue_number=issue_number

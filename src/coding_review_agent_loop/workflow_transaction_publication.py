@@ -112,6 +112,7 @@ from .workflow_transaction import (
     resolve_handoff_lineage,
     resolve_pr_contract_lineage,
     resolve_transaction_lineage,
+    round_metadata_digest,
     select_scheduler_checkpoint,
     verify_scheduler_checkpoint,
 )
@@ -1975,6 +1976,36 @@ def discover_canonical_issue_pr(
     )
 
 
+def recover_checkpoint_candidate_key(
+    intent: WorkflowTransition, plan_issue_view: AuthenticatedCommentView | None
+) -> PlanCandidateKey | None:
+    """Recover the approved plan's candidate key from the hashed checkpoint reference.
+
+    The intent hashes the checkpoint comment's round-metadata digest, and the
+    seam verified that record against the approved key before the prepared
+    write.  A comment that still matches the hashed digest therefore still
+    carries exactly that key.  Anything else returns ``None`` and is refused by
+    ``verify_scheduler_checkpoint``, which re-checks the digest, the subject,
+    the anchor, and the ordering itself.
+    """
+    reference = intent.scheduler_checkpoint.reference
+    if reference is None or plan_issue_view is None:
+        return None
+    comment = plan_issue_view.comment(reference.comment_id)
+    if comment is None:
+        return None
+    try:
+        if round_metadata_digest(comment) != reference.digest:
+            return None
+        for record in _extract_round_metadata_records(plan_issue_view.authored, flow="plan"):
+            if plan_issue_view.authored[record.index] is comment:
+                raw = record.metadata.plan_candidate_key
+                return PlanCandidateKey.from_mapping(raw) if raw is not None else None
+    except AgentLoopError:
+        return None
+    return None
+
+
 def gate_canonical_issue_pr(
     runner: Runner,
     config: AgentLoopConfig,
@@ -1984,12 +2015,14 @@ def gate_canonical_issue_pr(
     live_head: str,
     pr_state: str,
     authorization_codec: AuthorizationEntryCodec | None = None,
+    plan_candidate_key: PlanCandidateKey | None = None,
 ) -> CommittedTransaction:
     """Gate a discovered transaction-era canonical PR for an issue-only consumer.
 
     Read-only.  ``live_head`` is the PR's live head, or its final head when the
     PR is merged or closed (the terminal-state form staged phase progress uses).
-    The scheduler checkpoint is re-verified on the plan-owning issue.
+    The scheduler checkpoint is re-verified on the plan-owning issue; a caller
+    that holds no approved-plan session recovers the candidate key durably.
     """
     pr_number = discovered.pr_number
     resolved = read_pr_transaction_views(runner, config, pr_number, issue_number)
@@ -2003,6 +2036,10 @@ def gate_canonical_issue_pr(
             issue_number=issue_number,
             plan_issue_number=committed.intent.plan_owning_issue,
         )
+    if plan_candidate_key is None and committed is not None:
+        plan_candidate_key = recover_checkpoint_candidate_key(
+            committed.intent, views.plan_issue_view
+        )
     gated = require_committed_transaction(
         views,
         repository=config.repo,
@@ -2012,6 +2049,7 @@ def gate_canonical_issue_pr(
         pr_state=pr_state,
         allow_terminal_pr_state=True,
         authorization_codec=authorization_codec,
+        plan_candidate_key=plan_candidate_key,
     )
     if gated is None or gated.transaction_id != discovered.transaction_id:
         raise _error(

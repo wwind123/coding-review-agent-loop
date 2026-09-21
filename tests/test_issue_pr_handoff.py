@@ -1403,3 +1403,114 @@ def test_m946_forged_v2_handoff_alone_keeps_the_v1_rejection(tmp_path, monkeypat
             issue_context=_m946_issue_context(forged),
         )
     assert not isinstance(raised.value, _M946TransactionError)
+
+
+from coding_review_agent_loop.workflow_transaction_publication import (  # noqa: E402
+    ORIGIN_APPROVED_PLAN as _M946_APPROVED_PLAN,
+    ApprovedPlanInput as _M946PlanInput,
+)
+from workflow_transaction_helpers import (  # noqa: E402
+    PLAN as _M946_PLAN,
+    PLAN_HASH as _M946_PLAN_HASH,
+    PLAN_SUBJECT as _M946_PLAN_SUBJECT,
+    plan_key as _m946_plan_key,
+    plan_record_comment as _m946_plan_record,
+    scheduler_comment as _m946_scheduler,
+)
+
+
+def _m946_publish_approved_plan(tmp_path):
+    github = _M946GitHub()
+    github.seed(_M946_ISSUE, _m946_plan_record(1, _M946_PLAN).body)
+    checkpoint = github.seed(_M946_ISSUE, _m946_scheduler(2, _M946_PLAN).body)
+    _m946_publish(
+        github,
+        config=_m946_config(tmp_path),
+        request=_m946_request(
+            origin_path=_M946_APPROVED_PLAN,
+            approved_plan=_M946PlanInput(_M946_PLAN_HASH, _M946_PLAN_SUBJECT, _m946_plan_key()),
+        ),
+    )
+    return github, checkpoint
+
+
+def test_m946_approved_plan_transaction_authenticates_without_a_session_candidate_key(
+    tmp_path, monkeypatch
+):
+    github, _checkpoint = _m946_publish_approved_plan(tmp_path)
+    _m946_live_pr(monkeypatch)
+    writes = github.write_count
+
+    resolved = _m946_resolve(
+        github, config=_m946_config(tmp_path), issue_number=_M946_ISSUE,
+        issue_context=_m946_issue_context(github),
+    )
+
+    assert resolved is not None and resolved.pr_number == _M946_PR
+    assert resolved.metadata.flow == "approved-plan-implementation"
+    assert resolved.metadata.plan_hash == _M946_PLAN_HASH
+    assert github.write_count == writes
+
+
+@pytest.mark.parametrize("mutation", ["deleted", "edited"])
+def test_m946_approved_plan_reader_fails_closed_on_a_changed_checkpoint(
+    tmp_path, monkeypatch, mutation
+):
+    github, checkpoint = _m946_publish_approved_plan(tmp_path)
+    if mutation == "deleted":
+        github.delete(checkpoint)
+    else:
+        github.edit(
+            checkpoint,
+            _m946_scheduler(2, _M946_PLAN, key=_m946_plan_key(aggregate_plan_identity="other")).body,
+        )
+    _m946_live_pr(monkeypatch)
+
+    with pytest.raises(AgentLoopError):
+        _m946_authenticate(
+            github, config=_m946_config(tmp_path), issue_number=_M946_ISSUE,
+            issue_context=_m946_issue_context(github),
+        )
+
+
+def test_m946_capped_projection_still_surfaces_a_rest_only_handoff(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    import coding_review_agent_loop.github as github_module
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    github = _M946GitHub()
+    _m946_publish(github, config=_m946_config(tmp_path), request=_m946_request())
+    handoff_bodies = github.bodies(_M946_ISSUE)
+    assert _m946_handoff_module._names_version_2_handoff([_comment(b) for b in handoff_bodies])
+    projection = tuple(
+        IssueComment(
+            author="human",
+            created_at=f"2026-09-19T00:{index // 60:02d}:{index % 60:02d}Z",
+            body=f"note {index}",
+        )
+        for index in range(100)
+    )
+    rest_page_1 = [
+        {"id": index + 1, "body": item.body, "created_at": item.created_at,
+         "user": {"login": "human", "id": 3}}
+        for index, item in enumerate(projection)
+    ]
+    rest_page_2 = [
+        {"id": 5000 + index, "body": body, "created_at": "2026-09-19T01:00:00Z",
+         "user": {"login": "agent-loop-bot", "id": 4242}}
+        for index, body in enumerate(handoff_bodies)
+    ]
+
+    class _RestRunner:
+        def run(self, args, *, cwd, input_text=None, check=True, env=None):
+            page = rest_page_1 if args[-1].endswith("page=1") else rest_page_2
+            return SimpleNamespace(returncode=0, stdout=json.dumps(page), stderr="")
+
+    assert not _m946_handoff_module._names_version_2_handoff(projection)
+    merged = github_module._merge_issue_comment_transport_identity(
+        _RestRunner(), config=_m946_config(tmp_path), issue_number=_M946_ISSUE,
+        comments=projection,
+    )
+    assert _m946_handoff_module._names_version_2_handoff(merged)
