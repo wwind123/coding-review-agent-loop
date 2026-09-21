@@ -2887,3 +2887,174 @@ def test_m948_oversized_child_revision_posts_digest_and_resumes_losslessly(
     assert COMPACT_PLAN_DIGEST_NOTICE not in review_prompt
     # No forked plan round: nothing new was published by the coder.
     assert len(_m948_coder_anchors(second.issue_comments)) == 2
+
+
+# ---------------------------------------------------------------------------
+# #827 stage B: a transaction-era child PR is rebound through the seam
+# ---------------------------------------------------------------------------
+
+
+_M946_HEAD = "c" * 40
+
+
+class _M946TxWorld(_M936World):
+    """The #936 world, but PR #77 was published as one staged-child transaction.
+
+    Every durable comment lives in the fake's REST-served threads, so the
+    seam's authenticated reads and the issue context see the same history.
+    """
+
+    def __init__(self, tmp_path, monkeypatch):
+        super().__init__(tmp_path, monkeypatch)
+        # Drop the version-1 handoff: the transaction publishes the binding.
+        signed = self.comments[-1]
+        base = [item for item in self.comments[:-2]]
+        self.issue_rows = [self._row(item) for item in base]
+        self.pr_rows = []
+        runner = self._runner()
+        from coding_review_agent_loop import workflow_transaction_publication as publication
+        from coding_review_agent_loop.workflow_transaction import StagedIdentity
+
+        config = self.config()
+        plan_input = publication.recover_approved_plan_input(
+            runner, config, plan_issue_number=56, plan_hash=self.old_hash
+        )
+        assert plan_input is not None
+        publication.publish_transition(runner, config=config, request=publication.TransitionRequest(
+            repository="OWNER/REPO", pr_number=77, base="main", head_sha=_M946_HEAD,
+            origin_path=publication.ORIGIN_STAGED_CHILD, expected_closing_issue_ids=(56,),
+            primary_issue=56, staged=StagedIdentity(55, 56, "child"), approved_plan=plan_input,
+        ))
+        self.issue_rows.append(self._row(signed, author="human-reviewer"))
+        self.runner = None
+        self.last = None
+
+    @staticmethod
+    def _row(item, author="coding-review-agent-loop"):
+        return {"author": {"login": author}, "createdAt": item.created_at, "body": item.body}
+
+    def _runner(self, **outputs):
+        runner = FakeRunner(
+            persist_rest_comment_posts=True,
+            issue_payload={"number": 56, "title": "Child", "body": ""},
+            issue_comments=self.issue_rows,
+            pr_payload={
+                "number": 77, "body": "Fixes #56", "state": "OPEN",
+                "url": "https://github.com/OWNER/REPO/pull/77", "headRefOid": _M946_HEAD,
+                "baseRefName": "main", "comments": self.pr_rows,
+            },
+            git_head=_M946_HEAD,
+            **outputs,
+        )
+        # Share the durable threads, so every write lands in the history.
+        runner.issue_comments = self.issue_rows
+        runner.pr_payload["comments"] = self.pr_rows
+        self.runner = runner
+        return runner
+
+    def _issue_context(self, _runner, *, config, issue_number):
+        if issue_number != 56:
+            return self.parent
+        rows = self.runner.issue_comments if self.runner is not None else self.issue_rows
+        return dataclasses.replace(self.child, comments=tuple(
+            IssueComment(
+                author=(row.get("author") or {}).get("login", "bot"),
+                created_at=row.get("createdAt") or row.get("created_at") or "",
+                body=str(row.get("body", "")),
+            )
+            for row in rows
+        ))
+
+    def settle(self):
+        self.runner = None
+
+    def run_issue(self, *, config=None, **outputs):
+        before = len(self.issue_rows), len(self.pr_rows)
+        self._runner(**outputs)
+        self.before = before
+        return orchestrator.run_issue_loop(
+            self.runner, issue_number=56, config=config or self.config(), plan_first=True
+        )
+
+    def posted(self):
+        return [str(row["body"]) for row in self.issue_rows[self.before[0]:]]
+
+    def pr_posted(self):
+        return [str(row["body"]) for row in self.pr_rows[self.before[1]:]]
+
+
+def test_m946_transaction_era_child_pr_is_rebound_by_one_plan_replacement(
+    tmp_path, monkeypatch
+):
+    world = _M946TxWorld(tmp_path, monkeypatch)
+    handed = []
+
+    def capture_pr_loop(runner, *, pr_number, **kwargs):
+        handed.append((pr_number, kwargs["approved_plan_context"].plan_hash))
+        return 0
+
+    monkeypatch.setattr(orchestrator, "run_pr_loop", capture_pr_loop)
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    ) == 0
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.workflow_transaction import KIND_PLAN_REPLACEMENT, StagedIdentity
+
+    assert len(world.agent_calls("claude")) == 1
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in world.runner.commands)
+    config = world.config()
+    era, edge = publication.committed_plan_replacement(
+        world.runner, config, pr_number=77, issue_number=56
+    )
+    assert era == "transaction" and edge.replaced_plan_hash == world.old_hash
+    new_hash = edge.new_plan_hash
+    assert handed == [(77, new_hash)]
+    lineage = publication.read_pr_transaction_views(world.runner, config, 77, 56).lineage
+    committed = [state for state in lineage.chain if state.committed]
+    assert [state.intent.successor_kind for state in committed] == ["initial", KIND_PLAN_REPLACEMENT]
+    rebind = committed[-1].intent
+    assert rebind.staged == StagedIdentity(55, 56, "child")
+    assert rebind.expected_closing_issue_ids == (56,)
+    # One handoff, carrying the audit record, and one reissued PR contract; no
+    # version-1 record, no second PR, no implementation turn.
+    handoffs = [body for body in world.posted() if AGENT_ISSUE_PR_HANDOFF_RE.search(body)]
+    assert len(handoffs) == 1 and CHILD_PLAN_REBIND_MARKER_RE.search(handoffs[0])
+    assert committed[-1].transaction_id in handoffs[0]
+    assert '"schema_version": 1' not in handoffs[0]
+    assert sum("AGENT_PR_EXPECTED_CLOSING_ISSUES" in body for body in world.pr_posted()) == 1
+    # The rebind verifies on the transaction-era path, and a rerun writes nothing.
+    assert orchestrator.verify_child_plan_rebind(
+        world._issue_context(None, config=config, issue_number=56).comments,
+        repo="OWNER/REPO", parent_plan_context=_m936_binding(world).parent_plan_context,
+        child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
+        runner=world.runner, config=config,
+    ).plan_hash == new_hash
+    handed.clear()
+    assert world.run_issue(codex_outputs=[]) == 0
+    assert not any(
+        AGENT_ISSUE_PR_HANDOFF_RE.search(body) or CHILD_PLAN_REBIND_MARKER_RE.search(body)
+        for body in world.posted()
+    )
+    assert world.pr_posted() == []
+    assert world.agent_calls("claude") == [] and handed == [(77, new_hash)]
+
+
+def test_m946_transaction_era_replacement_without_its_audit_record_fails_closed(
+    tmp_path, monkeypatch
+):
+    world = _M946TxWorld(tmp_path, monkeypatch)
+    monkeypatch.setattr(orchestrator, "run_pr_loop", lambda runner, **kwargs: 0)
+    # A plan replacement committed without the rebind audit record.
+    monkeypatch.setattr(
+        orchestrator, "format_child_plan_rebind_section", lambda record, **kwargs: ""
+    )
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    ) == 0
+    rows_before = len(world.issue_rows), len(world.pr_rows)
+    with pytest.raises(AgentLoopError, match="exactly one rebind audit record"):
+        world.run_issue(codex_outputs=[PR_APPROVAL])
+    assert (len(world.issue_rows), len(world.pr_rows)) == rows_before
+    assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []

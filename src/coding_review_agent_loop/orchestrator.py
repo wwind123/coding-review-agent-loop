@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 from .agents.base import AgentName, AgentResult
@@ -144,6 +145,7 @@ from .github import (
 )
 from .issue_pr_handoff import (
     IssuePrHandoffMetadata,
+    _names_version_2_handoff,
     find_latest_issue_pr_handoff,
     authenticate_canonical_issue_pr,
     format_issue_pr_handoff_comment,
@@ -9227,6 +9229,8 @@ def verify_child_plan_rebind(
     stage_id: str,
     pr_number: int,
     require_admissible: bool = True,
+    runner: Runner | None = None,
+    config: AgentLoopConfig | None = None,
 ) -> ApprovedPlanContext | None:
     """Verify a planning child's same-PR plan-replacement handoff.
 
@@ -9242,40 +9246,68 @@ def verify_child_plan_rebind(
     the plan became the binding, so a legitimately rebound plan that a later
     contract tightening made inadmissible can still be superseded, while an
     unverified replacement can never be laundered through a new authorization.
+
+    A transaction-era PR (#827) is read through its committed lineage when a
+    ``runner`` is supplied: the edge is the latest committed plan-replacement
+    transaction, and its audit record must ride in the handoff that
+    transaction committed.
     """
-    lineage = resolve_issue_pr_handoff_lineage(
-        child_comments, issue_number=child_issue, repo=repo
-    )
-    if lineage is None or lineage.replaced is None or lineage.replacement is None:
-        return None
-    handoff = lineage.replacement
-    replaced = lineage.replaced
+    transaction_edge = None
+    if runner is not None and config is not None and _names_version_2_handoff(child_comments):
+        from . import workflow_transaction_publication as publication
+
+        era, transaction_edge = publication.committed_plan_replacement(
+            runner, config, pr_number=pr_number, issue_number=child_issue
+        )
+        if era == publication.ERA_TRANSACTION and transaction_edge is None:
+            return None
+        if era != publication.ERA_TRANSACTION:
+            transaction_edge = None
+    if transaction_edge is not None:
+        replaced_hash = transaction_edge.replaced_plan_hash
+        new_hash = transaction_edge.new_plan_hash
+        handoff_pr = transaction_edge.pr_number
+        audit_comments = (
+            [SimpleNamespace(body=transaction_edge.handoff_body)]
+            if transaction_edge.handoff_body is not None
+            else []
+        )
+        records = list(find_child_plan_rebind_records(audit_comments))
+    else:
+        lineage = resolve_issue_pr_handoff_lineage(
+            child_comments, issue_number=child_issue, repo=repo
+        )
+        if lineage is None or lineage.replaced is None or lineage.replacement is None:
+            return None
+        replaced_hash = lineage.replaced.plan_hash
+        new_hash = lineage.replacement.plan_hash
+        handoff_pr = lineage.replacement.pr_number
+        records = [
+            record
+            for record in find_child_plan_rebind_records(child_comments)
+            if record.comment_index == lineage.replacement_comment_index
+        ]
 
     def fail(reason: str) -> AgentLoopError:
         return AgentLoopError(
             f"Human repair required: child issue #{child_issue} carries a same-PR approved-plan "
-            f"replacement handoff ({replaced.plan_hash} -> {handoff.plan_hash}) for PR "
-            f"#{handoff.pr_number} that cannot be verified: {reason}. No reviewer, coder, "
+            f"replacement handoff ({replaced_hash} -> {new_hash}) for PR "
+            f"#{handoff_pr} that cannot be verified: {reason}. No reviewer, coder, "
             "qualification, or merge step ran and no corrective record was posted. Restore the "
             "signed child-plan supersession record and the rebind comment, or remove the "
             "unverifiable handoff comment, then rerun."
         )
 
-    if handoff.pr_number != pr_number:
-        raise fail(f"it names PR #{handoff.pr_number}, not PR #{pr_number}")
-    records = [
-        record
-        for record in find_child_plan_rebind_records(child_comments)
-        if record.comment_index == lineage.replacement_comment_index
-    ]
+    if handoff_pr != pr_number:
+        raise fail(f"it names PR #{handoff_pr}, not PR #{pr_number}")
     if len(records) != 1:
         raise fail("its comment does not carry exactly one rebind audit record")
     record = records[0]
     if (
         record.child_issue != child_issue
-        or record.pr_number != handoff.pr_number
-        or record.new_plan_hash != handoff.plan_hash
-        or record.superseded_plan_hash != replaced.plan_hash
+        or record.pr_number != handoff_pr
+        or record.new_plan_hash != new_hash
+        or record.superseded_plan_hash != replaced_hash
     ):
         raise fail(
             "its rebind audit record disagrees with the handoff on child issue, PR number, or "
@@ -9397,6 +9429,22 @@ def _rebind_superseded_child_plan(
             f"{plan_supersession.superseded_hash}; PR #{plan_supersession.pr_number} was not "
             "rebound and nothing was posted."
         )
+    from . import workflow_transaction_publication as publication
+
+    era = publication.read_pr_transaction_views(
+        runner, config, plan_supersession.pr_number, None
+    ).era
+    if era == publication.ERA_TRANSACTION:
+        _rebind_transaction_era_child_plan(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            issue_context=issue_context,
+            plan_supersession=plan_supersession,
+            plan_hash=plan_hash,
+            replan=replan,
+        )
+        return
     handoff_lineage = resolve_issue_pr_handoff_lineage(
         issue_context.comments, issue_number=issue_number, repo=config.repo
     )
@@ -9486,6 +9534,123 @@ def _rebind_superseded_child_plan(
     )
 
 
+def _rebind_transaction_era_child_plan(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    issue_context: IssueContext,
+    plan_supersession: _PlanSupersessionBinding,
+    plan_hash: str,
+    replan: AuthorizedReplanLineage,
+) -> None:
+    """Rebind a transaction-era child PR as one plan-replacement successor (#827).
+
+    The seam reissues the handoff, carrying the rebind audit record, and the
+    PR contract, then commits; nothing is written outside it.  The last
+    committed transaction is the binding: an already-rebound PR is verified
+    and nothing is posted, and a binding that names neither plan is refused.
+    """
+    from . import workflow_transaction_publication as publication
+
+    pr_number = plan_supersession.pr_number
+    binding = publication.committed_pr_binding(runner, config, pr_number)
+    assert binding is not None
+    committed = binding.transaction.intent
+    if committed.primary_issue != issue_number:
+        raise AgentLoopError(
+            f"Human repair required: PR #{pr_number}'s committed workflow transaction is bound "
+            f"to issue #{committed.primary_issue}, not child issue #{issue_number}; the "
+            "re-planned child plan was not rebound and nothing was posted."
+        )
+    authenticated = authenticate_canonical_issue_pr(
+        runner, config=config, issue_number=issue_number, issue_context=issue_context
+    )
+    if (
+        authenticated is None
+        or authenticated.pr_number != pr_number
+        or authenticated.state != "OPEN"
+    ):
+        raise AgentLoopError(
+            f"Human repair required: canonical PR #{pr_number} for issue #{issue_number} is "
+            f"{authenticated.state if authenticated is not None else 'not recorded'}, not OPEN "
+            "with the same number as the superseded handoff. The re-planned child plan was not "
+            "rebound, no superseding handoff was posted, and no implementation turn was started; "
+            "abandoning or replacing the existing PR is not supported."
+        )
+    if committed.approved_plan_hash == plan_hash:
+        verify_child_plan_rebind(
+            issue_context.comments,
+            repo=config.repo,
+            parent_plan_context=plan_supersession.parent_plan_context,
+            child_issue=issue_number,
+            parent_issue=plan_supersession.parent_issue,
+            stage_id=plan_supersession.stage_id,
+            pr_number=pr_number,
+            runner=runner,
+            config=config,
+        )
+        return
+    if committed.approved_plan_hash != plan_supersession.superseded_hash:
+        raise AgentLoopError(
+            f"Human repair required: PR #{pr_number}'s committed workflow transaction binds plan "
+            f"{committed.approved_plan_hash}, neither superseded plan "
+            f"{plan_supersession.superseded_hash} nor approved revision {plan_hash}; nothing "
+            "was posted."
+        )
+    plan_context = recover_approved_plan_context(issue_context.comments, expected_hash=plan_hash)
+    plan_input = publication.recover_approved_plan_input(
+        runner,
+        config,
+        plan_issue_number=issue_number,
+        plan_hash=plan_hash,
+        plan_subject=plan_context.plan_subject if plan_context.is_available else None,
+    )
+    if plan_input is None:
+        raise AgentLoopError(
+            f"Human repair required: approved plan {plan_hash} on issue #{issue_number} has no "
+            "record authored by this invocation's actor, so no plan-replacement transaction can "
+            f"bind it; PR #{pr_number} was not rebound and nothing was posted."
+        )
+    rebind_section = format_child_plan_rebind_section(
+        ChildPlanRebindRecord(
+            child_issue=issue_number,
+            pr_number=pr_number,
+            superseded_plan_hash=plan_supersession.superseded_hash,
+            new_plan_hash=plan_hash,
+            plan_supersession_digest=plan_supersession.digest,
+            first_replan_round=replan.first_round,
+            approved_round=replan.latest_round,
+        ),
+        transaction_era=True,
+    )
+    pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    _pr_url, head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
+    publication.publish_transition(
+        runner,
+        config=config,
+        request=publication.TransitionRequest(
+            repository=config.repo,
+            pr_number=pr_number,
+            base=str(pr_context.metadata.base_branch or config.base),
+            head_sha=head_sha,
+            origin_path=publication.ORIGIN_CHILD_PLAN_REBIND,
+            # The closing scope is never changed by a rebind.
+            expected_closing_issue_ids=tuple(committed.expected_closing_issue_ids),
+            primary_issue=issue_number,
+            staged=_staged_identity(plan_supersession.parent_issue, issue_number, "child"),
+            approved_plan=plan_input,
+            handoff_extra_section=rebind_section,
+        ),
+    )
+    log(
+        config,
+        f"Issue #{issue_number}: rebound PR #{pr_number} from approved plan "
+        f"{plan_supersession.superseded_hash} to {plan_hash} with one plan-replacement "
+        "workflow transaction",
+    )
+
+
 def _route_inadmissible_child_handoff(
     runner: Runner,
     *,
@@ -9516,6 +9681,8 @@ def _route_inadmissible_child_handoff(
         stage_id=fresh_child.stage_id,
         pr_number=handoff.pr_number,
         require_admissible=False,
+        runner=runner,
+        config=config,
     )
     failure = _child_plan_admissibility_failure(
         fresh_child.parent_plan_context, child_plan_context, stage_id=fresh_child.stage_id
@@ -9591,6 +9758,7 @@ def _require_admissible_pr_child_plan(
     binding: _PlanningChildBinding,
     child_plan_context: ApprovedPlanContext,
     pr_number: int,
+    runner: Runner | None = None,
 ) -> None:
     """PR-mode provenance gate for a planning child's bound plan (#936).
 
@@ -9607,6 +9775,8 @@ def _require_admissible_pr_child_plan(
         stage_id=binding.stage_id,
         pr_number=pr_number,
         require_admissible=False,
+        runner=runner,
+        config=config,
     )
     failure = _child_plan_admissibility_failure(
         binding.parent_plan_context, child_plan_context, stage_id=binding.stage_id
@@ -16027,6 +16197,8 @@ def _fresh_pr_qualification_snapshot(
                     parent_issue=planning_child_binding.parent_issue,
                     stage_id=planning_child_binding.stage_id,
                     pr_number=pr_number,
+                    runner=runner,
+                    config=config,
                 )
                 if (
                     verified_replacement is None
@@ -17143,6 +17315,7 @@ def run_pr_loop(
                                         binding=planning_child_binding,
                                         child_plan_context=child_plan_context,
                                         pr_number=pr_number,
+                                        runner=runner,
                                     )
                                     approved_plan_context = child_plan_context
                                 if phase_handoff is None:
@@ -17185,6 +17358,7 @@ def run_pr_loop(
                                         binding=planning_child_binding,
                                         child_plan_context=child_plan_context,
                                         pr_number=pr_number,
+                                        runner=runner,
                                     )
                                     # The child has its own approved plan, so
                                     # its matrix owners are authoritative for

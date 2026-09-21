@@ -78,6 +78,7 @@ from .workflow_transaction import (
     KIND_CLOSING_WIDENING,
     KIND_HEAD_ADVANCE,
     KIND_INITIAL,
+    KIND_PLAN_REPLACEMENT,
     PHASE_ABORTED,
     PHASE_COMMITTED,
     RECORD_SET_ENTRY_NAMES,
@@ -1701,6 +1702,64 @@ def committed_pr_binding(
         CommittedTransaction(committed, resolved.lineage, resolved.contract, resolved.handoff),
         contract,
         handoff,
+    )
+
+
+@dataclass(frozen=True)
+class CommittedPlanReplacement:
+    """The most recent committed plan-replacement edge of a PR's lineage.
+
+    ``handoff_body`` is the authenticated body of the handoff that transaction
+    committed; a child-plan rebind carries its audit record there.
+    """
+
+    pr_number: int
+    replaced_plan_hash: str | None
+    new_plan_hash: str
+    handoff_body: str | None
+
+
+def committed_plan_replacement(
+    runner: Runner, config: AgentLoopConfig, *, pr_number: int, issue_number: int
+) -> tuple[str, CommittedPlanReplacement | None]:
+    """Read-only: the PR's era and its latest committed plan replacement, if any.
+
+    A later closing widening or head advance never erases the edge: only a
+    committed ``plan-replacement`` successor is one.  A legacy-era PR returns
+    no edge, and its caller keeps the version-1 lineage reader.
+    """
+    resolved = read_pr_transaction_views(runner, config, pr_number, issue_number)
+    if resolved.era != ERA_TRANSACTION:
+        return resolved.era, None
+    lineage = resolved.lineage
+    state = next(
+        (
+            item
+            for item in reversed(lineage.chain)
+            if item.committed and item.intent.successor_kind == KIND_PLAN_REPLACEMENT
+        ),
+        None,
+    )
+    if state is None:
+        return resolved.era, None
+    predecessor_id = state.intent.predecessor_transaction_id
+    predecessor = lineage.state(predecessor_id) if predecessor_id is not None else None
+    handoff_body = None
+    outcomes = state.terminal.outcomes if state.terminal is not None else ()
+    handoff_id = next(
+        (item.comment_id for item in outcomes if item.name == ENTRY_HANDOFF), None
+    )
+    issue_view = resolved.views.issue_view
+    if handoff_id is not None and issue_view is not None:
+        found = issue_view.comment(handoff_id)
+        handoff_body = found.body if found is not None else None
+    return resolved.era, CommittedPlanReplacement(
+        pr_number=pr_number,
+        replaced_plan_hash=(
+            predecessor.intent.approved_plan_hash if predecessor is not None else None
+        ),
+        new_plan_hash=str(state.intent.approved_plan_hash),
+        handoff_body=handoff_body,
     )
 
 

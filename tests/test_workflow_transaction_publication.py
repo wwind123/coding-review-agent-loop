@@ -41,7 +41,12 @@ from workflow_transaction_helpers import (
 
 from coding_review_agent_loop.errors import AgentLoopError, WorkflowTransactionError
 from coding_review_agent_loop.protocol_markers import TrustedBody
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.round_state import (
+    PostedRoundMetadata,
+    _approved_plan_hash,
+    _attach_round_metadata,
+    _plan_subject,
+)
 from coding_review_agent_loop.workflow_transaction import (
     ENTRY_AUTHORIZATION,
     ENTRY_HANDOFF,
@@ -53,6 +58,7 @@ from coding_review_agent_loop.workflow_transaction import (
     KIND_HEAD_ADVANCE,
     KIND_INITIAL,
     KIND_MANAGED_CI_CONTINUITY,
+    KIND_PLAN_REPLACEMENT,
     RECOVERY_ORIGINAL_ACTOR,
     RECOVERY_RERUN,
     STATUS_WAIVED_CODER_RESPONSE,
@@ -77,12 +83,14 @@ from coding_review_agent_loop.workflow_transaction_publication import (
     CODE_UNCOMMITTED,
     CODE_WRITE_FAILED,
     ORIGIN_APPROVED_PLAN,
+    ORIGIN_CHILD_PLAN_REBIND,
     ORIGIN_DIRECT_ISSUE,
     ORIGIN_PR_RESUME,
     ORIGIN_STAGED_CHILD,
     ApprovedPlanInput,
     Committed,
     CommittedTransaction,
+    committed_plan_replacement,
     Granted,
     InitialCoderRound,
     Legacy,
@@ -296,6 +304,88 @@ def test_staged_child_each_boundary(tmp_path, boundary, mode):
     assert intent.scheduler_checkpoint.reference.surface == f"issue#{PARENT}"
     assert_converged(github, tmp_path, committed=committed, entries=2)
     assert not any("AGENT_ISSUE_PR_HANDOFF" in body for body in github.bodies(PARENT))
+
+
+REVISED_PLAN = "Approved plan: publish workflow metadata as one transaction, revised."
+REVISED_HASH = _approved_plan_hash(REVISED_PLAN)
+REBIND_SECTION = "Child plan rebind audit text.\n<!-- AGENT_CHILD_PLAN_REBIND: e30= -->"
+
+
+def _planning_child_committed(github, tmp_path):
+    """A planning child's PR committed under its own (child-owned) plan."""
+    seed_plan(github)
+    return publish(github, plan_request(
+        origin_path=ORIGIN_STAGED_CHILD, staged=StagedIdentity(PARENT, ISSUE, "child"),
+        initial_coder_round=None,
+    ), tmp_path)
+
+
+def _rebind_request(**overrides):
+    fields = dict(
+        origin_path=ORIGIN_CHILD_PLAN_REBIND,
+        staged=StagedIdentity(PARENT, ISSUE, "child"),
+        approved_plan=ApprovedPlanInput(
+            REVISED_HASH, _plan_subject(REVISED_PLAN), plan_key(REVISED_PLAN)
+        ),
+        initial_coder_round=None,
+        handoff_extra_section=REBIND_SECTION,
+    )
+    fields.update(overrides)
+    return plan_request(**fields)
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("boundary", [None, 1, 2, 3, 4])
+def test_child_plan_rebind_is_one_plan_replacement_successor(tmp_path, boundary, mode):
+    """#827: the rebind reissues the handoff (carrying its audit record) and the
+    PR contract as one committed plan-replacement successor, converging from an
+    interruption at every write."""
+    github = TransactionGitHub()
+    initial = _planning_child_committed(github, tmp_path)
+    era, edge = committed_plan_replacement(
+        github, make_config(tmp_path), pr_number=PR, issue_number=ISSUE
+    )
+    assert (era, edge) == ("transaction", None)
+    github.seed(ISSUE, plan_record_comment(1, REVISED_PLAN).body)
+    checkpoint_id = github.seed(ISSUE, scheduler_comment(2, REVISED_PLAN).body)
+    writes_before = github.write_count
+    if boundary is not None:
+        github.fail_write(writes_before + boundary, mode)
+        with pytest.raises(WorkflowTransactionError):
+            publish(github, _rebind_request(), tmp_path)
+    committed = publish(github, _rebind_request(), tmp_path)
+    intent = committed.intent
+    assert intent.successor_kind == KIND_PLAN_REPLACEMENT
+    assert intent.predecessor_transaction_id == initial.transaction_id
+    assert intent.approved_plan_hash == REVISED_HASH
+    assert intent.staged == StagedIdentity(PARENT, ISSUE, "child")
+    assert intent.expected_closing_issue_ids == (ISSUE,)
+    assert intent.scheduler_checkpoint.reference.comment_id == checkpoint_id
+    assert intent.entry(ENTRY_HANDOFF).disposition == "reissued"
+    assert intent.entry(ENTRY_PR_CONTRACT).disposition == "reissued"
+    # Exactly one handoff per transaction; only the rebind's carries the audit record.
+    handoffs = [body for body in github.bodies(ISSUE) if "AGENT_ISSUE_PR_HANDOFF" in body]
+    assert len(handoffs) == 2
+    assert [REBIND_SECTION in body for body in handoffs] == [False, True]
+    assert committed.transaction_id in handoffs[1]
+    assert sum("AGENT_PR_EXPECTED_CLOSING_ISSUES" in b for b in github.bodies(PR)) == 2
+    assert not any("AGENT_ISSUE_PR_HANDOFF" in body for body in github.bodies(PARENT))
+    # The edge reader names both plans and returns the committed handoff body.
+    era, edge = committed_plan_replacement(
+        github, make_config(tmp_path), pr_number=PR, issue_number=ISSUE
+    )
+    assert era == "transaction"
+    assert (edge.replaced_plan_hash, edge.new_plan_hash) == (PLAN_HASH, REVISED_HASH)
+    assert REBIND_SECTION in edge.handoff_body
+    # A further rerun writes nothing.
+    before = github.write_count
+    assert publish(github, _rebind_request(), tmp_path).transaction_id == committed.transaction_id
+    assert github.write_count == before
+
+
+def test_child_plan_rebind_is_refused_for_a_parent_owned_plan(tmp_path):
+    with pytest.raises(AgentLoopError, match="plan owner is the child"):
+        _rebind_request(staged=StagedIdentity(PARENT, ISSUE, "parent"))
 
 
 def test_staged_parent_may_never_join_the_closing_scope(tmp_path):
