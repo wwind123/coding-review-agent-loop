@@ -285,6 +285,8 @@ from coding_review_agent_loop.salvage import (
 )
 from coding_review_agent_loop.runner import CommandResult
 from coding_review_agent_loop.plan_assembly import AuthenticatedPlanState
+FULL_HEAD = "abc123" + "0" * 34
+
 from agent_loop_helpers import (
     FakeRunner as _FakeRunner,
     child_pr_handoff_comment,
@@ -2627,6 +2629,44 @@ def _plan_review_with_requirement_disposition(
     )
 
 
+
+def _m946_record_kinds(runner):
+    """Ordered kinds of the REST-written workflow records on each surface (#827)."""
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    def kind(comment):
+        body = comment["body"]
+        if "AGENT_WORKFLOW_TRANSACTION" in body:
+            return "transaction"
+        if "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body:
+            return "contract"
+        if "AGENT_ISSUE_PR_HANDOFF" in body:
+            return "handoff"
+        records = _extract_round_metadata_records(
+            [SimpleNamespace(body=body)], flow="pr"
+        )
+        if records and records[0].metadata.workflow_transaction_id is not None:
+            return "tagged-coder-round"
+        return "other"
+
+    rest = lambda items: [c for c in items if isinstance(c.get("id"), int) and "user" in c]
+    issue_threads = [runner.issue_comments, *runner.issue_comments_by_number.values()]
+    return {
+        "pr": [kind(c) for c in rest(runner.pr_payload.get("comments", []))],
+        "issue": [kind(c) for items in issue_threads for c in rest(items)],
+    }
+
+
+def _m946_assert_no_embedded_contract(runner):
+    """No coder round carries a copy of the PR expected-closing contract (#827)."""
+    for comment in runner.pr_payload.get("comments", []):
+        if "AGENT_LOOP_META" in comment["body"]:
+            assert "AGENT_PR_EXPECTED_CLOSING_ISSUES" not in comment["body"]
+    for body in runner.comments:
+        if "AGENT_LOOP_META" in body:
+            assert "AGENT_PR_EXPECTED_CLOSING_ISSUES" not in body
+
+
 def test_issue_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
@@ -2639,7 +2679,9 @@ def test_issue_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):
             + prior_item_dispositions("[item-1] resolved")
             + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
+        git_head=FULL_HEAD,
     )
+    runner.persist_rest_comment_posts = True
     config = make_config(tmp_path)
 
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
@@ -2647,14 +2689,27 @@ def test_issue_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):
     command_names = [cmd[:2] for cmd, _cwd in runner.commands]
     assert ["claude", "--print"] in command_names
     assert ["codex", "exec"] in command_names
-    assert len(runner.comments) == 5
+    # Reviewer and coder rounds go through `gh pr comment`; the transaction
+    # records and the initial coder round are REST writes read back (#827).
+    assert len(runner.comments) == 3
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
+    records = _m946_record_kinds(runner)
+    # Initial transaction (prepared, contract, tagged coder round, committed),
+    # then the head-advance successor (prepared, committed) after the push.
+    assert records["pr"] == [
+        "transaction", "contract", "tagged-coder-round", "transaction",
+        "transaction", "transaction",
+    ]
+    assert records["issue"] == ["handoff"]
+    _m946_assert_no_embedded_contract(runner)
     assert list((tmp_path / "logs").glob("*-claude-attempt1.log"))
     assert list((tmp_path / "logs").glob("*-codex.log"))
     assert (tmp_path / "logs" / ".gitignore").read_text(encoding="utf-8") == "*\n!.gitignore\n"
 
 def test_issue_loop_syncs_coder_base_after_memory_before_coder(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
         ],
@@ -2773,6 +2828,8 @@ def test_infer_staged_parent_requires_generated_marker_or_body_header():
 
 def test_issue_loop_can_use_codex_as_coder_and_claude_as_reviewer(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         codex_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
             "Fixed review.\n<!-- AGENT_STATE: blocking -->",
@@ -2795,11 +2852,18 @@ def test_issue_loop_can_use_codex_as_coder_and_claude_as_reviewer(tmp_path):
         ["codex", "exec"],
         ["claude", "--print"],
     ]
-    assert len(runner.comments) == 5
+    assert len(runner.comments) == 3
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
+    assert _m946_record_kinds(runner)["pr"] == [
+        "transaction", "contract", "tagged-coder-round", "transaction",
+        "transaction", "transaction",
+    ]
+    _m946_assert_no_embedded_contract(runner)
 
 def test_issue_loop_runs_pre_review_tests_after_coder_changes(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Created PR.\nTests: pytest passed.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
             "Fixed review.\nTests: pytest passed.\n<!-- AGENT_STATE: blocking -->",
@@ -2847,6 +2911,8 @@ def test_issue_loop_rejects_missing_initial_issue_human_requirements_acknowledge
 
 def test_issue_loop_accepts_initial_issue_human_requirements_acknowledgement(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         issue_payload={
             "author": {"login": "maintainer"},
             "createdAt": "2026-05-17T08:00:00Z",
@@ -6273,6 +6339,8 @@ def test_rejected_legacy_evidence_response_resumes_same_pr_without_reimplementat
 def test_issue_loop_direct_mode_incidental_open_pr_invokes_coder(tmp_path):
     """An incidental issue mention must not be treated as crash recovery."""
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         open_prs_payload=[
             {
                 "number": 492,
@@ -6290,7 +6358,12 @@ def test_issue_loop_direct_mode_incidental_open_pr_invokes_coder(tmp_path):
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
     assert any(cmd[:2] == ["claude", "--print"] for cmd, _cwd in runner.commands)
-    handoff_comments = [c for c in runner.comments if "<!-- AGENT_ISSUE_PR_HANDOFF:" in c]
+    handoff_comments = [
+        c["body"]
+        for items in (runner.issue_comments, *runner.issue_comments_by_number.values())
+        for c in items
+        if "<!-- AGENT_ISSUE_PR_HANDOFF:" in c["body"]
+    ]
     assert len(handoff_comments) == 1
     assert "PR #77" in handoff_comments[0]
     assert "PR #492" not in handoff_comments[0]
@@ -6418,6 +6491,8 @@ def test_issue_loop_direct_mode_canonical_record_resumes_refs_only_pr(tmp_path):
 
 def test_codex_issue_loop_creates_pr_then_claude_approves(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         codex_outputs=[
             "Fixed issue.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
         ],
@@ -6432,13 +6507,22 @@ def test_codex_issue_loop_creates_pr_then_claude_approves(tmp_path):
     command_names = [cmd[:2] for cmd, _cwd in runner.commands]
     assert ["codex", "exec"] in command_names
     assert ["claude", "--print"] in command_names
-    assert len(runner.comments) == 3
-    assert "<!-- AGENT_ISSUE_PR_HANDOFF:" in runner.comments[0]
-    assert runner.comments[1].startswith("## Issue implementation")
-    assert runner.comments[2].startswith("**Review verdict:** Approved\n\nLooks good.")
+    # The handoff and the initial coder round are transaction entries (#827).
+    assert len(runner.comments) == 1
+    assert runner.comments[0].startswith("**Review verdict:** Approved\n\nLooks good.")
+    kinds = _m946_record_kinds(runner)
+    assert kinds["issue"] == ["handoff"]
+    assert kinds["pr"] == ["transaction", "contract", "tagged-coder-round", "transaction"]
+    coder_round = [
+        c["body"] for c in runner.pr_payload["comments"] if "AGENT_LOOP_META" in c["body"]
+    ][0]
+    assert coder_round.startswith("## Issue implementation")
+    _m946_assert_no_embedded_contract(runner)
 
 def test_codex_issue_loop_alternates_until_claude_approval(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         codex_outputs=[
             "Implemented fix.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
             "Addressed Claude's review.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
@@ -6454,8 +6538,13 @@ def test_codex_issue_loop_alternates_until_claude_approval(tmp_path):
 
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
-    assert len(runner.comments) == 5
+    assert len(runner.comments) == 3
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
+    assert _m946_record_kinds(runner)["pr"] == [
+        "transaction", "contract", "tagged-coder-round", "transaction",
+        "transaction", "transaction",
+    ]
+    _m946_assert_no_embedded_contract(runner)
 
 def test_codex_issue_loop_requires_codex_to_report_pr_number(tmp_path):
     runner = FakeRunner(
@@ -7486,6 +7575,8 @@ def test_issue_loop_accepts_absolute_interpreter_test_command_through_response_p
     # freeform `Tests:` response path (origin='response', orchestrator.py
     # line ~3286/6223), matching the PR #484 follow-up reproducer.
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         codex_outputs=[
             "Fixed issue.\n"
             "Tests: `/usr/bin/python3 -m pytest tests/test_durable_jobs.py -q` "
@@ -7557,6 +7648,8 @@ def test_issue_loop_rejects_reported_pr_when_assigned_head_unchanged(tmp_path):
 
 def test_gemini_issue_loop_creates_pr_then_codex_approves(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         gemini_outputs=[
             "Fixed issue.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
         ],
@@ -7570,13 +7663,22 @@ def test_gemini_issue_loop_creates_pr_then_codex_approves(tmp_path):
 
     agent_commands = [cmd[:2] for cmd, _cwd in runner.commands if cmd[:1] in (["gemini"], ["codex"])]
     assert agent_commands == [["gemini", "--prompt"], ["codex", "exec"]]
-    assert len(runner.comments) == 3
-    assert "<!-- AGENT_ISSUE_PR_HANDOFF:" in runner.comments[0]
-    assert runner.comments[1].startswith("## Issue implementation")
-    assert runner.comments[2].startswith("**Review verdict:** Approved\n\nLooks good.")
+    # The handoff and the initial coder round are transaction entries (#827).
+    assert len(runner.comments) == 1
+    assert runner.comments[0].startswith("**Review verdict:** Approved\n\nLooks good.")
+    kinds = _m946_record_kinds(runner)
+    assert kinds["issue"] == ["handoff"]
+    assert kinds["pr"] == ["transaction", "contract", "tagged-coder-round", "transaction"]
+    coder_round = [
+        c["body"] for c in runner.pr_payload["comments"] if "AGENT_LOOP_META" in c["body"]
+    ][0]
+    assert coder_round.startswith("## Issue implementation")
+    _m946_assert_no_embedded_contract(runner)
 
 def test_gemini_issue_loop_resumes_session_for_followup(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         gemini_outputs=[
             json.dumps({
                 "response": "Fixed issue.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
@@ -7887,6 +7989,8 @@ def test_issue_implementation_rerun_prompt_includes_latest_salvage_summary(tmp_p
         created_at_ns=2,
     )
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],
@@ -8043,6 +8147,8 @@ def test_issue_implementation_rerun_discovers_remote_salvage_when_local_log_dir_
         failure_reason="remote-only failure summary",
     )
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         issue_comments=[remote_comment],
         claude_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
@@ -8083,6 +8189,8 @@ def test_issue_implementation_rerun_remote_salvage_with_omitted_patch_renders_lo
         failure_reason="remote failure with an oversized patch",
     )
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         issue_comments=[remote_comment],
         claude_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
@@ -8111,6 +8219,8 @@ def test_issue_implementation_rerun_ignores_remote_salvage_for_a_different_issue
         failure_reason="unrelated issue failure",
     )
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         issue_comments=[remote_comment],
         claude_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
@@ -10709,3 +10819,49 @@ def test_m948_overflow_the_digest_cannot_fix_fails_closed_and_posts_nothing(tmp_
     assert "compact_prior_summaries=" in str(excinfo.value)
     assert _m948_noise("unspillable", 64) not in str(excinfo.value)
     assert runner.issue_comments == []
+
+
+# --- #946: direct fresh-PR issue publication goes through the transaction seam ---
+
+
+@pytest.mark.parametrize("boundary", [1, 2, 3, 4, 5])
+def test_m946_direct_issue_publication_interrupted_at_each_boundary_grants_nothing(
+    tmp_path, boundary
+):
+    """Writes: 1 prepared, 2 handoff, 3 contract, 4 tagged coder round, 5 committed.
+
+    A failure at any boundary stops the issue command with the transaction
+    diagnostic before any reviewer round, leaves no committed record, writes no
+    version-1 handoff or contract, and never embeds the contract in a coder
+    round.
+    """
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    runner.rest_post_failures = (boundary,)
+    config = make_config(tmp_path)
+
+    with pytest.raises(WorkflowTransactionError) as caught:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(caught.value)
+    assert "Transaction(s):" in message and "Recovery:" in message
+    # No reviewer ran and nothing merged: a partial transaction grants nothing.
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+    # The coder ran exactly once.
+    assert sum(cmd[:2] == ["claude", "--print"] for cmd, _cwd in runner.commands) == 1
+    kinds = _m946_record_kinds(runner)
+    # Only the prepared record can precede the failed write; nothing committed.
+    assert kinds["pr"].count("transaction") == (1 if boundary > 1 else 0)
+    # No version-1 records were written through `gh pr/issue comment`.
+    assert not [
+        body for body in runner.comments
+        if "AGENT_ISSUE_PR_HANDOFF" in body or "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body
+    ]
+    _m946_assert_no_embedded_contract(runner)

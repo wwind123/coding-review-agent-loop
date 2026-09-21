@@ -5,6 +5,9 @@ from datetime import datetime as datetime_type, timezone
 
 import pytest
 
+# A full commit SHA: workflow transactions bind only full SHAs (#827).
+FULL_HEAD = "abc123" + "0" * 34
+
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
@@ -1624,6 +1627,8 @@ def test_compact_revision_prompt_stable_prefix_is_byte_identical_across_rounds(t
 
 def test_issue_loop_includes_issue_comments_in_coder_and_review_prompts(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         issue_payload={
             "number": 56,
             "state": "open",

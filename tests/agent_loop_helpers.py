@@ -8,6 +8,7 @@ import base64
 import datetime
 import json
 import os
+import hashlib
 import re
 import subprocess
 import sys
@@ -205,6 +206,20 @@ from unittest.mock import MagicMock, patch
 
 _REST_POST_ID_BASE = 1_000_000
 
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _next_fake_head(head: str, suffix: str) -> str:
+    """The head a fake push produces.
+
+    A full commit SHA stays a full commit SHA (workflow transactions bind only
+    full SHAs, #827); a short fixture head keeps the historical suffix form.
+    """
+    if _FULL_SHA_RE.match(str(head)):
+        return hashlib.sha1(f"{head}-{suffix}".encode("utf-8")).hexdigest()
+    return f"{head}-{suffix}"
+
+
 class FakeRunner(Runner):
     def __init__(
         self,
@@ -238,6 +253,7 @@ class FakeRunner(Runner):
         git_remote="git@github.com:OWNER/REPO.git",
         git_inside=True,
         git_head="abc123",
+        persist_rest_comment_posts=False,
         tracked_files=None,
         changed_files=None,
         diff_returncode=0,
@@ -296,7 +312,7 @@ class FakeRunner(Runner):
             "body": "PR description.",
             "headRefName": "feature/review-context",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": git_head,
             "comments": [],
             "reviews": [],
         }
@@ -355,6 +371,9 @@ class FakeRunner(Runner):
         self.git_remote = git_remote
         self.git_inside = git_inside
         self.git_head = git_head
+        # Opt-in (#827): persist REST comment writes so seam publications read
+        # their own records back.
+        self.persist_rest_comment_posts = persist_rest_comment_posts
         self.tracked_files = tracked_files or [
             "pyproject.toml",
             "README.md",
@@ -719,7 +738,7 @@ class FakeRunner(Runner):
         if not has_pr_identity:
             return
         self._agent_pr_counter += 1
-        self.git_head = f"{self.git_head}-agent-{self._agent_pr_counter}"
+        self.git_head = _next_fake_head(self.git_head, f"agent-{self._agent_pr_counter}")
 
     def _maybe_advance_pr_head_for_coder_followup(self, cmd) -> None:
         if not self.advance_pr_head_on_coder_followup:
@@ -728,7 +747,7 @@ class FakeRunner(Runner):
             return
         self._coder_followup_counter += 1
         head_sha = self.pr_payload.get("headRefOid", self.git_head)
-        new_head_sha = f"{head_sha}-coder-{self._coder_followup_counter}"
+        new_head_sha = _next_fake_head(head_sha, f"coder-{self._coder_followup_counter}")
         self.pr_payload["headRefOid"] = new_head_sha
         self.git_head = new_head_sha
 
@@ -1175,12 +1194,19 @@ class FakeRunner(Runner):
                 return CommandResult(cmd, cwd_path, "", "injected write failure", 1)
             if number == self._pr_payload_for(str(number)).get("number"):
                 thread = self._pr_payload_for(str(number)).setdefault("comments", [])
+            elif (
+                number not in self.issue_comments_by_number
+                and number == self.issue_payload.get("number")
+            ):
+                # The default issue's thread: never shadow its seeded comments.
+                thread = self.issue_comments
             else:
                 thread = self.issue_comments_by_number.setdefault(number, [])
             known = [
                 int(item["id"])
                 for items in (
                     self.pr_payload.get("comments", []),
+                    self.issue_comments,
                     *self.issue_comments_by_number.values(),
                 )
                 for item in items

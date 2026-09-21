@@ -82,6 +82,8 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_revision,
 )
 from coding_review_agent_loop.salvage import SalvageContext
+FULL_HEAD = "abc123" + "0" * 34
+
 from agent_loop_helpers import (
     FakeRunner,
     command_index,
@@ -99,6 +101,8 @@ from agent_loop_helpers import (
 
 def test_pre_review_tests_can_be_disabled(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Created PR.\nTests: pytest passed.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
         ],
@@ -122,6 +126,8 @@ def test_pre_review_tests_can_be_disabled(tmp_path):
 
 def test_issue_mode_passes_complete_expected_closing_set_to_coder(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
         ],
@@ -193,6 +199,8 @@ def test_approved_plan_additional_closing_issue_reaches_implementation_flow(tmp_
 
 def test_staged_child_closes_child_and_refs_parent(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
         ],
@@ -2767,6 +2775,8 @@ def test_clean_existing_auto_agent_dir_is_synced(tmp_path):
 @pytest.mark.parametrize("mode", ["issue", "task"])
 def test_issue_and_task_loops_use_repo_default_when_base_is_omitted(tmp_path, mode):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],

@@ -27,6 +27,9 @@ from coding_review_agent_loop.protocol import (
     validate_structured_issue_implementation,
 )
 
+# A full commit SHA: workflow transactions bind only full SHAs (#827).
+FULL_HEAD = "abc123" + "0" * 34
+
 from agent_loop_helpers import FakeRunner, make_config, structured_issue_implementation
 
 
@@ -352,6 +355,8 @@ def test_recovery_response_file_is_attempt_local_even_when_original_file_still_h
 
 def test_issue_loop_recovers_after_one_bounded_resume_then_succeeds(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             json.dumps(
                 {
@@ -386,6 +391,8 @@ def test_issue_loop_recovers_after_one_bounded_resume_then_succeeds(tmp_path):
 def test_issue_loop_recovers_from_claude_waiting_on_background_wording(tmp_path):
     """Match the exact #531 completion text, not only ``waiting for`` variants."""
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             json.dumps(
                 {

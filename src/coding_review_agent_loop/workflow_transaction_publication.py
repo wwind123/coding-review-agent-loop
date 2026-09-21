@@ -57,6 +57,7 @@ from .pr_contract import (
 )
 from .protocol_markers import TrustedBody, scan_reserved_markers
 from .round_state import _extract_round_metadata_records
+from .round_transport import prepare_round_comment
 from .runner import Runner
 from .workflow_transaction import (
     ABORT_SIBLING_CANONICAL,
@@ -1153,7 +1154,9 @@ class _Seam:
         expected = self._expected_coder_round(tx_id)
         candidates = _coder_round_candidates(
             intent, state.prepared_comment, views.pr_view,
-            expected_body=str(expected) if expected is not None else None,
+            expected_body=(
+                str(prepare_round_comment(expected)[-1]) if expected is not None else None
+            ),
         )
         return candidates[0].comment_id if candidates else None
 
@@ -1198,10 +1201,16 @@ class _Seam:
             expected = self._expected_coder_round(tx_id)
             if expected is None:
                 return None  # waived: the coder response is unavailable
-            _write_verified(
-                self.runner, self.config, surface=PR_THREAD_SURFACE, number=intent.pr_number,
-                body=expected, actor=actor, intent=intent, what="initial coder round",
-            )
+            # A long coder round spills into sidecar comments posted before its
+            # anchor.  The transport is deterministic, so a rerun renders the
+            # same anchor and adoption compares against it; an orphan sidecar
+            # left by an interrupted write carries no round metadata.
+            for part in prepare_round_comment(expected):
+                _write_verified(
+                    self.runner, self.config, surface=PR_THREAD_SURFACE,
+                    number=intent.pr_number, body=part, actor=actor, intent=intent,
+                    what="initial coder round",
+                )
         # A competing invocation may have interleaved: reconcile below the strict
         # resolver before anything resolves the lineage again.
         return self.reconcile_siblings(self.read())

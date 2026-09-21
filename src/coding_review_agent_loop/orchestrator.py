@@ -607,6 +607,11 @@ from .unresolved_items import (
 )
 
 
+def _canonical_trusted_body(text: str) -> TrustedBody:
+    expected = tuple(item.definition.token for item in scan_reserved_markers(text))
+    return TrustedBody.canonical(text, expected_tokens=expected)
+
+
 def _embed_pr_contract_marker(body: str | TrustedBody, contract: PrExpectedClosingContract) -> TrustedBody:
     marker = render_pr_contract_marker(contract)
     body_text = str(body)
@@ -13090,33 +13095,38 @@ def run_issue_loop(
             ),
         )
         initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_metadata)
-        pr_contract = make_pr_contract(
-            repository=config.repo,
-            pr_number=pr_number,
-            origin_flow="issue-implementation",
-            primary_issue_number=issue_number,
-            expected_closing_issue_ids=closing_contract.issue_ids,
-        )
-        post_trusted_pr_contract_record(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            body=TrustedBody.canonical(
-                format_pr_contract_comment(pr_contract),
-                expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
-            ),
-        )
-        post_issue_pr_handoff_comment(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            pr_number=pr_number,
-            pr_url=initial_pr_url,
-            pr_head_sha=initial_pr_head_sha,
-            flow="issue-implementation",
-            plan_hash=None,
-            expected_closing_issue_ids=closing_contract.issue_ids,
-        )
+        # The managed creation authorization is still published by the version-1
+        # writers, so a managed PR keeps the version-1 handoff and contract;
+        # every other direct fresh PR publishes one transaction (#827, site e).
+        publish_through_seam = managed_ci_handoff is None and not config.dry_run
+        if not publish_through_seam:
+            pr_contract = make_pr_contract(
+                repository=config.repo,
+                pr_number=pr_number,
+                origin_flow="issue-implementation",
+                primary_issue_number=issue_number,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+            )
+            post_trusted_pr_contract_record(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                body=TrustedBody.canonical(
+                    format_pr_contract_comment(pr_contract),
+                    expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+                ),
+            )
+            post_issue_pr_handoff_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                pr_number=pr_number,
+                pr_url=initial_pr_url,
+                pr_head_sha=initial_pr_head_sha,
+                flow="issue-implementation",
+                plan_hash=None,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+            )
         implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
             implementation_result,
             approved_plan_context=None,
@@ -13137,47 +13147,71 @@ def run_issue_loop(
             legacy_tests_run=implementation_result.tests_run,
             cwd=active_workdir(config),
         )
-        initial_coder_body = _attach_round_metadata(
-            render_public_agent_comment(
-                kind="issue_implementation",
-                parsed=implementation_result,
-                agent=config.coder,
+        def _render_initial_coder_body(workflow_transaction_id: str | None) -> str:
+            return _attach_round_metadata(
+                render_public_agent_comment(
+                    kind="issue_implementation",
+                    parsed=implementation_result,
+                    agent=config.coder,
+                    config=config,
+                    model_used=coder_response.model_used,
+                    local_test_evidence=initial_local_test_evidence,
+                    current_test_turn_id=coder_response.acquisition_test_turn_id,
+                ),
+                PostedRoundMetadata(
+                    flow="pr",
+                    role="coder",
+                    agent=agent_display_name(config.coder),
+                    round_number=1,
+                    subject=str(initial_pr_metadata.head_sha or "unknown"),
+                    prior_items=(),
+                    workflow_transaction_id=workflow_transaction_id,
+                    raw_structured_coder_response=coder_output,
+                    local_test_evidence=initial_local_test_evidence,
+                    risk_test_matrix_evidence=(
+                        implementation_result.risk_test_matrix_evidence.to_payload()
+                        if implementation_result.risk_test_matrix_evidence is not None
+                        else None
+                    ),
+                    risk_test_matrix_diagnostics=tuple(
+                        diagnostic.to_payload()
+                        for diagnostic in implementation_result.risk_test_matrix_diagnostics
+                    ),
+                    model_used=coder_response.model_used,
+                    **_metadata_identity_fields(coder_response),
+                    acquisition_outcome=coder_response.acquisition_outcome,
+                    acquisition_returncode=coder_response.acquisition_returncode,
+                    **_architecture_metadata_fields(config, impact=getattr(implementation_result, "architecture_impact", None)),
+                ),
+            )
+        if publish_through_seam:
+            from . import workflow_transaction_publication as publication
+
+            publication.publish_transition(
+                runner,
                 config=config,
-                model_used=coder_response.model_used,
-                local_test_evidence=initial_local_test_evidence,
-                current_test_turn_id=coder_response.acquisition_test_turn_id,
-            ),
-            PostedRoundMetadata(
-                flow="pr",
-                role="coder",
-                agent=agent_display_name(config.coder),
-                round_number=1,
-                subject=str(initial_pr_metadata.head_sha or "unknown"),
-                prior_items=(),
-                raw_structured_coder_response=coder_output,
-                local_test_evidence=initial_local_test_evidence,
-                risk_test_matrix_evidence=(
-                    implementation_result.risk_test_matrix_evidence.to_payload()
-                    if implementation_result.risk_test_matrix_evidence is not None
-                    else None
+                request=publication.TransitionRequest(
+                    repository=config.repo,
+                    pr_number=pr_number,
+                    base=str(initial_pr_metadata.base_branch or config.base),
+                    head_sha=initial_pr_head_sha,
+                    origin_path=publication.ORIGIN_DIRECT_ISSUE,
+                    expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                    primary_issue=issue_number,
+                    initial_coder_round=publication.InitialCoderRound(
+                        lambda transaction_id: _canonical_trusted_body(
+                            _render_initial_coder_body(transaction_id)
+                        )
+                    ),
                 ),
-                risk_test_matrix_diagnostics=tuple(
-                    diagnostic.to_payload()
-                    for diagnostic in implementation_result.risk_test_matrix_diagnostics
-                ),
-                model_used=coder_response.model_used,
-                **_metadata_identity_fields(coder_response),
-                acquisition_outcome=coder_response.acquisition_outcome,
-                acquisition_returncode=coder_response.acquisition_returncode,
-                **_architecture_metadata_fields(config, impact=getattr(implementation_result, "architecture_impact", None)),
-            ),
-        )
-        post_trusted_pr_comment(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            body=_embed_pr_contract_marker(initial_coder_body, pr_contract),
-        )
+            )
+        else:
+            post_trusted_pr_comment(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                body=_embed_pr_contract_marker(_render_initial_coder_body(None), pr_contract),
+            )
         return run_pr_loop(
             runner,
             pr_number=pr_number,
