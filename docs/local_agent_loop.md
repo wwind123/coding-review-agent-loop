@@ -1153,6 +1153,30 @@ GitHub renders as "No description provided.") remain valid. Keep those
 sidecars with the anchor: resume fails loudly if one is missing or corrupt, at
 which point restore the sidecars or remove the incomplete anchor and rerun.
 
+Two review-state fields grow with use rather than with the change under
+review: the accumulated review items (`prior_items`) and the canonical
+risk/test-matrix evidence (`risk_test_matrix_evidence`). They are the last
+fields considered for spilling, so they move into sidecars only when the anchor
+would still overflow after every other spillable field has moved; a comment
+that fits is posted byte-for-byte as before. Matrix evidence never spills
+without the review items also spilling, and neither field ever spills in a
+discuss round. Resume needs these sidecars like any other.
+
+An older agent-loop binary never treats one of these spill references as data,
+but it does not always fail with an error either:
+
+- Resume and round-record extraction raise an invalid round-metadata error.
+- The plan-candidate existence check skips the record as absent.
+- Managed-CI continuity cannot see a merge-conflict obligation carried in
+  spilled review items, so it declines a conflict-only head transition (one with
+  no blocking-review record) instead of granting it. Transitions with a
+  reviewer pair are unaffected.
+- Discuss comments never carry these spills, so older discuss classification is
+  unchanged.
+
+Downgrading across such a comment is unsupported: upgrade the binary before
+resuming. Before this change such a comment could not be posted at all.
+
 Sidecars carry metadata only. When the visible text of a structured plan comment
 (`plan_state` or `plan_revision`) would still push the comment over the
 60,000-character budget, the loop posts a **compact plan digest** instead of the
@@ -1188,11 +1212,15 @@ fit, nothing is posted and the error explains where the size is, for example:
 ```text
 Round comment exceeds 60000 characters even after metadata spill; shorten the
 visible response or metadata. Size attribution: visible body outside round
-metadata 9120 characters; residual encoded round metadata 71544 characters;
-largest unspilled metadata fields (encoded characters): prior_items=64012, ...
+metadata 52120 characters; residual encoded round metadata 9544 characters;
+largest unspilled metadata fields (encoded characters): architecture_impact=891, ...
 ```
 
-The attribution lists field names and sizes only, never their content.
+When the round-metadata marker alone, with its framing and an empty visible
+body, would exceed the budget, the message says so instead: `the derived round
+metadata alone needs N characters, so shortening the visible response cannot
+fix it.` The same size attribution follows. The attribution lists field names
+and sizes only, never their content.
 
 Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
 require multiple reviewers:
