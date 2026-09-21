@@ -15089,12 +15089,15 @@ def _round_live_head_authority(
     pr_number: int,
     head_sha: str | None,
 ) -> RoundAuthority:
-    """Resolve the per-round head binding (#827, point 2).  Never writes.
+    """Resolve the per-round head binding (#827, point 2).
 
-    A legacy-era PR yields ``LegacyEra`` and keeps today's reuse rules.  A
-    transaction-era PR yields its committed transaction for the live head, or
-    ``NoLiveHeadAuthority`` for a recoverable gap (pending, uncommitted, or an
-    older committed head), under which the round runs with fresh reviewers and
+    First commits the ``head-advance`` successor when the committed head
+    differs from the live head (the only write), then gates.  A legacy-era PR
+    yields ``LegacyEra`` and keeps today's reuse rules.  A transaction-era PR
+    yields its committed transaction for the live head, or
+    ``NoLiveHeadAuthority`` for a recoverable gap (a failed successor write, a
+    pending prepared record, or an unavailable managed input), under which the
+    round runs with fresh reviewers and
     reuses nothing.  Integrity failures raise and stop the round.
 
     A dry run has no authenticated actor, never qualifies, and never merges,
@@ -15105,12 +15108,19 @@ def _round_live_head_authority(
     if config.dry_run:
         return LegacyEra()
 
-    def gate() -> object:
-        return publication.require_live_head_authority(
-            runner, config, pr_number=pr_number, head_sha=str(head_sha or "")
+    live_head = str(head_sha or "")
+
+    def ensure() -> None:
+        publication.ensure_live_head_transaction(
+            runner, config, pr_number=pr_number, head_sha=live_head
         )
 
-    return resolve_round_authority(lambda: None, gate)
+    def gate() -> object:
+        return publication.require_live_head_authority(
+            runner, config, pr_number=pr_number, head_sha=live_head
+        )
+
+    return resolve_round_authority(ensure, gate)
 
 
 def _fresh_pr_qualification_snapshot(
@@ -15134,9 +15144,15 @@ def _fresh_pr_qualification_snapshot(
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
     # A transaction-era PR qualifies only a head its committed workflow
     # transaction binds; a legacy-era PR returns None and is unchanged (#827).
-    from .workflow_transaction_publication import require_live_head_authority
+    # Point 3 (#827): ensure the head successor first (the only case in which
+    # the snapshot writes), re-read, then gate the live head.
+    from . import workflow_transaction_publication as publication
 
-    require_live_head_authority(
+    if publication.ensure_live_head_transaction(
+        runner, config, pr_number=pr_number, head_sha=context.metadata.head_sha
+    ):
+        context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    publication.require_live_head_authority(
         runner, config, pr_number=pr_number, head_sha=context.metadata.head_sha
     )
     approved_identity = _latest_pr_approval_architecture_identity(

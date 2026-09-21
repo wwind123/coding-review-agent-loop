@@ -1150,6 +1150,48 @@ class FakeRunner(Runner):
                 cmd, cwd_path, json_dumps({"login": actor_login, "id": actor_id}), "", 0
             )
 
+        rest_post = (
+            re.search(r"^repos/[^/]+/[^/]+/issues/(\d+)/comments$", cmd[4])
+            if getattr(self, "persist_rest_comment_posts", False)
+            and cmd[:4] == ["gh", "api", "--method", "POST"]
+            and len(cmd) > 6
+            else None
+        )
+        if rest_post is not None:
+            # Opt-in (#827): persist a REST comment write so a real seam
+            # publication can read its own record back.
+            number = int(rest_post.group(1))
+            body = cmd[6].removeprefix("body=")
+            if number == self._pr_payload_for(str(number)).get("number"):
+                thread = self._pr_payload_for(str(number)).setdefault("comments", [])
+            else:
+                thread = self.issue_comments_by_number.setdefault(number, [])
+            known = [
+                int(item["id"])
+                for items in (
+                    self.pr_payload.get("comments", []),
+                    *self.issue_comments_by_number.values(),
+                )
+                for item in items
+                if isinstance(item, dict) and isinstance(item.get("id"), int)
+            ]
+            comment_id = max(known, default=0) + 1
+            # Later than every seeded fixture, ordered by the monotonic ID.
+            stamp = (
+                f"2030-01-01T{comment_id // 3600 % 24:02d}:"
+                f"{comment_id // 60 % 60:02d}:{comment_id % 60:02d}Z"
+            )
+            comment = {
+                "id": comment_id,
+                "user": {"login": actor_login, "id": actor_id},
+                "author": {"login": actor_login},
+                "created_at": stamp,
+                "createdAt": stamp,
+                "body": body,
+            }
+            thread.append(comment)
+            return CommandResult(cmd, cwd_path, json_dumps(comment), "", 0)
+
         rest_comments = re.search(
             r"/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)$", cmd[2]
         ) if cmd[:2] == ["gh", "api"] else None

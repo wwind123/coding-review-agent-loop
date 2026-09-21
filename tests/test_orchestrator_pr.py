@@ -2931,7 +2931,9 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     ]
 
 
-def _m946_merge_runner(monkeypatch, tmp_path, *, boundary=None, live_head=None):
+def _m946_merge_runner(
+    monkeypatch, tmp_path, *, boundary=None, live_head=None, persist_writes=False
+):
     """A FakeRunner whose PR and issue carry a real workflow transaction (#946).
 
     ``boundary`` interrupts the publication at that write, leaving a partial
@@ -2960,6 +2962,8 @@ def _m946_merge_runner(monkeypatch, tmp_path, *, boundary=None, live_head=None):
     head = live_head or HEAD_1
     runner = FakeRunner(pr_payload={"number": PR, "headRefOid": head})
     runner.authenticated_actor = ACTOR
+    # Opt-in: persist REST comment writes so a head successor can commit.
+    runner.persist_rest_comment_posts = persist_writes
 
     def dual(item):
         # REST-shaped for the authenticated read, gh-shaped for the PR context.
@@ -3086,10 +3090,14 @@ def test_m946_qualification_snapshot_refuses_a_partial_transaction(
     assert _m946_comment_writes(runner) == []
 
 
-def test_m946_qualification_snapshot_refuses_a_head_without_a_committed_successor(
+def _m946_rest_comment_posts(runner):
+    return [c for c, _cwd in runner.commands if c[:4] == ["gh", "api", "--method", "POST"]]
+
+
+def test_m946_qualification_snapshot_refuses_a_head_whose_successor_cannot_commit(
     monkeypatch, tmp_path
 ):
-    """The H1 transaction is never authority for H2."""
+    """The H1 transaction is never authority for H2: a failed successor write refuses."""
     from workflow_transaction_helpers import HEAD_2
     from coding_review_agent_loop.errors import WorkflowTransactionError
 
@@ -3097,9 +3105,49 @@ def test_m946_qualification_snapshot_refuses_a_head_without_a_committed_successo
         monkeypatch, tmp_path, live_head=HEAD_2
     )
 
-    with pytest.raises(WorkflowTransactionError):
+    with pytest.raises(WorkflowTransactionError) as raised:
         _m946_snapshot(runner, config, pr)
+    assert raised.value.successor_kind == "head-advance"
     assert _m946_comment_writes(runner) == []
+
+
+def test_m946_qualification_snapshot_commits_the_head_successor_then_gates(
+    monkeypatch, tmp_path
+):
+    """Point 3: ensure, re-read, then gate; writes only on a head difference."""
+    from workflow_transaction_helpers import HEAD_2
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2, persist_writes=True
+    )
+
+    context, _ids, _plan, _config = _m946_snapshot(runner, config, pr)
+
+    assert context.metadata.head_sha == HEAD_2
+    # Only the prepared and terminal records: the handoff and PR contract are inherited.
+    assert len(_m946_rest_comment_posts(runner)) == 2
+    gated = publication.require_live_head_authority(
+        runner, config, pr_number=pr, head_sha=HEAD_2
+    )
+    assert gated.intent.successor_kind == "head-advance"
+    assert gated.intent.head_sha == HEAD_2
+    # A second snapshot at the now-committed head writes nothing.
+    _m946_snapshot(runner, config, pr)
+    assert len(_m946_rest_comment_posts(runner)) == 2
+    assert _m946_comment_writes(runner) == []
+
+
+def test_m946_qualification_snapshot_at_the_committed_head_writes_nothing(
+    monkeypatch, tmp_path
+):
+    runner, config, _merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, persist_writes=True
+    )
+
+    _m946_snapshot(runner, config, pr)
+
+    assert _m946_rest_comment_posts(runner) == []
 
 
 def test_m946_qualification_snapshot_refuses_a_deleted_committed_record(monkeypatch, tmp_path):
@@ -3173,10 +3221,11 @@ def test_m946_round_authority_is_withheld_for_a_partial_transaction(
     assert _m946_comment_writes(runner) == []
 
 
-def test_m946_round_authority_is_withheld_for_a_head_without_a_committed_successor(
+def test_m946_round_authority_is_withheld_when_the_head_successor_cannot_commit(
     monkeypatch, tmp_path
 ):
-    """The H1 transaction is never reuse authority for H2."""
+    """The H1 transaction is never reuse authority for H2; a failed successor write
+    is recoverable, so the round continues without reuse instead of raising."""
     from workflow_transaction_helpers import HEAD_2
     from coding_review_agent_loop.workflow_transaction_publication import NoLiveHeadAuthority
 
@@ -3189,7 +3238,39 @@ def test_m946_round_authority_is_withheld_for_a_head_without_a_committed_success
     )
 
     assert isinstance(authority, NoLiveHeadAuthority)
-    assert _m946_comment_writes(runner) == []
+    assert authority.diagnostic.successor_kind == "head-advance"
+
+
+def test_m946_round_authority_commits_the_head_successor_for_a_new_head(
+    monkeypatch, tmp_path
+):
+    """Point 2: the per-round binding commits a head-advance successor that inherits the
+    handoff and PR contract, then grants the committed transaction for H2."""
+    from workflow_transaction_helpers import HEAD_2
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        CommittedTransaction, ENTRY_HANDOFF, ENTRY_PR_CONTRACT,
+    )
+
+    runner, config, _merged, pr, _head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2, persist_writes=True
+    )
+    authority = orchestrator._round_live_head_authority(
+        runner, config, pr_number=pr, head_sha=HEAD_2
+    )
+
+    assert isinstance(authority, CommittedTransaction)
+    assert authority.intent.successor_kind == "head-advance"
+    assert authority.intent.head_sha == HEAD_2
+    inherited = {entry.name: entry.disposition for entry in authority.intent.record_set}
+    assert inherited[ENTRY_HANDOFF] == "inherited"
+    assert inherited[ENTRY_PR_CONTRACT] == "inherited"
+    assert len(_m946_rest_comment_posts(runner)) == 2
+    # The next round at the same head reuses the committed successor with no write.
+    again = orchestrator._round_live_head_authority(
+        runner, config, pr_number=pr, head_sha=HEAD_2
+    )
+    assert again.transaction_id == authority.transaction_id
+    assert len(_m946_rest_comment_posts(runner)) == 2
 
 
 def test_m946_round_authority_is_legacy_era_for_a_pr_without_v2_records(tmp_path):

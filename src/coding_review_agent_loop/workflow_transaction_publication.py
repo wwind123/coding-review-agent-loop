@@ -1510,6 +1510,76 @@ def ensure_head_transaction(
     return publish_transition(runner, config=config, request=request, refresh=refresh)
 
 
+def ensure_live_head_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str,
+) -> bool:
+    """Commit the ``head-advance`` successor a new live head needs (#827, points 2-3).
+
+    The request is derived from the last committed intent alone (repository,
+    issue, base, flow, plan hash, closing contract, staged identity), never
+    from caller-chosen strings, so the successor inherits the handoff and PR
+    contract by reference.  Writes only when the committed head differs from
+    ``head_sha``; a legacy-era PR, a PR with no committed transaction, or an
+    equal head is left untouched (a pending prepared record at an equal head
+    is refused by the gate, not finished here).  A committed transaction with
+    a managed-CI generation needs a correlated or released managed input that
+    this derivation cannot supply, so it raises the recoverable
+    managed-unavailable error with no write.  Returns whether a successor
+    was published.
+    """
+    resolved = read_pr_transaction_views(runner, config, pr_number, None)
+    if resolved.era != ERA_TRANSACTION:
+        return False
+    committed = resolved.lineage.latest_committed
+    if committed is None or committed.intent.head_sha == head_sha:
+        return False
+    intent = committed.intent
+    if intent.managed_ci_generation is not None:
+        raise _error(
+            "The live head has no committed workflow transaction and its managed-CI "
+            "input is unavailable; nothing was written",
+            intent=intent,
+            problems=(
+                f"live head {head_sha} differs from committed head {intent.head_sha}",
+                "managed head has no continuity provenance",
+            ),
+            recovery=RECOVERY_RERUN,
+            code=CODE_MANAGED_UNAVAILABLE,
+        )
+    plan = None
+    if intent.approved_plan_hash is not None:
+        plan_views = _read_views(
+            runner, config, pr_number=pr_number, issue_number=intent.primary_issue,
+            plan_issue_number=intent.plan_owning_issue,
+        )
+        plan = ApprovedPlanInput(
+            intent.approved_plan_hash,
+            None,
+            recover_checkpoint_candidate_key(intent, plan_views.plan_issue_view),
+        )
+    ensure_head_transaction(
+        runner,
+        config=config,
+        request=TransitionRequest(
+            repository=intent.repository,
+            pr_number=pr_number,
+            base=intent.base,
+            head_sha=head_sha,
+            origin_path=ORIGIN_PR_RESUME,
+            expected_closing_issue_ids=tuple(intent.expected_closing_issue_ids),
+            primary_issue=intent.primary_issue,
+            approved_plan=plan,
+            staged=intent.staged,
+            unowned_managed_pr=intent.origin_flow == FLOW_MANAGED_PR,
+        ),
+    )
+    return True
+
+
 def _has_transaction_records(
     runner: Runner, config: AgentLoopConfig, request: TransitionRequest
 ) -> bool:

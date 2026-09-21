@@ -66,6 +66,9 @@ from coding_review_agent_loop.github import (
     reset_authenticated_github_actor,
 )
 from coding_review_agent_loop.workflow_transaction_publication import (
+    CODE_MANAGED_UNAVAILABLE,
+    ensure_live_head_transaction,
+    is_recoverable,
     CODE_HEAD_NOT_COMMITTED,
     CODE_PARTIAL_CANDIDATE,
     CODE_PENDING,
@@ -606,6 +609,57 @@ def test_closing_widening_successor_declares_its_supersession(tmp_path):
     contract = widened.contract.contract
     assert contract.supersession_kind == "closing-widening"
     assert contract.supersedes_record_hash == first.contract.record_hash
+
+
+def test_ensure_live_head_transaction_derives_the_successor_from_the_committed_intent(tmp_path):
+    """Points 2-3: the successor request comes from the committed intent alone; an
+    approved-plan transaction keeps its checkpoint, whose key is recovered durably."""
+    github = TransactionGitHub()
+    seed_plan(github)
+    first = publish(github, plan_request(), tmp_path)
+    config = make_config(tmp_path)
+    before = github.write_count
+
+    assert ensure_live_head_transaction(github, config, pr_number=PR, head_sha=HEAD_2)
+
+    successor = gate(github, tmp_path, live_head=HEAD_2, plan_candidate_key=plan_key())
+    assert successor.intent.successor_kind == KIND_HEAD_ADVANCE
+    assert successor.intent.predecessor_transaction_id == first.transaction_id
+    assert successor.intent.origin_flow == FLOW_APPROVED_PLAN
+    assert successor.intent.approved_plan_hash == first.intent.approved_plan_hash
+    assert successor.intent.scheduler_checkpoint == first.intent.scheduler_checkpoint
+    assert github.write_count == before + 2
+    # Equal head: nothing to write.
+    assert not ensure_live_head_transaction(github, config, pr_number=PR, head_sha=HEAD_2)
+    assert github.write_count == before + 2
+
+
+def test_ensure_live_head_transaction_leaves_legacy_and_equal_heads_untouched(tmp_path):
+    github = TransactionGitHub()
+    github.seed(PR, v1_contract_comment(1).body)
+    config = make_config(tmp_path)
+    assert not ensure_live_head_transaction(github, config, pr_number=PR, head_sha=HEAD_2)
+    assert github.write_count == 0
+    fresh = TransactionGitHub()
+    publish(fresh, direct_request(), tmp_path)
+    before = fresh.write_count
+    assert not ensure_live_head_transaction(fresh, config, pr_number=PR, head_sha=HEAD_1)
+    assert fresh.write_count == before
+
+
+def test_ensure_live_head_transaction_refuses_a_managed_generation_without_writing(tmp_path):
+    """A managed head needs a correlated or released input; the derivation has neither,
+    so it is recoverable (no live-head authority) and writes nothing."""
+    github, codec = TransactionGitHub(), StubAuthorizationCodec()
+    publish(github, managed_request(codec), tmp_path)
+    before = github.write_count
+    with pytest.raises(WorkflowTransactionError) as raised:
+        ensure_live_head_transaction(
+            github, make_config(tmp_path), pr_number=PR, head_sha=HEAD_2
+        )
+    assert raised.value.code == CODE_MANAGED_UNAVAILABLE
+    assert is_recoverable(raised.value)
+    assert github.write_count == before
 
 
 def test_ensure_head_transaction_leaves_a_legacy_pr_untouched(tmp_path):
