@@ -53,6 +53,7 @@ from .issue_pr_handoff import (
 from .pr_contract import (
     PR_EXPECTED_CLOSING_MARKER_RE,
     PrExpectedClosingContract,
+    PR_CONTRACT_SUPERSESSION_COMBINED,
     PrExpectedClosingContractV2,
     decode_pr_contract,
     decode_pr_contract_v2,
@@ -2363,6 +2364,19 @@ def _check_contract_supersession(
             and (kind in widening_kinds or (kind == KIND_INITIAL and prior_is_v1))
         ):
             raise refuse("contradictory closing-widening supersession")
+        return
+    if new.supersession_kind == PR_CONTRACT_SUPERSESSION_COMBINED:
+        # Flow and closing scope change together under one successor.  Only a
+        # transaction-era predecessor qualifies: a legacy root never widens.
+        widened = set(prior.expected_closing_issue_ids) < set(new.expected_closing_issue_ids)
+        if not (
+            widened
+            and prior.origin_flow != new.origin_flow
+            and prior.primary_issue_number == new.primary_issue_number
+            and kind in flow_kinds
+            and not prior_is_v1
+        ):
+            raise refuse("contradictory flow-correction-with-closing-widening supersession")
         return
     if not same_scope or prior.origin_flow == new.origin_flow:
         raise refuse("contradictory flow-correction: only the origin flow may change")

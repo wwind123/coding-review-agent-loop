@@ -231,7 +231,13 @@ def find_latest_pr_contract(
 # ---------------------------------------------------------------------------
 
 PR_CONTRACT_V2_SCHEMA_VERSION = 2
-PR_CONTRACT_SUPERSESSION_KINDS = frozenset({"closing-widening", "flow-correction"})
+# One successor transaction can change both the origin flow and the closing
+# scope (its kind is the higher-precedence one), and a record carries exactly
+# one supersession kind, so the combined change has its own atomic kind.
+PR_CONTRACT_SUPERSESSION_COMBINED = "flow-correction-with-closing-widening"
+PR_CONTRACT_SUPERSESSION_KINDS = frozenset(
+    {"closing-widening", "flow-correction", PR_CONTRACT_SUPERSESSION_COMBINED}
+)
 _HEX64_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _V2_REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
 _V2_ISSUE_ORIGIN_FLOWS = frozenset({"issue-implementation", "approved-plan-implementation"})

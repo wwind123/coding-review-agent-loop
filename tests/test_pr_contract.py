@@ -29,6 +29,7 @@ from workflow_transaction_helpers import (
 
 from coding_review_agent_loop.errors import AgentLoopError, WorkflowTransactionError
 from coding_review_agent_loop.pr_contract import (
+    PR_CONTRACT_SUPERSESSION_COMBINED,
     PrExpectedClosingContractV2,
     decode_pr_contract,
     decode_pr_contract_v2,
@@ -51,6 +52,7 @@ from coding_review_agent_loop.workflow_transaction import (
     KIND_FLOW_CORRECTION,
     KIND_HEAD_ADVANCE,
     KIND_LEGACY_ROOT_CORRECTION,
+    KIND_PLAN_REPLACEMENT,
     PHASE_ABORTED,
     CommentRef,
     LegacyRoot,
@@ -321,6 +323,110 @@ def test_committed_flow_correction_over_a_v2_predecessor_is_accepted():
     before_commit = _resolve(*comments[:5])
     assert before_commit.contract.origin_flow == "direct-pr"
     assert before_commit.pending_transaction_id == corrected.transaction_id
+
+
+def _flow_and_closing_chain(case, supersession_kind, *, ids=(ISSUE, 900), flow_changes=True):
+    """Committed initial, then one successor changing flow and closing scope."""
+    if case == "flow-correction":
+        base = direct_intent(
+            origin_flow="direct-pr", record_set=record_set(handoff=not_applicable(ENTRY_HANDOFF))
+        )
+        successor = replace(
+            base,
+            origin_flow="managed-pr" if flow_changes else "direct-pr",
+            expected_closing_issue_ids=ids,
+            successor_kind=KIND_FLOW_CORRECTION if flow_changes else KIND_CLOSING_WIDENING,
+            predecessor_transaction_id=base.transaction_id,
+            record_set=record_set(
+                handoff=not_applicable(ENTRY_HANDOFF),
+                coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND),
+            ),
+        )
+        first = {ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13}
+        second = {ENTRY_PR_CONTRACT: 32}
+    else:
+        # Plan replacement outranks both: issue flow -> approved-plan flow,
+        # a plan hash appears, and the closing scope widens, all at once.
+        base = direct_intent()
+        successor = plan_intent(
+            expected_closing_issue_ids=ids,
+            successor_kind=KIND_PLAN_REPLACEMENT,
+            predecessor_transaction_id=base.transaction_id,
+            record_set=record_set(coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND)),
+        )
+        first = {ENTRY_HANDOFF: 11, ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13}
+        second = {ENTRY_HANDOFF: 31, ENTRY_PR_CONTRACT: 32}
+    comments = [
+        prepared_comment(10, base),
+        v2_contract_comment(12, base),
+        terminal_comment(20, base, prepared_id=10, published=first),
+        prepared_comment(30, successor),
+        v2_contract_comment(
+            32,
+            successor,
+            supersession_kind=supersession_kind,
+            supersedes_record_hash=pr_contract_record_hash(derive_pr_contract(base)),
+        ),
+        terminal_comment(40, successor, prepared_id=30, published=second),
+    ]
+    return successor, comments
+
+
+@pytest.mark.parametrize("case", ["flow-correction", "plan-replacement"])
+def test_committed_successor_changing_flow_and_closing_scope_resolves_its_contract(case):
+    successor, comments = _flow_and_closing_chain(case, PR_CONTRACT_SUPERSESSION_COMBINED)
+    resolved = _resolve(*comments)
+    assert resolved.comment_id == 32
+    assert resolved.transaction_id == successor.transaction_id
+    assert resolved.contract.origin_flow == successor.origin_flow
+    assert tuple(resolved.contract.expected_closing_issue_ids) == (ISSUE, 900)
+    assert resolved.contract.supersession_kind == PR_CONTRACT_SUPERSESSION_COMBINED
+    # Neither single-change kind can describe the combined change.
+    for single in ("flow-correction", "closing-widening"):
+        _successor, mislabeled = _flow_and_closing_chain(case, single)
+        with pytest.raises(WorkflowTransactionError) as excinfo:
+            _resolve(*mislabeled)
+        assert excinfo.value.code == "contract-supersession-invalid"
+    # The existing entry point still rejects the version-2 payload.
+    with pytest.raises(AgentLoopError):
+        find_latest_pr_contract(
+            [SimpleNamespace(body=item.body) for item in comments], repository=REPO, pr_number=PR
+        )
+
+
+def test_combined_supersession_kind_requires_both_changes():
+    # Only the flow changes.
+    _successor, comments = _flow_and_closing_chain(
+        "flow-correction", PR_CONTRACT_SUPERSESSION_COMBINED, ids=(ISSUE,)
+    )
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _resolve(*comments)
+    assert excinfo.value.code == "contract-supersession-invalid"
+    # Only the closing scope changes.
+    _successor, comments = _flow_and_closing_chain(
+        "flow-correction", PR_CONTRACT_SUPERSESSION_COMBINED, flow_changes=False
+    )
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _resolve(*comments)
+    assert excinfo.value.code == "contract-supersession-invalid"
+
+
+def test_combined_supersession_kind_round_trips_and_unknown_kinds_are_rejected():
+    successor, _comments = _flow_and_closing_chain(
+        "flow-correction", PR_CONTRACT_SUPERSESSION_COMBINED
+    )
+    contract = derive_pr_contract(
+        successor,
+        supersession_kind=PR_CONTRACT_SUPERSESSION_COMBINED,
+        supersedes_record_hash="a" * 64,
+    )
+    assert decode_pr_contract_v2(encode_pr_contract_v2(contract)) == contract
+    with pytest.raises(AgentLoopError):
+        derive_pr_contract(
+            successor,
+            supersession_kind="closing-widening+flow-correction",
+            supersedes_record_hash="a" * 64,
+        )
 
 
 def test_closing_widening_and_inherited_contract_resolve_through_the_successor_chain():
