@@ -61,6 +61,7 @@ from .pr_contract import (
     pr_contract_payload_schema_version,
     pr_contract_record_hash,
 )
+from .plan_review_scheduling import PlanCandidateKey
 from .protocol_markers import TrustedBody
 from .round_state import (
     PostedRoundRecord,
@@ -1512,6 +1513,41 @@ def _validate_successor_delta(item: TransactionState, before: WorkflowTransition
             problems=(f"contradictory closing contract in successor {item.transaction_id}",),
             code="successor-kind-mismatch",
         )
+    # Dispositions follow the complete delta, not only the winning kind: a
+    # lower-precedence change still obliges its own entries to be reissued.
+    names = {
+        name
+        for name, _b, _a in _differing_fields(
+            TransitionInputs.of(before), TransitionInputs.of(intent)
+        )
+    }
+    affected = frozenset().union(*(_FIELD_AFFECTS[name] for name in names))
+    problems: list[str] = []
+    for name in (ENTRY_HANDOFF, ENTRY_PR_CONTRACT, ENTRY_AUTHORIZATION):
+        disposition = intent.entry(name).disposition
+        if name in affected:
+            # Flow and staging rules decide where not-applicable is legal;
+            # an affected entry may never be carried over by reference.
+            if disposition == DISPOSITION_INHERITED:
+                problems.append(
+                    f"contradictory {name} in successor {item.transaction_id}: it is inherited "
+                    "although " + ", ".join(
+                        sorted(field for field in names if name in _FIELD_AFFECTS[field])
+                    ) + " changed"
+                )
+        elif name != ENTRY_AUTHORIZATION and disposition == DISPOSITION_REISSUED:
+            problems.append(
+                f"contradictory {name} in successor {item.transaction_id}: it is reissued "
+                "although no field it carries changed"
+            )
+    if problems:
+        raise _transaction_error(
+            "A successor transaction's record set does not follow its changes relative to "
+            "the predecessor",
+            states=(item,),
+            problems=tuple(problems),
+            code="successor-disposition-mismatch",
+        )
 
 
 def _validate_chain(chain: Sequence[TransactionState]) -> None:
@@ -1672,6 +1708,30 @@ def resolve_approved_plan_anchor(
     return ApprovedPlanAnchor(comment, plan_hash, _plan_subject(text), text)
 
 
+def _require_candidate_key(key: object, anchor: ApprovedPlanAnchor) -> PlanCandidateKey:
+    """The approved plan's complete exact-plan candidate key, or a refusal."""
+    if not isinstance(key, PlanCandidateKey):
+        raise _fail("approved-plan-implementation requires the approved plan's candidate key.")
+    reason = key.incompleteness_reason()
+    if reason is not None:
+        raise _fail(f"the approved plan's candidate key is incomplete: {reason}.")
+    if key.subject != anchor.plan_subject:
+        raise _fail("the approved plan's candidate key names a different plan subject.")
+    return key
+
+
+def _checkpoint_key_matches(record: PostedRoundRecord, approved: PlanCandidateKey) -> bool:
+    # Full component-for-component equality: the subject alone is shared by
+    # candidates that differ in strategy, matrix, or surfaced requirements.
+    raw = record.metadata.plan_candidate_key
+    if raw is None:
+        return False
+    try:
+        return approved.matches(PlanCandidateKey.from_mapping(raw))
+    except AgentLoopError:
+        return False
+
+
 def round_metadata_digest(comment: AuthenticatedComment) -> str:
     """Digest of the canonical round-metadata payload carried by one comment."""
     matches = list(ROUND_RESUME_MARKER_RE.finditer(comment.body))
@@ -1688,11 +1748,13 @@ def select_scheduler_checkpoint(
     origin_flow: str,
     plan_hash: str | None = None,
     plan_subject: str | None = None,
+    plan_candidate_key: PlanCandidateKey | None = None,
 ) -> SchedulerCheckpointRef:
     """Bind the approved candidate's own scheduling decision, deterministically.
 
     The reference is the earliest authenticated issue-side scheduler-prelaunch
-    summary whose subject is the approved plan's subject and that is strictly
+    summary whose complete exact-plan candidate key equals the approved plan's
+    key (the subject alone is not enough) and that is strictly
     later than the approved-plan anchor.  It can never be displaced by records
     appended later, and PR-side scheduler records are never consulted.
     """
@@ -1704,6 +1766,7 @@ def select_scheduler_checkpoint(
     if not isinstance(plan_hash, str):
         raise _fail("approved-plan-implementation requires an approved-plan hash.")
     anchor = resolve_approved_plan_anchor(view, plan_hash=plan_hash, plan_subject=plan_subject)
+    approved_key = _require_candidate_key(plan_candidate_key, anchor)
     records = _plan_records(view)
     invalid = [
         comment for record, comment in records
@@ -1733,8 +1796,7 @@ def select_scheduler_checkpoint(
             continue
         if metadata.subject != anchor.plan_subject:
             continue
-        key = metadata.plan_candidate_key
-        if key is not None and key.get("subject") not in (None, anchor.plan_subject):
+        if not _checkpoint_key_matches(record, approved_key):
             continue
         order = comment_order(anchor.comment, comment)
         if order == "unordered":
@@ -1754,7 +1816,8 @@ def select_scheduler_checkpoint(
             f"The planning history on {view.surface} scheduled reviews, but no scheduler "
             f"checkpoint matches approved plan {plan_hash} after its anchor record",
             problems=(
-                f"missing scheduler checkpoint for plan subject {anchor.plan_subject} after "
+                f"missing scheduler checkpoint for the candidate key of plan subject "
+                f"{anchor.plan_subject} after "
                 f"anchor comment {anchor.comment.comment_id}",
             ),
             recovery_action=RECOVERY_RERUN_PLAN_REVIEW,
@@ -1767,7 +1830,10 @@ def select_scheduler_checkpoint(
 
 
 def verify_scheduler_checkpoint(
-    intent: WorkflowTransition, plan_issue_view: AuthenticatedCommentView | None
+    intent: WorkflowTransition,
+    plan_issue_view: AuthenticatedCommentView | None,
+    *,
+    plan_candidate_key: PlanCandidateKey | None = None,
 ) -> None:
     """Re-verify the hashed checkpoint reference; fail closed on any mismatch."""
     reference = intent.scheduler_checkpoint.reference
@@ -1800,6 +1866,7 @@ def verify_scheduler_checkpoint(
         raise refuse(f"contradictory digest for scheduler checkpoint comment {comment.comment_id}")
     assert intent.approved_plan_hash is not None
     anchor = resolve_approved_plan_anchor(view, plan_hash=intent.approved_plan_hash)
+    approved_key = _require_candidate_key(plan_candidate_key, anchor)
     record = next(
         (item for item, candidate in _plan_records(view) if candidate is comment), None
     )
@@ -1813,6 +1880,11 @@ def verify_scheduler_checkpoint(
         raise refuse(
             f"contradictory scheduler checkpoint comment {comment.comment_id}: it is not a "
             "scheduler-prelaunch record for the approved plan's subject"
+        )
+    if not _checkpoint_key_matches(record, approved_key):
+        raise refuse(
+            f"contradictory scheduler checkpoint comment {comment.comment_id}: its candidate "
+            "key is not the approved plan's complete candidate key"
         )
     if not is_strictly_later(anchor.comment, comment):
         raise refuse(
@@ -2277,19 +2349,24 @@ def _check_contract_supersession(
         )
     kind = state.intent.successor_kind
     prior_is_v1 = isinstance(prior, PrExpectedClosingContract)
+    # A plan replacement outranks both kinds, so a mixed successor carries the
+    # lower-precedence contract change under the plan-replacement kind.  Chain
+    # validation has already tied the reissue to the actual changed fields.
+    widening_kinds = {KIND_CLOSING_WIDENING, KIND_PLAN_REPLACEMENT}
+    flow_kinds = {KIND_FLOW_CORRECTION, KIND_PLAN_REPLACEMENT}
     if new.supersession_kind == "closing-widening":
         widened = set(prior.expected_closing_issue_ids) < set(new.expected_closing_issue_ids)
         if not (
             widened
             and prior.origin_flow == new.origin_flow
             and prior.primary_issue_number == new.primary_issue_number
-            and (kind == KIND_CLOSING_WIDENING or (kind == KIND_INITIAL and prior_is_v1))
+            and (kind in widening_kinds or (kind == KIND_INITIAL and prior_is_v1))
         ):
             raise refuse("contradictory closing-widening supersession")
         return
     if not same_scope or prior.origin_flow == new.origin_flow:
         raise refuse("contradictory flow-correction: only the origin flow may change")
-    if kind == KIND_FLOW_CORRECTION and not prior_is_v1:
+    if kind in flow_kinds and not prior_is_v1:
         return
     root = state.intent.legacy_root
     if (

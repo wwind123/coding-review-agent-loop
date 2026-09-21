@@ -252,10 +252,24 @@ def plan_record_comment(
     return comment(comment_id, body, surface=f"issue#{number}", author=author, second=second)
 
 
+def plan_key(plan: str = PLAN, **overrides) -> PlanCandidateKey:
+    fields = dict(
+        subject=_plan_subject(plan),
+        aggregate_plan_identity="aggregate",
+        execution_strategy_identity="strategy",
+        risk_test_matrix_identity="matrix",
+        surfaced_requirement_id_digest="requirements",
+        execution_strategy_contract_version=1,
+    )
+    fields.update(overrides)
+    return PlanCandidateKey(**fields)
+
+
 def scheduler_comment(
     comment_id: int,
     plan: str = PLAN,
     *,
+    key: PlanCandidateKey | None = None,
     number: int = ISSUE,
     author=ACTOR,
     second=None,
@@ -263,13 +277,7 @@ def scheduler_comment(
     surface: str | None = None,
 ):
     subject = _plan_subject(plan)
-    key = PlanCandidateKey(
-        subject=subject,
-        aggregate_plan_identity="aggregate",
-        execution_strategy_identity="strategy",
-        risk_test_matrix_identity="matrix",
-        surfaced_requirement_id_digest="requirements",
-    )
+    key = key or plan_key(plan)
     body = _attach_round_metadata(
         f"Plan review scheduling audit {comment_id}.\n\n-- Orchestrator",
         PostedRoundMetadata(

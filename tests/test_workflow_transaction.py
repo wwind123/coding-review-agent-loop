@@ -24,6 +24,9 @@ from workflow_transaction_helpers import (
     direct_intent,
     issue_view,
     plan_intent,
+    plan_key,
+    v2_contract_comment,
+    v2_handoff_comment,
     plan_record_comment,
     plan_reviewer_comment,
     pr_review_comment,
@@ -101,6 +104,7 @@ from coding_review_agent_loop.workflow_transaction import (
     reissued,
     resolve_approved_plan_anchor,
     resolve_handoff_lineage,
+    resolve_pr_contract_lineage,
     resolve_transaction_lineage,
     round_metadata_digest,
     select_scheduler_checkpoint,
@@ -819,7 +823,12 @@ EARLIER_PLAN = "Earlier candidate that reviewers sent back."
 
 
 def _select(view, **overrides):
-    fields = dict(origin_flow=FLOW_APPROVED_PLAN, plan_hash=PLAN_HASH, plan_subject=PLAN_SUBJECT)
+    fields = dict(
+        origin_flow=FLOW_APPROVED_PLAN,
+        plan_hash=PLAN_HASH,
+        plan_subject=PLAN_SUBJECT,
+        plan_candidate_key=plan_key(),
+    )
     fields.update(overrides)
     return select_scheduler_checkpoint(view, **fields)
 
@@ -942,7 +951,7 @@ def test_staged_direct_child_resolves_anchor_and_checkpoint_on_the_parent_issue(
     assert chosen.reference.surface == f"issue#{parent}"
     intent = plan_intent(staged=staged, scheduler_checkpoint=chosen)
     assert intent.plan_owning_issue == parent
-    verify_scheduler_checkpoint(intent, parent_view)
+    verify_scheduler_checkpoint(intent, parent_view, plan_candidate_key=plan_key())
     # The child issue is not where a direct-implementation child's plan lives.
     with pytest.raises(AgentLoopError, match="plan-owning issue"):
         plan_intent(
@@ -964,11 +973,11 @@ def test_gate_reverification_fails_closed_on_missing_foreign_altered_or_wrong_ch
     comments = [plan_record_comment(3), scheduler_comment(4), scheduler_comment(8, EARLIER_PLAN)]
     view = issue_view(*comments)
     intent = plan_intent(scheduler_checkpoint=_select(view))
-    verify_scheduler_checkpoint(intent, view)
+    verify_scheduler_checkpoint(intent, view, plan_candidate_key=plan_key())
 
     def code(bad_view, bad_intent=intent):
         with pytest.raises(WorkflowTransactionError) as excinfo:
-            verify_scheduler_checkpoint(bad_intent, bad_view)
+            verify_scheduler_checkpoint(bad_intent, bad_view, plan_candidate_key=plan_key())
         return str(excinfo.value)
 
     assert "missing scheduler checkpoint comment 4" in code(issue_view(comments[0]))
@@ -995,6 +1004,81 @@ def test_gate_reverification_fails_closed_on_missing_foreign_altered_or_wrong_ch
         ),
     )
     assert "not strictly later than anchor" in code(before_anchor, early)
+
+
+
+KEY_VARIANTS = (
+    {"aggregate_plan_identity": "other-aggregate"},
+    {"execution_strategy_identity": "other-strategy"},
+    {"risk_test_matrix_identity": "other-matrix"},
+    {"surfaced_requirement_id_digest": "other-requirements"},
+)
+
+
+@pytest.mark.parametrize("variant", KEY_VARIANTS)
+def test_same_subject_checkpoint_with_a_differing_key_component_is_never_bound(variant):
+    other = scheduler_comment(4, key=plan_key(**variant))
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _select(issue_view(plan_record_comment(3), other))
+    assert excinfo.value.code == "scheduler-checkpoint-unmatched"
+    # The exact candidate's own later checkpoint is bound instead of the earlier
+    # same-subject one.
+    view = issue_view(plan_record_comment(3), other, scheduler_comment(5, round_number=2))
+    assert _select(view).reference.comment_id == 5
+    assert _select(view, plan_candidate_key=plan_key(**variant)).reference.comment_id == 4
+
+
+@pytest.mark.parametrize("variant", KEY_VARIANTS)
+def test_gate_reverification_rejects_a_same_subject_checkpoint_with_a_differing_key(variant):
+    view = issue_view(plan_record_comment(3), scheduler_comment(4, key=plan_key(**variant)))
+    intent = plan_intent(
+        scheduler_checkpoint=SchedulerCheckpointRef(
+            CommentRef(ISSUE_SURFACE, 4, round_metadata_digest(view.comment(4)))
+        )
+    )
+    verify_scheduler_checkpoint(intent, view, plan_candidate_key=plan_key(**variant))
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        verify_scheduler_checkpoint(intent, view, plan_candidate_key=plan_key())
+    assert excinfo.value.code == "scheduler-checkpoint-invalid"
+    assert "not the approved plan's complete candidate key" in str(excinfo.value)
+
+
+def test_candidate_key_must_be_supplied_complete_and_for_the_anchor_subject():
+    view = issue_view(plan_record_comment(3), scheduler_comment(4))
+    with pytest.raises(AgentLoopError, match="requires the approved plan's candidate key"):
+        _select(view, plan_candidate_key=None)
+    with pytest.raises(AgentLoopError, match="incomplete"):
+        _select(view, plan_candidate_key=plan_key(risk_test_matrix_identity=None))
+    with pytest.raises(AgentLoopError, match="incomplete"):
+        _select(view, plan_candidate_key=plan_key(execution_strategy_contract_version=None))
+    with pytest.raises(AgentLoopError, match="different plan subject"):
+        _select(view, plan_candidate_key=plan_key(EARLIER_PLAN))
+    intent = plan_intent(scheduler_checkpoint=_select(view))
+    with pytest.raises(AgentLoopError, match="requires the approved plan's candidate key"):
+        verify_scheduler_checkpoint(intent, view)
+
+
+def test_checkpoint_without_a_decodable_candidate_key_is_never_bound(monkeypatch):
+    import coding_review_agent_loop.workflow_transaction as module
+
+    real = module._plan_records
+    for broken in (None, {"subject": 7}):
+        monkeypatch.setattr(
+            module,
+            "_plan_records",
+            lambda view, broken=broken: tuple(
+                (
+                    replace(record, metadata=replace(record.metadata, plan_candidate_key=broken))
+                    if record.metadata.role == "summary"
+                    else record,
+                    item,
+                )
+                for record, item in real(view)
+            ),
+        )
+        with pytest.raises(WorkflowTransactionError) as excinfo:
+            _select(issue_view(plan_record_comment(3), scheduler_comment(4)))
+        assert excinfo.value.code == "scheduler-checkpoint-unmatched"
 
 
 # --- legacy root validation --------------------------------------------------
@@ -1338,6 +1422,100 @@ def test_planned_successor_reissues_affected_entries_and_inherits_the_rest():
     assert corrected.successor_kind == KIND_FLOW_CORRECTION
     assert corrected.entry(ENTRY_HANDOFF).disposition == "not-applicable"
     assert corrected.entry(ENTRY_PR_CONTRACT).disposition == "reissued"
+
+
+def _mixed_successor_chain(contract_entry):
+    """Committed initial, then a plan replacement that also widens closing."""
+    base = plan_intent(
+        scheduler_checkpoint=SchedulerCheckpointRef(CommentRef(ISSUE_SURFACE, 4, DIGEST))
+    )
+    mixed = replace(
+        base,
+        approved_plan_hash="1" * 16,
+        expected_closing_issue_ids=(ISSUE, 900),
+        scheduler_checkpoint=SchedulerCheckpointRef(CommentRef(ISSUE_SURFACE, 40, DIGEST)),
+        successor_kind=KIND_PLAN_REPLACEMENT,
+        predecessor_transaction_id=base.transaction_id,
+        record_set=record_set(
+            contract=contract_entry, coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND)
+        ),
+    )
+    first_contract = v2_contract_comment(12, base)
+    pr_comments = [
+        prepared_comment(10, base),
+        first_contract,
+        terminal_comment(
+            20,
+            base,
+            prepared_id=10,
+            published={ENTRY_HANDOFF: 11, ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13},
+        ),
+        prepared_comment(30, mixed),
+    ]
+    published = {ENTRY_HANDOFF: 31}
+    if contract_entry.disposition == "reissued":
+        published[ENTRY_PR_CONTRACT] = 32
+        pr_comments.append(
+            v2_contract_comment(
+                32,
+                mixed,
+                supersession_kind="closing-widening",
+                supersedes_record_hash=pr_contract_record_hash(
+                    derive_pr_contract(base)
+                ),
+            )
+        )
+    pr_comments.append(terminal_comment(40, mixed, prepared_id=30, published=published))
+    issue_comments = [v2_handoff_comment(11, base), v2_handoff_comment(31, mixed)]
+    return base, mixed, pr_view(*pr_comments), issue_view(*issue_comments)
+
+
+def test_mixed_successor_cannot_inherit_an_entry_a_lower_precedence_change_affects():
+    # The winning kind only obliges the handoff; the closing change still
+    # obliges the PR contract, which would otherwise keep the old closing IDs.
+    _base, mixed, prs, issues = _mixed_successor_chain(
+        inherited(ENTRY_PR_CONTRACT, CommentRef(PR_SURFACE, 12, DIGEST))
+    )
+    assert successor_kind_for(_base, TransitionInputs.of(mixed)) == KIND_PLAN_REPLACEMENT
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        resolve_transaction_lineage(prs, repository=REPO, pr_number=PR)
+    assert excinfo.value.code == "successor-disposition-mismatch"
+    assert "pr-expected-closing-contract" in str(excinfo.value)
+    assert "expected_closing_issue_ids changed" in str(excinfo.value)
+
+
+def test_mixed_successor_reissuing_every_affected_entry_agrees_on_both_surfaces():
+    _base, mixed, prs, issues = _mixed_successor_chain(reissued(ENTRY_PR_CONTRACT))
+    lineage = resolve_transaction_lineage(prs, repository=REPO, pr_number=PR)
+    assert lineage.latest_committed.transaction_id == mixed.transaction_id
+    contract = resolve_pr_contract_lineage(prs, lineage, repository=REPO, pr_number=PR)
+    handoff = resolve_handoff_lineage(issues, lineage, repository=REPO, issue_number=ISSUE)
+    assert contract.comment_id == 32 and handoff.comment_id == 31
+    assert contract.transaction_id == handoff.transaction_id == mixed.transaction_id
+    assert (
+        tuple(contract.contract.expected_closing_issue_ids)
+        == tuple(handoff.handoff.expected_closing_issue_ids)
+        == (ISSUE, 900)
+    )
+    assert handoff.handoff.plan_hash == "1" * 16
+
+
+def test_successor_cannot_reissue_a_publicly_visible_entry_no_changed_field_affects():
+    base, comments = _committed_initial(
+        plan_intent(scheduler_checkpoint=SchedulerCheckpointRef(CommentRef(ISSUE_SURFACE, 4, DIGEST)))
+    )
+    replacement = replace(
+        base,
+        approved_plan_hash="1" * 16,
+        scheduler_checkpoint=SchedulerCheckpointRef(CommentRef(ISSUE_SURFACE, 40, DIGEST)),
+        successor_kind=KIND_PLAN_REPLACEMENT,
+        predecessor_transaction_id=base.transaction_id,
+        record_set=record_set(coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND)),
+    )
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _resolve(*comments, prepared_comment(30, replacement))
+    assert excinfo.value.code == "successor-disposition-mismatch"
+    assert "no field it carries changed" in str(excinfo.value)
 
 
 def test_successor_must_inherit_the_predecessors_scheduler_checkpoint_unchanged():
