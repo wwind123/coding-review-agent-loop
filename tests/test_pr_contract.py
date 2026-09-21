@@ -435,3 +435,239 @@ def test_v2_contract_decoder_and_lineage_reject_a_noncanonical_wire_record():
     assert body != comments[1].body
     with pytest.raises(AgentLoopError, match="not canonically encoded"):
         _resolve(comments[0], comment(12, body), comments[2])
+
+
+# --- review round 2 -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"repository": "x"},
+        {"repository": "OWNER/REPO/extra"},
+        {"repository": " OWNER/REPO"},
+        {"primary_issue_number": None},
+        {"origin_flow": "approved-plan-implementation", "primary_issue_number": None},
+        {"expected_closing_issue_ids": (900,)},
+        {"origin_flow": "direct-pr", "expected_closing_issue_ids": ()},
+    ],
+)
+def test_v2_contract_codec_enforces_the_typed_intent_invariants(overrides):
+    with pytest.raises(AgentLoopError):
+        _v2(**overrides)
+
+
+def test_v2_contract_codec_still_accepts_a_direct_pr_without_primary_issue():
+    contract = _v2(origin_flow="direct-pr", primary_issue_number=None, expected_closing_issue_ids=())
+    assert decode_pr_contract_v2(encode_pr_contract_v2(contract)) == contract
+    # The version-1 codec keeps its historical permissiveness.
+    assert decode_pr_contract(encode_pr_contract(replace(v1_contract(), repository="x")))
+
+
+def _successor(base, **overrides):
+    fields = dict(
+        head_sha=HEAD_2,
+        successor_kind=KIND_HEAD_ADVANCE,
+        predecessor_transaction_id=base.transaction_id,
+        record_set=record_set(
+            handoff=inherited(ENTRY_HANDOFF, CommentRef(ISSUE_SURFACE, 11, DIGEST)),
+            contract=inherited(
+                ENTRY_PR_CONTRACT,
+                CommentRef(PR_SURFACE, 12, pr_contract_record_hash(derive_pr_contract(base))),
+            ),
+            coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND),
+        ),
+    )
+    fields.update(overrides)
+    return replace(base, **fields)
+
+
+def _committed_successor(base, comments, successor):
+    return comments + [
+        prepared_comment(30, successor),
+        terminal_comment(40, successor, prepared_id=30),
+    ]
+
+
+def test_committed_successor_whose_kind_disagrees_with_its_delta_never_resolves():
+    base, comments = _initial()
+
+    def refused(successor):
+        with pytest.raises(WorkflowTransactionError) as excinfo:
+            _resolve(*_committed_successor(base, comments, successor))
+        assert excinfo.value.code == "successor-kind-mismatch"
+        return str(excinfo.value)
+
+    # A head-advance that also widens the closing scope while inheriting the
+    # predecessor's handoff and PR contract.
+    assert "require closing-widening" in refused(
+        _successor(base, expected_closing_issue_ids=(ISSUE, 900))
+    )
+    # An identical no-change successor.
+    assert "changes nothing" in refused(_successor(base, head_sha=base.head_sha))
+    # A closing change that is not a strict superset.
+    wide, wide_comments = _initial(direct_intent(expected_closing_issue_ids=(ISSUE, 900)))
+    narrowed = replace(
+        wide,
+        expected_closing_issue_ids=(ISSUE, 901),
+        successor_kind=KIND_CLOSING_WIDENING,
+        predecessor_transaction_id=wide.transaction_id,
+        record_set=record_set(coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND)),
+    )
+    with pytest.raises(WorkflowTransactionError, match="strict superset") as excinfo:
+        _resolve(
+            *wide_comments,
+            prepared_comment(30, narrowed),
+            terminal_comment(
+                40, narrowed, prepared_id=30,
+                published={ENTRY_HANDOFF: 31, ENTRY_PR_CONTRACT: 32},
+            ),
+        )
+    assert excinfo.value.code == "successor-kind-mismatch"
+
+    # A head-advance that silently changes the origin flow.
+    direct_pr = direct_intent(
+        origin_flow="direct-pr", record_set=record_set(handoff=not_applicable(ENTRY_HANDOFF))
+    )
+    _b, direct_comments = _initial(direct_pr)
+    flipped = replace(
+        direct_pr,
+        origin_flow="managed-pr",
+        head_sha=HEAD_2,
+        successor_kind=KIND_HEAD_ADVANCE,
+        predecessor_transaction_id=direct_pr.transaction_id,
+        record_set=record_set(
+            handoff=not_applicable(ENTRY_HANDOFF),
+            contract=inherited(
+                ENTRY_PR_CONTRACT,
+                CommentRef(PR_SURFACE, 12, pr_contract_record_hash(derive_pr_contract(direct_pr))),
+            ),
+            coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND),
+        ),
+    )
+    with pytest.raises(WorkflowTransactionError, match="require flow-correction"):
+        _resolve(*_committed_successor(direct_pr, direct_comments, flipped))
+
+    # The correctly labeled head-advance still resolves through the chain.
+    good = _resolve(*_committed_successor(base, comments, _successor(base)))
+    assert good.transaction_id == _successor(base).transaction_id
+
+
+def _timed_initial(*, prepared=(10, 10), contract=(12, 12), terminal=(20, 20), bind=10):
+    intent = direct_intent()
+    published = {**PUBLISHED, ENTRY_PR_CONTRACT: contract[0]}
+    return intent, [
+        comment(prepared[0], prepared_comment(prepared[0], intent).body, second=prepared[1]),
+        comment(contract[0], v2_contract_comment(contract[0], intent).body, second=contract[1]),
+        comment(
+            terminal[0],
+            terminal_comment(terminal[0], intent, prepared_id=bind, published=published).body,
+            second=terminal[1],
+        ),
+    ]
+
+
+def test_contract_must_be_published_between_the_bound_prepared_and_terminal_records():
+    # Same-second publication ordered by comment ID is normal and accepted.
+    _intent, same_second = _timed_initial(prepared=(10, 7), contract=(12, 7), terminal=(20, 7))
+    assert _resolve(*same_second).comment_id == 12
+
+    def refused(comments):
+        with pytest.raises(WorkflowTransactionError) as excinfo:
+            _resolve(*comments)
+        assert excinfo.value.code == "record-unordered"
+
+    refused(_timed_initial(contract=(9, 9))[1])  # posted before preparation
+    refused(_timed_initial(contract=(25, 25))[1])  # posted after the terminal record
+    refused(_timed_initial(contract=(12, 3))[1])  # greater ID, earlier timestamp
+    refused(_timed_initial(contract=(12, 50))[1])  # later than the terminal timestamp
+
+    # A contract carried inside the terminal comment itself.
+    intent = direct_intent()
+    terminal = terminal_comment(
+        20, intent, prepared_id=10, published={**PUBLISHED, ENTRY_PR_CONTRACT: 20}
+    )
+    merged = comment(20, terminal.body + "\n\n" + v2_contract_comment(20, intent).body)
+    refused([prepared_comment(10, intent), merged])
+
+
+def test_terminal_must_be_later_than_the_exact_prepared_comment_it_binds():
+    intent = direct_intent()
+    comments = [
+        prepared_comment(10, intent),
+        v2_contract_comment(12, intent),
+        # The terminal names a duplicate prepared comment posted after it.
+        terminal_comment(20, intent, prepared_id=25, published=PUBLISHED),
+        prepared_comment(25, intent),
+    ]
+    with pytest.raises(WorkflowTransactionError, match="not later than its prepared record"):
+        _resolve(*comments)
+    # Binding a duplicate that precedes the terminal is fine, and the named
+    # contract must then be later than that bound duplicate.
+    bound_late = [
+        prepared_comment(10, intent),
+        v2_contract_comment(12, intent),
+        prepared_comment(14, intent),
+        terminal_comment(20, intent, prepared_id=14, published=PUBLISHED),
+    ]
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _resolve(*bound_late)
+    assert excinfo.value.code == "record-unordered"
+
+
+def test_non_staged_transition_cannot_omit_the_pr_contract():
+    import base64
+    import hashlib
+    import json
+
+    from coding_review_agent_loop.workflow_transaction import StagedIdentity
+
+    for build in (direct_intent, plan_intent):
+        with pytest.raises(AgentLoopError, match="requires the PR expected-closing contract"):
+            build(record_set=record_set(contract=not_applicable(ENTRY_PR_CONTRACT)))
+    with pytest.raises(AgentLoopError, match="requires the PR expected-closing contract"):
+        direct_intent(
+            origin_flow="direct-pr",
+            record_set=record_set(
+                handoff=not_applicable(ENTRY_HANDOFF), contract=not_applicable(ENTRY_PR_CONTRACT)
+            ),
+        )
+    staged = direct_intent(
+        staged=StagedIdentity(827, ISSUE, "parent"),
+        record_set=record_set(contract=not_applicable(ENTRY_PR_CONTRACT)),
+    )
+    assert staged.entry(ENTRY_PR_CONTRACT).disposition == "not-applicable"
+
+    # A hand-built committed lineage whose stored intent omits the contract on
+    # a non-staged transition never resolves.
+    payload = staged.to_payload()
+    payload["staged"] = None
+    tx_id = hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+    def encoded(record):
+        return base64.urlsafe_b64encode(
+            json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
+        ).decode()
+
+    prepared = {
+        "schema_version": 1, "phase": "prepared", "transaction_id": tx_id, "intent": payload,
+        "writer": {"login": "agent-loop-bot", "id": 4242},
+    }
+    terminal = {
+        "schema_version": 1, "phase": "committed", "transaction_id": tx_id,
+        "prepared_comment_id": 10,
+        "entries": [
+            {"name": ENTRY_HANDOFF, "comment_id": 11, "status": None},
+            {"name": ENTRY_PR_CONTRACT, "comment_id": None, "status": "not-applicable"},
+            {"name": "managed-ci-authorization", "comment_id": None, "status": "not-applicable"},
+            {"name": ENTRY_INITIAL_CODER_ROUND, "comment_id": 13, "status": None},
+        ],
+    }
+    marker = "AGENT_" + "WORKFLOW_TRANSACTION"
+    with pytest.raises(AgentLoopError, match="requires the PR expected-closing contract"):
+        _resolve(
+            comment(10, f"<!-- {marker}: {encoded(prepared)} -->"),
+            comment(20, f"<!-- {marker}: {encoded(terminal)} -->"),
+        )

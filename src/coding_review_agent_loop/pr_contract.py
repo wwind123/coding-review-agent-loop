@@ -233,6 +233,8 @@ def find_latest_pr_contract(
 PR_CONTRACT_V2_SCHEMA_VERSION = 2
 PR_CONTRACT_SUPERSESSION_KINDS = frozenset({"closing-widening", "flow-correction"})
 _HEX64_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_V2_REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
+_V2_ISSUE_ORIGIN_FLOWS = frozenset({"issue-implementation", "approved-plan-implementation"})
 
 
 @dataclass(frozen=True)
@@ -325,11 +327,13 @@ def decode_pr_contract_v2(encoded: str) -> PrExpectedClosingContractV2:
     ):
         raise AgentLoopError(f"{prefix}: primary_issue_number is invalid.")
     repository = payload["repository"]
-    if not isinstance(repository, str) or not repository.strip():
-        raise AgentLoopError(f"{prefix}: repository is invalid.")
+    if not isinstance(repository, str) or _V2_REPOSITORY_RE.match(repository) is None:
+        raise AgentLoopError(f"{prefix}: repository must be OWNER/NAME.")
     origin = payload["origin_flow"]
     if origin not in _VALID_ORIGINS:
         raise AgentLoopError(f"{prefix}: origin_flow is invalid.")
+    if origin in _V2_ISSUE_ORIGIN_FLOWS and primary is None:
+        raise AgentLoopError(f"{prefix}: {origin} requires primary_issue_number.")
     ids = normalize_issue_ids(
         payload["expected_closing_issue_ids"],
         field_name=f"{PR_EXPECTED_CLOSING_MARKER}.expected_closing_issue_ids",
@@ -337,6 +341,10 @@ def decode_pr_contract_v2(encoded: str) -> PrExpectedClosingContractV2:
     assert ids is not None
     if list(ids) != payload["expected_closing_issue_ids"]:
         raise AgentLoopError(f"{prefix}: expected_closing_issue_ids are not canonical.")
+    if primary is not None and primary not in ids:
+        raise AgentLoopError(
+            f"{prefix}: expected_closing_issue_ids must retain primary issue #{primary}."
+        )
     digest = payload["contract_hash"]
     if not isinstance(digest, str) or digest != contract_hash(ids):
         raise AgentLoopError(f"{prefix}: contract_hash is invalid.")

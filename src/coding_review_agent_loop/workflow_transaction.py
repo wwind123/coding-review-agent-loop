@@ -670,6 +670,11 @@ class WorkflowTransition:
             # Without it a committed transaction would leave no discoverable
             # issue-to-PR record.
             raise _fail(f"{self.origin_flow} requires the issue-to-PR handoff entry.")
+        if self.staged is None and (
+            self.entry(ENTRY_PR_CONTRACT).disposition == DISPOSITION_NOT_APPLICABLE
+        ):
+            # Only a staged child may be handoff-only on the PR side.
+            raise _fail("a non-staged transition requires the PR expected-closing contract entry.")
         authorization = self.entry(ENTRY_AUTHORIZATION)
         if self.managed_ci_generation is None:
             if authorization.disposition != DISPOSITION_NOT_APPLICABLE:
@@ -1094,6 +1099,9 @@ class TransactionState:
     prepared_duplicates: tuple[AuthenticatedComment, ...] = ()
     terminal: WorkflowTransactionRecord | None = None
     terminal_comment: AuthenticatedComment | None = None
+    # The exact prepared comment the terminal record binds (it may be a
+    # byte-identical duplicate of ``prepared_comment``).
+    bound_prepared_comment: AuthenticatedComment | None = None
 
     @property
     def transaction_id(self) -> str:
@@ -1308,7 +1316,11 @@ def collect_transactions(
                         ),
                         code="terminal-without-prepared",
                     )
-                if not is_strictly_later(canonical_comment, comment):
+                bound_prepared = next(
+                    item for item, _record in items
+                    if item.comment_id == record.prepared_comment_id
+                )
+                if not is_strictly_later(bound_prepared, comment):
                     raise _transaction_error(
                         "A terminal transaction record is not later than its prepared record",
                         transaction_ids=(tx_id,),
@@ -1322,6 +1334,14 @@ def collect_transactions(
                 prepared_duplicates=tuple(comment for comment, _record in items[1:]),
                 terminal=terminal_record,
                 terminal_comment=terminal_comment,
+                bound_prepared_comment=(
+                    next(
+                        item for item, _record in items
+                        if item.comment_id == terminal_record.prepared_comment_id
+                    )
+                    if terminal_record is not None
+                    else None
+                ),
             )
         )
     states.sort(key=lambda item: item.prepared_comment.comment_id)
@@ -1456,6 +1476,44 @@ def resolve_transaction_lineage(
     )
 
 
+def _validate_successor_delta(item: TransactionState, before: WorkflowTransition) -> None:
+    """A successor's declared kind must be exactly what its delta implies."""
+    intent = item.intent
+    try:
+        expected = successor_kind_for(before, TransitionInputs.of(intent))
+    except AgentLoopError as exc:
+        raise _transaction_error(
+            "A successor transaction changes a field no successor kind may change",
+            states=(item,),
+            problems=(f"contradictory successor {item.transaction_id}: {exc}",),
+            code="successor-kind-mismatch",
+        ) from exc
+    if expected is None:
+        raise _transaction_error(
+            "A successor transaction changes nothing relative to its predecessor",
+            states=(item,),
+            problems=(f"contradictory zero-delta successor {item.transaction_id}",),
+            code="successor-kind-mismatch",
+        )
+    if expected != intent.successor_kind:
+        raise _transaction_error(
+            f"A successor transaction declares {intent.successor_kind} but its changes "
+            f"relative to the predecessor require {expected}",
+            states=(item,),
+            problems=(f"contradictory successor {item.transaction_id}",),
+            code="successor-kind-mismatch",
+        )
+    if tuple(before.expected_closing_issue_ids) != tuple(intent.expected_closing_issue_ids) and not (
+        set(before.expected_closing_issue_ids) < set(intent.expected_closing_issue_ids)
+    ):
+        raise _transaction_error(
+            "A successor transaction may only widen the closing contract to a strict superset",
+            states=(item,),
+            problems=(f"contradictory closing contract in successor {item.transaction_id}",),
+            code="successor-kind-mismatch",
+        )
+
+
 def _validate_chain(chain: Sequence[TransactionState]) -> None:
     effective: dict[str, tuple[int, str | None] | None] = {
         name: None for name in RECORD_SET_ENTRY_NAMES
@@ -1475,6 +1533,7 @@ def _validate_chain(chain: Sequence[TransactionState]) -> None:
                     states=(item,),
                     problems=(f"contradictory successor {item.transaction_id}",),
                 )
+            _validate_successor_delta(item, before)
             if (
                 intent.successor_kind != KIND_PLAN_REPLACEMENT
                 and intent.scheduler_checkpoint != before.scheduler_checkpoint
@@ -2062,7 +2121,11 @@ def _split_by_version(
 class _Group:
     record: object
     encoded: str
-    comment_ids: tuple[int, ...]
+    comments: tuple[AuthenticatedComment, ...]
+
+    @property
+    def comment_ids(self) -> tuple[int, ...]:
+        return tuple(item.comment_id for item in self.comments)
 
     @property
     def canonical_comment_id(self) -> int:
@@ -2076,7 +2139,7 @@ def _group_v2(
     for comment, encoded, record, tx_id in items:
         existing = groups.get(tx_id)
         if existing is None:
-            groups[tx_id] = _Group(record, encoded, (comment.comment_id,))
+            groups[tx_id] = _Group(record, encoded, (comment,))
         elif existing.encoded != encoded:
             raise WorkflowTransactionError(
                 f"Divergent version-2 {what} records are bound to one transaction",
@@ -2085,7 +2148,7 @@ def _group_v2(
                 recovery_action=RECOVERY_OPERATOR_REVIEW,
             )
         else:
-            groups[tx_id] = _Group(record, encoded, existing.comment_ids + (comment.comment_id,))
+            groups[tx_id] = _Group(record, encoded, existing.comments + (comment,))
     return groups
 
 
@@ -2108,15 +2171,25 @@ def _require_bound_states(
 
 def _reissued_group(
     state: TransactionState, groups: Mapping[str, _Group], name: str, *, what: str
-) -> _Group:
+) -> tuple[_Group, AuthenticatedComment]:
+    """Return the record group and the exact comment the terminal record names.
+
+    Publication order is part of the contract: the named comment must be
+    strictly later than the prepared comment the terminal binds and strictly
+    earlier than the terminal comment, under the shared two-field rule.  A
+    record posted before preparation, inside or after the terminal comment is
+    never accepted retroactively.
+    """
     group = groups.get(state.transaction_id)
     outcome = state.outcome(name)
-    if (
-        group is None
-        or outcome is None
-        or outcome.comment_id is None
-        or outcome.comment_id not in group.comment_ids
-    ):
+    named = (
+        next(
+            (item for item in group.comments if item.comment_id == outcome.comment_id), None
+        )
+        if group is not None and outcome is not None and outcome.comment_id is not None
+        else None
+    )
+    if group is None or named is None:
         raise _transaction_error(
             f"A committed transaction's {what} record is missing or is not the comment its "
             "terminal record names",
@@ -2124,7 +2197,23 @@ def _reissued_group(
             problems=(f"missing {what} record for transaction {state.transaction_id}",),
             code="record-missing",
         )
-    return group
+    assert state.bound_prepared_comment is not None and state.terminal_comment is not None
+    if not (
+        is_strictly_later(state.bound_prepared_comment, named)
+        and is_strictly_later(named, state.terminal_comment)
+    ):
+        raise _transaction_error(
+            f"A committed transaction's {what} record was not published between its prepared "
+            "and terminal records",
+            states=(state,),
+            problems=(
+                f"unordered {what} record in comment {named.comment_id}: expected prepared "
+                f"comment {state.bound_prepared_comment.comment_id} < {named.comment_id} < "
+                f"terminal comment {state.terminal_comment.comment_id}",
+            ),
+            code="record-unordered",
+        )
+    return group, named
 
 
 @dataclass(frozen=True)
@@ -2270,7 +2359,9 @@ def resolve_pr_contract_lineage(
         if not state.committed:
             continue
         if entry.disposition == DISPOSITION_REISSUED:
-            group = _reissued_group(state, groups, ENTRY_PR_CONTRACT, what="PR contract")
+            group, named = _reissued_group(
+                state, groups, ENTRY_PR_CONTRACT, what="PR contract"
+            )
             contract = group.record
             assert isinstance(contract, PrExpectedClosingContractV2)
             if contract != derive_pr_contract(
@@ -2288,7 +2379,7 @@ def resolve_pr_contract_lineage(
             _check_contract_supersession(contract, state, current, surface=view.surface)
             current = ResolvedPrContract(
                 contract,
-                group.canonical_comment_id,
+                named.comment_id,
                 pr_contract_record_hash(contract),
                 era,
                 transaction_id=state.transaction_id,
@@ -2439,7 +2530,7 @@ def resolve_handoff_lineage(
         if not state.committed:
             continue
         if entry.disposition == DISPOSITION_REISSUED:
-            group = _reissued_group(state, groups, ENTRY_HANDOFF, what="handoff")
+            group, named = _reissued_group(state, groups, ENTRY_HANDOFF, what="handoff")
             if group.record != derive_handoff_metadata(intent):
                 raise _transaction_error(
                     "A version-2 handoff disagrees with its transaction intent",
@@ -2451,7 +2542,7 @@ def resolve_handoff_lineage(
             assert isinstance(group.record, IssuePrHandoffMetadataV2)
             current = ResolvedHandoff(
                 group.record,
-                group.canonical_comment_id,
+                named.comment_id,
                 issue_pr_handoff_record_hash(group.record),
                 era,
                 transaction_id=state.transaction_id,

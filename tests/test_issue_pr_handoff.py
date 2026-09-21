@@ -1045,3 +1045,62 @@ def test_v2_handoff_decoder_and_lineage_reject_a_noncanonical_wire_record():
         resolve_handoff_lineage(
             issue_view(spaced), lineage, repository=REPO, issue_number=ISSUE
         )
+
+
+def test_handoff_must_be_published_between_the_bound_prepared_and_terminal_records():
+    from workflow_transaction_helpers import (
+        ISSUE,
+        PR,
+        REPO,
+        comment,
+        direct_intent,
+        issue_view,
+        pr_view,
+        prepared_comment,
+        terminal_comment,
+        v2_handoff_comment,
+    )
+
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.workflow_transaction import (
+        ENTRY_HANDOFF,
+        ENTRY_INITIAL_CODER_ROUND,
+        ENTRY_PR_CONTRACT,
+        resolve_handoff_lineage,
+        resolve_transaction_lineage,
+    )
+
+    intent = direct_intent()
+
+    def resolve(handoff, *, prepared=10, terminal=20):
+        published = {
+            ENTRY_HANDOFF: handoff[0], ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13
+        }
+        lineage = resolve_transaction_lineage(
+            pr_view(
+                comment(10, prepared_comment(10, intent).body, second=prepared),
+                comment(
+                    20,
+                    terminal_comment(20, intent, prepared_id=10, published=published).body,
+                    second=terminal,
+                ),
+            ),
+            repository=REPO,
+            pr_number=PR,
+        )
+        record = comment(
+            handoff[0],
+            v2_handoff_comment(handoff[0], intent).body,
+            surface=f"issue#{ISSUE}",
+            second=handoff[1],
+        )
+        return resolve_handoff_lineage(
+            issue_view(record), lineage, repository=REPO, issue_number=ISSUE
+        )
+
+    # Same-second publication ordered by comment ID is accepted.
+    assert resolve((11, 7), prepared=7, terminal=7).comment_id == 11
+    for handoff in ((9, 9), (25, 25), (11, 3), (11, 50)):
+        with pytest.raises(WorkflowTransactionError) as excinfo:
+            resolve(handoff)
+        assert excinfo.value.code == "record-unordered"
