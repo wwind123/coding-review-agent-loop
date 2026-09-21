@@ -1317,6 +1317,57 @@ def test_every_other_difference_is_a_contradiction_that_writes_nothing():
     assert older.outcome == "contradiction"
 
 
+def test_flow_correction_to_or_from_the_approved_plan_flow_over_a_predecessor_is_obsolete():
+    # A correction across the approved-plan boundary always moves the plan
+    # hash between absent and present; with a committed predecessor that is one
+    # legitimate difference, the same delta plan_successor represents.
+    anchor = plan_record_comment(3)
+    planless = _head_advance(direct_intent())
+    to_plan = _inputs(planless, origin_flow=FLOW_APPROVED_PLAN, approved_plan_hash=PLAN_HASH)
+    gained = compare_prepared_intent(planless, to_plan, fresh_plan_anchor=anchor)
+    assert (gained.outcome, gained.abort_reason) == ("obsolete", ABORT_SUPERSEDED_INTENT)
+    assert {name for name, _b, _a in gained.differing_fields} == {
+        "origin_flow",
+        "approved_plan_hash",
+    }
+    assert successor_kind_for(direct_intent(), to_plan) == KIND_PLAN_REPLACEMENT
+    # The plan that appears must still authenticate.
+    unauthenticated = compare_prepared_intent(planless, to_plan)
+    assert unauthenticated.outcome == "contradiction"
+    assert "does not authenticate" in " ".join(unauthenticated.contradictions)
+    assert (
+        compare_prepared_intent(planless, to_plan, fresh_plan_anchor=object()).outcome
+        == "contradiction"
+    )
+
+    planned = _head_advance(plan_intent())
+    from_plan = _inputs(planned, origin_flow="issue-implementation", approved_plan_hash=None)
+    lost = compare_prepared_intent(planned, from_plan)
+    assert (lost.outcome, lost.abort_reason) == ("obsolete", ABORT_SUPERSEDED_INTENT)
+    # Together with a head change it is still one superseded intent.
+    moved = compare_prepared_intent(planned, replace(from_plan, head_sha=HEAD_1))
+    assert moved.abort_reason == ABORT_SUPERSEDED_INTENT
+
+    # Without a committed predecessor both directions stay contradictions,
+    # even when the appearing plan authenticates.
+    for stored, fresh in (
+        (direct_intent(), _inputs(direct_intent(), origin_flow=FLOW_APPROVED_PLAN, approved_plan_hash=PLAN_HASH)),
+        (plan_intent(), _inputs(plan_intent(), origin_flow="issue-implementation", approved_plan_hash=None)),
+    ):
+        result = compare_prepared_intent(stored, fresh, fresh_plan_anchor=anchor)
+        assert result.outcome == "contradiction" and result.abort_reason is None
+    # A predecessor does not excuse a plan-hash flip without a flow change
+    # (the intent model itself forbids that pairing) nor a real replacement
+    # that fails to order.
+    swapped = compare_prepared_intent(
+        planned,
+        _inputs(planned, approved_plan_hash="1" * 16),
+        stored_plan_anchor=plan_record_comment(9, "Replacement plan."),
+        fresh_plan_anchor=anchor,
+    )
+    assert swapped.outcome == "contradiction"
+
+
 def test_successor_kind_follows_the_fixed_precedence():
     committed = plan_intent(managed_ci_generation="g1", record_set=record_set(authorization=reissued(ENTRY_AUTHORIZATION)))
     assert successor_kind_for(committed, _inputs(committed)) is None

@@ -2752,7 +2752,9 @@ def compare_prepared_intent(
     Legitimate differences make the prepared transaction obsolete: a different
     live head, an authenticated strictly-later approved plan, a strict-superset
     closing contract with the same primary issue, a different managed-CI
-    generation, and an origin-flow correction over a committed predecessor.
+    generation, and an origin-flow correction over a committed predecessor
+    (including the absent/present plan-hash change that a correction to or from
+    the approved-plan flow necessarily carries).
     Every other difference is a contradiction: nothing may be written, not even
     an abort.
     """
@@ -2760,8 +2762,27 @@ def compare_prepared_intent(
     if not differing:
         return IntentComparison("current")
     contradictions: list[str] = []
+    flow_corrected = stored.predecessor_transaction_id is not None and any(
+        name == "origin_flow" for name, _b, _a in differing
+    )
     for name, _before, _after in differing:
         if name in {"head_sha", "managed_ci_generation"}:
+            continue
+        if (
+            name == "approved_plan_hash"
+            and flow_corrected
+            and (stored.approved_plan_hash is None) != (fresh.approved_plan_hash is None)
+        ):
+            # A flow correction to or from the approved-plan flow always moves
+            # the plan hash between absent and present; that is part of the
+            # correction, not a plan replacement.  There is no stored plan to
+            # order against, but a plan that appears must still authenticate.
+            if fresh.approved_plan_hash is not None and not isinstance(
+                fresh_plan_anchor, AuthenticatedComment
+            ):
+                contradictions.append(
+                    "approved_plan_hash: the corrected flow's plan does not authenticate"
+                )
             continue
         if name == "approved_plan_hash":
             if (
