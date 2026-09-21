@@ -1686,6 +1686,166 @@ runs. The checked-in
 `docs/evaluation/frozen_review_report.json` is regenerated from the fixture
 artifact and asserted by `tests/test_review_evaluation.py`.
 
+#### Review contract comparison
+
+Each run may also carry a `review_contract` label naming the reviewer prompt
+contract every review round of that run used. There are exactly two values:
+`first-finding-permitted`, the historical contract under which a reviewer could
+return after substantiating a single blocking defect, and `exhaustive`, the
+contract introduced with the reviewer exhaustiveness rule (see
+[Protocol](#protocol)). An absent key
+defaults to `first-finding-permitted`, mirroring the absent-`flow` default, so
+artifacts frozen before this dimension keep loading with an unchanged artifact
+hash. An explicitly present null, non-string, blank, or unknown value is
+rejected at load time and by direct evaluation, naming the run and the field,
+and the CLI exits non-zero without writing a report. The label is not part of
+run identity: duplicates are still detected per `(flow, policy, run_id)`.
+
+`review_contract_provenance` is an optional `{"source": ..., "verified": ...}`
+object recording the evidence for the label. A malformed object is rejected
+like any other provenance, and the object is rejected on a run that names no
+`review_contract`, because evidence cannot vouch for a label nobody wrote down.
+
+The JSON report gains an additive section per flow,
+`flows.<flow>.review_contracts.<contract>.policies.<policy>`. Runs are
+partitioned by flow, then review contract, then scheduling policy; both
+contracts and every policy the flow can run are always enumerated, so the shape
+is stable. Each `(flow, review_contract, policy)` cell carries `run_count`, the
+summed `review_rounds`, `reviewer_calls`, `coder_followup_rounds`, and
+`escaped_defects`, and the derived `review_rounds_per_run`,
+`reviewer_calls_per_run`, and `escaped_defects_per_run`. A cell value is
+`verified` only when every run in the cell has both the verified underlying
+measurement and verified `review_contract_provenance`. A run whose label was
+defaulted, or whose label provenance is absent or `verified: false`, makes
+every value of its cell `unavailable` with a reason naming the runs, so a
+mislabelled or unevidenced run can never yield a verified comparison. A cell
+with no runs is `unavailable` with the reason `no frozen runs for this review
+contract and policy`; nothing is estimated and an empty cell is never divided.
+The existing `flows.*.policies` rows and the top-level `policies` alias are
+unchanged by this section.
+
+The text report prints a `Review contract comparison (within scheduling
+policy)` block after each flow's policy rows. For every policy it lists the
+`first-finding-permitted` and `exhaustive` per-run values side by side, and it
+states that the before/after comparison is unavailable for that policy when
+either contract lacks a fully verified cell under it.
+
+Two reading rules apply:
+
+- Read the effect of the contract only within the same flow and the same
+  scheduling policy. Policies differ in reviewer calls, rounds, and escapes by
+  design, so comparing an `exhaustive` cell under one policy with a
+  `first-finding-permitted` cell under another would attribute a scheduling
+  effect to the prompt contract. For the same reason no pooled contract figure
+  is produced: there is no per-flow or cross-policy contract rollup.
+- Read rounds per run and reviewer calls per run together with escaped defects
+  per run. Fewer rounds are an improvement only if they were not bought with
+  missed defects.
+
+There are two checked-in artifact pairs, and they never mix:
+
+- `docs/evaluation/frozen_review_artifacts.json` with
+  `docs/evaluation/frozen_review_report.json` is the synthetic regression
+  fixture. Its runs are unlabeled, so they count in the
+  `first-finding-permitted` cell of their own policy with `unavailable` values.
+  It is never extended with real runs, so fixture records can neither pool into
+  a real baseline cell nor count toward its run minimum, and real data can
+  never break the fixture's pinned test values.
+- `docs/evaluation/review_contract_runs.json` with
+  `docs/evaluation/review_contract_report.json` is reserved for real
+  review-contract runs. It ships with an empty `runs` list, whose report has
+  every contract cell `unavailable`. `tests/test_review_evaluation.py` asserts
+  that the report equals regeneration and checks per-run invariants without
+  pinning any metric value, so data-only additions need no test edit.
+
+#### Freezing a real run
+
+Follow this procedure when adding a completed agent-loop run to
+`docs/evaluation/review_contract_runs.json`. It is a data-only change: do not
+edit the regression fixture, its report, the evaluator, or the tests.
+
+1. **Eligibility.** Freeze only completed runs. Every real run carries an
+   explicit `review_contract`; never rely on the absent-key default. A run
+   whose review rounds straddle the prompt change (for example a PR resumed
+   after the tool was upgraded) belongs to neither contract and must not be
+   frozen under either label.
+2. **Metrics.** Take the figures from the run's own records, not from memory:
+   `review_rounds` is the number of review rounds the orchestrator ran for the
+   PR or plan, as recorded by its per-round review comments and round
+   metadata; `reviewer_calls` is the number of reviewer invocations across
+   those rounds, one per reviewer log under `.agent-loop-logs/` (see
+   [Logs](#logs)), which under a selective policy is fewer than rounds times
+   reviewers; `coder_followup_rounds` is the number of coder follow-up turns
+   between reviews. Record `flow`, `policy`, and, for `primary-then-panel`,
+   `primary_reviewer` as the run was configured.
+3. **Metric and finding provenance.** Set the run-level `provenance` to
+   `{"source": "<where the figures were read>", "verified": true}` only when
+   the figures were checked against those records; otherwise set `verified:
+   false` or leave the run out. Never upgrade a run that could not be
+   verified. Set `label_provenance` the same way for the maintainer-triaged
+   finding `valid` labels. Provenance sources starting with `frozen-fixture:`
+   are reserved for the synthetic fixture and are rejected by the real-run
+   test.
+4. **Contract label evidence.** Record the evidence in
+   `review_contract_provenance.source`: either the tool commit used for every
+   review round of the run relative to the commit that merged the
+   exhaustiveness rule, or the captured reviewer prompt in the per-run agent
+   log showing the presence or absence of the rule in every round. Mark it
+   `verified: true` only when that evidence covers every review round.
+5. **Escaped defects.** Use a fixed escaped-defect observation window of 14
+   days after the run's PR merge, identical for both contracts. For a plan-flow
+   run the window is measured from the merge of the implementation PR produced
+   from the plan. Count only defects reported inside the window and traced to
+   the run's merged change, for historical baselines as well as new runs, so a
+   longer-exposed baseline is truncated to the same window and a just-merged
+   run is not credited with an unobserved zero. Always give the metric its own
+   `metric_provenance.escaped_defects` entry, whose `source` records the merge
+   date, the window end date, the observation date, and where defects were
+   searched (issues and PRs referencing the merged change); the real-run test
+   rejects a run that carries `escaped_defects` with only run-level
+   provenance. `escaped_defects` may be frozen as `verified: true` only after
+   the window has closed. Before that, either wait or freeze the entry with
+   `verified: false`, which the per-metric override reports as `unavailable`
+   and which makes only that cell's escaped-defect values unavailable while
+   rounds and calls stay verified. Do not report a comparison while the window
+   is still open for any run counted toward either contract.
+6. **Regenerate and check.**
+
+   ```bash
+   agent-loop review-evaluation docs/evaluation/review_contract_runs.json \
+     --output docs/evaluation/review_contract_report.json
+   python3 -m pytest tests/test_review_evaluation.py -q -p no:cacheprovider
+   ```
+
+A frozen run looks like this:
+
+```json
+{
+  "run_id": "pr-<number>",
+  "flow": "pr",
+  "policy": "primary-then-panel",
+  "primary_reviewer": "<reviewer>",
+  "review_contract": "exhaustive",
+  "review_contract_provenance": {
+    "source": "tool commit <sha> (after the rule merged in <sha>) for all review rounds",
+    "verified": true
+  },
+  "provenance": {"source": "PR <number> round metadata and .agent-loop-logs", "verified": true},
+  "label_provenance": {"source": "maintainer triage <date>", "verified": true},
+  "metric_provenance": {
+    "escaped_defects": {
+      "source": "merged <date>; window end <date>; observed <date>; searched issues and PRs referencing the merge",
+      "verified": true
+    }
+  },
+  "metrics": {"review_rounds": 0, "reviewer_calls": 0, "coder_followup_rounds": 0, "escaped_defects": 0},
+  "findings": []
+}
+```
+
+The zeros above are placeholders for the shape only; never freeze an invented
+or estimated measurement.
+
 The policy remains non-default until a separate frozen-history review shows
 severity-weighted marginal coverage justifies its latency and cost tradeoff.
 
@@ -3328,6 +3488,23 @@ A plan review uses `kind: "plan_review"`, `blocking_plan_issues`,
 `AGENT_STATE` or `AGENT_PLAN_STATE` footer. Blocking reviews must not hide
 current-round work in `future_followups`; approved reviews must not contain
 active blocking, Same-PR, Same-plan, or carried-forward active items.
+
+Reviews are exhaustive. The full and compact PR review prompts and the full and
+compact plan review prompts share one static rule: report every defect that can
+be independently substantiated on the reviewed head or plan, not only the
+first; substantiating one blocking defect does not end the review; and when a
+defect is found in a function, code path, or plan step, re-read that whole
+function or path and enumerate every other independently evidenced defect
+there as separate entries in the same response. Each entry still needs its own
+evidence, and speculation or padding with items the reviewer cannot evidence
+is forbidden. When a defect genuinely prevents the reviewer from evaluating
+the code or plan content behind it, the reviewer says so in that entry's text
+and in `summary`, naming what could not be evaluated, so the coder knows
+another round is expected; masking must not be claimed merely to stop early.
+The rule changes no response schema: masking is conveyed through the existing
+finding text and `summary`. Coder, discuss, repair, and decomposition prompts
+do not carry it. Its effect on rounds per run is measured with the
+[review contract comparison](#review-contract-comparison).
 
 Published prior-item dispositions put the current status immediately after the
 item ID, before evidence and the original finding:

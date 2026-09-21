@@ -749,6 +749,18 @@ opt-in and does not change the default or the CI/merge gates. Use
 independent severity-weighted coverage before any proposal to change the
 default; measurements without verified provenance are reported as unavailable.
 
+PR and plan reviewers are prompted to review exhaustively: every independently
+substantiated defect on the reviewed head or plan is reported in one response,
+defects in the same function or path are enumerated together, and a defect that
+genuinely masks what lies behind it is disclosed in the finding text and
+summary. `review-evaluation` measures that contract with an optional per-run
+`review_contract` label (`first-finding-permitted` or `exhaustive`) plus
+`review_contract_provenance`, and reports rounds, reviewer calls, and escaped
+defects per run side by side within each flow and scheduling policy, never
+pooled across policies. Real runs are frozen only into
+`docs/evaluation/review_contract_runs.json`; see
+[review contract comparison](docs/local_agent_loop.md#review-contract-comparison).
+
 ### Staged issue plan review
 
 The same staged idea is available for issue plan review, selected independently

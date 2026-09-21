@@ -705,3 +705,384 @@ def test_every_counted_run_belongs_to_exactly_one_policy_row_of_its_flow():
         row = report["flows"][flow]
         counted = sum(policy_row["run_count"] for policy_row in row["policies"].values())
         assert counted == row["run_count"]
+
+
+# --- Review contract dimension (#894) --------------------------------------
+
+REAL_RUN_ARTIFACTS = REPO_ROOT / "docs" / "evaluation" / "review_contract_runs.json"
+REAL_RUN_REPORT = REPO_ROOT / "docs" / "evaluation" / "review_contract_report.json"
+LABEL_EVIDENCE = {"source": "tool commit abc123 for every review round", "verified": True}
+CONTRACT_VALUE_KEYS = (
+    "review_rounds",
+    "reviewer_calls",
+    "coder_followup_rounds",
+    "escaped_defects",
+    "review_rounds_per_run",
+    "reviewer_calls_per_run",
+    "escaped_defects_per_run",
+)
+
+
+def _contract_run(run_id, policy, contract, *, rounds, calls, escaped=0, followups=1, **overrides):
+    run = _run(
+        run_id=run_id,
+        policy=policy,
+        review_contract=contract,
+        review_contract_provenance=LABEL_EVIDENCE,
+        metrics={
+            "review_rounds": rounds,
+            "reviewer_calls": calls,
+            "coder_followup_rounds": followups,
+            "escaped_defects": escaped,
+        },
+    )
+    run.update(overrides)
+    return run
+
+
+def _cell(report, contract, policy, flow="pr"):
+    return report["flows"][flow]["review_contracts"][contract]["policies"][policy]
+
+
+def _verified(value):
+    return {"value": value, "status": "verified"}
+
+
+def _stratified_runs():
+    return [
+        _contract_run("base-all-1", "all-reviewers", "first-finding-permitted", rounds=6, calls=18, escaped=1),
+        _contract_run("base-all-2", "all-reviewers", "first-finding-permitted", rounds=4, calls=12),
+        _contract_run("base-panel-1", "primary-then-panel", "first-finding-permitted", rounds=11, calls=13),
+        _contract_run("exh-all-1", "all-reviewers", "exhaustive", rounds=3, calls=9),
+        _contract_run("exh-panel-1", "primary-then-panel", "exhaustive", rounds=4, calls=6, escaped=1),
+        _contract_run("exh-panel-2", "primary-then-panel", "exhaustive", rounds=2, calls=4),
+        _contract_run("exh-panel-3", "primary-then-panel", "exhaustive", rounds=3, calls=5),
+    ]
+
+
+def test_absent_review_contract_defaults_without_verifying_and_leaves_policy_rows_identical(tmp_path):
+    legacy = [_run(run_id="legacy-1"), _run(run_id="legacy-2", policy="all-reviewers")]
+    loaded = load_frozen_artifacts(_write(tmp_path, legacy))
+    # A defaulted label is not written into the normalized run, so it stays
+    # distinguishable from an explicit one and the artifact hash is unchanged.
+    assert all("review_contract" not in run for run in loaded["runs"])
+    report = evaluate_frozen_artifacts(loaded)
+    labelled = [dict(run, review_contract="first-finding-permitted") for run in legacy]
+    labelled_report = evaluate_frozen_artifacts(load_frozen_artifacts(_write(tmp_path, labelled, "labelled.json")))
+    assert json.dumps(report["policies"], sort_keys=True) == json.dumps(labelled_report["policies"], sort_keys=True)
+    for flow in FLOWS:
+        assert json.dumps(report["flows"][flow]["policies"], sort_keys=True) == json.dumps(
+            labelled_report["flows"][flow]["policies"], sort_keys=True
+        )
+    for policy, run_id in (("primary-then-panel", "legacy-1"), ("all-reviewers", "legacy-2")):
+        cell = _cell(report, "first-finding-permitted", policy)
+        assert cell["run_count"] == 1
+        for key in CONTRACT_VALUE_KEYS:
+            assert cell[key]["status"] == "unavailable"
+            assert cell[key]["value"] is None
+            assert run_id in cell[key]["reason"]
+        other = "all-reviewers" if policy == "primary-then-panel" else "primary-then-panel"
+        assert run_id not in json.dumps(_cell(report, "first-finding-permitted", other))
+    for flow in FLOWS:
+        for policy in FLOW_POLICIES[flow]:
+            cell = _cell(report, "exhaustive", policy, flow)
+            assert cell["run_count"] == 0
+            for key in CONTRACT_VALUE_KEYS:
+                assert cell[key] == {
+                    "value": None,
+                    "status": "unavailable",
+                    "reason": "no frozen runs for this review contract and policy",
+                }
+
+
+def test_contract_cells_are_stratified_by_policy_and_never_pooled(tmp_path):
+    runs = _stratified_runs()
+    report = evaluate_frozen_artifacts(load_frozen_artifacts(_write(tmp_path, runs)))
+    assert report == evaluate_frozen_artifacts({"schema_version": 1, "runs": runs}) | {
+        "artifact_sha256": report["artifact_sha256"]
+    }
+
+    base_all = _cell(report, "first-finding-permitted", "all-reviewers")
+    assert base_all["run_count"] == 2
+    assert base_all["review_rounds"] == _verified(10)
+    assert base_all["reviewer_calls"] == _verified(30)
+    assert base_all["coder_followup_rounds"] == _verified(2)
+    assert base_all["escaped_defects"] == _verified(1)
+    assert base_all["review_rounds_per_run"] == _verified(5.0)
+    assert base_all["reviewer_calls_per_run"] == _verified(15.0)
+    assert base_all["escaped_defects_per_run"] == _verified(0.5)
+
+    base_panel = _cell(report, "first-finding-permitted", "primary-then-panel")
+    assert base_panel["run_count"] == 1
+    assert base_panel["review_rounds_per_run"] == _verified(11.0)
+    assert base_panel["reviewer_calls_per_run"] == _verified(13.0)
+
+    exh_all = _cell(report, "exhaustive", "all-reviewers")
+    assert exh_all["run_count"] == 1
+    assert exh_all["reviewer_calls_per_run"] == _verified(9.0)
+
+    exh_panel = _cell(report, "exhaustive", "primary-then-panel")
+    assert exh_panel["run_count"] == 3
+    assert exh_panel["review_rounds"] == _verified(9)
+    assert exh_panel["reviewer_calls"] == _verified(15)
+    assert exh_panel["review_rounds_per_run"] == _verified(3.0)
+    assert exh_panel["reviewer_calls_per_run"] == _verified(5.0)
+    assert exh_panel["escaped_defects_per_run"] == _verified(1 / 3)
+
+    # Shape: both contracts, every policy of the flow, and no rollup anywhere.
+    for flow in FLOWS:
+        section = report["flows"][flow]["review_contracts"]
+        assert set(section) == {"first-finding-permitted", "exhaustive"}
+        for contract_section in section.values():
+            assert set(contract_section) == {"policies"}
+            assert set(contract_section["policies"]) == set(FLOW_POLICIES[flow])
+    assert "selective-intermediate" not in report["flows"]["plan"]["review_contracts"]["exhaustive"]["policies"]
+    assert "review_contracts" not in report
+    assert set(report["flows"]["pr"]) == {"title", "run_count", "policies", "review_contracts"}
+
+    # Changing a run under one policy never changes another policy's cells.
+    changed = _stratified_runs()
+    changed[0]["metrics"]["reviewer_calls"] = 99
+    changed[0]["metrics"]["review_rounds"] = 50
+    changed_report = evaluate_frozen_artifacts({"schema_version": 1, "runs": changed})
+    assert _cell(changed_report, "first-finding-permitted", "all-reviewers") != base_all
+    for contract, policy in (
+        ("first-finding-permitted", "primary-then-panel"),
+        ("first-finding-permitted", "selective-intermediate"),
+        ("exhaustive", "all-reviewers"),
+        ("exhaustive", "primary-then-panel"),
+    ):
+        assert _cell(changed_report, contract, policy) == _cell(report, contract, policy)
+
+
+def test_pr_and_plan_contract_cells_never_pool():
+    runs = [
+        _contract_run("shared", "all-reviewers", "exhaustive", rounds=2, calls=6),
+        _contract_run("shared", "all-reviewers", "exhaustive", rounds=5, calls=20, flow="plan"),
+    ]
+    report = evaluate_frozen_artifacts({"schema_version": 1, "runs": runs})
+    assert _cell(report, "exhaustive", "all-reviewers", "pr")["reviewer_calls"] == _verified(6)
+    assert _cell(report, "exhaustive", "all-reviewers", "plan")["reviewer_calls"] == _verified(20)
+    assert _cell(report, "exhaustive", "all-reviewers", "pr")["run_count"] == 1
+    assert _cell(report, "exhaustive", "all-reviewers", "plan")["run_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "label_provenance",
+    [None, {"source": "unconfirmed recollection", "verified": False}],
+)
+def test_unevidenced_label_makes_only_its_own_cell_unavailable(label_provenance):
+    runs = _stratified_runs()
+    runs[4]["review_contract_provenance"] = label_provenance
+    if label_provenance is None:
+        del runs[4]["review_contract_provenance"]
+    report = evaluate_frozen_artifacts({"schema_version": 1, "runs": runs})
+    cell = _cell(report, "exhaustive", "primary-then-panel")
+    assert cell["run_count"] == 3
+    for key in CONTRACT_VALUE_KEYS:
+        assert cell[key]["status"] == "unavailable"
+        assert "exh-panel-1" in cell[key]["reason"]
+        assert "exh-panel-2" not in cell[key]["reason"]
+    assert _cell(report, "exhaustive", "all-reviewers")["reviewer_calls_per_run"] == _verified(9.0)
+    assert _cell(report, "first-finding-permitted", "primary-then-panel")["review_rounds_per_run"] == _verified(11.0)
+    text = render_evaluation_report(report, human=True).split("Frozen plan review policy evaluation")[0]
+    assert "before/after comparison unavailable for primary-then-panel: no fully verified cell under exhaustive" in text
+    assert "before/after comparison unavailable for all-reviewers" not in text
+
+
+def test_unverified_metric_provenance_makes_only_that_value_of_that_cell_unavailable():
+    runs = _stratified_runs()
+    runs[5]["metric_provenance"] = {
+        "escaped_defects": {"source": "merged 2026-09-20; 14-day window still open", "verified": False}
+    }
+    report = evaluate_frozen_artifacts({"schema_version": 1, "runs": runs})
+    cell = _cell(report, "exhaustive", "primary-then-panel")
+    for key in ("escaped_defects", "escaped_defects_per_run"):
+        assert cell[key]["status"] == "unavailable"
+        assert cell[key]["reason"].endswith("for runs: exh-panel-2")
+    assert cell["review_rounds_per_run"] == _verified(3.0)
+    assert cell["reviewer_calls_per_run"] == _verified(5.0)
+    assert cell["coder_followup_rounds"] == _verified(3)
+    assert _cell(report, "exhaustive", "all-reviewers")["escaped_defects_per_run"] == _verified(0.0)
+
+    # A run whose run-level provenance is unverified loses every value, again
+    # only in its own cell, and a partial sum is never reported as verified.
+    runs = _stratified_runs()
+    runs[1]["provenance"] = {"source": "hand-copied", "verified": False}
+    report = evaluate_frozen_artifacts({"schema_version": 1, "runs": runs})
+    cell = _cell(report, "first-finding-permitted", "all-reviewers")
+    for key in CONTRACT_VALUE_KEYS:
+        assert cell[key]["status"] == "unavailable"
+        assert cell[key]["reason"].endswith("for runs: base-all-2")
+    assert _cell(report, "exhaustive", "all-reviewers")["review_rounds_per_run"] == _verified(3.0)
+
+
+def test_text_report_compares_contracts_side_by_side_within_each_policy():
+    report = evaluate_frozen_artifacts({"schema_version": 1, "runs": _stratified_runs()})
+    text = render_evaluation_report(report, human=True)
+    assert text.count("Review contract comparison (within scheduling policy)") == len(FLOWS)
+    pr_text, plan_text = text.split("Frozen plan review policy evaluation")
+    assert pr_text.index("calls_avoided") < pr_text.index("Review contract comparison")
+    assert "  primary-then-panel (first-finding-permitted 1 runs, exhaustive 3 runs)" in pr_text
+    assert "    review_rounds_per_run: first-finding-permitted=11.0 | exhaustive=3.0" in pr_text
+    assert "    reviewer_calls_per_run: first-finding-permitted=15.0 | exhaustive=9.0" in pr_text
+    assert "before/after comparison unavailable for all-reviewers" not in pr_text
+    assert "before/after comparison unavailable for primary-then-panel" not in pr_text
+    # No run exists under selective-intermediate, or anywhere in the plan flow.
+    assert (
+        "before/after comparison unavailable for selective-intermediate: "
+        "no fully verified cell under first-finding-permitted, exhaustive"
+    ) in pr_text
+    assert "selective-intermediate" not in plan_text
+    assert "before/after comparison unavailable for all-reviewers" in plan_text
+
+    # A policy verified under only one contract is reported as not comparable.
+    one_sided = [run for run in _stratified_runs() if run["run_id"] != "exh-all-1"]
+    text = render_evaluation_report(
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": one_sided}), human=True
+    )
+    pr_text = text.split("Frozen plan review policy evaluation")[0]
+    assert "reviewer_calls_per_run: first-finding-permitted=15.0 | exhaustive=unavailable" in pr_text
+    assert "before/after comparison unavailable for all-reviewers: no fully verified cell under exhaustive" in pr_text
+
+
+@pytest.mark.parametrize("label", [None, "", "   ", 7, True, ["exhaustive"], "thorough"])
+def test_invalid_explicit_review_contract_is_rejected_at_load_direct_evaluation_and_cli(tmp_path, label):
+    run = _run(review_contract=label)
+    path = _write(tmp_path, [run])
+    with pytest.raises(AgentLoopError, match="review_contract"):
+        load_frozen_artifacts(path)
+    with pytest.raises(AgentLoopError, match="run 0.*review_contract"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [run]})
+    output = tmp_path / "report.json"
+    assert cli_main(["review-evaluation", str(path), "--output", str(output)]) == 1
+    assert not output.exists()
+
+
+def test_review_contract_label_is_normalized_and_not_part_of_run_identity(tmp_path):
+    loaded = load_frozen_artifacts(_write(tmp_path, [_run(review_contract="  Exhaustive ")]))
+    assert loaded["runs"][0]["review_contract"] == "exhaustive"
+    assert loaded["runs"][0]["review_contract_provenance"] is None
+    duplicate = [
+        _run(review_contract="exhaustive"),
+        _run(review_contract="first-finding-permitted"),
+    ]
+    with pytest.raises(AgentLoopError, match="repeat run ID"):
+        load_frozen_artifacts(_write(tmp_path, duplicate, "dup.json"))
+    with pytest.raises(AgentLoopError, match="repeat run ID"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": duplicate})
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    ["run-log", [], {"verified": True}, {"source": " ", "verified": True}, {"source": "log", "verified": "yes"}],
+)
+def test_malformed_review_contract_provenance_is_rejected(tmp_path, provenance):
+    run = _run(review_contract="exhaustive", review_contract_provenance=provenance)
+    with pytest.raises(AgentLoopError, match="review_contract provenance"):
+        load_frozen_artifacts(_write(tmp_path, [run]))
+    with pytest.raises(AgentLoopError, match="review_contract provenance"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [run]})
+
+
+def test_label_provenance_cannot_vouch_for_a_defaulted_label(tmp_path):
+    run = _run(review_contract_provenance=LABEL_EVIDENCE)
+    with pytest.raises(AgentLoopError, match="without an explicit review_contract"):
+        load_frozen_artifacts(_write(tmp_path, [run]))
+    with pytest.raises(AgentLoopError, match="without an explicit review_contract"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [run]})
+
+
+def test_fixture_runs_are_unlabelled_and_land_in_unavailable_baseline_cells():
+    raw = json.loads(FIXTURE_ARTIFACTS.read_text(encoding="utf-8"))
+    assert len(raw["runs"]) == 5
+    for run in raw["runs"]:
+        assert run["run_id"].startswith("historical-")
+        assert "review_contract" not in run
+        assert "review_contract_provenance" not in run
+    report = json.loads(FIXTURE_REPORT.read_text(encoding="utf-8"))
+    for flow in FLOWS:
+        for policy in FLOW_POLICIES[flow]:
+            baseline = _cell(report, "first-finding-permitted", policy, flow)
+            assert baseline["run_count"] == 1
+            assert _cell(report, "exhaustive", policy, flow)["run_count"] == 0
+            for contract in ("first-finding-permitted", "exhaustive"):
+                for key in CONTRACT_VALUE_KEYS:
+                    assert _cell(report, contract, policy, flow)[key]["status"] == "unavailable"
+
+
+def _real_run_invariant_violations(runs):
+    """Return every documented real-run invariant a raw run list breaks."""
+    violations = []
+    for index, run in enumerate(runs):
+        name = f"run {run.get('run_id', index)!r}"
+        if "review_contract" not in run:
+            violations.append(f"{name} has no explicit review_contract")
+        label = run.get("review_contract_provenance")
+        if not isinstance(label, dict) or not str(label.get("source") or "").strip():
+            violations.append(f"{name} has no review_contract_provenance source")
+        per_metric = run.get("metric_provenance") if isinstance(run.get("metric_provenance"), dict) else {}
+        sources = [run.get("provenance"), run.get("label_provenance"), label, *per_metric.values()]
+        if any(
+            isinstance(entry, dict) and str(entry.get("source") or "").strip().startswith("frozen-fixture:")
+            for entry in sources
+        ):
+            violations.append(f"{name} uses a frozen-fixture: provenance source")
+        metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+        if "escaped_defects" in metrics or "escaped_defects" in run:
+            escaped = per_metric.get("escaped_defects")
+            if not isinstance(escaped, dict) or not str(escaped.get("source") or "").strip():
+                violations.append(f"{name} has no metric_provenance.escaped_defects source")
+    return violations
+
+
+def test_real_run_pair_is_reproducible_and_every_real_run_meets_the_freezing_invariants(tmp_path):
+    """Pins no metric literal, so stage-2 data-only additions need no test edit."""
+    raw = json.loads(REAL_RUN_ARTIFACTS.read_text(encoding="utf-8"))
+    assert _real_run_invariant_violations(raw["runs"]) == []
+    fixture_ids = {run["run_id"] for run in json.loads(FIXTURE_ARTIFACTS.read_text(encoding="utf-8"))["runs"]}
+    assert not fixture_ids & {run.get("run_id") for run in raw["runs"]}
+
+    report = evaluate_frozen_artifacts(load_frozen_artifacts(REAL_RUN_ARTIFACTS))
+    assert report == json.loads(REAL_RUN_REPORT.read_text(encoding="utf-8"))
+    assert sum(report["flows"][flow]["run_count"] for flow in FLOWS) == len(raw["runs"])
+    output = tmp_path / "report.json"
+    assert cli_main(["review-evaluation", str(REAL_RUN_ARTIFACTS), "--output", str(output)]) == 0
+    assert output.read_text(encoding="utf-8") == REAL_RUN_REPORT.read_text(encoding="utf-8")
+
+    # A cell with no runs is unavailable; while the artifact is empty that is
+    # every cell, and later additions only ever fill their own cells.
+    for flow in FLOWS:
+        for contract in ("first-finding-permitted", "exhaustive"):
+            for policy in FLOW_POLICIES[flow]:
+                cell = _cell(report, contract, policy, flow)
+                if cell["run_count"] == 0:
+                    for key in CONTRACT_VALUE_KEYS:
+                        assert cell[key]["status"] == "unavailable"
+
+
+def test_real_run_invariants_accept_documented_runs_and_reject_shortcuts(tmp_path):
+    good = _contract_run(
+        "pr-893", "primary-then-panel", "first-finding-permitted", rounds=11, calls=13,
+        metric_provenance={
+            "escaped_defects": {
+                "source": "merged 2026-09-19; window end 2026-10-03; observed 2026-10-04; issues and PRs referencing the merge",
+                "verified": True,
+            }
+        },
+    )
+    assert _real_run_invariant_violations([good]) == []
+    assert _real_run_invariant_violations([]) == []
+    load_frozen_artifacts(_write(tmp_path, [good]))
+
+    defaulted = {key: value for key, value in good.items() if key != "review_contract"}
+    assert any("explicit review_contract" in item for item in _real_run_invariant_violations([defaulted]))
+    unevidenced = {key: value for key, value in good.items() if key != "review_contract_provenance"}
+    assert any("review_contract_provenance" in item for item in _real_run_invariant_violations([unevidenced]))
+    run_level_only = {key: value for key, value in good.items() if key != "metric_provenance"}
+    assert any("escaped_defects source" in item for item in _real_run_invariant_violations([run_level_only]))
+    synthetic = dict(good, provenance={"source": "frozen-fixture:historical", "verified": True})
+    assert any("frozen-fixture:" in item for item in _real_run_invariant_violations([synthetic]))
+    # A run that froze no escaped-defect metric needs no per-metric entry.
+    no_escape = dict(run_level_only, metrics={"review_rounds": 2, "reviewer_calls": 3})
+    assert _real_run_invariant_violations([no_escape]) == []
