@@ -925,6 +925,11 @@ def _merge_with_exact_head_proof(
     proof: ExactHeadCiProof,
 ) -> None:
     """Make the live-head read the final remote operation before merging."""
+    # A transaction-era PR merges only a head its committed workflow
+    # transaction binds; a legacy-era PR returns None and is unchanged (#827).
+    from .workflow_transaction_publication import require_merge_authority
+
+    require_merge_authority(runner, config, pr_number=pr_number, head_sha=proof.head_sha)
     # Fetch a fresh, minimal head as the final normal remote read. If GitHub
     # serves an inconsistent GraphQL projection while it is converging, fetch
     # the full live PR tuple and require that authoritative view to agree with

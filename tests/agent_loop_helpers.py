@@ -1142,6 +1142,50 @@ class FakeRunner(Runner):
             }
             return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
 
+        actor_login, actor_id = getattr(
+            self, "authenticated_actor", ("coding-review-agent-loop", 4242)
+        )
+        if cmd[:3] == ["gh", "api", "user"]:
+            return CommandResult(
+                cmd, cwd_path, json_dumps({"login": actor_login, "id": actor_id}), "", 0
+            )
+
+        rest_comments = re.search(
+            r"/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)$", cmd[2]
+        ) if cmd[:2] == ["gh", "api"] else None
+        if rest_comments is not None:
+            # The exhaustive authenticated comment read (#827): serve the same
+            # conversation the GraphQL-shaped payloads hold, in REST shape.
+            number, per_page, page = (int(group) for group in rest_comments.groups())
+            if number == self._pr_payload_for(str(number)).get("number"):
+                source = self._pr_payload_for(str(number)).get("comments", [])
+            else:
+                source = self._issue_comments_for(number)
+            rows = []
+            for index, comment in enumerate(source, start=1):
+                if "user" in comment:
+                    # Already REST-shaped (seeded from a transaction fixture).
+                    rows.append(comment)
+                    continue
+                login = (comment.get("author") or {}).get("login") or "ghost"
+                rows.append(
+                    {
+                        "id": index,
+                        "user": {
+                            "login": login,
+                            "id": actor_id if login == actor_login else 9000 + index,
+                        },
+                        # GitHub always stamps a comment; fixtures often omit it.
+                        "created_at": comment.get("createdAt")
+                        or f"2026-05-23T00:{index // 60:02d}:{index % 60:02d}Z",
+                        "body": comment.get("body", ""),
+                    }
+                )
+            start = (page - 1) * per_page
+            return CommandResult(
+                cmd, cwd_path, json_dumps(rows[start : start + per_page]), "", 0
+            )
+
         if cmd[:2] == ["gh", "api"] and "/issues/" in cmd[2]:
             match = re.search(r"/issues/(\d+)", cmd[2])
             number = int(match.group(1)) if match else None

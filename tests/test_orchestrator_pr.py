@@ -2931,6 +2931,143 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     ]
 
 
+def _m946_merge_runner(monkeypatch, tmp_path, *, boundary=None, live_head=None):
+    """A FakeRunner whose PR and issue carry a real workflow transaction (#946).
+
+    ``boundary`` interrupts the publication at that write, leaving a partial
+    transaction.  Returns the runner, the config, and the merged-head list.
+    """
+    from workflow_transaction_helpers import (
+        ACTOR, FAIL_BEFORE_WRITE, HEAD_1, ISSUE, PR, REPO, TransactionGitHub,
+    )
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        ORIGIN_DIRECT_ISSUE, TransitionRequest, publish_transition,
+    )
+
+    config = make_config(tmp_path, repo=REPO, auto_merge=True)
+    github = TransactionGitHub()
+    request = TransitionRequest(
+        repository=REPO, pr_number=PR, base="main", head_sha=HEAD_1,
+        origin_path=ORIGIN_DIRECT_ISSUE, expected_closing_issue_ids=(ISSUE,),
+        primary_issue=ISSUE,
+    )
+    if boundary is None:
+        publish_transition(github, config=config, request=request)
+    else:
+        github.fail_write(boundary, FAIL_BEFORE_WRITE)
+        with pytest.raises(AgentLoopError):
+            publish_transition(github, config=config, request=request)
+    head = live_head or HEAD_1
+    runner = FakeRunner(pr_payload={"number": PR, "headRefOid": head})
+    runner.authenticated_actor = ACTOR
+    runner.pr_payload["comments"] = list(github.threads.get(PR, []))
+    runner.issue_comments_by_number[ISSUE] = list(github.threads.get(ISSUE, []))
+    merged = []
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: merged.append(kwargs["expected_head_sha"])
+    )
+    monkeypatch.setattr(orchestrator, "get_pr_head_sha", lambda *args, **kwargs: head)
+    return runner, config, merged, PR, head
+
+
+def test_m946_merge_passes_the_gate_for_a_committed_transaction_at_the_exact_head(
+    monkeypatch, tmp_path
+):
+    runner, config, merged, pr, head = _m946_merge_runner(monkeypatch, tmp_path)
+
+    orchestrator._merge_with_exact_head_proof(
+        runner, config=config, pr_number=pr,
+        proof=orchestrator.ExactHeadCiProof(head_sha=head, source="ordinary"),
+    )
+
+    assert merged == [head]
+    # The gate is read-only: no comment was written on either surface.
+    assert not [c for c, _cwd in runner.commands if c[:3] in (["gh", "pr", "comment"], ["gh", "issue", "comment"])]
+
+
+@pytest.mark.parametrize("boundary", [2, 3, 4])
+def test_m946_merge_refuses_a_partial_transaction(monkeypatch, tmp_path, boundary):
+    """Prepared record (and later entries) exist but no committed record: no merge."""
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, merged, pr, head = _m946_merge_runner(
+        monkeypatch, tmp_path, boundary=boundary
+    )
+
+    with pytest.raises(WorkflowTransactionError):
+        orchestrator._merge_with_exact_head_proof(
+            runner, config=config, pr_number=pr,
+            proof=orchestrator.ExactHeadCiProof(head_sha=head, source="ordinary"),
+        )
+
+    assert merged == []
+
+
+def test_m946_merge_refuses_a_head_the_committed_transaction_does_not_bind(
+    monkeypatch, tmp_path
+):
+    from workflow_transaction_helpers import HEAD_2
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, merged, pr, head = _m946_merge_runner(
+        monkeypatch, tmp_path, live_head=HEAD_2
+    )
+
+    with pytest.raises(WorkflowTransactionError):
+        orchestrator._merge_with_exact_head_proof(
+            runner, config=config, pr_number=pr,
+            proof=orchestrator.ExactHeadCiProof(head_sha=head, source="ordinary"),
+        )
+
+    assert merged == []
+
+
+def test_m946_merge_refuses_a_deleted_committed_record_and_never_goes_legacy(
+    monkeypatch, tmp_path
+):
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, merged, pr, head = _m946_merge_runner(monkeypatch, tmp_path)
+    # The terminal (committed) record is the last PR-side write of the publication.
+    assert len(runner.pr_payload["comments"]) >= 2
+    runner.pr_payload["comments"] = runner.pr_payload["comments"][:-1]
+
+    with pytest.raises(WorkflowTransactionError):
+        orchestrator._merge_with_exact_head_proof(
+            runner, config=config, pr_number=pr,
+            proof=orchestrator.ExactHeadCiProof(head_sha=head, source="ordinary"),
+        )
+
+    assert merged == []
+
+
+def test_m946_legacy_pr_merge_passes_the_gate_with_no_write(monkeypatch, tmp_path):
+    """A legacy-era PR still merges: the gate returns None and only reads."""
+    runner = FakeRunner()
+    config = make_config(tmp_path, auto_merge=True)
+    gated = []
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    real = publication.require_merge_authority
+    monkeypatch.setattr(
+        publication, "require_merge_authority",
+        lambda *args, **kwargs: gated.append(real(*args, **kwargs)),
+    )
+    merged = []
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: merged.append(kwargs["expected_head_sha"])
+    )
+
+    orchestrator._merge_with_exact_head_proof(
+        runner, config=config, pr_number=77,
+        proof=orchestrator.ExactHeadCiProof(head_sha="abc123", source="ordinary"),
+    )
+
+    assert gated == [None]  # legacy era: the gate defers to today's checks
+    assert merged == ["abc123"]
+    assert not [c for c, _cwd in runner.commands if c[:3] in (["gh", "pr", "comment"], ["gh", "issue", "comment"])]
+
+
 @pytest.mark.parametrize("board", ["absent", "neutral", "skipped", "forbidden"])
 def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
     monkeypatch, tmp_path, board

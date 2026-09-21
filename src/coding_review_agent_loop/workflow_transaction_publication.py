@@ -2139,6 +2139,51 @@ def gate_canonical_issue_pr(
     return gated
 
 
+def require_merge_authority(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str,
+) -> CommittedTransaction | None:
+    """Gate a merge of exactly ``head_sha``.  Read-only.
+
+    Returns ``None`` for a legacy-era PR, whose merge keeps today's checks.  A
+    transaction-era PR merges only when its committed canonical transaction
+    binds ``head_sha``; a partial, deleted, or older-head transaction raises.
+    """
+    resolved = read_pr_transaction_views(runner, config, pr_number, None)
+    if resolved.era != ERA_TRANSACTION:
+        return None
+    state = resolved.lineage.latest_committed or resolved.lineage.pending
+    issue_number = state.intent.primary_issue if state is not None else None
+    views = resolved.views
+    plan_candidate_key = None
+    if state is not None and issue_number is not None:
+        views = _read_views(
+            runner,
+            config,
+            pr_number=pr_number,
+            issue_number=issue_number,
+            plan_issue_number=state.intent.plan_owning_issue,
+        )
+        plan_candidate_key = recover_checkpoint_candidate_key(
+            state.intent, views.plan_issue_view
+        )
+    # Imported here: the bound codec module imports ``managed_ci``.
+    from .managed_ci_bound_authorization import BoundAuthorizationCodec
+
+    return require_committed_transaction(
+        views,
+        repository=config.repo,
+        pr_number=pr_number,
+        issue_number=issue_number,
+        live_head=head_sha,
+        authorization_codec=BoundAuthorizationCodec(),
+        plan_candidate_key=plan_candidate_key,
+    )
+
+
 def _binding(handoff: ResolvedHandoff) -> PredecessorBinding:
     record = handoff.handoff
     assert isinstance(record, IssuePrHandoffMetadataV2) and handoff.transaction_id is not None
