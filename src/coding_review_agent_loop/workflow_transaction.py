@@ -485,7 +485,7 @@ def inherited(name: str, reference: CommentRef) -> RecordSetEntry:
 # Which entries each successor kind must reissue and which it must not.
 _KIND_MUST_REISSUE: dict[str, frozenset[str]] = {
     KIND_LEGACY_ROOT_CORRECTION: frozenset({ENTRY_HANDOFF, ENTRY_PR_CONTRACT}),
-    KIND_PLAN_REPLACEMENT: frozenset({ENTRY_HANDOFF}),
+    KIND_PLAN_REPLACEMENT: frozenset({ENTRY_HANDOFF, ENTRY_PR_CONTRACT}),
     KIND_FLOW_CORRECTION: frozenset({ENTRY_HANDOFF, ENTRY_PR_CONTRACT}),
     KIND_CLOSING_WIDENING: frozenset({ENTRY_HANDOFF, ENTRY_PR_CONTRACT}),
     KIND_MANAGED_CI_CONTINUITY: frozenset({ENTRY_AUTHORIZATION}),
@@ -652,6 +652,13 @@ class WorkflowTransition:
                 if entry.inherited.surface != expected_surface:
                     raise _fail(f"inherited {entry.name} names the wrong comment thread.")
             has_entry = entry.name != ENTRY_HANDOFF or self.origin_flow in _ISSUE_ORIGIN_FLOWS
+            if (
+                entry.name == ENTRY_PR_CONTRACT
+                and self.staged is not None
+                and entry.disposition == DISPOSITION_NOT_APPLICABLE
+            ):
+                # A staged child may be handoff-only on the PR side.
+                has_entry = False
             if (
                 has_entry
                 and entry.name in _KIND_MUST_REISSUE.get(kind, frozenset())
@@ -838,6 +845,7 @@ def derive_pr_contract(
         primary_issue_number=intent.primary_issue,
         supersession_kind=supersession_kind,
         supersedes_record_hash=supersedes_record_hash,
+        approved_plan_hash=intent.approved_plan_hash,
     )
 
 
@@ -1536,11 +1544,6 @@ def _validate_successor_delta(item: TransactionState, before: WorkflowTransition
                         sorted(field for field in names if name in _FIELD_AFFECTS[field])
                     ) + " changed"
                 )
-        elif name != ENTRY_AUTHORIZATION and disposition == DISPOSITION_REISSUED:
-            problems.append(
-                f"contradictory {name} in successor {item.transaction_id}: it is reissued "
-                "although no field it carries changed"
-            )
     if problems:
         raise _transaction_error(
             "A successor transaction's record set does not follow its changes relative to "
@@ -1824,7 +1827,21 @@ def select_scheduler_checkpoint(
             recovery_action=RECOVERY_RERUN_PLAN_REVIEW,
             code="scheduler-checkpoint-unmatched",
         )
-    chosen = min(candidates, key=lambda item: item.comment_id)
+    candidates.sort(key=lambda item: item.comment_id)
+    # "Earliest" is only meaningful when the candidates themselves are ordered
+    # under the shared rule; never guess between unordered checkpoints.
+    for first, second in zip(candidates, candidates[1:]):
+        if not is_strictly_later(first, second):
+            raise WorkflowTransactionError(
+                "Scheduler checkpoints for the approved plan cannot be ordered",
+                problems=(
+                    f"unordered scheduler checkpoints in comments {first.comment_id} and "
+                    f"{second.comment_id}",
+                ),
+                recovery_action=RECOVERY_OPERATOR_REVIEW,
+                code="scheduler-checkpoint-unordered",
+            )
+    chosen = candidates[0]
     return SchedulerCheckpointRef(
         reference=CommentRef(view.surface, chosen.comment_id, round_metadata_digest(chosen))
     )
@@ -2097,6 +2114,21 @@ def validate_legacy_root(
             f"contradictory origin-evidence comment {evidence_comment.comment_id}: its head "
             f"{record.metadata.subject} is not a commit of PR #{intent.pr_number}"
         )
+    # Every plan-carrying reviewer record vouches for the plan identity, so
+    # each one's reviewed head must belong to this PR, not only the named one.
+    strays = [
+        (item, comment)
+        for item, comment in carrying
+        if item.metadata.subject not in set(pr_commit_shas)
+    ]
+    if strays:
+        raise refuse(
+            "; ".join(
+                f"contradictory plan-carrying round-metadata comment {comment.comment_id}: its "
+                f"head {item.metadata.subject} is not a commit of PR #{intent.pr_number}"
+                for item, comment in strays
+            )
+        )
     if not is_strictly_later(anchor.comment, evidence_comment):
         raise refuse(
             f"unordered origin-evidence comment {evidence_comment.comment_id}: it is not "
@@ -2341,6 +2373,17 @@ def _check_contract_supersession(
             raise refuse(
                 f"contradictory contract: it differs from comment {previous.comment_id} "
                 "without declaring a supersession"
+            )
+        # Same flow and scope: only the plan identity may differ, and only a
+        # committed plan replacement may change it.
+        if (
+            getattr(prior, "approved_plan_hash", None) != new.approved_plan_hash
+            and isinstance(prior, PrExpectedClosingContractV2)
+            and state.intent.successor_kind != KIND_PLAN_REPLACEMENT
+        ):
+            raise refuse(
+                f"contradictory contract: its plan hash differs from comment "
+                f"{previous.comment_id} outside a plan replacement"
             )
         return
     if new.supersedes_record_hash != previous.record_hash:
@@ -2826,7 +2869,8 @@ _FIELD_KIND: dict[str, str] = {
     "head_sha": KIND_HEAD_ADVANCE,
 }
 _FIELD_AFFECTS: dict[str, frozenset[str]] = {
-    "approved_plan_hash": frozenset({ENTRY_HANDOFF}),
+    # Both surface records carry the plan identity.
+    "approved_plan_hash": frozenset({ENTRY_HANDOFF, ENTRY_PR_CONTRACT}),
     "origin_flow": frozenset({ENTRY_HANDOFF, ENTRY_PR_CONTRACT}),
     "expected_closing_issue_ids": frozenset({ENTRY_HANDOFF, ENTRY_PR_CONTRACT}),
     "managed_ci_generation": frozenset({ENTRY_AUTHORIZATION}),

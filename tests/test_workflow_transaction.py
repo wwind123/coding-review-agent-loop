@@ -158,7 +158,7 @@ def test_handoff_and_contract_derive_from_one_intent_and_cannot_disagree(intent)
 
     assert handoff.flow == contract.origin_flow == intent.origin_flow
     assert handoff.issue_number == contract.primary_issue_number == intent.primary_issue
-    assert handoff.plan_hash == intent.approved_plan_hash
+    assert handoff.plan_hash == contract.approved_plan_hash == intent.approved_plan_hash
     assert (
         handoff.expected_closing_issue_ids
         == contract.expected_closing_issue_ids
@@ -898,6 +898,29 @@ def test_checkpoint_with_greater_id_but_earlier_timestamp_is_unordered_failure()
     assert excinfo.value.code == "scheduler-checkpoint-unordered"
 
 
+def test_matching_checkpoints_that_cannot_be_ordered_among_themselves_stop_the_selector():
+    # Both are later than the anchor, but the second has a greater ID and an
+    # earlier timestamp than the first: there is no "earliest" to bind.
+    view = issue_view(
+        plan_record_comment(3, second=1),
+        scheduler_comment(4, second=50),
+        scheduler_comment(8, second=20, round_number=2),
+    )
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _select(view)
+    assert excinfo.value.code == "scheduler-checkpoint-unordered"
+    assert "comments 4 and 8" in str(excinfo.value)
+    # Same-second checkpoints are ordered by ID, and a non-matching record in
+    # between is not part of the comparison.
+    ordered = issue_view(
+        plan_record_comment(3, second=1),
+        scheduler_comment(4, second=50),
+        scheduler_comment(6, EARLIER_PLAN, second=2),
+        scheduler_comment(8, second=50, round_number=2),
+    )
+    assert _select(ordered).reference.comment_id == 4
+
+
 def test_absence_reasons_are_mechanical_and_identical_for_both_schedulerless_histories():
     assert (
         select_scheduler_checkpoint(None, origin_flow="issue-implementation").absence_reason
@@ -1126,6 +1149,36 @@ def test_legacy_root_with_authenticated_pr_round_metadata_evidence_validates():
 def test_reviewer_records_for_different_heads_that_agree_on_the_plan_still_match():
     intent, pr, plan = _legacy_state(extra_pr=(pr_review_comment(108, head=HEAD_2),))
     _validate(intent, pr, plan)
+
+
+def test_every_plan_carrying_reviewer_record_must_name_a_commit_of_the_pr():
+    # The selected evidence is valid, but a second agreeing reviewer record
+    # reviewed a head that is not a commit of this PR.
+    stray = "c" * 40
+    intent, pr, plan = _legacy_state(extra_pr=(pr_review_comment(108, head=stray),))
+    with pytest.raises(WorkflowTransactionError) as excinfo:
+        _validate(intent, pr, plan)
+    assert excinfo.value.code == "legacy-root-invalid"
+    message = str(excinfo.value)
+    assert "plan-carrying round-metadata comment 108" in message
+    assert f"head {stray} is not a commit of PR" in message
+    assert "origin-evidence comment 107" not in message
+    # The same record is fine once its head belongs to the PR, and a record
+    # without plan identity is outside the rule.
+    _validate(intent, pr, plan, commits=(HEAD_1, HEAD_2, stray))
+    intent, pr, plan = _legacy_state(
+        extra_pr=(pr_review_comment(108, head=stray, plan_hash=None, plan_subject=None),)
+    )
+    _validate(intent, pr, plan)
+    # Lineage resolution applies the same rule through the legacy-root context.
+    intent, pr, plan = _legacy_state(extra_pr=(pr_review_comment(108, head=stray),))
+    with pytest.raises(WorkflowTransactionError, match="comment 108"):
+        resolve_transaction_lineage(
+            pr_view(*pr.authored, prepared_comment(110, intent)),
+            repository=REPO,
+            pr_number=PR,
+            legacy_root_context=LegacyRootContext(plan, (HEAD_1, HEAD_2)),
+        )
 
 
 def test_same_second_evidence_with_a_greater_comment_id_matches():
@@ -1450,7 +1503,8 @@ def test_planned_successor_reissues_affected_entries_and_inherits_the_rest():
     assert replacement.successor_kind == KIND_PLAN_REPLACEMENT
     assert replacement.scheduler_checkpoint == fresh_checkpoint
     assert replacement.entry(ENTRY_HANDOFF).disposition == "reissued"
-    assert replacement.entry(ENTRY_PR_CONTRACT).inherited == effective[ENTRY_PR_CONTRACT]
+    # Both surface records carry the plan hash, so both are reissued.
+    assert replacement.entry(ENTRY_PR_CONTRACT).disposition == "reissued"
 
     flow = plan_successor(
         direct_intent(),
@@ -1522,17 +1576,48 @@ def _mixed_successor_chain(contract_entry):
 
 
 def test_mixed_successor_cannot_inherit_an_entry_a_lower_precedence_change_affects():
-    # The winning kind only obliges the handoff; the closing change still
-    # obliges the PR contract, which would otherwise keep the old closing IDs.
-    _base, mixed, prs, issues = _mixed_successor_chain(
-        inherited(ENTRY_PR_CONTRACT, CommentRef(PR_SURFACE, 12, DIGEST))
+    # The winning kind (closing widening) only obliges the two surface records;
+    # the managed-CI generation change still obliges the bound authorization.
+    base = direct_intent(
+        managed_ci_generation="g1",
+        record_set=record_set(authorization=reissued(ENTRY_AUTHORIZATION)),
     )
-    assert successor_kind_for(_base, TransitionInputs.of(mixed)) == KIND_PLAN_REPLACEMENT
+    mixed = replace(
+        base,
+        expected_closing_issue_ids=(ISSUE, 900),
+        managed_ci_generation="g2",
+        successor_kind=KIND_CLOSING_WIDENING,
+        predecessor_transaction_id=base.transaction_id,
+        record_set=record_set(
+            authorization=inherited(ENTRY_AUTHORIZATION, CommentRef(PR_SURFACE, 14, DIGEST)),
+            coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND),
+        ),
+    )
+    assert successor_kind_for(base, TransitionInputs.of(mixed)) == KIND_CLOSING_WIDENING
+    comments = [
+        prepared_comment(10, base),
+        terminal_comment(
+            20,
+            base,
+            prepared_id=10,
+            published={
+                ENTRY_HANDOFF: 11,
+                ENTRY_PR_CONTRACT: 12,
+                ENTRY_AUTHORIZATION: 14,
+                ENTRY_INITIAL_CODER_ROUND: 13,
+            },
+        ),
+        prepared_comment(30, mixed),
+    ]
     with pytest.raises(WorkflowTransactionError) as excinfo:
-        resolve_transaction_lineage(prs, repository=REPO, pr_number=PR)
+        _resolve(*comments)
     assert excinfo.value.code == "successor-disposition-mismatch"
-    assert "pr-expected-closing-contract" in str(excinfo.value)
-    assert "expected_closing_issue_ids changed" in str(excinfo.value)
+    assert "managed-ci-authorization" in str(excinfo.value)
+    assert "managed_ci_generation changed" in str(excinfo.value)
+    # A plan replacement that keeps the old PR contract is refused by the
+    # intent model itself: both surface records carry the plan hash.
+    with pytest.raises(AgentLoopError, match="must reissue pr-expected-closing-contract"):
+        _mixed_successor_chain(inherited(ENTRY_PR_CONTRACT, CommentRef(PR_SURFACE, 12, DIGEST)))
 
 
 def test_mixed_successor_reissuing_every_affected_entry_agrees_on_both_surfaces():
@@ -1548,25 +1633,7 @@ def test_mixed_successor_reissuing_every_affected_entry_agrees_on_both_surfaces(
         == tuple(handoff.handoff.expected_closing_issue_ids)
         == (ISSUE, 900)
     )
-    assert handoff.handoff.plan_hash == "1" * 16
-
-
-def test_successor_cannot_reissue_a_publicly_visible_entry_no_changed_field_affects():
-    base, comments = _committed_initial(
-        plan_intent(scheduler_checkpoint=SchedulerCheckpointRef(CommentRef(ISSUE_SURFACE, 4, DIGEST)))
-    )
-    replacement = replace(
-        base,
-        approved_plan_hash="1" * 16,
-        scheduler_checkpoint=SchedulerCheckpointRef(CommentRef(ISSUE_SURFACE, 40, DIGEST)),
-        successor_kind=KIND_PLAN_REPLACEMENT,
-        predecessor_transaction_id=base.transaction_id,
-        record_set=record_set(coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND)),
-    )
-    with pytest.raises(WorkflowTransactionError) as excinfo:
-        _resolve(*comments, prepared_comment(30, replacement))
-    assert excinfo.value.code == "successor-disposition-mismatch"
-    assert "no field it carries changed" in str(excinfo.value)
+    assert handoff.handoff.plan_hash == contract.contract.approved_plan_hash == "1" * 16
 
 
 def test_successor_must_inherit_the_predecessors_scheduler_checkpoint_unchanged():

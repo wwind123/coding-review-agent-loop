@@ -492,7 +492,11 @@ def test_forged_and_contradictory_v2_contracts_never_count():
     tampered = comment(
         12,
         format_pr_contract_v2_comment(
-            replace(derive_pr_contract(base), origin_flow=FLOW_APPROVED_PLAN)
+            replace(
+                derive_pr_contract(base),
+                origin_flow=FLOW_APPROVED_PLAN,
+                approved_plan_hash=PLAN_HASH,
+            )
         ),
     )
     with pytest.raises(WorkflowTransactionError, match="disagrees with its transaction intent"):
@@ -509,6 +513,86 @@ def test_contract_lineage_rejects_an_unauthenticated_snapshot():
     with pytest.raises(AgentLoopError, match="only an authenticated comment view"):
         resolve_pr_contract_lineage(snapshot, None, repository=REPO, pr_number=PR)
     assert isinstance(_v2(), PrExpectedClosingContractV2)
+
+
+def test_v2_contract_carries_the_plan_hash_exactly_for_the_approved_plan_flow():
+    planned = _v2(origin_flow=FLOW_APPROVED_PLAN, approved_plan_hash=PLAN_HASH)
+    assert decode_pr_contract_v2(encode_pr_contract_v2(planned)) == planned
+    assert planned.approved_plan_hash == PLAN_HASH
+    assert f"Plan hash: {PLAN_HASH}" in format_pr_contract_v2_comment(planned)
+    assert _v2().approved_plan_hash is None
+    assert "Plan hash" not in format_pr_contract_v2_comment(_v2())
+    # The hash is part of the full record hash, so a replacement is a new record.
+    assert pr_contract_record_hash(planned) != pr_contract_record_hash(
+        _v2(origin_flow=FLOW_APPROVED_PLAN, approved_plan_hash="1" * 16)
+    )
+    for bad in (
+        dict(origin_flow=FLOW_APPROVED_PLAN),
+        dict(origin_flow=FLOW_APPROVED_PLAN, approved_plan_hash="B" * 16),
+        dict(origin_flow=FLOW_APPROVED_PLAN, approved_plan_hash="b" * 15),
+        dict(origin_flow=FLOW_APPROVED_PLAN, approved_plan_hash=7),
+        dict(approved_plan_hash=PLAN_HASH),
+        dict(origin_flow="direct-pr", primary_issue_number=None, approved_plan_hash=PLAN_HASH),
+    ):
+        with pytest.raises(AgentLoopError, match="approved_plan_hash"):
+            _v2(**bad)
+    # A payload without the field is not a version-2 contract at all.
+    import base64
+    import json
+
+    encoded = encode_pr_contract_v2(planned)
+    payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    del payload["approved_plan_hash"]
+    stripped = base64.urlsafe_b64encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    with pytest.raises(AgentLoopError):
+        decode_pr_contract_v2(stripped)
+
+
+def _plan_replacement_chain(*, contract_intent=None, kind=None):
+    """Committed approved-plan initial, then a hash-to-hash plan replacement."""
+    base = plan_intent()
+    successor = plan_intent(
+        approved_plan_hash="1" * 16,
+        successor_kind=KIND_PLAN_REPLACEMENT,
+        predecessor_transaction_id=base.transaction_id,
+        record_set=record_set(coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND)),
+    )
+    comments = [
+        prepared_comment(10, base),
+        v2_contract_comment(12, base),
+        terminal_comment(
+            20,
+            base,
+            prepared_id=10,
+            published={ENTRY_HANDOFF: 11, ENTRY_PR_CONTRACT: 12, ENTRY_INITIAL_CODER_ROUND: 13},
+        ),
+        prepared_comment(30, successor),
+        v2_contract_comment(32, contract_intent or successor),
+        terminal_comment(
+            40, successor, prepared_id=30, published={ENTRY_HANDOFF: 31, ENTRY_PR_CONTRACT: 32}
+        ),
+    ]
+    return base, successor, comments
+
+
+def test_plan_replacement_reissues_the_pr_contract_with_the_new_plan_hash():
+    base, successor, comments = _plan_replacement_chain()
+    assert _resolve(*comments[:3]).contract.approved_plan_hash == PLAN_HASH
+    resolved = _resolve(*comments)
+    assert resolved.comment_id == 32 and resolved.transaction_id == successor.transaction_id
+    assert resolved.contract.approved_plan_hash == "1" * 16
+    assert resolved.contract.supersession_kind is None
+    # The model itself refuses a plan replacement that keeps the old contract.
+    with pytest.raises(AgentLoopError, match="must reissue pr-expected-closing-contract"):
+        replace(
+            successor,
+            record_set=record_set(
+                contract=inherited(ENTRY_PR_CONTRACT, CommentRef(PR_SURFACE, 12, DIGEST)),
+                coder_round=not_applicable(ENTRY_INITIAL_CODER_ROUND),
+            ),
+        )
 
 
 # --- review round 1: canonical wire form ---------------------------------------
