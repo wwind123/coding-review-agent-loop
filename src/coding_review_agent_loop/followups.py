@@ -21,6 +21,7 @@ from .github import (
 from .issue_body_limits import BoundedSection, fit_github_body
 from .logging import log
 from .protocol import ApprovedFollowup, UnresolvedReviewItem
+from .round_state import find_approved_plan_comment_id
 from .round_transport import MAX_GITHUB_BODY_CHARS
 from .runner import Runner
 from .protocol_markers import TrustedBody, sanitize_historical_text
@@ -1464,6 +1465,62 @@ def _bounded_approved_plan_text(approved_plan: str, *, budget: int | None) -> st
     return f"{approved_plan[:keep].rstrip()}\n\n{PLAN_SUMMARY_TRUNCATION_NOTICE}"
 
 
+_PLAN_STEPS_HEADING = "### Plan steps"
+_PLAN_STEP_LINE_RE = re.compile(r"^(?P<number>\d+)\.[ \t]+(?P<text>.*)$")
+_PLAN_SECTION_START_RE = re.compile(r"^(?:#{1,3}[ \t]|<!--)")
+_PLAN_STEP_SUMMARY_CHARS = 160
+
+
+def _summarize_approved_plan_steps(approved_plan: str, *, plan_comment_url: str | None) -> str:
+    """Replace the verbatim ``### Plan steps`` block with a short digest (#941).
+
+    The planner's round comment already renders every step in full, and plan
+    recovery reads round metadata rather than this announcement, so the
+    announcement keeps only the step count, one clipped line per step, and a
+    pointer to the planner comment.  Plans without a canonical steps block
+    (free-form plans) are returned unchanged.
+    """
+    lines = approved_plan.split("\n")
+    for heading_index, line in enumerate(lines):
+        if line.rstrip() != _PLAN_STEPS_HEADING:
+            continue
+        cursor = heading_index + 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+        if cursor >= len(lines) or not lines[cursor].startswith("1. "):
+            continue
+        steps: list[str] = []
+        end = cursor
+        while end < len(lines):
+            current = lines[end]
+            match = _PLAN_STEP_LINE_RE.match(current)
+            if match is not None and int(match.group("number")) == len(steps) + 1:
+                steps.append(match.group("text").strip())
+            elif _PLAN_SECTION_START_RE.match(current):
+                break
+            end += 1
+        while end > cursor and not lines[end - 1].strip():
+            end -= 1
+        pointer = (
+            f"[the planner's plan comment]({plan_comment_url})"
+            if plan_comment_url
+            else "the planner's plan comment on this issue"
+        )
+        noun = "step" if len(steps) == 1 else "steps"
+        digest = [
+            f"{_PLAN_STEPS_HEADING} (summary)",
+            "",
+            f"{len(steps)} {noun}; the full text of each is in {pointer}.",
+            "",
+        ]
+        for number, text in enumerate(steps, start=1):
+            if len(text) > _PLAN_STEP_SUMMARY_CHARS:
+                text = text[: _PLAN_STEP_SUMMARY_CHARS - 1].rstrip() + "…"
+            digest.append(f"{number}. {text}")
+        return "\n".join([*lines[:heading_index], *digest, *lines[end:]])
+    return approved_plan
+
+
 def _format_plan_approval_summary_with_followups(
     issue_number: int,
     approved_plan: str,
@@ -1628,10 +1685,20 @@ def _publish_plan_approved_followups(
                 if publication.status in {"created", "uncertain"} and publication.issue_url
             ]
 
+    # The planner comment carries the steps in full, so the announcement only
+    # summarizes them and links there (#941).
+    plan_comment_id = find_approved_plan_comment_id(issue_comments, expected_hash=plan_hash)
+    plan_comment_url = (
+        f"{_issue_url(config.repo, issue_number)}#issuecomment-{plan_comment_id}"
+        if plan_comment_id is not None
+        else None
+    )
     # The approved plan is a re-rendered historical GitHub artifact.  Its
     # encoded plan metadata may contain durable records, but those records are
     # not newly authorized by this follow-up comment.
-    rendered_plan = sanitize_historical_text(approved_plan)
+    rendered_plan = sanitize_historical_text(
+        _summarize_approved_plan_steps(approved_plan, plan_comment_url=plan_comment_url)
+    )
 
     def _render(plan_char_budget: int | None) -> str:
         return _append_plan_approved_followups_marker(

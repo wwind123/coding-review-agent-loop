@@ -3181,6 +3181,36 @@ def _legacy_freeform_plan_candidates(record: PostedRoundRecord) -> tuple[str, ..
     return tuple(dict.fromkeys(spaced_candidates))
 
 
+def find_approved_plan_comment_id(
+    comments: Sequence[object],
+    *,
+    expected_hash: str,
+) -> int | None:
+    """Return the id of the latest planner comment carrying the approved plan.
+
+    Presentation only (#941): the approval announcement links here instead of
+    repeating the plan steps.  Any lookup failure yields ``None`` so the
+    announcement degrades to an unlinked pointer rather than failing.
+    """
+    try:
+        records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError:
+        return None
+    for record in reversed(records):
+        if record.metadata.role != "coder":
+            continue
+        raw = record.metadata.canonical_plan or record.metadata.raw_structured_coder_response
+        candidates = (raw,) if raw is not None else _legacy_freeform_plan_candidates(record)
+        if not any(
+            candidate and _approved_plan_hash(candidate) == expected_hash
+            for candidate in candidates
+        ):
+            continue
+        comment_id = getattr(comments[record.index], "comment_id", None)
+        return comment_id if isinstance(comment_id, int) else None
+    return None
+
+
 def recover_approved_plan_context(
     comments: Sequence[object],
     *,

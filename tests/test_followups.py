@@ -637,3 +637,101 @@ def test_oversized_plan_followup_update_notes_alone_are_shortened():
     for group in range(len(notes)):
         assert f"Update {group} line 0:" in body
     assert body.count("canonical plan comment") >= len(notes)
+
+
+def _capturing_runner(posted: list[str]):
+    class _CapturingRunner(FakeRunner):
+        def run(self, args, **kwargs):  # type: ignore[override]
+            if "comment" in args and "--body-file" in args:
+                path = args[args.index("--body-file") + 1]
+                posted.append(open(path, encoding="utf-8").read())
+            return super().run(args, **kwargs)
+
+    return _CapturingRunner()
+
+
+def test_approved_plan_announcement_summarizes_steps_and_links_planner_comment(tmp_path):
+    """#941: the announcement must not repeat the planner's steps verbatim."""
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.followups import _publish_plan_approved_followups
+    from coding_review_agent_loop.github import IssueComment
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
+
+    long_step = "Rework the renderer so " + "the long detail " * 40
+    approved_plan = "\n".join(
+        [
+            "Approved plan summary.",
+            "",
+            "### Plan steps",
+            f"1. {long_step}",
+            "2. Add regression tests.",
+            "   Continuation detail that only the planner comment carries.",
+            "",
+            "### Execution strategy recommendation (v1)",
+            "- strategy: one-shot",
+        ]
+    )
+    plan_hash = approved_plan_hash(approved_plan)
+    planner_body = _attach_round_metadata(
+        "## Revised plan\n\n" + approved_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=2,
+            subject="subject-941",
+            canonical_plan=approved_plan,
+        ),
+    )
+    comments = [
+        IssueComment(author="bot", created_at=None, body="unrelated", comment_id=11),
+        IssueComment(author="bot", created_at=None, body=planner_body, comment_id=5755997542),
+    ]
+    posted: list[str] = []
+    config = make_config(tmp_path, approved_followups="summarize")
+
+    assert _publish_plan_approved_followups(
+        _capturing_runner(posted),
+        config=config,
+        issue_number=941,
+        approved_plan=approved_plan,
+        plan_hash=plan_hash,
+        plan_subject="subject-941",
+        issue_comments=comments,
+        sources=[],
+        source_context=_source(parent=941),
+        allow_issue_filing=False,
+    )
+
+    body = posted[-1]
+    assert body.startswith("Planning complete for issue #941.")
+    assert "Approved plan summary." in body
+    assert "### Plan steps (summary)" in body
+    assert "\n### Plan steps\n" not in body
+    assert long_step not in body
+    assert "Continuation detail" not in body
+    assert "2 steps; the full text of each is in [the planner's plan comment](" in body
+    assert (
+        f"https://github.com/{config.repo}/issues/941#issuecomment-5755997542" in body
+    )
+    assert "\n2. Add regression tests.\n" in body
+    # Sections after the steps are kept intact.
+    assert "### Execution strategy recommendation (v1)\n- strategy: one-shot" in body
+    assert "AGENT_PLAN_APPROVED_FOLLOWUPS" in body
+
+
+def test_approved_plan_step_summary_without_planner_comment_or_steps():
+    from coding_review_agent_loop.followups import _summarize_approved_plan_steps
+
+    plan = "Summary.\n\n### Plan steps\n\n1. Only step.\n\n### Risk-based mode and transition test matrix\nrow"
+    summarized = _summarize_approved_plan_steps(plan, plan_comment_url=None)
+    assert summarized == (
+        "Summary.\n\n### Plan steps (summary)\n\n"
+        "1 step; the full text of each is in the planner's plan comment on this issue.\n\n"
+        "1. Only step.\n\n### Risk-based mode and transition test matrix\nrow"
+    )
+    freeform = "A free-form plan with no canonical steps block."
+    assert _summarize_approved_plan_steps(freeform, plan_comment_url=None) == freeform
