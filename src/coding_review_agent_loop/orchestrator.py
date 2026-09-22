@@ -14627,20 +14627,23 @@ def _require_complete_canonical_plan_approval(
     staged policy splits approvals across rounds by construction (the primary
     approves, then the panel approves while the primary is paused), so the
     union of qualifying exact-key approvals carried from the whole planning
-    history is consulted instead — the same carry the final planning gate
+    history is always consulted instead — the same carry the final planning gate
     uses.  A reviewer whose latest record for the exact plan is not an
     approval still leaves the set incomplete (#962).
     """
     configured_names = {agent_display_name(reviewer) for reviewer in reviewers(config)}
-    round_approved = {
-        record.metadata.agent
-        for record in plan_round.completed_reviews
-        if record.metadata.state == "approved"
-    }
-    if round_approved == configured_names:
-        return
     if not plan_policy_capabilities(config.plan_review_policy).scheduler_enabled:
-        raise AgentLoopError(error_message)
+        round_approved = {
+            record.metadata.agent
+            for record in plan_round.completed_reviews
+            if record.metadata.state == "approved"
+        }
+        if round_approved != configured_names:
+            raise AgentLoopError(error_message)
+        return
+    # Every staged recovery goes through the exact-key gate, even when one
+    # full-board round holds the whole set: an approval bound to a stale key
+    # or surfaced-requirement set must never satisfy it.
     coder_metadata = plan_round.coder_metadata
     if coder_metadata is None or coder_metadata.assembled_plan_sidecar is None:
         raise AgentLoopError(error_message)
