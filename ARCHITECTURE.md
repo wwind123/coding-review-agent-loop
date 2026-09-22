@@ -638,6 +638,23 @@ operator to fresh authorization. PR bodies, branches, labels, draft state,
 commits, and coder-authored comments remain corroboration only; they are not
 authority or a persistence substitute.
 
+The same chain is also a PR-qualification input. Managed recovery does not
+synthesize the issue-side handoff, so when a managed approved-plan PR has none,
+the fresh qualification snapshot reads the plan binding from the PR side
+instead (#966). On a voluntary or plan-limited base it re-reads the PR comments
+and requires every authorization record to be authored by the configured trusted
+actor (the comment author ID must match the record) and to name this
+repository, issue, PR, and base. It also requires exactly one distinct terminal
+at the live head. The only accepted exception follows resume: a single fresh
+grant may supersede the creation record at the same head. That terminal must
+link through round-backed continuity records to a creation or fresh root, the
+chain must not fork, and every record in it must carry the approved plan hash.
+A strictly protected base publishes no authorization record, so the binding
+comes from the same sources its resume used: the reserved managed branch for
+the issue, plus the issue's completely approved canonical plan, whose hash must
+still equal the bound plan. Any gap fails qualification closed. Runs that do
+have an issue-side handoff, and all non-managed runs, keep the issue-side check.
+
 The merge-conflict resolution round is the one automatic transition that has no
 reviewer to correlate. When the live head conflicts with the base branch the
 orchestrator skips reviewers by construction and routes the round to the coder,
