@@ -9745,14 +9745,23 @@ def _run_plan_first_loop(
         diagnostic = initial_diagnostic
         for replan_attempt in range(MAX_INHERITED_MATRIX_REPLANS + 1):
             response = invoke(diagnostic)
-            if inherited_matrix_binding is None or is_clarification_request(response.text):
+            if is_clarification_request(response.text):
                 return response
-            child_matrix = derive_matrix(response)
+            # Candidate assembly runs on every plan-first run, not only child
+            # cycles: a deterministic assembly failure (for example a row-bound
+            # overflow) becomes a bounded-replan diagnostic, not a crash.
             try:
-                check_inherited_candidate(child_matrix)
+                child_matrix = derive_matrix(response)
+                if inherited_matrix_binding is not None:
+                    check_inherited_candidate(child_matrix)
                 return response
             except AgentLoopError as exc:
                 rejection = sanitize_plan_validation_diagnostic(str(exc))
+            failure_description = (
+                "weaken inherited parent matrix rows"
+                if inherited_matrix_binding is not None
+                else "fail deterministic plan assembly"
+            )
             candidate_digest = hashlib.sha256(response.text.encode("utf-8")).hexdigest()
             if replan_attempt >= MAX_INHERITED_MATRIX_REPLANS:
                 exhaustion = DeterministicPlanValidationExhaustion(
@@ -9763,7 +9772,7 @@ def _run_plan_first_loop(
                 )
                 error = AgentInvocationError(
                     f"{coder_name} produced {MAX_INHERITED_MATRIX_REPLANS + 1} consecutive plan "
-                    "candidates that weaken inherited parent matrix rows; stopping before any "
+                    f"candidates that {failure_description}; stopping before any "
                     f"reviewer or implementation turn.\n{rejection}",
                     failure_category="deterministic",
                     plan_validation_exhaustion=exhaustion,
@@ -9784,8 +9793,8 @@ def _run_plan_first_loop(
                 raise error
             log(
                 config,
-                f"Planning issue #{issue_number}: unpublished candidate weakened inherited "
-                f"parent matrix rows; inherited-obligation replan {replan_attempt + 1} of "
+                f"Planning issue #{issue_number}: unpublished candidate failed deterministic "
+                f"plan validation; bounded replan {replan_attempt + 1} of "
                 f"{MAX_INHERITED_MATRIX_REPLANS}",
             )
             diagnostic = _InheritedReplanDiagnostic(

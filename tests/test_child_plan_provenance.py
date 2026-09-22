@@ -1825,6 +1825,81 @@ def test_m931_weakened_revision_candidate_is_replanned_over_the_unchanged_base(
     assert "Inherited coverage delta: none" in review_prompts[1]
 
 
+def _m976_full_plan_state():
+    from coding_review_agent_loop.protocol import RISK_MATRIX_MAX_ROWS
+
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["risk_test_matrix"] = _matrix(*[
+        _matrix_row(f"row-{index:02d}", "one-shot") for index in range(RISK_MATRIX_MAX_ROWS)
+    ])
+    return json.dumps(payload) + PLAN_FOOTER
+
+
+def _m976_patch(base_plan_text, *, summary, add_row=False):
+    patch = json.loads(_semantic_patch(base_plan_text, None, summary=summary).split("\n<!--", 1)[0])
+    if add_row:
+        patch["operations"].append({
+            "op": "matrix_add", "row": _matrix_row("row-new", "one-shot"),
+            "final_position": 0, "rationale": "Cover the reviewer finding.",
+        })
+    return json.dumps(patch) + PLAN_FOOTER
+
+
+def test_m976_top_level_row_bound_overflow_is_replanned_instead_of_fatal(tmp_path, monkeypatch):
+    """#976: a top-level (non-child) revision that overflows the row bound replans."""
+    def forbid_repair(*args, **kwargs):
+        raise AssertionError("a deterministic assembly rejection must never reach the repair model")
+
+    monkeypatch.setattr(orchestrator, "_run_structured_repair", forbid_repair)
+    fresh = _m976_full_plan_state()
+    overflow = _m976_patch(fresh, summary=WEAK_SUMMARY, add_row=True)
+    consolidated = _m976_patch(fresh, summary="Consolidated revision.")
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, overflow, consolidated],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert orchestrator.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+
+    planner_prompts = _agent_prompts(runner, "claude")
+    assert len(planner_prompts) == 3
+    assert "Trusted orchestration correction record" not in planner_prompts[1]
+    assert "Trusted orchestration correction record" in planner_prompts[2]
+    assert "24-row bound" in planner_prompts[2]
+    assert "consolidate scenarios explicitly" in planner_prompts[2]
+    # The overflowing candidate is never published or reviewed.
+    assert WEAK_SUMMARY not in _published(runner)
+    assert "Consolidated revision." in _published(runner)
+    assert runner.diagnostic_posts == []
+    review_prompts = _agent_prompts(runner, "codex")
+    assert len(review_prompts) == 2
+    assert all(WEAK_SUMMARY not in prompt for prompt in review_prompts)
+
+
+def test_m976_top_level_row_bound_overflow_exhausts_as_deterministic_failure(tmp_path):
+    fresh = _m976_full_plan_state()
+    overflow = _m976_patch(fresh, summary=WEAK_SUMMARY, add_row=True)
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh] + [overflow] * 3,
+        codex_outputs=[structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."])],
+    )
+    with pytest.raises(AgentInvocationError, match="fail deterministic plan assembly") as error:
+        orchestrator.run_issue_loop(
+            runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        )
+    assert error.value.failure_category == "deterministic"
+    assert "consolidate scenarios explicitly" in str(error.value)
+    assert len(_agent_prompts(runner, "claude")) == 4
+    assert WEAK_SUMMARY not in _published(runner)
+
+
 def test_m931_replan_exhaustion_persists_one_record_and_resume_feeds_the_next_turn(
     tmp_path, monkeypatch
 ):
