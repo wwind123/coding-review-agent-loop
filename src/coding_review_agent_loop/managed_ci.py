@@ -3113,6 +3113,73 @@ def _parse_override_audit(body: str) -> dict[str, str] | None:
     return None if record is None else record.field_map()
 
 
+def _committed_bound_resume_audit(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    live_head: str | None,
+    matches: Callable[[object, int], bool],
+) -> tuple[int, dict[str, str]] | None:
+    """Resume provenance on a transaction-era PR: the committed bound record.
+
+    Consumer mode only returns the latest committed transaction's granted
+    record at the live head, so an older head, a release, or no bound record
+    yields None and today's release or stop follows.  A prepared-only
+    transaction is refused rather than read as missing authority, so a
+    pending publication never releases the label; an invalid record raises
+    from the accessor (#827).
+    """
+    # Imported here: the bound codec imports this module, and the publication
+    # module is never imported from ``managed_ci``.
+    from .github import PR_THREAD_SURFACE, read_authenticated_protocol_comments
+    from .managed_ci_bound_authorization import consumer_bound_authorization
+    from .workflow_transaction import (
+        RECOVERY_RERUN,
+        actor_change_error,
+        resolve_transaction_lineage,
+    )
+    from .errors import WorkflowTransactionError
+
+    if live_head is None:
+        return None
+    pr_view = read_authenticated_protocol_comments(
+        runner, config=config, surface_kind=PR_THREAD_SURFACE, number=pr_number
+    )
+    foreign = actor_change_error(pr_view)
+    if foreign is not None:
+        raise foreign
+    lineage = resolve_transaction_lineage(pr_view, repository=config.repo, pr_number=pr_number)
+    pending = lineage.pending
+    if pending is not None:
+        raise WorkflowTransactionError(
+            f"Managed-CI resume on PR #{pr_number} is refused while a workflow transaction "
+            "is prepared but not committed; nothing was changed",
+            transaction_ids=(pending.transaction_id,),
+            successor_kind=pending.intent.successor_kind,
+            recovery_action=RECOVERY_RERUN,
+            code="transaction-pending",
+        )
+    effective = consumer_bound_authorization(pr_view, lineage, live_head=live_head)
+    if effective is None or not matches(effective.record, effective.comment_id):
+        return None
+    record = effective.record
+    return (
+        effective.comment_id,
+        {
+            "nonce": record.nonce or "",
+            "repo": record.repository,
+            "base": record.base_ref,
+            "head": record.head_sha,
+            "protection": record.protection or "",
+            "active_label_event_id": str(record.label_event_id),
+            "kind": record.kind,
+            "issue": str(record.issue_number),
+            "pr": str(record.pr_number),
+        },
+    )
+
+
 def _find_resume_audit(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, actor_login: str, actor_id: int,
     base_ref: str, issue_number: int | None = None, live_head: str | None = None,
@@ -3145,10 +3212,8 @@ def _find_resume_audit(
             ):
                 valid_label_event_ids.add(event_id)
 
-    def authorization_matches(
-        authorization: ManagedCiIssueAuthorization,
-        comment_id: int,
-    ) -> bool:
+    def tuple_matches(authorization) -> bool:
+        # Shared by v1 records and the bound record: both carry these fields.
         if (
             authorization.actor_login.casefold() != actor_login.casefold()
             or authorization.actor_id != actor_id
@@ -3178,6 +3243,16 @@ def _find_resume_audit(
             != (expected_handoff.approved_plan_hash or None)
         ):
             return False
+        return True
+
+    def authorization_matches(
+        authorization: ManagedCiIssueAuthorization,
+        comment_id: int,
+    ) -> bool:
+        if not tuple_matches(authorization):
+            return False
+        if expected_handoff is None:
+            return True
         # The opening nonce belongs to the authenticated PR body.  Validate it
         # on the creation root even when a later fresh/continuity record is the
         # selected terminal, so a trusted comment cannot launder a mismatched
@@ -3250,8 +3325,35 @@ def _find_resume_audit(
     )
     if scan.transaction_era:
         # Unbound records and trailer audits grant nothing once the PR carries
-        # workflow-transaction records; bound authority is read elsewhere.
-        return None
+        # workflow-transaction records.  The only resume authority is the
+        # committed bound record that consumer mode returns for the live head,
+        # judged by the same tuple, label-event, and opening-nonce checks.
+        def bound_matches(record, comment_id: int) -> bool:
+            if not tuple_matches(record):
+                return False
+            if expected_handoff is None:
+                return True
+            if (
+                expected_handoff.transaction_bound
+                and expected_handoff.authorization_comment_id is not None
+                and comment_id != expected_handoff.authorization_comment_id
+            ):
+                return False
+            if record.kind == "creation":
+                expected_nonce = (
+                    expected_handoff.opening_override_nonce or expected_handoff.override_nonce
+                )
+                if expected_nonce is not None and record.nonce != expected_nonce:
+                    return False
+            return True
+
+        return _committed_bound_resume_audit(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            live_head=live_head,
+            matches=bound_matches,
+        )
     malformed = scan.rejected
     for cid, authorization in scan.records:
         if (

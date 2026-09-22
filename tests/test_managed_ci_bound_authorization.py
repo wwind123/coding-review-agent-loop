@@ -897,3 +897,128 @@ def test_point_two_drops_a_retained_correlation_for_another_head(tmp_path, monke
     )
     assert isinstance(authority, NoLiveHeadAuthority)
     assert retained == {} and github.write_count == before
+
+
+class _LabeledGitHub(TransactionGitHub):
+    """The transaction fake plus a managed-label timeline for resume audits."""
+
+    def __init__(self, *events):
+        super().__init__()
+        self.label_events = [
+            {
+                "id": event_id, "event": "labeled", "label": {"name": "agent-loop-managed"},
+                "actor": {"login": login, "id": user_id},
+            }
+            for event_id, login, user_id in events
+        ]
+
+    def run(self, args, *, cwd=None, input_text=None, check=True, env=None):
+        import json
+        from types import SimpleNamespace
+
+        if any(str(item).startswith("repos/") and "/events" in str(item) for item in args):
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(self.label_events))
+        if "--paginate" in args:
+            # ``gh api --paginate`` returns the whole conversation as one array.
+            comments = sorted(self.threads.get(PR, []), key=lambda item: item["id"])
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(comments))
+        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+
+def _resume_audit(github, tmp_path, *, live_head=HEAD_1, handoff=None):
+    from coding_review_agent_loop import managed_ci
+
+    return managed_ci._find_resume_audit(
+        github, config=make_config(tmp_path), pr_number=PR, actor_login=ACTOR[0],
+        actor_id=ACTOR[1], base_ref="main", issue_number=ISSUE, live_head=live_head,
+        expected_handoff=handoff if handoff is not None else _coder_handoff(),
+        expected_protection="voluntary", require_actor_owned_label_event=True,
+    )
+
+
+def test_resume_audit_on_a_transaction_era_pr_reads_the_committed_bound_record(tmp_path):
+    """#827: PR-loop entry on a transaction-era managed PR authenticates the
+    committed bound record for the live head through consumer mode, never an
+    unbound record, and applies today's tuple, label-event, and nonce checks."""
+    from coding_review_agent_loop.managed_ci import MANAGED_LABEL
+
+    github = _LabeledGitHub((EVENT, ACTOR[0], ACTOR[1]))
+    assert github.label_events[0]["label"]["name"] == MANAGED_LABEL
+    publish(github, creation(), tmp_path)
+    # An unbound record for the same head grants nothing on a transaction-era PR.
+    github.seed(PR, format_issue_created_authorization_comment(v1()))
+    bound = bound_comments(github)
+    before = github.write_count
+    audit = _resume_audit(github, tmp_path)
+    assert audit is not None
+    comment_id, fields = audit
+    assert comment_id == bound[0]["id"]
+    assert fields["kind"] == "creation" and fields["head"] == HEAD_1
+    assert fields["nonce"] == "nonce-1" and fields["active_label_event_id"] == str(EVENT)
+    # An older committed head, a foreign-only label timeline, a mismatched
+    # opening nonce, or another plan grants no resume authority.
+    assert _resume_audit(github, tmp_path, live_head=HEAD_2) is None
+    assert _resume_audit(
+        github, tmp_path, handoff=_coder_handoff(override_nonce="other")
+    ) is None
+    assert _resume_audit(
+        github, tmp_path, handoff=_coder_handoff(approved_plan_hash="f" * 64)
+    ) is None
+    assert _resume_audit(
+        github, tmp_path,
+        handoff=_coder_handoff(transaction_bound=True, authorization_comment_id=1),
+    ) is None
+    github.label_events[0]["actor"] = {"login": "someone-else", "id": 77}
+    assert _resume_audit(github, tmp_path) is None
+    assert github.write_count == before
+
+
+def test_resume_audit_refuses_a_pending_transaction_without_releasing(tmp_path):
+    """A prepared-only managed transaction is refused as pending rather than
+    read as missing authority, so entry never releases the label for it."""
+    github = _LabeledGitHub((EVENT, ACTOR[0], ACTOR[1]))
+    github.fail_write(3, FAIL_BEFORE_WRITE)
+    with pytest.raises(WorkflowTransactionError):
+        publish(github, creation(), tmp_path)
+    before = github.write_count
+    with pytest.raises(WorkflowTransactionError) as caught:
+        _resume_audit(github, tmp_path)
+    assert caught.value.code == "transaction-pending"
+    assert github.write_count == before
+
+
+def test_resume_audit_raises_on_an_edited_committed_bound_record(tmp_path):
+    """An invalid committed record is an integrity error, never absent."""
+    github = _LabeledGitHub((EVENT, ACTOR[0], ACTOR[1]))
+    publish(github, creation(), tmp_path)
+    comment = bound_comments(github)[0]
+    github.edit(comment["id"], comment["body"])
+    with pytest.raises(WorkflowTransactionError):
+        _resume_audit(github, tmp_path)
+
+
+def test_resume_audit_after_a_continuity_names_the_successor_record(tmp_path, monkeypatch):
+    """After a committed coder-head continuity the resume audit for the new
+    head is that bound continuity record, under its canonical comment ID."""
+    from coding_review_agent_loop import managed_ci, orchestrator
+    from coding_review_agent_loop.managed_ci_bound_authorization import KIND_CONTINUITY
+
+    github = _LabeledGitHub((EVENT, ACTOR[0], ACTOR[1]))
+    publish(github, creation(), tmp_path)
+    rounds = (
+        _seed_round(github, role="reviewer", subject=HEAD_1, round_number=1, state="blocking"),
+        _seed_round(github, role="coder", subject=HEAD_2, round_number=2),
+    )
+    monkeypatch.setattr(
+        managed_ci, "_active_managed_label_event", lambda *a, **k: (EVENT, ACTOR[0], ACTOR[1])
+    )
+    bound_handoff = orchestrator._managed_coder_head_transaction(
+        github, make_config(tmp_path), pr_number=PR, handoff=_coder_handoff(),
+        predecessor_head=HEAD_1, new_head=HEAD_2, round_comment_ids=rounds,
+    )
+    audit = _resume_audit(github, tmp_path, live_head=HEAD_2, handoff=bound_handoff)
+    assert audit is not None
+    assert audit[0] == bound_handoff.authorization_comment_id
+    assert audit[1]["kind"] == KIND_CONTINUITY and audit[1]["head"] == HEAD_2
+    # The superseded creation record never answers for the old head either.
+    assert _resume_audit(github, tmp_path, live_head=HEAD_1) is None
