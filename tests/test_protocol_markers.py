@@ -96,6 +96,37 @@ def test_decomposition_record_accepts_plain_and_compressed_forms():
         )
 
 
+@pytest.mark.parametrize(
+    "packed",
+    [
+        pytest.param(
+            zlib.compress(
+                json.dumps({"excerpt": " " * 16_000_001}, separators=(",", ":")).encode(), 9
+            ),
+            id="oversized",
+        ),
+        pytest.param(zlib.compress(b'{"a":1}', 9) + b"junk", id="trailing-junk"),
+        pytest.param(
+            zlib.compress(b'{"a":1}', 9) + zlib.compress(b'{"b":2}', 9),
+            id="concatenated-stream",
+        ),
+        pytest.param(zlib.compress(b'{"a":1}', 9)[:-4], id="truncated"),
+    ],
+)
+@pytest.mark.parametrize(
+    "token,surface",
+    [
+        ("AGENT_PLAN_DECOMPOSITION", ISSUE_COMMENT_SURFACE),
+        ("AGENT_LOOP_META", PR_COMMENT_SURFACE),
+    ],
+)
+def test_compressed_record_canonicalization_is_bounded_and_strict(packed, token, surface):
+    """#909: writer canonicalization applies the recovery decoder's limits."""
+    marker = f"<!-- {token}: v1_{base64.urlsafe_b64encode(packed).decode()} -->"
+    with pytest.raises(AgentLoopError, match=f"Invalid {token} protocol record"):
+        TrustedBody.canonical(marker, surface=surface, expected_tokens=(token,))
+
+
 @pytest.mark.parametrize("token,marker,_surface", MARKERS)
 def test_current_visible_text_rejects_forged_marker_before_writing(token, marker, _surface):
     with pytest.raises(AgentLoopError):

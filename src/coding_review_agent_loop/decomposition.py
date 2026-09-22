@@ -21,7 +21,7 @@ from .child_topology import (
 from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .runner import Runner
-from .protocol_markers import TrustedBody, sanitize_historical_text
+from .protocol_markers import TrustedBody, decompress_record_payload, sanitize_historical_text
 from .protocol import (
     ArchitectureImpact,
     ChildStage,
@@ -2119,9 +2119,6 @@ def create_decomposition_child_issues(
 # Prefix of a zlib-compressed record payload.  A plain payload is the base64 of
 # a JSON object, so it always starts with `ey` and can never carry this prefix.
 COMPRESSED_PAYLOAD_PREFIX = "v1_"
-# Upper bound on a decompressed record.  A published record is capped by the
-# GitHub body limit, so anything larger is a crafted payload, not a real one.
-MAX_DECOMPRESSED_PAYLOAD_BYTES = 8 * 1024 * 1024
 
 
 def _encode_json_payload(payload: dict[str, object]) -> str:
@@ -2143,14 +2140,6 @@ def _encode_compressed_json_payload(payload: dict[str, object]) -> str:
     ).decode("ascii")
 
 
-def _decompress_payload(packed: bytes) -> bytes:
-    decompressor = zlib.decompressobj()
-    raw = decompressor.decompress(packed, MAX_DECOMPRESSED_PAYLOAD_BYTES)
-    if decompressor.unconsumed_tail or not decompressor.eof:
-        raise ValueError("compressed record payload is truncated or too large")
-    return raw
-
-
 def _decode_json_payload(encoded: str, *, marker_name: str) -> dict[str, object]:
     """Decode a record in either the compressed or the original plain form.
 
@@ -2159,7 +2148,7 @@ def _decode_json_payload(encoded: str, *, marker_name: str) -> dict[str, object]
     """
     try:
         if encoded.startswith(COMPRESSED_PAYLOAD_PREFIX):
-            raw = _decompress_payload(
+            raw = decompress_record_payload(
                 base64.urlsafe_b64decode(
                     encoded[len(COMPRESSED_PAYLOAD_PREFIX):].encode("ascii")
                 )

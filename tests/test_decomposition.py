@@ -2198,15 +2198,29 @@ def test_decomposition_record_still_decodes_plain_published_summaries():
 @pytest.mark.parametrize(
     "packed",
     [
-        pytest.param(zlib.compress(b" " * (9 * 1024 * 1024), 9), id="oversized"),
+        pytest.param(zlib.compress(b" " * 16_000_001, 9), id="oversized"),
         pytest.param(zlib.compress(b'{"a":1}', 9)[:-4], id="truncated"),
         pytest.param(b"not zlib data", id="garbage"),
+        pytest.param(zlib.compress(b'{"a":1}', 9) + b"junk", id="trailing-junk"),
+        pytest.param(
+            zlib.compress(b'{"a":1}', 9) + zlib.compress(b'{"b":2}', 9),
+            id="concatenated-stream",
+        ),
     ],
 )
 def test_compressed_record_payload_rejects_malformed_or_oversized_data(packed):
     encoded = "v1_" + base64.urlsafe_b64encode(packed).decode("ascii")
     with pytest.raises(AgentLoopError, match="Invalid AGENT_PLAN_DECOMPOSITION payload"):
         _decode_metadata(encoded)
+    # Recovery reads summaries straight from comments, so the decoder itself
+    # must reject the record rather than rely on writer canonicalization.
+    body = f"<!-- AGENT_PLAN_DECOMPOSITION: {encoded} -->"
+    with pytest.raises(AgentLoopError, match="Invalid AGENT_PLAN_DECOMPOSITION payload"):
+        find_existing_decomposition(
+            [IssueComment(author=None, created_at=None, body=body)],
+            parent_issue=909,
+            plan_hash=None,
+        )
 
 
 def test_parent_summary_overflow_names_the_surface_when_nothing_can_be_cut():

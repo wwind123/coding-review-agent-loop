@@ -50,10 +50,31 @@ def _canonical_source(match: re.Match[str], *, token: str) -> str:
     return f"<!-- {token} {_b64_json(value)} -->"
 
 
+# Upper bound on a decompressed protocol record, matching the round-transport
+# cap.  A published record is limited by the GitHub body size, so anything
+# larger is a crafted payload rather than a real one.
+MAX_DECOMPRESSED_RECORD_BYTES = 16_000_000
+
+
+def decompress_record_payload(packed: bytes) -> bytes:
+    """Strictly inflate one zlib stream, bounded and with no trailing data.
+
+    Every reader of a compressed record uses this, so a writer-side
+    canonicalization and a recovery-side decode accept the same inputs.
+    """
+    decompressor = zlib.decompressobj()
+    raw = decompressor.decompress(packed, MAX_DECOMPRESSED_RECORD_BYTES + 1)
+    if len(raw) > MAX_DECOMPRESSED_RECORD_BYTES or decompressor.unconsumed_tail:
+        raise ValueError("compressed record payload is too large")
+    if not decompressor.eof or decompressor.unused_data:
+        raise ValueError("compressed record payload is truncated or has trailing data")
+    return raw
+
+
 def _canonical_compressed_mapping(match: re.Match[str], *, token: str) -> str:
     encoded = match.group("payload")
     packed = base64.urlsafe_b64decode(encoded[3:].encode("ascii")) if encoded.startswith("v1_") else base64.urlsafe_b64decode(encoded.encode("ascii"))
-    value = json.loads(zlib.decompress(packed).decode("utf-8"))
+    value = json.loads(decompress_record_payload(packed).decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("mapping required")
     raw = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")
