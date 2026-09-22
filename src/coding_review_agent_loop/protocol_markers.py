@@ -61,15 +61,17 @@ def _canonical_compressed_mapping(match: re.Match[str], *, token: str) -> str:
     return f"<!-- {token}: {canonical} -->"
 
 
-def _canonical_checkpoint(match: re.Match[str]) -> str:
-    """Accept legacy raw checkpoints while emitting the compact form."""
+def _canonical_plain_or_compressed(match: re.Match[str], *, token: str) -> str:
+    """Accept records published in the plain form before the compact one."""
     encoded = match.group("payload")
     if not encoded.startswith("v1_"):
         value = _decode_b64_json(encoded)
-        return f"<!-- AGENT_PLAN_TOPOLOGY_CHECKPOINT: {_b64_json(value)} -->"
-    return _canonical_compressed_mapping(
-        match, token="AGENT_PLAN_TOPOLOGY_CHECKPOINT"
-    )
+        return f"<!-- {token}: {_b64_json(value)} -->"
+    return _canonical_compressed_mapping(match, token=token)
+
+
+def _canonical_checkpoint(match: re.Match[str]) -> str:
+    return _canonical_plain_or_compressed(match, token="AGENT_PLAN_TOPOLOGY_CHECKPOINT")
 
 
 def _canonical_raw_json(match: re.Match[str], *, token: str) -> str:
@@ -168,6 +170,8 @@ def _b64_definition(token: str, *, surfaces: frozenset[str], codec: str = "b64-j
         canonicalizer=lambda match, token=token, codec=codec: (
             _canonical_compressed_mapping(match, token=token)
             if codec == "compressed-mapping"
+            else _canonical_plain_or_compressed(match, token=token)
+            if codec == "plain-or-compressed-mapping"
             else _canonical_b64_json(match, prefix=token)
         ),
     )
@@ -232,7 +236,12 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
         _b64_definition("AGENT_EXECUTION_RECOMMENDATION", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_RISK_TEST_MATRIX", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_DEFERRED_STAGES", surfaces=_ISSUE_ONLY),
-        _b64_definition("AGENT_PLAN_DECOMPOSITION", surfaces=_ISSUE_ONLY),
+        # Compressed since #909; summaries posted earlier stay plain base64.
+        _b64_definition(
+            "AGENT_PLAN_DECOMPOSITION",
+            surfaces=_ISSUE_ONLY,
+            codec="plain-or-compressed-mapping",
+        ),
         _b64_definition("AGENT_PLAN_EXECUTION_DECISION", surfaces=_ISSUE_ONLY),
         MarkerDefinition(
             token="AGENT_PLAN_TOPOLOGY_CHECKPOINT",

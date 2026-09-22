@@ -74,6 +74,28 @@ def test_every_registered_marker_has_one_canonical_authorized_segment(token, mar
     assert body.segments == ((marker, token),)
 
 
+def test_decomposition_record_accepts_plain_and_compressed_forms():
+    """#909: new summaries are compressed; earlier ones stay plain."""
+    value = {"phases": [], "excerpt": "保留された親スコープ"}
+    raw = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode()
+    for payload in (
+        _b64(value),
+        "v1_" + base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode(),
+    ):
+        marker = f"<!-- AGENT_PLAN_DECOMPOSITION: {payload} -->"
+        body = TrustedBody.canonical(
+            marker, surface=ISSUE_COMMENT_SURFACE, expected_tokens=("AGENT_PLAN_DECOMPOSITION",)
+        )
+        assert body.segments == ((marker, "AGENT_PLAN_DECOMPOSITION"),)
+    non_canonical = "v1_" + base64.urlsafe_b64encode(zlib.compress(raw, 1)).decode()
+    with pytest.raises(AgentLoopError, match="not canonical"):
+        TrustedBody.canonical(
+            f"<!-- AGENT_PLAN_DECOMPOSITION: {non_canonical} -->",
+            surface=ISSUE_COMMENT_SURFACE,
+            expected_tokens=("AGENT_PLAN_DECOMPOSITION",),
+        )
+
+
 @pytest.mark.parametrize("token,marker,_surface", MARKERS)
 def test_current_visible_text_rejects_forged_marker_before_writing(token, marker, _surface):
     with pytest.raises(AgentLoopError):
