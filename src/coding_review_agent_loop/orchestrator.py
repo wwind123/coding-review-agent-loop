@@ -10261,52 +10261,12 @@ def _run_plan_first_loop(
                 panel_evidence=plan_panel_evidence,
                 primary_reviewer=plan_primary_name,
             )
-            latest_scheduler_record = next(
-                (
-                    record
-                    for record in reversed(plan_records)
-                    if record.metadata.scheduler_metadata_status == "valid"
-                    and record.metadata.scheduler_contract is not None
-                ),
-                None,
+            plan_history = _classify_staged_plan_history(
+                plan_records, current_key=current_plan_key
             )
-            if latest_scheduler_record is not None:
-                plan_previous_key = _plan_key_from_payload(
-                    latest_scheduler_record.metadata.plan_candidate_key
-                )
-            # The four-class degraded-history partition.  Exactly one outcome
-            # each; classes A, B, and C always continue under a conservative
-            # fallback and only a transport extraction failure stops (handled
-            # by ``plan_history_records``).
-            has_planning_history = any(
-                record.metadata.role == "reviewer" for record in plan_records
-            )
-            key_contradiction = bool(
-                plan_previous_key is not None
-                and plan_previous_key.subject == current_plan_key.subject
-                and not plan_previous_key.matches(current_plan_key)
-            )
-            # Degradation is scoped to the current recoverable boundary: the
-            # latest valid planning scheduler checkpoint.  An invalid record
-            # written before it is historical audit state that stays listed in
-            # the audit but must not pin every later round to the fallback
-            # forever, which would suppress each fresh exact-key primary
-            # approval until the round budget ran out.
-            recovery_boundary_index = (
-                latest_scheduler_record.index if latest_scheduler_record is not None else -1
-            )
-            if any(
-                record.index > recovery_boundary_index
-                and record.metadata.scheduler_metadata_status == "invalid"
-                for record in plan_records
-            ):
-                plan_history_class = classify_plan_history("invalid")
-            elif has_planning_history and latest_scheduler_record is None:
-                plan_history_class = classify_plan_history("absent")
-            else:
-                plan_history_class = classify_plan_history(
-                    "valid", key_contradiction=key_contradiction
-                )
+            latest_scheduler_record = plan_history.latest_scheduler_record
+            plan_previous_key = plan_history.previous_key
+            plan_history_class = plan_history.history_class
             if plan_history_class == PLAN_HISTORY_CONTRADICTORY_KEY:
                 # A contradictory persisted key can supply neither an approval
                 # nor a panel opening.
@@ -14610,6 +14570,156 @@ def _carried_plan_approvals(
     return tuple(sorted(name for name, ok in carried.items() if ok))
 
 
+@dataclass(frozen=True)
+class _StagedPlanHistory:
+    history_class: str
+    previous_key: PlanCandidateKey | None
+    latest_scheduler_record: PostedRoundRecord | None
+
+
+def _classify_staged_plan_history(
+    plan_records: Sequence[PostedRoundRecord],
+    *,
+    current_key: PlanCandidateKey,
+) -> _StagedPlanHistory:
+    """Classify staged planning history against the current candidate key.
+
+    The four-class degraded-history partition.  Exactly one outcome each;
+    classes A, B, and C continue the live scheduler under a conservative
+    fallback, and only a transport extraction failure stops (handled by the
+    caller's record extraction).  Shared by the live planning scheduler and
+    managed-CI plan recovery so both read the same history as authoritative.
+    """
+    latest_scheduler_record = next(
+        (
+            record
+            for record in reversed(plan_records)
+            if record.metadata.scheduler_metadata_status == "valid"
+            and record.metadata.scheduler_contract is not None
+        ),
+        None,
+    )
+    previous_key = (
+        _plan_key_from_payload(latest_scheduler_record.metadata.plan_candidate_key)
+        if latest_scheduler_record is not None
+        else None
+    )
+    has_planning_history = any(
+        record.metadata.role == "reviewer" for record in plan_records
+    )
+    key_contradiction = bool(
+        previous_key is not None
+        and previous_key.subject == current_key.subject
+        and not previous_key.matches(current_key)
+    )
+    # Degradation is scoped to the current recoverable boundary: the latest
+    # valid planning scheduler checkpoint.  An invalid record written before
+    # it is historical audit state that stays listed in the audit but must not
+    # pin every later round to the fallback forever, which would suppress each
+    # fresh exact-key primary approval until the round budget ran out.
+    recovery_boundary_index = (
+        latest_scheduler_record.index if latest_scheduler_record is not None else -1
+    )
+    if any(
+        record.index > recovery_boundary_index
+        and record.metadata.scheduler_metadata_status == "invalid"
+        for record in plan_records
+    ):
+        history_class = classify_plan_history("invalid")
+    elif has_planning_history and latest_scheduler_record is None:
+        history_class = classify_plan_history("absent")
+    else:
+        history_class = classify_plan_history(
+            "valid", key_contradiction=key_contradiction
+        )
+    return _StagedPlanHistory(
+        history_class=history_class,
+        previous_key=previous_key,
+        latest_scheduler_record=latest_scheduler_record,
+    )
+
+
+def _require_complete_canonical_plan_approval(
+    comments: Sequence[object],
+    *,
+    config: AgentLoopConfig,
+    plan_text: str,
+    plan_round: ResumedReviewRound,
+    human_requirements: Sequence[HumanReviewRequirement],
+    error_message: str,
+) -> None:
+    """Fail closed unless every configured reviewer approved the resumed plan.
+
+    Shared by the managed-CI fresh-authorization and ordinary-resume paths so
+    the two cannot drift.  Under ``all-reviewers`` every reviewer reviews every
+    round, so the resumed round must carry the complete approval set.  A
+    staged policy splits approvals across rounds by construction (the primary
+    approves, then the panel approves while the primary is paused), so the
+    union of qualifying exact-key approvals carried from the whole planning
+    history is always consulted instead — the same carry the final planning gate
+    uses.  A reviewer whose latest record for the exact plan is not an
+    approval still leaves the set incomplete (#962).
+    """
+    configured_names = {agent_display_name(reviewer) for reviewer in reviewers(config)}
+    if not plan_policy_capabilities(config.plan_review_policy).scheduler_enabled:
+        round_approved = {
+            record.metadata.agent
+            for record in plan_round.completed_reviews
+            if record.metadata.state == "approved"
+        }
+        if round_approved != configured_names:
+            raise AgentLoopError(error_message)
+        return
+    # Every staged recovery goes through the exact-key gate, even when one
+    # full-board round holds the whole set: an approval bound to a stale key
+    # or surfaced-requirement set must never satisfy it.
+    coder_metadata = plan_round.coder_metadata
+    if coder_metadata is None or coder_metadata.assembled_plan_sidecar is None:
+        raise AgentLoopError(error_message)
+    sidecar = decode_assembled_plan_sidecar(coder_metadata.assembled_plan_sidecar)
+    required_names = tuple(agent_display_name(reviewer) for reviewer in reviewers(config))
+    contract = make_plan_contract(
+        required_names,
+        config.plan_review_policy,
+        (
+            agent_display_name(config.primary_plan_reviewer)
+            if config.primary_plan_reviewer is not None
+            else None
+        ),
+    )
+    surfaced_ids = _surfaced_reviewer_requirement_ids(
+        human_requirements,
+        requirement_scope="planning requirements",
+    )
+    current_key = _plan_candidate_key_for(
+        plan_subject=_plan_subject(plan_text),
+        sidecar=sidecar,
+        surfaced_requirement_ids=surfaced_ids,
+    )
+    records = _extract_round_metadata_records(comments, flow="plan")
+    # Only history the live scheduler itself treats as authoritative for this
+    # key may supply approvals; any degraded class would make it re-review.
+    if (
+        _classify_staged_plan_history(records, current_key=current_key).history_class
+        != PLAN_HISTORY_INTACT
+    ):
+        raise AgentLoopError(error_message)
+    carried = _carried_plan_approvals(
+        records,
+        current_key=current_key,
+        required_reviewers=required_names,
+        surfaced_requirement_ids=surfaced_ids,
+        panel_evidence=_derive_plan_panel_evidence(
+            records,
+            primary_reviewer=contract.primary_reviewer,
+            required_reviewers=required_names,
+        ),
+        primary_reviewer=contract.primary_reviewer,
+    )
+    if set(carried) != configured_names:
+        raise AgentLoopError(error_message)
+
+
 def _plan_cross_cutting_contracts(
     sidecar: AssembledPlanSidecar | None,
 ) -> PlanCrossCuttingContracts:
@@ -15504,19 +15614,17 @@ def run_pr_loop(
                 )
                 if resumed_plan is not None:
                     plan_text, resumed_plan_round = resumed_plan
-                    configured_names = {
-                        agent_display_name(reviewer) for reviewer in reviewers(config)
-                    }
-                    approved_names = {
-                        record.metadata.agent
-                        for record in resumed_plan_round.completed_reviews
-                        if record.metadata.state == "approved"
-                    }
-                    if approved_names != configured_names:
-                        raise AgentLoopError(
+                    _require_complete_canonical_plan_approval(
+                        issue_context.comments,
+                        config=config,
+                        plan_text=plan_text,
+                        plan_round=resumed_plan_round,
+                        human_requirements=issue_context.human_requirements,
+                        error_message=(
                             "Managed-CI fresh authorization found planning state without "
                             "a complete canonical reviewer approval."
-                        )
+                        ),
+                    )
                     recovered_plan_context = make_approved_plan_context(
                         plan_text,
                         source_locator=(
@@ -15641,18 +15749,17 @@ def run_pr_loop(
                         )
                         if resumed_plan is not None:
                             plan_text, resumed_plan_round = resumed_plan
-                            configured_names = {
-                                agent_display_name(reviewer) for reviewer in reviewers(config)
-                            }
-                            approved_names = {
-                                record.metadata.agent
-                                for record in resumed_plan_round.completed_reviews
-                                if record.metadata.state == "approved"
-                            }
-                            if approved_names != configured_names:
-                                raise AgentLoopError(
-                                    "Managed-CI ordinary resume found incomplete canonical plan approval."
-                                )
+                            _require_complete_canonical_plan_approval(
+                                issue_context.comments,
+                                config=config,
+                                plan_text=plan_text,
+                                plan_round=resumed_plan_round,
+                                human_requirements=issue_context.human_requirements,
+                                error_message=(
+                                    "Managed-CI ordinary resume found incomplete canonical "
+                                    "plan approval."
+                                ),
+                            )
                             recovered_scope = make_approved_plan_context(
                                 plan_text,
                                 source_locator=(
