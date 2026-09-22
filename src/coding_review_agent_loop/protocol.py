@@ -359,6 +359,63 @@ class ArchitectureImpact:
     uncertainty: tuple[str, ...] = ()
 
 
+_ARCHITECTURE_CHANGED_REQUIRED_KEYS = frozenset({
+    "affected_components", "dependencies", "execution_data_flows",
+    "persistence", "public_contracts", "security_boundaries",
+    "canonical_document_action", "canonical_document_path",
+    "canonical_document_rationale",
+})
+
+# Deterministic near-miss vocabulary for the closed ``status`` enum (#916).
+# Reviewers repeatedly wrote ``modified`` for ``changed``; rejecting the whole
+# round for one off-vocabulary word discarded otherwise valid reviewed work.
+# Keys are compared after lowercasing and folding ``_``/spaces to ``-``.  Any
+# value outside this explicit table still fails closed.
+_ARCHITECTURE_STATUS_SYNONYMS: Mapping[str, str] = {
+    "changed": "changed",
+    "change": "changed",
+    "changes": "changed",
+    "modified": "changed",
+    "modifies": "changed",
+    "modify": "changed",
+    "updated": "changed",
+    "unchanged": "unchanged",
+    "no-change": "unchanged",
+    "no-changes": "unchanged",
+    "not-changed": "unchanged",
+    "unmodified": "unchanged",
+    "none": "unchanged",
+    "same": "unchanged",
+    "no-impact": "unchanged",
+}
+
+
+def _normalize_architecture_status(
+    status: str, payload: Mapping[str, object], *, context: str
+) -> tuple[str, str | None]:
+    """Map a near-miss status onto the closed enum, returning an audit note.
+
+    A synonym for ``changed`` is accepted only when the payload is corroborated
+    by the complete ``changed``-only required field set; otherwise the value is
+    too ambiguous to guess and the original enum error is raised.
+    """
+    if status in {"changed", "unchanged"}:
+        return status, None
+    enum_error = AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
+    key = re.sub(r"[\s_]+", "-", status.strip().lower())
+    canonical = _ARCHITECTURE_STATUS_SYNONYMS.get(key)
+    if canonical is None:
+        raise enum_error
+    if canonical == "changed" and not _ARCHITECTURE_CHANGED_REQUIRED_KEYS <= set(payload):
+        raise enum_error
+    shown = sanitize_historical_text(status.strip())[:40]
+    note = (
+        f"agent-loop normalized {context}.status from `{shown}` to "
+        f"`{canonical}` (deterministic closed-enum synonym)."
+    )
+    return canonical, note
+
+
 def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureImpact:
     payload = _expect_object(value, context=context)
     _expect_exact_keys(
@@ -372,22 +429,18 @@ def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureIm
             "canonical_document_path", "canonical_document_rationale", "uncertainty",
         },
     )
-    status = _expect_non_empty_string(payload["status"], context=f"{context}.status")
-    if status not in {"changed", "unchanged"}:
-        raise AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
+    status, normalization_note = _normalize_architecture_status(
+        _expect_non_empty_string(payload["status"], context=f"{context}.status"),
+        payload,
+        context=context,
+    )
     action = _expect_non_empty_string(
         payload.get("canonical_document_action", "no-change"),
         context=f"{context}.canonical_document_action",
     )
     rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")
     if status == "changed":
-        required_changed = {
-            "affected_components", "dependencies", "execution_data_flows",
-            "persistence", "public_contracts", "security_boundaries",
-            "canonical_document_action", "canonical_document_path",
-            "canonical_document_rationale",
-        }
-        missing = sorted(required_changed - set(payload))
+        missing = sorted(_ARCHITECTURE_CHANGED_REQUIRED_KEYS - set(payload))
         if missing:
             raise AgentLoopError(
                 f"{context} changed assessments must include: {', '.join(missing)}."
@@ -421,7 +474,10 @@ def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureIm
             if payload.get("canonical_document_rationale") not in (None, "")
             else ""
         ),
-        uncertainty=_expect_string_list(payload.get("uncertainty", []), context=f"{context}.uncertainty", item_context=context),
+        uncertainty=(
+            *_expect_string_list(payload.get("uncertainty", []), context=f"{context}.uncertainty", item_context=context),
+            *((normalization_note,) if normalization_note else ()),
+        ),
     )
 
 
