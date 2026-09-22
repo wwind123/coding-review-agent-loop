@@ -229,10 +229,27 @@ class PostedRoundMetadata:
     # on every historical record and omitted from the encoding when absent.
     plan_supersession_digest: str | None = None
     plan_supersession_superseded_hash: str | None = None
+    # Coder record round that last rendered the full visible matrix-evidence
+    # row list (#959).  Writers set it iff they persist matrix evidence; it is
+    # omitted from the encoding when None so legacy records stay byte-stable.
+    risk_test_matrix_evidence_full_round: int | None = None
+    # In-memory decode-quality signal for the anchor, never serialized:
+    # ``absent`` is a legacy (pre-#959) record, ``invalid`` a present but
+    # malformed value.  Constructing with an anchor promotes it to ``valid``.
+    risk_test_matrix_evidence_full_round_status: str = "absent"
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
+        if self.risk_test_matrix_evidence_full_round_status not in {"absent", "valid", "invalid"}:
+            raise ValueError("invalid matrix evidence full-round status")
+        if self.risk_test_matrix_evidence_full_round is not None:
+            if self.risk_test_matrix_evidence_full_round_status == "invalid":
+                raise ValueError("a matrix evidence full-round anchor cannot be invalid")
+            if self.risk_test_matrix_evidence_full_round_status == "absent":
+                object.__setattr__(
+                    self, "risk_test_matrix_evidence_full_round_status", "valid"
+                )
         if (self.plan_supersession_digest is None) != (
             self.plan_supersession_superseded_hash is None
         ):
@@ -1922,6 +1939,10 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         )
     if metadata.plan_candidate_key is not None:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
+    if metadata.risk_test_matrix_evidence_full_round is not None:
+        payload["risk_test_matrix_evidence_full_round"] = (
+            metadata.risk_test_matrix_evidence_full_round
+        )
     matrix_present =_risk_test_matrix_metadata_present(metadata)
     matrix_values = {
         "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,
@@ -1952,6 +1973,20 @@ def _decode_plan_supersession_field(payload: Mapping[str, object], key: str) -> 
     if not isinstance(value, str) or not value:
         raise ValueError(f"{key} must be a non-empty string")
     return value
+
+
+def _decode_matrix_evidence_full_round(payload: Mapping[str, object]) -> dict[str, object]:
+    # Missing is legacy absence; a present malformed value never raises and
+    # stays distinguishable from absence so it cannot claim the legacy rule.
+    if "risk_test_matrix_evidence_full_round" not in payload:
+        return {"risk_test_matrix_evidence_full_round_status": "absent"}
+    value = payload["risk_test_matrix_evidence_full_round"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return {"risk_test_matrix_evidence_full_round_status": "invalid"}
+    return {
+        "risk_test_matrix_evidence_full_round": value,
+        "risk_test_matrix_evidence_full_round_status": "valid",
+    }
 
 
 def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
@@ -2195,6 +2230,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             plan_supersession_superseded_hash=_decode_plan_supersession_field(
                 payload, "plan_supersession_superseded_hash"
             ),
+            **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:

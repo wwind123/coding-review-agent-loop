@@ -6,7 +6,7 @@ import json
 import re
 import shlex
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from .decomposition import _decode_json_payload, _encode_json_payload
@@ -48,6 +48,7 @@ from .protocol import (
     RiskTestMatrixEvidence,
     parse_risk_test_matrix,
     parse_risk_test_matrix_changes,
+    parse_risk_test_matrix_evidence,
     risk_test_matrix_identity,
     ExecutionStrategyRecommendation,
     EXECUTION_TOPOLOGY_SOURCE,
@@ -74,6 +75,7 @@ from .local_test_evidence import decode_bounded_evidence, redact_test_command
 if TYPE_CHECKING:
     from .agents.base import AgentName
     from .config import AgentLoopConfig
+    from .round_state import PostedRoundMetadata
 
 ITEM_SUMMARY_LIMIT = 100
 PLAN_EXPECTED_CLOSING_MARKER = "AGENT_PLAN_EXPECTED_CLOSING_ISSUES"
@@ -539,8 +541,103 @@ def decode_risk_test_matrix_marker(
     return payload
 
 
+_MATRIX_EVIDENCE_RENDER_MODES = frozenset({"full", "delta"})
+
+
+def _positive_round(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+@dataclass(frozen=True)
+class MatrixEvidenceRenderDecision:
+    """The single full-or-delta choice for a visible matrix-evidence section.
+
+    Presentation only (#959): canonical evidence in round metadata and the
+    matrix sidecar always keep every row.  ``anchor_round`` is the coder
+    record round that rendered the full row list and is what callers persist.
+    """
+
+    mode: str
+    anchor_round: int
+    previous_evidence: RiskTestMatrixEvidence | None = None
+    previous_round: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in _MATRIX_EVIDENCE_RENDER_MODES:
+            raise ValueError("matrix evidence render mode must be full or delta")
+        if not _positive_round(self.anchor_round):
+            raise ValueError("matrix evidence anchor round must be a positive integer")
+        if self.mode == "full" and (
+            self.previous_evidence is not None or self.previous_round is not None
+        ):
+            raise ValueError("a full matrix evidence decision carries no previous evidence")
+        if self.mode == "delta" and (
+            self.previous_evidence is None or not _positive_round(self.previous_round)
+        ):
+            raise ValueError("a delta matrix evidence decision requires previous evidence")
+
+
+def _matrix_evidence_row_key(row: object) -> str:
+    # The per-turn receipt_id is ignored: a row re-cited with a fresh receipt
+    # but the same claims is not a presentation change.
+    payload = row.to_payload()  # type: ignore[attr-defined]
+    payload["evidence_citations"] = [
+        {"command": item["command"], "claim": item["claim"]}
+        for item in payload["evidence_citations"]
+    ]
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def resolve_matrix_evidence_render(
+    current: RiskTestMatrixEvidence,
+    previous_metadata: "PostedRoundMetadata | None",
+    current_round: int,
+) -> MatrixEvidenceRenderDecision:
+    """Choose full or delta presentation against the previous coder record.
+
+    ``current_round`` is the round number of the coder metadata record being
+    published.  Never raises on unusable prior presentation data: any doubt
+    falls back to a full render anchored at ``current_round``.
+    """
+    full = MatrixEvidenceRenderDecision(mode="full", anchor_round=current_round)
+    if previous_metadata is None:
+        return full
+    raw_previous = getattr(previous_metadata, "risk_test_matrix_evidence", None)
+    if raw_previous is None:
+        return full
+    try:
+        previous = parse_risk_test_matrix_evidence(raw_previous)
+    except (AgentLoopError, ValueError, TypeError, KeyError):
+        return full
+    if previous.matrix_identity != current.matrix_identity:
+        return full
+    if {row.row_id for row in previous.rows} != {row.row_id for row in current.rows}:
+        return full
+    previous_round = getattr(previous_metadata, "round_number", None)
+    if not _positive_round(previous_round):
+        return full
+    status = getattr(previous_metadata, "risk_test_matrix_evidence_full_round_status", "absent")
+    if status == "valid":
+        anchor = getattr(previous_metadata, "risk_test_matrix_evidence_full_round", None)
+        if not _positive_round(anchor) or anchor > previous_round:
+            return full
+    elif status == "absent":
+        # A pre-#959 record rendered the full row list in its own comment.
+        anchor = previous_round
+    else:
+        return full
+    return MatrixEvidenceRenderDecision(
+        mode="delta",
+        anchor_round=anchor,
+        previous_evidence=previous,
+        previous_round=previous_round,
+    )
+
+
 def _render_risk_test_matrix_evidence(
     evidence: RiskTestMatrixEvidence | None,
+    *,
+    render_decision: MatrixEvidenceRenderDecision | None = None,
 ) -> str | None:
     if evidence is None:
         return None
@@ -550,7 +647,32 @@ def _render_risk_test_matrix_evidence(
         "### Risk-based mode and transition test matrix evidence",
         f"- Matrix identity: `{safe(evidence.matrix_identity)}`",
     ]
-    for row in rows:
+    unchanged_line: str | None = None
+    if render_decision is not None and render_decision.mode == "delta":
+        assert render_decision.previous_evidence is not None
+        previous_keys = {
+            row.row_id: _matrix_evidence_row_key(row)
+            for row in render_decision.previous_evidence.rows
+        }
+        shown = [
+            row for row in rows
+            if previous_keys.get(row.row_id) != _matrix_evidence_row_key(row)
+        ]
+        unchanged = len(rows) - len(shown)
+        summary = (
+            f"{len(shown)} changed {'row' if len(shown) == 1 else 'rows'}; "
+            f"{unchanged} unchanged since round {int(render_decision.previous_round)}"
+        )
+        unchanged_line = (
+            f"{unchanged} {'row' if unchanged == 1 else 'rows'} unchanged since round "
+            f"{int(render_decision.previous_round)}; full matrix in round "
+            f"{int(render_decision.anchor_round)}."
+        )
+    else:
+        shown = rows
+        summary = f"Full matrix evidence ({len(rows)} {'row' if len(rows) == 1 else 'rows'})"
+    lines.extend(["", "<details>", f"<summary>{summary}</summary>", ""])
+    for row in shown:
         lines.append(f"- **{safe(row.row_id)}** — `{safe(row.status)}`")
         lines.append(f"  - Tests: {', '.join(safe(item) for item in row.test_identifiers) or 'none'}")
         lines.append(f"  - Locations: {', '.join(safe(item) for item in row.test_locations) or 'none'}")
@@ -564,6 +686,11 @@ def _render_risk_test_matrix_evidence(
             ))
         if row.caveats:
             lines.append("  - Caveats: " + "; ".join(safe(item) for item in row.caveats))
+    if unchanged_line is not None:
+        if shown:
+            lines.append("")
+        lines.append(unchanged_line)
+    lines.extend(["", "</details>"])
     return "\n".join(lines)
 
 
@@ -1181,6 +1308,7 @@ def _render_public_coder_followup_comment(
     model_used: str | None = None,
     local_test_evidence: str | None = None,
     current_test_turn_id: str | None = None,
+    matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
 
@@ -1258,7 +1386,10 @@ def _render_public_coder_followup_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
-    matrix_evidence = _render_risk_test_matrix_evidence(parsed_followup.risk_test_matrix_evidence)
+    matrix_evidence = _render_risk_test_matrix_evidence(
+        parsed_followup.risk_test_matrix_evidence,
+        render_decision=matrix_evidence_render_decision,
+    )
     if matrix_evidence:
         sections.append(matrix_evidence)
     if parsed_followup.human_requirement_dispositions:
@@ -1733,6 +1864,7 @@ def render_public_agent_comment(
     local_test_evidence: str | None = None,
     current_test_turn_id: str | None = None,
     compact: bool = False,
+    matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -1775,6 +1907,7 @@ def render_public_agent_comment(
             model_used=model_used,
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
+            matrix_evidence_render_decision=matrix_evidence_render_decision,
         )
     if kind == "issue_implementation":
         if not isinstance(parsed, StructuredIssueImplementation):
