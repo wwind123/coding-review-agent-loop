@@ -1022,3 +1022,58 @@ def test_resume_audit_after_a_continuity_names_the_successor_record(tmp_path, mo
     assert audit[1]["kind"] == KIND_CONTINUITY and audit[1]["head"] == HEAD_2
     # The superseded creation record never answers for the old head either.
     assert _resume_audit(github, tmp_path, live_head=HEAD_1) is None
+
+
+@pytest.mark.parametrize("mode", [FAIL_BEFORE_WRITE, WRITE_THEN_REPORT_FAILURE])
+@pytest.mark.parametrize("boundary", [1, 2, 3, 4, 5])
+def test_pr_loop_entry_finishes_an_interrupted_managed_transaction_from_its_bound_record(
+    tmp_path, boundary, mode
+):
+    """#827 point 1, managed: writes are prepared, handoff, contract, bound
+    authorization, committed.  Once the bound record exists the rerun replays
+    it byte-exact and commits with no new nonce; before it exists nothing is
+    written and the recovery is the explicit fresh grant."""
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        CODE_MANAGED_UNAVAILABLE,
+        finish_pending_transaction,
+        read_pr_transaction_views,
+    )
+
+    github = TransactionGitHub()
+    config = make_config(tmp_path)
+    github.fail_write(boundary, mode)
+    with pytest.raises(WorkflowTransactionError):
+        publish(github, creation(), tmp_path)
+    written = bound_comments(github)
+    before = github.write_count
+    pending = read_pr_transaction_views(github, config, PR, None).lineage.pending
+    if pending is None:
+        # Nothing was prepared, or the terminal write landed: nothing to finish.
+        assert finish_pending_transaction(github, config, pr_number=PR, head_sha=HEAD_1) is False
+        assert github.write_count == before
+        return
+    if not written:
+        with pytest.raises(WorkflowTransactionError) as raised:
+            finish_pending_transaction(github, config, pr_number=PR, head_sha=HEAD_1)
+        assert raised.value.code == CODE_MANAGED_UNAVAILABLE
+        assert "fresh" in raised.value.recovery_action
+        assert github.write_count == before
+        return
+    # A moved head is never finished from the old head's grant.
+    with pytest.raises(WorkflowTransactionError) as moved:
+        finish_pending_transaction(github, config, pr_number=PR, head_sha=HEAD_2)
+    assert moved.value.code == CODE_MANAGED_UNAVAILABLE and github.write_count == before
+
+    assert finish_pending_transaction(github, config, pr_number=PR, head_sha=HEAD_1) is True
+    resolved = read_pr_transaction_views(github, config, PR, None)
+    assert resolved.lineage.pending is None
+    assert bound_comments(github) == written
+    consumer = consumer_bound_authorization(
+        resolved.views.pr_view, resolved.lineage, live_head=HEAD_1
+    )
+    assert consumer is not None and consumer.comment_id == written[0]["id"]
+    assert consumer.record.nonce == "nonce-1"
+    assert gate(github, tmp_path) is not None
+    after = github.write_count
+    assert finish_pending_transaction(github, config, pr_number=PR, head_sha=HEAD_1) is False
+    assert github.write_count == after

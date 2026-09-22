@@ -2036,22 +2036,18 @@ def finish_pending_transaction(
     derived from the stored intent alone: the seam adopts that intent and
     finishes it (an initial coder round entry nobody can supply is waived), or
     aborts it as obsolete when the live head moved and prepares a fresh one.
-    Returns whether anything was pending.  A managed pending transaction, and
-    a successor kind the PR loop cannot re-derive, raise without writing.
+    Returns whether anything was pending.  A managed pending transaction is
+    finished only from the bound authorization it already wrote; without one,
+    or with a successor kind the PR loop cannot re-derive, it raises unwritten.
     """
     resolved = read_pr_transaction_views(runner, config, pr_number, None)
     pending = resolved.lineage.pending if resolved.era == ERA_TRANSACTION else None
     if pending is None:
         return False
     intent = pending.intent
+    managed_request: dict[str, object] = {}
     if intent.managed_ci_generation is not None:
-        raise _error(
-            "Finishing a managed transaction needs a managed-CI input; nothing was written",
-            intent=intent,
-            problems=("managed pending transaction is not finished from the PR loop",),
-            recovery=RECOVERY_RERUN,
-            code=CODE_MANAGED_UNAVAILABLE,
-        )
+        managed_request = _pending_managed_input(resolved, pending, head_sha=head_sha)
     if intent.successor_kind not in _ENTRY_FINISHABLE_KINDS:
         raise _error(
             "The pending transaction is not one the PR loop can finish; nothing was written",
@@ -2063,12 +2059,56 @@ def finish_pending_transaction(
             recovery=RECOVERY_RERUN,
             code=CODE_PENDING,
         )
-    publish_transition(
-        runner,
-        config=config,
-        request=_request_from_intent(runner, config, intent, head_sha=head_sha),
-    )
+    request = _request_from_intent(runner, config, intent, head_sha=head_sha)
+    if managed_request:
+        request = dataclasses.replace(request, **managed_request)
+    publish_transition(runner, config=config, request=request)
     return True
+
+
+def _pending_managed_input(
+    resolved: PrTransactionViews, pending: TransactionState, *, head_sha: str
+) -> dict[str, object]:
+    """The managed input that finishes an interrupted managed transaction (#827).
+
+    Only a bound authorization the interrupted run already wrote can be
+    adopted: pending mode validates it against the stored intent, and it is
+    replayed byte-exact as the entry's payload, so a rerun mints nothing and
+    needs no fresh grant.  When it was never written, or the live head moved
+    (a managed head needs its own continuity provenance), nothing is written
+    and the recovery is the explicit fresh grant.
+    """
+    from . import managed_ci_bound_authorization as bound
+
+    intent = pending.intent
+    record = (
+        bound.pending_bound_authorization(
+            resolved.views.pr_view, resolved.lineage, pending
+        )
+        if intent.head_sha == head_sha
+        else None
+    )
+    if record is None:
+        raise _error(
+            "Finishing this managed transaction needs its bound authorization; nothing was written",
+            intent=intent,
+            problems=(
+                (
+                    f"live head {head_sha} differs from the pending head {intent.head_sha}"
+                    if intent.head_sha != head_sha
+                    else "the pending transaction's bound authorization was never written"
+                ),
+            ),
+            recovery="rerun the pr command with the explicit fresh issue-created authorization",
+            code=CODE_MANAGED_UNAVAILABLE,
+        )
+    payload = dataclasses.replace(record.record, transaction_id="")
+    managed = (
+        Released(payload, payload.generation())
+        if payload.kind == bound.KIND_ORDINARY_RELEASE
+        else Granted(payload, payload.generation())
+    )
+    return {"managed": managed, "authorization_codec": bound.BoundAuthorizationCodec()}
 
 
 LEGACY_UPGRADE_FLOWS = frozenset({FLOW_ISSUE, FLOW_DIRECT_PR, FLOW_MANAGED_PR})

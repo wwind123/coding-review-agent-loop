@@ -11260,3 +11260,62 @@ def test_m946_managed_approved_plan_interrupted_grants_nothing(tmp_path, monkeyp
     assert bound.consumer_bound_authorization(
         resolved.views.pr_view, resolved.lineage, live_head=FULL_HEAD
     ) is None
+
+
+@pytest.mark.parametrize("boundary", [5, 6])
+def test_m946_managed_approved_plan_rerun_finishes_from_the_written_bound_record(
+    tmp_path, monkeypatch, boundary
+):
+    """After the bound creation record was written (interruption at the tagged
+    coder round or the committed record), an issue-command rerun finishes the
+    stored transaction from that record: no coder turn, no second PR, no
+    version-1 authorization, exactly one bound record, and one commit."""
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, seen = _m946_managed_one_shot(tmp_path, monkeypatch, boundary)
+    with pytest.raises(WorkflowTransactionError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    claude_calls = sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    runner.rest_post_failures = ()
+    run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands) == claude_calls
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+    assert seen["v1"] == 0
+    assert not _m946_workflow_records(runner, "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1")
+    assert len(_m946_workflow_records(runner, bound.BOUND_AUTHORIZATION_MARKER)) == 1
+    resolved = publication.read_pr_transaction_views(runner, config, 77, 56)
+    assert resolved.lineage.pending is None
+    assert resolved.lineage.latest_committed.intent.managed_ci_generation == (
+        seen["built"][0].generation()
+    )
+    assert bound.consumer_bound_authorization(
+        resolved.views.pr_view, resolved.lineage,
+        live_head=resolved.lineage.latest_committed.intent.head_sha,
+    ) is not None
+
+
+def test_m946_managed_approved_plan_rerun_without_the_bound_record_writes_nothing(
+    tmp_path, monkeypatch
+):
+    """Interrupted before the bound creation record was written: the rerun has
+    no grant to replay, so it stops with the managed-unavailable diagnostic
+    naming the explicit fresh grant, and writes and invokes nothing."""
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, seen = _m946_managed_one_shot(tmp_path, monkeypatch, 4)
+    with pytest.raises(WorkflowTransactionError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    claude_calls = sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    runner.rest_post_failures = ()
+    before = len(runner.pr_payload.get("comments", []))
+    with pytest.raises(WorkflowTransactionError) as raised:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert raised.value.code == publication.CODE_MANAGED_UNAVAILABLE
+    assert "fresh" in raised.value.recovery_action
+    assert len(runner.pr_payload.get("comments", [])) == before
+    assert sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands) == claude_calls
+    assert seen["reviewed"] == [] and seen["v1"] == 0
