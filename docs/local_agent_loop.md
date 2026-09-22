@@ -1177,6 +1177,20 @@ but it does not always fail with an error either:
 Downgrading across such a comment is unsupported: upgrade the binary before
 resuming. Before this change such a comment could not be posted at all.
 
+The visible risk/test-matrix evidence section of coder comments is collapsed
+under a `<details>` summary and, on PR coder follow-ups, shows only the rows
+whose status, assertions, citations (ignoring receipt IDs) or caveats changed
+since the previous coder round, followed by a line such as `21 rows unchanged
+since round 26; full matrix in round 23.` The full row list is rendered in the
+issue-implementation comment, in the first follow-up that carries evidence,
+whenever the matrix identity or row set changes, and whenever the previous
+round's evidence or its recorded full-matrix round cannot be used. That round is
+kept in the optional `risk_test_matrix_evidence_full_round` round-metadata field;
+records written before this change are treated as having rendered the full list
+themselves. The canonical `risk_test_matrix_evidence` in `AGENT_LOOP_META` and
+the matrix sidecar still carry every row, so resume and reviewer prompts are
+unaffected.
+
 Sidecars carry metadata only. When the visible text of a structured plan comment
 (`plan_state` or `plan_revision`) would still push the comment over the
 60,000-character budget, the loop posts a **compact plan digest** instead of the

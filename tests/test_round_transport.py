@@ -2380,3 +2380,79 @@ def test_m953_derived_overflow_threshold_uses_the_framed_marker(monkeypatch) -> 
         message = overflow_message(budget)
         assert "derived round metadata alone" in message
         assert "shorten the visible response or metadata." not in message
+
+
+# --- #959: persisted full-matrix anchor ------------------------------------
+
+_EVIDENCE_959 = {"matrix_identity": "a" * 64, "rows": []}
+
+
+def _coder_metadata_959(**kwargs):
+    return PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=3,
+        subject="abc",
+        risk_test_matrix_evidence=_EVIDENCE_959,
+        **kwargs,
+    )
+
+
+def test_959_matrix_full_round_round_trips_with_valid_status():
+    metadata = _coder_metadata_959(risk_test_matrix_evidence_full_round=2)
+    assert metadata.risk_test_matrix_evidence_full_round_status == "valid"
+    encoded = _encode_round_metadata(metadata)
+    payload = transport.decode_mapping(encoded)
+    assert payload["risk_test_matrix_evidence_full_round"] == 2
+    assert "risk_test_matrix_evidence_full_round_status" not in payload
+    decoded = _decode_round_metadata(encoded)
+    assert decoded.risk_test_matrix_evidence_full_round == 2
+    assert decoded.risk_test_matrix_evidence_full_round_status == "valid"
+    assert decoded.risk_test_matrix_evidence == _EVIDENCE_959
+
+
+def test_959_matrix_full_round_omitted_when_unset_keeps_legacy_encoding():
+    metadata = _coder_metadata_959()
+    assert metadata.risk_test_matrix_evidence_full_round_status == "absent"
+    encoded = _encode_round_metadata(metadata)
+    payload = transport.decode_mapping(encoded)
+    assert "risk_test_matrix_evidence_full_round" not in payload
+    assert "risk_test_matrix_evidence_full_round_status" not in payload
+    # Byte-identical to an encoding of the same record written before #959.
+    assert transport.encode_mapping(payload) == encoded
+    decoded = _decode_round_metadata(encoded)
+    assert decoded.risk_test_matrix_evidence_full_round is None
+    assert decoded.risk_test_matrix_evidence_full_round_status == "absent"
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 0, -1, "2", None, 2.0])
+def test_959_malformed_matrix_full_round_decodes_invalid_without_raising(bad_value):
+    payload = transport.decode_mapping(_encode_round_metadata(_coder_metadata_959()))
+    payload["risk_test_matrix_evidence_full_round"] = bad_value
+    decoded = _decode_round_metadata_mapping(payload)
+    assert decoded.risk_test_matrix_evidence_full_round is None
+    assert decoded.risk_test_matrix_evidence_full_round_status == "invalid"
+    assert decoded.risk_test_matrix_evidence == _EVIDENCE_959
+
+
+def test_959_matrix_full_round_construction_status_rules():
+    assert _coder_metadata_959().risk_test_matrix_evidence_full_round_status == "absent"
+    assert (
+        _coder_metadata_959(risk_test_matrix_evidence_full_round=1)
+        .risk_test_matrix_evidence_full_round_status
+        == "valid"
+    )
+    with pytest.raises(ValueError):
+        _coder_metadata_959(
+            risk_test_matrix_evidence_full_round=1,
+            risk_test_matrix_evidence_full_round_status="invalid",
+        )
+    with pytest.raises(ValueError):
+        _coder_metadata_959(risk_test_matrix_evidence_full_round_status="bogus")
+    invalid = _coder_metadata_959(risk_test_matrix_evidence_full_round_status="invalid")
+    assert invalid.risk_test_matrix_evidence_full_round is None
+
+
+def test_959_matrix_full_round_does_not_change_growth_spill_fields():
+    assert transport._GROWTH_SPILL_FIELDS == ("prior_items", "risk_test_matrix_evidence")

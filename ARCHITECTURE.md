@@ -65,7 +65,7 @@ Source paths below are relative to
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py`, `plan_review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head or a candidate plan. |
-| Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. Structured plan coder comments additionally have a bounded visible digest, selected only when the full comment overflows the body budget (see *Compact-on-overflow plan presentation*). |
+| Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. Structured plan coder comments additionally have a bounded visible digest, selected only when the full comment overflows the body budget (see *Compact-on-overflow plan presentation*). The visible coder matrix-evidence section is collapsed and, on PR coder follow-ups, projected as a delta against the previous coder round, while canonical evidence stays complete (see *Delta matrix-evidence presentation*). |
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier. |
 | Workflow transaction model (#827, stage A) | `workflow_transaction.py` | Typed transition intent whose canonical hash is the transaction ID; append-only prepared/terminal transaction record codec (PR-comment-only); version-2 handoff and PR contract derivation; lineage, era, approved-plan anchor, scheduler-checkpoint, and legacy-root resolvers. Every resolver accepts only the author-authenticated comment view read by `github.read_authenticated_protocol_comments`. Model only: no writer emits these records and no orchestration call site consumes them yet; the version-1 reader entry points are unchanged and still reject version 2. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
@@ -921,3 +921,59 @@ mismatched response fails before publication. The assembled generation-1
 Markdown and its existing subject/hash remain the downstream review and
 implementation surface; the sidecar is the durable authority used for
 hydration.
+
+### Delta matrix-evidence presentation (#959)
+
+The visible `### Risk-based mode and transition test matrix evidence` section of
+coder comments is presentation only: reviewers and resume read the canonical
+`risk_test_matrix_evidence` in round metadata (and the matrix sidecar), which
+always carries every row. The section therefore keeps its heading and
+`- Matrix identity:` line visible but wraps the row list in a renderer-emitted
+`<details><summary>…</summary>` block, padded with blank lines so GitHub renders
+the Markdown inside it collapsed. The summary text is built only from counts and
+integer round numbers; row text is still sanitized.
+
+`comment_rendering.resolve_matrix_evidence_render` is the single place that
+chooses the presentation. It returns a frozen `MatrixEvidenceRenderDecision`
+(`mode`, `anchor_round`, `previous_evidence`, `previous_round`), never raises,
+and `_render_risk_test_matrix_evidence` follows the decision without comparing
+anything itself:
+
+- **Full** (anchor = the coder record's own round number). Chosen when there is
+  no previous coder metadata, the previous evidence is absent or fails
+  `parse_risk_test_matrix_evidence`, the matrix identity differs, the row-ID sets
+  differ, or the previous anchor is unusable. A full decision carries no
+  previous evidence. Every row is rendered.
+- **Delta**. Chosen only for the same identity and the same row-ID set with a
+  usable anchor. Only rows whose comparison key changed are shown, followed by
+  `N rows unchanged since round P; full matrix in round F.`; with no changes that
+  line is the only content. The comparison key is the row payload with each
+  citation reduced to `(command, claim)`, so a fresh per-turn receipt ID alone is
+  not a change. The anchor is carried forward unchanged.
+
+The PR coder follow-up computes the posted record's round number once
+(`round_number + 1`) and uses it both as the helper's `current_round` and as the
+metadata `round_number`; it passes the same decision to
+`render_public_agent_comment(matrix_evidence_render_decision=...)` and persists
+its `anchor_round`. When the derived current evidence is `None` the helper is not
+called, no decision is passed, the section is omitted and no anchor is written;
+a later round with evidence then renders full. Issue-implementation comments that
+carry canonical evidence always render the full list, and both issue-to-PR
+metadata sites persist their own round as the anchor. The structured no-PR and
+rejected-conflict terminal comments carry no canonical evidence and omit the
+section.
+
+The anchor is the optional `PostedRoundMetadata.risk_test_matrix_evidence_full_round`
+integer, written only when not `None` (so earlier encodings stay byte-identical)
+and set if and only if the record persists matrix evidence. It is a small
+unspillable scalar. A non-serialized
+`risk_test_matrix_evidence_full_round_status` distinguishes decode quality, in
+the same style as `scheduler_metadata_status`: a missing key decodes as
+`absent`; a positive non-bool integer decodes as `valid`; any other present value
+(bool, zero, negative, string, null, float) decodes as anchor `None` with status
+`invalid`, without raising. Construction with an anchor promotes the status to
+`valid`, so in-process and decoded records agree, and an anchor combined with
+`invalid` is rejected. The helper treats a `valid` anchor as usable only when it
+is a positive integer no later than the previous record's round; an `absent`
+status on a record with evidence is a pre-#959 record, which rendered the full
+list itself, so its own round is the anchor; `invalid` forces a full render.

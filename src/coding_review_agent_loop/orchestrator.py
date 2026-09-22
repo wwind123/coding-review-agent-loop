@@ -448,6 +448,7 @@ from .comment_rendering import (
     normalize_freeform_signature,
     render_discuss_round_summary_comment,
     render_public_agent_comment,
+    resolve_matrix_evidence_render,
     render_agent_unavailable_comment,
     render_canonical_plan_revision,
     render_canonical_plan_state,
@@ -8388,6 +8389,10 @@ def _implement_approved_issue(
                 if implementation_result.risk_test_matrix_evidence is not None
                 else None
             ),
+            # The establishing comment renders the full row list (#959).
+            risk_test_matrix_evidence_full_round=(
+                1 if implementation_result.risk_test_matrix_evidence is not None else None
+            ),
             risk_test_matrix_diagnostics=tuple(
                 diagnostic.to_payload()
                 for diagnostic in implementation_result.risk_test_matrix_diagnostics
@@ -13108,6 +13113,10 @@ def run_issue_loop(
                     implementation_result.risk_test_matrix_evidence.to_payload()
                     if implementation_result.risk_test_matrix_evidence is not None
                     else None
+                ),
+                # The establishing comment renders the full row list (#959).
+                risk_test_matrix_evidence_full_round=(
+                    1 if implementation_result.risk_test_matrix_evidence is not None else None
                 ),
                 risk_test_matrix_diagnostics=tuple(
                     diagnostic.to_payload()
@@ -20701,6 +20710,19 @@ def run_pr_loop(
                     else None
                 ),
             )
+            # The coder metadata record posted below is numbered one past the
+            # loop round; the matrix-evidence anchor must use that number.
+            coder_record_round = round_number + 1
+            matrix_evidence_render_decision = None
+            if (
+                isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                and coder_response.marker_value.risk_test_matrix_evidence is not None
+            ):
+                matrix_evidence_render_decision = resolve_matrix_evidence_render(
+                    coder_response.marker_value.risk_test_matrix_evidence,
+                    latest_coder_metadata,
+                    coder_record_round,
+                )
             if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                 public_comment = render_public_agent_comment(
                     kind="coder_followup",
@@ -20711,6 +20733,7 @@ def run_pr_loop(
                     model_used=coder_response.model_used,
                     local_test_evidence=local_test_evidence,
                     current_test_turn_id=coder_response.acquisition_test_turn_id,
+                    matrix_evidence_render_decision=matrix_evidence_render_decision,
                 )
 
             qualification_checkpoint = _machine_obligation_checkpoint(
@@ -20736,7 +20759,7 @@ def run_pr_loop(
                 flow="pr",
                 role="coder",
                 agent=coder_name,
-                round_number=round_number + 1,
+                round_number=coder_record_round,
                 subject=str(updated_pr_context.metadata.head_sha or "unknown"),
                 prior_items=tuple(unresolved_items),
                 raw_structured_coder_response=raw_structured_coder_response,
@@ -20745,6 +20768,11 @@ def run_pr_loop(
                     coder_response.marker_value.risk_test_matrix_evidence.to_payload()
                     if isinstance(coder_response.marker_value, StructuredCoderFollowup)
                     and coder_response.marker_value.risk_test_matrix_evidence is not None
+                    else None
+                ),
+                risk_test_matrix_evidence_full_round=(
+                    matrix_evidence_render_decision.anchor_round
+                    if matrix_evidence_render_decision is not None
                     else None
                 ),
                 risk_test_matrix_diagnostics=(

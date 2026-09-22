@@ -927,6 +927,16 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
     )
     assert metadata.risk_test_matrix_evidence is not None
     assert metadata.risk_test_matrix_evidence["rows"][0]["status"] == expected_status
+    # #959: the establishing comment renders the full list and anchors to itself.
+    assert metadata.risk_test_matrix_evidence_full_round == metadata.round_number
+    assert metadata.risk_test_matrix_evidence_full_round_status == "valid"
+    coder_comment = next(
+        comment for comment in raw_comments
+        if "AGENT_LOOP_META: " in comment
+        and _metadata_from_public_comment(comment).role == "coder"
+    )
+    assert "<summary>Full matrix evidence (1 row)</summary>" in coder_comment
+    assert "unchanged since round" not in coder_comment
     if expected_diagnostic is None:
         assert not metadata.risk_test_matrix_diagnostics
     else:
@@ -10901,3 +10911,99 @@ def test_m948_overflow_the_digest_cannot_fix_fails_closed_and_posts_nothing(tmp_
     assert "compact_prior_summaries=" in str(excinfo.value)
     assert _m948_noise("unspillable", 64) not in str(excinfo.value)
     assert runner.issue_comments == []
+
+
+# --- #959: issue-to-PR coder metadata persists the full-matrix anchor -------
+
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    parse_risk_test_matrix_evidence as _parse_evidence_959,
+)
+
+
+def _issue_evidence_959():
+    return _parse_evidence_959({
+        "matrix_identity": "c" * 64,
+        "rows": [{
+            "row_id": f"row-{index}",
+            "status": "missing",
+            "test_identifiers": [],
+            "test_locations": [],
+            "workflow_path_claim": f"Direct flow path {index}.",
+            "outcome_assertions": [],
+            "forbidden_effect_assertions": [],
+            "evidence_citations": [],
+            "caveats": [],
+        } for index in range(2)],
+    })
+
+
+@pytest.mark.parametrize("with_evidence", [True, False], ids=["evidence", "no-evidence"])
+def test_959_direct_issue_implementation_metadata_anchors_to_own_round(
+    tmp_path, monkeypatch, with_evidence
+):
+    runner = FakeRunner(claude_outputs=[structured_issue_implementation(pr_number=77)])
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    real_derive = orchestrator_module._derive_authenticated_risk_evidence_for_coder
+
+    def derive(result, **kwargs):
+        derived, extra = real_derive(result, **kwargs)
+        if with_evidence:
+            derived = replace(derived, risk_test_matrix_evidence=_issue_evidence_959())
+        return derived, extra
+
+    monkeypatch.setattr(orchestrator_module, "_derive_authenticated_risk_evidence_for_coder", derive)
+    monkeypatch.setattr(orchestrator_module, "run_pr_loop", lambda *_a, **_k: 0)
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    coder_comments = [
+        item["body"] for item in runner.pr_payload.get("comments", [])
+        if isinstance(item, dict) and isinstance(item.get("body"), str)
+        and "AGENT_LOOP_META: " in item["body"]
+        and _metadata_from_public_comment(item["body"]).role == "coder"
+    ]
+    assert len(coder_comments) == 1
+    metadata = _metadata_from_public_comment(coder_comments[0])
+    visible = coder_comments[0].split("AGENT_LOOP_META", 1)[0]
+    if with_evidence:
+        assert metadata.risk_test_matrix_evidence is not None
+        assert metadata.risk_test_matrix_evidence_full_round == metadata.round_number
+        assert metadata.risk_test_matrix_evidence_full_round_status == "valid"
+        assert "<summary>Full matrix evidence (2 rows)</summary>" in visible
+        assert "**row-0**" in visible and "**row-1**" in visible
+    else:
+        assert metadata.risk_test_matrix_evidence is None
+        assert metadata.risk_test_matrix_evidence_full_round is None
+        assert metadata.risk_test_matrix_evidence_full_round_status == "absent"
+        assert "matrix evidence" not in visible
+        assert "<details>" not in visible
+
+
+def test_959_structured_no_pr_terminal_comment_omits_matrix_evidence(tmp_path):
+    raw = structured_issue_implementation(pr_number=None, summary="Blocked before a PR.")
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["risk_test_matrix_claims"] = [{
+        "row_id": "row-0",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": ["tests/test_x.py::test_y"],
+        "test_locations": ["tests/test_x.py"],
+        "workflow_path_claim": "Semantic claim only.",
+        "outcome_assertions": ["outcome"],
+        "forbidden_effect_assertions": ["forbidden"],
+        "caveats": [],
+    }]
+    parsed = validate_structured_issue_implementation(json.dumps(payload) + raw[end:])
+    assert parsed is not None and parsed.pr_number is None
+    assert parsed.risk_test_matrix_evidence is None
+    runner = FakeRunner()
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+
+    orchestrator_module._post_structured_issue_implementation_terminal_comment(
+        runner, config=config, issue_number=56, parsed=parsed, model_used=None
+    )
+
+    assert runner.comments
+    body = runner.comments[-1]
+    assert "Blocked before a PR." in body
+    assert "matrix evidence" not in body
+    assert "<details>" not in body
