@@ -627,6 +627,15 @@ def test_recognized_inner_probe_uses_only_safe_version_argv(tmp_path, monkeypatc
     assert calls[0][1]["timeout_seconds"] == 5.0
 
 
+_SYSTEM_ENV_AVAILABLE = os.name == "posix" and runtime._is_trusted_env_executable(
+    "/usr/bin/env", environment=os.environ
+)
+requires_system_env = pytest.mark.skipif(
+    not _SYSTEM_ENV_AVAILABLE, reason="root-owned /usr/bin/env is unavailable"
+)
+
+
+@requires_system_env
 def test_env_assignment_prefix_is_normalized_for_inner_probe(tmp_path, monkeypatch):
     calls = []
 
@@ -652,12 +661,14 @@ def test_env_assignment_prefix_is_normalized_for_inner_probe(tmp_path, monkeypat
         assert probe_env["AGENT_FLAG"] == "1"
 
 
+@requires_system_env
 def test_env_prefix_without_assignments_is_normalized(tmp_path):
     assert runtime.recognized_inner_probe(
         ["env", sys.executable, "-m", "pytest", "tests"], cwd=tmp_path
     ) == (sys.executable, "-m", "pytest", "--version")
 
 
+@requires_system_env
 def test_env_prefix_assignments_distinguish_inner_probe_cache(tmp_path, monkeypatch):
     calls = []
 
@@ -713,6 +724,29 @@ def test_env_prefix_without_command_or_with_unrecognized_target_is_unknown(tmp_p
     for argv in (["env"], ["env", "PYTHONPATH=x"], ["env", "PYTHONPATH=x", "make", "test"]):
         result = runtime.probe_inner_launcher(argv, cwd=tmp_path)
         assert result.state == "unknown", argv
+    assert calls == []
+
+
+def test_lookalike_env_executable_is_not_stripped_from_probe(tmp_path, monkeypatch):
+    # A program named ``env`` that ignores its argv and exits 0 must not let
+    # the probe verify the real interpreter on its behalf.
+    calls = []
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_env = fake_bin / "env"
+    fake_env.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_env.chmod(0o755)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    shadowed = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
+    for argv_prefix, environment in (
+        (["env"], shadowed),
+        ([str(fake_env)], None),
+    ):
+        argv = [*argv_prefix, "PYTHONPATH=x", sys.executable, "-m", "pytest", "tests"]
+        assert runtime.recognized_inner_probe(argv, cwd=tmp_path, environment=environment) is None
+        result = runtime.probe_inner_launcher(argv, cwd=tmp_path, environment=environment)
+        assert result.state == "unknown", argv_prefix
+        assert "unrecognized" in result.diagnostic
     assert calls == []
 
 

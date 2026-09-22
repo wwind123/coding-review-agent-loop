@@ -2088,10 +2088,45 @@ def verified_wrapper_prefix(**kwargs: object) -> tuple[str, ...] | None:
 
 
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+# Only the system ``env`` is trusted to exec the remaining argv unchanged.  A
+# lookalike reached through a caller-controlled PATH or an arbitrary absolute
+# path could ignore its argv and exit 0 while the probe verified the real
+# interpreter, so such prefixes stay unrecognized.
+_TRUSTED_ENV_PATHS = (Path("/usr/bin/env"), Path("/bin/env"))
+
+
+def _is_trusted_env_executable(token: str, *, environment: Mapping[str, str]) -> bool:
+    """Return whether ``token`` resolves to a root-owned system ``env``."""
+    if os.name != "posix":
+        return False
+    if token == "env":
+        located = shutil.which(token, path=environment.get("PATH"))
+        if located is None:
+            return False
+        candidate = Path(located)
+    elif Path(token).is_absolute():
+        candidate = Path(token)
+    else:
+        return False
+    try:
+        resolved = candidate.resolve(strict=True)
+        trusted = {path.resolve(strict=True) for path in _TRUSTED_ENV_PATHS if path.exists()}
+    except OSError:
+        return False
+    if resolved not in trusted:
+        return False
+    for path in (resolved, resolved.parent):
+        try:
+            info = path.stat()
+        except OSError:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            return False
+    return True
 
 
 def _split_env_prefix(
-    tokens: Sequence[str],
+    tokens: Sequence[str], *, environment: Mapping[str, str]
 ) -> tuple[dict[str, str], tuple[str, ...]] | None:
     """Strip a leading ``env [--] NAME=VALUE...`` prefix from a launcher argv.
 
@@ -2099,15 +2134,15 @@ def _split_env_prefix(
     assignments plus the remaining target argv when the prefix is a plain
     assignment list, and ``None`` when ``env`` is spelled in a way whose
     effect on the target cannot be reproduced for the probe: any ``env``
-    option (``-i``, ``-u``, ``-S``, ``--chdir``...), a repository-relative
-    ``env`` path, a malformed assignment, a nested ``env``, or no command.
+    option (``-i``, ``-u``, ``-S``, ``--chdir``...), an ``env`` that is not
+    the root-owned system executable (``./env``, ``/tmp/env``, or a bare
+    ``env`` shadowed on ``PATH``), a malformed assignment, a nested ``env``,
+    or no command.
     """
     tokens = tuple(tokens)
     if not tokens or Path(tokens[0]).name != "env":
         return {}, tokens
-    if tokens[0] != "env" and not Path(tokens[0]).is_absolute():
-        # ``./env`` or ``tools/env`` is an arbitrary repository program, not
-        # the system ``env`` whose semantics this normalization assumes.
+    if not _is_trusted_env_executable(tokens[0], environment=environment):
         return None
     assignments: dict[str, str] = {}
     index = 1
@@ -2140,11 +2175,11 @@ def _recognized_inner_probe_with_environment(
     to the probe environment so it observes what the target will observe.
     """
     tokens = tuple(str(item) for item in argv)
-    split = _split_env_prefix(tokens)
+    values: Mapping[str, str] = environment if environment is not None else os.environ
+    split = _split_env_prefix(tokens, environment=values)
     if split is None:
         return None
     assignments, target = split
-    values: Mapping[str, str] = environment if environment is not None else os.environ
     if assignments:
         # ``env`` resolves the command with the modified PATH, so resolve the
         # interpreter against the same merged environment.
