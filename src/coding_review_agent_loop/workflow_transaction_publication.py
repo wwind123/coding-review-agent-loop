@@ -805,11 +805,44 @@ class _Seam:
 
     # -- (2) sibling reconciliation -----------------------------------------
 
+    def _abort_obsolete_siblings(
+        self, views: PublicationViews, states: Sequence[TransactionState]
+    ) -> bool:
+        """Abort prepared-only siblings made obsolete by this caller's inputs.
+
+        Runs before the lowest-ID tie-break, and only for a group in which some
+        prepared-only member is ``current`` for this caller: an obsolete member
+        (stale head, superseded plan, widened contract) is never finished by
+        anyone, so it receives the same ``stale-head`` / ``superseded-intent``
+        abort a single pending record would.  Without this, a stale lower-ID
+        sibling would win the tie-break, the caller's live intent would be
+        aborted as the loser, and its identical intent could never be prepared
+        again.  Returns whether anything was aborted.
+        """
+        aborted = False
+        for members in _sibling_groups(states).values():
+            pending = [item for item in members if not item.committed]
+            if len(members) < 2 or not pending:
+                continue
+            comparisons = [(item, self.compare(views, item.intent)) for item in pending]
+            if not any(comparison.outcome == "current" for _item, comparison in comparisons):
+                continue
+            for item, comparison in comparisons:
+                if comparison.outcome == "obsolete":
+                    self._abort_obsolete(views, item, comparison)
+                    aborted = True
+        return aborted
+
     def reconcile_siblings(self, views: PublicationViews) -> PublicationViews:
         request = self.request
         states = collect_transactions(
             views.pr_view, repository=request.repository, pr_number=request.pr_number
         )
+        if self._abort_obsolete_siblings(views, states):
+            views = self.read()
+            states = collect_transactions(
+                views.pr_view, repository=request.repository, pr_number=request.pr_number
+            )
         losers: list[TransactionState] = []
         for members in _sibling_groups(states).values():
             if len(members) < 2:

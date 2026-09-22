@@ -3149,9 +3149,10 @@ def test_m946_prepared_rebind_siblings_are_reconciled_by_an_issue_rerun(
     tmp_path, monkeypatch, competitor
 ):
     """#827: a second prepared-only plan replacement of the same committed
-    predecessor (a competing invocation that never resumes) does not stop the
-    issue command in routing: the seam reconciles the siblings and one rebind
-    commits."""
+    predecessor (a competing invocation that never resumes, naming a stale head)
+    does not stop the issue command, whether its prepared record has the lower
+    or the higher comment ID: the obsolete sibling is aborted before the
+    tie-break and the live rebind commits."""
     from coding_review_agent_loop import workflow_transaction_publication as publication
     from coding_review_agent_loop.errors import WorkflowTransactionError
     from coding_review_agent_loop.workflow_transaction import (
@@ -3209,22 +3210,6 @@ def test_m946_prepared_rebind_siblings_are_reconciled_by_an_issue_rerun(
         publication.discover_canonical_issue_pr(world._runner(), config, 56)
 
     writes["armed"] = False
-    if competitor == "lower-id":
-        # Our transaction loses the tie-break and is aborted; the canonical
-        # rival names a head that is no longer live, so it is aborted as
-        # obsolete, and re-preparing our identical intent is refused by the
-        # aborted-intent rule.  The stop is non-mutating beyond the aborts and
-        # nothing ever binds the new plan.
-        with pytest.raises(WorkflowTransactionError, match="aborted-intent-reused"):
-            world.run_issue(codex_outputs=[])
-        lineage = publication.read_pr_transaction_views(world.runner, config, 77, 56).lineage
-        assert lineage.latest_committed.intent.approved_plan_hash == world.old_hash
-        assert lineage.pending is None
-        assert handed == [] and world.agent_calls("claude") == []
-        assert not any(
-            CHILD_PLAN_REBIND_MARKER_RE.search(str(row["body"])) for row in world.issue_rows
-        )
-        return
     assert world.run_issue(codex_outputs=[]) == 0
     assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
     lineage = publication.read_pr_transaction_views(world.runner, config, 77, 56).lineage
@@ -3232,8 +3217,12 @@ def test_m946_prepared_rebind_siblings_are_reconciled_by_an_issue_rerun(
     committed = [state for state in lineage.chain if state.committed]
     assert [state.intent.successor_kind for state in committed] == ["initial", KIND_PLAN_REPLACEMENT]
     assert committed[-1].intent.head_sha == _M946_HEAD
+    # Our interrupted transaction is adopted and finished, not re-prepared.
+    assert committed[-1].transaction_id == ours.transaction_id
     rival_state = lineage.state(rival_intent.transaction_id)
     assert rival_state is not None and rival_state.aborted
+    # The stale rival is aborted as obsolete before the tie-break, whatever its ID.
+    assert rival_state.terminal.abort_reason == "stale-head"
     assert handed == [77]
     bodies = [str(row["body"]) for row in world.issue_rows]
     rebinds = [body for body in bodies if CHILD_PLAN_REBIND_MARKER_RE.search(body)]
