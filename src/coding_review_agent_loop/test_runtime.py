@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -93,6 +93,11 @@ class LauncherProbeResult:
     state: str
     diagnostic: str = ""
     identity: str = ""
+    # Argv the real target must be spawned with for the probe result to hold.
+    # Empty means ``candidate`` itself.  A normalized ``env`` prefix is bound
+    # here to the authenticated system ``env`` path so a mutable spelling
+    # (bare ``env`` on PATH, a symlink) cannot be swapped after the probe.
+    launch_argv: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.state not in WRAPPER_BOOTSTRAP_STATES:
@@ -2087,19 +2092,150 @@ def verified_wrapper_prefix(**kwargs: object) -> tuple[str, ...] | None:
     return None
 
 
+_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+# Only the system ``env`` is trusted to exec the remaining argv unchanged.  A
+# lookalike reached through a caller-controlled PATH or an arbitrary absolute
+# path could ignore its argv and exit 0 while the probe verified the real
+# interpreter, so such prefixes stay unrecognized.
+_TRUSTED_ENV_PATHS = (Path("/usr/bin/env"), Path("/bin/env"))
+
+
+def _root_protected_chain(path: Path) -> bool:
+    """Return whether ``path`` and every ancestor are root-owned and unwritable.
+
+    ``path`` must already be canonical (symlink-free), so a non-root user can
+    neither replace the file nor any directory entry leading to it.
+    """
+    for entry in (path, *path.parents):
+        try:
+            info = entry.lstat()
+        except OSError:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            return False
+    return True
+
+
+def _trusted_env_executable(token: str, *, environment: Mapping[str, str]) -> str | None:
+    """Return the canonical root-protected system ``env`` that ``token`` names.
+
+    ``token`` (a bare ``env`` looked up on the caller's PATH, or an absolute
+    path) must currently resolve to the same file as a system ``env`` whose
+    canonical path is root-protected end to end.  The returned canonical path
+    is what the target is then spawned with, so the check does not depend on
+    the mutable lookup path staying unchanged until spawn.
+    """
+    if os.name != "posix":
+        return None
+    if token == "env":
+        located = shutil.which(token, path=environment.get("PATH"))
+        if located is None:
+            return None
+        candidate = Path(located)
+    elif Path(token).is_absolute():
+        candidate = Path(token)
+    else:
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    for trusted in _TRUSTED_ENV_PATHS:
+        try:
+            canonical = trusted.resolve(strict=True)
+        except OSError:
+            continue
+        if canonical == resolved and _root_protected_chain(canonical):
+            return str(canonical)
+    return None
+
+
+def _split_env_prefix(
+    tokens: Sequence[str], *, environment: Mapping[str, str]
+) -> tuple[dict[str, str], tuple[str, ...], str | None] | None:
+    """Strip a leading ``env [--] NAME=VALUE...`` prefix from a launcher argv.
+
+    Returns ``({}, tokens, None)`` unchanged when there is no ``env`` prefix,
+    the assignments, remaining target argv, and canonical trusted ``env`` path
+    when the prefix is a plain assignment list, and ``None`` when ``env`` is spelled in a way whose
+    effect on the target cannot be reproduced for the probe: any ``env``
+    option (``-i``, ``-u``, ``-S``, ``--chdir``...), an ``env`` that is not
+    the root-owned system executable (``./env``, ``/tmp/env``, or a bare
+    ``env`` shadowed on ``PATH``), a malformed assignment, a nested ``env``,
+    or no command.
+    """
+    tokens = tuple(tokens)
+    if not tokens or Path(tokens[0]).name != "env":
+        return {}, tokens, None
+    env_path = _trusted_env_executable(tokens[0], environment=environment)
+    if env_path is None:
+        return None
+    assignments: dict[str, str] = {}
+    index = 1
+    if index < len(tokens) and tokens[index] == "--":
+        index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("-"):
+            return None
+        if "=" not in token:
+            break
+        if not _ENV_ASSIGNMENT_RE.match(token):
+            return None
+        name, _, value = token.partition("=")
+        assignments[name] = value
+        index += 1
+    remaining = tokens[index:]
+    if not remaining or Path(remaining[0]).name == "env":
+        return None
+    return assignments, remaining, env_path
+
+
+def _recognized_inner_probe_with_environment(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str], tuple[str, ...]] | None:
+    """Return ``(probe, target, env_assignments, launch_argv)`` if recognized.
+
+    A leading plain ``env NAME=VALUE...`` prefix is normalized away so the
+    probe runs the real interpreter; the stripped assignments must be applied
+    to the probe environment so it observes what the target will observe.
+    """
+    tokens = tuple(str(item) for item in argv)
+    values: Mapping[str, str] = environment if environment is not None else os.environ
+    split = _split_env_prefix(tokens, environment=values)
+    if split is None:
+        return None
+    assignments, target, env_path = split
+    if assignments:
+        # ``env`` resolves the command with the modified PATH, so resolve the
+        # interpreter against the same merged environment.
+        values = {**values, **assignments}
+    probe = _recognized_inner_probe_tokens(target, cwd=cwd, environment=values)
+    if probe is None:
+        return None
+    launch = (env_path, *tokens[1:]) if env_path is not None else tokens
+    return probe, target, assignments, launch
+
+
 def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None) -> tuple[str, ...] | None:
     """Return the only inner launcher forms eligible for a safe bootstrap probe."""
-    tokens = tuple(str(item) for item in argv)
+    recognized = _recognized_inner_probe_with_environment(argv, cwd=cwd, environment=environment)
+    return recognized[0] if recognized is not None else None
+
+
+def _recognized_inner_probe_tokens(
+    tokens: tuple[str, ...], *, cwd: Path, environment: Mapping[str, str]
+) -> tuple[str, ...] | None:
     if not tokens:
         return None
-    values = environment if environment is not None else os.environ
+    values = environment
     first = Path(tokens[0]).name
     if first in {"pytest", "py.test"}:
         executable = tokens[0]
         if not Path(executable).is_absolute() and (tokens[0].startswith((".", "~")) or Path(tokens[0]).parent != Path(".")):
             executable = str((cwd / Path(tokens[0])).resolve(strict=False))
         elif not Path(executable).is_absolute():
-            executable = shutil.which(executable, path=(environment or os.environ).get("PATH")) or executable
+            executable = shutil.which(executable, path=values.get("PATH")) or executable
         return (executable, "--version")
     if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
         interpreter = _python_interpreter_path(tokens[0], cwd=cwd, environment=values)
@@ -2124,11 +2260,33 @@ def probe_inner_launcher(
         else ({**os.environ, **environment} if environment is not None else dict(os.environ))
     )
     original = tuple(str(item) for item in argv)
-    probe = recognized_inner_probe(original, cwd=cwd, environment=values)
-    if probe is None:
+    recognized = _recognized_inner_probe_with_environment(original, cwd=cwd, environment=values)
+    if recognized is None:
         return LauncherProbeResult(original, "unknown", "unrecognized inner launcher")
-    identity = launcher_candidate_identity(original, cwd=cwd, environment=values, kind="inner")
+    probe, target, env_assignments, launch_argv = recognized
+    if env_assignments:
+        values = {**values, **env_assignments}
+    identity = launcher_candidate_identity(target, cwd=cwd, environment=values, kind="inner")
+    if target != original:
+        # Distinguish ``env A=1 python -m pytest`` from ``env A=2 ...`` and
+        # from the unprefixed spelling in the per-invocation probe cache.
+        identity["env_prefix_sha256"] = hashlib.sha256(
+            json.dumps([launch_argv[0], *original[1: len(original) - len(target)]]).encode("utf-8")
+        ).hexdigest()
     identity_key = _identity_key(identity)
+    rebound = launch_argv if launch_argv != original else ()
+
+    def bind(result: LauncherProbeResult) -> LauncherProbeResult:
+        # The cache holds only launcher authentication keyed by identity,
+        # which ignores pytest's trailing arguments.  Always bind the returned
+        # result to *this* command so a cache hit never launches or reports an
+        # earlier command's argv.
+        return replace(
+            result,
+            candidate=original,
+            launch_argv=rebound if result.state == "verified" else (),
+        )
+
     invocation = values.get("AGENT_LOOP_INVOCATION_ID")
     cache_key = (invocation, identity_key) if invocation else None
     flight: threading.Event | None = None
@@ -2139,7 +2297,7 @@ def probe_inner_launcher(
             _touch_invocation_locked(invocation)
             cached = _INNER_PREFLIGHT_CACHE.get(cache_key)
             if cached is not None:
-                return cached
+                return bind(cached)
             flight = _INNER_PREFLIGHT_INFLIGHT.get(cache_key)
             if flight is not None:
                 owner = False
@@ -2164,7 +2322,7 @@ def probe_inner_launcher(
             with _INNER_PREFLIGHT_LOCK:
                 cached = _INNER_PREFLIGHT_CACHE.get(cache_key)  # type: ignore[arg-type]
             if cached is not None:
-                return cached
+                return bind(cached)
         return LauncherProbeResult(
             original,
             "unknown",
@@ -2177,7 +2335,11 @@ def probe_inner_launcher(
             completed = _run_bounded_probe(
                 probe,
                 cwd=cwd,
-                env=(values if environment_is_complete or environment is not None else None),
+                env=(
+                    values
+                    if environment_is_complete or environment is not None or env_assignments
+                    else None
+                ),
                 timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
@@ -2192,7 +2354,7 @@ def probe_inner_launcher(
                 result = LauncherProbeResult(original, "verified", output, identity_key)
             else:
                 result = LauncherProbeResult(original, "failed", output or f"bootstrap exited {completed.returncode}", identity_key)
-        return result
+        return bind(result)
     finally:
         if cache_key is not None:
             assert flight is not None

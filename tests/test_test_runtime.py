@@ -627,6 +627,273 @@ def test_recognized_inner_probe_uses_only_safe_version_argv(tmp_path, monkeypatc
     assert calls[0][1]["timeout_seconds"] == 5.0
 
 
+_SYSTEM_ENV = runtime._trusted_env_executable("/usr/bin/env", environment=os.environ)
+_SYSTEM_ENV_AVAILABLE = _SYSTEM_ENV is not None
+requires_system_env = pytest.mark.skipif(
+    not _SYSTEM_ENV_AVAILABLE, reason="root-owned /usr/bin/env is unavailable"
+)
+
+
+@pytest.fixture
+def no_ambient_invocation(monkeypatch):
+    # An ambient invocation id (e.g. running under agent-loop) would share the
+    # per-invocation probe cache and candidate budget across tests.
+    monkeypatch.delenv("AGENT_LOOP_INVOCATION_ID", raising=False)
+
+
+@requires_system_env
+def test_env_assignment_prefix_is_normalized_for_inner_probe(tmp_path, monkeypatch, no_ambient_invocation):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    src = str(tmp_path / "src")
+    for prefix in (["env"], ["/usr/bin/env"], ["env", "--"]):
+        calls.clear()
+        runtime._INNER_PREFLIGHT_CACHE.clear()
+        result = runtime.probe_inner_launcher(
+            [*prefix, f"PYTHONPATH={src}", "AGENT_FLAG=1", sys.executable, "-m", "pytest", "tests", "-q"],
+            cwd=tmp_path,
+        )
+        assert result.state == "verified", prefix
+        # The probe runs the real interpreter, not ``env``...
+        assert calls[0][0] == (sys.executable, "-m", "pytest", "--version")
+        # ...under the assignments the target will actually see.
+        probe_env = calls[0][1]["env"]
+        assert probe_env["PYTHONPATH"] == src
+        assert probe_env["AGENT_FLAG"] == "1"
+
+
+@requires_system_env
+def test_env_prefix_without_assignments_is_normalized(tmp_path):
+    assert runtime.recognized_inner_probe(
+        ["env", sys.executable, "-m", "pytest", "tests"], cwd=tmp_path
+    ) == (sys.executable, "-m", "pytest", "--version")
+
+
+@requires_system_env
+def test_env_prefix_assignments_distinguish_inner_probe_cache(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(kwargs["env"].get("PYTHONPATH"))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    environment = {**runtime.os.environ, "AGENT_LOOP_INVOCATION_ID": "inv-964"}
+    for value in ("a", "b", "a"):
+        result = runtime.probe_inner_launcher(
+            ["env", f"PYTHONPATH={value}", sys.executable, "-m", "pytest", "tests"],
+            cwd=tmp_path,
+            environment=environment,
+            environment_is_complete=True,
+        )
+        assert result.state == "verified"
+    assert calls == ["a", "b"]
+
+
+@pytest.mark.parametrize(
+    "argv_prefix",
+    [
+        ["env", "-i"],
+        ["env", "--ignore-environment"],
+        ["env", "-"],
+        ["env", "-u", "PATH"],
+        ["env", "-S"],
+        ["env", "--chdir=/tmp"],
+        ["env", "PYTHONPATH=x", "-i"],
+        ["env", "1BAD=x"],
+        ["env", "=x"],
+        ["env", "env"],
+        ["./env"],
+        ["tools/env"],
+    ],
+)
+def test_env_prefix_with_unreproducible_semantics_stays_unrecognized(tmp_path, monkeypatch, argv_prefix, no_ambient_invocation):
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    result = runtime.probe_inner_launcher(
+        [*argv_prefix, sys.executable, "-m", "pytest", "tests"], cwd=tmp_path
+    )
+
+    assert result.state == "unknown"
+    assert "unrecognized" in result.diagnostic
+    assert calls == []
+
+
+def test_env_prefix_without_command_or_with_unrecognized_target_is_unknown(tmp_path, monkeypatch, no_ambient_invocation):
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    for argv in (["env"], ["env", "PYTHONPATH=x"], ["env", "PYTHONPATH=x", "make", "test"]):
+        result = runtime.probe_inner_launcher(argv, cwd=tmp_path)
+        assert result.state == "unknown", argv
+    assert calls == []
+
+
+def test_lookalike_env_executable_is_not_stripped_from_probe(tmp_path, monkeypatch, no_ambient_invocation):
+    # A program named ``env`` that ignores its argv and exits 0 must not let
+    # the probe verify the real interpreter on its behalf.
+    calls = []
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_env = fake_bin / "env"
+    fake_env.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_env.chmod(0o755)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    shadowed = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
+    for argv_prefix, environment in (
+        (["env"], shadowed),
+        ([str(fake_env)], None),
+    ):
+        argv = [*argv_prefix, "PYTHONPATH=x", sys.executable, "-m", "pytest", "tests"]
+        assert runtime.recognized_inner_probe(argv, cwd=tmp_path, environment=environment) is None
+        result = runtime.probe_inner_launcher(argv, cwd=tmp_path, environment=environment)
+        assert result.state == "unknown", argv_prefix
+        assert "unrecognized" in result.diagnostic
+    assert calls == []
+
+
+@requires_system_env
+def test_symlinked_env_is_bound_to_canonical_system_env(tmp_path, monkeypatch, no_ambient_invocation):
+    # A mutable alias (an absolute symlink, or a bare ``env`` found through a
+    # user-writable PATH symlink) may be recognized, but the verified result
+    # binds the launch to the canonical root-protected ``env`` so swapping
+    # the alias after the probe cannot change what actually runs.
+    monkeypatch.setattr(
+        runtime,
+        "_run_bounded_probe",
+        lambda argv, **kwargs: type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})(),
+    )
+    alias_dir = tmp_path / "alias-bin"
+    alias_dir.mkdir()
+    alias = alias_dir / "env"
+    alias.symlink_to(_SYSTEM_ENV)
+    shadowed = {**os.environ, "PATH": f"{alias_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
+    for token, environment in ((str(alias), None), ("env", shadowed)):
+        runtime._INNER_PREFLIGHT_CACHE.clear()
+        argv = [token, "PYTHONPATH=x", sys.executable, "-m", "pytest", "tests"]
+        result = runtime.probe_inner_launcher(argv, cwd=tmp_path, environment=environment)
+        assert result.state == "verified", token
+        assert result.candidate == tuple(argv)
+        assert result.launch_argv == (_SYSTEM_ENV, *argv[1:])
+
+
+def test_unprotected_env_install_is_not_trusted(tmp_path, monkeypatch):
+    fake_env = tmp_path / "usr" / "bin" / "env"
+    fake_env.parent.mkdir(parents=True)
+    fake_env.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_env.chmod(0o755)
+    monkeypatch.setattr(runtime, "_TRUSTED_ENV_PATHS", (fake_env,))
+    # Same file as the "trusted" path, but its chain is user-owned.
+    assert runtime._trusted_env_executable(str(fake_env), environment=os.environ) is None
+
+
+def test_unprefixed_launcher_has_no_launch_rebinding(tmp_path, monkeypatch, no_ambient_invocation):
+    monkeypatch.setattr(
+        runtime,
+        "_run_bounded_probe",
+        lambda argv, **kwargs: type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})(),
+    )
+    result = runtime.probe_inner_launcher([sys.executable, "-m", "pytest", "tests"], cwd=tmp_path)
+    assert result.state == "verified"
+    assert result.launch_argv == ()
+
+
+@requires_system_env
+def test_cached_env_probe_binds_launch_to_current_command(tmp_path, monkeypatch):
+    # The per-invocation cache is keyed by launcher identity, not by pytest's
+    # selectors; a cache hit must launch and report the current command.
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    environment = {**os.environ, "AGENT_LOOP_INVOCATION_ID": "inv-964-selectors"}
+    first = ["env", "X=1", sys.executable, "-m", "pytest", "tests/a"]
+    second = ["env", "X=1", sys.executable, "-m", "pytest", "tests/b"]
+    first_result = runtime.probe_inner_launcher(
+        first, cwd=tmp_path, environment=environment, environment_is_complete=True
+    )
+    second_result = runtime.probe_inner_launcher(
+        second, cwd=tmp_path, environment=environment, environment_is_complete=True
+    )
+    assert len(calls) == 1  # the second probe is a cache hit
+    assert first_result.launch_argv == (_SYSTEM_ENV, *first[1:])
+    assert second_result.state == "verified"
+    assert second_result.candidate == tuple(second)
+    assert second_result.launch_argv == (_SYSTEM_ENV, *second[1:])
+    assert all(entry.launch_argv == () for entry in runtime._INNER_PREFLIGHT_CACHE.values())
+
+
+@requires_system_env
+def test_foreground_runs_under_shared_invocation_spawn_their_own_selectors(tmp_path, monkeypatch):
+    from coding_review_agent_loop import runner as runner_module
+
+    for name in ("a", "b"):
+        (tmp_path / f"test_{name}.py").write_text(
+            f"def test_{name}():\n    print('RAN-{name.upper()}')\n", encoding="utf-8"
+        )
+    spawned = []
+    real_popen = runner_module.subprocess.Popen
+
+    def recording_popen(argv, *args, **kwargs):
+        spawned.append(list(argv))
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inv-964-foreground")
+    results = []
+    for name in ("a", "b"):
+        cmd = [
+            "env", "X=1", sys.executable, "-m", "pytest", f"test_{name}.py",
+            "-q", "-s", "-p", "no:cacheprovider",
+        ]
+        results.append(
+            runner_module.run_foreground_test(cmd, cwd=tmp_path, timeout_seconds=60, echo_output=False)
+        )
+
+    assert [result.suite_start for result in results] == ["verified", "verified"]
+    # Ignore the bounded ``--version`` probes; keep only the real targets.
+    targets = [argv for argv in spawned if argv[0] == _SYSTEM_ENV]
+    assert [argv[5] for argv in targets] == ["test_a.py", "test_b.py"]
+    assert "RAN-B" in results[1].output_tail
+    assert "RAN-A" not in results[1].output_tail
+
+
+@requires_system_env
+def test_foreground_run_spawns_authenticated_env_after_alias_swap(tmp_path, monkeypatch, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    alias_dir = tmp_path / "alias-bin"
+    alias_dir.mkdir()
+    alias = alias_dir / "env"
+    alias.symlink_to(_SYSTEM_ENV)
+    original_probe = runner_module.probe_inner_launcher
+
+    def probe_then_swap(*args, **kwargs):
+        result = original_probe(*args, **kwargs)
+        # Replace the authenticated alias with a no-op lookalike.
+        alias.unlink()
+        alias.write_text("#!/bin/sh\necho FAKE-ENV\nexit 0\n", encoding="utf-8")
+        alias.chmod(0o755)
+        return result
+
+    monkeypatch.setattr(runner_module, "probe_inner_launcher", probe_then_swap)
+    cmd = [str(alias), "AGENT_LOOP_964_MARK=1", sys.executable, "-m", "pytest", "--version"]
+    result = runner_module.run_foreground_test(cmd, cwd=tmp_path, timeout_seconds=60, echo_output=False)
+
+    assert result.suite_start == "verified"
+    assert result.args == cmd
+    assert result.passed
+    assert "FAKE-ENV" not in result.output_tail
+    assert "pytest" in result.output_tail
+
+
 def test_non_python_m_pytest_command_is_not_spawned_by_preflight(tmp_path, monkeypatch):
     calls = []
     non_python = tmp_path / "repo-script"
