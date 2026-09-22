@@ -1547,6 +1547,22 @@ def test_advisory_issue_provenance_skips_commit_scan_in_dry_run(tmp_path):
     assert runner.pr_commit_calls == 0
 
 
+def _m946_bound_creation(handoff, *, approved_plan_hash=None):
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+
+    return bound.bind_v1_authorization(
+        ManagedCiIssueAuthorization(
+            kind="creation", repository="OWNER/REPO", issue_number=handoff.issue_number,
+            pr_number=handoff.pr_number, base_ref=handoff.base_ref,
+            head_sha=handoff.head_sha, actor_login=handoff.trusted_actor_login,
+            actor_id=handoff.trusted_actor_id, protection=handoff.protection_mode,
+            waiver="allow-unprotected-managed-ci", nonce=handoff.override_nonce,
+            label_event_id=9001, approved_plan_hash=approved_plan_hash,
+        ),
+        grant_anchor_event_id=9001,
+    )
+
+
 def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tmp_path, monkeypatch):
     nonce = "direct-managed-nonce"
     body = f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}"
@@ -1556,8 +1572,13 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
         protection_mode="voluntary",
         audit_nonce=nonce,
     )
-    handoff = _managed_issue_handoff(nonce=nonce)
+    handoff = dataclasses.replace(
+        _managed_issue_handoff(nonce=nonce), head_sha=FULL_HEAD,
+        trusted_actor_login="coding-review-agent-loop", trusted_actor_id=4242,
+    )
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Implemented the issue.\n<!-- AGENT_PR: 77 -->\n"
             "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
@@ -1566,7 +1587,7 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
         pr_payload={
             "body": body,
             "headRefName": "agent-loop/managed-56",
-            "headRefOid": "abc123",
+            "headRefOid": FULL_HEAD,
         },
     )
     config = make_config(
@@ -1580,6 +1601,7 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
     )
     authentication_calls = []
     publication_calls = []
+    built = []
     readiness_heads = []
     dispatches = []
     prepared_heads = []
@@ -1602,8 +1624,10 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
 
     def revalidate(*_args, **kwargs):
         assert kwargs["config"].managed_ci_expected_override_nonce == nonce
-        assert kwargs["handoff"] == handoff
-        return handoff
+        # The loop continues from the committed bound creation record.
+        assert kwargs["handoff"].transaction_bound
+        assert kwargs["handoff"].override_nonce == nonce
+        return kwargs["handoff"]
 
     monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_args, **_kwargs: intent)
     monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
@@ -1611,6 +1635,13 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
         orchestrator_module,
         "publish_issue_created_authorization",
         lambda *_args, **kwargs: publication_calls.append(kwargs) or handoff,
+    )
+    # The waiver-path grant is the bound entry of the initial transaction (#827,
+    # site e); its builder's own checks are covered in test_managed_ci.
+    monkeypatch.setattr(
+        orchestrator_module,
+        "build_issue_created_creation_payload",
+        lambda *_args, **kwargs: built.append(kwargs) or _m946_bound_creation(kwargs["handoff"]),
     )
     monkeypatch.setattr(orchestrator_module, "revalidate_issue_created_handoff", revalidate)
     monkeypatch.setattr(
@@ -1633,7 +1664,7 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
     monkeypatch.setattr(
         orchestrator_module,
         "wait_for_final_qualification",
-        lambda *_args, **_kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *_args, **_kwargs: ManagedCiOutcome(status="passed", head_sha=FULL_HEAD),
     )
     monkeypatch.setattr(
         orchestrator_module,
@@ -1649,12 +1680,12 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
     assert len(authentication_calls) == 1
-    assert len(publication_calls) == 1
+    assert publication_calls == [] and len(built) == 1
     assert ["verify-managed-head"] in [command for command, _cwd in runner.commands]
-    assert readiness_heads == ["abc123"]
-    assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["abc123"]
-    assert prepared_heads == ["abc123"]
-    assert merged_heads == ["abc123"]
+    assert readiness_heads == [FULL_HEAD]
+    assert [dispatch["expected_head_sha"] for dispatch in dispatches] == [FULL_HEAD]
+    assert prepared_heads == [FULL_HEAD]
+    assert merged_heads == [FULL_HEAD]
 
 
 def test_direct_issue_conflict_posts_once_and_stops_before_pr_handoff_gates(tmp_path, monkeypatch):
@@ -6665,7 +6696,44 @@ def test_issue_loop_outside_workdir_after_reported_pr_mentions_confirmed_resume(
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 
-def test_managed_issue_invalid_post_pr_report_persists_authorization_before_rejection(
+def _assert_rejected_managed_report_leaves_no_grant(runner, config, monkeypatch):
+    """#827 site e: a waiver grant is committed only with the initial
+    transaction, so a report rejected by post-PR validation leaves no
+    authorization, and an ordinary rerun stops with the explicit fresh
+    issue-created recovery instead of reviewing an unauthorized head."""
+    with pytest.raises(AgentLoopError, match="managed-ci-fresh") as rejected:
+        run_issue_loop(runner, issue_number=56, config=config)
+    assert "persisted before this report was rejected" in str(rejected.value)
+    assert [
+        comment for comment in runner.authorization_comments
+        if parse_issue_created_authorization_comment(comment["body"]) is not None
+    ] == []
+    assert runner.comments == []
+
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    runner.pr_commit_pages = _provenance_pages(
+        "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct"
+    )
+    coder_calls = sum(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    _stop_issue_resume_after_reviewer(monkeypatch)
+    with pytest.raises(AgentLoopError, match="managed-ci-fresh"):
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert sum(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands) == coder_calls
+    assert not any(command[:1] == ["claude"] for command, _cwd in runner.commands)
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert runner.authorization_comments == []
+    assert not any(
+        marker in comment
+        for comment in runner.comments
+        for marker in (
+            "AGENT_ISSUE_PR_HANDOFF", "AGENT_TEST_OBSERVATION", "AGENT_MANAGED_CI_READINESS",
+        )
+    )
+
+
+def test_managed_issue_invalid_post_pr_report_leaves_no_authorization(
     tmp_path, monkeypatch,
 ):
     runner = _IssueRecoveryWorkflowRunner(
@@ -6706,53 +6774,7 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
         orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
     )
 
-    with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
-        run_issue_loop(runner, issue_number=56, config=config)
-
-    records = [
-        parsed
-        for comment in runner.authorization_comments
-        if (parsed := parse_issue_created_authorization_comment(comment["body"]))
-        is not None
-    ]
-    assert len(records) == 1 and records[0].kind == "creation"
-    assert runner.comments == []
-
-    # A later ordinary managed issue invocation discovers and enters the real
-    # recovery/activation seam for the same head instead of invoking the
-    # implementation coder again.
-    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
-    runner.pr_commit_pages = _provenance_pages(
-        "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct"
-    )
-    coder_calls = sum(
-        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
-    )
-    _stop_issue_resume_after_reviewer(monkeypatch)
-    with pytest.raises(_RealManagedReviewReached):
-        run_issue_loop(runner, issue_number=56, config=config)
-
-    assert sum(
-        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
-    ) == coder_calls
-    assert runner.labels_posted is False
-    assert runner.dispatch_count == 0
-    reviewer_command = next(
-        command for command, _cwd in runner.commands if command[:1] == ["claude"]
-    )
-    assert "abc123" in " ".join(reviewer_command)
-    assert any(
-        "Reviewed the post-report recovery head." in comment
-        for comment in runner.comments
-    )
-    assert not any(
-        marker in comment
-        for comment in runner.comments
-        for marker in (
-            "AGENT_ISSUE_PR_HANDOFF",
-            "AGENT_TEST_OBSERVATION", "AGENT_MANAGED_CI_READINESS",
-        )
-    )
+    _assert_rejected_managed_report_leaves_no_grant(runner, config, monkeypatch)
 
 
 def test_approved_plan_invalid_post_pr_observation_keeps_authorization_resumable(
@@ -7045,7 +7067,7 @@ def _stop_issue_resume_after_reviewer(monkeypatch):
     monkeypatch.setattr(orchestrator_module, "post_pr_comment", post_and_stop)
 
 
-def test_managed_issue_resume_reviews_same_head_after_post_pr_report_rejection(
+def test_managed_issue_resume_after_post_pr_report_rejection_needs_the_fresh_grant(
     tmp_path, monkeypatch,
 ):
     runner = _IssueRecoveryWorkflowRunner(
@@ -7076,37 +7098,10 @@ def test_managed_issue_resume_reviews_same_head_after_post_pr_report_rejection(
         orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
     )
 
-    with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
-        run_issue_loop(runner, issue_number=56, config=config)
-
-    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
-    runner.pr_commit_pages = _provenance_pages(
-        "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct"
-    )
-    coder_calls = sum(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
-    _stop_issue_resume_after_reviewer(monkeypatch)
-
-    with pytest.raises(_RealManagedReviewReached):
-        run_issue_loop(runner, issue_number=56, config=config)
-
-    assert sum(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands) == coder_calls
-    assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == 1
-    reviewer_command = next(command for command, _cwd in runner.commands if command[:1] == ["claude"])
-    assert "abc123" in " ".join(reviewer_command)
-    assert runner.labels_posted is False
-    assert runner.dispatch_count == 0
-    assert any("Reviewed the resumed exact head." in comment for comment in runner.comments)
-    assert not any(
-        marker in comment
-        for comment in runner.comments
-        for marker in (
-            "AGENT_ISSUE_PR_HANDOFF", "AGENT_TEST_OBSERVATION",
-            "AGENT_MANAGED_CI_READINESS",
-        )
-    )
+    _assert_rejected_managed_report_leaves_no_grant(runner, config, monkeypatch)
 
 
-def test_invalid_post_pr_report_then_issue_resume_runs_real_activation_without_reimplementation(
+def test_invalid_post_pr_report_then_issue_resume_stops_without_reimplementation(
     tmp_path, monkeypatch,
 ):
     runner = _IssueRecoveryWorkflowRunner(
@@ -7136,53 +7131,7 @@ def test_invalid_post_pr_report_then_issue_resume_runs_real_activation_without_r
         orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
     )
 
-    with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
-        run_issue_loop(runner, issue_number=56, config=config)
-
-    records = [
-        parsed
-        for comment in runner.authorization_comments
-        if (parsed := parse_issue_created_authorization_comment(comment["body"]))
-        is not None
-    ]
-    assert len(records) == 1 and records[0].kind == "creation"
-    assert runner.comments == []
-    coder_calls = sum(
-        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
-    )
-
-    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
-    runner.pr_commit_pages = _provenance_pages(
-        "Implement issue.\n\nAgent-Issue-Provenance: v1 "
-        "repo=owner/repo issue=56 flow=direct"
-    )
-    _stop_issue_resume_after_reviewer(monkeypatch)
-    recovery_start = len(runner.commands)
-    with pytest.raises(_RealManagedReviewReached):
-        run_issue_loop(runner, issue_number=56, config=config)
-
-    recovery_commands = runner.commands[recovery_start:]
-    assert any("repos/OWNER/REPO/pulls/77" in " ".join(command) for command, _cwd in recovery_commands)
-    assert any("repos/OWNER/REPO/issues/77/comments?" in " ".join(command) for command, _cwd in recovery_commands)
-    assert any("actions/variables/AGENT_LOOP_MANAGED_ACTOR" in " ".join(command) for command, _cwd in recovery_commands)
-    assert any("contents/.github/workflows/ci.yml" in " ".join(command) for command, _cwd in recovery_commands)
-    assert any("repos/OWNER/REPO/commits/main" in " ".join(command) for command, _cwd in recovery_commands)
-    assert sum(
-        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
-    ) == coder_calls
-    assert runner.labels_posted is False
-    assert runner.dispatch_count == 0
-    reviewer_command = next(command for command, _cwd in runner.commands if command[:1] == ["claude"])
-    assert "abc123" in " ".join(reviewer_command)
-    assert any("Reviewed the durable recovery head." in comment for comment in runner.comments)
-    assert not any(
-        marker in comment
-        for comment in runner.comments
-        for marker in (
-            "AGENT_ISSUE_PR_HANDOFF",
-            "AGENT_TEST_OBSERVATION", "AGENT_MANAGED_CI_READINESS",
-        )
-    )
+    _assert_rejected_managed_report_leaves_no_grant(runner, config, monkeypatch)
 
 
 def test_pre_pr_number_response_rejection_then_fresh_issue_recovery_uses_real_activation(
@@ -7478,42 +7427,6 @@ def test_managed_issue_authorization_publication_failure_prints_fresh_recovery(
     assert "publication was interrupted" in message
     assert "--managed-ci-fresh" in message
     assert "agent-loop issue 56" in message
-
-
-def test_managed_issue_publication_malformed_response_stops_before_handoff_or_review(
-    tmp_path, monkeypatch,
-):
-    runner = _MalformedAuthorizationResponseRunner(
-        labeled=True,
-        codex_outputs=[
-            "Implemented.\nTests: python3 -m pytest tests/test_managed_ci.py\n"
-            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
-        ],
-    )
-    config = make_config(
-        tmp_path, coder="codex", reviewer="claude", managed_ci=True,
-        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
-    )
-    intent = ManagedCiCreationIntent(
-        branch="agent-loop/managed-56", trusted_actor="agent-loop",
-        protection_mode="voluntary", audit_nonce="opening-nonce",
-    )
-    handoff = _managed_issue_handoff(nonce="opening-nonce")
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
-    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff)
-
-    with pytest.raises(AgentLoopError, match="publication was interrupted"):
-        run_issue_loop(runner, issue_number=56, config=config)
-
-    assert any(
-        endpoint in " ".join(command)
-        for command, _cwd in runner.commands
-        for endpoint in ("repos/OWNER/REPO/issues/77/comments",)
-        if "POST" in command and "ISSUE_AUTHORIZATION" in " ".join(command)
-    )
-    assert runner.authorization_comments == []
-    assert runner.comments == []
-    assert not any(command[:1] == ["claude"] for command, _cwd in runner.commands)
 
 
 def test_issue_fresh_recovery_discovers_pre_handoff_pr_without_reimplementing(
@@ -11137,15 +11050,6 @@ def test_m946_approved_plan_resume_with_bad_scheduler_history_writes_nothing(tmp
 
 
 def _m946_managed_one_shot(tmp_path, monkeypatch, boundary=None):
-    from coding_review_agent_loop import managed_ci_bound_authorization as bound
-
-    nonce = "plan-managed-nonce"
-    intent = ManagedCiCreationIntent(
-        branch="agent-loop/managed-56",
-        trusted_actor="coding-review-agent-loop",
-        protection_mode="voluntary",
-        audit_nonce=nonce,
-    )
     runner = _m946_one_shot_runner(boundary)
     config = make_config(
         tmp_path,
@@ -11154,6 +11058,18 @@ def _m946_managed_one_shot(tmp_path, monkeypatch, boundary=None):
         managed_ci=True,
         managed_ci_trusted_actor="coding-review-agent-loop",
         allow_unprotected_managed_ci=True,
+    )
+    return runner, config, _m946_install_managed_creation(monkeypatch, "plan-managed-nonce")
+
+
+def _m946_install_managed_creation(monkeypatch, nonce):
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="coding-review-agent-loop",
+        protection_mode="voluntary",
+        audit_nonce=nonce,
     )
     seen = {"built": [], "reviewed": [], "v1": 0}
 
@@ -11194,7 +11110,7 @@ def _m946_managed_one_shot(tmp_path, monkeypatch, boundary=None):
         orchestrator_module, "run_pr_loop",
         lambda *_a, **kwargs: seen["reviewed"].append(kwargs) or 0,
     )
-    return runner, config, seen
+    return seen
 
 
 def test_m946_managed_approved_plan_commits_the_creation_grant_in_the_initial_transaction(
@@ -11319,3 +11235,179 @@ def test_m946_managed_approved_plan_rerun_without_the_bound_record_writes_nothin
     assert len(runner.pr_payload.get("comments", [])) == before
     assert sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands) == claude_calls
     assert seen["reviewed"] == [] and seen["v1"] == 0
+
+
+# --- #946: managed direct-issue creation grant goes through the seam (site e) ---
+
+
+def _m946_managed_direct(tmp_path, monkeypatch, boundary=None):
+    runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    if boundary is not None:
+        runner.rest_post_failures = (boundary,)
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="coding-review-agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    return runner, config, _m946_install_managed_creation(monkeypatch, "direct-managed-nonce")
+
+
+def test_m946_managed_direct_issue_commits_the_creation_grant_in_the_initial_transaction(
+    tmp_path, monkeypatch
+):
+    """#827 site e, managed waiver path: nothing is written before post-PR
+    validation, the grant is the bound authorization entry of the one committed
+    initial transaction, and the PR loop starts from that committed record."""
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+
+    runner, config, seen = _m946_managed_direct(tmp_path, monkeypatch)
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    assert seen["v1"] == 0 and len(seen["built"]) == 1
+    assert seen["built"][0].approved_plan_hash is None
+    kinds = _m946_record_kinds(runner)
+    assert kinds["issue"] == ["handoff"]
+    assert kinds["pr"] == [
+        "transaction", "contract", "other", "tagged-coder-round", "transaction",
+    ]
+    assert not _m946_workflow_records(runner, "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1")
+    assert not [
+        body for body in runner.comments
+        if "AGENT_ISSUE_PR_HANDOFF" in body or "AGENT_PR_EXPECTED_CLOSING_ISSUES" in body
+    ]
+    _m946_assert_no_embedded_contract(runner)
+    bound_records = _m946_workflow_records(runner, bound.BOUND_AUTHORIZATION_MARKER)
+    assert len(bound_records) == 1
+
+    resolved = publication.read_pr_transaction_views(runner, config, 77, 56)
+    committed = resolved.lineage.latest_committed
+    assert resolved.lineage.pending is None and committed.intent.successor_kind == "initial"
+    assert committed.intent.origin_flow == "issue-implementation"
+    assert committed.intent.managed_ci_generation == seen["built"][0].generation()
+    consumer = bound.consumer_bound_authorization(
+        resolved.views.pr_view, resolved.lineage, live_head=committed.intent.head_sha
+    )
+    assert consumer is not None and consumer.record.kind == "creation"
+    assert consumer.comment_id == bound_records[0]["id"]
+
+    (review,) = seen["reviewed"]
+    handoff = review["managed_ci_handoff"]
+    assert handoff.transaction_bound and handoff.authorization_kind == "creation"
+    assert handoff.authorization_comment_id == consumer.comment_id
+    assert handoff.active_label_event_id == 9001
+    assert handoff.approved_plan_hash is None
+
+
+@pytest.mark.parametrize("boundary", [1, 2, 3, 4, 5, 6])
+def test_m946_managed_direct_issue_interrupted_grants_nothing(tmp_path, monkeypatch, boundary):
+    """Writes: prepared, handoff, contract, bound authorization, tagged coder
+    round, committed.  An interruption at any of them starts no PR loop,
+    writes no version-1 authorization, and leaves no committed transaction."""
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, seen = _m946_managed_direct(tmp_path, monkeypatch, boundary)
+    with pytest.raises(WorkflowTransactionError):
+        run_issue_loop(runner, issue_number=56, config=config)
+    assert seen["reviewed"] == [] and seen["v1"] == 0
+    assert not _m946_workflow_records(runner, "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1")
+    _m946_assert_no_embedded_contract(runner)
+    resolved = publication.read_pr_transaction_views(runner, config, 77, None)
+    assert resolved.lineage.latest_committed is None
+    assert bound.consumer_bound_authorization(
+        resolved.views.pr_view, resolved.lineage, live_head=FULL_HEAD
+    ) is None
+
+
+@pytest.mark.parametrize("boundary", [5, 6])
+def test_m946_managed_direct_issue_rerun_finishes_from_the_written_bound_record(
+    tmp_path, monkeypatch, boundary
+):
+    """After the bound creation record was written, an issue-command rerun
+    finishes the stored transaction from it: no coder turn, no second PR, no
+    version-1 authorization, exactly one bound record, and one commit."""
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, seen = _m946_managed_direct(tmp_path, monkeypatch, boundary)
+    with pytest.raises(WorkflowTransactionError):
+        run_issue_loop(runner, issue_number=56, config=config)
+    claude_calls = sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    runner.rest_post_failures = ()
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    run_issue_loop(runner, issue_number=56, config=config)
+
+    assert sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands) == claude_calls
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+    assert seen["v1"] == 0
+    assert not _m946_workflow_records(runner, "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1")
+    assert len(_m946_workflow_records(runner, bound.BOUND_AUTHORIZATION_MARKER)) == 1
+    resolved = publication.read_pr_transaction_views(runner, config, 77, 56)
+    assert resolved.lineage.pending is None
+    assert resolved.lineage.latest_committed.intent.managed_ci_generation == (
+        seen["built"][0].generation()
+    )
+    assert bound.consumer_bound_authorization(
+        resolved.views.pr_view, resolved.lineage,
+        live_head=resolved.lineage.latest_committed.intent.head_sha,
+    ) is not None
+
+
+def test_m946_managed_direct_issue_strict_protection_keeps_the_version_one_writers(
+    tmp_path, monkeypatch
+):
+    """A strict-protection grant (no waiver nonce, null generation) is not on
+    the seam yet: it keeps today's version-1 publisher and builds no bound
+    payload."""
+    runner, config, seen = _m946_managed_direct(tmp_path, monkeypatch)
+    strict = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="coding-review-agent-loop",
+        protection_mode="strict",
+        audit_nonce=None,
+    )
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: strict)
+    monkeypatch.setattr(
+        orchestrator_module, "authenticate_issue_created_handoff",
+        lambda *_a, **kwargs: dataclasses.replace(
+            _managed_issue_handoff(nonce=None),
+            head_sha=kwargs["metadata"].head_sha,
+            trusted_actor_login="coding-review-agent-loop",
+            trusted_actor_id=4242,
+        ),
+    )
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+    assert seen["v1"] == 1 and seen["built"] == []
+    (review,) = seen["reviewed"]
+    assert not review["managed_ci_handoff"].transaction_bound
+
+
+def test_m946_managed_direct_issue_malformed_authorization_response_stops_before_review(
+    tmp_path, monkeypatch
+):
+    """The bound authorization write returns a successful but unverifiable
+    response: the issue command stops with the transaction diagnostic before
+    any PR loop, and nothing commits or grants managed authority."""
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+
+    runner, config, seen = _m946_managed_direct(tmp_path, monkeypatch)
+    runner.rest_post_malformed = (4,)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config)
+    assert seen["reviewed"] == [] and seen["v1"] == 0
+    assert not _m946_workflow_records(runner, bound.BOUND_AUTHORIZATION_MARKER)
+    assert not _m946_workflow_records(runner, "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1")
+    resolved = publication.read_pr_transaction_views(runner, config, 77, None)
+    assert resolved.lineage.latest_committed is None
+    # Prepared, handoff, and contract were written; the tagged round never was.
+    assert _m946_record_kinds(runner)["pr"] == ["transaction", "contract"]

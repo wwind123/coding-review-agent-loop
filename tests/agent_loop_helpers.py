@@ -1213,6 +1213,9 @@ class FakeRunner(Runner):
             self.rest_post_count = getattr(self, "rest_post_count", 0) + 1
             if self.rest_post_count in getattr(self, "rest_post_failures", ()):
                 return CommandResult(cmd, cwd_path, "", "injected write failure", 1)
+            if self.rest_post_count in getattr(self, "rest_post_malformed", ()):
+                # A successful but unverifiable response; nothing is stored.
+                return CommandResult(cmd, cwd_path, "{}", "", 0)
             if number == self._pr_payload_for(str(number)).get("number"):
                 thread = self._pr_payload_for(str(number)).setdefault("comments", [])
             elif (

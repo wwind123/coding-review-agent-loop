@@ -7902,7 +7902,9 @@ def _validate_tests_with_post_pr_context(
             f"{exc}\n\n"
             f"PR #{pr_number} was confirmed open, but the handoff/reviewer comments were not posted because "
             f"the {report_description} was invalid. The managed-CI authorization checkpoint, when required, "
-            "was persisted before this report was rejected. Correct the PR/comment if needed, then continue safely with "
+            "was persisted before this report was rejected, unless it is a waiver grant carried by the PR's initial "
+            "transaction: none exists yet, so a managed resume needs the explicit fresh issue-created authorization "
+            "(`--managed-ci-fresh`). Correct the PR/comment if needed, then continue safely with "
             f"`agent-loop pr {pr_number}` instead of rerunning implementation and creating a duplicate PR."
         ) from exc
 
@@ -13938,14 +13940,22 @@ def run_issue_loop(
                     config,
                     managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
                 )
-            managed_ci_handoff = _publish_issue_authorization_with_recovery(
-                runner,
-                config=config,
-                handoff=managed_ci_handoff,
-                metadata=initial_pr_context.metadata,
-                issue_number=issue_number,
+            # As at site b, a waiver-path grant becomes the bound authorization
+            # entry of the fresh PR's initial transaction instead of a
+            # version-1 record written before post-PR validation (#827, site e).
+            managed_through_seam = (
+                managed_ci_handoff.override_nonce is not None and not config.dry_run
             )
+            if not managed_through_seam:
+                managed_ci_handoff = _publish_issue_authorization_with_recovery(
+                    runner,
+                    config=config,
+                    handoff=managed_ci_handoff,
+                    metadata=initial_pr_context.metadata,
+                    issue_number=issue_number,
+                )
         else:
+            managed_through_seam = False
             reject_forged_protocol_markers(
                 initial_pr_context.metadata.body or "",
                 surface=f"pull-request #{pr_number} body",
@@ -13990,10 +14000,12 @@ def run_issue_loop(
             ),
         )
         initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_metadata)
-        # The managed creation authorization is still published by the version-1
-        # writers, so a managed PR keeps the version-1 handoff and contract;
-        # every other direct fresh PR publishes one transaction (#827, site e).
-        publish_through_seam = managed_ci_handoff is None and not config.dry_run
+        # A strict-protection managed grant is still published by the version-1
+        # writers, so it keeps the version-1 handoff and contract; every other
+        # direct fresh PR publishes one transaction (#827, site e).
+        publish_through_seam = (
+            managed_ci_handoff is None or managed_through_seam
+        ) and not config.dry_run
         if not publish_through_seam:
             pr_contract = make_pr_contract(
                 repository=config.repo,
@@ -14081,8 +14093,24 @@ def run_issue_loop(
             )
         if publish_through_seam:
             from . import workflow_transaction_publication as publication
+            from .workflow_transaction import ENTRY_AUTHORIZATION
 
-            publication.publish_transition(
+            creation_payload = None
+            managed_request: dict[str, object] = {}
+            if managed_through_seam:
+                from .managed_ci_bound_authorization import BoundAuthorizationCodec
+
+                creation_payload = build_issue_created_creation_payload(
+                    runner,
+                    config=config,
+                    handoff=managed_ci_handoff,
+                    metadata=initial_pr_metadata,
+                )
+                managed_request = dict(
+                    managed=publication.Granted(creation_payload, creation_payload.generation()),
+                    authorization_codec=BoundAuthorizationCodec(),
+                )
+            committed = publication.publish_transition(
                 runner,
                 config=config,
                 request=publication.TransitionRequest(
@@ -14098,8 +14126,18 @@ def run_issue_loop(
                             _render_initial_coder_body(transaction_id)
                         )
                     ),
+                    **managed_request,
                 ),
             )
+            if creation_payload is not None:
+                # The PR loop continues from the committed bound creation record.
+                managed_ci_handoff = dataclasses_replace(
+                    managed_ci_handoff,
+                    active_label_event_id=creation_payload.label_event_id,
+                    authorization_kind="creation",
+                    authorization_comment_id=committed.entry_comment_id(ENTRY_AUTHORIZATION),
+                    transaction_bound=True,
+                )
         else:
             post_trusted_pr_comment(
                 runner,
