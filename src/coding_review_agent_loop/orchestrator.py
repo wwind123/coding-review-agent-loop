@@ -14610,6 +14610,77 @@ def _carried_plan_approvals(
     return tuple(sorted(name for name, ok in carried.items() if ok))
 
 
+def _require_complete_canonical_plan_approval(
+    comments: Sequence[object],
+    *,
+    config: AgentLoopConfig,
+    plan_text: str,
+    plan_round: ResumedReviewRound,
+    human_requirements: Sequence[HumanReviewRequirement],
+    error_message: str,
+) -> None:
+    """Fail closed unless every configured reviewer approved the resumed plan.
+
+    Shared by the managed-CI fresh-authorization and ordinary-resume paths so
+    the two cannot drift.  Under ``all-reviewers`` every reviewer reviews every
+    round, so the resumed round must carry the complete approval set.  A
+    staged policy splits approvals across rounds by construction (the primary
+    approves, then the panel approves while the primary is paused), so the
+    union of qualifying exact-key approvals carried from the whole planning
+    history is consulted instead — the same carry the final planning gate
+    uses.  A reviewer whose latest record for the exact plan is not an
+    approval still leaves the set incomplete (#962).
+    """
+    configured_names = {agent_display_name(reviewer) for reviewer in reviewers(config)}
+    round_approved = {
+        record.metadata.agent
+        for record in plan_round.completed_reviews
+        if record.metadata.state == "approved"
+    }
+    if round_approved == configured_names:
+        return
+    if not plan_policy_capabilities(config.plan_review_policy).scheduler_enabled:
+        raise AgentLoopError(error_message)
+    coder_metadata = plan_round.coder_metadata
+    if coder_metadata is None or coder_metadata.assembled_plan_sidecar is None:
+        raise AgentLoopError(error_message)
+    sidecar = decode_assembled_plan_sidecar(coder_metadata.assembled_plan_sidecar)
+    required_names = tuple(agent_display_name(reviewer) for reviewer in reviewers(config))
+    contract = make_plan_contract(
+        required_names,
+        config.plan_review_policy,
+        (
+            agent_display_name(config.primary_plan_reviewer)
+            if config.primary_plan_reviewer is not None
+            else None
+        ),
+    )
+    surfaced_ids = _surfaced_reviewer_requirement_ids(
+        human_requirements,
+        requirement_scope="planning requirements",
+    )
+    current_key = _plan_candidate_key_for(
+        plan_subject=_plan_subject(plan_text),
+        sidecar=sidecar,
+        surfaced_requirement_ids=surfaced_ids,
+    )
+    records = _extract_round_metadata_records(comments, flow="plan")
+    carried = _carried_plan_approvals(
+        records,
+        current_key=current_key,
+        required_reviewers=required_names,
+        surfaced_requirement_ids=surfaced_ids,
+        panel_evidence=_derive_plan_panel_evidence(
+            records,
+            primary_reviewer=contract.primary_reviewer,
+            required_reviewers=required_names,
+        ),
+        primary_reviewer=contract.primary_reviewer,
+    )
+    if set(carried) != configured_names:
+        raise AgentLoopError(error_message)
+
+
 def _plan_cross_cutting_contracts(
     sidecar: AssembledPlanSidecar | None,
 ) -> PlanCrossCuttingContracts:
@@ -15504,19 +15575,17 @@ def run_pr_loop(
                 )
                 if resumed_plan is not None:
                     plan_text, resumed_plan_round = resumed_plan
-                    configured_names = {
-                        agent_display_name(reviewer) for reviewer in reviewers(config)
-                    }
-                    approved_names = {
-                        record.metadata.agent
-                        for record in resumed_plan_round.completed_reviews
-                        if record.metadata.state == "approved"
-                    }
-                    if approved_names != configured_names:
-                        raise AgentLoopError(
+                    _require_complete_canonical_plan_approval(
+                        issue_context.comments,
+                        config=config,
+                        plan_text=plan_text,
+                        plan_round=resumed_plan_round,
+                        human_requirements=issue_context.human_requirements,
+                        error_message=(
                             "Managed-CI fresh authorization found planning state without "
                             "a complete canonical reviewer approval."
-                        )
+                        ),
+                    )
                     recovered_plan_context = make_approved_plan_context(
                         plan_text,
                         source_locator=(
@@ -15641,18 +15710,17 @@ def run_pr_loop(
                         )
                         if resumed_plan is not None:
                             plan_text, resumed_plan_round = resumed_plan
-                            configured_names = {
-                                agent_display_name(reviewer) for reviewer in reviewers(config)
-                            }
-                            approved_names = {
-                                record.metadata.agent
-                                for record in resumed_plan_round.completed_reviews
-                                if record.metadata.state == "approved"
-                            }
-                            if approved_names != configured_names:
-                                raise AgentLoopError(
-                                    "Managed-CI ordinary resume found incomplete canonical plan approval."
-                                )
+                            _require_complete_canonical_plan_approval(
+                                issue_context.comments,
+                                config=config,
+                                plan_text=plan_text,
+                                plan_round=resumed_plan_round,
+                                human_requirements=issue_context.human_requirements,
+                                error_message=(
+                                    "Managed-CI ordinary resume found incomplete canonical "
+                                    "plan approval."
+                                ),
+                            )
                             recovered_scope = make_approved_plan_context(
                                 plan_text,
                                 source_locator=(
