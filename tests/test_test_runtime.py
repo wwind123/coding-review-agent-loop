@@ -803,6 +803,69 @@ def test_unprefixed_launcher_has_no_launch_rebinding(tmp_path, monkeypatch, no_a
 
 
 @requires_system_env
+def test_cached_env_probe_binds_launch_to_current_command(tmp_path, monkeypatch):
+    # The per-invocation cache is keyed by launcher identity, not by pytest's
+    # selectors; a cache hit must launch and report the current command.
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    environment = {**os.environ, "AGENT_LOOP_INVOCATION_ID": "inv-964-selectors"}
+    first = ["env", "X=1", sys.executable, "-m", "pytest", "tests/a"]
+    second = ["env", "X=1", sys.executable, "-m", "pytest", "tests/b"]
+    first_result = runtime.probe_inner_launcher(
+        first, cwd=tmp_path, environment=environment, environment_is_complete=True
+    )
+    second_result = runtime.probe_inner_launcher(
+        second, cwd=tmp_path, environment=environment, environment_is_complete=True
+    )
+    assert len(calls) == 1  # the second probe is a cache hit
+    assert first_result.launch_argv == (_SYSTEM_ENV, *first[1:])
+    assert second_result.state == "verified"
+    assert second_result.candidate == tuple(second)
+    assert second_result.launch_argv == (_SYSTEM_ENV, *second[1:])
+    assert all(entry.launch_argv == () for entry in runtime._INNER_PREFLIGHT_CACHE.values())
+
+
+@requires_system_env
+def test_foreground_runs_under_shared_invocation_spawn_their_own_selectors(tmp_path, monkeypatch):
+    from coding_review_agent_loop import runner as runner_module
+
+    for name in ("a", "b"):
+        (tmp_path / f"test_{name}.py").write_text(
+            f"def test_{name}():\n    print('RAN-{name.upper()}')\n", encoding="utf-8"
+        )
+    spawned = []
+    real_popen = runner_module.subprocess.Popen
+
+    def recording_popen(argv, *args, **kwargs):
+        spawned.append(list(argv))
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inv-964-foreground")
+    results = []
+    for name in ("a", "b"):
+        cmd = [
+            "env", "X=1", sys.executable, "-m", "pytest", f"test_{name}.py",
+            "-q", "-s", "-p", "no:cacheprovider",
+        ]
+        results.append(
+            runner_module.run_foreground_test(cmd, cwd=tmp_path, timeout_seconds=60, echo_output=False)
+        )
+
+    assert [result.suite_start for result in results] == ["verified", "verified"]
+    # Ignore the bounded ``--version`` probes; keep only the real targets.
+    targets = [argv for argv in spawned if argv[0] == _SYSTEM_ENV]
+    assert [argv[5] for argv in targets] == ["test_a.py", "test_b.py"]
+    assert "RAN-B" in results[1].output_tail
+    assert "RAN-A" not in results[1].output_tail
+
+
+@requires_system_env
 def test_foreground_run_spawns_authenticated_env_after_alias_swap(tmp_path, monkeypatch, no_ambient_invocation):
     from coding_review_agent_loop import runner as runner_module
 

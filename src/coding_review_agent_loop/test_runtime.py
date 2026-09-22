@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -2274,6 +2274,19 @@ def probe_inner_launcher(
             json.dumps([launch_argv[0], *original[1: len(original) - len(target)]]).encode("utf-8")
         ).hexdigest()
     identity_key = _identity_key(identity)
+    rebound = launch_argv if launch_argv != original else ()
+
+    def bind(result: LauncherProbeResult) -> LauncherProbeResult:
+        # The cache holds only launcher authentication keyed by identity,
+        # which ignores pytest's trailing arguments.  Always bind the returned
+        # result to *this* command so a cache hit never launches or reports an
+        # earlier command's argv.
+        return replace(
+            result,
+            candidate=original,
+            launch_argv=rebound if result.state == "verified" else (),
+        )
+
     invocation = values.get("AGENT_LOOP_INVOCATION_ID")
     cache_key = (invocation, identity_key) if invocation else None
     flight: threading.Event | None = None
@@ -2284,7 +2297,7 @@ def probe_inner_launcher(
             _touch_invocation_locked(invocation)
             cached = _INNER_PREFLIGHT_CACHE.get(cache_key)
             if cached is not None:
-                return cached
+                return bind(cached)
             flight = _INNER_PREFLIGHT_INFLIGHT.get(cache_key)
             if flight is not None:
                 owner = False
@@ -2309,7 +2322,7 @@ def probe_inner_launcher(
             with _INNER_PREFLIGHT_LOCK:
                 cached = _INNER_PREFLIGHT_CACHE.get(cache_key)  # type: ignore[arg-type]
             if cached is not None:
-                return cached
+                return bind(cached)
         return LauncherProbeResult(
             original,
             "unknown",
@@ -2338,16 +2351,10 @@ def probe_inner_launcher(
         else:
             output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
             if completed.returncode == 0:
-                result = LauncherProbeResult(
-                    original,
-                    "verified",
-                    output,
-                    identity_key,
-                    launch_argv if launch_argv != original else (),
-                )
+                result = LauncherProbeResult(original, "verified", output, identity_key)
             else:
                 result = LauncherProbeResult(original, "failed", output or f"bootstrap exited {completed.returncode}", identity_key)
-        return result
+        return bind(result)
     finally:
         if cache_key is not None:
             assert flight is not None
