@@ -1145,7 +1145,10 @@ def test_gemini_pre_marker_429_malformed_public_response_fails_deterministically
             run_pr_loop(runner, pr_number=77, config=config)
 
     message = str(exc_info.value)
-    assert "Failure category: deterministic" in message
+    # The internal category stays deterministic (no transient auto-retry), but
+    # the operator label reflects a stochastic schema miss (#957).
+    assert getattr(exc_info.value, "failure_category", "deterministic") == "deterministic"
+    assert "Failure category: schema-validation" in message
     assert "Failure category: transient" not in message
 
 
@@ -6549,6 +6552,37 @@ def test_format_invalid_agent_response_error_includes_suggestion_deterministic()
     )
     assert "Suggestion:" in msg
     assert "inspect" in msg.lower()
+
+
+def test_format_invalid_agent_response_error_schema_rejection_is_retryable_957():
+    msg = _format_invalid_agent_response_error(
+        agent_name="Codex",
+        marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+        reason="plan_review.blocking_plan_issues at index 0 must be a string.",
+        result=None,
+        log_paths=[],
+        category="deterministic",
+        classification_text="structured plan_review response failed trusted validation",
+    )
+    assert "Failure category: schema-validation" in msg
+    assert "may require a code fix" not in msg
+    assert "re-run the same command" in msg
+    # The actual reason leads; the marker requirement follows it.
+    assert msg.index("Reason: plan_review.blocking_plan_issues") < msg.index("Required marker:")
+
+
+def test_format_invalid_agent_response_error_unstructured_deterministic_unchanged_957():
+    msg = _format_invalid_agent_response_error(
+        agent_name="Codex",
+        marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+        reason="missing marker",
+        result=None,
+        log_paths=[],
+        category="deterministic",
+        classification_text="some other diagnostic",
+    )
+    assert "Failure category: deterministic (may require a code fix)." in msg
+    assert "schema-validation" not in msg
 
 
 def test_format_invalid_agent_response_error_no_suggestion_empty_response():

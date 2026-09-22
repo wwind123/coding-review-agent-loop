@@ -3577,6 +3577,22 @@ A plan review uses `kind: "plan_review"`, `blocking_plan_issues`,
 current-round work in `future_followups`; approved reviews must not contain
 active blocking, Same-PR, Same-plan, or carried-forward active items.
 
+Each plan-review finding entry is normally a string. A reviewer may instead
+emit a finding object using only the keys `title`, `text`, `issue`, `finding`,
+`description`, `summary`, `location`, `evidence`, `rationale`, `impact`,
+`required_change`, `recommendation`, `suggested_fix`, and the reviewer-local
+labels `item_id`/`id` (#957). The parser flattens such an object mechanically,
+in that fixed key order, into one finding string that keeps every prose value
+verbatim (labelled values such as `Evidence:` and `Required change:` keep their
+label); the local labels are dropped. No repair model runs for this shape, so a
+container-type mismatch can no longer discard a well-grounded review. Unknown
+keys and non-string values are still rejected.
+
+When a structured response is recognized but fails schema validation, the
+terminal error leads with the validation reason and reports `Failure category:
+schema-validation`: the rejection is deterministic for that output, but model
+output varies between runs, so re-running the same command may succeed.
+
 Reviews are exhaustive. The full and compact PR review prompts and the full and
 compact plan review prompts share one static rule: report every defect that can
 be independently substantiated on the reviewed head or plan, not only the

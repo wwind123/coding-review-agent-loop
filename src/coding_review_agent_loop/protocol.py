@@ -3466,6 +3466,74 @@ def _expect_optional_string_list(
     )
 
 
+# Structured plan-review finding objects (#957).  Reviewers asked for grounded,
+# itemised findings often emit objects instead of strings.  Each object is
+# flattened mechanically, in this fixed order, into one finding string that
+# keeps every supplied prose value verbatim, so no model repair is needed and
+# no qualifier can be lost.  Identifier keys are dropped: they are the
+# reviewer's local labels, not orchestrator item IDs.  Unknown keys and
+# non-string values are still rejected.
+PLAN_REVIEW_FINDING_TEXT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("title", ""),
+    ("text", ""),
+    ("issue", ""),
+    ("finding", ""),
+    ("description", ""),
+    ("summary", ""),
+    ("location", "Location"),
+    ("evidence", "Evidence"),
+    ("rationale", "Rationale"),
+    ("impact", "Impact"),
+    ("required_change", "Required change"),
+    ("recommendation", "Recommendation"),
+    ("suggested_fix", "Suggested fix"),
+)
+PLAN_REVIEW_FINDING_ID_FIELDS = frozenset({"item_id", "id"})
+
+
+def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
+    if isinstance(raw, str):
+        return _expect_non_empty_string(raw, context=item_context)
+    if not isinstance(raw, dict):
+        raise AgentLoopError(f"{item_context} must be a string or a finding object.")
+    text_fields = {name for name, _label in PLAN_REVIEW_FINDING_TEXT_FIELDS}
+    unknown = sorted(set(raw) - text_fields - PLAN_REVIEW_FINDING_ID_FIELDS)
+    if unknown:
+        allowed = ", ".join(sorted(text_fields | PLAN_REVIEW_FINDING_ID_FIELDS))
+        raise AgentLoopError(
+            f"{item_context} has unsupported finding key(s) {', '.join(unknown)}; "
+            f"use a string or an object with only: {allowed}."
+        )
+    for name in sorted(PLAN_REVIEW_FINDING_ID_FIELDS & set(raw)):
+        if not isinstance(raw[name], str):
+            raise AgentLoopError(f"{item_context}.{name} must be a string.")
+    parts: list[str] = []
+    for name, label in PLAN_REVIEW_FINDING_TEXT_FIELDS:
+        if name not in raw:
+            continue
+        value = _expect_non_empty_string(raw[name], context=f"{item_context}.{name}").strip()
+        parts.append(f"{label}: {value}" if label else value)
+    if not parts:
+        raise AgentLoopError(f"{item_context} finding object has no text field.")
+    return " ".join(parts)
+
+
+def _expect_plan_review_finding_list(
+    payload: dict[str, object],
+    field_name: str,
+    *,
+    context: str,
+) -> tuple[str, ...]:
+    """Accept plan-review findings as strings or flattenable objects (#957)."""
+    value = payload.get(field_name, [])
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    return tuple(
+        _flatten_plan_review_finding(raw, item_context=f"{context} at index {index}")
+        for index, raw in enumerate(value)
+    )
+
+
 def _expect_review_finding_list(
     payload: dict[str, object],
     field_name: str,
@@ -4701,23 +4769,20 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
     summary = review_freeform_summary_text(
         _expect_non_empty_string(payload["summary"], context="plan_review.summary")
     )
-    blocking_items = _expect_optional_string_list(
+    blocking_items = _expect_plan_review_finding_list(
         payload,
         "blocking_plan_issues",
         context="plan_review.blocking_plan_issues",
-        item_context="plan_review.blocking_plan_issues",
     )
-    same_plan_followups = _expect_optional_string_list(
+    same_plan_followups = _expect_plan_review_finding_list(
         payload,
         "same_plan_followups",
         context="plan_review.same_plan_followups",
-        item_context="plan_review.same_plan_followups",
     )
-    future_followups = _expect_optional_string_list(
+    future_followups = _expect_plan_review_finding_list(
         payload,
         "future_followups",
         context="plan_review.future_followups",
-        item_context="plan_review.future_followups",
     )
     dispositions = _expect_disposition_list(
         payload["prior_plan_item_dispositions"],

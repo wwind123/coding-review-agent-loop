@@ -2095,6 +2095,86 @@ def test_parse_structured_plan_review_normalizes_v1_payload():
     ]
 
 
+def _plan_review_with_blocking(items: list[object]) -> str:
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "plan_review",
+                "state": "blocking",
+                "summary": "Plan has a blocking gap.",
+                "blocking_plan_issues": items,
+                "same_plan_followups": [],
+                "future_followups": [],
+                "prior_plan_item_dispositions": [],
+            }
+        )
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+
+def test_parse_structured_plan_review_flattens_finding_objects_verbatim_957():
+    finding = {
+        "item_id": "start-limit-recovery",
+        "title": "dev-deploy cannot reliably recover the unit",
+        "evidence": "Step 6 uses only `systemctl start`; systemd does not reset the start limit.",
+        "required_change": "Add `systemctl reset-failed` before the deploy start, without weakening boot-time limits.",
+    }
+
+    parsed = parse_structured_plan_review(
+        _plan_review_with_blocking([finding, "Plain string finding."]),
+        reviewer="OpenAI Codex",
+    )
+
+    assert parsed is not None
+    assert [item.text for item in parsed.items.blocking] == [
+        "dev-deploy cannot reliably recover the unit "
+        "Evidence: Step 6 uses only `systemctl start`; systemd does not reset the start limit. "
+        "Required change: Add `systemctl reset-failed` before the deploy start, "
+        "without weakening boot-time limits.",
+        "Plain string finding.",
+    ]
+    assert "start-limit-recovery" not in parsed.items.blocking[0].text
+
+
+def test_parse_structured_plan_review_accepts_text_finding_object_in_every_bucket_957():
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "plan_review",
+            "state": "blocking",
+            "summary": "Plan needs work.",
+            "blocking_plan_issues": [{"text": "Blocking gap."}],
+            "same_plan_followups": [{"text": "Same-plan cleanup."}],
+            "future_followups": [{"title": "Later idea."}],
+            "prior_plan_item_dispositions": [],
+        }
+    ) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+
+    parsed = parse_structured_plan_review(payload, reviewer="OpenAI Codex")
+
+    assert parsed is not None
+    assert [item.text for item in parsed.items.blocking] == ["Blocking gap."]
+    assert [item.text for item in parsed.items.same_plan] == ["Same-plan cleanup."]
+
+
+@pytest.mark.parametrize(
+    ("item", "message"),
+    [
+        ({"title": "x", "severity": "high"}, "unsupported finding key"),
+        ({"item_id": "only-an-id"}, "no text field"),
+        ({"title": 3}, r"at index 0\.title"),
+        ({"title": "  "}, r"at index 0\.title"),
+        ({"item_id": 7, "title": "x"}, r"at index 0\.item_id must be a string"),
+        (["nested"], "must be a string or a finding object"),
+        (5, "must be a string or a finding object"),
+    ],
+)
+def test_parse_structured_plan_review_rejects_malformed_finding_objects_957(item, message):
+    with pytest.raises(AgentLoopError, match=message):
+        parse_structured_plan_review(_plan_review_with_blocking([item]), reviewer="OpenAI Codex")
+
+
 def test_parse_structured_plan_review_tolerates_omitted_empty_collections():
     payload = (
         json.dumps(

@@ -1370,6 +1370,23 @@ def _is_retryable_marker_near_miss(text: str) -> bool:
     )
 
 
+_STRUCTURED_SCHEMA_REJECTION_RE = re.compile(
+    r"^structured [a-z_]+ (?:response|repair) failed trusted validation$"
+)
+
+
+def _is_structured_schema_rejection(classification_text: str) -> bool:
+    """True when a recognized structured envelope failed schema validation (#957).
+
+    The rejection is deterministic for that output, but the output came from a
+    stochastic model, so the operator guidance must not discourage a rerun.
+    """
+    return any(
+        _STRUCTURED_SCHEMA_REJECTION_RE.match(line.strip())
+        for line in (classification_text or "").splitlines()
+    )
+
+
 def _failure_category(
     text: str,
     *,
@@ -1968,6 +1985,12 @@ def _failure_suggestion(
             return "Suggestion: clean up the dirty working tree or workdir, then re-run."
         return f"Suggestion: check that {agent_name} is installed and authenticated, then re-run."
     if category == "deterministic":
+        if _is_structured_schema_rejection(classification_text):
+            return (
+                "Suggestion: re-run the same command — the agent's structured response "
+                "failed schema validation, and model output varies between runs, so a "
+                "retry may succeed. If the same rejection recurs, inspect the log above."
+            )
         if "repair invocation failure" in reason and "invalid_output" in reason:
             return (
                 "Suggestion: re-run the same command — "
@@ -2042,6 +2065,11 @@ def _format_invalid_agent_response_error(
         category_hint = " Failure category: transient (rerun may succeed)."
     elif category == "non-retryable":
         category_hint = " Failure category: non-retryable (check credentials or billing)."
+    elif category == "deterministic" and _is_structured_schema_rejection(classification_text):
+        category_hint = (
+            " Failure category: schema-validation (the agent's structured response did not "
+            "match the schema; model output varies between runs, so a rerun may succeed)."
+        )
     elif category == "deterministic":
         category_hint = " Failure category: deterministic (may require a code fix)."
     elif category == "timeout":
@@ -2092,7 +2120,7 @@ def _format_invalid_agent_response_error(
     return (
         f"{agent_name} failed before producing a valid public response. "
         "No review result was recorded. "
-        f"Required marker: {marker_description}. Reason: {reason}.{exit_context}"
+        f"Reason: {reason}. Required marker: {marker_description}.{exit_context}"
         f"{category_hint}"
         f"{log_context}"
         f"{suggestion_line}"
