@@ -2774,8 +2774,9 @@ withhold code approval.
 
 The checked-in workflow for `wwind123/coding-review-agent-loop` is the
 base-branch security boundary for managed CI. It declares the literal
-`AGENT_LOOP_MANAGED_CI_V2` and
-`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` capabilities and subscribes to
+`AGENT_LOOP_MANAGED_CI_V2`,
+`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1`, and
+`AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1` capabilities and subscribes to
 exactly `opened`, `synchronize`, `reopened`, and `unlabeled` pull-request
 activities. A trusted same-repository draft on `main` with a reserved
 `agent-loop/managed-*` head may suppress the opening matrix before its label is
@@ -3212,6 +3213,18 @@ converges same-nonce duplicate dispatches to the newest surviving run. It
 accepts neither green nor red same-context statuses unless publisher, nonce,
 attached run, and latest attempt all correlate. A failure is reported from the
 validated run's failing jobs, not base-ref PR checks.
+
+The workflow fullmatches the whole stripped intent comment body, so a trusted
+comment can never carry prose or a second record alongside the authorization.
+When the base workflow also advertises
+`AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1`, its envelope additionally admits one
+fixed visible line ahead of the hidden record, exactly
+`Managed CI authorization for exact head <sha>.` followed by a blank line, and
+the workflow rejects the record when that SHA differs from the payload's
+`expected_head_sha`. Agent-loop emits that line only for a base workflow that
+advertises the capability; against an older workflow, which accepts only the
+bare record, the comment stays marker-only. The bare form remains accepted by
+the current workflow for this transition.
 
 The v2 intent lifecycle is deliberately limited to `prepared`,
 `dispatch-requested`, `attached`, and `completed`. `prepared` and

@@ -5,6 +5,7 @@ name: CI
 env:
   AGENT_LOOP_MANAGED_CI_V2: enabled
   AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1: enabled
+  AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1: enabled
 
 on:
   push:
@@ -179,7 +180,13 @@ jobs:
                   'terminal_outcome', 'terminal_attempts',
               }
               allowed_states = {'prepared', 'dispatch-requested', 'attached', 'completed'}
-              envelope = re.compile(r'^<!-- AGENT_MANAGED_CI_INTENT_V2 (?P<payload>.*?) -->$')
+              # The whole stripped body must be exactly one record, optionally after a
+              # single fixed-template visible line (#935).  Nothing free-form can ride
+              # along; the bare form stays accepted during the writer transition.
+              envelope = re.compile(
+                  r'^(?:Managed CI authorization for exact head (?P<visible_sha>[0-9a-f]{40})\.\n\n)?'
+                  r'<!-- AGENT_MANAGED_CI_INTENT_V2 (?P<payload>.*?) -->$'
+              )
               sha_re = r'[0-9a-f]{40}'
               token_re = r'[A-Za-z0-9_-]{32}'
               validated = []
@@ -212,6 +219,9 @@ jobs:
                           fail('unsupported intent version')
                       if record.get('nonce') != nonce:
                           continue
+                      visible_sha = match.group('visible_sha')
+                      if visible_sha is not None and visible_sha != record.get('expected_head_sha'):
+                          fail('visible intent line disagrees with the authorized head')
                       if set(record) != required:
                           fail('trusted intent has an invalid schema')
                       exact_string(record.get('repository'), 'repository', r'[^/\s]+/[^/\s]+')

@@ -103,8 +103,9 @@ replace provider subscriptions.
 ### Managed CI in this repository
 
 This repository's `.github/workflows/ci.yml` installs the managed-CI v2
-contract with the literal `AGENT_LOOP_MANAGED_CI_V2` and
-`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` declarations. Pull requests use
+contract with the literal `AGENT_LOOP_MANAGED_CI_V2`,
+`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1`, and
+`AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1` declarations. Pull requests use
 exactly four activities: `opened`, `synchronize`, `reopened`, and `unlabeled`.
 Only a trusted, same-repository draft on the reserved
 `agent-loop/managed-*` branch can suppress intermediate CI: opening is
