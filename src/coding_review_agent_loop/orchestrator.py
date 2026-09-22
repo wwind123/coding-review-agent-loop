@@ -9694,6 +9694,10 @@ def _rebind_transaction_era_child_plan(
     )
     pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
     _pr_url, head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
+    managed, codec = _rebind_managed_input(
+        runner, config, committed=committed, issue_number=issue_number,
+        plan_hash=plan_hash, live_head=head_sha,
+    )
     publication.publish_transition(
         runner,
         config=config,
@@ -9703,6 +9707,8 @@ def _rebind_transaction_era_child_plan(
             base=str(pr_context.metadata.base_branch or config.base),
             head_sha=head_sha,
             origin_path=publication.ORIGIN_CHILD_PLAN_REBIND,
+            managed=managed,
+            authorization_codec=codec,
             # The closing scope is never changed by a rebind.
             expected_closing_issue_ids=tuple(committed.expected_closing_issue_ids),
             primary_issue=issue_number,
@@ -9716,6 +9722,71 @@ def _rebind_transaction_era_child_plan(
         f"Issue #{issue_number}: rebound PR #{pr_number} from approved plan "
         f"{plan_supersession.superseded_hash} to {plan_hash} with one plan-replacement "
         "workflow transaction",
+    )
+
+
+def _rebind_managed_input(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    committed,
+    issue_number: int,
+    plan_hash: str,
+    live_head: str,
+):
+    """The managed-CI input of a transaction-era rebind, and its codec (#827).
+
+    A null committed generation needs none.  A granted one is reissued in the
+    same plan-replacement transaction as a deterministic ``plan-rebind``
+    record naming the new plan (nothing is minted, no fresh grant is needed);
+    a released one stays inherited under the unchanged released generation.
+    A live head that moved past the committed granted record stops before any
+    write: the PR loop commits the head successor first.
+    """
+    from . import managed_ci_bound_authorization as bound
+    from . import workflow_transaction_publication as publication
+
+    generation = committed.managed_ci_generation
+    if generation is None:
+        return publication.Unmanaged(), None
+    resolved = publication.read_pr_transaction_views(
+        runner, config, committed.pr_number, issue_number
+    )
+    view = bound.builder_authorization_view(resolved.views.pr_view, resolved.lineage)
+    effective = view.effective
+    if effective is not None and not effective.record.granted:
+        return (
+            publication.Released(effective.record, generation),
+            bound.BoundAuthorizationCodec(),
+        )
+    payload = (
+        bound.build_plan_rebind_payload(
+            effective.record,
+            committed_comment_id=effective.comment_id,
+            new_plan_hash=plan_hash,
+            live_head=live_head,
+        )
+        if effective is not None
+        else None
+    )
+    if payload is None:
+        raise WorkflowTransactionError(
+            f"PR #{committed.pr_number}'s managed-CI authorization cannot be reissued for "
+            f"approved plan {plan_hash}; the re-planned child plan was not rebound and nothing "
+            "was written",
+            transaction_ids=(committed.transaction_id,),
+            problems=(
+                "managed head has no continuity provenance"
+                if effective is not None and effective.record.head_sha != live_head
+                else "no committed granted authorization to reissue",
+                f"live head {live_head}, committed head {committed.head_sha}",
+            ),
+            recovery_action=publication.RECOVERY_RERUN,
+            code=publication.CODE_MANAGED_UNAVAILABLE,
+        )
+    return (
+        publication.Granted(payload, payload.generation()),
+        bound.BoundAuthorizationCodec(),
     )
 
 

@@ -2897,6 +2897,19 @@ def test_m948_oversized_child_revision_posts_digest_and_resumes_losslessly(
 _M946_HEAD = "c" * 40
 
 
+def _m946_creation(plan_hash):
+    """A committed creation grant for PR #77, bound by the seam on publication."""
+    from coding_review_agent_loop.managed_ci import ManagedCiIssueAuthorization
+    from coding_review_agent_loop.managed_ci_bound_authorization import bind_v1_authorization
+
+    return bind_v1_authorization(ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=56, pr_number=77,
+        base_ref="main", head_sha=_M946_HEAD, actor_login="coding-review-agent-loop",
+        actor_id=4242, protection="voluntary", waiver="allow-unprotected-managed-ci",
+        nonce="nonce-1", label_event_id=9001, approved_plan_hash=plan_hash,
+    ), grant_anchor_event_id=9001)
+
+
 class _M946TxWorld(_M936World):
     """The #936 world, but PR #77 was published as one staged-child transaction.
 
@@ -2920,10 +2933,20 @@ class _M946TxWorld(_M936World):
             runner, config, plan_issue_number=56, plan_hash=self.old_hash
         )
         assert plan_input is not None
+        managed = {}
+        if self.managed_creation:
+            from coding_review_agent_loop import managed_ci_bound_authorization as bound
+
+            creation = _m946_creation(self.old_hash)
+            managed = dict(
+                managed=publication.Granted(creation, creation.generation()),
+                authorization_codec=bound.BoundAuthorizationCodec(),
+            )
         publication.publish_transition(runner, config=config, request=publication.TransitionRequest(
             repository="OWNER/REPO", pr_number=77, base="main", head_sha=_M946_HEAD,
             origin_path=publication.ORIGIN_STAGED_CHILD, expected_closing_issue_ids=(56,),
             primary_issue=56, staged=StagedIdentity(55, 56, "child"), approved_plan=plan_input,
+            **managed,
         ))
         self.issue_rows.append(self._row(signed, author="human-reviewer"))
         self.runner = None
@@ -2934,6 +2957,7 @@ class _M946TxWorld(_M936World):
         return {"author": {"login": author}, "createdAt": item.created_at, "body": item.body}
 
     head = _M946_HEAD
+    managed_creation = False
 
     def _runner(self, **outputs):
         runner = FakeRunner(
@@ -3318,3 +3342,123 @@ def test_m946_rebind_aborts_a_pending_head_advance_as_superseded(tmp_path, monke
     )
     assert world.pr_posted() == []
     assert world.agent_calls("claude") == [] and handed == [(77, new_hash)]
+
+
+class _M946ManagedTxWorld(_M946TxWorld):
+    managed_creation = True
+
+
+@pytest.mark.parametrize("mode", ["fail-before-write", "write-then-report-failure"])
+@pytest.mark.parametrize("boundary", [None, 1, 2, 3, 4, 5])
+def test_m946_managed_rebind_reissues_a_plan_rebind_authorization(
+    tmp_path, monkeypatch, boundary, mode
+):
+    """#827: on a managed waiver PR the rebind's plan-replacement transaction
+    reissues the handoff, the PR contract, and a deterministic ``plan-rebind``
+    bound authorization naming the new plan; an interruption at any of its five
+    writes is finished by a plain issue-command rerun with no fresh grant."""
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.workflow_transaction import (
+        KIND_PLAN_REPLACEMENT, RECOVERY_RERUN,
+    )
+
+    world = _M946ManagedTxWorld(tmp_path, monkeypatch)
+    handed = []
+    monkeypatch.setattr(
+        orchestrator, "run_pr_loop",
+        lambda runner, *, pr_number, **kwargs: handed.append(
+            (pr_number, kwargs["approved_plan_context"].plan_hash)
+        ) or 0,
+    )
+    config = world.config()
+    before = publication.read_pr_transaction_views(world._runner(), config, 77, 56).lineage
+    initial = before.latest_committed
+    assert initial.intent.managed_ci_generation is not None
+    real_write = publication._write_verified
+    writes = {"count": 0, "armed": boundary is not None}
+
+    def flaky(*args, **kwargs):
+        writes["count"] += 1
+        if writes["armed"] and writes["count"] == boundary:
+            if mode == "write-then-report-failure":
+                real_write(*args, **kwargs)
+            raise publication._error(
+                "injected write failure", recovery=RECOVERY_RERUN,
+                code=publication.CODE_WRITE_FAILED,
+            )
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "_write_verified", flaky)
+    outputs = dict(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    if boundary is None:
+        assert world.run_issue(**outputs) == 0
+    else:
+        with pytest.raises(WorkflowTransactionError):
+            world.run_issue(**outputs)
+        assert handed == []
+        writes["armed"] = False
+        # No planner, reviewer, or coder turn and no fresh-grant flags on the rerun.
+        assert world.run_issue(codex_outputs=[]) == 0
+        assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in world.runner.commands)
+    resolved = publication.read_pr_transaction_views(world.runner, config, 77, 56)
+    lineage = resolved.lineage
+    assert lineage.pending is None
+    committed = [state for state in lineage.chain if state.committed]
+    assert [state.intent.successor_kind for state in committed] == [
+        "initial", KIND_PLAN_REPLACEMENT,
+    ]
+    rebind = committed[-1].intent
+    new_hash = rebind.approved_plan_hash
+    assert new_hash != world.old_hash and handed == [(77, new_hash)]
+    # The handoff, the PR contract, and the authorization all name the new plan.
+    view = bound.builder_authorization_view(resolved.views.pr_view, lineage)
+    assert view.effective.record.kind == bound.KIND_PLAN_REBIND
+    assert view.effective.record.approved_plan_hash == new_hash
+    assert view.effective.record.transaction_id == committed[-1].transaction_id
+    assert view.effective.record.nonce == "nonce-1"
+    assert view.effective.record.grant_anchor_event_id == 9001
+    assert rebind.managed_ci_generation == view.effective.record.generation()
+    assert rebind.managed_ci_generation != initial.intent.managed_ci_generation
+    consumer = bound.consumer_bound_authorization(
+        resolved.views.pr_view, lineage, live_head=_M946_HEAD
+    )
+    assert consumer is not None and consumer.record.approved_plan_hash == new_hash
+    bound_bodies = [
+        str(row["body"]) for row in world.pr_rows
+        if bound.BOUND_AUTHORIZATION_MARKER in str(row["body"])
+    ]
+    # One creation grant and exactly one plan-rebind reissue: no duplicate.
+    assert len(bound_bodies) == 2
+    bodies = [str(row["body"]) for row in world.issue_rows]
+    rebinds = [body for body in bodies if CHILD_PLAN_REBIND_MARKER_RE.search(body)]
+    assert len(rebinds) == 1 and committed[-1].transaction_id in rebinds[0]
+
+
+def test_m946_managed_rebind_with_a_moved_live_head_stops_before_any_write(
+    tmp_path, monkeypatch
+):
+    """#827: a granted authorization bound to an older head cannot be reissued
+    for the new plan; the rebind stops non-mutating and the old plan stays bound."""
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    world = _M946ManagedTxWorld(tmp_path, monkeypatch)
+    monkeypatch.setattr(orchestrator, "run_pr_loop", lambda runner, **kwargs: 0)
+    world.head = "e" * 40
+    # Refused before any write: the committed binding is for another head.
+    with pytest.raises(WorkflowTransactionError, match="another head|continuity provenance"):
+        world.run_issue(
+            claude_outputs=[world.good_patch()],
+            codex_outputs=[structured_plan_review(state="approved")],
+        )
+    assert world.pr_posted() == []
+    assert not any(CHILD_PLAN_REBIND_MARKER_RE.search(body) for body in world.posted())
+    lineage = publication.read_pr_transaction_views(world.runner, world.config(), 77, 56).lineage
+    assert lineage.pending is None
+    assert lineage.latest_committed.intent.approved_plan_hash == world.old_hash
