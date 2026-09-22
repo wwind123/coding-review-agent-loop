@@ -15182,6 +15182,65 @@ def _is_completed_full_board_scheduler_record(
         return False
 
 
+def _managed_binding_protection_mode(
+    handoff: AuthenticatedIssueCreatedHandoff | None,
+) -> str | None:
+    """Return ``strict`` only for a handoff that publishes no PR-side record.
+
+    Authorization records are skipped exactly when the authenticated handoff
+    carries no override nonce; any other handoff must bind through them.
+    """
+    if handoff is not None and handoff.protection_mode == "strict" and handoff.override_nonce is None:
+        return "strict"
+    return None
+
+
+def _verify_strict_managed_plan_binding(
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    issue_context: IssueContext,
+    metadata: PullRequestMetadata,
+    expected_plan_hash: str,
+) -> None:
+    """Bind a strict-protection managed PR to the issue's canonical plan.
+
+    A strictly protected base never publishes a PR-side authorization record,
+    and managed recovery never synthesizes the issue-side handoff.  The durable
+    binding is therefore the one the managed resume itself used: the reserved
+    managed branch for this issue and the issue's canonical, completely
+    approved plan, whose hash must still be the plan the reviewers were bound
+    to.  GitHub's exact-head protection independently gates the merge.
+    """
+
+    def fail(reason: str) -> AgentLoopError:
+        return AgentLoopError(
+            "Approved-plan/handoff identity changed or disappeared during PR qualification; "
+            f"the strict managed-CI binding does not tie PR #{pr_number} to approved plan "
+            f"{expected_plan_hash} ({reason}). Stale approvals cannot be used for this head."
+        )
+
+    if metadata.head_branch != f"agent-loop/managed-{issue_context.number}" or not metadata.head_sha:
+        raise fail(f"the PR is not the reserved managed branch for issue #{issue_context.number}")
+    resumed_plan = _resume_plan_round(
+        issue_context.comments,
+        configured_reviewers=reviewers(config),
+    )
+    if resumed_plan is None:
+        raise fail("the issue carries no canonical approved plan")
+    plan_text, plan_round = resumed_plan
+    _require_complete_canonical_plan_approval(
+        issue_context.comments,
+        config=config,
+        plan_text=plan_text,
+        plan_round=plan_round,
+        human_requirements=issue_context.human_requirements,
+        error_message=str(fail("the canonical plan is not completely approved")),
+    )
+    if approved_plan_hash(plan_text) != expected_plan_hash:
+        raise fail("the issue's canonical approved plan changed")
+
+
 def _fresh_pr_qualification_snapshot(
     runner: Runner,
     *,
@@ -15193,6 +15252,7 @@ def _fresh_pr_qualification_snapshot(
     scheduler_contract: ReviewSchedulingContract | None = None,
     allow_plan_handoff_change: bool = False,
     planning_child_binding: _PlanningChildBinding | None = None,
+    managed_protection_mode: str | None = None,
 ) -> tuple[PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None, AgentLoopConfig]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
     staged_owner = (
@@ -15299,16 +15359,28 @@ def _fresh_pr_qualification_snapshot(
             repo=config.repo,
         )
         if fresh_handoff is None and config.managed_ci:
-            # Managed-CI runs deliberately never post the issue-side handoff;
-            # their binding is the trusted PR-side authorization chain (#966).
-            verify_managed_pr_plan_binding(
-                runner,
-                config=config,
-                pr_number=pr_number,
-                issue_number=fresh_issue.number,
-                live_head=context.metadata.head_sha,
-                approved_plan_hash=approved_plan_context.plan_hash,
-            )
+            # Managed-CI recovery deliberately does not synthesize the
+            # issue-side handoff (#966).  A voluntary or plan-limited base binds
+            # through the trusted PR-side authorization chain; a strictly
+            # protected base publishes no such record, so it is bound the way
+            # its resume was: reserved branch plus the issue's canonical plan.
+            if managed_protection_mode == "strict":
+                _verify_strict_managed_plan_binding(
+                    config=config,
+                    pr_number=pr_number,
+                    issue_context=fresh_issue,
+                    metadata=context.metadata,
+                    expected_plan_hash=approved_plan_context.plan_hash,
+                )
+            else:
+                verify_managed_pr_plan_binding(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    issue_number=fresh_issue.number,
+                    live_head=context.metadata.head_sha,
+                    approved_plan_hash=approved_plan_context.plan_hash,
+                )
         elif (
             fresh_handoff is None
             or fresh_handoff.pr_number != pr_number
@@ -18981,6 +19053,7 @@ def run_pr_loop(
                         scheduler_contract=scheduler_contract if selective_policy else None,
                         allow_plan_handoff_change=True,
                         planning_child_binding=planning_child_binding,
+                        managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                     )
                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                         log(
@@ -19341,6 +19414,7 @@ def run_pr_loop(
                                 scheduler_contract=scheduler_contract if selective_policy else None,
                                 allow_plan_handoff_change=True,
                                 planning_child_binding=planning_child_binding,
+                                managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                             )
                             if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                 unresolved_items = _advance_machine_obligations_for_head(
@@ -19716,6 +19790,7 @@ def run_pr_loop(
                             scheduler_contract=scheduler_contract if selective_policy else None,
                             allow_plan_handoff_change=True,
                             planning_child_binding=planning_child_binding,
+                            managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             prefetched_pr_context = fresh_context
@@ -19741,6 +19816,7 @@ def run_pr_loop(
                             scheduler_contract=scheduler_contract if selective_policy else None,
                             allow_plan_handoff_change=True,
                             planning_child_binding=planning_child_binding,
+                            managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             log(
@@ -19982,6 +20058,7 @@ def run_pr_loop(
                                         scheduler_contract=scheduler_contract if selective_policy else None,
                                         allow_plan_handoff_change=True,
                                         planning_child_binding=planning_child_binding,
+                                        managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                                     )
                                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                         prefetched_pr_context = fresh_context

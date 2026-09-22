@@ -54,10 +54,12 @@ def _root(**overrides):
 
 
 def _continuity(**overrides):
-    return _root(
+    fields = dict(
         kind="continuity", head_sha="head-1", nonce="next", predecessor_head="head-0",
-        predecessor_comment_id=41, round_comment_ids=(88, 89), **overrides,
+        predecessor_comment_id=41, round_comment_ids=(88, 89),
     )
+    fields.update(overrides)
+    return _root(**fields)
 
 
 def _auth_comment(comment_id, record, *, login="agent-loop", user_id=1):
@@ -160,7 +162,10 @@ def test_binding_rejects_an_uninspectable_comment_list(tmp_path):
         )
 
 
-def _snapshot(tmp_path, monkeypatch, *, managed_ci, issue_comments=()):
+def _snapshot(
+    tmp_path, monkeypatch, *, managed_ci, issue_comments=(), managed_protection_mode=None,
+    head_branch="agent-loop/managed-959",
+):
     issue = IssueContext(
         number=959, repo="OWNER/REPO", title="t", body="b", url=None,
         comments=tuple(issue_comments),
@@ -169,7 +174,7 @@ def _snapshot(tmp_path, monkeypatch, *, managed_ci, issue_comments=()):
         canonical_text="plan", plan_hash=PLAN, plan_subject="subject", availability="available",
     )
     pr_context = SimpleNamespace(
-        metadata=SimpleNamespace(head_sha="head-1", base_branch="main"),
+        metadata=SimpleNamespace(head_sha="head-1", base_branch="main", head_branch=head_branch),
         comments=(),
         human_requirements=(),
         architecture_identity_changed=False,
@@ -190,6 +195,7 @@ def _snapshot(tmp_path, monkeypatch, *, managed_ci, issue_comments=()):
     result = orchestrator._fresh_pr_qualification_snapshot(
         object(), config=config, pr_number=7, issue_context=issue,
         parent_issue_context=None, approved_plan_context=plan,
+        managed_protection_mode=managed_protection_mode,
     )
     return result, calls
 
@@ -214,3 +220,95 @@ def test_unrelated_issue_prose_is_not_a_handoff(tmp_path, monkeypatch):
     prose = IssueComment(author="agent-loop", created_at=None, body="status note: handoff pending")
     with pytest.raises(AgentLoopError, match="Approved-plan/handoff identity changed"):
         _snapshot(tmp_path, monkeypatch, managed_ci=False, issue_comments=(prose,))
+
+
+def test_competing_creation_terminals_at_the_live_head_fail_closed(tmp_path):
+    comments = [_auth_comment(41, _root()), _auth_comment(42, _root(nonce="other"))]
+    with pytest.raises(AgentLoopError, match="more than one distinct authorization terminal"):
+        _verify(tmp_path, comments, live_head="head-0")
+
+
+def test_competing_continuity_terminals_at_the_live_head_fail_closed(tmp_path):
+    comments = _chain() + [
+        _round_comment(90, role="reviewer", subject="head-0", round_number=1, state="blocking"),
+        _round_comment(91, role="coder", subject="head-1", round_number=2),
+        _auth_comment(101, _continuity(nonce="competing", round_comment_ids=(90, 91))),
+    ]
+    with pytest.raises(AgentLoopError, match="more than one distinct authorization terminal"):
+        _verify(tmp_path, comments)
+
+
+def test_byte_equivalent_retry_is_one_terminal(tmp_path):
+    _verify(tmp_path, [_auth_comment(41, _root()), _auth_comment(42, _root())], live_head="head-0")
+
+
+def test_one_fresh_grant_supersedes_the_creation_terminal(tmp_path):
+    fresh = _root(kind="fresh", nonce="grant")
+    _verify(tmp_path, [_auth_comment(41, _root()), _auth_comment(42, fresh)], live_head="head-0")
+
+
+def test_two_fresh_grants_at_the_live_head_fail_closed(tmp_path):
+    comments = [
+        _auth_comment(41, _root()),
+        _auth_comment(42, _root(kind="fresh", nonce="grant-a")),
+        _auth_comment(43, _root(kind="fresh", nonce="grant-b")),
+    ]
+    with pytest.raises(AgentLoopError, match="more than one distinct authorization terminal"):
+        _verify(tmp_path, comments, live_head="head-0")
+
+
+def _strict(monkeypatch, *, plan_text="approved plan", complete=True):
+    monkeypatch.setattr(
+        orchestrator, "_resume_plan_round",
+        lambda comments, **_k: None if plan_text is None else (plan_text, object()),
+    )
+
+    def require(*_a, error_message, **_k):
+        if not complete:
+            raise AgentLoopError(error_message)
+
+    monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    monkeypatch.setattr(
+        orchestrator, "approved_plan_hash",
+        lambda text: PLAN if text == "approved plan" else "0" * 16,
+    )
+
+
+def test_strict_managed_qualification_binds_the_canonical_plan(tmp_path, monkeypatch):
+    _strict(monkeypatch)
+    (_context, _ids, plan, _config), calls = _snapshot(
+        tmp_path, monkeypatch, managed_ci=True, managed_protection_mode="strict"
+    )
+    assert plan.plan_hash == PLAN
+    # A strict base publishes no PR-side record, so the chain is never consulted.
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("strict_kwargs", "head_branch", "reason"),
+    [
+        ({}, "feature/other", "not the reserved managed branch for issue #959"),
+        ({"plan_text": "a later plan"}, "agent-loop/managed-959", "canonical approved plan changed"),
+        ({"plan_text": None}, "agent-loop/managed-959", "no canonical approved plan"),
+        ({"complete": False}, "agent-loop/managed-959", "not completely approved"),
+    ],
+)
+def test_strict_managed_qualification_fails_closed(
+    tmp_path, monkeypatch, strict_kwargs, head_branch, reason
+):
+    _strict(monkeypatch, **strict_kwargs)
+    with pytest.raises(AgentLoopError, match=reason):
+        _snapshot(
+            tmp_path, monkeypatch, managed_ci=True, managed_protection_mode="strict",
+            head_branch=head_branch,
+        )
+
+
+@pytest.mark.parametrize(
+    ("protection_mode", "override_nonce", "expected"),
+    [("strict", None, "strict"), ("strict", "nonce", None), ("voluntary", "nonce", None)],
+)
+def test_only_a_recordless_strict_handoff_skips_the_chain(protection_mode, override_nonce, expected):
+    handoff = SimpleNamespace(protection_mode=protection_mode, override_nonce=override_nonce)
+    assert orchestrator._managed_binding_protection_mode(handoff) == expected
+    assert orchestrator._managed_binding_protection_mode(None) is None

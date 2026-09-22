@@ -3109,6 +3109,16 @@ def verify_managed_pr_plan_binding(
         bound_terminals.add(terminal)
     if not bound_terminals:
         raise fail("no authenticated chain reaches the live head")
+    if len(bound_terminals) != 1:
+        # Byte-equivalent retries collapse in the set.  As in resume, a single
+        # fresh grant at the creation head supersedes that creation record;
+        # any other pair of distinct live-head terminals is ambiguous.
+        fresh_roots = {record for record in bound_terminals if record.kind == "fresh"}
+        if not (
+            {record.kind for record in bound_terminals} <= {"creation", "fresh"}
+            and len(fresh_roots) == 1
+        ):
+            raise fail("more than one distinct authorization terminal reaches the live head")
 
 
 def _find_resume_audit(
