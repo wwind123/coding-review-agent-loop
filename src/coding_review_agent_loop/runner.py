@@ -347,6 +347,14 @@ def run_foreground_test(
                 health_provenance,
             )
         suite_start = "verified" if inner_probe.state == "verified" else "unknown"
+        # A verified probe only vouches for the argv it authenticated; spawn
+        # that exact argv (e.g. the canonical system ``env``) instead of
+        # re-resolving a mutable spelling.  ``cmd`` stays the reported command.
+        launch_cmd = (
+            list(inner_probe.launch_argv)
+            if inner_probe.state == "verified" and inner_probe.launch_argv
+            else cmd
+        )
         pass_fds: tuple[int, ...] = ()
         if parent_cgroup_path is not None:
             ready_read, ready_write = os.pipe()
@@ -363,7 +371,7 @@ def run_foreground_test(
                 "--release-fd",
                 str(release_read),
                 "--",
-                *cmd,
+                *launch_cmd,
             ]
         elif containment_policy is not None and containment_policy.mode != "off":
             # An explicit caller environment takes precedence; when it is
@@ -377,18 +385,18 @@ def run_foreground_test(
                 # parent's aggregate ceiling.
                 inherited_scope = True
                 inherited_cgroup = cgroup_path_for_pid(os.getpid())
-                spawn_cmd = cmd
+                spawn_cmd = launch_cmd
             else:
                 try:
                     handle = InvocationHandle.prepare(
-                        containment_policy, role=containment_role, target_argv=cmd, env=env
+                        containment_policy, role=containment_role, target_argv=launch_cmd, env=env
                     )
                 except BaseException:
                     lane_lock.close()
                     raise
                 spawn_cmd = list(handle.launcher_argv)
         else:
-            spawn_cmd = cmd
+            spawn_cmd = launch_cmd
         spawn_cwd: str | Path = cwd
         spawn_preexec: Callable[[], None] | None = None
         if cwd_fd is not None:
