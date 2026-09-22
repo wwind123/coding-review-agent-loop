@@ -346,6 +346,7 @@ class FakeRunner(Runner):
         self.repo_default_branch = repo_default_branch
         self.repo_default_branch_returncode = repo_default_branch_returncode
         self.commands = []
+        self.argv_commands = []
         self.comments = []
         self.issues = []
         self.git_status = git_status
@@ -643,11 +644,19 @@ class FakeRunner(Runner):
             return output
         return output, 0
 
-    def _record_command(self, args, cwd):
-        cmd = [str(arg) for arg in args]
+    def _record_command(self, args, cwd, *, input_text=None):
+        argv = [str(arg) for arg in args]
         cwd_path = Path(cwd)
         if not cwd_path.is_dir():
             raise FileNotFoundError(cwd_path)
+        # ``argv_commands`` is the exact exec argv. Claude and Codex receive
+        # their prompt on stdin (#870), so ``commands`` appends that stdin
+        # prompt as a trailing element: tests can keep reading ``cmd[-1]`` as
+        # the delivered prompt while argv-leak checks use ``argv_commands``.
+        self.argv_commands.append((argv, cwd_path))
+        cmd = list(argv)
+        if input_text is not None and (argv[:1] == ["claude"] or argv[:2] == ["codex", "exec"]):
+            cmd.append(input_text)
         self.commands.append((cmd, cwd_path))
         return cmd, cwd_path
 
@@ -793,7 +802,7 @@ class FakeRunner(Runner):
             )
 
     def _run_with_log_locked(self, args, *, cwd, log_path, check, input_text=None):
-        cmd, cwd_path = self._record_command(args, cwd)
+        cmd, cwd_path = self._record_command(args, cwd, input_text=input_text)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         ensure_log_dir_ignored(log_path.parent)
 
@@ -968,7 +977,7 @@ class FakeRunner(Runner):
         return None
 
     def _run_locked(self, args, *, cwd, check, input_text=None):
-        cmd, cwd_path = self._record_command(args, cwd)
+        cmd, cwd_path = self._record_command(args, cwd, input_text=input_text)
 
         if cmd[:1] == ["claude"]:
             output, returncode = self._next_agent_output(self.claude_outputs)
