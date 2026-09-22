@@ -2685,6 +2685,30 @@ def test_959_helper_falls_back_to_full(previous_kwargs):
     assert decision == MatrixEvidenceRenderDecision(mode="full", anchor_round=3)
 
 
+def test_959_helper_falls_back_to_full_when_prior_parser_raises_unexpectedly(monkeypatch):
+    # A decoded prior payload may carry lone surrogates from JSON escapes; the
+    # parser's UTF-8 length check raises UnicodeEncodeError on them.
+    current = _evidence_959(_rows_959())
+    bad_rows = _rows_959()
+    bad_rows[0]["workflow_path_claim"] = "path \ud800"
+    previous = _previous_959(_rows_959(), round_number=2, raw=_evidence_payload_959(bad_rows))
+    assert resolve_matrix_evidence_render(current, previous, 3) == MatrixEvidenceRenderDecision(
+        mode="full", anchor_round=3
+    )
+
+    # Any other parser failure is equally presentation-only and must not raise.
+    import coding_review_agent_loop.comment_rendering as rendering
+
+    def _explode(_raw):
+        raise RuntimeError("unexpected parser failure")
+
+    monkeypatch.setattr(rendering, "parse_risk_test_matrix_evidence", _explode)
+    previous = _previous_959(_rows_959(), round_number=2)
+    assert resolve_matrix_evidence_render(current, previous, 3) == MatrixEvidenceRenderDecision(
+        mode="full", anchor_round=3
+    )
+
+
 @pytest.mark.parametrize("bad_anchor", [0, -1])
 def test_959_helper_rejects_non_positive_valid_anchor(bad_anchor):
     # A directly constructed record cannot normally carry these, so emulate a

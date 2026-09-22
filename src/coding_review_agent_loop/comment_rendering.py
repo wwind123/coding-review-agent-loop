@@ -607,7 +607,7 @@ def resolve_matrix_evidence_render(
         return full
     try:
         previous = parse_risk_test_matrix_evidence(raw_previous)
-    except (AgentLoopError, ValueError, TypeError, KeyError):
+    except Exception:  # noqa: BLE001 - prior presentation data must never abort a round
         return full
     if previous.matrix_identity != current.matrix_identity:
         return full
