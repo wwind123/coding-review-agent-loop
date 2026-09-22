@@ -64,6 +64,9 @@ V2_FEATURE_MARKERS = (V2_MARKER, "workflow_dispatch", "managed_nonce", FINAL_CON
 V2_ADOPTION_MARKER = "AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION"
 V2_ADOPTION_FEATURE_MARKERS = (V2_ADOPTION_MARKER,)
 RECOVERY_MARKER = "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1"
+# Advertised by a base workflow whose intent validator admits the fixed
+# visible authorization line ahead of the record (#935).
+VISIBLE_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1"
 UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
 ISSUE_AUTHORIZATION_MARKER = "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1"
 _TERMINAL_CI_STATUSES = frozenset({
@@ -155,6 +158,9 @@ class ManagedCiContract:
     # delayed dispatch-time fallback so a suppressed draft is released only
     # when that same workflow advertises an unlabeled CI route.
     ordinary_recovery_capable: bool = False
+    # Derived from the same base workflow. Only a workflow that advertises
+    # the visible-intent envelope may receive the prefixed intent body.
+    visible_intent_capable: bool = False
     # Explicit lifecycle provenance.  These fields are intentionally not
     # inferred from public mode flags after activation.
     origin: Literal["issue-created", "source-managed"] | None = None
@@ -3498,6 +3504,7 @@ def _activate_v2_managed_ci(
     ordinary_recovery_capable = (
         RECOVERY_MARKER in workflow_text and "pull_request" in workflow_text and "unlabeled" in workflow_text
     )
+    visible_intent_capable = VISIBLE_INTENT_MARKER in workflow_text
 
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -4076,6 +4083,7 @@ def _activate_v2_managed_ci(
         issue_created_pr=origin == "issue-created",
         invocation_applied_label=label_applied,
         ordinary_recovery_capable=ordinary_recovery_capable,
+        visible_intent_capable=visible_intent_capable,
         origin=origin,
         lifecycle=lifecycle,
         authenticated_resume=managed_resume,
@@ -4276,6 +4284,7 @@ def _activate_v2_existing_pr_adoption(
         trusted_actor_id=actor_id, workflow_revision=revision if isinstance(revision, str) else None,
         adopted_existing_pr=True, guard_head_sha=live_sha, active_label_event_id=existing[0],
         invocation_applied_label=applied,
+        visible_intent_capable=VISIBLE_INTENT_MARKER in source,
         intent_generation=(
             secrets.token_urlsafe(16)
             if config.managed_ci
@@ -4777,16 +4786,21 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
             for run_id, run_attempt in contract.terminal_attempts
         ],
     }
+    record = f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->"
     # The intent record is the one protocol comment parsed by the installed
-    # base workflow, whose envelope is anchored at the start of the body
-    # (`^<!-- AGENT_MANAGED_CI_INTENT_V2 ... -->$` in .github/workflows/ci.yml).
-    # A visible #878 label ahead of the marker makes every dispatch fail with
-    # "expected exactly one fresh intent for requested nonce", so this record
-    # stays marker-only until the workflow contract accepts a prefix (#888).
-    return TrustedBody.canonical(
-        f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->",
-        expected_tokens=(INTENT_MARKER,),
-    )
+    # base workflow, which fullmatches the whole stripped body.  An older
+    # workflow accepts only the bare record (#888), so the fixed visible line
+    # is emitted only when the same base workflow advertises that its
+    # envelope admits it (#935).  The line is a literal template bound to the
+    # payload's head, never free text.
+    if contract.visible_intent_capable:
+        record = visible_intent_line(expected_head_sha) + "\n\n" + record
+    return TrustedBody.canonical(record, expected_tokens=(INTENT_MARKER,))
+
+
+def visible_intent_line(expected_head_sha: str) -> str:
+    """Return the exact visible line a v2 workflow admits ahead of the record."""
+    return f"Managed CI authorization for exact head {expected_head_sha}."
 
 
 def _validate_v2_intent_publication(contract: ManagedCiContract, *, state: str) -> None:

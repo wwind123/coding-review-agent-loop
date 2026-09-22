@@ -33,6 +33,7 @@ from coding_review_agent_loop.managed_ci import (
     assess_exact_head_protection,
     _dispatch_v2_qualification,
     _ensure_v2_intent,
+    _intent_body,
     _patch_intent,
     _v2_failed_jobs,
     _v2_correlated_status,
@@ -5287,6 +5288,98 @@ def test_v2_activation_and_preflight_require_authenticated_actor(tmp_path):
     assert contract is not None
     assert contract.protocol_version == 2
     assert contract.trusted_actor_login == "agent-loop"
+
+
+
+@pytest.mark.parametrize(
+    ("workflow", "capable"),
+    [
+        (V2_WORKFLOW, False),
+        (V2_WORKFLOW + "# AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1\n", True),
+    ],
+)
+def test_v2_activation_derives_visible_intent_capability_from_base_workflow(
+    tmp_path, workflow, capable
+):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(workflow=workflow, pr_payload={"headRefOid": "abc123"})
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.visible_intent_capable is capable
+
+
+def _visible_intent_pr(expected_head):
+    return {
+        "state": "open", "draft": True, "number": 7,
+        "base": {"ref": "main"}, "head": {
+            "sha": expected_head, "ref": "agent-loop/managed-7",
+            "repo": {"full_name": "OWNER/REPO"},
+        }, "user": {"login": "agent-loop", "id": 7},
+        "labels": [{"name": MANAGED_LABEL}],
+    }
+
+
+def test_v2_intent_body_is_bare_for_workflow_without_visible_capability():
+    revision, expected_head = "a" * 40, "b" * 40
+    contract = v2_contract(
+        workflow_revision=revision, repository="OWNER/REPO", nonce="n" * 32, created_at=1,
+        intent_generation="generation-935",
+        attached_run_id=100, run_attempt=1,
+    )
+
+    body = str(_intent_body(contract, pr_number=7, expected_head_sha=expected_head, state="attached"))
+
+    assert body.startswith("<!-- AGENT_MANAGED_CI_INTENT_V2 ")
+    pages = [[{"user": {"login": "agent-loop", "id": 7}, "body": body}]]
+    # Older pinned consumers, which fullmatch the bare record, keep working.
+    for router in (historical_router, current_router):
+        router.validate(
+            _visible_intent_pr(expected_head), pages, "OWNER/REPO", "7", expected_head,
+            "n" * 32, "agent-loop", revision,
+        )
+    local_router.validate(
+        _visible_intent_pr(expected_head), pages, "OWNER/REPO", "7", expected_head,
+        "n" * 32, "agent-loop", revision, 7,
+    )
+
+
+def test_v2_intent_body_leads_with_fixed_visible_line_for_capable_workflow():
+    revision, expected_head = "a" * 40, "b" * 40
+    contract = v2_contract(
+        workflow_revision=revision, repository="OWNER/REPO", nonce="n" * 32, created_at=1,
+        intent_generation="generation-935",
+        attached_run_id=100, run_attempt=1, visible_intent_capable=True,
+    )
+
+    body = str(_intent_body(contract, pr_number=7, expected_head_sha=expected_head, state="attached"))
+
+    visible, record = body.split("\n\n", 1)
+    assert visible == f"Managed CI authorization for exact head {expected_head}."
+    assert record.startswith("<!-- AGENT_MANAGED_CI_INTENT_V2 ")
+    pages = [[{"user": {"login": "agent-loop", "id": 7}, "body": body}]]
+    validated = local_router.validate(
+        _visible_intent_pr(expected_head), pages, "OWNER/REPO", "7", expected_head,
+        "n" * 32, "agent-loop", revision, 7,
+    )
+    assert validated["expected_head_sha"] == expected_head
+
+
+def test_v2_visible_intent_body_round_trips_through_intent_rediscovery(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner()
+    contract = v2_contract(visible_intent_capable=True)
+
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract)
+    nonce = contract.nonce
+    _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+
+    assert [snapshot["state"] for snapshot in runner.intent_snapshots] == ["prepared", "dispatch-requested"]
+    resumed = v2_contract(visible_intent_capable=True, nonce=None)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=resumed)
+    assert resumed.nonce == nonce
+    assert resumed.intent_state == "dispatch-requested"
 
 
 def test_v2_preflight_accepts_exactly_one_reserved_direct_branch(tmp_path):
