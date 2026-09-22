@@ -3003,6 +3003,114 @@ def _parse_override_audit(body: str) -> dict[str, str] | None:
     return None if record is None else record.field_map()
 
 
+def verify_managed_pr_plan_binding(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    issue_number: int,
+    live_head: str | None,
+    approved_plan_hash: str,
+) -> None:
+    """Require the PR-side authorization chain to bind this PR to the plan.
+
+    Managed-CI issue-created runs deliberately do not post the issue-side
+    handoff record; their durable binding is the trusted actor's PR-comment
+    authorization chain (#966).  Qualification reads the binding from there
+    with the same substance the issue-side check enforces: the chain must name
+    this repository, issue, PR, and approved plan hash, and its unique terminal
+    must be the live head, linked back to a creation or fresh root.
+    """
+    failure = (
+        "Approved-plan/handoff identity changed or disappeared during PR qualification; "
+        "the managed-CI authorization chain does not bind PR #{pr} to approved plan "
+        "{plan} at the live head ({reason}). Stale approvals cannot be used for this head."
+    )
+
+    def fail(reason: str) -> AgentLoopError:
+        return AgentLoopError(
+            failure.format(pr=pr_number, plan=approved_plan_hash, reason=reason)
+        )
+
+    trusted_actor = (config.managed_ci_trusted_actor or "").strip()
+    if not trusted_actor:
+        raise fail("no trusted managed-CI actor is configured")
+    if not live_head:
+        raise fail("the live head is unknown")
+    comments = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+    )
+    if comments is None:
+        raise fail("the PR authorization comments could not be inspected")
+    records: list[tuple[int, ManagedCiIssueAuthorization]] = []
+    for comment in comments:
+        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        if ISSUE_AUTHORIZATION_MARKER not in body:
+            continue
+        try:
+            authorization = parse_issue_created_authorization_comment(body)
+        except AgentLoopError as exc:
+            raise fail("an authorization record is malformed") from exc
+        if authorization is None:
+            continue
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        comment_id = comment.get("id")
+        login = user.get("login")
+        if (
+            not isinstance(comment_id, int)
+            or not isinstance(login, str)
+            or login.casefold() != trusted_actor.casefold()
+            or authorization.actor_login.casefold() != trusted_actor.casefold()
+            or user.get("id") != authorization.actor_id
+        ):
+            raise fail("an authorization record is not authored by the trusted actor")
+        if (
+            authorization.repository.casefold() != config.repo.casefold()
+            or authorization.pr_number != pr_number
+            or authorization.issue_number != issue_number
+            or (config.base and authorization.base_ref != config.base)
+        ):
+            raise fail("an authorization record names a different repository, issue, PR, or base")
+        records.append((comment_id, authorization))
+    if not records:
+        raise fail("no authorization record exists")
+    by_comment_id = dict(records)
+    children_by_predecessor: dict[ManagedCiIssueAuthorization, set[str]] = {}
+    for _comment_id, authorization in records:
+        if authorization.kind == "continuity" and authorization.predecessor_comment_id is not None:
+            predecessor = by_comment_id.get(authorization.predecessor_comment_id)
+            if predecessor is not None and predecessor.head_sha == authorization.predecessor_head:
+                children_by_predecessor.setdefault(predecessor, set()).add(authorization.head_sha)
+    if any(len(heads) > 1 for heads in children_by_predecessor.values()):
+        raise fail("the authorization chain forks")
+    bound_terminals: set[ManagedCiIssueAuthorization] = set()
+    for _comment_id, terminal in records:
+        if terminal.head_sha != live_head:
+            continue
+        chain: list[ManagedCiIssueAuthorization] = []
+        current: ManagedCiIssueAuthorization | None = terminal
+        while current is not None and current.kind == "continuity":
+            if current in chain or not _continuity_round_metadata_is_valid(
+                comments, authorization=current
+            ):
+                current = None
+                break
+            chain.append(current)
+            predecessor = by_comment_id.get(current.predecessor_comment_id or 0)
+            if predecessor is None or predecessor.head_sha != current.predecessor_head:
+                current = None
+                break
+            current = predecessor
+        if current is None or current.kind not in {"creation", "fresh"}:
+            continue
+        chain.append(current)
+        if any(record.approved_plan_hash != approved_plan_hash for record in chain):
+            raise fail("the authorization chain names a different approved plan")
+        bound_terminals.add(terminal)
+    if not bound_terminals:
+        raise fail("no authenticated chain reaches the live head")
+
+
 def _find_resume_audit(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, actor_login: str, actor_id: int,
     base_ref: str, issue_number: int | None = None, live_head: str | None = None,

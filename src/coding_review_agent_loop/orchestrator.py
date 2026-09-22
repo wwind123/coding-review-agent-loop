@@ -221,6 +221,7 @@ from .managed_ci import (
     recover_issue_created_handoff,
     render_managed_ci_resume_command,
     validate_ordinary_recovery_capability,
+    verify_managed_pr_plan_binding,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
@@ -15297,7 +15298,18 @@ def _fresh_pr_qualification_snapshot(
             issue_number=fresh_issue.number,
             repo=config.repo,
         )
-        if (
+        if fresh_handoff is None and config.managed_ci:
+            # Managed-CI runs deliberately never post the issue-side handoff;
+            # their binding is the trusted PR-side authorization chain (#966).
+            verify_managed_pr_plan_binding(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                issue_number=fresh_issue.number,
+                live_head=context.metadata.head_sha,
+                approved_plan_hash=approved_plan_context.plan_hash,
+            )
+        elif (
             fresh_handoff is None
             or fresh_handoff.pr_number != pr_number
             or fresh_handoff.flow != "approved-plan-implementation"
@@ -15306,7 +15318,7 @@ def _fresh_pr_qualification_snapshot(
                 "Approved-plan/handoff identity changed or disappeared during PR qualification; "
                 "stale approvals cannot be used for this head."
             )
-        if fresh_handoff.plan_hash != approved_plan_context.plan_hash:
+        if fresh_handoff is not None and fresh_handoff.plan_hash != approved_plan_context.plan_hash:
             if not allow_plan_handoff_change:
                 raise AgentLoopError(
                     "Approved-plan/handoff identity changed or disappeared during PR qualification; "
