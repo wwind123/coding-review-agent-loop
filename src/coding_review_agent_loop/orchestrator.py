@@ -656,25 +656,44 @@ def _recorded_issue_handoff(
     config: AgentLoopConfig,
     *,
     issue_context: IssueContext,
+    defer_pending_successor: bool = False,
 ):
     """The issue's recorded handoff (flow and plan hash), across versions (#827).
 
     A transaction-era handoff is read through authenticated discovery after an
     interrupted publication is finished from its stored intent; the version-1
     comment reader would reject it.  A legacy issue keeps today's reader.
+
+    ``defer_pending_successor`` (a planning child, which may be rebound this
+    run): a pending successor of any kind is not finished here.  The caller
+    reads the committed predecessor binding, and either the child-plan rebind
+    adopts the pending transaction or aborts it as superseded, or the later
+    interrupted-publication finisher finishes it when no rebind runs.
     """
     from . import workflow_transaction_publication as publication
 
     if not config.dry_run:
-        _finish_interrupted_issue_publication(
-            runner, config, issue_number=issue_context.number
-        )
         route = publication.route_issue_publication(runner, config, issue_context.number)
-        if isinstance(route, publication.RecoverableSuccessor) and (
-            publication.pending_plan_replacement(runner, config, route.pr_number) is not None
+        deferred = (
+            defer_pending_successor
+            and isinstance(route, publication.RecoverableSuccessor)
+            and publication.pending_successor(runner, config, route.pr_number) is not None
+        )
+        if not deferred:
+            _finish_interrupted_issue_publication(
+                runner, config, issue_number=issue_context.number
+            )
+            route = publication.route_issue_publication(
+                runner, config, issue_context.number
+            )
+        if deferred or (
+            isinstance(route, publication.RecoverableSuccessor)
+            and publication.pending_plan_replacement(runner, config, route.pr_number)
+            is not None
         ):
-            # An interrupted child-plan rebind: only the rebind writer can
-            # finish it, so its preconditions read the committed predecessor
+            # An interrupted child-plan rebind, or a pending successor a rebind
+            # may supersede: only the rebind writer (or the later finisher) can
+            # settle it, so preconditions read the committed predecessor
             # binding.  Not authority; every authority consumer still refuses.
             binding = route.predecessor
             return SimpleNamespace(
@@ -9559,14 +9578,17 @@ def _rebind_superseded_child_plan(
 
 
 def _interrupted_rebind_pr_is_open(runner: Runner, config: AgentLoopConfig, pr_number: int) -> bool:
-    """Whether the PR carries an interrupted plan-replacement rebind (#827).
+    """Whether the PR carries a pending successor the rebind must settle (#827).
 
-    True only when a prepared-only plan replacement is pending on the
-    committed chain; the PR must then still be OPEN, or nothing proceeds.
+    True when a prepared-only successor of any kind is pending on the
+    committed chain: an interrupted plan-replacement rebind is adopted, and
+    any other pending successor (for example a head advance) is aborted as
+    superseded by the seam.  The PR must then still be OPEN, or nothing
+    proceeds.  The authority form would refuse both states.
     """
     from . import workflow_transaction_publication as publication
 
-    if publication.pending_plan_replacement(runner, config, pr_number) is None:
+    if publication.pending_successor(runner, config, pr_number) is None:
         return False
     validate_open_pr(runner, config=config, pr_number=pr_number)
     return True
@@ -13169,7 +13191,12 @@ def run_issue_loop(
             # contract. Fall back to the latest reconstructable round only when
             # no approved-plan handoff has selected a plan yet.
             recorded_plan_handoff = _recorded_issue_handoff(
-                runner, config, issue_context=issue_context
+                runner,
+                config,
+                issue_context=issue_context,
+                defer_pending_successor=(
+                    fresh_child is not None and fresh_child.route.is_planning
+                ),
             )
             if (
                 recorded_plan_handoff is not None

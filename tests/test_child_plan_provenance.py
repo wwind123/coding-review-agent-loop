@@ -2933,6 +2933,8 @@ class _M946TxWorld(_M936World):
     def _row(item, author="coding-review-agent-loop"):
         return {"author": {"login": author}, "createdAt": item.created_at, "body": item.body}
 
+    head = _M946_HEAD
+
     def _runner(self, **outputs):
         runner = FakeRunner(
             persist_rest_comment_posts=True,
@@ -2940,10 +2942,10 @@ class _M946TxWorld(_M936World):
             issue_comments=self.issue_rows,
             pr_payload={
                 "number": 77, "body": "Fixes #56", "state": "OPEN",
-                "url": "https://github.com/OWNER/REPO/pull/77", "headRefOid": _M946_HEAD,
+                "url": "https://github.com/OWNER/REPO/pull/77", "headRefOid": self.head,
                 "baseRefName": "main", "comments": self.pr_rows,
             },
-            git_head=_M946_HEAD,
+            git_head=self.head,
             **outputs,
         )
         # Share the durable threads, so every write lands in the history.
@@ -3227,3 +3229,92 @@ def test_m946_prepared_rebind_siblings_are_reconciled_by_an_issue_rerun(
     bodies = [str(row["body"]) for row in world.issue_rows]
     rebinds = [body for body in bodies if CHILD_PLAN_REBIND_MARKER_RE.search(body)]
     assert len(rebinds) == 1 and committed[-1].transaction_id in rebinds[0]
+
+
+def test_m946_rebind_aborts_a_pending_head_advance_as_superseded(tmp_path, monkeypatch):
+    """#827: a child-plan rebind that meets a pending ``head-advance`` successor
+    (a PR loop interrupted before its terminal write) aborts it as superseded
+    and commits one plan-replacement successor for the live head.  The issue
+    command does not finish the head advance first."""
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+    from coding_review_agent_loop.workflow_transaction import (
+        KIND_HEAD_ADVANCE, KIND_PLAN_REPLACEMENT, RECOVERY_RERUN,
+    )
+
+    world = _M946TxWorld(tmp_path, monkeypatch)
+    handed = []
+    monkeypatch.setattr(
+        orchestrator, "run_pr_loop",
+        lambda runner, *, pr_number, **kwargs: handed.append(
+            (pr_number, kwargs["approved_plan_context"].plan_hash)
+        ) or 0,
+    )
+    new_head = "e" * 40
+    world.head = new_head
+    config = world.config()
+    real_write = publication._write_verified
+    writes = {"count": 0}
+
+    def fail_terminal(*args, **kwargs):
+        writes["count"] += 1
+        if writes["count"] == 2:
+            raise publication._error(
+                "injected write failure", recovery=RECOVERY_RERUN,
+                code=publication.CODE_WRITE_FAILED,
+            )
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "_write_verified", fail_terminal)
+    with pytest.raises(WorkflowTransactionError):
+        publication.ensure_live_head_transaction(
+            world._runner(), config, pr_number=77, head_sha=new_head
+        )
+    monkeypatch.setattr(publication, "_write_verified", real_write)
+    lineage = publication.read_pr_transaction_views(world._runner(), config, 77, 56).lineage
+    stale = lineage.pending
+    assert stale is not None and stale.intent.successor_kind == KIND_HEAD_ADVANCE
+    assert stale.intent.head_sha == new_head
+    # The authority form refuses the pending state.
+    with pytest.raises(WorkflowTransactionError):
+        publication.discover_canonical_issue_pr(world.runner, config, 56)
+
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    ) == 0
+    # The re-plan turn is the only coder-side call, and no PR is created.
+    assert len(world.agent_calls("claude")) == 1
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in world.runner.commands)
+    lineage = publication.read_pr_transaction_views(world.runner, config, 77, 56).lineage
+    assert lineage.pending is None
+    committed = [state for state in lineage.chain if state.committed]
+    # The head advance never committed: the plan replacement supersedes it.
+    assert [state.intent.successor_kind for state in committed] == [
+        "initial", KIND_PLAN_REPLACEMENT,
+    ]
+    assert committed[-1].intent.head_sha == new_head
+    stale_state = lineage.state(stale.transaction_id)
+    assert stale_state is not None and stale_state.aborted
+    assert stale_state.terminal.abort_reason == "superseded-intent"
+    new_hash = committed[-1].intent.approved_plan_hash
+    assert new_hash != world.old_hash
+    assert handed == [(77, new_hash)]
+    bodies = [str(row["body"]) for row in world.issue_rows]
+    rebinds = [body for body in bodies if CHILD_PLAN_REBIND_MARKER_RE.search(body)]
+    assert len(rebinds) == 1 and committed[-1].transaction_id in rebinds[0]
+    assert orchestrator.verify_child_plan_rebind(
+        world._issue_context(None, config=config, issue_number=56).comments,
+        repo="OWNER/REPO", parent_plan_context=_m936_binding(world).parent_plan_context,
+        child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
+        runner=world.runner, config=config,
+    ).plan_hash == new_hash
+    # A rerun writes nothing and invokes no agent.
+    handed.clear()
+    assert world.run_issue(codex_outputs=[]) == 0
+    assert not any(
+        AGENT_ISSUE_PR_HANDOFF_RE.search(body) or CHILD_PLAN_REBIND_MARKER_RE.search(body)
+        for body in world.posted()
+    )
+    assert world.pr_posted() == []
+    assert world.agent_calls("claude") == [] and handed == [(77, new_hash)]

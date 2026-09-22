@@ -1854,6 +1854,18 @@ def latest_committed_intent(
     return chain[-1].intent if chain else None
 
 
+def pending_successor(
+    runner: Runner, config: AgentLoopConfig, pr_number: int
+) -> TransactionState | None:
+    """Read-only: the lowest-ID prepared-only successor of the committed tip.
+
+    Any successor kind.  The child-plan rebind uses it to take over a pending
+    successor it will adopt or abort as superseded, instead of letting the
+    issue command finish it first.  Sibling-tolerant; grants no authority.
+    """
+    return _pending_successor(runner, config, pr_number, kind=None)
+
+
 def pending_plan_replacement(
     runner: Runner, config: AgentLoopConfig, pr_number: int
 ) -> TransactionState | None:
@@ -1865,6 +1877,12 @@ def pending_plan_replacement(
     transactions below the strict resolver, so same-parent prepared-only
     siblings are handed to the seam's reconciliation.  Grants no authority.
     """
+    return _pending_successor(runner, config, pr_number, kind=KIND_PLAN_REPLACEMENT)
+
+
+def _pending_successor(
+    runner: Runner, config: AgentLoopConfig, pr_number: int, *, kind: str | None
+) -> TransactionState | None:
     _views, states = _grouped_views(runner, config, pr_number, None)
     if not states:
         return None
@@ -1883,7 +1901,7 @@ def pending_plan_replacement(
         key=lambda item: item.prepared_comment.comment_id,
     )
     return next(
-        (item for item in pending if item.intent.successor_kind == KIND_PLAN_REPLACEMENT),
+        (item for item in pending if kind is None or item.intent.successor_kind == kind),
         None,
     )
 
