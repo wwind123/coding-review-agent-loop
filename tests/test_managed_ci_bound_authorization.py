@@ -808,3 +808,92 @@ def test_dispatched_coder_head_on_a_legacy_pr_keeps_todays_publication(tmp_path,
         predecessor_head=HEAD_1, new_head=HEAD_2, round_comment_ids=(5,),
     ) is None
     assert github.write_count == 0
+
+
+def test_point_two_retries_a_failed_coder_head_continuity_with_its_retained_correlation(
+    tmp_path, monkeypatch
+):
+    """#827: a recoverable point-4 failure retains the push's correlation; the
+    next round's head binding (point 2) retries exactly that continuity. Until
+    it commits the round has no live-head authority and nothing else is built."""
+    from coding_review_agent_loop import managed_ci, orchestrator
+    from coding_review_agent_loop.managed_ci_bound_authorization import KIND_CONTINUITY
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        CommittedTransaction,
+        NoLiveHeadAuthority,
+    )
+
+    github = TransactionGitHub()
+    config = make_config(tmp_path)
+    publish(github, creation(), tmp_path)
+    rounds = (
+        _seed_round(github, role="reviewer", subject=HEAD_1, round_number=1, state="blocking"),
+        _seed_round(github, role="coder", subject=HEAD_2, round_number=2),
+    )
+    owner = {"event": (EVENT, ACTOR[0], ACTOR[1])}
+    monkeypatch.setattr(managed_ci, "_active_managed_label_event", lambda *a, **k: owner["event"])
+    retained: dict = {}
+    handoff = _coder_handoff()
+    # Point 4: the prepared write fails, so nothing commits.
+    github.fail_write(github.write_count + 1, FAIL_BEFORE_WRITE)
+    assert orchestrator._managed_coder_head_transaction(
+        github, config, pr_number=PR, handoff=handoff, predecessor_head=HEAD_1,
+        new_head=HEAD_2, round_comment_ids=rounds, retained=retained,
+    ) == handoff
+    assert retained["new_head"] == HEAD_2 and retained["round_comment_ids"] == rounds
+
+    # Point 2 with a foreign label event: the retry is refused, no authority, no write.
+    owner["event"] = (EVENT + 1, "someone-else", 77)
+    before = github.write_count
+    authority = orchestrator._round_live_head_authority(
+        github, config, pr_number=PR, head_sha=HEAD_2, retained_continuity=retained,
+    )
+    assert isinstance(authority, NoLiveHeadAuthority)
+    assert github.write_count == before and retained["new_head"] == HEAD_2
+
+    # Point 2 once the actor owns the label again: the retained continuity commits.
+    owner["event"] = (EVENT, ACTOR[0], ACTOR[1])
+    authority = orchestrator._round_live_head_authority(
+        github, config, pr_number=PR, head_sha=HEAD_2, retained_continuity=retained,
+    )
+    assert isinstance(authority, CommittedTransaction)
+    assert authority.intent.head_sha == HEAD_2
+    bound_handoff = retained.pop("bound_handoff")
+    assert bound_handoff.authorization_kind == KIND_CONTINUITY
+    assert bound_handoff.head_sha == HEAD_2 and bound_handoff.transaction_bound
+    assert retained == {}
+    assert len(bound_comments(github)) == 2
+    # A further round writes nothing.
+    before = github.write_count
+    assert isinstance(
+        orchestrator._round_live_head_authority(
+            github, config, pr_number=PR, head_sha=HEAD_2, retained_continuity=retained,
+        ),
+        CommittedTransaction,
+    )
+    assert github.write_count == before
+
+
+def test_point_two_drops_a_retained_correlation_for_another_head(tmp_path, monkeypatch):
+    """A retained correlation applies only to the head it was built for: an
+    external push leaves the round without managed authority and builds no
+    continuity from the stale correlation."""
+    from coding_review_agent_loop import managed_ci, orchestrator
+    from coding_review_agent_loop.workflow_transaction_publication import NoLiveHeadAuthority
+
+    github = TransactionGitHub()
+    config = make_config(tmp_path)
+    publish(github, creation(), tmp_path)
+    monkeypatch.setattr(
+        managed_ci, "_active_managed_label_event", lambda *a, **k: (EVENT, ACTOR[0], ACTOR[1])
+    )
+    retained = {
+        "pr_number": PR, "predecessor_head": HEAD_1, "new_head": HEAD_2,
+        "round_comment_ids": (5,), "handoff": _coder_handoff(),
+    }
+    before = github.write_count
+    authority = orchestrator._round_live_head_authority(
+        github, config, pr_number=PR, head_sha="f" * 40, retained_continuity=retained,
+    )
+    assert isinstance(authority, NoLiveHeadAuthority)
+    assert retained == {} and github.write_count == before

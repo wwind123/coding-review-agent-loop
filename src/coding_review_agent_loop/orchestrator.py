@@ -16107,6 +16107,8 @@ def _managed_coder_head_transaction(
     predecessor_head: str,
     new_head: str,
     round_comment_ids: tuple[int, ...],
+    retained: dict[str, object] | None = None,
+    raise_recoverable: bool = False,
 ):
     """Head-advance point 4 on a granted managed PR (#827).
 
@@ -16118,6 +16120,12 @@ def _managed_coder_head_transaction(
     committed generation, where today's publication runs unchanged.  A
     recoverable failure writes nothing more and does not raise: the round has
     no live-head managed authority until a rerun commits the successor.
+
+    ``retained`` keeps that correlation (predecessor head, new head, dispatched
+    round comment IDs, handoff) after a recoverable failure, so the next
+    round's head binding (point 2) retries exactly this continuity; it is
+    cleared once the successor commits.  ``raise_recoverable`` re-raises the
+    recoverable error for that retry, which maps it to no live-head authority.
     """
     import secrets
 
@@ -16160,12 +16168,25 @@ def _managed_coder_head_transaction(
     except WorkflowTransactionError as exc:
         if not publication.is_recoverable(exc):
             raise
+        if retained is not None:
+            retained.clear()
+            retained.update(
+                pr_number=pr_number,
+                predecessor_head=predecessor_head,
+                new_head=new_head,
+                round_comment_ids=tuple(round_comment_ids),
+                handoff=handoff,
+            )
+        if raise_recoverable:
+            raise
         log(
             config,
             f"PR #{pr_number}: managed head {new_head} has no committed continuity yet; "
-            f"nothing grants it until a rerun commits the successor. {exc}",
+            f"the next round retries it and nothing grants it until then. {exc}",
         )
         return handoff
+    if retained is not None:
+        retained.clear()
     if committed is None:
         return None
     resolved = publication.read_pr_transaction_views(runner, config, pr_number, None)
@@ -16222,6 +16243,7 @@ def _round_live_head_authority(
     *,
     pr_number: int,
     head_sha: str | None,
+    retained_continuity: dict[str, object] | None = None,
 ) -> RoundAuthority:
     """Resolve the per-round head binding (#827, point 2).
 
@@ -16236,6 +16258,11 @@ def _round_live_head_authority(
 
     A dry run has no authenticated actor, never qualifies, and never merges,
     so it previews under today's rules.
+
+    A managed coder head whose continuity failed at point 4 is retried here
+    with its retained correlation, and only for exactly that head; the
+    committed handoff it yields is left in ``retained_continuity`` under
+    ``bound_handoff`` for the loop.  No other managed input is built here.
     """
     from . import workflow_transaction_publication as publication
 
@@ -16245,6 +16272,29 @@ def _round_live_head_authority(
     live_head = str(head_sha or "")
 
     def ensure() -> None:
+        retained = retained_continuity
+        if (
+            retained
+            and retained.get("pr_number") == pr_number
+            and retained.get("new_head") == live_head
+        ):
+            handoff = retained["handoff"]
+            bound_handoff = _managed_coder_head_transaction(
+                runner,
+                config,
+                pr_number=pr_number,
+                handoff=handoff,
+                predecessor_head=str(retained["predecessor_head"]),
+                new_head=live_head,
+                round_comment_ids=tuple(retained["round_comment_ids"]),
+                retained=retained,
+                raise_recoverable=True,
+            )
+            if bound_handoff is not None:
+                retained["bound_handoff"] = bound_handoff
+        elif retained:
+            # A different live head: the retained correlation no longer applies.
+            retained.clear()
         publication.ensure_live_head_transaction(
             runner, config, pr_number=pr_number, head_sha=live_head
         )
@@ -18097,6 +18147,9 @@ def run_pr_loop(
         # range large enough to reach both; ``allowed_rounds`` remains the
         # authoritative guard and prevents either slot from being used unless
         # its corresponding watcher transition grants it.
+        # A managed coder head whose continuity did not commit keeps its
+        # correlation here, so the next round's head binding retries it (#827).
+        retained_continuity: dict[str, object] = {}
         for round_number in range(start_round_number, config.max_rounds + 3):
             if round_number > allowed_rounds:
                 raise AgentLoopError(
@@ -18248,8 +18301,18 @@ def run_pr_loop(
             # binds the live head.  A recoverable gap keeps the round running
             # with fresh reviewers; an integrity failure stops it.
             round_authority = _round_live_head_authority(
-                runner, config, pr_number=pr_number, head_sha=pr_metadata.head_sha
+                runner, config, pr_number=pr_number, head_sha=pr_metadata.head_sha,
+                retained_continuity=retained_continuity,
             )
+            retried_handoff = retained_continuity.pop("bound_handoff", None)
+            if retried_handoff is not None:
+                managed_ci_handoff = retried_handoff
+                authenticated_managed_resume = AuthenticatedManagedResume(
+                    origin="issue-created",
+                    lifecycle=managed_ci_handoff.lifecycle,
+                    issue_created_handoff=managed_ci_handoff,
+                    override_nonce=managed_ci_handoff.override_nonce,
+                )
             round_reuse_allowed = not isinstance(round_authority, NoLiveHeadAuthority)
             if not round_reuse_allowed:
                 log(
@@ -21972,6 +22035,7 @@ def run_pr_loop(
                         predecessor_head=predecessor_head,
                         new_head=new_head,
                         round_comment_ids=round_comment_ids,
+                        retained=retained_continuity,
                     )
                     managed_ci_handoff = (
                         bound_handoff
