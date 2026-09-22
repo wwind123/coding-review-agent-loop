@@ -19,7 +19,9 @@ AgentName = Literal["claude", "codex", "gemini", "antigravity"]
 AgentTextSource = Literal["response_file", "stdout_marker", "stdout"]
 
 # Keep prompts below Linux's per-argument exec limit; longer prompts are sent
-# through stdin or backend-specific task context instead.
+# through stdin or backend-specific task context instead. Claude and Codex
+# always use stdin regardless of size (#870); this bound applies to the
+# Gemini, Antigravity, and Gemini-repair directive paths.
 STDIN_PROMPT_THRESHOLD_BYTES = 100_000
 
 
