@@ -1625,6 +1625,60 @@ def ensure_live_head_transaction(
     return True
 
 
+def ensure_managed_continuity_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str,
+    build: Callable[[object], object | None],
+) -> CommittedTransaction | None:
+    """Head-advance point 4 on a granted managed PR (#827).
+
+    The coder head's ``head-advance`` successor reissues a bound
+    ``continuity`` authorization that ``build`` derives from the committed
+    effective record (a ``BoundAuthorizationRecord``) and the correlated
+    dispatched round metadata.  Returns ``None`` for a legacy-era PR or a
+    null committed generation, where the caller keeps today's behavior.
+    ``build`` returning ``None`` is the recoverable managed-unavailable stop,
+    with no write.  Authority exists only once the successor commits.
+    """
+    from . import managed_ci_bound_authorization as bound
+
+    resolved = read_pr_transaction_views(runner, config, pr_number, None)
+    if resolved.era != ERA_TRANSACTION:
+        return None
+    committed = resolved.lineage.latest_committed
+    if committed is None or committed.intent.managed_ci_generation is None:
+        return None
+    intent = committed.intent
+    codec = bound.BoundAuthorizationCodec()
+    if intent.head_sha == head_sha and resolved.lineage.pending is None:
+        return ensure_head_transaction(
+            runner, config=config,
+            request=_request_from_intent(runner, config, intent, head_sha=head_sha),
+        )
+    view = bound.builder_authorization_view(resolved.views.pr_view, resolved.lineage)
+    payload = build(view.effective) if view.effective is not None else None
+    if payload is None:
+        raise _error(
+            "The coder head has no correlated managed-CI continuity input; nothing was written",
+            intent=intent,
+            problems=(
+                f"live head {head_sha} differs from committed head {intent.head_sha}",
+                "managed head has no continuity provenance",
+            ),
+            recovery=RECOVERY_RERUN,
+            code=CODE_MANAGED_UNAVAILABLE,
+        )
+    request = dataclasses.replace(
+        _request_from_intent(runner, config, intent, head_sha=head_sha),
+        managed=Granted(payload, payload.generation()),
+        authorization_codec=codec,
+    )
+    return ensure_head_transaction(runner, config=config, request=request)
+
+
 def _request_from_intent(
     runner: Runner,
     config: AgentLoopConfig,

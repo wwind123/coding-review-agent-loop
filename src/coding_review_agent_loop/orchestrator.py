@@ -16098,6 +16098,93 @@ def _entry_transaction_precheck(
         )
 
 
+def _managed_coder_head_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    handoff,
+    predecessor_head: str,
+    new_head: str,
+    round_comment_ids: tuple[int, ...],
+):
+    """Head-advance point 4 on a granted managed PR (#827).
+
+    Replaces the version-1 continuity publication: the coder head's
+    ``head-advance`` successor reissues a bound ``continuity`` record that
+    extends the committed effective grant and names the correlated dispatched
+    round metadata, under today's actor-owned active label event.  Returns the
+    handoff to continue with, or ``None`` on a legacy-era PR or a null
+    committed generation, where today's publication runs unchanged.  A
+    recoverable failure writes nothing more and does not raise: the round has
+    no live-head managed authority until a rerun commits the successor.
+    """
+    import secrets
+
+    from . import managed_ci as managed_ci_module
+    from . import managed_ci_bound_authorization as bound
+    from . import workflow_transaction_publication as publication
+    from .workflow_transaction import ENTRY_AUTHORIZATION
+
+    if config.dry_run or handoff.override_nonce is None:
+        return None
+    event = managed_ci_module._active_managed_label_event(
+        runner, config=config, pr_number=pr_number
+    )
+    owned = (
+        event is not None
+        and event[1].casefold() == handoff.trusted_actor_login.casefold()
+        and event[2] == handoff.trusted_actor_id
+    )
+    built: list[object] = []
+
+    def build(effective):
+        if not owned:
+            return None
+        payload = bound.build_continuity_payload(
+            effective.record,
+            effective_comment_id=effective.comment_id,
+            predecessor_head=predecessor_head,
+            new_head=new_head,
+            round_comment_ids=round_comment_ids,
+            label_event_id=event[0],
+            nonce=secrets.token_urlsafe(24),
+        )
+        built.append(payload)
+        return payload
+
+    try:
+        committed = publication.ensure_managed_continuity_transaction(
+            runner, config, pr_number=pr_number, head_sha=new_head, build=build
+        )
+    except WorkflowTransactionError as exc:
+        if not publication.is_recoverable(exc):
+            raise
+        log(
+            config,
+            f"PR #{pr_number}: managed head {new_head} has no committed continuity yet; "
+            f"nothing grants it until a rerun commits the successor. {exc}",
+        )
+        return handoff
+    if committed is None:
+        return None
+    resolved = publication.read_pr_transaction_views(runner, config, pr_number, None)
+    effective = bound.builder_authorization_view(
+        resolved.views.pr_view, resolved.lineage
+    ).effective
+    if effective is None or effective.record.head_sha != new_head:
+        return handoff
+    return dataclasses_replace(
+        handoff,
+        head_sha=new_head,
+        active_label_event_id=effective.record.label_event_id,
+        authorization_kind=effective.record.kind,
+        authorization_comment_id=committed.entry_comment_id(ENTRY_AUTHORIZATION),
+        override_nonce=effective.record.nonce,
+        transaction_bound=True,
+    )
+
+
 def _dispatched_coder_head_transaction(
     runner: Runner,
     config: AgentLoopConfig,
@@ -21877,13 +21964,26 @@ def run_pr_loop(
                             managed_ci_handoff.authorization_comment_id or 0
                         ),
                     )
-                    managed_ci_handoff = publish_issue_created_continuity_authorization(
+                    bound_handoff = _managed_coder_head_transaction(
                         runner,
-                        config=config,
+                        config,
+                        pr_number=pr_number,
                         handoff=managed_ci_handoff,
                         predecessor_head=predecessor_head,
                         new_head=new_head,
                         round_comment_ids=round_comment_ids,
+                    )
+                    managed_ci_handoff = (
+                        bound_handoff
+                        if bound_handoff is not None
+                        else publish_issue_created_continuity_authorization(
+                            runner,
+                            config=config,
+                            handoff=managed_ci_handoff,
+                            predecessor_head=predecessor_head,
+                            new_head=new_head,
+                            round_comment_ids=round_comment_ids,
+                        )
                     )
                     authenticated_managed_resume = AuthenticatedManagedResume(
                         origin="issue-created",

@@ -625,3 +625,186 @@ def test_release_hook_failure_raises_and_a_rerun_converges(tmp_path, boundary):
     hook()
     assert gate(github, tmp_path).intent.managed_ci_generation == release().generation()
     assert len(bound_comments(github)) == 2
+
+
+def _seed_round(github, *, role, subject, round_number, state=None):
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+
+    return github.seed(PR, _attach_round_metadata(f"{role} round", PostedRoundMetadata(
+        flow="pr", role=role, agent="agent-loop", round_number=round_number,
+        subject=subject, state=state,
+    )))
+
+
+@pytest.mark.parametrize("mode", [FAIL_BEFORE_WRITE, WRITE_THEN_REPORT_FAILURE])
+@pytest.mark.parametrize("boundary", [None, 1, 2, 3])
+def test_coder_head_on_a_granted_pr_commits_a_bound_continuity(tmp_path, boundary, mode):
+    """#827 point 4: a correlated coder push on a granted managed PR commits a
+    ``head-advance`` successor that reissues a bound ``continuity`` record
+    extending the committed effective grant; an interruption at any of its
+    three writes (prepared, bound authorization, committed) converges on a
+    rerun with no duplicate record, and nothing grants the new head before."""
+    from coding_review_agent_loop.managed_ci_bound_authorization import (
+        KIND_CONTINUITY,
+        build_continuity_payload,
+    )
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        ensure_managed_continuity_transaction,
+    )
+
+    github = TransactionGitHub()
+    config = make_config(tmp_path)
+    publish(github, creation(), tmp_path)
+    rounds = (
+        _seed_round(github, role="reviewer", subject=HEAD_1, round_number=1, state="blocking"),
+        _seed_round(github, role="coder", subject=HEAD_2, round_number=2),
+    )
+    calls = []
+
+    def build(effective):
+        calls.append(effective.comment_id)
+        return build_continuity_payload(
+            effective.record, effective_comment_id=effective.comment_id,
+            predecessor_head=HEAD_1, new_head=HEAD_2, round_comment_ids=rounds,
+            label_event_id=EVENT, nonce=f"nonce-{len(calls)}",
+        )
+
+    def run():
+        return ensure_managed_continuity_transaction(
+            github, config, pr_number=PR, head_sha=HEAD_2, build=build
+        )
+
+    if boundary is not None:
+        github.fail_write(github.write_count + boundary, mode)
+        with pytest.raises(WorkflowTransactionError):
+            run()
+        if not (boundary == 3 and mode == WRITE_THEN_REPORT_FAILURE):
+            # Nothing is authority for the new head until the successor commits.
+            with pytest.raises(WorkflowTransactionError):
+                gate(github, tmp_path, live_head=HEAD_2)
+    committed = run()
+    assert committed is not None and committed.intent.head_sha == HEAD_2
+    assert committed.intent.successor_kind == KIND_HEAD_ADVANCE
+    lineage = resolve_transaction_lineage(
+        views(github, tmp_path).pr_view, repository=REPO, pr_number=PR
+    )
+    assert lineage.pending is None
+    assert not any(state.aborted for state in lineage.transactions)
+    pr_view = views(github, tmp_path).pr_view
+    view = builder_authorization_view(pr_view, lineage)
+    record = view.effective.record
+    assert record.kind == KIND_CONTINUITY and record.head_sha == HEAD_2
+    assert record.predecessor_head == HEAD_1
+    assert record.round_comment_ids == tuple(sorted(rounds))
+    assert record.grant_anchor_event_id == EVENT
+    assert record.generation() == committed.intent.managed_ci_generation
+    consumer = consumer_bound_authorization(pr_view, lineage, live_head=HEAD_2)
+    assert consumer is not None and consumer.record.kind == KIND_CONTINUITY
+    # One creation grant and exactly one continuity record: no duplicate.
+    assert len(bound_comments(github)) == 2
+    assert gate(github, tmp_path, live_head=HEAD_2) is not None
+    # A plain rerun writes nothing.
+    before = github.write_count
+    run()
+    assert github.write_count == before
+
+
+def test_uncorrelated_coder_head_on_a_granted_pr_writes_nothing(tmp_path):
+    """#827 point 4: without correlated round metadata the continuity input is
+    unavailable; the seam stops recoverably before any write."""
+    from coding_review_agent_loop.managed_ci_bound_authorization import build_continuity_payload
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        ensure_managed_continuity_transaction,
+        is_recoverable,
+    )
+
+    github = TransactionGitHub()
+    config = make_config(tmp_path)
+    publish(github, creation(), tmp_path)
+    before = github.write_count
+    with pytest.raises(WorkflowTransactionError) as caught:
+        ensure_managed_continuity_transaction(
+            github, config, pr_number=PR, head_sha=HEAD_2,
+            build=lambda effective: build_continuity_payload(
+                effective.record, effective_comment_id=effective.comment_id,
+                predecessor_head=HEAD_1, new_head=HEAD_2, round_comment_ids=(),
+                label_event_id=EVENT, nonce="n",
+            ),
+        )
+    assert is_recoverable(caught.value)
+    assert github.write_count == before
+
+
+def _coder_handoff(**overrides):
+    from coding_review_agent_loop.managed_ci import AuthenticatedIssueCreatedHandoff
+
+    fields = dict(
+        pr_number=PR, issue_number=ISSUE, repository=REPO, base_ref="main", head_sha=HEAD_1,
+        branch="agent-loop/managed", trusted_actor_login=ACTOR[0], trusted_actor_id=ACTOR[1],
+        protection_mode="voluntary", override_nonce="nonce-1", active_label_event_id=EVENT,
+    )
+    fields.update(overrides)
+    return AuthenticatedIssueCreatedHandoff(**fields)
+
+
+@pytest.mark.parametrize("label_owner", ["actor", "foreign", "none"])
+def test_dispatched_coder_head_replaces_the_legacy_continuity_publication(
+    tmp_path, monkeypatch, label_owner
+):
+    """#827 point 4 in the PR loop: on a transaction-era granted PR the coder
+    head gets a committed bound continuity instead of a version-1 record; a
+    label event not owned by the actor grants nothing and writes nothing."""
+    from coding_review_agent_loop import managed_ci, orchestrator
+    from coding_review_agent_loop.managed_ci_bound_authorization import KIND_CONTINUITY
+
+    github = TransactionGitHub()
+    config = make_config(tmp_path)
+    publish(github, creation(), tmp_path)
+    rounds = (
+        _seed_round(github, role="reviewer", subject=HEAD_1, round_number=1, state="blocking"),
+        _seed_round(github, role="coder", subject=HEAD_2, round_number=2),
+    )
+    events = {
+        "actor": (EVENT, ACTOR[0], ACTOR[1]),
+        "foreign": (EVENT + 1, "someone-else", 77),
+        "none": None,
+    }
+    monkeypatch.setattr(
+        managed_ci, "_active_managed_label_event", lambda *a, **k: events[label_owner]
+    )
+    handoff = _coder_handoff()
+    before = github.write_count
+    result = orchestrator._managed_coder_head_transaction(
+        github, config, pr_number=PR, handoff=handoff, predecessor_head=HEAD_1,
+        new_head=HEAD_2, round_comment_ids=rounds,
+    )
+    # No version-1 authorization is ever appended to a transaction-era PR.
+    assert not any(
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in body for body in github.bodies(PR)
+    )
+    if label_owner != "actor":
+        assert result == handoff and github.write_count == before
+        with pytest.raises(WorkflowTransactionError):
+            gate(github, tmp_path, live_head=HEAD_2)
+        return
+    assert result.head_sha == HEAD_2 and result.authorization_kind == KIND_CONTINUITY
+    assert result.transaction_bound
+    bound = [item for item in github.threads[PR] if BOUND_AUTHORIZATION_MARKER in item["body"]]
+    assert result.authorization_comment_id == bound[-1]["id"]
+    assert result.override_nonce == parse_bound_authorization_comment(bound[-1]["body"]).nonce
+    assert gate(github, tmp_path, live_head=HEAD_2) is not None
+
+
+def test_dispatched_coder_head_on_a_legacy_pr_keeps_todays_publication(tmp_path, monkeypatch):
+    """A legacy-era PR is not handled here: the caller keeps the v1 publisher."""
+    from coding_review_agent_loop import managed_ci, orchestrator
+
+    github = TransactionGitHub()
+    monkeypatch.setattr(
+        managed_ci, "_active_managed_label_event", lambda *a, **k: (EVENT, ACTOR[0], ACTOR[1])
+    )
+    assert orchestrator._managed_coder_head_transaction(
+        github, make_config(tmp_path), pr_number=PR, handoff=_coder_handoff(),
+        predecessor_head=HEAD_1, new_head=HEAD_2, round_comment_ids=(5,),
+    ) is None
+    assert github.write_count == 0

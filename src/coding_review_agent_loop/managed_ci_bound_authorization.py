@@ -283,6 +283,49 @@ def build_plan_rebind_payload(
     )
 
 
+def build_continuity_payload(
+    effective_record: BoundManagedCiAuthorization,
+    *,
+    effective_comment_id: int,
+    predecessor_head: str,
+    new_head: str,
+    round_comment_ids: tuple[int, ...],
+    label_event_id: int,
+    nonce: str,
+) -> BoundManagedCiAuthorization | None:
+    """The ``continuity`` record extending the committed effective grant.
+
+    The predecessor is the last committed transaction's effective record,
+    never a record selected by head, so a superseded record at the same head
+    never conflicts.  The anchor, plan, protection, and waiver are copied.
+    Returns ``None`` (managed input unavailable) when the effective record
+    grants nothing, is bound to another head, or the push is not correlated.
+    """
+    rounds = tuple(sorted(set(round_comment_ids)))
+    if (
+        not effective_record.granted
+        or effective_record.head_sha != predecessor_head
+        or not new_head
+        or new_head == predecessor_head
+        or not rounds
+        or any(value <= 0 for value in rounds)
+        or not nonce
+    ):
+        return None
+    return replace(
+        effective_record,
+        kind=KIND_CONTINUITY,
+        transaction_id="",
+        head_sha=new_head,
+        nonce=nonce,
+        label_event_id=label_event_id,
+        predecessor_head=predecessor_head,
+        predecessor_comment_id=effective_comment_id,
+        round_comment_ids=rounds,
+        upgraded_from_comment_id=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Codec
 # ---------------------------------------------------------------------------
