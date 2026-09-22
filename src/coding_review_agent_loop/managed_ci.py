@@ -1641,17 +1641,15 @@ def _continuity_round_metadata_is_valid(
     return len(reviewers) + 1 == len(selected)
 
 
-def publish_issue_created_authorization(
+def _validated_creation_authorization(
     runner: Runner,
     *,
     config: AgentLoopConfig,
     handoff: AuthenticatedIssueCreatedHandoff,
     metadata: PullRequestMetadata,
-    approved_plan_hash: str | None = None,
-) -> AuthenticatedIssueCreatedHandoff:
-    """Persist the creation checkpoint before validating coder test evidence."""
-    if handoff.override_nonce is None:
-        return handoff
+    approved_plan_hash: str | None,
+) -> tuple[ManagedCiIssueAuthorization, tuple[int, str, int]]:
+    """The creation grant's fields after today's label-event and tuple checks."""
     event = _active_managed_label_event(runner, config=config, pr_number=handoff.pr_number)
     if event is None or event[1].casefold() != handoff.trusted_actor_login.casefold() or event[2] != handoff.trusted_actor_id:
         raise AgentLoopError(
@@ -1699,6 +1697,58 @@ def publish_issue_created_authorization(
         raise AgentLoopError(
             "Managed-CI issue-created authorization label provenance changed before publication."
         )
+    return expected, event
+
+
+def build_issue_created_creation_payload(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    metadata: PullRequestMetadata,
+    approved_plan_hash: str | None = None,
+):
+    """Transaction-era creation grant: the bound payload, never a write (#827).
+
+    Runs exactly the v1 publisher's validation (actor-owned label event, the
+    re-read opening tuple, unchanged label provenance) and returns the payload
+    the seam publishes inside the fresh PR's ``initial`` transaction, with the
+    validated label event as its grant anchor.  None when the path needs no
+    authorization record (strict protection, no waiver nonce).
+    """
+    if handoff.override_nonce is None:
+        return None
+    # Imported here: the bound codec imports this module.
+    from .managed_ci_bound_authorization import bind_v1_authorization
+
+    expected, event = _validated_creation_authorization(
+        runner,
+        config=config,
+        handoff=handoff,
+        metadata=metadata,
+        approved_plan_hash=approved_plan_hash,
+    )
+    return bind_v1_authorization(expected, grant_anchor_event_id=event[0])
+
+
+def publish_issue_created_authorization(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    metadata: PullRequestMetadata,
+    approved_plan_hash: str | None = None,
+) -> AuthenticatedIssueCreatedHandoff:
+    """Persist the creation checkpoint before validating coder test evidence."""
+    if handoff.override_nonce is None:
+        return handoff
+    expected, event = _validated_creation_authorization(
+        runner,
+        config=config,
+        handoff=handoff,
+        metadata=metadata,
+        approved_plan_hash=approved_plan_hash,
+    )
     records = _legacy_authorization_records(
         runner,
         config=config,

@@ -208,6 +208,7 @@ from .managed_ci import (
     authorize_fresh_issue_created_resume,
     authenticate_source_managed_resume,
     authenticate_issue_created_handoff,
+    build_issue_created_creation_payload,
     dispatch_final_qualification,
     intermediate_managed_checks,
     managed_label_present,
@@ -8626,7 +8627,18 @@ def _implement_approved_issue(
                 implementation_config,
                 managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
             )
-        if managed_ci_handoff is not None:
+        # A waiver-path grant on a seam-eligible approved plan is no longer
+        # published before post-PR validation: it becomes the bound
+        # authorization entry of the fresh PR's initial transaction, so a
+        # rejected report leaves no authorization at all (#827).
+        managed_through_seam = (
+            managed_ci_handoff.override_nonce is not None
+            and plan_candidate_key is not None
+            and plan_candidate_key.incompleteness_reason() is None
+            and (staged_parent_issue is None or staged_plan_owner is not None)
+            and not implementation_config.dry_run
+        )
+        if not managed_through_seam:
             managed_ci_handoff = _publish_issue_authorization_with_recovery(
                 runner,
                 config=implementation_config,
@@ -8636,6 +8648,7 @@ def _implement_approved_issue(
                 approved_plan_hash_value=plan_hash,
             )
     else:
+        managed_through_seam = False
         reject_forged_protocol_markers(
             initial_pr_context.metadata.body or "",
             surface=f"pull-request #{pr_number} body",
@@ -8689,7 +8702,7 @@ def _implement_approved_issue(
     publish_through_seam = (
         plan_candidate_key is not None
         and plan_candidate_key.incompleteness_reason() is None
-        and managed_ci_handoff is None
+        and (managed_ci_handoff is None or managed_through_seam)
         and (staged_parent_issue is None or staged_plan_owner is not None)
         and not implementation_config.dry_run
     )
@@ -8810,8 +8823,25 @@ def _implement_approved_issue(
         )
     if publish_through_seam:
         from . import workflow_transaction_publication as publication
+        from .workflow_transaction import ENTRY_AUTHORIZATION
 
-        publication.publish_transition(
+        creation_payload = None
+        managed_request: dict[str, object] = {}
+        if managed_through_seam:
+            from .managed_ci_bound_authorization import BoundAuthorizationCodec
+
+            creation_payload = build_issue_created_creation_payload(
+                runner,
+                config=implementation_config,
+                handoff=managed_ci_handoff,
+                metadata=initial_pr_context.metadata,
+                approved_plan_hash=plan_hash,
+            )
+            managed_request = dict(
+                managed=publication.Granted(creation_payload, creation_payload.generation()),
+                authorization_codec=BoundAuthorizationCodec(),
+            )
+        committed = publication.publish_transition(
             runner,
             config=implementation_config,
             request=publication.TransitionRequest(
@@ -8837,8 +8867,19 @@ def _implement_approved_issue(
                         _render_initial_coder_body(transaction_id)
                     )
                 ),
+                **managed_request,
             ),
         )
+        if creation_payload is not None:
+            # The PR loop continues from the committed bound creation record.
+            managed_ci_handoff = dataclasses_replace(
+                managed_ci_handoff,
+                active_label_event_id=creation_payload.label_event_id,
+                authorization_kind="creation",
+                authorization_comment_id=committed.entry_comment_id(ENTRY_AUTHORIZATION),
+                approved_plan_hash=plan_hash,
+                transaction_bound=True,
+            )
         # The parent phase handoff is a follow-on write, only after the commit.
         if one_shot_parent_issue is not None:
             _post_one_shot_parent_handoff_once(

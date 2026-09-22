@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import json
 import re
@@ -11130,3 +11131,132 @@ def test_m946_approved_plan_resume_with_bad_scheduler_history_writes_nothing(tmp
     assert sum(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands) == codex_calls
     assert not _m946_workflow_records(runner, "AGENT_PLAN_ONE_SHOT_IMPL")
 
+
+
+# --- #946: the managed creation grant rides in the fresh PR's initial transaction ---
+
+
+def _m946_managed_one_shot(tmp_path, monkeypatch, boundary=None):
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+
+    nonce = "plan-managed-nonce"
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="coding-review-agent-loop",
+        protection_mode="voluntary",
+        audit_nonce=nonce,
+    )
+    runner = _m946_one_shot_runner(boundary)
+    config = make_config(
+        tmp_path,
+        plan_execution_mode="implement-one-shot",
+        execution_strategy_contract_required=True,
+        managed_ci=True,
+        managed_ci_trusted_actor="coding-review-agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    seen = {"built": [], "reviewed": [], "v1": 0}
+
+    def authenticate(*_args, **kwargs):
+        return dataclasses.replace(
+            _managed_issue_handoff(nonce=nonce),
+            head_sha=kwargs["metadata"].head_sha,
+            trusted_actor_login="coding-review-agent-loop",
+            trusted_actor_id=4242,
+        )
+
+    def build(_runner, *, config, handoff, metadata, approved_plan_hash=None):
+        # The real builder's label-event and tuple checks are covered in
+        # test_managed_ci; here it yields the payload they would validate.
+        payload = bound.bind_v1_authorization(
+            ManagedCiIssueAuthorization(
+                kind="creation", repository=config.repo, issue_number=handoff.issue_number,
+                pr_number=handoff.pr_number, base_ref=handoff.base_ref,
+                head_sha=handoff.head_sha, actor_login=handoff.trusted_actor_login,
+                actor_id=handoff.trusted_actor_id, protection=handoff.protection_mode,
+                waiver="allow-unprotected-managed-ci", nonce=handoff.override_nonce,
+                label_event_id=9001, approved_plan_hash=approved_plan_hash,
+            ),
+            grant_anchor_event_id=9001,
+        )
+        seen["built"].append(payload)
+        return payload
+
+    def legacy_publish(*_args, **kwargs):
+        seen["v1"] += 1
+        return kwargs["handoff"]
+
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+    monkeypatch.setattr(orchestrator_module, "build_issue_created_creation_payload", build)
+    monkeypatch.setattr(orchestrator_module, "publish_issue_created_authorization", legacy_publish)
+    monkeypatch.setattr(
+        orchestrator_module, "run_pr_loop",
+        lambda *_a, **kwargs: seen["reviewed"].append(kwargs) or 0,
+    )
+    return runner, config, seen
+
+
+def test_m946_managed_approved_plan_commits_the_creation_grant_in_the_initial_transaction(
+    tmp_path, monkeypatch
+):
+    """#827 site b, managed waiver path: no version-1 creation record is written
+    before post-PR validation; the grant is the bound authorization entry of the
+    one committed initial transaction, and the PR loop starts from it."""
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+
+    runner, config, seen = _m946_managed_one_shot(tmp_path, monkeypatch)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert seen["v1"] == 0 and len(seen["built"]) == 1
+    kinds = _m946_record_kinds(runner)
+    assert kinds["issue"] == ["handoff"]
+    assert kinds["pr"] == [
+        "transaction", "contract", "other", "tagged-coder-round", "transaction",
+    ]
+    assert not _m946_workflow_records(runner, "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1")
+    _m946_assert_no_embedded_contract(runner)
+    bound_records = _m946_workflow_records(runner, bound.BOUND_AUTHORIZATION_MARKER)
+    assert len(bound_records) == 1
+
+    resolved = publication.read_pr_transaction_views(runner, config, 77, 56)
+    committed = resolved.lineage.latest_committed
+    assert resolved.lineage.pending is None and committed.intent.successor_kind == "initial"
+    assert committed.intent.managed_ci_generation == seen["built"][0].generation()
+    consumer = bound.consumer_bound_authorization(
+        resolved.views.pr_view, resolved.lineage, live_head=committed.intent.head_sha
+    )
+    assert consumer is not None and consumer.record.kind == "creation"
+    assert consumer.comment_id == bound_records[0]["id"]
+
+    (review,) = seen["reviewed"]
+    handoff = review["managed_ci_handoff"]
+    assert handoff.transaction_bound and handoff.authorization_kind == "creation"
+    assert handoff.authorization_comment_id == consumer.comment_id
+    assert handoff.active_label_event_id == 9001
+    assert handoff.approved_plan_hash == committed.intent.approved_plan_hash
+    assert len(_m946_workflow_records(runner, "AGENT_PLAN_ONE_SHOT_IMPL")) == 1
+
+
+@pytest.mark.parametrize("boundary", [1, 2, 3, 4, 5, 6])
+def test_m946_managed_approved_plan_interrupted_grants_nothing(tmp_path, monkeypatch, boundary):
+    """Writes: prepared, handoff, contract, bound authorization, tagged coder
+    round, committed.  An interruption at any of them starts no PR loop, posts
+    no parent handoff, writes no version-1 authorization, and leaves no
+    committed transaction, so nothing grants managed authority."""
+    from coding_review_agent_loop import managed_ci_bound_authorization as bound
+    from coding_review_agent_loop import workflow_transaction_publication as publication
+    from coding_review_agent_loop.errors import WorkflowTransactionError
+
+    runner, config, seen = _m946_managed_one_shot(tmp_path, monkeypatch, boundary)
+    with pytest.raises(WorkflowTransactionError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert seen["reviewed"] == [] and seen["v1"] == 0
+    assert not _m946_workflow_records(runner, "AGENT_PLAN_ONE_SHOT_IMPL")
+    assert not _m946_workflow_records(runner, "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1")
+    resolved = publication.read_pr_transaction_views(runner, config, 77, None)
+    assert resolved.lineage.latest_committed is None
+    assert bound.consumer_bound_authorization(
+        resolved.views.pr_view, resolved.lineage, live_head=FULL_HEAD
+    ) is None
