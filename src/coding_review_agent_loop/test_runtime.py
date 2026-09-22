@@ -2087,19 +2087,93 @@ def verified_wrapper_prefix(**kwargs: object) -> tuple[str, ...] | None:
     return None
 
 
+_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _split_env_prefix(
+    tokens: Sequence[str],
+) -> tuple[dict[str, str], tuple[str, ...]] | None:
+    """Strip a leading ``env [--] NAME=VALUE...`` prefix from a launcher argv.
+
+    Returns ``({}, tokens)`` unchanged when there is no ``env`` prefix, the
+    assignments plus the remaining target argv when the prefix is a plain
+    assignment list, and ``None`` when ``env`` is spelled in a way whose
+    effect on the target cannot be reproduced for the probe: any ``env``
+    option (``-i``, ``-u``, ``-S``, ``--chdir``...), a repository-relative
+    ``env`` path, a malformed assignment, a nested ``env``, or no command.
+    """
+    tokens = tuple(tokens)
+    if not tokens or Path(tokens[0]).name != "env":
+        return {}, tokens
+    if tokens[0] != "env" and not Path(tokens[0]).is_absolute():
+        # ``./env`` or ``tools/env`` is an arbitrary repository program, not
+        # the system ``env`` whose semantics this normalization assumes.
+        return None
+    assignments: dict[str, str] = {}
+    index = 1
+    if index < len(tokens) and tokens[index] == "--":
+        index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("-"):
+            return None
+        if "=" not in token:
+            break
+        if not _ENV_ASSIGNMENT_RE.match(token):
+            return None
+        name, _, value = token.partition("=")
+        assignments[name] = value
+        index += 1
+    remaining = tokens[index:]
+    if not remaining or Path(remaining[0]).name == "env":
+        return None
+    return assignments, remaining
+
+
+def _recognized_inner_probe_with_environment(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str]] | None:
+    """Return ``(probe, target, env_assignments)`` for a recognized launcher.
+
+    A leading plain ``env NAME=VALUE...`` prefix is normalized away so the
+    probe runs the real interpreter; the stripped assignments must be applied
+    to the probe environment so it observes what the target will observe.
+    """
+    tokens = tuple(str(item) for item in argv)
+    split = _split_env_prefix(tokens)
+    if split is None:
+        return None
+    assignments, target = split
+    values: Mapping[str, str] = environment if environment is not None else os.environ
+    if assignments:
+        # ``env`` resolves the command with the modified PATH, so resolve the
+        # interpreter against the same merged environment.
+        values = {**values, **assignments}
+    probe = _recognized_inner_probe_tokens(target, cwd=cwd, environment=values)
+    if probe is None:
+        return None
+    return probe, target, assignments
+
+
 def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None) -> tuple[str, ...] | None:
     """Return the only inner launcher forms eligible for a safe bootstrap probe."""
-    tokens = tuple(str(item) for item in argv)
+    recognized = _recognized_inner_probe_with_environment(argv, cwd=cwd, environment=environment)
+    return recognized[0] if recognized is not None else None
+
+
+def _recognized_inner_probe_tokens(
+    tokens: tuple[str, ...], *, cwd: Path, environment: Mapping[str, str]
+) -> tuple[str, ...] | None:
     if not tokens:
         return None
-    values = environment if environment is not None else os.environ
+    values = environment
     first = Path(tokens[0]).name
     if first in {"pytest", "py.test"}:
         executable = tokens[0]
         if not Path(executable).is_absolute() and (tokens[0].startswith((".", "~")) or Path(tokens[0]).parent != Path(".")):
             executable = str((cwd / Path(tokens[0])).resolve(strict=False))
         elif not Path(executable).is_absolute():
-            executable = shutil.which(executable, path=(environment or os.environ).get("PATH")) or executable
+            executable = shutil.which(executable, path=values.get("PATH")) or executable
         return (executable, "--version")
     if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
         interpreter = _python_interpreter_path(tokens[0], cwd=cwd, environment=values)
@@ -2124,10 +2198,19 @@ def probe_inner_launcher(
         else ({**os.environ, **environment} if environment is not None else dict(os.environ))
     )
     original = tuple(str(item) for item in argv)
-    probe = recognized_inner_probe(original, cwd=cwd, environment=values)
-    if probe is None:
+    recognized = _recognized_inner_probe_with_environment(original, cwd=cwd, environment=values)
+    if recognized is None:
         return LauncherProbeResult(original, "unknown", "unrecognized inner launcher")
-    identity = launcher_candidate_identity(original, cwd=cwd, environment=values, kind="inner")
+    probe, target, env_assignments = recognized
+    if env_assignments:
+        values = {**values, **env_assignments}
+    identity = launcher_candidate_identity(target, cwd=cwd, environment=values, kind="inner")
+    if target != original:
+        # Distinguish ``env A=1 python -m pytest`` from ``env A=2 ...`` and
+        # from the unprefixed spelling in the per-invocation probe cache.
+        identity["env_prefix_sha256"] = hashlib.sha256(
+            json.dumps(list(original[: len(original) - len(target)])).encode("utf-8")
+        ).hexdigest()
     identity_key = _identity_key(identity)
     invocation = values.get("AGENT_LOOP_INVOCATION_ID")
     cache_key = (invocation, identity_key) if invocation else None
@@ -2177,7 +2260,11 @@ def probe_inner_launcher(
             completed = _run_bounded_probe(
                 probe,
                 cwd=cwd,
-                env=(values if environment_is_complete or environment is not None else None),
+                env=(
+                    values
+                    if environment_is_complete or environment is not None or env_assignments
+                    else None
+                ),
                 timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
