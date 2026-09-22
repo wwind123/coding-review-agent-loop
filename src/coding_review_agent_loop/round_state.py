@@ -3181,6 +3181,72 @@ def _legacy_freeform_plan_candidates(record: PostedRoundRecord) -> tuple[str, ..
     return tuple(dict.fromkeys(spaced_candidates))
 
 
+@dataclass(frozen=True)
+class ApprovedPlanComment:
+    """The planner comment that carries an approved plan, for presentation."""
+
+    comment: object
+    # Structured steps from the authenticated plan sidecar, or ``None`` when
+    # the record has no sidecar bound to the approved rendered plan.
+    plan_steps: tuple[str, ...] | None
+
+
+def _sidecar_plan_steps(metadata: PostedRoundMetadata, rendered_plan: str) -> tuple[str, ...] | None:
+    if metadata.assembled_plan_sidecar is None:
+        return None
+    try:
+        sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+    except AgentLoopError:
+        return None
+    if (
+        sidecar.rendered_plan_identity is not None
+        and sidecar.rendered_plan_identity != rendered_plan_identity(rendered_plan)
+    ):
+        return None
+    steps = sidecar.canonical_json.get("plan_steps")
+    if not isinstance(steps, list) or not steps or not all(isinstance(step, str) for step in steps):
+        return None
+    return tuple(steps)
+
+
+def find_approved_plan_comment(
+    comments: Sequence[object],
+    *,
+    expected_hash: str,
+) -> ApprovedPlanComment | None:
+    """Return the latest planner comment carrying the approved plan.
+
+    Presentation only (#941): the approval announcement links here and uses
+    the structured steps to summarize them instead of repeating them.  Any
+    lookup failure yields ``None`` so the announcement degrades to the full
+    plan text rather than failing.
+    """
+    try:
+        records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError:
+        return None
+    for record in reversed(records):
+        if record.metadata.role != "coder":
+            continue
+        raw = record.metadata.canonical_plan or record.metadata.raw_structured_coder_response
+        candidates = (raw,) if raw is not None else _legacy_freeform_plan_candidates(record)
+        matched = next(
+            (
+                candidate.strip()
+                for candidate in candidates
+                if candidate and _approved_plan_hash(candidate) == expected_hash
+            ),
+            None,
+        )
+        if matched is None:
+            continue
+        return ApprovedPlanComment(
+            comment=comments[record.index],
+            plan_steps=_sidecar_plan_steps(record.metadata, matched),
+        )
+    return None
+
+
 def recover_approved_plan_context(
     comments: Sequence[object],
     *,

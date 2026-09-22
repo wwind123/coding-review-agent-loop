@@ -21,6 +21,8 @@ from .github import (
 from .issue_body_limits import BoundedSection, fit_github_body
 from .logging import log
 from .protocol import ApprovedFollowup, UnresolvedReviewItem
+from .comment_rendering import render_canonical_plan_steps
+from .round_state import find_approved_plan_comment
 from .round_transport import MAX_GITHUB_BODY_CHARS
 from .runner import Runner
 from .protocol_markers import TrustedBody, sanitize_historical_text
@@ -1464,6 +1466,78 @@ def _bounded_approved_plan_text(approved_plan: str, *, budget: int | None) -> st
     return f"{approved_plan[:keep].rstrip()}\n\n{PLAN_SUMMARY_TRUNCATION_NOTICE}"
 
 
+_PLAN_STEPS_HEADING = "### Plan steps"
+_PLAN_STEP_SUMMARY_CHARS = 160
+
+
+def _summarize_approved_plan_steps(
+    approved_plan: str,
+    *,
+    plan_steps: Sequence[str] | None,
+    plan_comment_url: str | None,
+) -> str:
+    """Replace the verbatim ``### Plan steps`` block with a short digest (#941).
+
+    The planner's round comment already renders every step in full, and plan
+    recovery reads round metadata rather than this announcement, so the
+    announcement keeps only the step count, one clipped line per step, and a
+    pointer to the planner comment.
+
+    The block is located from the structured steps, not by guessing where the
+    Markdown section ends: a step may itself contain headings or HTML comment
+    lines.  Without structured steps, or unless the canonical block occurs
+    exactly once, the plan is returned unchanged.
+    """
+    if not plan_steps:
+        return approved_plan
+    rendered_steps = render_canonical_plan_steps(plan_steps)
+    matches: list[tuple[int, int]] = []
+    for separator in ("\n", "\n\n"):
+        block = f"{_PLAN_STEPS_HEADING}{separator}{rendered_steps}"
+        cursor = approved_plan.find(block)
+        while cursor != -1:
+            block_end = cursor + len(block)
+            at_line_start = cursor == 0 or approved_plan[cursor - 1] == "\n"
+            at_line_end = block_end == len(approved_plan) or approved_plan[block_end] == "\n"
+            if at_line_start and at_line_end:
+                matches.append((cursor, block_end))
+            cursor = approved_plan.find(block, cursor + 1)
+    if len(matches) != 1:
+        return approved_plan
+    block_start, block_end = matches[0]
+    pointer = (
+        f"[the planner's plan comment]({plan_comment_url})"
+        if plan_comment_url
+        else "the planner's plan comment on this issue"
+    )
+    noun = "step" if len(plan_steps) == 1 else "steps"
+    digest = [
+        f"{_PLAN_STEPS_HEADING} (summary)",
+        "",
+        f"{len(plan_steps)} {noun}; the full text of each is in {pointer}.",
+        "",
+    ]
+    for number, step in enumerate(plan_steps, start=1):
+        line = next((part.strip() for part in step.splitlines() if part.strip()), "")
+        if len(line) > _PLAN_STEP_SUMMARY_CHARS:
+            line = line[: _PLAN_STEP_SUMMARY_CHARS - 1].rstrip() + "…"
+        digest.append(f"{number}. {line}")
+    return approved_plan[:block_start] + "\n".join(digest) + approved_plan[block_end:]
+
+
+def _approved_plan_comment_url(
+    comment: object, *, repo: str, issue_number: int
+) -> str | None:
+    prefix = f"{_issue_url(repo, issue_number)}#issuecomment-"
+    url = getattr(comment, "url", None)
+    if isinstance(url, str) and url.startswith(prefix) and url[len(prefix):].isdigit():
+        return url
+    comment_id = getattr(comment, "comment_id", None)
+    if isinstance(comment_id, int) and not isinstance(comment_id, bool) and comment_id > 0:
+        return f"{prefix}{comment_id}"
+    return None
+
+
 def _format_plan_approval_summary_with_followups(
     issue_number: int,
     approved_plan: str,
@@ -1628,10 +1702,22 @@ def _publish_plan_approved_followups(
                 if publication.status in {"created", "uncertain"} and publication.issue_url
             ]
 
+    # The planner comment carries the steps in full, so the announcement only
+    # summarizes them and links there (#941).
+    plan_comment = find_approved_plan_comment(issue_comments, expected_hash=plan_hash)
+    summarized_plan = approved_plan
+    if plan_comment is not None:
+        summarized_plan = _summarize_approved_plan_steps(
+            approved_plan,
+            plan_steps=plan_comment.plan_steps,
+            plan_comment_url=_approved_plan_comment_url(
+                plan_comment.comment, repo=config.repo, issue_number=issue_number
+            ),
+        )
     # The approved plan is a re-rendered historical GitHub artifact.  Its
     # encoded plan metadata may contain durable records, but those records are
     # not newly authorized by this follow-up comment.
-    rendered_plan = sanitize_historical_text(approved_plan)
+    rendered_plan = sanitize_historical_text(summarized_plan)
 
     def _render(plan_char_budget: int | None) -> str:
         return _append_plan_approved_followups_marker(

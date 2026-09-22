@@ -10,7 +10,7 @@ import os
 import re
 import tempfile
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
@@ -81,6 +81,9 @@ class IssueComment:
     body: str | None
     comment_id: int | None = None
     author_id: int | None = None
+    # Presentation-only permalink (GraphQL ``url`` / REST ``html_url``).  It
+    # is excluded from equality so it never participates in record identity.
+    url: str | None = field(default=None, compare=False)
 
     @property
     def id(self) -> int | None:
@@ -1337,6 +1340,8 @@ def _parse_issue_comments(raw_comments: object) -> tuple[IssueComment, ...]:
                 body=_optional_str(raw_comment.get("body")),
                 comment_id=comment_id,
                 author_id=_author_id(author),
+                url=_optional_str(raw_comment.get("url"))
+                or _optional_str(raw_comment.get("html_url")),
             )
         )
     return tuple(sorted(comments, key=_comment_sort_key))
