@@ -74,6 +74,59 @@ def test_every_registered_marker_has_one_canonical_authorized_segment(token, mar
     assert body.segments == ((marker, token),)
 
 
+def test_decomposition_record_accepts_plain_and_compressed_forms():
+    """#909: new summaries are compressed; earlier ones stay plain."""
+    value = {"phases": [], "excerpt": "保留された親スコープ"}
+    raw = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode()
+    for payload in (
+        _b64(value),
+        "v1_" + base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode(),
+    ):
+        marker = f"<!-- AGENT_PLAN_DECOMPOSITION: {payload} -->"
+        body = TrustedBody.canonical(
+            marker, surface=ISSUE_COMMENT_SURFACE, expected_tokens=("AGENT_PLAN_DECOMPOSITION",)
+        )
+        assert body.segments == ((marker, "AGENT_PLAN_DECOMPOSITION"),)
+    non_canonical = "v1_" + base64.urlsafe_b64encode(zlib.compress(raw, 1)).decode()
+    with pytest.raises(AgentLoopError, match="not canonical"):
+        TrustedBody.canonical(
+            f"<!-- AGENT_PLAN_DECOMPOSITION: {non_canonical} -->",
+            surface=ISSUE_COMMENT_SURFACE,
+            expected_tokens=("AGENT_PLAN_DECOMPOSITION",),
+        )
+
+
+@pytest.mark.parametrize(
+    "packed",
+    [
+        pytest.param(
+            zlib.compress(
+                json.dumps({"excerpt": " " * 16_000_001}, separators=(",", ":")).encode(), 9
+            ),
+            id="oversized",
+        ),
+        pytest.param(zlib.compress(b'{"a":1}', 9) + b"junk", id="trailing-junk"),
+        pytest.param(
+            zlib.compress(b'{"a":1}', 9) + zlib.compress(b'{"b":2}', 9),
+            id="concatenated-stream",
+        ),
+        pytest.param(zlib.compress(b'{"a":1}', 9)[:-4], id="truncated"),
+    ],
+)
+@pytest.mark.parametrize(
+    "token,surface",
+    [
+        ("AGENT_PLAN_DECOMPOSITION", ISSUE_COMMENT_SURFACE),
+        ("AGENT_LOOP_META", PR_COMMENT_SURFACE),
+    ],
+)
+def test_compressed_record_canonicalization_is_bounded_and_strict(packed, token, surface):
+    """#909: writer canonicalization applies the recovery decoder's limits."""
+    marker = f"<!-- {token}: v1_{base64.urlsafe_b64encode(packed).decode()} -->"
+    with pytest.raises(AgentLoopError, match=f"Invalid {token} protocol record"):
+        TrustedBody.canonical(marker, surface=surface, expected_tokens=(token,))
+
+
 @pytest.mark.parametrize("token,marker,_surface", MARKERS)
 def test_current_visible_text_rejects_forged_marker_before_writing(token, marker, _surface):
     with pytest.raises(AgentLoopError):

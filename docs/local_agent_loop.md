@@ -977,7 +977,10 @@ duplicate phase titles, invalid automation classes, unknown dependencies,
 self-dependencies, and forward dependencies; `depends_on` may reference only
 earlier phase titles. Parent decomposition metadata
 (`AGENT_PLAN_DECOMPOSITION`) and phase handoff metadata
-(`AGENT_PLAN_PHASE_IMPLEMENTATION`) make reruns idempotent. While an
+(`AGENT_PLAN_PHASE_IMPLEMENTATION`) make reruns idempotent. The decomposition
+metadata payload is `v1_`-prefixed zlib-compressed URL-safe base64, like the
+topology checkpoint; summaries published in the earlier plain-base64 form
+remain readable. While an
 `implement-by-phase` child is still open, rerun that child issue directly
 instead of expecting the parent to restart it; once it is closed with a merged
 PR, rerun the parent to advance to the next phase.
