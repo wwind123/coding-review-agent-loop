@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import shlex
@@ -634,6 +635,16 @@ def resolve_matrix_evidence_render(
     )
 
 
+def _matrix_evidence_display_text(value: object) -> str:
+    # Row text is agent-influenced and sits inside a renderer-owned
+    # <details> wrapper, so it must not be able to emit HTML tags (a raw
+    # </details> would close the wrapper early) or line breaks (which could
+    # start a new Markdown block).  Escape after protocol-record neutralization.
+    text = sanitize_historical_text(str(value))
+    text = " ".join(text.splitlines())
+    return html.escape(text, quote=False)
+
+
 def _render_risk_test_matrix_evidence(
     evidence: RiskTestMatrixEvidence | None,
     *,
@@ -641,7 +652,7 @@ def _render_risk_test_matrix_evidence(
 ) -> str | None:
     if evidence is None:
         return None
-    safe = lambda value: sanitize_historical_text(str(value))
+    safe = _matrix_evidence_display_text
     rows = sorted(evidence.rows, key=lambda row: (row.status == "verified", row.row_id))
     lines = [
         "### Risk-based mode and transition test matrix evidence",

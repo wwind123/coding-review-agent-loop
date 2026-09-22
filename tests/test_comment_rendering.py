@@ -2808,6 +2808,61 @@ def test_959_delta_render_sanitizes_row_text_inside_details():
     assert "[protocol LOOP_META record] hidden" in rendered
 
 
+_WRAPPER_ESCAPE_959 = "x\n</details>\n\ny </summary><details><summary>z"
+
+
+def _assert_rows_stay_inside_wrapper_959(rendered, row_ids):
+    # Exactly one renderer-owned wrapper, and every rendered row sits inside it.
+    assert rendered.count("<details>") == 1
+    assert rendered.count("</details>") == 1
+    assert rendered.count("<summary>") == 1
+    assert rendered.count("</summary>") == 1
+    start = rendered.index("<details>")
+    end = rendered.index("</details>")
+    assert rendered.rstrip().endswith("</details>")
+    for row_id in row_ids:
+        position = rendered.index(f"**{row_id}**")
+        assert start < position < end
+    assert "&lt;/details&gt;" in rendered
+    assert "&lt;summary&gt;" in rendered
+
+
+def test_959_full_render_escapes_wrapper_tags_in_row_text():
+    rows = _rows_959(3)
+    rows[0] = dict(
+        rows[0],
+        caveats=[_WRAPPER_ESCAPE_959],
+        outcome_assertions=[_WRAPPER_ESCAPE_959],
+        workflow_path_claim=_WRAPPER_ESCAPE_959,
+    )
+    rendered = _render_risk_test_matrix_evidence(_evidence_959(rows))
+    _assert_rows_stay_inside_wrapper_959(rendered, ["row-0", "row-1", "row-2"])
+    # Embedded line breaks cannot start a new Markdown block inside the list.
+    assert "\n</details>\n\ny" not in rendered
+
+
+def test_959_delta_render_escapes_wrapper_tags_in_row_text():
+    rows = _rows_959(3)
+    current_rows = [dict(row) for row in rows]
+    current_rows[0] = dict(
+        current_rows[0],
+        caveats=[_WRAPPER_ESCAPE_959],
+        forbidden_effect_assertions=[_WRAPPER_ESCAPE_959],
+    )
+    current_rows[1] = dict(current_rows[1], test_identifiers=["tests/x.py::t</details>"])
+    decision = MatrixEvidenceRenderDecision(
+        mode="delta",
+        anchor_round=1,
+        previous_evidence=_evidence_959(rows),
+        previous_round=2,
+    )
+    rendered = _render_risk_test_matrix_evidence(_evidence_959(current_rows), render_decision=decision)
+    _assert_rows_stay_inside_wrapper_959(rendered, ["row-0", "row-1"])
+    assert "**row-2**" not in rendered
+    summary_line = "1 row unchanged since round 2; full matrix in round 1."
+    assert rendered.index("<details>") < rendered.index(summary_line) < rendered.index("</details>")
+
+
 def test_959_no_evidence_renders_no_section_or_wrapper():
     assert _render_risk_test_matrix_evidence(None) is None
     parsed = _validate_followup_959(structured_coder_followup(summary="No matrix."))
