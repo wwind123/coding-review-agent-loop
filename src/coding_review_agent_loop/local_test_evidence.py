@@ -981,20 +981,25 @@ def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object
     def retention_priority(row: Mapping[str, object]) -> int:
         if row.get("superseded_by"):
             return 0
+        caveats = row.get("caveats")
+        if isinstance(caveats, list) and OUT_OF_CHECKOUT_CONTEXT_CAVEAT in caveats:
+            # Context is never evidence: under the count or byte cap it must
+            # yield to every in-checkout row, including unresolved failures.
+            return 1
         if row.get("outcome") in {
             "failed",
             "timed_out",
             "interrupted",
             "incomplete",
         }:
-            return 4
+            return 5
         if row.get("outcome") != "passed":
-            return 3
+            return 4
         attribution = row.get("attribution")
         state = attribution.get("state") if isinstance(attribution, Mapping) else "unknown"
         if state == "stale":
-            return 1
-        return 2
+            return 2
+        return 3
 
     indexed = list(enumerate(all_details))
     selected = sorted(

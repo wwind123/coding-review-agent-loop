@@ -1547,3 +1547,33 @@ def test_unvalidatable_failure_is_not_relabeled_as_context(tmp_path):
     (marked,) = mark_out_of_checkout_context([row], assigned_workdir=tmp_path)
 
     assert not marked.is_out_of_checkout_context
+
+
+def test_bounded_journal_keeps_in_checkout_failure_over_context_rows():
+    """Issue #991: context rows yield to a real failure under the count cap."""
+    from coding_review_agent_loop.local_test_evidence import (
+        MAX_ROUND_OBSERVATIONS,
+        OUT_OF_CHECKOUT_CONTEXT_CAVEAT,
+    )
+
+    rows = [{
+        "command": ["python", "-m", "pytest", "tests/test_runner.py", "-q"],
+        "outcome": "failed", "provenance": "parent-observed", "receipt_id": "real-failure",
+        "turn_id": "turn", "timestamp": "2026-09-23T10:00:00+00:00", "environment": "unknown",
+    }]
+    rows.extend({
+        "command": ["python", "-m", "pytest", f"/tmp/scratch-main/tests/test_{index}.py"],
+        "outcome": "failed", "provenance": "parent-observed", "receipt_id": f"baseline-{index}",
+        "turn_id": "turn", "timestamp": f"2026-09-23T11:{index:02d}:00+00:00",
+        "environment": "unknown", "caveats": [OUT_OF_CHECKOUT_CONTEXT_CAVEAT],
+    } for index in range(MAX_ROUND_OBSERVATIONS))
+
+    decoded = decode_bounded_evidence(bounded_evidence_for_round({
+        "observations": rows, "authoritative_failures": ["real-failure"],
+    }))
+
+    assert decoded is not None
+    receipts = [row.receipt_id for row in decoded.observations]
+    assert "real-failure" in receipts
+    assert len(receipts) <= MAX_ROUND_OBSERVATIONS
+    assert decoded.capture_incomplete

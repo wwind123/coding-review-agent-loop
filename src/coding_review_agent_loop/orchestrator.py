@@ -417,6 +417,7 @@ from .workdir_guard import (
     validate_checkout_inspected_evidence,
     validate_response_tests_within_workdir,
     command_is_admissible_evidence,
+    command_targets_outside_workdir,
     partition_reported_tests_by_workdir,
     validate_test_observation_citations_within_workdir,
 )
@@ -4571,14 +4572,27 @@ def _current_test_turn_observations(runner: Runner) -> tuple[object, ...]:
 
 
 def _admissible_evidence_observations(
-    observations: Sequence[object], *, assigned_workdir: Path
+    observations: Sequence[object],
+    *,
+    assigned_workdir: Path,
+    selectable: bool = True,
 ) -> tuple[object, ...]:
     """Drop broker runs that targeted paths outside the assigned checkout.
 
     The broker confines ``cwd`` but not test operands, so a run of a clean
     base-branch baseline can carry a valid selector. It stays visible as
     context, but can never back a risk-matrix citation (#991).
+
+    ``selectable=True`` filters the execution catalog: anything the guard
+    cannot prove in-checkout is dropped.  ``selectable=False`` filters the
+    failure journal: only runs proven to target another location are dropped,
+    so an unvalidatable failure still degrades the rows it would affect.
     """
+
+    def keep(command: str | tuple[str, ...]) -> bool:
+        if selectable:
+            return command_is_admissible_evidence(command, assigned_workdir=assigned_workdir)
+        return not command_targets_outside_workdir(command, assigned_workdir=assigned_workdir)
 
     def argv(observation: object) -> object:
         if isinstance(observation, Mapping):
@@ -4589,15 +4603,11 @@ def _admissible_evidence_observations(
     for observation in observations:
         command = argv(observation)
         if isinstance(command, str):
-            admissible = command_is_admissible_evidence(
-                command, assigned_workdir=assigned_workdir
-            )
+            admissible = keep(command)
         elif isinstance(command, Sequence):
-            admissible = command_is_admissible_evidence(
-                tuple(str(item) for item in command), assigned_workdir=assigned_workdir
-            )
+            admissible = keep(tuple(str(item) for item in command))
         else:
-            admissible = False
+            admissible = not selectable
         if admissible:
             kept.append(observation)
     return tuple(kept)
@@ -4745,7 +4755,7 @@ def _derive_authenticated_risk_evidence_for_coder(
         closed_catalog, assigned_workdir=assigned_workdir
     )
     journal_observations = _admissible_evidence_observations(
-        journal_observations, assigned_workdir=assigned_workdir
+        journal_observations, assigned_workdir=assigned_workdir, selectable=False
     )
     try:
         snapshot = stable_tracked_tree_snapshot(assigned_workdir)

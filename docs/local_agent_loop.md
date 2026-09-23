@@ -2976,7 +2976,10 @@ evidence, so it can never back a verified row. In the public local test
 journal such a run carries an out-of-checkout context caveat that survives
 round metadata; it never counts as an authoritative failure, cannot supersede
 or be superseded by an in-checkout run, and renders as "out-of-checkout
-context (not evidence)" instead of "uncited authoritative". Test-observation receipt
+context (not evidence)" instead of "uncited authoritative". When the journal
+is trimmed for transport, context rows yield to every in-checkout row. A broker
+run the guard cannot validate is never a selectable execution ref, but its
+failure still counts against risk-matrix rows. Test-observation receipt
 citations remain strict, and so do freeform `Tests:` reports that are not
 converted to a structured result: if an explicit
 test location is outside the assigned checkout there, or a live remote target
