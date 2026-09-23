@@ -259,6 +259,10 @@ and then inspects phase 1:
   planning when no implementation PR exists yet, or have a human post the signed
   `child-plan-supersession` record on the child issue and then rerun the
   child's `--plan-first` command, which re-plans it and rebinds the same PR.
+  The same signed record authorizes a deliberate re-plan (for example a scope
+  reduction) of a plan that is still admissible; run the child's
+  `--plan-first` command, not `agent-loop pr`, which refuses to review while
+  such a record is pending.
   Never edit handoff records by hand. See "Re-planning an approved child plan"
   in `docs/local_agent_loop.md`.
 - If a reviewer backend is unavailable (for example, an exhausted quota) and a

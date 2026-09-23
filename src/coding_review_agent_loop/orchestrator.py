@@ -8953,6 +8953,10 @@ class _PlanSupersessionBinding:
     parent_issue: int
     stage_id: str
     parent_plan_context: ApprovedPlanContext
+    # The signed record's human rationale.  It is the instruction the forced
+    # revision turn carries, so an admissible plan is re-planned for the
+    # reason a human gave rather than re-approved unchanged (#985).
+    rationale: str = ""
 
 
 def _child_plan_admissibility_failure(
@@ -9273,7 +9277,7 @@ def _rebind_superseded_child_plan(
     )
 
 
-def _route_inadmissible_child_handoff(
+def _route_child_plan_handoff(
     runner: Runner,
     *,
     config: AgentLoopConfig,
@@ -9283,13 +9287,16 @@ def _route_inadmissible_child_handoff(
     handoff,
     child_plan_context: ApprovedPlanContext,
 ) -> _PlanSupersessionBinding | None:
-    """Issue-mode routing for a planning child's handed-off plan (#936).
+    """Issue-mode routing for a planning child's handed-off plan (#936, #985).
 
-    Admissible: verify any same-PR plan replacement and return ``None`` so the
-    PR resumes unchanged.  Inadmissible without a matching signed record:
-    fail closed with the record template, before any agent or write.
-    Inadmissible with exactly one matching signed record: authenticate the
-    canonical PR and return the binding that reopens planning.
+    Admissibility and authorization are separate questions: admissibility asks
+    whether the bound plan is broken, a signed supersession record asks whether
+    a human authorized replacing it.  The signed records are therefore
+    consulted for every bound plan.  Exactly one matching signed record:
+    authenticate the canonical PR and return the binding that reopens planning,
+    whether or not the plan is admissible.  No matching record: an admissible
+    plan returns ``None`` so the PR resumes unchanged, and an inadmissible one
+    fails closed with the record template, before any agent or write.
     """
     # How the handed-off plan became the binding is verified first and on
     # every branch: a signed authorization for the current hash never
@@ -9307,8 +9314,6 @@ def _route_inadmissible_child_handoff(
     failure = _child_plan_admissibility_failure(
         fresh_child.parent_plan_context, child_plan_context, stage_id=fresh_child.stage_id
     )
-    if failure is None:
-        return None
     ignored: list[str] = []
     supersessions = collect_child_plan_supersessions(
         issue_context.comments,
@@ -9323,6 +9328,8 @@ def _route_inadmissible_child_handoff(
         record for record in supersessions if record.superseded_plan_hash == handoff.plan_hash
     ]
     if not matching:
+        if failure is None:
+            return None
         raise AgentLoopError(
             f"Approved child plan {handoff.plan_hash} on issue #{issue_number}, bound to PR "
             f"#{handoff.pr_number}, is inadmissible under the inherited-matrix contract. No agent "
@@ -9357,7 +9364,8 @@ def _route_inadmissible_child_handoff(
         pr_number = authenticated.pr_number
     log(
         config,
-        f"Issue #{issue_number}: approved child plan {handoff.plan_hash} is inadmissible; "
+        f"Issue #{issue_number}: approved child plan {handoff.plan_hash} is "
+        f"{'inadmissible' if failure is not None else 'admissible'}; "
         f"re-planning under signed supersession {signed.digest} ({signed.comment_locator}) "
         f"for PR #{pr_number}",
     )
@@ -9368,6 +9376,7 @@ def _route_inadmissible_child_handoff(
         parent_issue=fresh_child.parent_issue,
         stage_id=fresh_child.stage_id,
         parent_plan_context=fresh_child.parent_plan_context,
+        rationale=signed.rationale,
     )
 
 
@@ -9383,7 +9392,11 @@ def _require_admissible_pr_child_plan(
 
     PR mode never re-plans and never rebinds: an inadmissible binding fails
     closed naming the issue-mode supersession route, and a same-PR plan
-    replacement must pass rebind verification before any reviewer runs.
+    replacement must pass rebind verification before any reviewer runs.  A
+    signed supersession naming the bound plan also fails closed (#985): the
+    human authorized a re-plan, reviewers cannot judge the PR against a scope
+    no plan approved, and a PR-mode coder turn can never produce the
+    replacement, so reviewing would only repeat the same verdict.
     """
     verify_child_plan_rebind(
         child_comments,
@@ -9408,6 +9421,25 @@ def _require_admissible_pr_child_plan(
                 stage_id=binding.stage_id,
                 superseded_plan_hash=child_plan_context.plan_hash or "",
             )
+        )
+    pending = [
+        record
+        for record in collect_child_plan_supersessions(
+            child_comments,
+            child_issue=binding.child_issue,
+            parent_issue=binding.parent_issue,
+            stage_id=binding.stage_id,
+        )
+        if record.superseded_plan_hash == child_plan_context.plan_hash
+    ]
+    if pending:
+        raise AgentLoopError(
+            f"PR #{pr_number} is bound to approved child plan {child_plan_context.plan_hash}, "
+            f"which the signed child-plan supersession at {pending[0].comment_locator} "
+            "authorizes replacing; no reviewer ran. The authorization permits a re-plan but is "
+            "not itself an approved plan, and `agent-loop pr` never re-plans or rebinds. Rerun "
+            f"`{_child_resume_hint(binding.child_issue, EXECUTION_DISPOSITION_PLANNING)}`: the "
+            "child is re-planned, and after approval this PR is rebound to the revised plan."
         )
 
 
@@ -11561,6 +11593,12 @@ def _run_plan_first_loop(
         )
 
         inherited_guard_revision = None
+        # The signed re-plan has not produced a revision yet: the current plan
+        # is still the one the human authorized replacing.
+        supersession_revision_pending = (
+            plan_supersession is not None
+            and approved_plan_hash(current_plan) == plan_supersession.superseded_hash
+        )
         if (
             all_approved
             and not must_fix_items
@@ -11599,6 +11637,24 @@ def _run_plan_first_loop(
                     ),
                 )
             inherited_guard_revision = inherited_review_failure
+        elif (
+            all_approved
+            and not must_fix_items
+            and not plan_missing_approvals
+            and supersession_revision_pending
+        ):
+            # An admissible plan under a signed supersession (#985): reviewer
+            # approval of the superseded plan is not approval of its
+            # replacement, so the authorized revision runs instead of
+            # approving and rebinding the plan the human asked to replace.
+            if round_number == config.max_rounds:
+                raise AgentLoopError(
+                    f"Approved child plan {plan_supersession.superseded_hash} on issue "
+                    f"#{issue_number} must be re-planned under its signed supersession, but "
+                    f"the planning round budget ({config.max_rounds}) is exhausted. Raise "
+                    "--max-rounds and rerun; re-planning continues the existing round "
+                    "numbering."
+                )
         elif all_approved and not must_fix_items and not plan_missing_approvals:
             if plan_amendment_note:
                 log(
@@ -12260,6 +12316,18 @@ def _run_plan_first_loop(
             # The revised subject gets the complete board and carries no
             # approval from the superseded one.
             plan_automatic_force_full = True
+        if supersession_revision_pending:
+            # The signed authorization is the revision's instruction; the
+            # planner must actually replace the plan, not return it (#985).
+            authorization = (
+                "Signed child-plan supersession (human authorization, not a reviewer "
+                f"finding): approved plan {plan_supersession.superseded_hash} must be "
+                f"replaced. Human rationale:\n\n{plan_supersession.rationale}"
+            )
+            combined_review = (
+                f"{authorization}\n\n{combined_review}" if combined_review else authorization
+            )
+            plan_automatic_force_full = True
         log(
             config,
             f"Planning round {round_number}: {coder_name} revising the plan "
@@ -12850,9 +12918,11 @@ def run_issue_loop(
                     )
 
         # A planning child's handed-off plan is judged against its inherited
-        # parent rows before the canonical PR is resolved (#936).  An
-        # inadmissible plan reopens planning only under a matching signed
-        # supersession record; a same-PR plan replacement must verify.
+        # parent rows before the canonical PR is resolved (#936).  A matching
+        # signed supersession record reopens planning whether or not the plan
+        # is admissible (#985); without one, an inadmissible plan fails closed
+        # and an admissible one resumes its PR.  A same-PR plan replacement
+        # must verify.
         plan_supersession: _PlanSupersessionBinding | None = None
         if (
             plan_first
@@ -12863,7 +12933,7 @@ def run_issue_loop(
             and recovered_plan_context is not None
             and recovered_plan_context.is_available
         ):
-            plan_supersession = _route_inadmissible_child_handoff(
+            plan_supersession = _route_child_plan_handoff(
                 runner,
                 config=config,
                 issue_number=issue_number,

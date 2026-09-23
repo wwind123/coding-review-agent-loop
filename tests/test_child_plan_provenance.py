@@ -3216,3 +3216,78 @@ def test_m948_oversized_child_revision_posts_digest_and_resumes_losslessly(
     assert COMPACT_PLAN_DIGEST_NOTICE not in review_prompt
     # No forked plan round: nothing new was published by the coder.
     assert len(_m948_coder_anchors(second.issue_comments)) == 2
+
+
+def test_m985_admissible_plan_with_signed_record_is_replanned_and_rebound(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    world.comments[-1] = comment(world.signed_record(rationale="Reduce scope to the seam writers."))
+    patch = _m936_patch(world.old_state, None, summary="Reduced scope plan.")
+    assert world.run_issue(
+        claude_outputs=[patch],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    comments = world.all_comments()
+    digest = collect_child_plan_supersessions(
+        comments, child_issue=56, parent_issue=55, stage_id="stage-one"
+    )[0].digest
+    coder_rounds = [
+        record.metadata for record in _extract_round_metadata_records(comments, flow="plan")
+        if record.metadata.role == "coder"
+    ]
+    assert [item.plan_supersession_digest for item in coder_rounds] == [None, digest]
+    new_hash = approved_plan_hash(coder_rounds[1].canonical_plan)
+    assert new_hash != world.old_hash
+    # The planner was told why, even though no reviewer or matrix check blocked.
+    planner_prompts = world.agent_calls("claude")
+    assert len(planner_prompts) == 1
+    assert "Reduce scope to the seam writers." in planner_prompts[0]
+    # The same PR is rebound once, then reviewed under the revised plan.
+    rebinds = [body for body in world.posted() if CHILD_PLAN_REBIND_MARKER_RE.search(body)]
+    assert len(rebinds) == 1
+    latest = find_latest_issue_pr_handoff(comments, issue_number=56, repo="OWNER/REPO")
+    assert (latest.pr_number, latest.plan_hash) == (77, new_hash)
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in world.runner.commands)
+    reviewer_prompts = world.agent_calls("codex")
+    assert len(reviewer_prompts) == 2 and "Reduced scope plan." in reviewer_prompts[1]
+    # After the rebind the record names a superseded hash: a plain PR resume.
+    assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
+    assert world.agent_calls("claude") == []
+    assert not any(CHILD_PLAN_REBIND_MARKER_RE.search(body) for body in world.posted())
+
+
+def test_m985_admissible_plan_ignores_a_record_for_another_plan_hash(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
+    world.comments.append(comment(world.signed_record(superseded_plan_hash="0" * 16)))
+    world.comments.append(comment(world.signed_record().replace("\n-- Human Reviewer", "")))
+    assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
+    assert world.agent_calls("claude") == []
+    assert len(world.agent_calls("codex")) == 1
+    assert not any(
+        AGENT_ISSUE_PR_HANDOFF_RE.search(body) or CHILD_PLAN_REBIND_MARKER_RE.search(body)
+        for body in world.posted()
+    )
+
+
+def test_m985_admissible_signed_replan_fails_closed_on_a_closed_pr(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    with pytest.raises(AgentLoopError, match="not OPEN"):
+        world.run_issue(pr_state="CLOSED")
+    assert world.agent_calls("claude") == [] and world.posted() == []
+
+
+def test_m985_pr_mode_refuses_to_review_under_a_pending_signed_replan(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    with pytest.raises(AgentLoopError) as excinfo:
+        world.run_pr(codex_outputs=[PR_APPROVAL])
+    message = str(excinfo.value)
+    assert "authorizes replacing" in message
+    assert "agent-loop issue 56 --plan-first --plan-execution-mode auto" in message
+    assert world.agent_calls("codex") == [] and world.agent_calls("claude") == []
+    assert world.posted() == []
+    # Once the issue-mode re-plan has rebound the PR, PR mode proceeds.
+    assert world.run_issue(
+        claude_outputs=[_m936_patch(world.old_state, None, summary="Reduced scope plan.")],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    assert world.run_pr(codex_outputs=[PR_APPROVAL]) == 0
+    assert len(world.agent_calls("codex")) == 1
