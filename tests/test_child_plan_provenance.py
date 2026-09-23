@@ -3564,3 +3564,120 @@ def test_m988_earlier_edge_with_its_handoff_transition_is_retired(tmp_path, monk
     assert _m988_retired(world) == frozenset({world.old_hash, _M988_EARLIER})
     assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
     assert len(world.agent_calls("codex")) == 1
+
+
+# ---------------------------------------------------------------------------
+# A signed re-plan retires the managed-CI grant of the superseded plan (#993)
+# ---------------------------------------------------------------------------
+
+
+class _M993Captured(Exception):
+    pass
+
+
+def _m993_fresh_scope(world, monkeypatch):
+    """Run the PR-mode fresh authorization path and capture what it grants."""
+    captured = {}
+
+    def authorize(*_args, **kwargs):
+        captured.update(kwargs)
+        raise _M993Captured
+
+    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    world.settle()
+    world.runner = _ChildPlanningRunner(
+        pr_payload={
+            "number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main",
+        },
+    )
+    config = world.config(
+        managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+    )
+    with pytest.raises(_M993Captured):
+        orchestrator.run_pr_loop(world.runner, pr_number=77, config=config)
+    return captured
+
+
+def test_m993_fresh_authorization_after_rebind_retires_the_superseded_plan(
+    tmp_path, monkeypatch,
+):
+    world = _m988_rebound_world(tmp_path, monkeypatch)
+    new_hash = find_latest_issue_pr_handoff(
+        world.comments, issue_number=56, repo="OWNER/REPO"
+    ).plan_hash
+    assert new_hash != world.old_hash
+
+    captured = _m993_fresh_scope(world, monkeypatch)
+
+    assert captured["approved_plan_hash"] == new_hash
+    assert captured["retired_plan_hashes"] == frozenset({world.old_hash})
+    assert world.agent_calls("claude") == [] and world.agent_calls("codex") == []
+
+
+def test_m993_fresh_authorization_without_a_rebind_retires_nothing(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
+
+    captured = _m993_fresh_scope(world, monkeypatch)
+
+    assert captured["approved_plan_hash"] == world.old_hash
+    assert captured["retired_plan_hashes"] == frozenset()
+
+
+def _m993_ordinary_scope(world, monkeypatch):
+    """Run the PR-mode ordinary managed resume and capture the bound handoff."""
+    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="voluntary", override_nonce="opening-nonce",
+    )
+    monkeypatch.setattr(
+        orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff
+    )
+    captured = {}
+
+    def revalidate(*_args, **kwargs):
+        captured.update(kwargs)
+        raise _M993Captured
+
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", revalidate)
+    world.settle()
+    world.runner = _ChildPlanningRunner(
+        pr_payload={
+            "number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main",
+        },
+    )
+    config = world.config(
+        managed_ci=True, managed_ci_pr_mode=True, managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+    )
+    with pytest.raises(_M993Captured):
+        orchestrator.run_pr_loop(world.runner, pr_number=77, config=config)
+    return captured["handoff"]
+
+
+def test_m993_ordinary_resume_after_rebind_carries_the_retired_plan(tmp_path, monkeypatch):
+    world = _m988_rebound_world(tmp_path, monkeypatch)
+    new_hash = find_latest_issue_pr_handoff(
+        world.comments, issue_number=56, repo="OWNER/REPO"
+    ).plan_hash
+
+    handoff = _m993_ordinary_scope(world, monkeypatch)
+
+    assert handoff.approved_plan_hash == new_hash
+    assert handoff.retired_plan_hashes == frozenset({world.old_hash})
+
+
+def test_m993_ordinary_resume_without_a_rebind_retires_nothing(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
+
+    handoff = _m993_ordinary_scope(world, monkeypatch)
+
+    assert handoff.approved_plan_hash == world.old_hash
+    assert handoff.retired_plan_hashes == frozenset()
