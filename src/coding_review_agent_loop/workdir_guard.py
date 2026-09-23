@@ -1171,25 +1171,52 @@ class _PathLog(list):
 
 
 # Options whose following operand is a value (config file, plugin, expression,
-# ignore pattern, ...) rather than a test target.  A path after one of these
-# says nothing about where the tests themselves live.
+# worker count, report path, ...) rather than a test target.  The list can
+# never be complete, so an absolute path after an *unknown* option is also
+# ignored; see _record_test_targets for why that is the fail-safe direction.
 _VALUE_TAKING_OPTIONS = frozenset({
-    "-c", "-p", "-k", "-m", "-o", "--config", "--config-file", "--confcutdir",
-    "--basetemp", "--cache-dir", "--ignore", "--ignore-glob", "--deselect",
-    "--cov", "--cov-config", "--override-ini", "--junitxml", "--log-file",
-    "--import-mode",
+    "-c", "-p", "-k", "-m", "-o", "-n", "-r", "-W", "--config", "--config-file",
+    "--confcutdir", "--basetemp", "--cache-dir", "--ignore", "--ignore-glob",
+    "--deselect", "--cov", "--cov-config", "--cov-report", "--override-ini",
+    "--junitxml", "--junit-xml", "--html", "--log-file", "--log-level",
+    "--import-mode", "--numprocesses", "--dist", "--maxfail", "--tb",
+    "--timeout", "--timeout-method", "--durations", "--capture", "--color",
+    "--rootdir",
+})
+# Flags known to take no value, so a following path is a test operand.
+_BOOLEAN_SHORT_FLAGS_RE = re.compile(r"-[qvxslh]+")
+_BOOLEAN_LONG_FLAGS = frozenset({
+    "--quiet", "--verbose", "--exitfirst", "--lf", "--last-failed", "--ff",
+    "--failed-first", "--sw", "--stepwise", "--no-header", "--strict-markers",
+    "--showlocals", "--collect-only", "--co",
+})
+# Options that change the process working directory.  pytest's --rootdir is
+# deliberately absent: it selects configuration, not where operands resolve.
+_CWD_FLAGS = frozenset({"-C", "--directory", "--chdir", "--cwd"})
+_CWD_FLAG_PREFIXES = ("--directory=", "--chdir=", "--cwd=")
+# Clause heads that never run tests themselves.  A shell's own clause is here
+# because its -c script is expanded into separate clauses.
+_NON_TEST_HEADS = frozenset({
+    "pwd", "echo", "printf", "true", "false", "ls", "cat", "export", "set",
+    "source", ".", "mkdir", "rm", "cp", "mv", "which", "git", "popd",
+    "sh", "bash", "zsh",
 })
 
 
 def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> None:
-    """Note whether a clause names test targets inside and/or outside the checkout.
+    """Note whether a clause's test targets lie inside and/or outside the checkout.
 
-    A relative operand resolves against the current directory: the confined
-    in-checkout ``cwd``, unless an earlier ``cd``/``pushd`` clause or a
-    working-directory option in this clause moved it elsewhere.  An absolute
-    positional operand counts on whichever side it resolves to.  Operands of
-    value-taking options are ignored: an outside config or ignore path does
-    not move the tested suite elsewhere.
+    This is fail-safe: a run counts as out-of-checkout context only with
+    positive evidence that everything it tested lies elsewhere.  Every
+    positional operand that does not resolve outside -- relative paths, bare
+    words such as ``tests``, node IDs such as ``test_a.py::t`` -- is an inside
+    target, resolved against the current directory.  That is the confined
+    in-checkout ``cwd`` unless a ``cd``/``pushd`` clause or a real
+    working-directory option (``-C``, ``--chdir``, ...) moved it; ``--rootdir``
+    does not.  A test clause with no positional operand tests its current
+    directory.  An absolute path after a value-taking or unknown option is not
+    a target, so an unrecognized report or config path can never turn an
+    in-checkout run into context.
     """
 
     def outside(raw: str) -> bool | None:
@@ -1199,55 +1226,76 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         return not (path == assigned or _is_inside(path, assigned))
 
     tokens = clause.tokens
-    program_positions, head = _program_position_indices(tokens)
-    relative_outside = log.cwd_outside
-    for index, token in enumerate(tokens):
-        value: str | None = None
-        if token in WORKDIR_FLAGS and index + 1 < len(tokens):
-            value = tokens[index + 1]
-        else:
-            for prefix in WORKDIR_FLAG_PREFIXES:
-                if token.startswith(prefix):
-                    value = token[len(prefix) :]
-        if value is not None:
-            is_outside = outside(value)
-            if is_outside is not None:
-                relative_outside = is_outside
-                if is_outside:
-                    log.outside_target = True
-    head_token = tokens[head] if head is not None and head < len(tokens) else (
-        tokens[0] if tokens else ""
-    )
-    if _program_basename(head_token) in {"cd", "pushd"}:
-        # The directory change persists for the following clauses.
-        log.cwd_outside = relative_outside
+    _, head = _program_position_indices(tokens)
+    if head is None or head >= len(tokens):
         return
-    for index, token in enumerate(tokens):
-        previous = tokens[index - 1] if index else ""
+    head_name = _program_basename(tokens[head])
+    if head_name in {"cd", "pushd"}:
+        if head + 1 < len(tokens):
+            moved = outside(tokens[head + 1])
+            if moved is not None:
+                log.cwd_outside = moved
+        return
+    if head_name in _NON_TEST_HEADS:
+        return
+
+    cwd_outside = log.cwd_outside
+    index = head + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _CWD_FLAGS and index + 1 < len(tokens):
+            moved = outside(tokens[index + 1])
+            if moved is not None:
+                cwd_outside = moved
+            index += 2
+            continue
+        for prefix in _CWD_FLAG_PREFIXES:
+            if token.startswith(prefix):
+                moved = outside(token[len(prefix) :])
+                if moved is not None:
+                    cwd_outside = moved
+        index += 1
+
+    saw_positional = False
+    for index in range(head + 1, len(tokens)):
+        token = tokens[index]
+        previous = tokens[index - 1]
         if (
-            index in program_positions
-            or token in WORKDIR_FLAGS
-            or previous in WORKDIR_FLAGS
-            or token.startswith("-")
+            token.startswith("-")
             or VAR_ASSIGNMENT_RE.match(token)
             or _is_url_token(token)
+            or previous in _CWD_FLAGS
+            or previous in WORKDIR_FLAGS
             or previous in _VALUE_TAKING_OPTIONS
             or previous in INTERPRETER_VALUE_FLAGS
             or previous in OUTPUT_VALUE_FLAGS
         ):
             continue
         cleaned = _strip_wrap(token)
+        if not cleaned or cleaned.isdigit():
+            continue
+        after_unknown_option = previous.startswith("-") and not (
+            _BOOLEAN_SHORT_FLAGS_RE.fullmatch(previous) or previous in _BOOLEAN_LONG_FLAGS
+        )
         if _is_path_shaped(cleaned):
-            is_outside = outside(cleaned)
-            if is_outside is True:
-                log.outside_target = True
-            elif is_outside is False:
-                log.inside_target = True
-        elif _is_path_like_token(cleaned) or cleaned.endswith(".py"):
-            if relative_outside:
+            if after_unknown_option:
+                continue
+            saw_positional = True
+            if outside(cleaned):
                 log.outside_target = True
             else:
                 log.inside_target = True
+            continue
+        saw_positional = True
+        if cwd_outside:
+            log.outside_target = True
+        else:
+            log.inside_target = True
+    if not saw_positional:
+        if cwd_outside:
+            log.outside_target = True
+        else:
+            log.inside_target = True
 
 
 def _validate_command_contents(

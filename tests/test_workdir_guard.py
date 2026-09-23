@@ -1507,7 +1507,22 @@ def test_command_is_admissible_evidence(tmp_path, argv, admissible):
     ("python3 -m pytest /tmp/scratch-main-991/tests/ -q", True),
     ("python3 -m pytest -q /tmp/scratch-main-991/tests/", True),
     ("bash -c 'cd /tmp/scratch-main-991 && pytest tests/'", True),
-    ("pytest --rootdir=/tmp/scratch-main-991 tests/", True),
+    ("bash -c 'cd /tmp/scratch-main-991 && pytest'", True),
+    (
+        "PYTHONPATH=/tmp/scratch-main-991 timeout 900 /usr/bin/python3 -m pytest "
+        "/tmp/scratch-main-991/tests/ -q -n 4 -p no:cacheprovider",
+        True,
+    ),
+    ("make -C /tmp/scratch-main-991 test", True),
+    # --rootdir selects configuration; operands still resolve in the checkout.
+    ("pytest --rootdir=/tmp/scratch-main-991 tests/", False),
+    ("pytest --rootdir /tmp/scratch-main-991 tests/test_foo.py", False),
+    # Bare directories, node IDs and the implicit cwd are in-checkout targets.
+    ("python3 -m pytest tests /tmp/scratch-main-991/tests", False),
+    ("python3 -m pytest test_a.py::t /tmp/scratch-main-991/tests", False),
+    ("python3 -m pytest -q --junit-xml /tmp/scratch-main-991/r.xml", False),
+    ("python3 -m pytest -q --html /tmp/scratch-main-991/r.html", False),
+    ("python3 -m pytest -q --unknown-report /tmp/scratch-main-991/r.html", False),
     # Mixed runs and outside option values still test the checkout (#991).
     ("python3 -m pytest tests/test_foo.py /tmp/scratch-main-991/tests/test_foo.py", False),
     ("python3 -m pytest -c /tmp/scratch-main-991/pytest.ini tests/", False),
@@ -1524,7 +1539,7 @@ def test_command_targets_outside_workdir_only_for_pure_outside_runs(
         command, assigned_workdir=tmp_path
     ) is outside_only
     if not outside_only and "/tmp/scratch-main-991" in command:
-        # Mixed runs remain unselectable as evidence.
+        # Runs naming any outside path remain unselectable as evidence.
         assert not workdir_guard.command_is_admissible_evidence(
             command, assigned_workdir=tmp_path
         )

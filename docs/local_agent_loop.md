@@ -2972,10 +2972,16 @@ never becomes a self-reported evidence row, and renders it in a separate
 handoff context applies the same classification. A managed-broker run whose
 test operands point outside the assigned checkout is likewise excluded from
 the selectable execution catalog and the journal used for risk-matrix
-evidence, so it can never back a verified row. On the failure side, only a
-run whose test targets are all outside the checkout counts as context. A mixed
-run that also names an in-checkout test target, or whose only outside path is
-an option value such as a config file, keeps its failures authoritative. In
+evidence, so it can never back a verified row. On the failure side the
+classification is fail-safe: only a run with positive evidence that every test
+target lies outside the checkout counts as context. Any other positional
+operand, such as a relative path, a bare directory like `tests`, or a node ID,
+is an in-checkout target, and so is the current directory of a test command
+with no operand. Relative operands resolve through `cd`/`pushd` and real
+working-directory options such as `-C`, but not through pytest's `--rootdir`.
+An absolute path after a value-taking or unknown option (a config, report, or
+ignore path) is never a target. A mixed run, or one whose only outside path is
+an option value, therefore keeps its failures authoritative. In
 the public local test journal a pure outside run carries an out-of-checkout
 context caveat that survives
 round metadata; it never counts as an authoritative failure, cannot supersede

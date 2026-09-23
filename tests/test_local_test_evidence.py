@@ -1605,3 +1605,41 @@ def test_mixed_operand_broker_failure_stays_authoritative(tmp_path):
     assert decoded is not None
     assert decoded.authoritative_failures == ("mixed-failure",)
     assert not decoded.observations[0].is_out_of_checkout_context
+
+
+@pytest.mark.parametrize("command", [
+    ("pytest", "--rootdir=/tmp/scratch-main-991", "tests/test_foo.py"),
+    ("python3", "-m", "pytest", "tests", "/tmp/scratch-main-991/tests"),
+    ("python3", "-m", "pytest", "-q", "--junit-xml", "/tmp/scratch-main-991/r.xml"),
+])
+def test_in_checkout_broker_failure_with_outside_path_stays_authoritative(tmp_path, command):
+    """Issue #991: only positive evidence of an outside-only run makes context.
+
+    Covers the journal and the public receipt label.
+    """
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+    from coding_review_agent_loop.runner import Runner
+
+    registry = EnvironmentIdentityRegistry()
+    failing = _replace(
+        _observation(
+            outcome="failed", timestamp="2026-09-23T10:00:00+00:00",
+            receipt_id="in-checkout-failure", registry=registry,
+        ),
+        command=command,
+    )
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.append(failing)
+
+    rendered = runner.render_local_test_evidence(cwd=tmp_path)
+    decoded = decode_bounded_evidence(rendered)
+
+    assert decoded is not None
+    assert decoded.authoritative_failures == ("in-checkout-failure",)
+    assert not decoded.observations[0].is_out_of_checkout_context
+    public = _render_test_observation_citations((), local_test_evidence=rendered)
+    assert "uncited authoritative `failed`" in public
+    assert "out-of-checkout context" not in public
