@@ -149,6 +149,20 @@ def _render_test_commands_for_comment(
     return [_render_test_command_for_comment(command, config=config) for command in commands]
 
 
+def _render_out_of_checkout_tests(
+    commands: Sequence[str], *, config: AgentLoopConfig | None = None
+) -> str:
+    """Show reported out-of-checkout runs as context that is not evidence."""
+    if not commands:
+        return ""
+    return "\n".join([
+        "### Out-of-checkout context runs (not evidence)",
+        "Reported runs outside the assigned checkout, such as a clean-base "
+        "baseline. They are not evidence for this change.",
+        *[f"- {test}" for test in _render_test_commands_for_comment(commands, config=config)],
+    ])
+
+
 def _render_test_observation_citations(
     citations: Sequence[object],
     *,
@@ -1391,6 +1405,11 @@ def _render_public_coder_followup_comment(
                 ]]
             )
         )
+    out_of_checkout_section = _render_out_of_checkout_tests(
+        parsed_followup.out_of_checkout_tests_run, config=config
+    )
+    if out_of_checkout_section:
+        sections.append(out_of_checkout_section)
     if parsed_followup.test_observations or local_test_evidence:
         sections.append(_render_test_observation_citations(
             parsed_followup.test_observations,
@@ -1455,6 +1474,11 @@ def _render_public_issue_implementation_comment(
                 ]]
             )
         )
+    out_of_checkout_section = _render_out_of_checkout_tests(
+        parsed.out_of_checkout_tests_run, config=config
+    )
+    if out_of_checkout_section:
+        sections.append(out_of_checkout_section)
     if parsed.test_observations or local_test_evidence:
         sections.append(_render_test_observation_citations(
             parsed.test_observations,

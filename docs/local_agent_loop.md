@@ -2963,9 +2963,17 @@ the loop's own classifier -- for example a backslash inside the URL, which
 WHATWG URL parsers treat as a path separator and could resolve to a different
 host than a strict URL parse reports -- is never treated as loopback, even if
 it superficially contains `localhost` or a loopback IP; it is rejected as an
-unverifiable live target instead. If an explicit
-test location is outside the assigned checkout, or a live remote target is
-detected, the loop fails with an `AgentLoopError` naming the offending
+unverifiable live target instead. A structured `tests_run` entry whose only
+problem is a test location outside the assigned checkout -- for example an
+honestly reported baseline run on a clean copy of the base branch -- does not
+reject the hand-off (#991). The orchestrator moves it out of `tests_run`, so it
+never becomes a self-reported evidence row, and renders it in a separate
+"Out-of-checkout context runs (not evidence)" section. Test-observation receipt
+citations remain strict, and so do freeform `Tests:` reports that are not
+converted to a structured result: if an explicit
+test location is outside the assigned checkout there, or a live remote target
+is detected anywhere (including in a structured `tests_run` entry), the loop
+fails with an `AgentLoopError` naming the offending
 command/URL and assigned checkout. When that failure happens after a PR was
 already created or detected, the error also confirms the PR state and tells
 the user to continue with `agent-loop pr <number>` instead of rerunning

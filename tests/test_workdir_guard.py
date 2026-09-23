@@ -1431,3 +1431,59 @@ def test_managed_run_tests_with_worker_flags_keeps_wrapper_contract(tmp_path):
     outside = [*wrapper[:-4], str(tmp_path / "outside.py")]
     with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
         validate_test_commands_within_workdir([shlex.join(outside)], assigned_workdir=checkout)
+
+
+# Issue #991: a reported run outside the assigned checkout (for example a
+# baseline on a clean copy of the base branch) is context, not evidence.
+_BASELINE_991 = (
+    "PYTHONPATH=/tmp/scratch-main-1176 timeout 900 /usr/bin/python3 -m pytest "
+    "/tmp/scratch-main-1176/tests/ -q -n 4"
+)
+
+
+def test_partition_moves_out_of_checkout_baseline_to_context(tmp_path):
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        ["python3 -m pytest tests/test_api.py -q", _BASELINE_991],
+        assigned_workdir=tmp_path,
+    )
+
+    assert partition.in_checkout == ("python3 -m pytest tests/test_api.py -q",)
+    assert partition.out_of_checkout == (_BASELINE_991,)
+    # The strict validator used for evidence citations still fails closed.
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir([_BASELINE_991], assigned_workdir=tmp_path)
+
+
+def test_partition_moves_managed_wrapper_outside_target_to_context(tmp_path):
+    command = (
+        "/home/user/.local/bin/agent-loop run-tests --memory-dir /cache -- "
+        "python3 -m pytest /tmp/scratch-main/tests/ -q"
+    )
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        [command], assigned_workdir=tmp_path
+    )
+
+    assert partition.in_checkout == ()
+    assert partition.out_of_checkout == (command,)
+
+
+@pytest.mark.parametrize("command", [
+    "cd /tmp/scratch-main && pytest tests/ https://live.example",
+    "pytest /tmp/scratch-main/tests/ --base-url https://live.example",
+    r"pytest C:\outside\tests",
+])
+def test_partition_still_rejects_non_path_violations(tmp_path, command):
+    with pytest.raises(AgentLoopError):
+        workdir_guard.partition_reported_tests_by_workdir(
+            [command], assigned_workdir=tmp_path
+        )
+
+
+@pytest.mark.parametrize("tests_run", [None, ()])
+def test_partition_preserves_empty_reports(tmp_path, tests_run):
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        tests_run, assigned_workdir=tmp_path
+    )
+
+    assert partition.in_checkout == tests_run
+    assert partition.out_of_checkout == ()

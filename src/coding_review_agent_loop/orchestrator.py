@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 from .agents.base import AgentName, AgentResult
 from .agents.antigravity import AntigravityAttemptState
@@ -416,7 +416,7 @@ from .workdir_guard import (
     validate_assigned_head_advanced,
     validate_checkout_inspected_evidence,
     validate_response_tests_within_workdir,
-    validate_test_commands_within_workdir,
+    partition_reported_tests_by_workdir,
     validate_test_observation_citations_within_workdir,
 )
 from .checks import (
@@ -7827,24 +7827,55 @@ def _validate_response_tests_with_post_pr_context(
     )
 
 
+_StructuredTestReport = TypeVar(
+    "_StructuredTestReport", StructuredIssueImplementation, StructuredCoderFollowup
+)
+
+
+def _degrade_out_of_checkout_tests(
+    parsed: _StructuredTestReport, *, config: AgentLoopConfig
+) -> _StructuredTestReport:
+    """Move reported out-of-checkout runs to non-evidence context (#991).
+
+    A baseline run on a clean base-branch copy is honest context, not a reason
+    to reject the whole hand-off. It is removed from ``tests_run`` so it never
+    becomes a self-reported evidence row, and rendered separately. Live remote
+    targets and other unvalidatable reports still raise.
+    """
+    partition = partition_reported_tests_by_workdir(
+        parsed.tests_run, assigned_workdir=active_workdir(config)
+    )
+    if not partition.out_of_checkout:
+        return parsed
+    log(
+        config,
+        f"Recorded {len(partition.out_of_checkout)} reported test run(s) outside the "
+        "assigned checkout as non-evidence context",
+    )
+    return dataclasses_replace(
+        parsed,
+        tests_run=partition.in_checkout,
+        out_of_checkout_tests_run=partition.out_of_checkout,
+    )
+
+
 def _validate_structured_response_tests_with_post_pr_context(
-    tests_run: Sequence[str] | None,
+    parsed: _StructuredTestReport,
     *,
     runner: Runner,
     config: AgentLoopConfig,
     pr_number: int,
-) -> None:
+) -> _StructuredTestReport:
     """Validate structured test commands with the same confirmed-PR diagnostic."""
+    result: list[_StructuredTestReport] = []
     _validate_tests_with_post_pr_context(
-        lambda: validate_test_commands_within_workdir(
-            tests_run,
-            assigned_workdir=active_workdir(config),
-        ),
+        lambda: result.append(_degrade_out_of_checkout_tests(parsed, config=config)),
         runner=runner,
         config=config,
         pr_number=pr_number,
         report_description="structured test report",
     )
+    return result[0]
 
 
 def _validate_structured_response_observations_with_post_pr_context(
@@ -8364,9 +8395,10 @@ def _implement_approved_issue(
     coder_output = coder_response.text
     implementation_result = coder_response.marker_value
     if isinstance(implementation_result, _TerminalIssueImplementationConflict):
-        validate_test_commands_within_workdir(
-            implementation_result.parsed.tests_run,
-            assigned_workdir=active_workdir(implementation_config),
+        implementation_result = _TerminalIssueImplementationConflict(
+            _degrade_out_of_checkout_tests(
+                implementation_result.parsed, config=implementation_config
+            )
         )
         _post_structured_issue_implementation_terminal_comment(
             runner,
@@ -8381,9 +8413,8 @@ def _implement_approved_issue(
         )
     if isinstance(implementation_result, StructuredIssueImplementation):
         if implementation_result.pr_number is None:
-            validate_test_commands_within_workdir(
-                implementation_result.tests_run,
-                assigned_workdir=active_workdir(implementation_config),
+            implementation_result = _degrade_out_of_checkout_tests(
+                implementation_result, config=implementation_config
             )
             _post_structured_issue_implementation_terminal_comment(
                 runner,
@@ -8448,8 +8479,8 @@ def _implement_approved_issue(
             surface=f"pull-request #{pr_number} body",
         )
     if isinstance(implementation_result, StructuredIssueImplementation):
-        _validate_structured_response_tests_with_post_pr_context(
-            implementation_result.tests_run,
+        implementation_result = _validate_structured_response_tests_with_post_pr_context(
+            implementation_result,
             runner=runner,
             config=implementation_config,
             pr_number=pr_number,
@@ -13551,9 +13582,8 @@ def run_issue_loop(
         coder_session_id = coder_response.session_id
         implementation_result = coder_response.marker_value
         if isinstance(implementation_result, _TerminalIssueImplementationConflict):
-            validate_test_commands_within_workdir(
-                implementation_result.parsed.tests_run,
-                assigned_workdir=active_workdir(config),
+            implementation_result = _TerminalIssueImplementationConflict(
+                _degrade_out_of_checkout_tests(implementation_result.parsed, config=config)
             )
             validate_test_observation_citations_within_workdir(
                 implementation_result.parsed.test_observations,
@@ -13572,9 +13602,8 @@ def run_issue_loop(
             )
         if isinstance(implementation_result, StructuredIssueImplementation):
             if implementation_result.pr_number is None:
-                validate_test_commands_within_workdir(
-                    implementation_result.tests_run,
-                    assigned_workdir=active_workdir(config),
+                implementation_result = _degrade_out_of_checkout_tests(
+                    implementation_result, config=config
                 )
                 validate_test_observation_citations_within_workdir(
                     implementation_result.test_observations,
@@ -13642,8 +13671,8 @@ def run_issue_loop(
                 surface=f"pull-request #{pr_number} body",
             )
         if isinstance(implementation_result, StructuredIssueImplementation):
-            _validate_structured_response_tests_with_post_pr_context(
-                implementation_result.tests_run,
+            implementation_result = _validate_structured_response_tests_with_post_pr_context(
+                implementation_result,
                 runner=runner,
                 config=config,
                 pr_number=pr_number,
@@ -21731,9 +21760,11 @@ def run_pr_loop(
             public_comment = coder_output
             raw_structured_coder_response: str | None = None
             if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                validate_test_commands_within_workdir(
-                    coder_response.marker_value.tests_run,
-                    assigned_workdir=active_workdir(config),
+                coder_response = dataclasses_replace(
+                    coder_response,
+                    marker_value=_degrade_out_of_checkout_tests(
+                        coder_response.marker_value, config=config
+                    ),
                 )
                 validate_test_observation_citations_within_workdir(
                     coder_response.marker_value.test_observations,

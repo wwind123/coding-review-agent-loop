@@ -9757,7 +9757,12 @@ def test_pr_loop_posts_followup_with_env_prefixed_managed_tests(tmp_path):
     )
 
 
-def test_pr_loop_rejects_structured_followup_outside_workdir_tests_before_posting(tmp_path):
+def test_pr_loop_records_structured_followup_out_of_checkout_tests_as_context(tmp_path):
+    """Issue #991: a clean-base baseline is context, not a rejected hand-off."""
+    baseline = (
+        "PYTHONPATH=/tmp/scratch-main /usr/bin/python3 -m pytest "
+        "/tmp/scratch-main/tests/ -q"
+    )
     runner = FakeRunner(
         claude_outputs=[
             structured_pr_review(
@@ -9766,25 +9771,34 @@ def test_pr_loop_rejects_structured_followup_outside_workdir_tests_before_postin
                 blocking_items=["Add a regression test."],
                 reviewer="Anthropic Claude",
             ),
-            "Looks good.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude",
+            structured_pr_review(
+                state="approved",
+                summary="The regression test resolves the finding.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                reviewer="Anthropic Claude",
+            ),
         ],
         codex_outputs=[
             structured_coder_followup(
                 summary="Added the test.",
                 addressed_items=["item-1"],
-                tests_run=["cd ~/llm-dialectic && python -m pytest"],
+                tests_run=["python -m pytest tests/test_foo.py -q", baseline],
                 reviewer="OpenAI Codex",
             ),
         ],
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
 
-    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert len(runner.comments) == 1
-    assert runner.comments[0].startswith("**Review verdict:** Blocking")
-    assert not any("Added the test." in comment for comment in runner.comments)
+    followup = next(comment for comment in runner.comments if "Added the test." in comment)
+    tests_section, _, context_section = followup.partition(
+        "### Out-of-checkout context runs (not evidence)"
+    )
+    assert "python -m pytest tests/test_foo.py -q" in tests_section
+    assert "/tmp/scratch-main" not in tests_section
+    assert f"- {baseline}" in context_section
+
 
 def test_pr_loop_rejects_structured_followup_live_target_tests_before_posting(tmp_path):
     # Regression for #584: a structured `tests_run` entry (origin='structured',

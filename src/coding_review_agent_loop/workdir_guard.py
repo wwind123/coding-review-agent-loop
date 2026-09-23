@@ -828,7 +828,14 @@ def _path_roles(clause: _Clause) -> list[tuple[str, str]]:
     return results
 
 
-def _check_path_role(raw_path: str, role: str, *, command: str, assigned: Path) -> None:
+def _check_path_role(
+    raw_path: str,
+    role: str,
+    *,
+    command: str,
+    assigned: Path,
+    path_violations: list[str] | None = None,
+) -> None:
     path = _normalize_reported_path(raw_path)
     if path is None:
         return
@@ -839,6 +846,11 @@ def _check_path_role(raw_path: str, role: str, *, command: str, assigned: Path) 
     if role == "interpreter_value":
         return
     if role == "output":
+        return
+    if path_violations is not None:
+        # The caller degrades this report to out-of-checkout context instead
+        # of rejecting the whole payload; every other check still applies.
+        path_violations.append(raw_path)
         return
     raise AgentLoopError(
         "Coder reported tests from outside the assigned checkout: "
@@ -1148,7 +1160,13 @@ def _url_targets_in_clause(clause: _Clause) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _validate_command_contents(command: str, *, assigned: Path, origin: Origin) -> None:
+def _validate_command_contents(
+    command: str,
+    *,
+    assigned: Path,
+    origin: Origin,
+    path_violations: list[str] | None = None,
+) -> None:
     for raw_windows in WINDOWS_PATH_RE.findall(command):
         if _windows_path_is_exempt(command, raw_windows, origin):
             continue
@@ -1166,12 +1184,19 @@ def _validate_command_contents(command: str, *, assigned: Path, origin: Origin) 
         if not _validate_managed_command(
             shlex.join(clause.tokens), assigned=assigned,
             origin="structured" if clause.mode in {"structured", "code"} else "response",
+            path_violations=path_violations,
         ):
             ordinary_clauses.append(clause)
 
     for clause in ordinary_clauses:
         for raw_path, role in _path_roles(clause):
-            _check_path_role(raw_path, role, command=command, assigned=assigned)
+            _check_path_role(
+                raw_path,
+                role,
+                command=command,
+                assigned=assigned,
+                path_violations=path_violations,
+            )
 
     for clause in ordinary_clauses:
         for target in _url_targets_in_clause(clause):
@@ -1196,7 +1221,13 @@ def _validate_command_contents(command: str, *, assigned: Path, origin: Origin) 
                 )
 
 
-def _validate_managed_command(command: str, *, assigned: Path, origin: Origin) -> bool:
+def _validate_managed_command(
+    command: str,
+    *,
+    assigned: Path,
+    origin: Origin,
+    path_violations: list[str] | None = None,
+) -> bool:
     # The managed wrapper itself is an absolute executable outside the checkout
     # by design, and its memory directory is an output location.  Once the
     # exact contract is recognized, validate leading shell assignments and the
@@ -1216,18 +1247,34 @@ def _validate_managed_command(command: str, *, assigned: Path, origin: Origin) -
         # prose response; the inner report retains its original source mode.
         if prefix_len:
             _validate_command_contents(
-                shlex.join(tokens[:prefix_len]), assigned=assigned, origin="structured"
+                shlex.join(tokens[:prefix_len]),
+                assigned=assigned,
+                origin="structured",
+                path_violations=path_violations,
             )
         _validate_single_command(
-            shlex.join(managed.inner_argv), assigned=assigned, origin=origin
+            shlex.join(managed.inner_argv),
+            assigned=assigned,
+            origin=origin,
+            path_violations=path_violations,
         )
         return True
     return False
 
 
-def _validate_single_command(command: str, *, assigned: Path, origin: Origin) -> None:
-    if not _validate_managed_command(command, assigned=assigned, origin=origin):
-        _validate_command_contents(command, assigned=assigned, origin=origin)
+def _validate_single_command(
+    command: str,
+    *,
+    assigned: Path,
+    origin: Origin,
+    path_violations: list[str] | None = None,
+) -> None:
+    if not _validate_managed_command(
+        command, assigned=assigned, origin=origin, path_violations=path_violations
+    ):
+        _validate_command_contents(
+            command, assigned=assigned, origin=origin, path_violations=path_violations
+        )
 
 
 def validate_test_commands_within_workdir(
@@ -1241,6 +1288,42 @@ def validate_test_commands_within_workdir(
     assigned = _canonical(assigned_workdir)
     for command in tests_run:
         _validate_single_command(command, assigned=assigned, origin=origin)
+
+
+@dataclass(frozen=True)
+class ReportedTestsPartition:
+    """Display-only ``tests_run`` split by whether it ran in the assigned checkout."""
+
+    in_checkout: tuple[str, ...] | None
+    out_of_checkout: tuple[str, ...] = ()
+
+
+def partition_reported_tests_by_workdir(
+    tests_run: Sequence[str] | None,
+    *,
+    assigned_workdir: Path,
+) -> ReportedTestsPartition:
+    """Separate out-of-checkout context runs from a display-only test report.
+
+    A coder may honestly report a baseline run on a clean copy of the base
+    branch.  That run is context, not evidence: it is split out so it never
+    becomes a self-reported evidence row, and it does not reject the whole
+    hand-off.  Only path containment degrades this way.  Live remote targets,
+    unvalidatable Windows paths, and malformed shell text still fail closed,
+    as do receipt citations, which keep using the strict validator.
+    """
+    if not tests_run:
+        return ReportedTestsPartition(in_checkout=None if tests_run is None else ())
+    assigned = _canonical(assigned_workdir)
+    kept: list[str] = []
+    context: list[str] = []
+    for command in tests_run:
+        violations: list[str] = []
+        _validate_single_command(
+            command, assigned=assigned, origin="structured", path_violations=violations
+        )
+        (context if violations else kept).append(command)
+    return ReportedTestsPartition(in_checkout=tuple(kept), out_of_checkout=tuple(context))
 
 
 def validate_test_observation_citations_within_workdir(
