@@ -2972,7 +2972,11 @@ never becomes a self-reported evidence row, and renders it in a separate
 handoff context applies the same classification. A managed-broker run whose
 test operands point outside the assigned checkout is likewise excluded from
 the selectable execution catalog and the journal used for risk-matrix
-evidence, so it can never back a verified row. Test-observation receipt
+evidence, so it can never back a verified row. In the public local test
+journal such a run carries an out-of-checkout context caveat that survives
+round metadata; it never counts as an authoritative failure, cannot supersede
+or be superseded by an in-checkout run, and renders as "out-of-checkout
+context (not evidence)" instead of "uncited authoritative". Test-observation receipt
 citations remain strict, and so do freeform `Tests:` reports that are not
 converted to a structured result: if an explicit
 test location is outside the assigned checkout there, or a live remote target

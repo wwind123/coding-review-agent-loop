@@ -1237,10 +1237,15 @@ class Runner:
         from .local_test_evidence import (
             bounded_evidence_for_round,
             decode_bounded_evidence,
+            mark_out_of_checkout_context,
             stable_tracked_tree_snapshot,
         )
 
         observations = list(self.local_test_observations())
+        if cwd is not None:
+            observations = list(
+                mark_out_of_checkout_context(observations, assigned_workdir=cwd)
+            )
         prior = decode_bounded_evidence(prior_local_test_evidence)
         if prior is not None:
             live_receipts = {

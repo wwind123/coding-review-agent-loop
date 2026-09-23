@@ -1337,9 +1337,33 @@ def command_is_admissible_evidence(
     context, not evidence, even when the managed broker ran it from inside the
     checkout (#991).  Anything the guard cannot validate is inadmissible too.
     """
+    violations = _command_path_violations(argv, assigned_workdir=assigned_workdir)
+    return violations is not None and not violations
+
+
+def command_targets_outside_workdir(
+    argv: Sequence[str] | str,
+    *,
+    assigned_workdir: Path,
+) -> bool:
+    """Return whether a validatable command targets paths outside the checkout.
+
+    Unlike :func:`command_is_admissible_evidence`, a command the guard cannot
+    validate is *not* reported as outside: callers use this to relabel a run
+    as context, and an unvalidatable failure must stay authoritative.
+    """
+    return bool(_command_path_violations(argv, assigned_workdir=assigned_workdir))
+
+
+def _command_path_violations(
+    argv: Sequence[str] | str,
+    *,
+    assigned_workdir: Path,
+) -> list[str] | None:
+    """Out-of-checkout paths in ``argv``, or ``None`` when unvalidatable."""
     command = argv if isinstance(argv, str) else shlex.join(str(item) for item in argv)
     if not command.strip():
-        return False
+        return None
     violations: list[str] = []
     try:
         _validate_single_command(
@@ -1349,8 +1373,8 @@ def command_is_admissible_evidence(
             path_violations=violations,
         )
     except AgentLoopError:
-        return False
-    return not violations
+        return None
+    return violations
 
 
 def validate_test_observation_citations_within_workdir(

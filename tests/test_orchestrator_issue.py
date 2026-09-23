@@ -7529,6 +7529,18 @@ def test_issue_loop_records_out_of_checkout_baseline_as_context(tmp_path):
         ],
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
+    # The same baseline also ran (and failed) through the managed broker.
+    from coding_review_agent_loop.local_test_evidence import LocalTestObservation
+
+    runner._local_test_observations.append(LocalTestObservation(
+        command=("python3", "-m", "pytest", "/tmp/scratch-main-1176/tests/", "-q"),
+        outcome="failed",
+        provenance="parent-observed",
+        receipt_id="baseline-broker-failure",
+        turn_id="turn-baseline",
+        timestamp="2026-09-23T10:00:00+00:00",
+        cwd=str(tmp_path),
+    ))
 
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
@@ -7541,6 +7553,11 @@ def test_issue_loop_records_out_of_checkout_baseline_as_context(tmp_path):
     assert "python3 -m pytest tests/test_api.py -q" in tests_section
     assert "/tmp/scratch-main-1176" not in tests_section
     assert f"- {baseline}" in context_section
+    baseline_line = next(
+        line for line in handoff.splitlines() if "baseline-broker-failure" in line
+    )
+    assert "out-of-checkout context (not evidence) `failed`" in baseline_line
+    assert "authoritative" not in baseline_line
 
 
 def test_degrade_out_of_checkout_tests_keeps_baseline_out_of_evidence(tmp_path):

@@ -222,8 +222,13 @@ def _render_test_observation_citations(
                 and not item.superseded_by
             ):
                 safe_command, _identifiers, _caveats = redact_test_command(item.command)
+                label = (
+                    "out-of-checkout context (not evidence)"
+                    if item.is_out_of_checkout_context
+                    else "uncited authoritative"
+                )
                 lines.append(
-                    f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — uncited authoritative `{item.outcome}`"
+                    f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — {label} `{item.outcome}`"
                 )
     return "\n".join(lines)
 

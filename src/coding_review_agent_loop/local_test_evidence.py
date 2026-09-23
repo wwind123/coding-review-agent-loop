@@ -42,6 +42,7 @@ LOCAL_TEST_EVIDENCE_FIELD = "local_test_evidence"
 OUTCOMES = frozenset(
     {"passed", "failed", "timed_out", "interrupted", "incomplete", "overlap-rejected", "launch-failed"}
 )
+OUT_OF_CHECKOUT_CONTEXT_CAVEAT = "out-of-checkout context run; not evidence"
 PROVENANCES = frozenset({"parent-observed", "telemetry-unverified", "self-reported"})
 CLAIMS = frozenset({"current-result", "base-reproduction"})
 ENVIRONMENT_STATES = frozenset(
@@ -361,6 +362,10 @@ class LocalTestObservation:
     def is_failure(self) -> bool:
         return self.outcome in {"failed", "timed_out", "interrupted", "incomplete", "launch-failed"}
 
+    @property
+    def is_out_of_checkout_context(self) -> bool:
+        return OUT_OF_CHECKOUT_CONTEXT_CAVEAT in self.caveats
+
     def public_projection(self) -> dict[str, object]:
         command, _, _ = redact_test_command(
             self.command,
@@ -408,6 +413,27 @@ class LocalTestObservation:
         if self.execution_ref:
             projection["execution_ref"] = _safe_text(self.execution_ref, MAX_SAFE_IDENTIFIER_BYTES)
         return projection
+
+
+def mark_out_of_checkout_context(
+    observations: Iterable[LocalTestObservation], *, assigned_workdir: Path
+) -> tuple[LocalTestObservation, ...]:
+    """Label live runs whose test operands escape the assigned checkout (#991).
+
+    Only live observations carry the raw argv this needs; restored rows keep
+    the persisted caveat instead.  The caveat is placed first so the bounded
+    public projection, which keeps only the leading caveats, retains it.
+    """
+    from .workdir_guard import command_targets_outside_workdir
+
+    marked: list[LocalTestObservation] = []
+    for row in observations:
+        if not row.is_out_of_checkout_context and command_targets_outside_workdir(
+            row.command, assigned_workdir=assigned_workdir
+        ):
+            row = replace(row, caveats=(OUT_OF_CHECKOUT_CONTEXT_CAVEAT, *row.caveats))
+        marked.append(row)
+    return tuple(marked)
 
 
 def _coerce_command(value: object) -> tuple[str, ...]:
@@ -699,10 +725,14 @@ def reconcile_test_observations(
                 )
 
     for failure_index, failure in enumerate(rows):
-        if not failure.is_failure or failure.superseded_by:
+        if (
+            not failure.is_failure
+            or failure.superseded_by
+            or failure.is_out_of_checkout_context
+        ):
             continue
         for later in rows[failure_index + 1 :]:
-            if later.outcome != "passed":
+            if later.outcome != "passed" or later.is_out_of_checkout_context:
                 continue
             allowed, reason = _can_supersede(failure, later, registry=registry)
             if allowed:
@@ -741,7 +771,10 @@ def reconcile_test_observations(
     authoritative_failures = tuple(
         row.receipt_id or f"observation-{index}"
         for index, row in enumerate(rows)
-        if row.is_failure and row.provenance == "parent-observed" and not row.superseded_by
+        if row.is_failure
+        and row.provenance == "parent-observed"
+        and not row.superseded_by
+        and not row.is_out_of_checkout_context
     )
     legacy_limited = bool(legacy_rows)
     if legacy_limited:

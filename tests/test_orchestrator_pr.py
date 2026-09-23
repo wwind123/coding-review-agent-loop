@@ -9788,6 +9788,16 @@ def test_pr_loop_records_structured_followup_out_of_checkout_tests_as_context(tm
         ],
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
+    # The same baseline also ran (and failed) through the managed broker.
+    runner._local_test_observations.append(LocalTestObservation(
+        command=("python3", "-m", "pytest", "/tmp/scratch-main/tests/", "-q"),
+        outcome="failed",
+        provenance="parent-observed",
+        receipt_id="baseline-broker-failure",
+        turn_id="turn-baseline",
+        timestamp="2026-09-23T10:00:00+00:00",
+        cwd=str(tmp_path),
+    ))
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -9798,6 +9808,11 @@ def test_pr_loop_records_structured_followup_out_of_checkout_tests_as_context(tm
     assert "python -m pytest tests/test_foo.py -q" in tests_section
     assert "/tmp/scratch-main" not in tests_section
     assert f"- {baseline}" in context_section
+    baseline_line = next(
+        line for line in followup.splitlines() if "baseline-broker-failure" in line
+    )
+    assert "out-of-checkout context (not evidence) `failed`" in baseline_line
+    assert "authoritative" not in baseline_line
 
 
 def test_pr_loop_rejects_structured_followup_live_target_tests_before_posting(tmp_path):
