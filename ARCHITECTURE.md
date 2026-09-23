@@ -154,7 +154,11 @@ re-invoked with the field-level diagnostic over the unchanged authenticated
 base, and exhausting `MAX_INHERITED_MATRIX_REPLANS` persists one authenticated
 plan-validation diagnostic record and stops deterministically before any
 reviewer or implementation turn; the next invocation recovers that record for
-its first planner turn. Every plan prompt form carries the inherited obligations
+its first planner turn. The same loop also absorbs deterministic plan-assembly
+failures on every plan-first run and semantic-patch payload rejections: repair
+may change only a semantic patch's envelope, so a rejection naming the patch
+payload (for example an unknown prior-item disposition) skips the repair model
+and becomes a replan diagnostic instead. Every plan prompt form carries the inherited obligations
 through one shared lossless renderer that shows exactly the compared form. Both
 prompt blocks fail closed rather than truncate: oversized parent obligations
 stop child planning before any planner turn, and an oversized delta set rejects

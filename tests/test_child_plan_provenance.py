@@ -1900,6 +1900,153 @@ def test_m976_top_level_row_bound_overflow_exhausts_as_deterministic_failure(tmp
     assert WEAK_SUMMARY not in _published(runner)
 
 
+def _m979_patch_with_unknown_disposition(base_plan_text, *, summary):
+    patch = json.loads(_m976_patch(base_plan_text, summary=summary).split("\n<!--", 1)[0])
+    patch["prior_plan_item_dispositions"].append(
+        {"item_id": "item-43", "disposition": "resolved", "note": "Same-round finding."}
+    )
+    return json.dumps(patch) + PLAN_FOOTER
+
+
+def _m979_forbid_repair(*args, **kwargs):
+    raise AssertionError("a semantic patch payload rejection must never reach the repair model")
+
+
+def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monkeypatch):
+    """#979: repair pins the patch payload, so a payload rejection replans instead."""
+    monkeypatch.setattr(orchestrator, "_run_structured_repair", _m979_forbid_repair)
+    fresh = _m976_full_plan_state()
+    rejected = _m979_patch_with_unknown_disposition(fresh, summary=WEAK_SUMMARY)
+    corrected = _m976_patch(fresh, summary="Corrected revision.")
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, rejected, corrected],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert orchestrator.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+
+    planner_prompts = _agent_prompts(runner, "claude")
+    assert len(planner_prompts) == 3
+    assert "Trusted orchestration correction record" not in planner_prompts[1]
+    assert "Trusted orchestration correction record" in planner_prompts[2]
+    assert "Unknown prior-item disposition ID(s) ['item-43']" in planner_prompts[2]
+    # Same authenticated base binding on the replan turn.
+    binding_line = re.search(r"- base_state_identity: (\S+)", planner_prompts[1]).group(0)
+    assert binding_line in planner_prompts[2]
+    assert WEAK_SUMMARY not in _published(runner)
+    assert "Corrected revision." in _published(runner)
+    assert runner.diagnostic_posts == []
+    review_prompts = _agent_prompts(runner, "codex")
+    assert len(review_prompts) == 2
+    assert all(WEAK_SUMMARY not in prompt for prompt in review_prompts)
+
+
+def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(orchestrator, "_run_structured_repair", _m979_forbid_repair)
+    fresh = _m976_full_plan_state()
+    rejected = _m979_patch_with_unknown_disposition(fresh, summary=WEAK_SUMMARY)
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh] + [rejected] * 3,
+        codex_outputs=[structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."])],
+    )
+    with pytest.raises(
+        AgentInvocationError, match="fail semantic patch payload validation"
+    ) as error:
+        orchestrator.run_issue_loop(
+            runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        )
+    assert error.value.failure_category == "deterministic"
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None and exhaustion.candidate_kind == "plan_revision"
+    assert "item-43" in exhaustion.diagnostic
+    assert len(_agent_prompts(runner, "claude")) == orchestrator.MAX_INHERITED_MATRIX_REPLANS + 2
+    assert WEAK_SUMMARY not in _published(runner)
+
+
+def test_m979_patch_envelope_defect_still_routes_to_repair(tmp_path, monkeypatch):
+    """#979: an envelope-only defect is exactly what patch repair may fix."""
+    fresh = _m976_full_plan_state()
+    corrected = _m976_patch(fresh, summary="Repaired revision.")
+    missing_footer = corrected.split("\n<!--", 1)[0]
+    repair_calls = []
+
+    def envelope_repair(raw, *, validate, repair_kwargs, **kwargs):
+        repair_calls.append((raw, repair_kwargs["expected_kind"]))
+        return corrected, validate(corrected), []
+
+    monkeypatch.setattr(orchestrator, "_run_structured_repair", envelope_repair)
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, missing_footer],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert orchestrator.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+    assert repair_calls == [(missing_footer, "plan_revision_patch")]
+    assert len(_agent_prompts(runner, "claude")) == 2
+    assert "Repaired revision." in _published(runner)
+
+
+def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
+    """No rejection class both invokes patch repair and is guaranteed to fail preservation."""
+    fresh = _m976_full_plan_state()
+    good = _m976_patch(fresh, summary="Good.")
+    unknown = _m979_patch_with_unknown_disposition(fresh, summary="Bad.")
+
+    def validate(text):
+        return orchestrator._validate_plan_revision_patch_response(
+            text,
+            unresolved_items=(
+                orchestrator.UnresolvedReviewItem(
+                    item_id="item-1", reviewer="OpenAI Codex", source_round=1,
+                    text="Add coverage.", status="blocking", source_status="blocking",
+                ),
+            ),
+        )
+
+    def classify(text, normalized=None):
+        with pytest.raises(AgentLoopError) as error:
+            validate(text)
+        return orchestrator._semantic_patch_payload_rejection(
+            error.value, text=text, normalized=normalized, validate=validate
+        )
+
+    # Payload-level: the unknown disposition sits inside the pinned payload.
+    candidate, diagnostic = classify(unknown)
+    assert candidate == unknown and "item-43" in diagnostic
+    # Envelope-only: a missing footer is exactly what repair may change.
+    assert classify(good.split("\n<!--", 1)[0]) is None
+    # An envelope defect hiding a payload defect is still unsatisfiable once
+    # the envelope is normalized.
+    prose_wrapped = "Here it is:\n" + unknown
+    normalized = orchestrator.attempt_envelope_normalization(
+        prose_wrapped, expected_kind="plan_revision_patch"
+    )
+    assert normalized is not None
+    candidate, diagnostic = classify(prose_wrapped, normalized)
+    assert candidate == normalized and "item-43" in diagnostic
+    # The classifier agrees with the preservation check: any repair that
+    # clears the payload rejection must change the payload, which is vetoed.
+    from coding_review_agent_loop.repair_preservation import validate_repair_preservation
+
+    stripped = _m976_patch(fresh, summary="Bad.")
+    with pytest.raises(AgentLoopError, match="must be preserved exactly"):
+        validate_repair_preservation(unknown, stripped)
+
+
 def test_m931_replan_exhaustion_persists_one_record_and_resume_feeds_the_next_turn(
     tmp_path, monkeypatch
 ):
