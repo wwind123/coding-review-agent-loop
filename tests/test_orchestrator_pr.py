@@ -13145,3 +13145,53 @@ def test_pr_board_amendment_managed_completion_names_the_reduced_board(
         if comment.startswith("Review completed on a reduced reviewer board.")
     ]
     assert len(notes) == 1
+
+
+def test_pr_board_amendment_qualification_refuses_a_digest_on_a_contract_neutral_record(
+    tmp_path, monkeypatch
+):
+    """Row digest-binding at the gate: a neutral record carrying a digest blocks merge."""
+    from coding_review_agent_loop.board_amendment import collect_reviewer_board_amendments
+
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    template = _m943_amendment_from_error(str(excinfo.value))
+    _m943_append(runner, template)
+    (amendment,) = collect_reviewer_board_amendments(
+        [SimpleNamespace(body=template)], flow="pr", pr_number=77
+    )
+    neutral = _attach_round_metadata(
+        _staged_review(reviewer="OpenAI Codex"),
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=9, subject="abc123",
+            reviewer_board_amendment_digest=amendment.digest,
+        ),
+    )
+    assert orchestrator._extract_round_metadata_records(
+        [SimpleNamespace(body=neutral)], flow="pr"
+    )[0].metadata.scheduler_metadata_status == "absent"
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    injected = []
+
+    def wait_and_inject(*args, **kwargs):
+        _m943_append(runner, neutral, login="bot")
+        injected.append(True)
+        return ManagedCiOutcome(status="passed", head_sha="abc123")
+
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait_and_inject)
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("a neutral digest must block merge")
+    )
+    monkeypatch.setattr(
+        orchestrator, "_merge_with_exact_head_proof",
+        lambda *args, **kwargs: pytest.fail("a neutral digest must block merge"),
+    )
+    with pytest.raises(AgentLoopError, match="(?i)no qualification or merge is permitted") as gate:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert injected
+    assert "contract-neutral" in str(gate.value)

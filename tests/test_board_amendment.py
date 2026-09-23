@@ -464,3 +464,27 @@ def test_signed_amendment_with_invalid_json_is_reported():
     # An unrelated signed fence with invalid JSON is not an amendment diagnostic.
     unrelated = "```json\n{not json\n```\n-- Human Reviewer"
     assert parse_reviewer_board_amendment_records(unrelated, comment_locator="c") == ((), ())
+
+
+def test_malformed_amendment_comment_is_not_a_signed_requirement_on_issue_or_pr():
+    from coding_review_agent_loop.board_amendment import is_reviewer_board_amendment_only
+    from coding_review_agent_loop.github import (
+        _parse_issue_human_requirements,
+        _parse_pr_human_requirements,
+    )
+    from coding_review_agent_loop.protocol import parse_signed_human_requirement_body
+
+    valid = _amendment_body()
+    malformed = valid.replace('"flow": "plan",', '"flow": "plan"')  # invalid JSON
+    # Discovery still reports it as an ignored malformed record.
+    _records, ignored = parse_reviewer_board_amendment_records(malformed, comment_locator="c")
+    assert ignored and "invalid JSON" in ignored[0]
+    assert is_reviewer_board_amendment_only(parse_signed_human_requirement_body(malformed))
+    ordinary = "Please keep the CLI flag stable.\n-- Human Reviewer"
+    comments = [{"body": malformed}, {"body": valid}, {"body": ordinary}]
+    for parse in (_parse_issue_human_requirements, _parse_pr_human_requirements):
+        parsed = parse({"comments": comments})
+        assert [item.body for item in parsed] == ["Please keep the CLI flag stable."]
+    # Malformed JSON mixed with other text stays a signed requirement.
+    mixed = malformed.replace("Reviewer board amendment:", "Also rename the flag.")
+    assert not is_reviewer_board_amendment_only(parse_signed_human_requirement_body(mixed))

@@ -313,6 +313,12 @@ def is_reviewer_board_amendment_only(signed_body: str | None) -> bool:
         try:
             payload = json.loads(match.group("body"))
         except json.JSONDecodeError:
+            # A malformed amendment fence (the same shape discovery reports
+            # as an ignored record) is still an orchestration record, never
+            # a requirement on the reviewed artifact.
+            if REVIEWER_BOARD_AMENDMENT_KIND in match.group("body"):
+                found = True
+                return ""
             return match.group(0)
         if isinstance(payload, dict) and payload.get("kind") == REVIEWER_BOARD_AMENDMENT_KIND:
             found = True

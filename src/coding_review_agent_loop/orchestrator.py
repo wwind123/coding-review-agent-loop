@@ -15874,6 +15874,7 @@ def _fresh_pr_qualification_snapshot(
         fresh_scheduler_records = _extract_round_metadata_records(
             context.comments, flow="pr"
         )
+        superseded_invalid_indexes: set[int] = set()
         for record_position, record in enumerate(fresh_scheduler_records):
             status = record.metadata.scheduler_metadata_status
             if status == "invalid":
@@ -15888,6 +15889,7 @@ def _fresh_pr_qualification_snapshot(
                     # Resume recovery deliberately selected the full board.
                     # A later completed reconciliation checkpoint supersedes
                     # this historical malformed optimization record.
+                    superseded_invalid_indexes.add(record.index)
                     continue
                 raise AgentLoopError(
                     "Malformed or contradictory PR review scheduler metadata was observed "
@@ -15912,11 +15914,15 @@ def _fresh_pr_qualification_snapshot(
         # Pre-amendment contracts are accepted only by the lineage rules, and
         # a post-amendment record only with the exact amendment digest.
         try:
+            # Every fresh record takes part, contract-neutral ones included,
+            # so a digest on a coder or reviewer record posted during managed
+            # CI fails closed; only an invalid optimization record already
+            # superseded by the recovery rule above is left out.
             resolve_contract_lineage(
                 tuple(
                     record
                     for record in fresh_scheduler_records
-                    if record.metadata.scheduler_metadata_status == "valid"
+                    if record.index not in superseded_invalid_indexes
                 ),
                 collect_reviewer_board_amendments(
                     context.comments, flow="pr", pr_number=pr_number
