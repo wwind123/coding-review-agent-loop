@@ -1374,7 +1374,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
         require_risk_test_matrix_contract=True,
         authoritative_test_observations=(current,),
         delivered_risk_test_matrix_row_ids=plan_context.risk_test_matrix_expected_row_ids,
-        execution_catalog=(current,),
+        execution_catalog=(current,), architecture_status_mode="legacy",
     )
     assert initial_parsed.pr_number == 77
     initial_claim = initial_parsed.risk_test_matrix_claims.claims[0]
@@ -10497,9 +10497,13 @@ def _deg_task_text(impact, outcome="opened_pr"):
     return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
 
 
-def _deg_issue_validate(text):
-    return orchestrator_module._validate_issue_implementation_response(
-        text, human_requirements=(), require_architecture_impact=True
+def _deg_issue_validators():
+    """The opt-in degradable validate and its strict re-parse, as call sites build them."""
+    return orchestrator_module._architecture_mode_validators(
+        lambda mode: lambda text: orchestrator_module._validate_issue_implementation_response(
+            text, human_requirements=(), require_architecture_impact=True,
+            architecture_status_mode=mode,
+        )
     )
 
 
@@ -10517,7 +10521,7 @@ def test_seam_refuses_and_retains_an_unsatisfied_response(tmp_path, impact, reco
         orchestrator_module._run_validated_agent(
             runner, agent="claude", config=config, prompt="Implement.",
             marker_description="structured issue_implementation result",
-            validate=_deg_issue_validate,
+            **_deg_issue_validators(),
             require_architecture_impact_contract=True,
         )
 
@@ -10538,9 +10542,15 @@ def test_seam_accepts_a_corroborated_near_miss_with_its_record(tmp_path):
     response = orchestrator_module._run_validated_agent(
         runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
         prompt="Implement.", marker_description="structured issue_implementation result",
-        validate=_deg_issue_validate, require_architecture_impact_contract=True,
+        **_deg_issue_validators(), require_architecture_impact_contract=True,
     )
     assert response.marker_value.architecture_impact.status == "changed"
+    # The accepted text is canonical: it re-parses strictly and no longer
+    # carries the near miss.
+    assert '"modified"' not in response.text
+    assert validate_structured_issue_implementation(
+        response.text, required_architecture_impact_contract=1
+    ).architecture_impact.status == "changed"
     assert [r.outcome for r in response.marker_value.architecture_impact_degradations] == [
         "normalized-to-changed"
     ]
@@ -10566,13 +10576,13 @@ def test_unsatisfied_conflict_payload_is_not_hidden_by_the_conflict_wrapper():
 
 def test_unsatisfied_blocking_task_is_not_hidden_by_the_no_pr_wrapper(tmp_path):
     result = orchestrator_module._require_task_implementation_result(
-        _deg_task_text(None, outcome="blocking"), required_architecture_impact_contract=1
+        _deg_task_text(None, outcome="blocking"), required_architecture_impact_contract=1, architecture_status_mode="legacy"
     )
     assert not isinstance(result, orchestrator_module._TerminalNoPrImplementation)
     assert orchestrator_module.architecture_impact_contract_unsatisfied(result)
     satisfied = orchestrator_module._require_task_implementation_result(
         _deg_task_text({"status": "unchanged", "rationale": "No change."}, outcome="blocking"),
-        required_architecture_impact_contract=1,
+        required_architecture_impact_contract=1, architecture_status_mode="legacy",
     )
     assert isinstance(satisfied, orchestrator_module._TerminalNoPrImplementation)
 
@@ -10582,7 +10592,7 @@ def test_unsatisfied_blocking_task_is_not_hidden_by_the_no_pr_wrapper(tmp_path):
             runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
             prompt="Task.", marker_description="structured task_result JSON",
             validate=lambda text: orchestrator_module._require_task_implementation_result(
-                text, required_architecture_impact_contract=1
+                text, required_architecture_impact_contract=1, architecture_status_mode="legacy"
             ),
             require_architecture_impact_contract=True,
         )
@@ -10619,10 +10629,12 @@ def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kin
     factory = structured_plan_state if kind == "plan_state" else structured_plan_revision
     source = _deg_with(factory(), _DEG_UNCORROBORATED, unexpected_key=True)
     repaired = _deg_with(factory(), None)
-    validator = (
-        (lambda text: validate_structured_plan_state(text, required_architecture_impact_contract=1))
+    validators = orchestrator_module._architecture_mode_validators(
+        (lambda mode: lambda text: validate_structured_plan_state(
+            text, required_architecture_impact_contract=1, architecture_status_mode=mode))
         if kind == "plan_state"
-        else (lambda text: _deg_validate_plan_revision(text, required_architecture_impact_contract=1))
+        else (lambda mode: lambda text: _deg_validate_plan_revision(
+            text, required_architecture_impact_contract=1, architecture_status_mode=mode))
     )
     persisted = []
     runner = _FakeRunner(claude_outputs=[source])
@@ -10631,7 +10643,7 @@ def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kin
             orchestrator_module._run_validated_agent(
                 runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
                 prompt="Plan.", marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                validate=validator, use_repair=True, repair_expected_kind=kind,
+                **validators, use_repair=True, repair_expected_kind=kind,
                 require_architecture_impact_contract=True,
                 plan_validation_failure_handler=lambda exhaustion, err: persisted.append(exhaustion),
             )
@@ -10676,18 +10688,19 @@ def make_config_for_metadata():
     [
         ("issue_implementation", lambda: validate_structured_issue_implementation(
             _deg_with(structured_issue_implementation(), _DEG_CORROBORATED),
-            required_architecture_impact_contract=1)),
+            required_architecture_impact_contract=1, architecture_status_mode="degradable")),
         ("task_result", lambda: _deg_validate_task_result(
-            _deg_task_text(_DEG_CORROBORATED), required_architecture_impact_contract=1)),
+            _deg_task_text(_DEG_CORROBORATED), required_architecture_impact_contract=1,
+            architecture_status_mode="degradable")),
         ("plan_state", lambda: validate_structured_plan_state(
             _deg_with(structured_plan_state(), _DEG_CORROBORATED),
-            required_architecture_impact_contract=1)),
+            required_architecture_impact_contract=1, architecture_status_mode="degradable")),
         ("plan_revision", lambda: _deg_validate_plan_revision(
             _deg_with(structured_plan_revision(), _DEG_CORROBORATED),
-            required_architecture_impact_contract=1)),
+            required_architecture_impact_contract=1, architecture_status_mode="degradable")),
         ("coder_followup", lambda: _deg_validate_coder_followup(
             _deg_with(_deg_coder_followup(), _DEG_CORROBORATED),
-            required_architecture_impact_contract=1)),
+            required_architecture_impact_contract=1, architecture_status_mode="degradable")),
     ],
 )
 def test_accepted_non_review_carrier_persists_and_renders_its_record(name, parse):
@@ -10704,7 +10717,8 @@ def test_accepted_non_review_carrier_persists_and_renders_its_record(name, parse
 
 def test_accepted_conflict_wrapper_persists_its_record():
     parsed = validate_structured_issue_implementation(
-        _deg_with(structured_issue_implementation(), _DEG_CORROBORATED)
+        _deg_with(structured_issue_implementation(), _DEG_CORROBORATED),
+        architecture_status_mode="degradable",
     )
     wrapped = orchestrator_module._TerminalIssueImplementationConflict(parsed)
     fields = orchestrator_module._architecture_metadata_fields(make_config_for_metadata(), result=wrapped)

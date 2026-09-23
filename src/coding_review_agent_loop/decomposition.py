@@ -802,21 +802,31 @@ def _required_text(payload: dict[str, object], key: str, *, phase_title: str) ->
 
 
 def parse_plan_decomposition(
-    text: str, *, required_architecture_impact_contract: int = 0
+    text: str,
+    *,
+    required_architecture_impact_contract: int = 0,
+    architecture_status_mode: str = "strict",
 ) -> PlanDecomposition:
     payload = _extract_json_object(text)
     if payload.get("kind") not in (None, "plan_decomposition"):
         raise AgentLoopError("Invalid plan decomposition: `kind` must be `plan_decomposition`.")
-    # Fresh decomposition responses degrade only the status near miss; an
-    # absent or undetermined required assessment is returned as an
-    # unsatisfied contract for the orchestration seam to refuse (#925).
+    # Only the fresh agent-response parse opts into degradation; an absent
+    # or undetermined required assessment is returned as an unsatisfied
+    # contract for the orchestration seam to refuse (#925).
     impact = None
     degradations: tuple[ParseDegradation, ...] = ()
     if "architecture_impact" in payload:
-        impact, record = parse_architecture_impact_degradable(
-            payload["architecture_impact"], context="plan_decomposition.architecture_impact"
-        )
-        degradations = () if record is None else (record,)
+        if architecture_status_mode == "degradable":
+            impact, record = parse_architecture_impact_degradable(
+                payload["architecture_impact"], context="plan_decomposition.architecture_impact"
+            )
+            degradations = () if record is None else (record,)
+        else:
+            impact = parse_architecture_impact(
+                payload["architecture_impact"],
+                context="plan_decomposition.architecture_impact",
+                architecture_status_mode=architecture_status_mode,
+            )
     impact_contract = architecture_impact_contract_for(
         impact, required=required_architecture_impact_contract == 1
     )

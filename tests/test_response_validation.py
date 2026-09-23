@@ -48,7 +48,7 @@ def test_validate_review_response_accepts_structured_pr_review():
         + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
     )
 
-    parsed = _validate_review_response(review, reviewer="OpenAI Codex", unresolved_items=())
+    parsed = _validate_review_response(review, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy")
 
     assert parsed.summary == "Need one more regression test before merge."
     assert [item.text for item in parsed.blocking_items] == [
@@ -89,7 +89,7 @@ def test_machine_obligation_must_be_dispositioned_but_resolution_is_advisory():
     parsed = _validate_review_response(
         review,
         reviewer="OpenAI Codex",
-        unresolved_items=(machine_item,),
+        unresolved_items=(machine_item,), architecture_status_mode="legacy",
     )
     retained, _ = _apply_unresolved_item_dispositions(
         (machine_item,),
@@ -148,7 +148,7 @@ def test_validate_coder_followup_response_accepts_structured_item_partition():
     parsed = _validate_coder_followup_response(
         response,
         unresolved_items=unresolved_items,
-        human_requirements=(),
+        human_requirements=(), architecture_status_mode="legacy",
     )
 
     assert parsed.addressed_items == ("item-1",)
@@ -184,7 +184,7 @@ def test_validate_coder_followup_response_requires_visible_future_item():
         _validate_coder_followup_response(
             response,
             unresolved_items=unresolved_items,
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         )
 
 
@@ -215,7 +215,7 @@ def test_coder_namespace_keeps_machine_items_and_separates_ack_record():
     parsed = _validate_coder_followup_response(
         response,
         unresolved_items=(machine_item, ack_item),
-        human_requirements=(),
+        human_requirements=(), architecture_status_mode="legacy",
     )
     rendered = format_coder_followup_context((machine_item, ack_item))
 
@@ -249,7 +249,7 @@ def test_validate_coder_followup_response_uses_disposition_aware_requirement_led
             item_id="item-1", reviewer="OpenAI Codex", source_round=1,
             text="Add a regression test.", status="blocking",
         ),),
-        human_requirements=(requirement,),
+        human_requirements=(requirement,), architecture_status_mode="legacy",
     )
     assert parsed.human_requirements.addressed_ids == ()
 
@@ -274,7 +274,7 @@ def test_validate_coder_followup_response_rejects_mismatched_requirement_ledger(
                 item_id="item-1", reviewer="OpenAI Codex", source_round=1,
                 text="Add a regression test.", status="blocking",
             ),),
-            human_requirements=(requirement,),
+            human_requirements=(requirement,), architecture_status_mode="legacy",
         )
 
 def test_validate_coder_followup_response_rejects_issue_acceptance_criteria_as_human_requirement():
@@ -298,7 +298,7 @@ def test_validate_coder_followup_response_rejects_issue_acceptance_criteria_as_h
                     status="blocking",
                 ),
             ),
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         )
 
 def test_validate_coder_followup_response_rejects_requirement_label_when_none_surfaced():
@@ -323,7 +323,7 @@ def test_validate_coder_followup_response_rejects_requirement_label_when_none_su
                     status="blocking",
                 ),
             ),
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         )
 
 def test_validate_coder_followup_response_accepts_surfaced_requirement_label():
@@ -353,7 +353,7 @@ def test_validate_coder_followup_response_accepts_surfaced_requirement_label():
                 status="blocking",
             ),
         ),
-        human_requirements=(requirement,),
+        human_requirements=(requirement,), architecture_status_mode="legacy",
     )
 
     assert parsed.human_requirements.addressed_ids == (requirement.requirement_id,)
@@ -387,7 +387,7 @@ def test_validate_coder_followup_response_rejects_mixed_valid_and_invalid_requir
                     url="https://github.com/OWNER/REPO/pull/1#issuecomment-1",
                     body="Add coverage for the rejected label case.",
                 ),
-            ),
+            ), architecture_status_mode="legacy",
         )
 
 @pytest.mark.parametrize(
@@ -442,7 +442,7 @@ def test_validate_coder_followup_response_rejects_invalid_structured_item_partit
         _validate_coder_followup_response(
             response,
             unresolved_items=unresolved_items,
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         )
 
 def test_validate_coder_followup_response_rejects_marker_only_markdown():
@@ -450,7 +450,7 @@ def test_validate_coder_followup_response_rejects_marker_only_markdown():
         _validate_coder_followup_response(
             "Updated the PR.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
             unresolved_items=(),
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         )
 
 def test_validate_coder_followup_response_requires_regular_synthetic_human_requirement_item():
@@ -481,7 +481,7 @@ def test_validate_coder_followup_response_requires_regular_synthetic_human_requi
         _validate_coder_followup_response(
             response,
             unresolved_items=unresolved_items,
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         )
 
 def test_apply_unresolved_item_dispositions_preserves_claim_and_appends_notes():
@@ -776,7 +776,7 @@ def test_validate_coder_followup_response_accepts_disputed_items():
     parsed = _validate_coder_followup_response(
         response,
         unresolved_items=unresolved_items,
-        human_requirements=(),
+        human_requirements=(), architecture_status_mode="legacy",
     )
 
     assert isinstance(parsed, StructuredCoderFollowup)
@@ -829,7 +829,7 @@ def test_validate_coder_followup_response_rejects_missing_item_when_disputed_not
         _validate_coder_followup_response(
             response,
             unresolved_items=unresolved_items,
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         )
 
 

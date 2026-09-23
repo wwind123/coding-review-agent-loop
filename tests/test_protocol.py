@@ -137,7 +137,7 @@ def test_issue_implementation_protocol_preserves_positive_pr_blocked_conflict():
     )
     result = _validate_issue_implementation_response(
         text,
-        human_requirements=(requirement,),
+        human_requirements=(requirement,), architecture_status_mode="legacy",
     )
 
     assert isinstance(result, _TerminalIssueImplementationConflict)
@@ -1035,7 +1035,7 @@ def test_validate_plan_review_response_rejects_duplicate_item_ids():
                     text="Keep the extra regression coverage.",
                     status="same-plan",
                 ),
-            ),
+            ), architecture_status_mode="legacy",
         )
 
 
@@ -1058,7 +1058,7 @@ def test_validate_plan_review_response_rejects_unknown_item_ids():
                     text="Keep the extra regression coverage.",
                     status="same-plan",
                 ),
-            ),
+            ), architecture_status_mode="legacy",
         )
 
 
@@ -1073,7 +1073,7 @@ def test_validate_plan_review_response_rejects_unknown_item_with_empty_prior_led
         _validate_plan_review_response(
             review,
             reviewer="OpenAI Codex",
-            unresolved_items=(),
+            unresolved_items=(), architecture_status_mode="legacy",
         )
 
     assert exc_info.value.unknown_ids == ("item-1",)
@@ -1113,7 +1113,7 @@ def test_validate_plan_review_response_describes_same_round_unknown_item():
             review,
             reviewer="OpenAI Codex",
             unresolved_items=(),
-            current_round_items=(current_round_item,),
+            current_round_items=(current_round_item,), architecture_status_mode="legacy",
         )
 
     assert "item-2" in exc_info.value.same_round_description
@@ -1147,7 +1147,7 @@ def test_validate_plan_review_response_accepts_structured_resolved_dispositions(
                 text="Clarify the fallback trigger.",
                 status="blocking",
             ),
-        ),
+        ), architecture_status_mode="legacy",
     )
 
     assert [(item.item_id, item.disposition) for item in parsed.dispositions] == [
@@ -1184,7 +1184,7 @@ def test_validate_plan_review_response_rejects_missing_structured_dispositions()
                     text="Clarify the fallback trigger.",
                     status="blocking",
                 ),
-            ),
+            ), architecture_status_mode="legacy",
         )
 
 
@@ -1345,7 +1345,7 @@ def test_validate_review_response_accepts_structured_resolved_dispositions():
                 text="Keep the PR body issue reference.",
                 status="blocking",
             ),
-        ),
+        ), architecture_status_mode="legacy",
     )
 
     assert [(item.item_id, item.disposition) for item in parsed.dispositions] == [
@@ -1365,7 +1365,7 @@ def test_validate_review_response_rejects_unknown_item_with_empty_prior_ledger()
         _validate_review_response(
             review,
             reviewer="OpenAI Codex",
-            unresolved_items=(),
+            unresolved_items=(), architecture_status_mode="legacy",
         )
 
     assert exc_info.value.unknown_ids == ("item-1",)
@@ -1396,7 +1396,7 @@ def test_validate_review_response_rejects_ambiguous_blanket_prose():
                     text="Rename the helper.",
                     status="same-pr",
                 ),
-            ),
+            ), architecture_status_mode="legacy",
         )
 
 
@@ -3286,7 +3286,7 @@ def test_fresh_task_contract_rejects_legacy_marker_only_output():
         from coding_review_agent_loop.orchestrator import _require_task_implementation_result
         _require_task_implementation_result(
             "Implemented.\n<!-- AGENT_PR: 12 -->\n<!-- AGENT_STATE: blocking -->",
-            required_architecture_impact_contract=1,
+            required_architecture_impact_contract=1, architecture_status_mode="legacy",
         )
 
 
@@ -3756,7 +3756,7 @@ def test_unversioned_plans_keep_explicit_legacy_typed_stages_materializable():
 def test_validate_plan_revision_response_rejects_marker_only_markdown():
     with pytest.raises(AgentLoopError, match="Plan revision did not use the required structured format"):
         _validate_plan_revision_response(
-            "Revised plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+            "Revised plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex", architecture_status_mode="legacy"
         )
 
 
@@ -3775,7 +3775,7 @@ def test_validate_plan_revision_response_rejects_unknown_prior_disposition():
     )
 
     with pytest.raises(UnknownPriorItemDispositionError) as exc_info:
-        _validate_plan_revision_response(revision, unresolved_items=(active_item,))
+        _validate_plan_revision_response(revision, unresolved_items=(active_item,), architecture_status_mode="legacy")
 
     assert exc_info.value.unknown_ids == ("item-15",)
     assert exc_info.value.allowed_ids == ("item-12",)
@@ -5035,19 +5035,24 @@ def _required_validators():
     """(name, text factory, validator) for the five protocol enforcement points."""
     return [
         ("coder_followup", _deg_coder_followup,
-         lambda text: validate_structured_coder_followup(text, required_architecture_impact_contract=1)),
+         lambda text: validate_structured_coder_followup(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
         ("issue_implementation", _deg_issue_implementation,
-         lambda text: validate_structured_issue_implementation(text, required_architecture_impact_contract=1)),
+         lambda text: validate_structured_issue_implementation(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
         ("task_result", lambda: json.dumps({
             "schema_version": 1, "kind": "task_result", "state": "blocking",
             "outcome": "opened_pr", "summary": "Done.", "pr_number": 4,
             "architecture_impact": {"status": "unchanged", "rationale": "No change."},
         }) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
-         lambda text: validate_structured_task_result(text, required_architecture_impact_contract=1)),
+         lambda text: validate_structured_task_result(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
         ("plan_revision", _deg_plan_revision,
-         lambda text: validate_structured_plan_revision(text, required_architecture_impact_contract=1)),
+         lambda text: validate_structured_plan_revision(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
         ("plan_state", _deg_plan_state,
-         lambda text: validate_structured_plan_state(text, required_architecture_impact_contract=1)),
+         lambda text: validate_structured_plan_state(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
     ]
 
 
@@ -5112,10 +5117,12 @@ def test_non_required_parse_keeps_contract_unrequired():
 
 def test_review_parsers_carry_degradation_records():
     pr = parse_structured_pr_review(
-        _with_impact(_deg_pr_review(), _deg_uncorroborated()), reviewer="OpenAI Codex"
+        _with_impact(_deg_pr_review(), _deg_uncorroborated()), reviewer="OpenAI Codex",
+        architecture_status_mode="degradable",
     )
     plan = parse_structured_plan_review(
-        _with_impact(_deg_plan_review(), _deg_uncorroborated()), reviewer="OpenAI Codex"
+        _with_impact(_deg_plan_review(), _deg_uncorroborated()), reviewer="OpenAI Codex",
+        architecture_status_mode="degradable",
     )
     for parsed, kind in ((pr, "pr_review"), (plan, "plan_review")):
         assert parsed.architecture_impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
@@ -5166,7 +5173,9 @@ def test_plan_review_keeps_envelope_for_modified_architecture_status_916():
         "architecture_impact": _changed_architecture_impact("modified"),
     }) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
 
-    parsed = parse_structured_plan_review(payload, reviewer="OpenAI Codex")
+    parsed = parse_structured_plan_review(
+        payload, reviewer="OpenAI Codex", architecture_status_mode="degradable"
+    )
 
     # A fresh review degrades the uncorroborated near miss (#925) rather than
     # rejecting the round; the #916 synonym table is now the explicit legacy

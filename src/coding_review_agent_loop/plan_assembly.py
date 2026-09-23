@@ -197,9 +197,10 @@ def _parse_wire_plan_payload(payload: Mapping[str, object]) -> StructuredPlanRev
     )
     kind = payload.get("kind")
     if kind == "plan_revision":
-        parsed = validate_structured_plan_revision(text)
+        # Stored plans re-authenticate in the explicit legacy decode (#925).
+        parsed = validate_structured_plan_revision(text, architecture_status_mode="legacy")
     elif kind == "plan_state":
-        parsed = validate_structured_plan_state(text)
+        parsed = validate_structured_plan_state(text, architecture_status_mode="legacy")
     else:
         raise AgentLoopError("Authenticated plan base must be plan_revision or plan_state.")
     if parsed is None:

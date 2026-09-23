@@ -750,7 +750,7 @@ def test_codex_chatgpt_unsupported_model_public_response_skips_retry_repair_and_
                 validate=lambda text: _validate_review_response(
                     text,
                     reviewer="OpenAI Codex",
-                    unresolved_items=(),
+                    unresolved_items=(), architecture_status_mode="legacy",
                 ),
                 use_repair=True,
                 repair_expected_kind="pr_review",
@@ -866,7 +866,7 @@ def test_structured_plan_review_transient_terms_with_trailing_prose_normalizes(t
             validate=lambda text: _validate_plan_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="plan_review",
@@ -909,7 +909,7 @@ def test_structured_pr_review_transient_terms_duplicate_footer_normalizes(tmp_pa
             validate=lambda text: _validate_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -976,7 +976,7 @@ def test_structured_coder_followup_transient_terms_before_footer_runs_repair(tmp
             validate=lambda text: _validate_coder_followup_response(
                 text,
                 unresolved_items=unresolved_items,
-                human_requirements=(),
+                human_requirements=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="coder_followup",
@@ -1029,7 +1029,7 @@ def test_run_validated_agent_recovers_coder_followup_from_message_text_when_resp
         validate=lambda text: _validate_coder_followup_response(
             text,
             unresolved_items=unresolved_items,
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         ),
         repair_expected_kind="coder_followup",
     )
@@ -1071,7 +1071,7 @@ def test_run_validated_agent_recovers_fenced_coder_followup_from_raw_stdout(tmp_
         validate=lambda text: _validate_coder_followup_response(
             text,
             unresolved_items=unresolved_items,
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         ),
         repair_expected_kind="coder_followup",
     )
@@ -1194,7 +1194,7 @@ def test_malformed_structured_review_model_support_terms_still_runs_repair(tmp_p
             validate=lambda text: _validate_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -4309,7 +4309,7 @@ def test_claude_self_update_replay_recovers_valid_response_with_remaining_timeou
         prompt="Review the PR.",
         marker_description="<!-- AGENT_STATE: approved|blocking -->",
         validate=lambda text: _validate_review_response(
-            text, reviewer="Anthropic Claude", unresolved_items=()
+            text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
         ),
         timeout_seconds=12,
     )
@@ -4359,7 +4359,7 @@ def test_claude_self_update_stability_failure_preserves_ordinary_retry_budget(tm
         prompt="Review the PR.",
         marker_description="<!-- AGENT_STATE: approved|blocking -->",
         validate=lambda text: _validate_review_response(
-            text, reviewer="Anthropic Claude", unresolved_items=()
+            text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
         ),
     )
 
@@ -4402,7 +4402,7 @@ def test_claude_self_update_stability_failure_sets_final_category(tmp_path):
             prompt="Review the PR.",
             marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Anthropic Claude", unresolved_items=()
+                text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4447,7 +4447,7 @@ def test_claude_replay_refusal_is_diagnostic_only_and_does_not_wait_or_override_
                 prompt="Review the PR.",
                 marker_description="<!-- AGENT_STATE: approved|blocking -->",
                 validate=lambda text: _validate_review_response(
-                    text, reviewer="Anthropic Claude", unresolved_items=()
+                    text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
                 ),
                 usage_context=usage,
             )
@@ -4478,7 +4478,7 @@ def test_transient_claude_replay_refusal_keeps_provider_retry_and_category(tmp_p
             prompt="Review the PR.",
             marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Anthropic Claude", unresolved_items=()
+                text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4500,7 +4500,7 @@ def test_transient_claude_replay_refusal_only_retains_transient_category(tmp_pat
                 prompt="Review the PR.",
                 marker_description="<!-- AGENT_STATE: approved|blocking -->",
                 validate=lambda text: _validate_review_response(
-                    text, reviewer="Anthropic Claude", unresolved_items=()
+                    text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
                 ),
             )
 
@@ -4557,7 +4557,7 @@ def test_codex_executable_replacement_replay_uses_fresh_full_timeout(tmp_path):
             prompt="Review the PR.",
             marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=lambda text: _validate_review_response(
-                text, reviewer="OpenAI Codex", unresolved_items=()
+                text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
             ),
             timeout_seconds=60,
         )
@@ -4596,7 +4596,7 @@ def test_codex_replacement_replay_does_not_consume_ordinary_retry(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="OpenAI Codex", unresolved_items=()
+                text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4627,7 +4627,7 @@ def test_codex_replacement_exhaustion_keeps_specific_terminal_category(tmp_path)
                 prompt="Review the PR.",
                 marker_description="test",
                 validate=lambda text: _validate_review_response(
-                    text, reviewer="OpenAI Codex", unresolved_items=()
+                    text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
                 ),
             )
 
@@ -4660,7 +4660,7 @@ def test_codex_unstable_replacement_retains_ordinary_retry(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="OpenAI Codex", unresolved_items=()
+                text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4687,7 +4687,7 @@ def test_codex_replacement_context_does_not_change_long_quota_exit_priority(tmp_
                 prompt="Review the PR.",
                 marker_description="test",
                 validate=lambda text: _validate_review_response(
-                    text, reviewer="OpenAI Codex", unresolved_items=()
+                    text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
                 ),
             )
 
@@ -4747,7 +4747,7 @@ def test_gemini_replacement_replay_uses_fresh_timeout_and_provider_suffix(tmp_pa
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Gemini", unresolved_items=()
+                text, reviewer="Google Gemini", unresolved_items=(), architecture_status_mode="legacy"
             ),
             timeout_seconds=60,
         )
@@ -4786,7 +4786,7 @@ def test_gemini_unstable_replacement_preserves_ordinary_retry(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Gemini", unresolved_items=()
+                text, reviewer="Google Gemini", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4821,7 +4821,7 @@ def test_claude_quiet_unstable_replacement_keeps_ordinary_retry(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Anthropic Claude", unresolved_items=()
+                text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4869,7 +4869,7 @@ def test_antigravity_quiet_unstable_replacement_reaches_model_fallback(tmp_path)
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Antigravity", unresolved_items=()
+                text, reviewer="Google Antigravity", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4918,7 +4918,7 @@ def test_antigravity_replacement_replay_does_not_advance_model_state(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Antigravity", unresolved_items=()
+                text, reviewer="Google Antigravity", unresolved_items=(), architecture_status_mode="legacy"
             ),
             timeout_seconds=60,
         )
@@ -5088,7 +5088,7 @@ def test_orchestrator_retries_capture_diagnostics_as_tooling_failure(
                 prompt="Review the PR.",
                 marker_description="test",
                 validate=lambda value: _validate_review_response(
-                    value, reviewer="OpenAI Codex", unresolved_items=()
+                    value, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
                 ),
             )
 

@@ -296,7 +296,7 @@ def test_render_issue_implementation_conflict_explains_rejected_pr_handoff():
     )
     result = _validate_issue_implementation_response(
         text,
-        human_requirements=(requirement,),
+        human_requirements=(requirement,), architecture_status_mode="legacy",
     )
 
     assert isinstance(result, _TerminalIssueImplementationConflict)
@@ -2370,8 +2370,14 @@ def test_degraded_review_carriers_reach_round_metadata_and_summary():
 
     config = SimpleNamespace(architecture_context=None)
     for parsed, flow in (
-        (parse_structured_pr_review(_deg_review_text(structured_pr_review()), reviewer="OpenAI Codex"), "pr"),
-        (parse_structured_plan_review(_deg_review_text(structured_plan_review()), reviewer="OpenAI Codex"), "plan"),
+        (parse_structured_pr_review(
+            _deg_review_text(structured_pr_review()), reviewer="OpenAI Codex",
+            architecture_status_mode="degradable",
+        ), "pr"),
+        (parse_structured_plan_review(
+            _deg_review_text(structured_plan_review()), reviewer="OpenAI Codex",
+            architecture_status_mode="degradable",
+        ), "plan"),
     ):
         (record,) = parsed.architecture_impact_degradations
         fields = orchestrator_module._architecture_metadata_fields(config, result=parsed)

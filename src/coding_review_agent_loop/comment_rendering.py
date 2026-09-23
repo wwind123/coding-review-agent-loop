@@ -816,6 +816,29 @@ def render_decomposition_degradation_comment(records: Sequence[object]) -> str |
     return section + "\n\n-- coding-review-agent-loop"
 
 
+def render_refused_decomposition_comment(
+    records: Sequence[object], *, diagnostic: str
+) -> str:
+    """Plain parent-issue comment for a decomposition refused by its contract.
+
+    Posted once before the exhaustion error propagates; it carries no managed
+    record, and nothing was checkpointed or created.
+    """
+    section = render_parse_degradations_section(
+        records, heading="### Decomposition parse degradations"
+    )
+    lines = [section] if section is not None else [
+        "### Decomposition parse degradations",
+        "The required `architecture_impact` assessment was omitted.",
+    ]
+    lines.append(
+        "The decomposition was refused: no child issue was created and no topology "
+        "checkpoint was published."
+    )
+    lines.append(f"Diagnostic: {_degradation_cell(diagnostic)}")
+    return "\n".join(lines) + "\n\n-- coding-review-agent-loop"
+
+
 def render_deferred_stages_section(deferred_stages: Sequence[DeferredStage]) -> str | None:
     """Render declared deferred stages so they carry into the plan's markdown.
 

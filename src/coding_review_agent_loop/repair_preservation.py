@@ -8,11 +8,9 @@ import re
 
 from .errors import AgentLoopError
 from .protocol import (
-    ARCHITECTURE_IMPACT_NEAR_MISS_RULE,
-    ARCHITECTURE_IMPACT_STATUS_ALIASES,
     ParseDegradation,
     _extract_json_object_prefix,
-    architecture_impact_near_miss_corroborated,
+    classify_architecture_status_near_miss,
     _normalize_requirement_label,
     normalize_response_file_structured_text,
     parse_plan_revision_patch,
@@ -1369,6 +1367,41 @@ class ArchitectureNearMissNormalization:
     forbid_architecture_impact: bool
 
 
+def _rewrite_architecture_near_miss(raw: str) -> tuple[str, ParseDegradation | None, dict | None, bool]:
+    """Deterministically rewrite a top-level near miss to its wire-valid form.
+
+    A corroborated `modified` becomes `changed`; every other near miss has its
+    optional object removed.  Only the JSON object span is rewritten; the
+    footer and signature bytes that follow it are kept.
+    """
+    payload, trailing = _payload_and_trailing(raw)
+    impact = payload.get("architecture_impact") if isinstance(payload, dict) else None
+    if not isinstance(impact, dict):
+        return raw, None, payload, False
+    kind = payload.get("kind") if isinstance(payload.get("kind"), str) else "response"
+    near_miss = classify_architecture_status_near_miss(
+        impact, context=f"{kind}.architecture_impact"
+    )
+    if near_miss is None:
+        return raw, None, payload, False
+    resolved, record = near_miss
+    rewritten = dict(payload)
+    removed = resolved != "changed"
+    if removed:
+        rewritten.pop("architecture_impact")
+    else:
+        rewritten["architecture_impact"] = {**impact, "status": resolved}
+    normalized = json.dumps(rewritten, ensure_ascii=False) + (
+        trailing if trailing.startswith(("\n", "\r")) else "\n" + trailing.lstrip()
+    )
+    return normalized, record, rewritten, removed
+
+
+def canonicalize_architecture_near_miss_text(text: str) -> str:
+    """Return accepted text with any near-miss status in its wire-valid form."""
+    return _rewrite_architecture_near_miss(text)[0]
+
+
 def normalize_architecture_impact_near_miss(
     raw: str, *, required_contract: bool, expected_kind: str | None = None
 ) -> ArchitectureNearMissNormalization:
@@ -1376,40 +1409,17 @@ def normalize_architecture_impact_near_miss(
 
     Deterministic normalization runs before the LLM repair pass.  A
     corroborated `modified` becomes a wire-valid `changed` that preservation
-    then pins; an uncorroborated one has its whole optional object removed,
+    then pins; every other near miss has its whole optional object removed,
     which is exactly what the parser-only `undetermined` status stands for.
     Any other payload, including an unparseable one, is returned unchanged.
 
-    The absence pin applies to a recoverable source of the expected kind.  A
-    wrong-kind source is a kind-selection defect that preservation already
-    leaves to the caller's validator, exactly as before.
+    The absence pin has two triggers.  A normalization removal is pinned for
+    every kind, including optional-assessment reviews, so repair can never put
+    back a stronger claim.  Under a required contract, a recoverable source of
+    the expected kind that simply omits the assessment is pinned too.
     """
-    payload, trailing = _payload_and_trailing(raw)
-    record: ParseDegradation | None = None
-    normalized = raw
-    impact = payload.get("architecture_impact") if isinstance(payload, dict) else None
-    status = impact.get("status") if isinstance(impact, dict) else None
-    if isinstance(payload, dict) and isinstance(status, str) and status in ARCHITECTURE_IMPACT_STATUS_ALIASES:
-        kind = payload.get("kind") if isinstance(payload.get("kind"), str) else "response"
-        corroborated = architecture_impact_near_miss_corroborated(impact)
-        rewritten = dict(payload)
-        if corroborated:
-            rewritten["architecture_impact"] = {
-                **impact, "status": ARCHITECTURE_IMPACT_STATUS_ALIASES[status],
-            }
-        else:
-            rewritten.pop("architecture_impact")
-        record = ParseDegradation.build(
-            element_path=f"{kind}.architecture_impact.status",
-            rule=ARCHITECTURE_IMPACT_NEAR_MISS_RULE,
-            observed=status,
-            outcome="normalized-to-changed" if corroborated else "degraded-to-undetermined",
-        )
-        normalized = json.dumps(rewritten, ensure_ascii=False) + (
-            trailing if trailing.startswith(("\n", "\r")) else "\n" + trailing.lstrip()
-        )
-        payload = rewritten
-    forbid = bool(
+    normalized, record, payload, removed = _rewrite_architecture_near_miss(raw)
+    forbid = removed or bool(
         required_contract
         and isinstance(payload, dict)
         and "architecture_impact" not in payload

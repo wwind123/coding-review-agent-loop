@@ -3829,6 +3829,7 @@ def _resume_plan_round(
             if response_kind == "plan_revision":
                 parsed_revision = validate_structured_plan_revision(
                     coder_output,
+                    architecture_status_mode="legacy",
                     require_execution_strategy_contract=1,
                     require_risk_test_matrix_contract=(1 if matrix_metadata_version == 1 else 0),
                 )
@@ -3840,6 +3841,7 @@ def _resume_plan_round(
             elif response_kind == "plan_state":
                 parsed = validate_structured_plan_state(
                     coder_output,
+                    architecture_status_mode="legacy",
                     require_execution_strategy_contract=1,
                     require_risk_test_matrix_contract=(1 if matrix_metadata_version == 1 else 0),
                 )

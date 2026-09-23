@@ -157,7 +157,7 @@ def main() -> None:
                 delivered_risk_test_matrix_identity=ctx.get("risk_test_matrix_identity"),
                 require_risk_test_matrix_contract=args.require_risk_test_matrix_contract,
                 authoritative_test_observations=authoritative_test_observations,
-                delivered_risk_test_matrix_row_ids=ctx.get("risk_test_matrix_expected_row_ids"),
+                delivered_risk_test_matrix_row_ids=ctx.get("risk_test_matrix_expected_row_ids"), architecture_status_mode="legacy",
             )
             parsed = getattr(parsed_result, "parsed", parsed_result)
             rendered = render_public_agent_comment(

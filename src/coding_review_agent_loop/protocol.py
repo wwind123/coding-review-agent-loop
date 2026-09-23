@@ -530,28 +530,74 @@ def _non_blank_string_entries(value: object) -> bool:
     return isinstance(value, list) and any(isinstance(item, str) and item.strip() for item in value)
 
 
+def _near_miss_predicate_failure(payload: Mapping[str, object]) -> str | None:
+    """Return the first literal key that fails the positive-evidence predicate."""
+    # Literal keys only: the flow aliases do not satisfy the `changed`
+    # required-key check, so counting them here would reject the envelope.
+    for key in (
+        "affected_components", "dependencies", "execution_data_flows",
+        "persistence", "public_contracts", "security_boundaries",
+    ):
+        if not _non_blank_string_entries(payload.get(key)):
+            return key
+    action = payload.get("canonical_document_action")
+    if not isinstance(action, str) or not action.strip() or action.strip() == "no-change":
+        return "canonical_document_action"
+    path = payload.get("canonical_document_path")
+    if not isinstance(path, str) or not path.strip():
+        return "canonical_document_path"
+    rationale = payload.get("canonical_document_rationale")
+    if not (isinstance(rationale, str) and rationale.strip()):
+        return "canonical_document_rationale"
+    return None
+
+
 def architecture_impact_near_miss_corroborated(payload: Mapping[str, object]) -> bool:
     """Positive-evidence predicate: the payload itself settles `changed`.
 
     Key presence is not evidence.  Every changed-only list must hold a
     non-blank entry and the canonical-document fields must describe a real
-    document action; anything less leaves the status undetermined.
+    document action; anything less leaves the status undetermined.  Passing
+    implies every key the `changed` required-key check demands is present.
     """
-    for key in ("affected_components", "dependencies", "persistence", "public_contracts", "security_boundaries"):
-        if not _non_blank_string_entries(payload.get(key)):
-            return False
-    # Literal key only: the flow aliases do not satisfy the `changed`
-    # required-key check, so counting them here would reject the envelope.
-    if not _non_blank_string_entries(payload.get("execution_data_flows")):
-        return False
-    action = payload.get("canonical_document_action")
-    if not isinstance(action, str) or not action.strip() or action.strip() == "no-change":
-        return False
-    path = payload.get("canonical_document_path")
-    if not isinstance(path, str) or not path.strip():
-        return False
-    rationale = payload.get("canonical_document_rationale")
-    return isinstance(rationale, str) and bool(rationale.strip())
+    return _near_miss_predicate_failure(payload) is None
+
+
+ARCHITECTURE_IMPACT_CLOSED_ENUM_RULE = "status-not-in-closed-enum"
+
+
+def classify_architecture_status_near_miss(
+    impact: Mapping[str, object], *, context: str
+) -> tuple[str, ParseDegradation] | None:
+    """Classify a closed-enum near miss, or return None for any other status.
+
+    Exactly one alias is honored: a corroborated `modified` resolves to
+    `changed`.  Every other spelling of the legacy synonym table, and an
+    uncorroborated `modified`, resolves to the parser-only `undetermined` --
+    never to `unchanged`.  Declared and unknown values are not near misses.
+    """
+    status_value = impact.get("status")
+    if not isinstance(status_value, str) or status_value in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+        return None
+    if status_value in ARCHITECTURE_IMPACT_STATUS_ALIASES:
+        failure = _near_miss_predicate_failure(impact)
+        if failure is None:
+            resolved = ARCHITECTURE_IMPACT_STATUS_ALIASES[status_value]
+            rule = ARCHITECTURE_IMPACT_NEAR_MISS_RULE
+            outcome = "normalized-to-changed"
+        else:
+            resolved = ARCHITECTURE_IMPACT_UNDETERMINED
+            rule = f"{ARCHITECTURE_IMPACT_NEAR_MISS_RULE}; positive evidence missing: {failure}"
+            outcome = "degraded-to-undetermined"
+    elif status_value in _ARCHITECTURE_STATUS_SYNONYMS:
+        resolved = ARCHITECTURE_IMPACT_UNDETERMINED
+        rule = ARCHITECTURE_IMPACT_CLOSED_ENUM_RULE
+        outcome = "degraded-to-undetermined"
+    else:
+        return None
+    return resolved, ParseDegradation.build(
+        element_path=f"{context}.status", rule=rule, observed=status_value, outcome=outcome,
+    )
 
 
 def _parse_architecture_impact_degradable(
@@ -559,18 +605,11 @@ def _parse_architecture_impact_degradable(
 ) -> tuple[ArchitectureImpact, ParseDegradation | None]:
     """Parse an agent-supplied assessment, degrading only the status near miss."""
     payload = _expect_object(value, context=context)
-    status_value = payload.get("status")
-    if isinstance(status_value, str) and status_value in ARCHITECTURE_IMPACT_STATUS_ALIASES:
-        corroborated = architecture_impact_near_miss_corroborated(payload)
-        resolved = ARCHITECTURE_IMPACT_STATUS_ALIASES[status_value] if corroborated else ARCHITECTURE_IMPACT_UNDETERMINED
-        record = ParseDegradation.build(
-            element_path=f"{context}.status",
-            rule=ARCHITECTURE_IMPACT_NEAR_MISS_RULE,
-            observed=status_value,
-            outcome="normalized-to-changed" if corroborated else "degraded-to-undetermined",
-        )
-        return _parse_architecture_impact_payload(payload, context=context, status=resolved), record
-    return _parse_architecture_impact_payload(payload, context=context), None
+    near_miss = classify_architecture_status_near_miss(payload, context=context)
+    if near_miss is None:
+        return _parse_architecture_impact_payload(payload, context=context), None
+    resolved, record = near_miss
+    return _parse_architecture_impact_payload(payload, context=context, status=resolved), record
 
 
 def parse_architecture_impact_degradable(
@@ -580,7 +619,7 @@ def parse_architecture_impact_degradable(
     return _parse_architecture_impact_degradable(value, context=context)
 
 
-ARCHITECTURE_STATUS_MODES = frozenset({"strict", "legacy"})
+ARCHITECTURE_STATUS_MODES = frozenset({"strict", "legacy", "degradable"})
 
 
 def _parse_architecture_impact(
@@ -589,6 +628,8 @@ def _parse_architecture_impact(
     """Strict by default; `legacy` keeps the #916 synonym decode for stored text."""
     if architecture_status_mode not in ARCHITECTURE_STATUS_MODES:
         raise AgentLoopError(f"Unknown architecture_status_mode {architecture_status_mode!r}.")
+    if architecture_status_mode == "degradable":
+        raise AgentLoopError("Degradable parsing returns a record; use the response parsers.")
     return _parse_architecture_impact_payload(
         _expect_object(value, context=context),
         context=context,
@@ -4884,12 +4925,27 @@ def _expect_disposition_list(
     )
 
 
+def _check_architecture_status_mode(mode: str) -> str:
+    if mode not in ARCHITECTURE_STATUS_MODES:
+        raise AgentLoopError(f"Unknown architecture_status_mode {mode!r}.")
+    return mode
+
+
 def _degradable_response_impact(
-    payload: Mapping[str, object], *, context: str
+    payload: Mapping[str, object], *, context: str, mode: str = "strict"
 ) -> tuple[ArchitectureImpact | None, tuple[ParseDegradation, ...]]:
-    """Read an optional response assessment, degrading only its own status."""
+    """Read an optional response assessment in the caller's explicit mode.
+
+    Only `degradable` can produce a record or `undetermined`; `strict` accepts
+    exactly `changed`/`unchanged`, and `legacy` is the stored-text decode.
+    """
+    _check_architecture_status_mode(mode)
     if "architecture_impact" not in payload:
         return None, ()
+    if mode != "degradable":
+        return _parse_architecture_impact(
+            payload["architecture_impact"], context=context, architecture_status_mode=mode
+        ), ()
     impact, record = _parse_architecture_impact_degradable(payload["architecture_impact"], context=context)
     return impact, (() if record is None else (record,))
 
@@ -5022,7 +5078,9 @@ def _dedupe_pr_review_items(
     return ApprovedFollowups(same_pr=same_pr, future=future)
 
 
-def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | None:
+def parse_structured_pr_review(
+    text: str, *, reviewer: str, architecture_status_mode: str = "strict"
+) -> ParsedReview | None:
     payload = _extract_structured_pr_review_payload(text)
     if payload is None:
         return None
@@ -5063,7 +5121,7 @@ def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | No
         is_plan_review=False,
     )
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(
-        payload, context="pr_review.architecture_impact"
+        payload, mode=architecture_status_mode, context="pr_review.architecture_impact"
     )
     structured_blocking_items = blocking_items
     followups = _dedupe_pr_review_items(
@@ -5084,7 +5142,9 @@ def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | No
     )
 
 
-def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanReview | None:
+def parse_structured_plan_review(
+    text: str, *, reviewer: str, architecture_status_mode: str = "strict"
+) -> ParsedPlanReview | None:
     payload = _extract_structured_plan_review_payload(text)
     if payload is None:
         return None
@@ -5135,7 +5195,7 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
         context="plan_review.human_requirement_dispositions",
     )
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(
-        payload, context="plan_review.architecture_impact"
+        payload, mode=architecture_status_mode, context="plan_review.architecture_impact"
     )
     items = _dedupe_plan_review_items(
         PlanReviewItems(
@@ -5164,6 +5224,7 @@ def validate_structured_coder_followup(
     delivered_risk_test_matrix_row_ids: Sequence[str] | None = None,
     execution_catalog: Sequence[object] | None = None,
     allow_historical_canonical_evidence: bool = False,
+    architecture_status_mode: str = "strict",
 ) -> StructuredCoderFollowup | None:
     payload = _extract_structured_coder_followup_payload(text)
     if payload is None:
@@ -5251,7 +5312,7 @@ def validate_structured_coder_followup(
     # return the parsed result with an unsatisfied contract instead of
     # rejecting the envelope.  The orchestration seam refuses it (#925).
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(
-        payload, context="coder_followup.architecture_impact"
+        payload, mode=architecture_status_mode, context="coder_followup.architecture_impact"
     )
     architecture_impact_contract = architecture_impact_contract_for(
         architecture_impact, required=required_architecture_impact_contract == 1
@@ -5349,6 +5410,7 @@ def validate_structured_issue_implementation(
     delivered_risk_test_matrix_row_ids: Sequence[str] | None = None,
     execution_catalog: Sequence[object] | None = None,
     allow_historical_canonical_evidence: bool = False,
+    architecture_status_mode: str = "strict",
 ) -> StructuredIssueImplementation | None:
     """Parse and validate the strict issue-implementation result envelope.
 
@@ -5446,7 +5508,7 @@ def validate_structured_issue_implementation(
     # Missing claims remain a bounded, complete non-verified result at the
     # post-head builder boundary; they are not a reason to discard a PR.
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(
-        payload, context="issue_implementation.architecture_impact"
+        payload, mode=architecture_status_mode, context="issue_implementation.architecture_impact"
     )
     architecture_impact_contract = architecture_impact_contract_for(
         architecture_impact, required=required_architecture_impact_contract == 1
@@ -5497,6 +5559,8 @@ def parse_historical_structured_coder_followup(
     **kwargs: object,
 ) -> StructuredCoderFollowup | None:
     """Read an already-persisted follow-up without making it a fresh contract."""
+    # Stored text decodes in the explicit legacy mode, exactly as before #925.
+    kwargs.setdefault("architecture_status_mode", "legacy")
     return validate_structured_coder_followup(
         text, allow_historical_canonical_evidence=True, **kwargs
     )
@@ -5507,6 +5571,8 @@ def parse_historical_structured_issue_implementation(
     **kwargs: object,
 ) -> StructuredIssueImplementation | None:
     """Read an already-persisted implementation without making it a fresh contract."""
+    # Stored text decodes in the explicit legacy mode, exactly as before #925.
+    kwargs.setdefault("architecture_status_mode", "legacy")
     return validate_structured_issue_implementation(
         text, allow_historical_canonical_evidence=True, **kwargs
     )
@@ -5516,6 +5582,7 @@ def validate_structured_task_result(
     text: str,
     *,
     required_architecture_impact_contract: int = 0,
+    architecture_status_mode: str = "strict",
 ) -> StructuredTaskResult | None:
     """Validate the versioned task terminal envelope, when present."""
     normalized, _status = normalize_response_file_structured_text(text)
@@ -5555,7 +5622,7 @@ def validate_structured_task_result(
     if outcome != "clarification" and questions:
         raise AgentLoopError("task_result.clarification is only valid for clarification.")
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(
-        payload, context="task_result.architecture_impact"
+        payload, mode=architecture_status_mode, context="task_result.architecture_impact"
     )
     return StructuredTaskResult(
         schema_version=1, kind="task_result", state=state, outcome=outcome,
@@ -5577,6 +5644,7 @@ def validate_structured_plan_revision(
     require_risk_test_matrix_contract: int = 0,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
     require_child_dispositions: bool = False,
+    architecture_status_mode: str = "strict",
 ) -> StructuredPlanRevision | None:
     payload = _extract_structured_plan_revision_payload(text)
     if payload is None:
@@ -5642,7 +5710,7 @@ def validate_structured_plan_revision(
         min_length=1,
     )
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(
-        payload, context="plan_revision.architecture_impact"
+        payload, mode=architecture_status_mode, context="plan_revision.architecture_impact"
     )
     additional_closing_issue_ids = _expect_optional_issue_id_list(
         payload,
@@ -5687,6 +5755,7 @@ def validate_structured_plan_state(
     require_execution_strategy_contract: int = 0,
     require_risk_test_matrix_contract: int = 0,
     require_child_dispositions: bool = False,
+    architecture_status_mode: str = "strict",
 ) -> StructuredPlanState | None:
     payload = _extract_structured_plan_state_payload(text)
     if payload is None:
@@ -5730,7 +5799,7 @@ def validate_structured_plan_state(
     if state != "blocking":
         raise AgentLoopError("plan_state.state must be `blocking`.")
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(
-        payload, context="plan_state.architecture_impact"
+        payload, mode=architecture_status_mode, context="plan_state.architecture_impact"
     )
     return StructuredPlanState(
         schema_version=int(payload.get("schema_version", 1)),
@@ -6164,16 +6233,24 @@ def parse_review(text: str, *, reviewer: str) -> ParsedReview:
     )
 
 
-def parse_pr_review(text: str, *, reviewer: str) -> ParsedReview:
-    parsed = parse_structured_pr_review(text, reviewer=reviewer)
+def parse_pr_review(
+    text: str, *, reviewer: str, architecture_status_mode: str = "strict"
+) -> ParsedReview:
+    parsed = parse_structured_pr_review(
+        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+    )
     if parsed is not None:
         return parsed
     raise AgentLoopError("Agent response did not use the required structured format.")
 
 
-def parse_plan_review(text: str, *, reviewer: str) -> ParsedPlanReview:
+def parse_plan_review(
+    text: str, *, reviewer: str, architecture_status_mode: str = "strict"
+) -> ParsedPlanReview:
     """Parse a plan review, including state, structured plan items, and dispositions."""
-    parsed = parse_structured_plan_review(text, reviewer=reviewer)
+    parsed = parse_structured_plan_review(
+        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+    )
     if parsed is not None:
         return parsed
     raise AgentLoopError("Agent response did not use the required structured format.")
@@ -7454,7 +7531,11 @@ def _parse_plan_patch_field_value(field_name: str, value: object, *, context: st
         # status must never persist.  Name the route forward instead of the
         # generic enum message so the planner does not retry blindly (#924).
         status_value = value.get("status") if isinstance(value, Mapping) else None
-        if isinstance(status_value, str) and status_value in ARCHITECTURE_IMPACT_STATUS_ALIASES:
+        if (
+            isinstance(status_value, str)
+            and status_value not in ARCHITECTURE_IMPACT_DECLARED_STATUSES
+            and status_value in _ARCHITECTURE_STATUS_SYNONYMS
+        ):
             raise AgentLoopError(
                 f"{context}.status must be `changed` or `unchanged`; "
                 f"`{status_value}` is not accepted in a patch. Replace architecture_impact "

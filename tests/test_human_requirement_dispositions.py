@@ -93,7 +93,9 @@ def test_initial_plan_validator_checks_coder_dispositions():
                 f"- Requirement {requirement.requirement_id}: Grafana is planned.\n"
                 "<!-- AGENT_PLAN_STATE: blocking -->",
             ),
-            marker_validator=orchestrator._require_plan_state_or_clarification,
+            marker_validator=lambda text: orchestrator._require_plan_state_or_clarification(
+                text, architecture_status_mode="legacy"
+            ),
             human_requirements=(requirement,),
             requirement_scope="planning requirements",
             full_omission_fallback="Fetch the discussion.",

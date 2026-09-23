@@ -2017,10 +2017,15 @@ def test_near_miss_normalization_removes_uncorroborated_assessment():
     assert required.record.outcome == "degraded-to-undetermined"
     assert required.forbid_architecture_impact is True
     assert "undetermined" not in required.raw
+    # A normalization removal is pinned for every kind, including the
+    # optional-assessment reviews, so repair can never restore a claim.
     optional = normalize_architecture_impact_near_miss(
         _deg_text(_DEG_UNCORROBORATED), required_contract=False
     )
-    assert optional.forbid_architecture_impact is False
+    assert optional.forbid_architecture_impact is True
+    # A genuine omission is pinned only under a required contract.
+    omitted = normalize_architecture_impact_near_miss(_deg_text(None), required_contract=False)
+    assert omitted.forbid_architecture_impact is False
 
 
 @pytest.mark.parametrize(
@@ -2074,14 +2079,19 @@ def _deg_run_repair(tmp_path, source, repaired, *, path, required=True, kind="is
         return diagnostic
 
     validate = (
-        (lambda text: _deg_validate_issue_implementation(text, required_architecture_impact_contract=1))
+        (lambda text: _deg_validate_issue_implementation(
+            text, required_architecture_impact_contract=1, architecture_status_mode="degradable"
+        ))
         if kind == "issue_implementation"
-        else (lambda text: _deg_parse_pr_review(text, reviewer="OpenAI Codex"))
+        else (lambda text: _deg_parse_pr_review(
+            text, reviewer="OpenAI Codex", architecture_status_mode="degradable"
+        ))
     )
     extra = (
         {"require_architecture_impact_contract": True, "contract_refusal": contract_refusal}
         if required else {}
     )
+    extra["degrade_architecture_impact"] = True
     if path == "legacy":
         config = _deg_make_config(tmp_path)
         with patch.object(_deg_orchestrator, "attempt_repair", lambda raw, cmd, **kw: repaired):
@@ -2127,10 +2137,18 @@ def test_repair_of_uncorroborated_near_miss_is_refused_after_records_attach(tmp_
     (repaired, parsed, attempts), refusals = _deg_run_repair(
         tmp_path, source, repaired_text, path=path
     )
-    assert repaired.strip() == repaired_text.strip()
     assert parsed is None
     terminal = attempts[-1]
+    # The refused candidate is recorded on its own attempt; the execute path
+    # returns no accepted text at all.
+    assert terminal.output.strip() == repaired_text.strip()
+    if path == "execute":
+        assert repaired is None
     assert terminal.outcome == "architecture_contract_unsatisfied"
+    assert terminal.validation_result.architecture_impact is None
+    assert [r.outcome for r in terminal.validation_result.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
     assert "architecture_impact" in terminal.diagnostic
     assert [r.outcome for r in terminal.architecture_impact_degradations] == ["degraded-to-undetermined"]
     # The record was attached before the refusal ran.
@@ -2139,7 +2157,7 @@ def test_repair_of_uncorroborated_near_miss_is_refused_after_records_attach(tmp_
     assert [r.outcome for r in refused_parsed.architecture_impact_degradations] == [
         "degraded-to-undetermined"
     ]
-    assert "undetermined" not in repaired
+    assert "undetermined" not in terminal.output
 
 
 @pytest.mark.parametrize("path", ["legacy", "execute"])
