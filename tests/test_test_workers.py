@@ -1085,6 +1085,108 @@ def test_terminate_reports_unconfirmed_when_group_survives(monkeypatch):
     assert outcome.confirmed is False and outcome.count == 1
 
 
+def _wait_until(predicate, seconds):
+    import time
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def test_unconfirmed_survivor_keeps_the_worker_budget_lock_held(tmp_path, monkeypatch):
+    """When SIGKILL cannot be confirmed, the lock stays held until the group is gone."""
+    from coding_review_agent_loop import runner as runner_module
+    from coding_review_agent_loop import test_workers
+
+    # Simulate a survivor that outlives the bounded SIGKILL wait: termination
+    # reports it unconfirmed and leaves the (TERM-ignoring) descendant alive.
+    monkeypatch.setattr(
+        runner_module, "terminate_process_group_descendants",
+        lambda pgid: test_workers.DescendantTermination(1, False),
+    )
+    pid_file, ready = tmp_path / "child.pid", tmp_path / "child.ready"
+    child = (
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"open({str(ready)!r}, 'w').write('ok'); time.sleep(3)"
+    )
+    script = (
+        "import subprocess, sys, time, os; "
+        f"p = subprocess.Popen([sys.executable, '-c', {child!r}]); "
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid)); "
+        f"[time.sleep(0.02) for _ in range(500) if not os.path.exists({str(ready)!r})]"
+    )
+    root = tmp_path / "locks"
+    env = {**os.environ, "AGENT_LOOP_INVOCATION_ID": "survivor"}
+    result = runner_module.run_foreground_test(
+        [sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=60, env=env,
+        environment_is_complete=True, echo_output=False, worker_budget=_enforced(), worker_lock_root=root,
+    )
+    assert result.returncode == 0
+    assert any("stays held until it exits" in notice for notice in result.worker_notices)
+    survivor = int(pid_file.read_text())
+    assert not _pid_gone(survivor)
+    # The next command of the invocation cannot take the budget while the
+    # survivor lives ...
+    busy, reason = WorkerBudgetLock.acquire(invocation_id="survivor", cwd=tmp_path, root=root)
+    assert busy is None and reason is None
+    # ... and can once it has exited.
+    assert _wait_until(lambda: _pid_gone(survivor), 15)
+
+    def acquired():
+        lock, _ = WorkerBudgetLock.acquire(invocation_id="survivor", cwd=tmp_path, root=root)
+        if lock is None:
+            return False
+        lock.close()
+        return True
+
+    assert _wait_until(acquired, 10)
+
+
+def test_hold_until_group_exits_blocks_when_watcher_cannot_start(tmp_path, monkeypatch):
+    import subprocess
+    import time
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"], start_new_session=True)
+    lock, _ = WorkerBudgetLock.acquire(invocation_id="blocking", cwd=tmp_path, root=tmp_path / "locks")
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("no fork")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    started = time.monotonic()
+    try:
+        assert lock.hold_until_group_exits(child.pid) == "waited"
+    finally:
+        child.wait(timeout=10)
+    assert time.monotonic() - started >= 0.5
+    again, _ = WorkerBudgetLock.acquire(invocation_id="blocking", cwd=tmp_path, root=tmp_path / "locks")
+    assert again is not None
+    again.close()
+
+
+def test_process_group_alive_does_not_depend_on_proc(monkeypatch):
+    import subprocess
+
+    from coding_review_agent_loop import test_workers
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        def no_proc(_path):
+            raise PermissionError("no /proc")
+
+        monkeypatch.setattr(os, "listdir", no_proc)
+        assert test_workers.process_group_alive(child.pid) is True
+        assert test_workers.process_group_members(child.pid) is None
+    finally:
+        monkeypatch.undo()
+        child.kill()
+        child.wait(timeout=10)
+    assert test_workers.process_group_alive(child.pid) is False
+
+
 def test_setsid_descendant_is_documented_exclusion_and_off_mode_terminates_nothing(tmp_path):
     from coding_review_agent_loop.runner import run_foreground_test
 

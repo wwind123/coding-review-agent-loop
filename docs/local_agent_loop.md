@@ -578,10 +578,12 @@ can choose; an unsafe directory fails closed. The command lane is keyed on the
 requested command with worker-selection tokens removed and no budget or mode,
 so every worker spelling of one command shares a lane in every mode. After the
 target exits, its process group is terminated before the lock is released:
-the group is signalled (SIGTERM, then SIGKILL after a short grace) even where
-`/proc` cannot enumerate it, and the lock is released only after no live member
-remains (a bounded wait; a survivor is reported with a warning notice). Processes
-that escape into a new session (`setsid`, double fork) are outside
+the group is always signalled with `killpg` (SIGTERM, then SIGKILL after a
+short grace), independently of `/proc`, and the lock is released only once no
+live member remains. If a member survives the bounded wait after SIGKILL, a
+warning is printed and a small detached watcher inherits the lock and holds it
+until the group is gone, so the next command of the invocation keeps getting
+`worker-budget-busy` until then. Processes that escape into a new session (`setsid`, double fork) are outside
 the ceiling and bounded only by cgroup limits. Off mode takes no worker-budget
 lock and terminates nothing. Test suites that exercise `run-tests` itself must
 give the inner call its own environment (clear `AGENT_LOOP_INVOCATION_ID` and

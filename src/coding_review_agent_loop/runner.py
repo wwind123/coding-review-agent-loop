@@ -46,7 +46,6 @@ from .test_workers import (
     WorkerDecision,
     analyze_worker_report,
     apply_worker_budget,
-    process_group_alive,
     terminate_process_group_descendants,
     worker_budget_busy_message,
     worker_lane_identity,
@@ -301,6 +300,11 @@ class _HeldTestLocks:
         self._lane = lane
         self._worker_lock = worker_lock
         self._decision = decision
+
+    def retain_worker_lock_until_group_exits(self, pgid: int) -> None:
+        if self._worker_lock is not None:
+            self._worker_lock.hold_until_group_exits(pgid)
+            self._worker_lock = None
 
     def close(self) -> None:
         try:
@@ -794,10 +798,13 @@ def run_foreground_test(
             # Processes that escaped into a new session are outside it.
             # The group is signalled even where /proc cannot enumerate it,
             # and the lock is released only after termination is confirmed.
-            if process_group_alive(proc.pid):
-                termination = terminate_process_group_descendants(proc.pid)
-                descendants_terminated = termination.count
-                descendants_unconfirmed = not termination.confirmed
+            termination = terminate_process_group_descendants(proc.pid)
+            descendants_terminated = termination.count
+            descendants_unconfirmed = not termination.confirmed
+            if descendants_unconfirmed:
+                # A survivor still counts against the ceiling: the lock stays
+                # held (by a watcher) until the group is really gone.
+                lane_lock.retain_worker_lock_until_group_exits(proc.pid)
         if decision is not None:
             analysis = analyze_worker_report(
                 decision.report_path,
@@ -841,7 +848,7 @@ def run_foreground_test(
         worker_notices = (
             *worker_notices,
             "agent-loop worker budget: WARNING a process in the test command's process group "
-            "was still alive after SIGKILL; the worker ceiling may be exceeded until it exits",
+            "was still alive after SIGKILL; the worker budget stays held until it exits",
         )
     for notice in worker_notices:
         notify(notice)

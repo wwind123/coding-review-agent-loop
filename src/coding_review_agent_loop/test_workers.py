@@ -987,6 +987,38 @@ class WorkerBudgetLock:
         finally:
             self.handle.close()
 
+    def hold_until_group_exits(self, pgid: int) -> str:
+        """Keep the lock held until process group ``pgid`` has no live member.
+
+        The flock belongs to the open file description, so a detached watcher
+        process that inherits the descriptor keeps the lock held after this
+        process closes its copy; the lock is released only when the watcher
+        sees the group gone and exits.  If the watcher cannot be started, this
+        call blocks until the group is gone instead.  Returns "watcher" or
+        "waited".
+        """
+        import subprocess
+        import sys
+
+        if self.handle.closed:
+            return "waited"
+        fd = self.handle.fileno()
+        try:
+            subprocess.Popen(
+                [sys.executable, "-c", _GROUP_WATCHER_SOURCE, str(pgid)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                pass_fds=(fd,), start_new_session=True, close_fds=True,
+            )
+        except OSError:
+            while process_group_alive(pgid):
+                time.sleep(0.2)
+            self.close()
+            return "waited"
+        # Drop only this process's reference: no LOCK_UN, which would release
+        # the lock shared with the watcher.
+        self.handle.close()
+        return "watcher"
+
     def __enter__(self) -> "WorkerBudgetLock":
         return self
 
@@ -1005,45 +1037,40 @@ def worker_budget_busy_message(budget: WorkerBudget, reason: str | None = None) 
 
 
 def process_group_members(pgid: int) -> list[int] | None:
-    """Live (non-zombie) processes in ``pgid``, or None when /proc is unavailable."""
+    """Live (non-zombie) processes in ``pgid``, or None when /proc is not a
+    complete view: /proc cannot be listed, or an entry that still exists
+    cannot be read."""
     members: list[int] = []
-    proc = Path("/proc")
     try:
-        entries = list(proc.iterdir())
+        entries = os.listdir("/proc")
     except OSError:
         return None
-    for entry in entries:
-        if not entry.name.isdigit():
+    for name in entries:
+        if not name.isdigit():
             continue
         try:
-            text = (entry / "stat").read_text(encoding="ascii", errors="replace")
+            with open(f"/proc/{name}/stat", encoding="ascii", errors="replace") as stream:
+                text = stream.read()
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # exited during the scan
         except OSError:
-            continue
-        close = text.rfind(")")
-        fields = text[close + 2:].split()
-        if len(fields) < 3:
-            continue
-        state, group = fields[0], fields[2]
-        if state == "Z":
+            return None
+        fields = text[text.rfind(")") + 2:].split()
+        if len(fields) < 3 or fields[0] == "Z":
             continue
         try:
-            if int(group) == pgid:
-                members.append(int(entry.name))
+            if int(fields[2]) == pgid:
+                members.append(int(name))
         except ValueError:
             continue
     return members
 
 
-def process_group_alive(pgid: int) -> bool:
-    """Whether any live process remains in ``pgid``.
-
-    Uses /proc when it can be enumerated (zombies do not count); otherwise
-    falls back to a signal-0 probe of the group, which works on every POSIX
-    host.  A permission error means the group still exists.
-    """
-    members = process_group_members(pgid)
-    if members is not None:
-        return bool(members)
+# The liveness probe is kept as source so the lock-holding watcher process
+# (see WorkerBudgetLock.hold_until_group_exits) runs exactly the same check.
+_GROUP_ALIVE_SOURCE = """
+def group_alive(pgid):
+    import os
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -1052,7 +1079,46 @@ def process_group_alive(pgid: int) -> bool:
         return True
     except OSError:
         return False
-    return True
+    # The group exists.  A complete /proc scan may still show only zombies,
+    # which hold no memory; anything short of a complete scan counts as alive.
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return True
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % name, encoding="ascii", errors="replace") as stream:
+                text = stream.read()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return True
+        fields = text[text.rfind(")") + 2:].split()
+        if len(fields) >= 3 and fields[0] != "Z" and fields[2] == str(pgid):
+            return True
+    return False
+"""
+_group_namespace: dict = {}
+exec(_GROUP_ALIVE_SOURCE, _group_namespace)  # noqa: S102 - trusted, module-local source
+
+
+def process_group_alive(pgid: int) -> bool:
+    """Whether any live process remains in ``pgid``.
+
+    A signal-0 probe of the group decides first, independently of /proc; a
+    complete /proc scan may then rule out a group that holds only zombies.
+    """
+    return bool(_group_namespace["group_alive"](pgid))
+
+
+_GROUP_WATCHER_SOURCE = _GROUP_ALIVE_SOURCE + """
+import sys, time
+_pgid = int(sys.argv[1])
+while group_alive(_pgid):
+    time.sleep(0.2)
+"""
 
 
 def _wait_group_gone(pgid: int, seconds: float) -> bool:
@@ -1079,24 +1145,24 @@ def terminate_process_group_descendants(
 ) -> DescendantTermination:
     """Terminate whatever is left in the target's process group.
 
-    The group is signalled whether or not /proc can enumerate it.  After
-    SIGTERM and a grace period the group is SIGKILLed, and the call waits
-    (bounded) until no live member remains, so the caller releases the
-    worker-budget lock only once the old workers are gone.  ``confirmed`` is
-    False when a member was still alive at the end of the bounded wait.
+    The group is always signalled with ``killpg`` (no /proc enumeration is
+    needed to decide whether to signal).  After SIGTERM and a grace period
+    the group is SIGKILLed, and the call waits (bounded) until no live member
+    remains.  ``confirmed`` is False when a member was still alive at the end
+    of the wait; the caller must then keep the worker-budget lock held until
+    the group is gone (WorkerBudgetLock.hold_until_group_exits).
     """
-    if not process_group_alive(pgid):
-        return DescendantTermination(0, True)
     members = process_group_members(pgid)
-    count = max(len(members), 1) if members is not None else 1
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
-        return DescendantTermination(count, True)
+        return DescendantTermination(0, True)
     except OSError:
         pass
+    count = len(members) if members is not None else 1
     if _wait_group_gone(pgid, grace_seconds):
         return DescendantTermination(count, True)
+    count = max(count, 1)
     try:
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
