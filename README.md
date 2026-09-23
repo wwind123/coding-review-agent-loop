@@ -588,8 +588,12 @@ Reviewer board amendment:
   there is no primary. It stays blocking until a new owner clears it; nothing
   is auto-cleared. Approvals the removed reviewer already gave remain in the
   history but are no longer required. The run posts one audit comment naming
-  the record, the activation round, and every reassignment. Scheduler audits
-  and the completion message note that the run finished on a reduced board.
+  the record, the activation round, and every reassignment. Scheduler audits,
+  completion messages, and (for PR runs, on every completion path including
+  managed CI) one plain completion comment on the PR note that the run
+  finished on a reduced board. The activation round always posts a fresh
+  scheduler checkpoint carrying the amended board and digest, even when every
+  remaining reviewer's review is reused.
 - Unsigned or malformed records are ignored with a logged diagnostic. A comment
   that contains only the record is not treated as a signed human requirement.
   All-reviewers PR runs and the non-staged plan path persist no contract, so

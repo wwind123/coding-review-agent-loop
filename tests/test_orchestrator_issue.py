@@ -11076,6 +11076,51 @@ def _m943_interrupted_history(tmp_path):
     return runner
 
 
+def _m943_strip_ownership(runner, item_id="item-1"):
+    """Rewrite persisted records so ``item_id`` has genuinely pre-change ownership.
+
+    Every record that carries the item gets ``resolution_owners``,
+    ``owner_states``, ``owner_evidence``, and ``owner_dispositions`` emptied,
+    so the finding falls back to its author exactly as a legacy ledger does.
+    """
+    from coding_review_agent_loop.round_state import _encode_round_metadata
+
+    def legacy(items):
+        return tuple(
+            replace(
+                item,
+                resolution_owners=(),
+                owner_states=(),
+                owner_evidence=(),
+                owner_dispositions=(),
+            )
+            if item.item_id == item_id
+            else item
+            for item in items
+        )
+
+    rewritten = 0
+    for comment in runner.issue_comments:
+        metadata = _m943_decoded(comment["body"])
+        if metadata is None or not any(
+            item.item_id == item_id for item in (*metadata.prior_items, *metadata.new_items)
+        ):
+            continue
+        stripped = replace(
+            metadata,
+            prior_items=legacy(metadata.prior_items),
+            new_items=legacy(metadata.new_items),
+        )
+        comment["body"] = re.sub(
+            r"<!-- AGENT_LOOP_META: \S+ -->",
+            lambda _match: f"<!-- AGENT_LOOP_META: {_encode_round_metadata(stripped)} -->",
+            comment["body"],
+        )
+        rewritten += 1
+    assert rewritten
+    return runner
+
+
 def _m943_post_amendment(runner, *, effective_from_round, removed=("Antigravity",), **overrides):
     values = dict(
         flow="plan",
@@ -11105,7 +11150,9 @@ def _m943_reduced_config(tmp_path):
 def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(tmp_path):
     """Rows legacy-no-amendment, partial-round-activation, legacy-retroactive-amend,
     sole-owner-reassign, and activation-mismatch on one real history."""
-    runner = _m943_interrupted_history(tmp_path)
+    # The Antigravity finding is genuinely pre-change: no persisted record
+    # carries explicit ownership, so it falls back to its removed author.
+    runner = _m943_strip_ownership(_m943_interrupted_history(tmp_path))
     records = _plan_round_records(runner)
     old_round_3 = [
         record for record in records
@@ -11117,6 +11164,7 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
     assert all(record.reviewer_board_amendment_digest is None for record in records)
     (finding,) = old_round_3[0].prior_items
     assert finding.item_id == "item-1" and finding.reviewer == "Antigravity"
+    assert finding.resolution_owners == () and finding.owner_states == ()
     calls_before = _m943_reviewer_calls(runner)
     comments_before = len(runner.issue_comments)
 
@@ -11206,6 +11254,15 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
         if record.scheduler_contract is None
     )
     # The Antigravity finding was cleared only by Codex's disposition.
+    item_1_dispositions = [
+        disposition
+        for record in records
+        if record.round_number == 3
+        for disposition in record.dispositions
+        if disposition.item_id == "item-1"
+    ]
+    assert item_1_dispositions
+    assert {disposition.reviewer for disposition in item_1_dispositions} == {"Codex"}
     later = [record for record in records if record.round_number >= 4]
     assert later and all(
         item.item_id != "item-1" for record in later for item in record.prior_items
@@ -11285,8 +11342,14 @@ def test_board_amendment_invalid_records_fail_closed_or_are_ignored(tmp_path):
         run_issue_loop(other_issue, issue_number=56, config=_m943_reduced_config(tmp_path), plan_first=True)
 
 
-def test_board_amendment_reenters_a_reconciled_round_under_the_amended_board(tmp_path):
-    """Row reconciled-round-reentry: round 2 was reconciled under the old board."""
+@pytest.mark.parametrize("legacy_owner", [False, True], ids=["explicit-owner", "legacy-implicit-owner"])
+def test_board_amendment_reenters_a_reconciled_round_under_the_amended_board(tmp_path, legacy_owner):
+    """Row reconciled-round-reentry: round 2 was reconciled under the old board.
+
+    The legacy variant strips the Antigravity finding's persisted ownership,
+    so the next round's ledger proves implicit ownership is normalized and
+    reassigned rather than falling back to the removed author.
+    """
     fresh, patch_text = _remediation_plan_fixtures()
     resolved = [{"item_id": "item-1", "disposition": "resolved"}]
 
@@ -11335,6 +11398,16 @@ def test_board_amendment_reenters_a_reconciled_round_under_the_amended_board(tmp
     assert (_m943_reviewer_calls(early), len(early.issue_comments)) == before
 
     runner = reconciled_history()
+    if legacy_owner:
+        _m943_strip_ownership(runner)
+        (seeded,) = [
+            item
+            for record in _plan_round_records(runner)
+            if record.round_number == 2 and record.phase == "reconciliation"
+            for item in record.new_items
+            if item.item_id == "item-1"
+        ]
+        assert seeded.resolution_owners == () and seeded.owner_states == ()
     _m943_post_amendment(runner, effective_from_round=2)
     runner.claude_outputs.append(patch_text)
     calls_before = _m943_reviewer_calls(runner)
@@ -11358,5 +11431,9 @@ def test_board_amendment_reenters_a_reconciled_round_under_the_amended_board(tmp
     # The carried finding now has explicit ownership that excludes Antigravity.
     (carried,) = [item for item in round_3[0].prior_items if item.item_id == "item-1"]
     assert carried.reviewer == "Antigravity"
+    assert carried.status == "blocking"
     assert carried.resolution_owners == ("Codex",)
+    assert carried.owner_states == (("Codex", "pending"),)
+    audits = [c["body"] for c in runner.issue_comments if "Reviewer board amendment applied." in c["body"]]
+    assert len(audits) == 1 and "item-1 (Antigravity -> Codex)" in audits[0]
     assert "agy" not in _m943_reviewer_calls(runner)[len(calls_before):]

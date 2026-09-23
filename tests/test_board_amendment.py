@@ -448,3 +448,19 @@ def test_amendment_only_comment_is_not_a_signed_human_requirement():
     )
     assert [item.body.startswith("Also please") for item in parsed].count(True) == 1
     assert len(parsed) == 2
+
+
+def test_signed_amendment_with_invalid_json_is_reported():
+    body = _amendment_body().replace('"flow": "plan",', '"flow": "plan"')  # drop a comma
+    records, ignored = parse_reviewer_board_amendment_records(body, comment_locator="issue #942 comment 4")
+    assert records == ()
+    assert len(ignored) == 1
+    assert "issue #942 comment 4" in ignored[0] and "invalid JSON" in ignored[0]
+    diagnostics = []
+    assert collect_reviewer_board_amendments(
+        [_comment(body)], flow="plan", issue_number=942, ignored_sink=diagnostics
+    ) == ()
+    assert diagnostics == [ignored[0].replace("issue #942 comment 4", "issue #942 comment 1")]
+    # An unrelated signed fence with invalid JSON is not an amendment diagnostic.
+    unrelated = "```json\n{not json\n```\n-- Human Reviewer"
+    assert parse_reviewer_board_amendment_records(unrelated, comment_locator="c") == ((), ())

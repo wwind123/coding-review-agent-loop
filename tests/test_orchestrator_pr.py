@@ -13024,14 +13024,24 @@ def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkey
     assert "agy" not in _agent_sequence(runner)[len(calls_before):]
     assert any("Reviewer board amendment applied." in comment for comment in runner.comments)
     posted = _posted_scheduler_metadata(runner)
-    # Gemini's round-2 review was reused and Codex's approval carried, so no
-    # new scheduler record was needed; any that exists is digest-bound.
+    # Gemini's round-2 review was reused and Codex's approval carried, yet the
+    # activation round still persists a fresh digest-bound scheduler decision.
+    amended = [item for item in posted if item.reviewer_board_amendment_digest is not None]
+    assert amended
+    assert amended[0].phase == "scheduler-prelaunch"
+    assert amended[0].round_number == 2
     for item in posted:
         board = tuple(item.scheduler_contract["required_reviewers"])
         if item.reviewer_board_amendment_digest is not None:
             assert board == ("Codex", "Gemini")
         else:
             assert board == ("Codex", "Gemini", "Antigravity")
+    completion_notes = [
+        comment for comment in runner.comments
+        if comment.startswith("Review completed on a reduced reviewer board.")
+    ]
+    assert len(completion_notes) == 1
+    assert "required board now Codex, Gemini" in completion_notes[0]
 
 
 def test_pr_board_amendment_qualification_refuses_a_stale_contract(tmp_path, monkeypatch):
@@ -13092,3 +13102,46 @@ def test_pr_board_amendment_on_the_owning_issue_fails_closed(tmp_path):
     with pytest.raises(AgentLoopError, match="Post this record on PR #77"):
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, reviewer=("codex", "gemini")))
     assert _agent_sequence(runner) == []
+
+
+@pytest.mark.parametrize("auto_merge", [True, False], ids=["auto-merge", "manual-qualification"])
+def test_pr_board_amendment_managed_completion_names_the_reduced_board(
+    tmp_path, monkeypatch, capsys, auto_merge
+):
+    """Managed-CI completion paths repeat the reduced-board note durably."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=auto_merge)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    waits = []
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        lambda *args, **kwargs: waits.append(True) or ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    merges = []
+    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator, "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
+    )
+    monkeypatch.setattr(
+        orchestrator, "publish_manual_v2_qualification", lambda *args, **kwargs: "abc123"
+    )
+    capsys.readouterr()
+    assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+
+    assert waits, "the managed qualification path was not exercised"
+    assert bool(merges) is auto_merge
+    out = capsys.readouterr().out
+    assert "Reviewer board amended from round 2" in out
+    assert "required board now Codex, Gemini" in out
+    notes = [
+        comment for comment in runner.comments
+        if comment.startswith("Review completed on a reduced reviewer board.")
+    ]
+    assert len(notes) == 1

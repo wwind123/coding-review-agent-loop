@@ -15674,6 +15674,39 @@ def _pr_contract_drift_error(
     )
 
 
+REDUCED_BOARD_COMPLETION_HEADING = "Review completed on a reduced reviewer board."
+
+
+def _post_reduced_board_completion_note(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    digest: str,
+    note: str,
+) -> None:
+    """Post one plain completion note per amendment digest (no round metadata)."""
+    try:
+        comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
+    except AgentLoopError:
+        comments = ()
+    if any(
+        REDUCED_BOARD_COMPLETION_HEADING in (getattr(comment, "body", "") or "")
+        and digest in (getattr(comment, "body", "") or "")
+        for comment in comments
+    ):
+        return
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=(
+            f"{REDUCED_BOARD_COMPLETION_HEADING}\n\n- {note}\n"
+            f"- Signed amendment digest: `{digest}`\n\n-- Orchestrator"
+        ),
+    )
+
+
 def _pr_amendment_start_round(
     pr_context: PullRequestReviewContext,
     configured_reviewers: Sequence[AgentName],
@@ -17489,6 +17522,7 @@ def run_pr_loop(
             ),
         )
         pr_amendment_digest = pr_contract_lineage.active_digest
+        pr_amendment_checkpoint_pending = bool(pr_contract_lineage.pending_amendments)
         for record in startup_records:
             if record.metadata.scheduler_force_full:
                 if record.metadata.scheduler_force_full_source == "operator":
@@ -17590,6 +17624,19 @@ def run_pr_loop(
                         reassignments=pr_amendment_reassignments,
                     ),
                 )
+
+        def announce_reduced_board_completion() -> str:
+            """Durable reduced-board completion note (#943); returns stdout suffix."""
+            if pr_amendment_note is None or pr_contract_lineage.active_amendment is None:
+                return ""
+            _post_reduced_board_completion_note(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                digest=pr_contract_lineage.active_amendment.digest,
+                note=pr_amendment_note,
+            )
+            return f" {pr_amendment_note}"
 
         def pr_ledger_view(
             items: Sequence[UnresolvedReviewItem],
@@ -18514,13 +18561,26 @@ def run_pr_loop(
                     f"{', '.join(scheduler_decision.active_owners) or 'none'}"
                     + (f"; {pr_amendment_note}" if pr_amendment_note else ""),
                 )
-                if scheduler_decision.selected_reviewers and not skip_reviewers_for_recovery and not conflict_pending:
+                # The amendment's activation round always persists a fresh
+                # digest-bound scheduler decision (#943), even when every
+                # remaining reviewer's review is reused and nobody is invoked.
+                amendment_checkpoint_due = bool(
+                    pr_amendment_checkpoint_pending
+                    and pr_contract_lineage.active_amendment is not None
+                    and round_number == pr_contract_lineage.active_amendment.effective_from_round
+                )
+                if (
+                    (scheduler_decision.selected_reviewers or amendment_checkpoint_due)
+                    and not skip_reviewers_for_recovery
+                    and not conflict_pending
+                ):
+                    pr_amendment_checkpoint_pending = False
                     post_pr_comment(
                         runner,
                         config=config,
                         pr_number=pr_number,
                         body=_attach_round_metadata(
-                            f"PR review scheduling audit: selected {', '.join(scheduler_decision.selected_reviewers)}; "
+                            f"PR review scheduling audit: selected {', '.join(scheduler_decision.selected_reviewers) or 'none'}; "
                             f"paused {', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}; "
                             f"reason: {scheduler_decision.reason}; phase: {scheduler_decision.phase}; "
                             f"head: {current_pr_subject}; primary: "
@@ -20180,9 +20240,15 @@ def run_pr_loop(
                                     source="full-board",
                                 ),
                             )
-                            print(f"PR #{pr_number} merged after CI watch completed.")
+                            print(
+                                f"PR #{pr_number} merged after CI watch completed."
+                                + announce_reduced_board_completion()
+                            )
                         else:
-                            print(f"PR #{pr_number} is merge-ready after CI watch completed.")
+                            print(
+                                f"PR #{pr_number} is merge-ready after CI watch completed."
+                                + announce_reduced_board_completion()
+                            )
                         return 0
                     if watch_outcome.status == "not_started":
                         command = render_managed_ci_resume_command(
@@ -20776,6 +20842,7 @@ def run_pr_loop(
                                     print(
                                         f"PR #{pr_number} approved by "
                                         f"{format_agent_list(configured_reviewers)}."
+                                        + announce_reduced_board_completion()
                                     )
                                 else:
                                     qualified_head = publish_manual_v2_qualification(
@@ -20800,6 +20867,7 @@ def run_pr_loop(
                                         f"PR #{pr_number} approved and qualified; manual merge required. "
                                         f"Qualified head: {qualified_head}. Run `{merge_command}` after "
                                         f"confirming the live head.{risk}"
+                                        + announce_reduced_board_completion()
                                     )
                                 return 0
                             if managed_outcome.status == "head_changed":
@@ -20972,7 +21040,7 @@ def run_pr_loop(
                         )
                         print(
                             f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}."
-                            + (f" {pr_amendment_note}" if pr_amendment_note else "")
+                            + announce_reduced_board_completion()
                         )
                         return 0
             if round_number == allowed_rounds:

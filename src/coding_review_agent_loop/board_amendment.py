@@ -259,7 +259,14 @@ def parse_reviewer_board_amendment_records(
     for match in _FENCED_JSON_RE.finditer(signed):
         try:
             payload = json.loads(match.group("body"))
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            # A fence that names the record kind but is not valid JSON is a
+            # malformed amendment: report it rather than skip it silently.
+            if REVIEWER_BOARD_AMENDMENT_KIND in match.group("body"):
+                ignored.append(
+                    f"{comment_locator}: malformed reviewer-board amendment record ignored "
+                    f"(invalid JSON: {exc.msg} at line {exc.lineno} column {exc.colno})"
+                )
             continue
         if not isinstance(payload, dict) or payload.get("kind") != REVIEWER_BOARD_AMENDMENT_KIND:
             continue
