@@ -387,34 +387,99 @@ def test_sequential_pytest_main_sessions_each_claim_and_report(tmp_path):
     assert analysis.enforcement == "refused-in-command" and not analysis.direct_refusal
 
 
-def test_nested_sessions_are_not_enforced_and_write_nested_markers(tmp_path):
+NESTED_TEST = """
+import os, subprocess, sys
+import pytest
+
+def test_env_entry_withdrawn():
+    assert "_agent_loop_worker_cap" not in os.environ.get("PYTEST_PLUGINS", "")
+    assert os.environ.get("PYTEST_PLUGINS") == os.environ.get("EXPECT_PLUGINS")
+
+def test_nested_in_process(tmp_path):
+    (tmp_path / "test_inner.py").write_text("def test_inner():\\n    pass\\n")
+    assert pytest.main(["-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")]) == 0
+
+def test_nested_child(tmp_path):
+    (tmp_path / "test_inner.py").write_text("def test_inner():\\n    pass\\n")
+    env = dict(os.environ)
+    assert "AGENT_LOOP_WORKER_CAP_SPEC" not in env
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")],
+        env=env,
+    )
+    assert proc.returncode == 0
+
+def test_nested_child_with_replaced_pythonpath(tmp_path):
+    (tmp_path / "test_inner.py").write_text("def test_inner():\\n    pass\\n")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")],
+        env=env, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+"""
+
+
+@pytest.mark.parametrize("inject_token", [True, False])
+# ``string`` stands in for a caller's own importable, hook-free plugin entry.
+@pytest.mark.parametrize("caller_plugins", [None, "string"])
+def test_nested_sessions_do_not_inherit_the_plugin_env(tmp_path, inject_token, caller_plugins):
+    """Issue #1008: nested pytest runs succeed and stay unobserved (top-level only)."""
+    project = _project(tmp_path, {"test_nested.py": NESTED_TEST})
+    env = {"EXPECT_PLUGINS": caller_plugins}
+    if caller_plugins:
+        env["PYTEST_PLUGINS"] = f"{caller_plugins},{PLUGIN_MODULE}"
+    proc, rows, _ran = _run(project, ["test_nested.py"], budget=2, env=env, inject_token=inject_token)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "4 passed" in proc.stdout
+    assert not _only(rows, "nested")
+    assert len(_only(rows, "confirmed")) == 1
+    command_class = "direct-pytest" if inject_token else "other"
+    analysis = analyze_worker_report(project.parent / "report.jsonl", command_class=command_class, mode="clamp")
+    assert "worker-budget-nested-session" not in analysis.caveats
+
+
+def test_in_process_nested_session_with_explicit_token_writes_nested_marker(tmp_path):
     nested_test = """
-    import os, subprocess, sys
     import pytest
 
     def test_nested_in_process(tmp_path):
         (tmp_path / "test_inner.py").write_text("def test_inner():\\n    pass\\n")
-        assert pytest.main(["-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")]) == 0
-
-    def test_nested_child(tmp_path):
-        (tmp_path / "test_inner.py").write_text("def test_inner():\\n    pass\\n")
-        env = dict(os.environ)
-        assert "AGENT_LOOP_WORKER_CAP_SPEC" not in env
-        proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")],
-            env=env,
-        )
-        assert proc.returncode == 0
+        args = ["-p", "_agent_loop_worker_cap", "-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")]
+        assert pytest.main(args) == 0
     """
     project = _project(tmp_path, {"test_nested.py": nested_test})
     proc, rows, _ran = _run(project, ["test_nested.py"], budget=2)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    nested = _only(rows, "nested")
-    assert sorted(row["where"] for row in nested) == ["child", "in-process"]
+    assert [row["where"] for row in _only(rows, "nested")] == ["in-process"]
     assert len(_only(rows, "confirmed")) == 1
     analysis = analyze_worker_report(project.parent / "report.jsonl", command_class="direct-pytest", mode="clamp")
     assert analysis.workers_cohort == "unknown"
     assert "worker-budget-nested-session" in analysis.caveats
+
+
+def test_env_only_sequential_sessions_each_claim_after_withdrawal(tmp_path):
+    """The withdrawn env entry is restored between claims for launcher scripts."""
+    project = _project(tmp_path)
+    runner = project.parent / "runner.py"
+    runner.write_text(
+        textwrap.dedent(
+            """
+            import os, sys, pytest
+            first = pytest.main(["-p", "no:cacheprovider", "-q", "-n", sys.argv[1]])
+            assert "_agent_loop_worker_cap" in os.environ.get("PYTEST_PLUGINS", "")
+            second = pytest.main(["-p", "no:cacheprovider", "-q", "-n", sys.argv[2]])
+            sys.exit(int(first) or int(second))
+            """
+        ),
+        encoding="utf-8",
+    )
+    proc, rows, _ran = _run(project, [], budget=2, command=[sys.executable, str(runner), "1", "16"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    confirmed = _only(rows, "confirmed")
+    assert len({row["session"] for row in confirmed}) == 2
+    assert [row["effective"] for row in confirmed] == [1, 2]
 
 
 def test_filtered_child_pytest_is_unobservable_top_level_only(tmp_path):

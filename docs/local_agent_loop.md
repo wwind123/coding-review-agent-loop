@@ -701,7 +701,15 @@ status. xdist worker processes never enforce or write. Each top-level
 `pytest.main` in a process claims the spec for its own Config and reports under
 its own session; configs nested inside an active claim (pytester,
 `pytest.main` in a test) and child processes that inherit the environment are
-never enforced and write only a best-effort nested marker.
+never enforced. Enforcement and observation are top-level only: on import and
+for the whole of every claimed session the plugin withdraws its own
+`PYTEST_PLUGINS` entry from the process environment (keeping any caller
+entries), so a test that launches a nested `python -m pytest` — including one
+with a replaced `PYTHONPATH` that could not import the plugin — neither loads
+nor fails on it, and stays unobserved. The entry is restored when a claim ends,
+so a launcher script's later sequential `pytest.main` still loads the plugin. A
+nested session that loads the plugin explicitly (`-p _agent_loop_worker_cap`)
+writes only a best-effort nested marker.
 
 The enforcement contract is deliberately narrow. A repository tryfirst
 `pytest_xdist_setupnodes` wrapper registered after the plugin can add gateways
