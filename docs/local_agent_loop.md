@@ -448,27 +448,37 @@ cannot fit. The default expands as needed for the bounded architecture block.
 
 #### Degraded architecture-impact assessments
 
-Fresh coder turns must return an `architecture_impact` whose `status` is
-`changed` or `unchanged`. If a response uses the near miss `modified`, it is
-not discarded:
+Fresh coder and reviewer turns must return an `architecture_impact` whose
+`status` is `changed` or `unchanged`. A response that uses a near-miss spelling
+is not discarded:
 
-- When the payload corroborates a change (non-empty affected components,
-  dependencies, flows, persistence, public contracts and security boundaries,
-  plus a canonical-document action, path and rationale), the status is read as
-  `changed`.
-- Otherwise the assessment is treated as undetermined. It never counts as
-  `unchanged`.
+- `modified` is read as `changed` only when the payload corroborates a change.
+  The payload must list non-empty affected components, dependencies,
+  `execution_data_flows`, persistence, public contracts and security
+  boundaries, and name a canonical-document action, path and rationale.
+- Any other spelling, such as `updated`, `none` or `same`, and an uncorroborated
+  `modified`, is treated as undetermined. It never counts as `unchanged`.
+
+When a response is accepted, the posted text is rewritten into its canonical
+form. The status becomes `changed`, or an undetermined optional review
+assessment is dropped. The text therefore always parses strictly afterwards.
+Stored plans, checkpoints and earlier posted rounds are still decoded exactly
+as before.
 
 An omitted or undetermined required assessment leaves the contract
 unsatisfied. The turn is refused with a message naming `architecture_impact`
-and its accepted values. The number of agent turns stays the same, and the
-refused response is kept for the operator. Planning turns carry that message
-into the next planner prompt. The repair pass cannot add an assessment that the
-agent did not supply. Each degradation is listed under **Parse degradations**
-in the round summary. An accepted decomposition reports its degradations in a
-separate parent-issue comment, and its topology checkpoint is unchanged. A
-semantic plan patch that replaces `architecture_impact` with `modified` is
-rejected with a message telling the planner to use `changed` or `unchanged`.
+and its accepted values. It is retried within `--agent-max-retries`, and the
+retried prompt repeats that message. No repair call is spent on it, including
+when it arrives as a response-file artifact or from completion recovery. When
+the retries run out, the refused response is kept for the operator. The repair
+pass cannot add an assessment that the agent did not supply, and a repair that
+only adds a signed-requirement acknowledgement cannot change an accepted
+assessment. Each degradation is listed under **Parse degradations** in the
+round summary. A decomposition reports its degradations in a separate
+parent-issue comment, whether it was accepted or refused. Its topology
+checkpoint is unchanged. A semantic plan patch that replaces
+`architecture_impact` with any near-miss spelling is rejected with a message
+telling the planner to use `changed` or `unchanged`.
 
 ## Agent Backends
 

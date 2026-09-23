@@ -5261,3 +5261,137 @@ def test_default_strict_mode_rejects_every_synonym_925(raw):
 
     with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
         parse_architecture_impact(_changed_architecture_impact(raw))
+
+
+# --- #925 round 2: explicit parser modes and the single-alias vocabulary ------
+
+
+@pytest.mark.parametrize("spelling", ["updated", "change", "changes", "modifies", "modify"])
+def test_degradable_mode_never_maps_a_second_changed_alias(spelling):
+    impact, record = parse_architecture_impact_degradable(dict(_CORROBORATED_IMPACT, status=spelling))
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert record.outcome == "degraded-to-undetermined"
+    assert record.rule == "status-not-in-closed-enum"
+    assert impact.uncertainty == ()
+
+
+@pytest.mark.parametrize("spelling", ["none", "same", "no-change", "not-changed", "unmodified"])
+def test_degradable_mode_never_resolves_a_near_miss_to_unchanged(spelling):
+    impact, record = parse_architecture_impact_degradable(dict(_CORROBORATED_IMPACT, status=spelling))
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert record.observed_preview == spelling
+
+
+@pytest.mark.parametrize("alias_key", ["execution_flows", "data_flows"])
+def test_flow_alias_only_modified_degrades_without_rejecting(alias_key):
+    payload = dict(_CORROBORATED_IMPACT)
+    flows = payload.pop("execution_data_flows")
+    payload[alias_key] = flows
+    impact, record = parse_architecture_impact_degradable(payload)
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert "execution_data_flows" in record.rule
+
+
+def test_predicate_implies_every_changed_required_key():
+    from coding_review_agent_loop.protocol import (
+        _ARCHITECTURE_CHANGED_REQUIRED_KEYS,
+        architecture_impact_near_miss_corroborated,
+    )
+
+    assert architecture_impact_near_miss_corroborated(_CORROBORATED_IMPACT)
+    for key in _ARCHITECTURE_CHANGED_REQUIRED_KEYS:
+        reduced = {k: v for k, v in _CORROBORATED_IMPACT.items() if k != key}
+        assert not architecture_impact_near_miss_corroborated(reduced), key
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+def test_valid_statuses_parse_identically_in_every_mode(mode):
+    for status in ("changed", "unchanged"):
+        value = dict(_CORROBORATED_IMPACT, status=status)
+        degradable, record = parse_architecture_impact_degradable(value)
+        assert record is None
+        assert parse_architecture_impact(value, architecture_status_mode=mode) == degradable
+
+
+def test_structured_parsers_default_to_strict_and_accept_explicit_legacy():
+    text = _with_impact(_deg_plan_state(), _changed_architecture_impact("modified"))
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        validate_structured_plan_state(text)
+    legacy = validate_structured_plan_state(text, architecture_status_mode="legacy")
+    assert legacy.architecture_impact.status == "changed"
+    assert legacy.architecture_impact_degradations == ()
+    assert legacy.architecture_impact.uncertainty[-1].startswith("agent-loop normalized")
+
+
+def test_historical_parsers_decode_in_legacy_mode():
+    from coding_review_agent_loop.protocol import parse_historical_structured_issue_implementation
+
+    text = _with_impact(_deg_issue_implementation(), _changed_architecture_impact("modified"))
+    parsed = parse_historical_structured_issue_implementation(text)
+    assert parsed.architecture_impact.status == "changed"
+    assert parsed.architecture_impact_degradations == ()
+
+
+@pytest.mark.parametrize("spelling", ["modified", "updated", "none"])
+def test_patch_replace_rejects_every_synonym_with_route_forward(spelling):
+    from coding_review_agent_loop.protocol import _parse_plan_patch_field_value
+
+    with pytest.raises(AgentLoopError) as error:
+        _parse_plan_patch_field_value(
+            "architecture_impact", dict(_CORROBORATED_IMPACT, status=spelling),
+            context="plan_revision_patch.operations[0].value",
+        )
+    assert f"`{spelling}` is not accepted in a patch" in str(error.value)
+
+
+def test_every_parser_call_site_in_src_chooses_its_mode_explicitly():
+    """Static classification: no parser or helper call silently takes a default."""
+    import ast
+    from pathlib import Path
+
+    parsers = {
+        "parse_structured_pr_review", "parse_structured_plan_review",
+        "validate_structured_coder_followup", "validate_structured_issue_implementation",
+        "validate_structured_task_result", "validate_structured_plan_revision",
+        "validate_structured_plan_state", "parse_plan_decomposition",
+        "parse_pr_review", "parse_plan_review", "parse_architecture_impact",
+        "_parse_architecture_impact",
+    }
+    helpers = {
+        "_validate_issue_implementation_response", "_require_task_implementation_result",
+        "_require_plan_state_or_clarification", "_validate_plan_revision_response",
+        "_validate_coder_followup_response", "_validate_review_response",
+        "_validate_plan_review_response",
+    }
+    # Calls that deliberately forward a received mode, or omit one on purpose.
+    allowed_without_keyword = {
+        # Historical wrappers set legacy through kwargs.setdefault.
+        ("protocol.py", "validate_structured_coder_followup"),
+        ("protocol.py", "validate_structured_issue_implementation"),
+        # The patch replace is intentionally strict by default (step 11).
+        ("protocol.py", "_parse_architecture_impact"),
+    }
+    root = Path(__file__).resolve().parents[1] / "src" / "coding_review_agent_loop"
+    unclassified = []
+    degradable_factories = 0
+    for path in root.glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name == "_architecture_mode_validators":
+                degradable_factories += 1
+            if name not in parsers | helpers:
+                continue
+            if any(k.arg == "architecture_status_mode" for k in node.keywords):
+                continue
+            if any(k.arg is None for k in node.keywords):
+                continue
+            if (path.name, name) in allowed_without_keyword:
+                continue
+            unclassified.append(f"{path.name}:{node.lineno} {name}")
+    assert unclassified == []
+    # Seven required-contract invocations plus four live review invocations.
+    assert degradable_factories == 11

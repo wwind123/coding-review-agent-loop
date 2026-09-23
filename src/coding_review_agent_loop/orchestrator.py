@@ -367,6 +367,7 @@ from .protocol import (
     sanitize_architecture_impact,
     ARCHITECTURE_IMPACT_DECLARED_STATUSES,
     ARCHITECTURE_IMPACT_UNDETERMINED,
+    ArchitectureImpact,
     ParseDegradation,
 )
 from .protocol import parse_review
@@ -5113,6 +5114,83 @@ def _surface_decomposition_degradations(
     )
     log(config, f"Plan decomposition for issue #{issue_number} parse degradations: {summary}"[:600])
     post_issue_comment(runner, config=config, issue_number=issue_number, body=body)
+
+
+def _architecture_impact_from_metadata(value: object) -> ArchitectureImpact | None:
+    """Rebuild an accepted assessment from its durable round-metadata shape.
+
+    Metadata stores ``sanitize_architecture_impact`` of the accepted carrier's
+    assessment.  It is used only when its keys are exactly the dataclass
+    fields and its status is declared; anything else yields None, so an
+    assessment is never fabricated.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    names = {field.name for field in dataclasses.fields(ArchitectureImpact)}
+    if set(value) != names or value.get("status") not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+        return None
+    kwargs: dict[str, object] = {}
+    for name in names:
+        item = value[name]
+        kwargs[name] = tuple(item) if isinstance(item, list) else item
+    try:
+        return ArchitectureImpact(**kwargs)
+    except TypeError:
+        return None
+
+
+def _resumed_review_architecture(
+    metadata: object, legacy_reparse: ArchitectureImpact | None
+) -> tuple[ArchitectureImpact | None, tuple[ParseDegradation, ...]]:
+    """The accepted assessment and records of a resumed review record.
+
+    A record written with the architecture contract takes both from its round
+    metadata, whatever its phase, so a rendered-prose post and a publication
+    post rebuild the same carrier.  Only a record older than architecture
+    metadata falls back to the legacy re-parse of its text, with no records.
+    """
+    if getattr(metadata, "architecture_contract_version", None) is None:
+        return legacy_reparse, ()
+    impact = _architecture_impact_from_metadata(getattr(metadata, "architecture_impact", None))
+    return impact, tuple(getattr(metadata, "architecture_impact_degradations", ()) or ())
+
+
+def _acknowledgement_repair_forbids_assessment(review_output: str) -> bool:
+    """An acknowledgement repair may not add an assessment the source lacks.
+
+    It exists only to add the acknowledgement, so absence is pinned whether
+    the review omitted the assessment or a degraded one was removed.
+    """
+    payload = recover_payload(review_output)
+    return isinstance(payload, dict) and "architecture_impact" not in payload
+
+
+def _pin_acknowledgement_repair(
+    accepted: object | None,
+    repaired: object | None,
+    *,
+    config: AgentLoopConfig,
+    reviewer_name: str,
+) -> object | None:
+    """Keep the accepted assessment and records through an acknowledgement repair.
+
+    A repair whose assessment differs, in its durable shape, from the accepted
+    one is a failed repair; otherwise the accepted records are reattached.
+    """
+    if repaired is None or accepted is None:
+        return repaired
+    if sanitize_architecture_impact(repaired.architecture_impact) != sanitize_architecture_impact(
+        accepted.architecture_impact
+    ):
+        log(
+            config,
+            f"{reviewer_name}: acknowledgement repair changed the accepted architecture_impact; "
+            "treating the repair as failed",
+        )
+        return None
+    return dataclasses_replace(
+        repaired, architecture_impact_degradations=accepted.architecture_impact_degradations
+    )
 
 
 def _surface_refused_decomposition(
@@ -11738,6 +11816,9 @@ def _run_plan_first_loop(
         ) else ""
         blocking_reviews: list[tuple[str, str]] = []
         approved_review_outputs: list[tuple[str, str]] = []
+        # The accepted carrier beside each approved text, keyed by reviewer, so
+        # an acknowledgement repair can pin its assessment and records (#925).
+        accepted_review_carriers: dict[str, ParsedPlanReview | ParsedReview] = {}
         all_approved = True
         resumed_by_name = {
             record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
@@ -12047,6 +12128,10 @@ def _run_plan_first_loop(
                     architecture_status_mode="legacy",
                     reviewer=reviewer_name,
                 )
+                resumed_impact, resumed_records = _resumed_review_architecture(
+                    resumed_record.metadata,
+                    structured_review.architecture_impact if structured_review is not None else None,
+                )
                 parsed_review = ParsedPlanReview(
                     state=resumed_record.metadata.state or parse_plan_state(review_output),
                     summary=(
@@ -12060,6 +12145,8 @@ def _run_plan_first_loop(
                         else parse_plan_review_items(review_output, reviewer=reviewer_name)
                     ),
                     dispositions=resumed_record.metadata.dispositions,
+                    architecture_impact=resumed_impact,
+                    architecture_impact_degradations=resumed_records,
                 )
                 review_state = parsed_review.state
                 log(config, f"Planning round {round_number}: resuming {reviewer_name}'s completed review")
@@ -12185,6 +12272,7 @@ def _run_plan_first_loop(
                 blocking_reviews.append((reviewer_name, review_output))
             else:
                 approved_review_outputs.append((reviewer_name, review_output))
+                accepted_review_carriers[reviewer_name] = parsed_review
             if resumed_record is None or (
                 resumed_record.metadata.phase == "publication"
                 and not (current_resume is not None and current_resume.reconciled)
@@ -12383,6 +12471,15 @@ def _run_plan_first_loop(
                                 item.item_id for item in prior_unresolved_items
                             ),
                         },
+                        forbid_architecture_impact=_acknowledgement_repair_forbids_assessment(
+                            review_output
+                        ),
+                    )
+                    repaired_validated = _pin_acknowledgement_repair(
+                        accepted_review_carriers.get(reviewer_name),
+                        repaired_validated,
+                        config=config,
+                        reviewer_name=reviewer_name,
                     )
                     _log_repair_attempts(
                         config, f"Planning round {round_number}: {reviewer_name}", repair_attempts
@@ -19115,6 +19212,9 @@ def run_pr_loop(
                 human_requirements
             )
             approved_review_outputs: list[tuple[str, str]] = []
+            # The accepted carrier beside each approved text, keyed by reviewer, so
+            # an acknowledgement repair can pin its assessment and records (#925).
+            accepted_review_carriers: dict[str, ParsedPlanReview | ParsedReview] = {}
             completed_by_name = {
                 record.metadata.agent: record
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
@@ -20151,12 +20251,18 @@ def run_pr_loop(
                     reparsed_review = structured_review or parse_review(
                         review_output, reviewer=reviewer_name
                     )
+                    resumed_impact, resumed_records = _resumed_review_architecture(
+                        resumed_record.metadata,
+                        structured_review.architecture_impact if structured_review is not None else None,
+                    )
                     parsed_review = ParsedReview(
                         state=resumed_record.metadata.state or parse_agent_state(review_output),
                         summary=reparsed_review.summary,
                         blocking_items=reparsed_review.blocking_items,
                         followups=reparsed_review.followups,
                         dispositions=resumed_record.metadata.dispositions,
+                        architecture_impact=resumed_impact,
+                        architecture_impact_degradations=resumed_records,
                     )
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)
@@ -20537,6 +20643,7 @@ def run_pr_loop(
                     continue
 
                 approved_review_outputs.append((reviewer_name, review_output))
+                accepted_review_carriers[reviewer_name] = parsed_review
                 if (
                     (resumed_record is None or resumed_record.metadata.phase == "publication")
                     and carried_approval_record is None
@@ -20834,6 +20941,15 @@ def run_pr_loop(
                                         item.item_id for item in prior_unresolved_items
                                     ),
                                 },
+                                forbid_architecture_impact=_acknowledgement_repair_forbids_assessment(
+                                    review_output
+                                ),
+                            )
+                            repaired_validated = _pin_acknowledgement_repair(
+                                accepted_review_carriers.get(reviewer_name),
+                                repaired_validated,
+                                config=config,
+                                reviewer_name=reviewer_name,
                             )
                             _log_repair_attempts(
                                 config, f"Round {round_number}: {reviewer_name}", repair_attempts
