@@ -940,6 +940,12 @@ best-effort, retained to 20 samples per command/fingerprint cohort and 200
 cohorts, and becomes stale after 30 days or when relevant inputs change.
 Cohorts also key on the worker count, so serial and parallel durations never
 blend.
+Each wrapper row also records `launch_integrity`: a run whose wrapper
+bootstrap, inner exec and suite start were not all verified (for example an ad
+hoc shell script wrapping pytest) is the same run the evidence gate refuses, so
+it is stored as non-evidence. Non-evidence rows never feed a timeout
+recommendation and are never surfaced to coders as remembered commands; older
+rows without the field are surfaced only for recognized `pytest` launchers.
 
 `run-tests`, `containment-preflight` and the loop flows accept
 `--test-workers N`, `--test-worker-memory SIZE` and

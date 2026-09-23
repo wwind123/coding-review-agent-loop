@@ -2489,6 +2489,7 @@ def test_coder_prompt_renders_remembered_runtime_context_without_test_gate(tmp_p
         attempted_timeout_seconds=7200,
         policy_ceiling_seconds=7200,
         timestamp=datetime_type.now(timezone.utc),
+        launch_integrity="verified",
     )
     assert runtime.record_test_observation(
         memory_dir,
@@ -2499,6 +2500,7 @@ def test_coder_prompt_renders_remembered_runtime_context_without_test_gate(tmp_p
         attempted_timeout_seconds=7200,
         policy_ceiling_seconds=7200,
         timestamp=datetime_type.now(timezone.utc),
+        launch_integrity="verified",
     )
     memory = AgentMemoryContext(
         memory_dir=memory_dir,
@@ -2526,6 +2528,53 @@ def test_coder_prompt_renders_remembered_runtime_context_without_test_gate(tmp_p
     assert "Invocation guidance:" not in reviewer_prompt
 
 
+def test_coder_prompt_never_recommends_runs_refused_as_evidence(tmp_path):
+    """#989: a run refused as evidence must not come back as a remembered command."""
+    memory_dir = tmp_path / "memory"
+    config = make_config(
+        tmp_path,
+        test_command=None,
+        coder_test_command_timeout_seconds=7200,
+        agent_memory_dir=memory_dir,
+    )
+    rows = (
+        (["/tmp/scratch/run_suite.sh"], "unverified"),
+        (["./legacy_wrapper.sh", "-q"], None),
+        ([sys.executable, "-m", "pytest", "tests/test_verified.py"], "verified"),
+        (["env", "PYTHONPATH=src", sys.executable, "-m", "pytest", "tests/test_legacy.py"], None),
+    )
+    for command, integrity in rows:
+        assert runtime.record_test_observation(
+            memory_dir,
+            argv=command,
+            cwd=config.claude_dir,
+            outcome="passed",
+            elapsed_seconds=60,
+            attempted_timeout_seconds=7200,
+            policy_ceiling_seconds=7200,
+            timestamp=datetime_type.now(timezone.utc),
+            launch_integrity=integrity,
+        )
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit="abc123",
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary="REPO SUMMARY TEXT",
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+        runtime_observations=tuple(runtime.load_runtime_memory(memory_dir)),
+    )
+
+    prompt = build_issue_prompt(56, config, memory=memory)
+
+    assert "run_suite.sh" not in prompt
+    assert "legacy_wrapper.sh" not in prompt
+    assert "tests/test_verified.py" in prompt
+    assert "tests/test_legacy.py" in prompt
+
+
 def test_coder_prompt_reuses_stored_runtime_keys_for_redacted_and_external_commands(tmp_path):
     memory_dir = tmp_path / "memory"
     config = make_config(
@@ -2550,6 +2599,7 @@ def test_coder_prompt_reuses_stored_runtime_keys_for_redacted_and_external_comma
             attempted_timeout_seconds=7200,
             policy_ceiling_seconds=7200,
             timestamp=datetime_type.now(timezone.utc),
+            launch_integrity="verified",
         )
     memory = AgentMemoryContext(
         memory_dir=memory_dir,

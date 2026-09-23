@@ -333,6 +333,74 @@ def test_cli_wrapper_records_omitted_ceiling_and_rejects_over_policy_before_spaw
     assert len(runtime.load_runtime_memory(memory)) == 1
 
 
+def test_cli_marks_unauthenticated_wrapper_launch_as_non_evidence(tmp_path, monkeypatch):
+    """#989: a wrapper script's suite start is unknown, so it is not evidence."""
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "AGENT_LOOP_TEST_BROKER_ENDPOINT",
+        "AGENT_LOOP_TEST_BROKER_CAPABILITY",
+        "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    wrapper = tmp_path / "run_suite.sh"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    assert main(["run-tests", "--timeout-seconds", "5", "--memory-dir", str(memory), "--", str(wrapper)]) == 0
+    rows = runtime.load_runtime_memory(memory)
+    assert rows[-1]["launch_integrity"] == "unverified"
+    assert not runtime.runtime_row_recommendable(rows[-1], [str(wrapper)])
+    recommendation = runtime.recommend_timeout(
+        memory, argv=[str(wrapper)], cwd=tmp_path, policy_ceiling_seconds=1800, now=_now()
+    )
+    assert recommendation.successful_samples == 0
+    assert recommendation.recommended_timeout_seconds == 1800
+
+
+def test_launch_integrity_state_requires_every_launch_boundary_verified():
+    from types import SimpleNamespace
+
+    verified = SimpleNamespace(wrapper_bootstrap="verified", inner_exec="started", suite_start="verified")
+    assert runtime.launch_integrity_state(verified) == "verified"
+    for field, value in (
+        ("wrapper_bootstrap", "unknown"),
+        ("inner_exec", "failed"),
+        ("suite_start", "unknown"),
+    ):
+        degraded = SimpleNamespace(**{**vars(verified), field: value})
+        assert runtime.launch_integrity_state(degraded) == "unverified"
+    assert runtime.launch_integrity_state(object()) == "unverified"
+
+
+def test_recommend_timeout_ignores_non_evidence_rows(tmp_path):
+    memory = tmp_path / "memory"
+    command = [sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"]
+    for elapsed in (401, 410, 420):
+        assert runtime.record_test_observation(
+            memory, argv=command, cwd=tmp_path, outcome="passed", elapsed_seconds=elapsed,
+            attempted_timeout_seconds=1800, policy_ceiling_seconds=1800, timestamp=_now(),
+            launch_integrity="unverified",
+        )
+    assert runtime.recommend_timeout(
+        memory, argv=command, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now()
+    ).successful_samples == 0
+    assert runtime.record_test_observation(
+        memory, argv=command, cwd=tmp_path, outcome="passed", elapsed_seconds=400,
+        attempted_timeout_seconds=1800, policy_ceiling_seconds=1800, timestamp=_now(),
+        launch_integrity="bogus",
+    )
+    assert runtime.load_runtime_memory(memory)[-1]["launch_integrity"] == "unverified"
+
+
+def test_runtime_row_recommendable_legacy_rows_only_for_pytest_launchers():
+    assert runtime.runtime_row_recommendable({}, ["pytest", "-q"])
+    assert runtime.runtime_row_recommendable({}, ["env", "A=1", "python", "-m", "pytest"])
+    assert not runtime.runtime_row_recommendable({}, ["/tmp/run_suite.sh"])
+    assert not runtime.runtime_row_recommendable({}, ["python", "-c", "pass"])
+    assert runtime.runtime_row_recommendable({"launch_integrity": "verified"}, ["./run.sh"])
+    assert not runtime.runtime_row_recommendable({"launch_integrity": "unverified"}, ["pytest"])
+
+
 def test_cli_broker_failure_falls_back_and_records_unverified_run(tmp_path, monkeypatch, capsys):
     memory = tmp_path / "memory"
     marker = tmp_path / "ran"
