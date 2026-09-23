@@ -155,6 +155,20 @@ class DeterministicPlanValidationExhaustion:
     candidate_digest: str
 
 
+@dataclass(frozen=True)
+class PreservedUnsatisfiedResponse:
+    """The last parsed response refused for an unsatisfied architecture contract.
+
+    The response is retained, not discarded: its text, the field-naming
+    diagnostic, and any parser-derived degradation records travel on the
+    final invocation error so the operator sees the attempt (#925).
+    """
+
+    text: str
+    diagnostic: str
+    architecture_impact_degradations: tuple = ()
+
+
 class AgentInvocationError(AgentLoopError):
     """Raised when an agent invocation fails after retries/repair.
 
@@ -172,6 +186,7 @@ class AgentInvocationError(AgentLoopError):
         terminal_public_response: str | None = None,
         containment: "ContainmentEvidence | None" = None,
         plan_validation_exhaustion: DeterministicPlanValidationExhaustion | None = None,
+        preserved_unsatisfied_response: PreservedUnsatisfiedResponse | None = None,
         bounded_replan_rejection: DeterministicPlanValidationExhaustion | None = None,
     ) -> None:
         super().__init__(message)
@@ -183,6 +198,7 @@ class AgentInvocationError(AgentLoopError):
         self.terminal_public_response = terminal_public_response
         self.containment = containment
         self.plan_validation_exhaustion = plan_validation_exhaustion
+        self.preserved_unsatisfied_response = preserved_unsatisfied_response
         # A semantic-patch payload rejection that repair could never satisfy
         # (#979). The planner's bounded replan consumes it as a diagnostic.
         self.bounded_replan_rejection = bounded_replan_rejection

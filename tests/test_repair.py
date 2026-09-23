@@ -733,7 +733,7 @@ def test_plan_revision_repair_strips_fabricated_ack_without_signed_requirement_c
         def validate_without_ack(text):
             if HUMAN_REQUIREMENTS_ADDRESSED_MARKER in text or "### Human requirements" in text:
                 raise AgentLoopError("fabricated human requirements acknowledgement")
-            return _validate_plan_revision_response(text)
+            return _validate_plan_revision_response(text, architecture_status_mode="legacy")
 
         response = _run_validated_agent(
             runner,
@@ -1927,7 +1927,7 @@ def _plan_revision_validate_with_human_requirements(human_requirements):
         text,
         marker_validator=lambda revised_text: _validate_plan_revision_response(
             revised_text,
-            unresolved_items=(),
+            unresolved_items=(), architecture_status_mode="legacy",
         ),
         human_requirements=human_requirements,
         requirement_scope="planning requirements",
@@ -3228,7 +3228,7 @@ def test_run_validated_agent_deterministically_strips_unknown_plan_review_withou
             validate=lambda text: _validate_plan_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="plan_review",
@@ -3261,7 +3261,7 @@ def test_run_validated_agent_deterministically_strips_unknown_pr_review_without_
             validate=lambda text: _validate_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -3304,7 +3304,7 @@ def test_run_validated_agent_deterministic_strip_preserves_valid_removes_unknown
             validate=lambda text: _validate_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(carried_item,),
+                unresolved_items=(carried_item,), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -3335,7 +3335,7 @@ def test_run_validated_agent_deterministic_strip_logs_removed_and_allowed_ids(tm
         validate=lambda text: _validate_plan_review_response(
             text,
             reviewer="Google Gemini",
-            unresolved_items=(),
+            unresolved_items=(), architecture_status_mode="legacy",
         ),
         use_repair=True,
         repair_expected_kind="plan_review",
@@ -3383,7 +3383,7 @@ def test_run_validated_agent_deterministic_strip_falls_through_to_repair_on_seco
             validate=lambda text: _validate_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(missing_item,),
+                unresolved_items=(missing_item,), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -3416,7 +3416,7 @@ def test_run_validated_agent_real_264_shape_approved_plan_review_same_round_item
                 text,
                 reviewer="Google Gemini",
                 unresolved_items=(),
-                current_round_items=(),
+                current_round_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="plan_review",
@@ -3452,7 +3452,7 @@ def test_run_validated_agent_deterministic_strip_skipped_when_ledger_incomplete(
                 validate=lambda text: _validate_plan_review_response(
                     text,
                     reviewer="Google Gemini",
-                    unresolved_items=(),
+                    unresolved_items=(), architecture_status_mode="legacy",
                 ),
                 use_repair=True,
                 repair_expected_kind="plan_review",
@@ -3527,7 +3527,7 @@ def _run_incomplete_ledger_pr_review(tmp_path, review, *, history_ids):
                 validate=lambda text: _validate_review_response(
                     text,
                     reviewer="Google Gemini",
-                    unresolved_items=(),
+                    unresolved_items=(), architecture_status_mode="legacy",
                 ),
                 use_repair=True,
                 repair_expected_kind="pr_review",
@@ -3721,7 +3721,7 @@ def test_run_validated_agent_refuses_plan_revision_missing_direct_discussion_ack
                 prompt="Revise the plan.",
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
                 validate=lambda text: (
-                    _validate_plan_revision_response(text, unresolved_items=()),
+                    _validate_plan_revision_response(text, unresolved_items=(), architecture_status_mode="legacy"),
                     validate_human_requirements_acknowledgement(
                         text,
                         surfaced_requirement_ids=(),
@@ -3878,7 +3878,7 @@ def test_run_validated_agent_refuses_unrecoverable_stdout_when_response_file_mar
             validate=lambda text: _validate_coder_followup_response(
                 text,
                 unresolved_items=(),
-                human_requirements=(),
+                human_requirements=(), architecture_status_mode="legacy",
             ),
             repair_expected_kind="coder_followup",
         )
@@ -3910,7 +3910,7 @@ def test_run_validated_agent_refuses_multiple_stdout_structured_candidates(tmp_p
             validate=lambda text: _validate_coder_followup_response(
                 text,
                 unresolved_items=(),
-                human_requirements=(),
+                human_requirements=(), architecture_status_mode="legacy",
             ),
             repair_expected_kind="coder_followup",
         )
@@ -3936,7 +3936,7 @@ def test_run_validated_agent_keeps_valid_response_file_authoritative_over_noisy_
         validate=lambda text: _validate_coder_followup_response(
             text,
             unresolved_items=(),
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         ),
         repair_expected_kind="coder_followup",
     )
@@ -3979,7 +3979,7 @@ def test_structured_plan_revision_transient_terms_before_footer_runs_repair(tmp_
             config=config,
             prompt="Revise the plan.",
             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-            validate=_validate_plan_revision_response,
+            validate=lambda text: _validate_plan_revision_response(text, architecture_status_mode="legacy"),
             use_repair=True,
             repair_expected_kind="plan_revision",
             repair_surfaced_requirement_ids=("Requirement 1",),
@@ -4015,7 +4015,7 @@ def test_run_validated_agent_repairs_unknown_prior_item_disposition_when_ledger_
             validate=lambda text: _validate_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -4050,7 +4050,7 @@ def test_run_validated_agent_skips_unknown_prior_item_repair_when_ledger_incompl
                 validate=lambda text: _validate_review_response(
                     text,
                     reviewer="Google Gemini",
-                    unresolved_items=(),
+                    unresolved_items=(), architecture_status_mode="legacy",
                 ),
                 use_repair=True,
                 repair_expected_kind="pr_review",
@@ -4200,7 +4200,7 @@ def test_run_validated_agent_combined_envelope_and_disposition_fix(tmp_path):
             validate=lambda text: _validate_plan_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="plan_review",
@@ -4250,7 +4250,7 @@ def test_run_validated_agent_rejects_repair_that_invents_prior_item_id(tmp_path)
                 validate=lambda text: _validate_review_response(
                     text,
                     reviewer="Google Gemini",
-                    unresolved_items=(carried_item_3,),
+                    unresolved_items=(carried_item_3,), architecture_status_mode="legacy",
                 ),
                 use_repair=True,
                 repair_expected_kind="pr_review",
@@ -4289,7 +4289,7 @@ def test_run_validated_agent_preserves_valid_disposition_when_repair_removes_unk
             validate=lambda text: _validate_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(carried_item,),
+                unresolved_items=(carried_item,), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -4325,7 +4325,7 @@ def test_run_validated_agent_repairs_unknown_plan_revision_prior_disposition(tmp
             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
             validate=lambda text: _validate_plan_revision_response(
                 text,
-                unresolved_items=(active_item,),
+                unresolved_items=(active_item,), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="plan_revision",
@@ -4364,7 +4364,7 @@ def test_run_validated_agent_plan_revision_unknown_prior_disposition_fails_when_
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
                 validate=lambda text: _validate_plan_revision_response(
                     text,
-                    unresolved_items=(active_item,),
+                    unresolved_items=(active_item,), architecture_status_mode="legacy",
                 ),
                 use_repair=True,
                 repair_expected_kind="plan_revision",
@@ -4904,7 +4904,7 @@ def test_run_validated_agent_neutralizes_markers_named_in_response_prose(tmp_pat
             prompt="Review the PR.",
             marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Gemini", unresolved_items=(),
+                text, reviewer="Google Gemini", unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -4952,7 +4952,7 @@ def test_run_validated_agent_salvages_artifact_whose_prose_names_markers(
             prompt="Review the PR.",
             marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Gemini", unresolved_items=(),
+                text, reviewer="Google Gemini", unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",

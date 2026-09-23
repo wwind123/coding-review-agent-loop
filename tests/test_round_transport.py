@@ -2317,6 +2317,62 @@ def test_planning_scheduler_record_with_a_partial_candidate_key_decodes_invalid(
     )
 
 
+# --- #925: degradation records in round metadata ------------------------------
+
+def _deg_record(outcome="degraded-to-undetermined"):
+    from coding_review_agent_loop.protocol import ParseDegradation
+
+    return ParseDegradation.build(
+        element_path="pr_review.architecture_impact.status",
+        rule="architecture_impact.status-closed-enum-near-miss",
+        observed="modified",
+        outcome=outcome,
+    )
+
+
+def test_degradation_records_round_trip_through_round_metadata():
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _decode_round_metadata,
+        _encode_round_metadata,
+    )
+
+    records = (_deg_record(), _deg_record("normalized-to-changed"))
+    metadata = PostedRoundMetadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=2, subject="head",
+        architecture_impact_degradations=records,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.architecture_impact_degradations == records
+
+
+def test_historical_and_malformed_degradation_metadata_rehydrate_safely():
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _decode_round_metadata_mapping,
+        _encode_round_metadata,
+    )
+
+    metadata = PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex", round_number=2, subject="head")
+    encoded = _encode_round_metadata(metadata)
+    payload = transport.decode_mapping(encoded)
+    # Undegraded rounds keep the historical key shape.
+    assert "architecture_impact_degradations" not in payload
+    assert _decode_round_metadata_mapping(payload).architecture_impact_degradations == ()
+
+    payload["architecture_impact_degradations"] = [
+        _deg_record().to_payload(),
+        {"element_path": "x", "rule": "y"},  # missing keys: dropped
+        {**_deg_record().to_payload(), "outcome": "laundered-to-unchanged"},  # unknown outcome: dropped
+        {**_deg_record().to_payload(), "extra": "agent-authored"},  # extra key: dropped
+        "not a mapping",
+    ]
+    decoded = _decode_round_metadata_mapping(payload)
+    assert decoded.architecture_impact_degradations == (_deg_record(),)
+    payload["architecture_impact_degradations"] = "not a list"
+    assert _decode_round_metadata_mapping(payload).architecture_impact_degradations == ()
+
+
 # --- #948: dedicated overflow error, fit check and size attribution ---
 
 

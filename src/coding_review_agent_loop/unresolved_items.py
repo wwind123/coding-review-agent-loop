@@ -428,8 +428,11 @@ def _validate_review_response(
     reviewer: str,
     unresolved_items: Sequence[UnresolvedReviewItem],
     current_round_items: Sequence[UnresolvedReviewItem] = (),
+    architecture_status_mode: str,
 ) -> ParsedReview:
-    parsed = parse_pr_review(text, reviewer=reviewer)
+    parsed = parse_pr_review(
+        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+    )
 
     unresolved_by_id = {item.item_id: item for item in unresolved_items}
     dispositions = _maybe_fill_resolved_dispositions_from_prose(
@@ -475,14 +478,9 @@ def _validate_review_response(
                 "relevant evidence, and the change or test needed. A status alone or a "
                 "review-level summary is not an item-specific explanation."
             )
-    return ParsedReview(
-        state=parsed.state,
-        summary=parsed.summary,
-        blocking_items=parsed.blocking_items,
-        followups=parsed.followups,
-        dispositions=dispositions,
-        raw_dispositions_text=parsed.raw_dispositions_text,
-    )
+    # Replace only the dispositions: the assessment, its degradation records
+    # and every other parsed field survive a carried-item round (#925).
+    return replace(parsed, dispositions=dispositions)
 
 
 def _upsert_human_requirements_ack_item(
@@ -770,6 +768,7 @@ def _validate_coder_followup_response(
     authoritative_test_observations=None,
     delivered_risk_test_matrix_row_ids=None,
     execution_catalog=None,
+    architecture_status_mode: str,
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -781,6 +780,7 @@ def _validate_coder_followup_response(
         authoritative_test_observations=authoritative_test_observations,
         delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
         execution_catalog=execution_catalog,
+        architecture_status_mode=architecture_status_mode,
     )
     if structured_followup is not None:
         _validate_structured_coder_followup_items(
@@ -1112,8 +1112,11 @@ def _validate_plan_review_response(
     unresolved_items: Sequence[UnresolvedReviewItem],
     current_round_items: Sequence[UnresolvedReviewItem] = (),
     surfaced_requirement_ids: Sequence[str] = (),
+    architecture_status_mode: str,
 ) -> ParsedPlanReview:
-    parsed = parse_plan_review(text, reviewer=reviewer)
+    parsed = parse_plan_review(
+        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+    )
     validate_human_requirement_dispositions(
         parsed.human_requirement_dispositions,
         surfaced_requirement_ids=surfaced_requirement_ids,
@@ -1149,13 +1152,9 @@ def _validate_plan_review_response(
                 "Plan review did not evaluate all prior unresolved plan items: "
                 + ", ".join(missing)
             )
-    return ParsedPlanReview(
-        state=parsed.state,
-        summary=parsed.summary,
-        items=parsed.items,
-        dispositions=dispositions,
-        raw_dispositions_text=parsed.raw_dispositions_text,
-    )
+    # Replace only the dispositions: the assessment, its degradation records
+    # and every other parsed field survive a carried-item round (#925).
+    return replace(parsed, dispositions=dispositions)
 
 
 def _record_prior_item_disposition(

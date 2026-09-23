@@ -842,6 +842,49 @@ paths, and fresh turns with an acquired architecture snapshot use the versioned
 architecture-impact assessment. Legacy records remain decodable without
 inventing a snapshot or assessment; source inspection remains required.
 
+Semantic-claim validation degrades the narrowest offending element instead of
+rejecting the whole response. The architecture-impact parser has three explicit
+modes. `strict` is the default and accepts only `changed` and `unchanged`.
+`legacy` is the #916 synonym normalization, selected explicitly only where
+stored or historical text is decoded: plan re-authentication, both topology
+checkpoint decodes, and re-parses of posted or resumed records. `degradable`
+is selected only by the agent-response validation of the seven
+required-contract invocations and the four live review invocations. It honors
+exactly one alias: `modified` becomes `changed` when the payload corroborates a
+change, meaning every changed-only list, including the literal
+`execution_data_flows` key, is non-empty, and the payload names a real
+canonical-document action. Every other synonym, and an uncorroborated
+`modified`, becomes the parser-only `undetermined` status, which has no wire
+form and never resolves to `unchanged`.
+
+Accepted text is canonicalized at one acceptance boundary that every
+successful exit of `_run_validated_agent` and of completion recovery goes
+through. The status is rewritten to `changed`, or an undetermined optional
+review assessment is removed. The rewritten text is then re-parsed strictly
+under the candidate's own test-turn context, and the degradation records are
+reattached, so later strict re-parses of posted text still succeed.
+
+A required assessment that is omitted, removed, or `undetermined` does not
+satisfy the contract. The validators return it without raising, and
+`_run_validated_agent` refuses it. The refusal is deterministic and makes no
+repair call. It takes an ordinary retry whose prompt names `architecture_impact`
+and its accepted values, within the existing `--agent-max-retries` budget and
+attempt bound. This applies to a primary response, a response-file artifact
+from a timeout or nonzero exit, a completion-recovery response, and a repair
+candidate. The refused response is kept on the final error.
+
+Semantic patch values stay strict. Canonical plan assembly and topology
+checkpoint publication refuse a degraded status. Repair normalizes a near miss
+before the repair prompt is built. It pins the absence of any removed
+assessment, and of an omitted required one, and it refuses an unsatisfied
+candidate before counting it as a success. Acknowledgement-only review repairs
+validate new output strictly and keep the accepted assessment. Every
+degradation produces a bounded, parser-derived record. Records travel on the
+parsed result and in an optional round-metadata field, from which resumed
+review carriers are rebuilt, and they appear in the round summary. A
+decomposition surfaces its records in a plain parent-issue comment, whether it
+was accepted or refused.
+
 ## Semantic planning foundation
 
 Generation-1 planning remains the downstream wire contract. A semantic

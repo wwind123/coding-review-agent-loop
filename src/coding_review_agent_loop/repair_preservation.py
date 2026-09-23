@@ -2,11 +2,15 @@
 
 from collections import Counter
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+import json
 import re
 
 from .errors import AgentLoopError
 from .protocol import (
+    ParseDegradation,
     _extract_json_object_prefix,
+    classify_architecture_status_near_miss,
     _normalize_requirement_label,
     normalize_response_file_structured_text,
     parse_plan_revision_patch,
@@ -871,6 +875,7 @@ def validate_repair_preservation(
     reviewer_requirement_ids: Sequence[str] | None = None,
     allowed_prior_item_ids: Sequence[str] | None = None,
     allow_legacy_matrix_removal: bool = False,
+    forbid_architecture_impact: bool = False,
 ) -> None:
     """Reject observable losses, not certify semantic equivalence.
 
@@ -878,6 +883,8 @@ def validate_repair_preservation(
     Do not heuristically parse broken JSON or interpret prose as item ledgers.
     """
     source, target = _payload(raw), _payload(repaired)
+    if forbid_architecture_impact:
+        require_repair_architecture_impact_absent(repaired)
     # Reviewer grounding is triggered by the repaired TARGET kind, so it also
     # covers a legacy repair entry point and an absent or wrong-kind source,
     # neither of which reaches the loss checks below.
@@ -1333,3 +1340,91 @@ def validate_repair_preservation(
             )
             require(match is not None, field)
             available.pop(match)
+
+
+def require_repair_architecture_impact_absent(repaired: str) -> None:
+    """Pin the absence of a required assessment through repair (#925).
+
+    When a required-contract source carries no assessment -- genuinely
+    omitted, or removed by pre-repair near-miss normalization -- a repair
+    model must not supply one: a fabricated `unchanged` would launder an
+    unsupplied assessment into a satisfied contract.
+    """
+    target = _payload(repaired)
+    if isinstance(target, dict) and "architecture_impact" in target:
+        raise AgentLoopError(
+            "Repair content preservation failed for architecture_impact: the source "
+            "carried no assessment, so repair must not introduce one."
+        )
+
+
+@dataclass(frozen=True)
+class ArchitectureNearMissNormalization:
+    """Pre-repair normalization result; the record stays out of band."""
+
+    raw: str
+    record: ParseDegradation | None
+    forbid_architecture_impact: bool
+
+
+def _rewrite_architecture_near_miss(raw: str) -> tuple[str, ParseDegradation | None, dict | None, bool]:
+    """Deterministically rewrite a top-level near miss to its wire-valid form.
+
+    A corroborated `modified` becomes `changed`; every other near miss has its
+    optional object removed.  Only the JSON object span is rewritten; the
+    footer and signature bytes that follow it are kept.
+    """
+    payload, trailing = _payload_and_trailing(raw)
+    impact = payload.get("architecture_impact") if isinstance(payload, dict) else None
+    if not isinstance(impact, dict):
+        return raw, None, payload, False
+    kind = payload.get("kind") if isinstance(payload.get("kind"), str) else "response"
+    near_miss = classify_architecture_status_near_miss(
+        impact, context=f"{kind}.architecture_impact"
+    )
+    if near_miss is None:
+        return raw, None, payload, False
+    resolved, record = near_miss
+    rewritten = dict(payload)
+    removed = resolved != "changed"
+    if removed:
+        rewritten.pop("architecture_impact")
+    else:
+        rewritten["architecture_impact"] = {**impact, "status": resolved}
+    normalized = json.dumps(rewritten, ensure_ascii=False) + (
+        trailing if trailing.startswith(("\n", "\r")) else "\n" + trailing.lstrip()
+    )
+    return normalized, record, rewritten, removed
+
+
+def canonicalize_architecture_near_miss_text(text: str) -> str:
+    """Return accepted text with any near-miss status in its wire-valid form."""
+    return _rewrite_architecture_near_miss(text)[0]
+
+
+def normalize_architecture_impact_near_miss(
+    raw: str, *, required_contract: bool, expected_kind: str | None = None
+) -> ArchitectureNearMissNormalization:
+    """Resolve the status near miss in the raw payload before repair (#924).
+
+    Deterministic normalization runs before the LLM repair pass.  A
+    corroborated `modified` becomes a wire-valid `changed` that preservation
+    then pins; every other near miss has its whole optional object removed,
+    which is exactly what the parser-only `undetermined` status stands for.
+    Any other payload, including an unparseable one, is returned unchanged.
+
+    The absence pin has two triggers.  A normalization removal is pinned for
+    every kind, including optional-assessment reviews, so repair can never put
+    back a stronger claim.  Under a required contract, a recoverable source of
+    the expected kind that simply omits the assessment is pinned too.
+    """
+    normalized, record, payload, removed = _rewrite_architecture_near_miss(raw)
+    forbid = removed or bool(
+        required_contract
+        and isinstance(payload, dict)
+        and "architecture_impact" not in payload
+        and (expected_kind is None or payload.get("kind") == expected_kind)
+    )
+    return ArchitectureNearMissNormalization(
+        raw=normalized, record=record, forbid_architecture_impact=forbid
+    )

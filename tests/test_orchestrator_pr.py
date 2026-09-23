@@ -7487,6 +7487,11 @@ def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_ite
                 "checked_discussion_directly": False,
             },
             "human_requirement_dispositions": [],
+            # The source carries its own assessment: repair may fix the
+            # envelope but may not supply an omitted one (#925).
+            "architecture_impact": json.loads(
+                structured_coder_followup().split("\n<!--", 1)[0]
+            )["architecture_impact"],
         }
     )
     repaired_coder_response = structured_coder_followup(
@@ -13248,3 +13253,254 @@ def test_m985_unchanged_head_count_resets_after_an_external_head_advance():
     assert tracker.observe("C", "C") == 1
     # An unknown reviewed head never counts.
     assert tracker.observe(None, None) == 0
+
+
+# --- #925 round 5: the PR acknowledgement repair through the real flow -------
+
+_ACK_UNCORROBORATED = {"status": "modified", "rationale": "Something changed."}
+
+
+def _ack_with_impact(rendered, impact):
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    if impact is None:
+        payload.pop("architecture_impact", None)
+    else:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload) + rendered[split:]
+
+
+def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the current audit trail.",
+    )
+    metadata = PullRequestMetadata(
+        number=77, repo="OWNER/REPO", title="Acknowledgement repair",
+        head_branch="feature/review-context", base_branch="main",
+        head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: PullRequestReviewContext(
+            metadata=metadata, comments=(), human_requirements=(requirement,)
+        ),
+    )
+    # The reviewer approves with an uncorroborated near miss and no
+    # acknowledgement; acceptance removes the assessment and records it.
+    unacknowledged = _ack_with_impact(
+        structured_pr_review(summary="Codex approves.", reviewer="OpenAI Codex"),
+        _ACK_UNCORROBORATED,
+    )
+    repaired = _ack_with_impact(
+        structured_pr_review(
+            summary="Codex approves.", reviewer="OpenAI Codex",
+            human_requirements_resolved=True,
+        ),
+        None if repaired_status is None
+        else {"status": repaired_status, "rationale": "No architectural change."},
+    )
+    runner = FakeRunner(codex_outputs=[unacknowledged] * 3)
+    repair_calls = []
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    config = make_config(
+        tmp_path, reviewer="codex", max_rounds=1,
+        agent_max_retries=0, agent_retry_backoff_seconds=0,
+    )
+    repair_results = []
+    real_structured_repair = orchestrator._run_structured_repair
+
+    def spy_repair(*args, **kwargs):
+        result = real_structured_repair(*args, **kwargs)
+        repair_results.append(result)
+        return result
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator, "_run_structured_repair", spy_repair
+    ):
+        try:
+            outcome = run_pr_loop(runner, pr_number=77, config=config)
+        except AgentLoopError as exc:
+            outcome = exc
+    _ack_pr_run.repair_results = repair_results
+    records = []
+    for comment in runner.pr_payload["comments"]:
+        match = re.search(
+            r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", comment["body"]
+        )
+        if match:
+            decoded = _decode_round_metadata(match.group("payload"))
+            if decoded.role == "reviewer":
+                records.append(decoded)
+    return outcome, records, repair_calls
+
+
+def test_pr_acknowledgement_repair_keeps_the_accepted_assessment_and_record(
+    tmp_path, monkeypatch
+):
+    outcome, records, repair_calls = _ack_pr_run(tmp_path, monkeypatch)
+    assert repair_calls, "the acknowledgement repair must run through the flow"
+    assert '"modified"' not in repair_calls[0]
+    # Exactly one reviewer publication, made from the accepted carrier before
+    # the gate; the successful repair posts nothing new.
+    assert len(records) == 1
+    assert records[0].architecture_impact is None
+    assert [r.outcome for r in records[0].architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+    assert outcome == 0, outcome
+
+
+@pytest.mark.parametrize("status", ["unchanged", "none"])
+def test_pr_acknowledgement_repair_cannot_add_an_assessment(tmp_path, monkeypatch, status):
+    outcome, records, repair_calls = _ack_pr_run(tmp_path, monkeypatch, repaired_status=status)
+    assert repair_calls
+    refusal = {"unchanged": "must not introduce one", "none": "must be `changed` or `unchanged`"}
+    assert _ack_pr_run.repair_results
+    for _text, validated, attempts in _ack_pr_run.repair_results:
+        assert validated is None
+        assert refusal[status] in attempts[-1].diagnostic
+    # The refused repair leaves the approval unacknowledged: nothing merges.
+    assert outcome != 0
+    assert all(record.architecture_impact is None for record in records)
+
+
+
+def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
+    """Interrupt right after Codex's review is posted, then resume the round."""
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the current audit trail.",
+    )
+    real_context = orchestrator.get_pr_review_context
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: dataclasses.replace(
+            real_context(*args, **kwargs), human_requirements=(requirement,)
+        ),
+    )
+    review = _ack_with_impact(
+        structured_pr_review(
+            summary="Codex approves.", reviewer="OpenAI Codex",
+            human_requirements_resolved=acknowledged,
+        ),
+        _ACK_UNCORROBORATED,
+    )
+    repaired = structured_pr_review(
+        summary="Codex approves.", reviewer="OpenAI Codex", human_requirements_resolved=True
+    )
+    runner = FakeRunner(codex_outputs=[review] * 3)
+    config = make_config(
+        tmp_path, reviewer="codex", max_rounds=1, review_parallel=parallel,
+        agent_max_retries=0, agent_retry_backoff_seconds=0,
+    )
+
+    def codex_records():
+        found = []
+        for comment in runner.pr_payload["comments"]:
+            match = re.search(
+                r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", comment["body"]
+            )
+            if match:
+                decoded = _decode_round_metadata(match.group("payload"))
+                if decoded.role == "reviewer" and decoded.agent == "Codex":
+                    found.append(decoded)
+        return found
+
+    real_post = orchestrator.post_pr_comment
+    interrupted = []
+
+    def interrupt_after_review(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        if not interrupted and codex_records():
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        return result
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", lambda raw, cmd, **kw: repaired), \
+            patch.object(orchestrator, "post_pr_comment", side_effect=interrupt_after_review):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    codex_before = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["codex"])
+
+    resumed, carriers, repair_calls = [], [], []
+    real_resumed = orchestrator._resumed_review_architecture
+    real_pin = orchestrator._pin_acknowledgement_repair
+
+    def spy_resumed(*args, **kwargs):
+        result = real_resumed(*args, **kwargs)
+        resumed.append(result)
+        return result
+
+    def spy_pin(accepted, repaired_value, **kwargs):
+        carriers.append(accepted)
+        return real_pin(accepted, repaired_value, **kwargs)
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator, "_resumed_review_architecture", spy_resumed
+    ), patch.object(orchestrator, "_pin_acknowledgement_repair", spy_pin):
+        try:
+            outcome = run_pr_loop(runner, pr_number=77, config=config)
+        except AgentLoopError as exc:
+            outcome = exc
+    codex_after = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["codex"])
+    return SimpleNamespace(
+        outcome=outcome, resumed=resumed, carriers=carriers, repair_calls=repair_calls,
+        records=codex_records(), reinvoked=codex_after - codex_before,
+    )
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["authoritative", "publication"])
+def test_resumed_acknowledged_pr_review_is_rebuilt_from_round_metadata(
+    tmp_path, monkeypatch, parallel
+):
+    run = _ack_pr_resume_run(tmp_path, monkeypatch, acknowledged=True, parallel=parallel)
+    # The posted review resumes without re-invoking the reviewer, and its
+    # carrier's assessment and records come from round metadata, whatever the
+    # record's phase: a null assessment plus the original degradation record.
+    assert run.reinvoked == 0
+    ((impact, records),) = run.resumed
+    assert impact is None
+    assert [r.outcome for r in records] == ["degraded-to-undetermined"]
+    assert run.repair_calls == []
+    for record in run.records:
+        assert record.architecture_impact is None
+        assert [r.outcome for r in record.architecture_impact_degradations] == [
+            "degraded-to-undetermined"
+        ]
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["authoritative", "publication"])
+def test_resumed_unacknowledged_pr_review_is_reinvoked_not_repaired_from_a_stale_source(
+    tmp_path, monkeypatch, parallel
+):
+    # In the PR flow a same-head review resumes only when its record already
+    # carries the acknowledgement (_resumed_pr_reviewer_matches_requirements),
+    # so an unacknowledged posted review is re-run instead of resumed. The
+    # acknowledgement repair then sees the fresh accepted carrier, which keeps
+    # the null assessment and its record.
+    run = _ack_pr_resume_run(tmp_path, monkeypatch, acknowledged=False, parallel=parallel)
+    assert run.reinvoked == 1
+    assert run.resumed == []
+    assert run.carriers
+    for carrier in run.carriers:
+        assert carrier.architecture_impact is None
+        assert [r.outcome for r in carrier.architecture_impact_degradations] == [
+            "degraded-to-undetermined"
+        ]

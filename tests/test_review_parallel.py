@@ -256,9 +256,58 @@ def test_plan_validation_diagnostic_survives_a_new_invocation_and_is_superseded(
     assert planner_prompts[1].count(
         "plan_state must include architecture_impact for this fresh contract turn."
     ) == 1
+    # The re-prompt names the field and its accepted values (#925).
+    assert "`changed` or `unchanged`" in planner_prompts[1]
     assert "AGENT_PLAN_VALIDATION_DIAGNOSTIC" not in planner_prompts[1]
     assert "2026-09-17T05:31:00Z" not in planner_prompts[1]
     assert len(runner.verified_round_bodies) == 2
+
+
+def test_unsatisfied_plan_repair_is_deterministic_and_the_rerun_is_accepted(tmp_path):
+    """An uncorroborated near miss plus a repairable defect (#925).
+
+    Repair fixes the envelope but may not supply the assessment, so the repair
+    outcome is a deterministic contract refusal; the planner re-prompt names
+    the field and the next planner turn is accepted.
+    """
+    payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    payload["architecture_impact"] = {"status": "modified", "rationale": "Something changed."}
+    payload["unexpected_key"] = True
+    invalid_candidate = (
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    repaired_payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    repaired_payload.pop("architecture_impact")
+    repaired_candidate = (
+        json.dumps(repaired_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=None,
+        claude_outputs=[invalid_candidate],
+        codex_outputs=[],
+        gemini_outputs=[],
+    )
+    config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
+
+    with patch.object(orchestrator, "attempt_repair", lambda raw, cmd, **kw: repaired_candidate):
+        with pytest.raises(AgentInvocationError) as error:
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert error.value.failure_category == "deterministic"
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None and exhaustion.candidate_text == repaired_candidate
+    assert [r.outcome for r in error.value.preserved_unsatisfied_response.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+    assert len(runner.verified_round_bodies) == 1
+
+    runner.claude_outputs = [structured_plan_state(summary="Recovered plan.")]
+    runner.codex_outputs = [structured_plan_review(summary="The recovered plan is approved.")]
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    planner_prompts = [command[-1] for command, _cwd in runner.commands if command[:1] == ["claude"]]
+    assert len(planner_prompts) == 2
+    assert "plan_state must include architecture_impact" in planner_prompts[1]
+    assert "`changed` or `unchanged`" in planner_prompts[1]
 
 
 @pytest.mark.parametrize("context_mode", ["compact", "full"])

@@ -48,7 +48,7 @@ def test_live_carried_item_requires_explanation(disposition, note):
     with pytest.raises(AgentLoopError, match="requires an actionable note"):
         _validate_review_response(
             carried_review(disposition=disposition, note=note),
-            reviewer="Codex", unresolved_items=(carried_item(),),
+            reviewer="Codex", unresolved_items=(carried_item(),), architecture_status_mode="legacy",
         )
 
 
@@ -56,13 +56,13 @@ def test_live_carried_item_requires_explanation(disposition, note):
 def test_live_carried_item_rejects_blank_note(note):
     with pytest.raises(AgentLoopError):
         _validate_review_response(
-            carried_review(note=note), reviewer="Codex", unresolved_items=(carried_item(),),
+            carried_review(note=note), reviewer="Codex", unresolved_items=(carried_item(),), architecture_status_mode="legacy",
         )
 
 
 def test_resolved_note_optional_and_historical_blocker_still_readable():
     _validate_review_response(
-        carried_review(disposition="resolved"), reviewer="Codex", unresolved_items=(carried_item(),),
+        carried_review(disposition="resolved"), reviewer="Codex", unresolved_items=(carried_item(),), architecture_status_mode="legacy",
     )
     old = parse_pr_review(carried_review(), reviewer="Codex")
     items, _ = _apply_unresolved_item_dispositions(
@@ -74,7 +74,7 @@ def test_resolved_note_optional_and_historical_blocker_still_readable():
 
 def test_note_survives_publication_metadata_and_reconciliation():
     parsed = _validate_review_response(
-        carried_review(note=NOTE), reviewer="Codex", unresolved_items=(carried_item(),),
+        carried_review(note=NOTE), reviewer="Codex", unresolved_items=(carried_item(),), architecture_status_mode="legacy",
     )
     public = _render_public_pr_review_comment(
         parsed, reviewer="Codex", prior_items=(carried_item(),), dispositions=parsed.dispositions,
@@ -107,7 +107,7 @@ def test_carried_machine_obligation_keeps_authority_after_reparsed_approval():
         prior_item_dispositions=[{"item_id": "item-30", "disposition": "resolved"}],
     )
     parsed = _validate_review_response(
-        review, reviewer="Codex", unresolved_items=(machine_item,)
+        review, reviewer="Codex", unresolved_items=(machine_item,), architecture_status_mode="legacy"
     )
     saved = _attach_round_metadata(
         "Published review.\n<!-- AGENT_STATE: approved -->\n-- Codex",

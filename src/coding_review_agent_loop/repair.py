@@ -1302,7 +1302,7 @@ RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
     "transient_provider_error", "fresh_contract_integrity", "semantic_patch_integrity",
-    "review_substance_integrity",
+    "review_substance_integrity", "architecture_contract_unsatisfied",
 ]
 
 
@@ -1319,6 +1319,26 @@ class RepairAttemptResult:
     fallback_planned: bool
     validation_result: object | None = None
     integrity_contract: Literal["execution_recommendation", "risk_test_matrix"] | None = None
+    # Out-of-band parse degradation records derived by pre-repair
+    # normalization.  They never appear in any text a repair model sees.
+    architecture_impact_degradations: tuple = ()
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    """A repair candidate's authoritative parsed value and contract refusal.
+
+    ``parsed`` is the record-bearing carrier; ``refusal`` is the field-naming
+    diagnostic when the required architecture-impact contract is unsatisfied.
+    """
+
+    parsed: object
+    refusal: str | None
+
+
+def _decision_records(parsed: object) -> tuple:
+    carrier = getattr(parsed, "parsed", parsed)
+    return tuple(getattr(carrier, "architecture_impact_degradations", ()) or ())
 
 
 _KNOWN_ERROR_RE = re.compile(
@@ -1703,9 +1723,17 @@ def execute_repair(
     run_id: str | None,
     usage_context: RunUsageContext | None,
     validate: Callable[[str], object],
+    forbid_architecture_impact: bool = False,
+    candidate_refusal: Callable[[str, object], CandidateDecision] | None = None,
     **prompt_kwargs: object,
 ) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
-    """Run the configured repair chain and validate each candidate."""
+    """Run the configured repair chain and validate each candidate.
+
+    ``forbid_architecture_impact`` and ``candidate_refusal`` are control
+    parameters, never prompt keywords.  The contract refusal is decided per
+    candidate, before any success bookkeeping, so a refused candidate is never
+    counted as a success or retroactively rejected.
+    """
     prompt = _build_repair_prompt(raw, **prompt_kwargs)
     attempts: list[RepairAttemptResult] = []
     if config.repair_backend == "antigravity":
@@ -1879,6 +1907,7 @@ def execute_repair(
                         allow_legacy_matrix_removal=bool(
                             prompt_kwargs.get("reject_unsolicited_risk_test_matrix_contract")
                         ),
+                        forbid_architecture_impact=forbid_architecture_impact,
                     )
                 except Exception as exc:
                     if outcome == "succeeded":
@@ -1890,6 +1919,37 @@ def execute_repair(
                     if usage_record is not None:
                         usage_record.outcome = attempt.outcome
                 else:
+                    if candidate_refusal is not None:
+                        decision = candidate_refusal(output, validation_result)
+                        validation_result = decision.parsed
+                        if decision.refusal is not None:
+                            # Refused, not accepted.  This returns or moves to
+                            # the next model before the Antigravity transient
+                            # reclassification below can rewrite it.
+                            attempt.outcome = "architecture_contract_unsatisfied"
+                            attempt.validation_result = validation_result
+                            attempt.architecture_impact_degradations = _decision_records(
+                                validation_result
+                            )
+                            attempt.diagnostic = "\n".join(
+                                part for part in (
+                                    attempt.diagnostic,
+                                    _sanitize_diagnostic(decision.refusal, config=config),
+                                ) if part
+                            )
+                            # A binding absence pin holds every later model to
+                            # the same unsatisfied state, so the chain stops.
+                            attempt.fallback_planned = (
+                                fallback_planned and not forbid_architecture_impact
+                            )
+                            if usage_record is not None:
+                                usage_record.validation_status = "invalid"
+                                usage_record.outcome = attempt.outcome
+                                usage_record.fallback_planned = attempt.fallback_planned
+                            attempts.append(attempt)
+                            if not attempt.fallback_planned:
+                                return None, None, attempts
+                            break
                     if outcome != "succeeded":
                         attempt.outcome = (
                             "accepted_timeout" if outcome == "timeout"

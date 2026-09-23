@@ -715,3 +715,60 @@ def test_stored_patch_provenance_round_trips_and_resumes(tmp_path) -> None:
     resumed_plan, resumed_round = resumed
     assert resumed_plan == canonical_plan
     assert resumed_round.coder_output == raw_patch_body
+
+
+# --- #925: degraded statuses never reach approved plan state ------------------
+
+_DEG_CHANGED_IMPACT = {
+    "status": "changed",
+    "rationale": "The revision adds a publication seam.",
+    "affected_components": ["round_state.py"],
+    "dependencies": ["plan_assembly.py"],
+    "execution_data_flows": ["plan round -> metadata"],
+    "persistence": ["round metadata"],
+    "public_contracts": ["canonical plan"],
+    "security_boundaries": ["approved plan identity"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Record the new seam.",
+}
+
+
+def test_patch_replace_with_near_miss_status_is_rejected_with_route_forward() -> None:
+    state = _state(_base([_row("row-a")]))
+    patch = _patch(
+        state,
+        [{"op": "replace", "field": "architecture_impact",
+          "value": dict(_DEG_CHANGED_IMPACT, status="modified")}],
+    )
+    with pytest.raises(AgentLoopError) as error:
+        assemble_authenticated_plan_revision(state, patch)
+    message = str(error.value)
+    assert "`changed` or `unchanged`" in message
+    assert "`modified` is not accepted in a patch" in message
+    with pytest.raises(AgentLoopError, match="not accepted in a patch"):
+        parse_plan_revision_patch(patch)
+
+
+def test_canonical_assembly_fails_closed_on_a_degraded_status() -> None:
+    from coding_review_agent_loop.protocol import (
+        ARCHITECTURE_IMPACT_UNDETERMINED,
+        validate_structured_plan_revision,
+    )
+
+    payload = dict(_base([_row("row-a")]), architecture_impact=_DEG_CHANGED_IMPACT)
+    text = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    plan = validate_structured_plan_revision(text)
+    identity = aggregate_plan_identity(structured_plan_revision_to_payload(plan))
+    degraded = replace(
+        plan,
+        architecture_impact=replace(plan.architecture_impact, status=ARCHITECTURE_IMPACT_UNDETERMINED),
+    )
+    with pytest.raises(AgentLoopError, match="refusing degraded status"):
+        structured_plan_revision_to_payload(degraded)
+    # An undegraded plan's canonical payload and identity are unchanged.
+    assert aggregate_plan_identity(structured_plan_revision_to_payload(plan)) == identity
+    reauthenticated = AuthenticatedPlanState.from_plan(
+        structured_plan_revision_to_payload(plan), round_number=4
+    )
+    assert reauthenticated.plan.architecture_impact == plan.architecture_impact
