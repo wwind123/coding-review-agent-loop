@@ -6975,6 +6975,7 @@ def _persist_execution_decision_if_needed(
     recommendation,
     requested_policy: str,
     resolved_execution: ResolvedExecution | None = None,
+    retired_plan_hashes: frozenset[str] = frozenset(),
 ) -> None:
     if resolved_execution is not None:
         recommendation = resolved_execution.recommendation
@@ -7013,6 +7014,7 @@ def _persist_execution_decision_if_needed(
         plan_subject=plan_subject,
         strategy=recommendation.strategy,
         recommendation_digest=str(identity["recommendation_sha256"]),
+        retired_plan_hashes=retired_plan_hashes,
     )
     if existing is None:
         post_execution_decision(runner, config=config, decision=decision)
@@ -7027,6 +7029,7 @@ def _preflight_fresh_staged_topology(
     issue_context: IssueContext,
     mode: str,
     normalized_topology,
+    retired_plan_hashes: frozenset[str] = frozenset(),
 ) -> tuple[CreatedPhaseIssue, ...] | NeedsHumanDecision:
     """Validate fresh staged recovery without publishing or creating anything."""
     decomposition, retained_parent_scope = normalized_topology
@@ -7049,6 +7052,7 @@ def _preflight_fresh_staged_topology(
         plan_subject=plan_subject,
         strategy="staged",
         recommendation_digest=decomposition.recommendation_digest,
+        retired_plan_hashes=retired_plan_hashes,
     )
     existing_pr = resolve_canonical_pr_for_issue(
         runner,
@@ -7410,6 +7414,7 @@ def _preflight_fresh_one_shot_recovery(
     config: AgentLoopConfig,
     issue_context: IssueContext,
     recommendation=None,
+    retired_plan_hashes: frozenset[str] = frozenset(),
 ) -> None:
     """Validate existing one-shot handoffs before the decision record is posted."""
     plan_hash = approved_plan_hash(approved_plan)
@@ -7427,6 +7432,7 @@ def _preflight_fresh_one_shot_recovery(
             plan_subject=plan_subject,
             strategy="one-shot",
             recommendation_digest=str(identity["recommendation_sha256"]),
+            retired_plan_hashes=retired_plan_hashes,
         )
     _preflight_fresh_split_topology(
         runner,
@@ -9131,6 +9137,88 @@ def verify_child_plan_rebind(
     if inadmissible is not None:
         raise fail(f"the replacement plan is itself inadmissible.\n{inadmissible}")
     return replacement
+
+
+def verified_retired_child_plan_hashes(
+    child_comments: Sequence[object],
+    *,
+    repo: str,
+    parent_plan_context: ApprovedPlanContext,
+    child_issue: int,
+    parent_issue: int,
+    stage_id: str,
+    pr_number: int,
+) -> frozenset[str]:
+    """Approved plans that a verified signed supersession chain replaced (#988).
+
+    A rebind moves the PR binding to the replacement plan, but the execution
+    decision recorded under the superseded plan stays on the issue.  That
+    decision is history, not a competing topology, exactly when the plan it
+    names was replaced through a verified signed re-plan.  The chain is
+    walked backwards from the live handoff: the latest edge is verified by
+    ``verify_child_plan_rebind`` (which raises on an unverifiable
+    replacement), and each earlier edge must carry one consistent rebind
+    audit record whose digest-bound re-plan lineage verifies.  The walk
+    stops at the first edge that does not verify, so an unexplained hash
+    divergence keeps failing closed at the execution-decision check.
+    """
+    replacement = verify_child_plan_rebind(
+        child_comments,
+        repo=repo,
+        parent_plan_context=parent_plan_context,
+        child_issue=child_issue,
+        parent_issue=parent_issue,
+        stage_id=stage_id,
+        pr_number=pr_number,
+        require_admissible=False,
+    )
+    if replacement is None or not replacement.plan_hash:
+        return frozenset()
+    supersessions = collect_child_plan_supersessions(
+        child_comments, child_issue=child_issue, parent_issue=parent_issue, stage_id=stage_id
+    )
+    rebinds = [
+        record
+        for record in find_child_plan_rebind_records(child_comments)
+        if record.child_issue == child_issue and record.pr_number == pr_number
+    ]
+    retired: set[str] = set()
+    current = replacement.plan_hash
+    while True:
+        edges = {
+            (
+                record.superseded_plan_hash,
+                record.plan_supersession_digest,
+                record.first_replan_round,
+                record.approved_round,
+            )
+            for record in rebinds
+            if record.new_plan_hash == current
+        }
+        if len(edges) != 1:
+            # No edge ends the chain; two different edges into one plan are
+            # ambiguous and never chosen between.
+            break
+        superseded, digest, first_round, approved_round = next(iter(edges))
+        if superseded in retired or superseded == replacement.plan_hash:
+            break
+        replan = authorized_replan_lineage(
+            child_comments,
+            superseded_hash=superseded,
+            digest=digest,
+            supersessions=supersessions,
+            through_round=approved_round,
+        )
+        if (
+            isinstance(replan, str)
+            or replan.first_round != first_round
+            or replan.latest_round != approved_round
+            or replan.latest_plan_hash != current
+        ):
+            break
+        retired.add(superseded)
+        current = superseded
+    return frozenset(retired)
 
 
 def _require_authorized_replan_state(
@@ -13016,6 +13104,26 @@ def run_issue_loop(
                 ),
                 plan_supersession=plan_supersession,
             )
+        # A verified signed re-plan retires the execution decision recorded
+        # under each superseded plan (#988); the resumed run then records the
+        # decision for the rebound plan instead of failing on the old one.
+        retired_plan_hashes: frozenset[str] = frozenset()
+        if (
+            plan_first
+            and fresh_child is not None
+            and fresh_child.route.is_planning
+            and recorded_plan_handoff is not None
+            and recorded_plan_handoff.flow == "approved-plan-implementation"
+        ):
+            retired_plan_hashes = verified_retired_child_plan_hashes(
+                issue_context.comments,
+                repo=config.repo,
+                parent_plan_context=fresh_child.parent_plan_context,
+                child_issue=issue_number,
+                parent_issue=fresh_child.parent_issue,
+                stage_id=fresh_child.stage_id,
+                pr_number=recorded_plan_handoff.pr_number,
+            )
 
         # Resolve the canonical AGENT_ISSUE_PR_HANDOFF record (or, failing
         # that, the legacy exactly-one-open-PR search) before invoking a
@@ -13079,6 +13187,7 @@ def run_issue_loop(
                         issue_context=issue_context,
                         mode=recovered_execution.action,
                         normalized_topology=recovered_topology,
+                        retired_plan_hashes=retired_plan_hashes,
                     )
                 elif (
                     recovered_execution.recommendation is not None
@@ -13096,6 +13205,7 @@ def run_issue_loop(
                         config=config,
                         issue_context=issue_context,
                         recommendation=recovered_execution.recommendation,
+                        retired_plan_hashes=retired_plan_hashes,
                     )
             closing_contract = resolve_issue_contract(
                 primary_issue=issue_number,
@@ -13154,6 +13264,7 @@ def run_issue_loop(
                         recommendation=recovered_execution.recommendation,
                         requested_policy=recovered_execution.requested_policy,
                         resolved_execution=recovered_execution,
+                        retired_plan_hashes=retired_plan_hashes,
                     )
             if plan_first and resolved_pr.source == "canonical" and resolved_metadata is not None:
                 if resolved_metadata.flow == "approved-plan-implementation" and recovered_plan_hash is None:

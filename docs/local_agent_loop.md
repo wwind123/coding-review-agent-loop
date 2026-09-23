@@ -213,6 +213,14 @@ With exactly one matching record and an open canonical PR, planning reopens:
   plan round was posted; the requirement is recomputed from the issue history.
   PR reviewer approvals are keyed by plan hash and subject, so none recorded
   before the rebind counts under the new plan.
+- The execution decision record the original planning run left under the
+  superseded plan hash stays on the issue as history. After a rebind, issue
+  mode walks the verified rebind chain back from the live handoff. A decision
+  bound to a plan hash that the chain replaced is skipped, and the resumed run
+  records the decision for the rebound plan. A decision under any other plan
+  hash is still a competing topology and fails closed. An issue that got
+  stuck on this conflict before the fix recovers by rerunning the same
+  issue-mode command, with no manual edit.
 
 `agent-loop pr <n>` never re-plans or rebinds; it prints the issue-mode route.
 That includes an admissible bound plan with a pending matching signed record:
