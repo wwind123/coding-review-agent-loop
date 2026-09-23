@@ -2968,7 +2968,11 @@ problem is a test location outside the assigned checkout -- for example an
 honestly reported baseline run on a clean copy of the base branch -- does not
 reject the hand-off (#991). The orchestrator moves it out of `tests_run`, so it
 never becomes a self-reported evidence row, and renders it in a separate
-"Out-of-checkout context runs (not evidence)" section. Test-observation receipt
+"Out-of-checkout context runs (not evidence)" section; the next reviewer's
+handoff context applies the same classification. A managed-broker run whose
+test operands point outside the assigned checkout is likewise excluded from
+the selectable execution catalog and the journal used for risk-matrix
+evidence, so it can never back a verified row. Test-observation receipt
 citations remain strict, and so do freeform `Tests:` reports that are not
 converted to a structured result: if an explicit
 test location is outside the assigned checkout there, or a live remote target

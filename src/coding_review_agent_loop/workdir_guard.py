@@ -1326,6 +1326,33 @@ def partition_reported_tests_by_workdir(
     return ReportedTestsPartition(in_checkout=tuple(kept), out_of_checkout=tuple(context))
 
 
+def command_is_admissible_evidence(
+    argv: Sequence[str] | str,
+    *,
+    assigned_workdir: Path,
+) -> bool:
+    """Return whether a recorded test command may back an evidence selector.
+
+    A command that targets a location outside the assigned checkout is
+    context, not evidence, even when the managed broker ran it from inside the
+    checkout (#991).  Anything the guard cannot validate is inadmissible too.
+    """
+    command = argv if isinstance(argv, str) else shlex.join(str(item) for item in argv)
+    if not command.strip():
+        return False
+    violations: list[str] = []
+    try:
+        _validate_single_command(
+            command,
+            assigned=_canonical(assigned_workdir),
+            origin="structured",
+            path_violations=violations,
+        )
+    except AgentLoopError:
+        return False
+    return not violations
+
+
 def validate_test_observation_citations_within_workdir(
     citations: Sequence[object] | None,
     *,

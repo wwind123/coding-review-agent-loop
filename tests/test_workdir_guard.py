@@ -1487,3 +1487,17 @@ def test_partition_preserves_empty_reports(tmp_path, tests_run):
 
     assert partition.in_checkout == tests_run
     assert partition.out_of_checkout == ()
+
+
+@pytest.mark.parametrize(("argv", "admissible"), [
+    (("python3", "-m", "pytest", "tests/test_api.py", "-q"), True),
+    (("/usr/bin/python3", "-m", "pytest", "tests/"), True),
+    (("python3", "-m", "pytest", "/tmp/scratch-main-991/tests/"), False),
+    (("pytest", "--rootdir=/tmp/scratch-main-991"), False),
+    (("pytest", "tests/", "https://live.example"), False),
+    ((), False),
+])
+def test_command_is_admissible_evidence(tmp_path, argv, admissible):
+    assert workdir_guard.command_is_admissible_evidence(
+        argv, assigned_workdir=tmp_path
+    ) is admissible

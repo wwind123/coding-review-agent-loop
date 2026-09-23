@@ -416,6 +416,7 @@ from .workdir_guard import (
     validate_assigned_head_advanced,
     validate_checkout_inspected_evidence,
     validate_response_tests_within_workdir,
+    command_is_admissible_evidence,
     partition_reported_tests_by_workdir,
     validate_test_observation_citations_within_workdir,
 )
@@ -4569,6 +4570,39 @@ def _current_test_turn_observations(runner: Runner) -> tuple[object, ...]:
     )
 
 
+def _admissible_evidence_observations(
+    observations: Sequence[object], *, assigned_workdir: Path
+) -> tuple[object, ...]:
+    """Drop broker runs that targeted paths outside the assigned checkout.
+
+    The broker confines ``cwd`` but not test operands, so a run of a clean
+    base-branch baseline can carry a valid selector. It stays visible as
+    context, but can never back a risk-matrix citation (#991).
+    """
+
+    def argv(observation: object) -> object:
+        if isinstance(observation, Mapping):
+            return observation.get("argv", observation.get("command", ()))
+        return getattr(observation, "command", ())
+
+    kept: list[object] = []
+    for observation in observations:
+        command = argv(observation)
+        if isinstance(command, str):
+            admissible = command_is_admissible_evidence(
+                command, assigned_workdir=assigned_workdir
+            )
+        elif isinstance(command, Sequence):
+            admissible = command_is_admissible_evidence(
+                tuple(str(item) for item in command), assigned_workdir=assigned_workdir
+            )
+        else:
+            admissible = False
+        if admissible:
+            kept.append(observation)
+    return tuple(kept)
+
+
 def _safe_execution_handle_catalog(observations: Sequence[object]) -> tuple[dict[str, object], ...]:
     """Project correction context without exposing receipt authority."""
     catalog: list[dict[str, object]] = []
@@ -4706,6 +4740,12 @@ def _derive_authenticated_risk_evidence_for_coder(
                 else getattr(observation, "turn_id", None)
             ) == bound_invocation_id
         )
+    )
+    closed_catalog = _admissible_evidence_observations(
+        closed_catalog, assigned_workdir=assigned_workdir
+    )
+    journal_observations = _admissible_evidence_observations(
+        journal_observations, assigned_workdir=assigned_workdir
     )
     try:
         snapshot = stable_tracked_tree_snapshot(assigned_workdir)
@@ -14000,6 +14040,7 @@ def _coder_followup_review_context(
     metadata: PostedRoundMetadata | None,
     *,
     head_sha: str | None,
+    assigned_workdir: Path | None = None,
 ) -> str:
     if not text or metadata is None:
         return ""
@@ -14010,6 +14051,19 @@ def _coder_followup_review_context(
         )
     summary = _extract_structured_coder_summary(text)
     tests = _extract_structured_coder_tests_run(text)
+    out_of_checkout_tests: tuple[str, ...] = ()
+    if tests and assigned_workdir is not None:
+        # The persisted response keeps the coder's raw list; reapply the same
+        # classification the public comment used so the reviewer never sees
+        # an out-of-checkout baseline as an ordinary test run (#991).
+        try:
+            partition = partition_reported_tests_by_workdir(
+                tests, assigned_workdir=assigned_workdir
+            )
+        except AgentLoopError:
+            tests, out_of_checkout_tests = (), tuple(tests)
+        else:
+            tests, out_of_checkout_tests = partition.in_checkout, partition.out_of_checkout
     try:
         parsed = parse_historical_structured_coder_followup(text)
     except AgentLoopError:
@@ -14019,6 +14073,8 @@ def _coder_followup_review_context(
         "tests_run": tests,
         "local_test_evidence": metadata.local_test_evidence,
     }
+    if out_of_checkout_tests:
+        payload["out_of_checkout_context_runs_not_evidence"] = out_of_checkout_tests
     # Reviewers receive the orchestrator-derived authority carried by the
     # same round metadata as the public comment. Do not reconstruct it from
     # the coder's fresh response or from the cumulative local journal.
@@ -18344,7 +18400,10 @@ def run_pr_loop(
                 and not round_ledger_incomplete
             )
             coder_followup_context = _coder_followup_review_context(
-                latest_coder_output, latest_coder_metadata, head_sha=pr_metadata.head_sha,
+                latest_coder_output,
+                latest_coder_metadata,
+                head_sha=pr_metadata.head_sha,
+                assigned_workdir=active_workdir(config),
             )
             # Persist the same digest identities surfaced in reviewer prompts.
             # An edited signed comment must not inherit the old approval.
