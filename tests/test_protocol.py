@@ -286,7 +286,10 @@ def test_discuss_answer_needs_human_contract_and_legacy_decoder_are_isolated():
         DiscussUnresolvedItem("blocker", "Verify availability."),
     )
 from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER
-from coding_review_agent_loop.errors import UnknownPriorItemDispositionError
+from coding_review_agent_loop.errors import (
+    NonRepairableEvidenceRejection,
+    UnknownPriorItemDispositionError,
+)
 from coding_review_agent_loop.orchestrator import (
     _detect_discuss_consensus,
     _decode_public_response_json_prefix,
@@ -2493,7 +2496,7 @@ def test_semantic_matrix_claim_authority_defects_still_reject(kind, mutate, matc
 
 @pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
 def test_semantic_matrix_claim_inadmissible_selector_still_rejects(kind):
-    with pytest.raises(AgentLoopError, match="not an admissible passing observation"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="not an admissible passing observation"):
         _validate_claims_envelope(
             kind,
             [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
@@ -2640,7 +2643,7 @@ def test_semantic_matrix_claim_launch_integrity_failing_or_unknown_selector_stil
     It is a real broker handle, so selecting it is an authority decision and
     must not be downgraded to a dropped ref.
     """
-    with pytest.raises(AgentLoopError, match="launch-integrity"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="launch-integrity"):
         _validate_claims_envelope(
             kind,
             [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
@@ -2655,7 +2658,7 @@ def test_semantic_matrix_claim_launch_integrity_failing_or_unknown_selector_stil
 
 def test_semantic_matrix_claim_catalog_collision_still_rejects():
     entry = {"execution_ref": "turn:observation-1", "outcome": "passed", "provenance": "parent-observed"}
-    with pytest.raises(AgentLoopError, match="colliding execution_ref"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="colliding execution_ref"):
         _validate_claims_envelope(
             "issue_implementation",
             [{"row_id": "row-1", "execution_refs": [_COMMAND_REF]}],
@@ -2789,7 +2792,7 @@ def test_semantic_matrix_claims_reject_known_launch_integrity_failures_before_au
         if kind == "issue_implementation"
         else validate_structured_coder_followup
     )
-    with pytest.raises(AgentLoopError, match="launch-integrity"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="launch-integrity"):
         validator(
             text,
             delivered_risk_test_matrix_row_ids=["row-1"],

@@ -900,6 +900,12 @@ authority, are unbounded input, or are owned elsewhere:
   defect;
 - legacy canonical evidence fields in a fresh response.
 
+Catalog collisions and non-passing or non-authoritative in-catalog selectors
+are not repairable by reformatting, so they skip the structured repair pass
+and its model fallback chain entirely. The run reports `Failure category:
+semantic-evidence-rejection` with the selector named, rather than a repair
+timeout (#990).
+
 Broader handoff atomicity for other envelope failures after a PR is pushed is
 owned by #827 and #828.
 

@@ -108,6 +108,7 @@ from .errors import (
     FreshContractIntegrityError,
     HumanDecisionRequiredError,
     IssueImplementationConflictError,
+    NonRepairableEvidenceRejection,
     QuotaResetExceededError,
     ReviewSubstanceIntegrityError,
     SemanticPatchPayloadRejection,
@@ -1392,6 +1393,13 @@ _STRUCTURED_SCHEMA_REJECTION_RE = re.compile(
 )
 
 
+# Classification text for a semantic evidence rejection that skipped repair
+# (#990). The terminal category names this rejection, not a repair symptom.
+_SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION = (
+    "structured response failed semantic evidence validation"
+)
+
+
 def _is_structured_schema_rejection(classification_text: str) -> bool:
     """True when a recognized structured envelope failed schema validation (#957).
 
@@ -2082,6 +2090,15 @@ def _format_invalid_agent_response_error(
         category_hint = " Failure category: transient (rerun may succeed)."
     elif category == "non-retryable":
         category_hint = " Failure category: non-retryable (check credentials or billing)."
+    elif (
+        category == "deterministic"
+        and classification_text == _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
+    ):
+        category_hint = (
+            " Failure category: semantic-evidence-rejection (a risk-matrix claim selected a "
+            "test observation that cannot carry authority; repair was skipped because "
+            "reformatting cannot change it)."
+        )
     elif category == "deterministic" and _is_structured_schema_rejection(classification_text):
         category_hint = (
             " Failure category: schema-validation (the agent's structured response did not "
@@ -3803,6 +3820,9 @@ def _run_validated_agent(
                     ledger_incomplete or repair_expected_kind == "plan_revision_patch"
                 )
                 normalized: str | None = None
+                # An authority rejection exposed only once the envelope is
+                # normalized is as unrepairable as one on the raw text (#990).
+                normalized_evidence_rejection: NonRepairableEvidenceRejection | None = None
                 if (
                     use_repair
                     and not public_text_is_transient
@@ -3921,6 +3941,8 @@ def _run_validated_agent(
                                             model_used=result.model_used,
                                             **_response_identity_fields(result),
                                         )
+                        except NonRepairableEvidenceRejection as norm_exc:
+                            normalized_evidence_rejection = norm_exc
                         except AgentLoopError:
                             pass
                         else:
@@ -4062,6 +4084,31 @@ def _run_validated_agent(
                             candidate_text.encode("utf-8")
                         ).hexdigest(),
                     )
+                    should_retry = False
+                    last_failure_category = "deterministic"
+                elif (
+                    evidence_rejection := (
+                        exc
+                        if isinstance(exc, NonRepairableEvidenceRejection)
+                        else normalized_evidence_rejection
+                    )
+                ) is not None:
+                    # Selecting a real broker handle that is not an
+                    # authoritative passing observation is an authority
+                    # decision. Repair may only reshape the envelope around
+                    # the coder's claims, so it cannot satisfy this; running
+                    # it (and its fallback chain) only burns its timeout and
+                    # then misreports the stop as that timeout (#990).
+                    log(
+                        config,
+                        f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
+                        "not repairable by reformatting, skipping repair pass",
+                    )
+                    last_error = (
+                        f"{evidence_rejection} (semantic evidence rejection; "
+                        "repair skipped because reformatting cannot change it)"
+                    )
+                    last_classification_text = _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
                     should_retry = False
                     last_failure_category = "deterministic"
                 elif (

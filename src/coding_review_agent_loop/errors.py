@@ -112,6 +112,16 @@ class SemanticPatchUnknownPriorItemDispositionError(
     """An unknown prior-item disposition inside a semantic patch payload."""
 
 
+class NonRepairableEvidenceRejection(AgentLoopError):
+    """A semantic evidence rejection that no structured repair can satisfy.
+
+    Selecting an in-catalog broker handle that is not an admissible,
+    authoritatively launched passing observation is an authority decision,
+    not a formatting defect: repair may only reshape the envelope around the
+    coder's own claims, so it is never invoked for this class (#990).
+    """
+
+
 class IssueImplementationConflictError(AgentLoopError):
     """A parsed implementation result cannot be handed off as reported.
 
