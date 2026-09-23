@@ -1577,3 +1577,31 @@ def test_bounded_journal_keeps_in_checkout_failure_over_context_rows():
     assert "real-failure" in receipts
     assert len(receipts) <= MAX_ROUND_OBSERVATIONS
     assert decoded.capture_incomplete
+
+
+def test_mixed_operand_broker_failure_stays_authoritative(tmp_path):
+    """Issue #991: a run naming in-checkout tests is not relabeled as context."""
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.runner import Runner
+
+    registry = EnvironmentIdentityRegistry()
+    mixed = _replace(
+        _observation(
+            outcome="failed", timestamp="2026-09-23T10:00:00+00:00",
+            receipt_id="mixed-failure", registry=registry,
+        ),
+        command=(
+            sys.executable, "-m", "pytest", "tests/test_foo.py",
+            "/tmp/scratch-main-991/tests/test_foo.py",
+        ),
+    )
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.append(mixed)
+
+    decoded = decode_bounded_evidence(runner.render_local_test_evidence(cwd=tmp_path))
+
+    assert decoded is not None
+    assert decoded.authoritative_failures == ("mixed-failure",)
+    assert not decoded.observations[0].is_out_of_checkout_context

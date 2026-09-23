@@ -1501,3 +1501,30 @@ def test_command_is_admissible_evidence(tmp_path, argv, admissible):
     assert workdir_guard.command_is_admissible_evidence(
         argv, assigned_workdir=tmp_path
     ) is admissible
+
+
+@pytest.mark.parametrize(("command", "outside_only"), [
+    ("python3 -m pytest /tmp/scratch-main-991/tests/ -q", True),
+    ("python3 -m pytest -q /tmp/scratch-main-991/tests/", True),
+    ("bash -c 'cd /tmp/scratch-main-991 && pytest tests/'", True),
+    ("pytest --rootdir=/tmp/scratch-main-991 tests/", True),
+    # Mixed runs and outside option values still test the checkout (#991).
+    ("python3 -m pytest tests/test_foo.py /tmp/scratch-main-991/tests/test_foo.py", False),
+    ("python3 -m pytest -c /tmp/scratch-main-991/pytest.ini tests/", False),
+    ("pytest -c /tmp/scratch-main-991/pytest.ini", False),
+    ("bash -c 'cd /tmp/scratch-main-991 && pytest; cd {checkout} && pytest tests/'", False),
+    ("python3 -m pytest tests/ -q", False),
+    ("pytest tests/ https://live.example", False),
+])
+def test_command_targets_outside_workdir_only_for_pure_outside_runs(
+    tmp_path, command, outside_only
+):
+    command = command.format(checkout=tmp_path)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=tmp_path
+    ) is outside_only
+    if not outside_only and "/tmp/scratch-main-991" in command:
+        # Mixed runs remain unselectable as evidence.
+        assert not workdir_guard.command_is_admissible_evidence(
+            command, assigned_workdir=tmp_path
+        )

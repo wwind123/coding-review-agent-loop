@@ -498,10 +498,18 @@ def test_orchestrator_derivation_excludes_out_of_checkout_broker_runs(
         )
 
 
+@pytest.mark.parametrize("failure_command", [
+    ("pytest", "tests/", "https://live.example"),
+    ("python3", "-m", "pytest", "tests/test_protocol.py", "/tmp/scratch-main-991/tests/"),
+])
 def test_orchestrator_derivation_keeps_unvalidatable_failures_in_journal(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, failure_command
 ) -> None:
-    """Issue #991: only proven out-of-checkout runs leave the failure journal."""
+    """Issue #991: only pure out-of-checkout runs leave the failure journal.
+
+    Unvalidatable runs and mixed runs that also name in-checkout tests keep
+    degrading rows, though neither is ever a selectable execution ref.
+    """
     matrix = parse_risk_test_matrix(_matrix())
     identity = risk_test_matrix_identity(matrix)
     plan_context = make_approved_plan_context(
@@ -518,7 +526,7 @@ def test_orchestrator_derivation_keeps_unvalidatable_failures_in_journal(
         execution_ref="current-turn:observation-1",
         receipt_id="receipt-url-failure",
         outcome="failed",
-        command=("pytest", "tests/", "https://live.example"),
+        command=failure_command,
     )
     in_checkout_pass = _derived_observation(
         execution_ref="current-turn:observation-2",

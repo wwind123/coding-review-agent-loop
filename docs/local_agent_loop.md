@@ -2972,8 +2972,12 @@ never becomes a self-reported evidence row, and renders it in a separate
 handoff context applies the same classification. A managed-broker run whose
 test operands point outside the assigned checkout is likewise excluded from
 the selectable execution catalog and the journal used for risk-matrix
-evidence, so it can never back a verified row. In the public local test
-journal such a run carries an out-of-checkout context caveat that survives
+evidence, so it can never back a verified row. On the failure side, only a
+run whose test targets are all outside the checkout counts as context. A mixed
+run that also names an in-checkout test target, or whose only outside path is
+an option value such as a config file, keeps its failures authoritative. In
+the public local test journal a pure outside run carries an out-of-checkout
+context caveat that survives
 round metadata; it never counts as an authoritative failure, cannot supersede
 or be superseded by an in-checkout run, and renders as "out-of-checkout
 context (not evidence)" instead of "uncited authoritative". When the journal

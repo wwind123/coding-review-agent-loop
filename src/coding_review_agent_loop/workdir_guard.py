@@ -1160,6 +1160,96 @@ def _url_targets_in_clause(clause: _Clause) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+class _PathLog(list):
+    """Out-of-checkout path violations plus where the run's test targets lie."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.inside_target = False
+        self.outside_target = False
+        self.cwd_outside = False
+
+
+# Options whose following operand is a value (config file, plugin, expression,
+# ignore pattern, ...) rather than a test target.  A path after one of these
+# says nothing about where the tests themselves live.
+_VALUE_TAKING_OPTIONS = frozenset({
+    "-c", "-p", "-k", "-m", "-o", "--config", "--config-file", "--confcutdir",
+    "--basetemp", "--cache-dir", "--ignore", "--ignore-glob", "--deselect",
+    "--cov", "--cov-config", "--override-ini", "--junitxml", "--log-file",
+    "--import-mode",
+})
+
+
+def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> None:
+    """Note whether a clause names test targets inside and/or outside the checkout.
+
+    A relative operand resolves against the current directory: the confined
+    in-checkout ``cwd``, unless an earlier ``cd``/``pushd`` clause or a
+    working-directory option in this clause moved it elsewhere.  An absolute
+    positional operand counts on whichever side it resolves to.  Operands of
+    value-taking options are ignored: an outside config or ignore path does
+    not move the tested suite elsewhere.
+    """
+
+    def outside(raw: str) -> bool | None:
+        path = _normalize_reported_path(raw)
+        if path is None:
+            return None
+        return not (path == assigned or _is_inside(path, assigned))
+
+    tokens = clause.tokens
+    program_positions, head = _program_position_indices(tokens)
+    relative_outside = log.cwd_outside
+    for index, token in enumerate(tokens):
+        value: str | None = None
+        if token in WORKDIR_FLAGS and index + 1 < len(tokens):
+            value = tokens[index + 1]
+        else:
+            for prefix in WORKDIR_FLAG_PREFIXES:
+                if token.startswith(prefix):
+                    value = token[len(prefix) :]
+        if value is not None:
+            is_outside = outside(value)
+            if is_outside is not None:
+                relative_outside = is_outside
+                if is_outside:
+                    log.outside_target = True
+    head_token = tokens[head] if head is not None and head < len(tokens) else (
+        tokens[0] if tokens else ""
+    )
+    if _program_basename(head_token) in {"cd", "pushd"}:
+        # The directory change persists for the following clauses.
+        log.cwd_outside = relative_outside
+        return
+    for index, token in enumerate(tokens):
+        previous = tokens[index - 1] if index else ""
+        if (
+            index in program_positions
+            or token in WORKDIR_FLAGS
+            or previous in WORKDIR_FLAGS
+            or token.startswith("-")
+            or VAR_ASSIGNMENT_RE.match(token)
+            or _is_url_token(token)
+            or previous in _VALUE_TAKING_OPTIONS
+            or previous in INTERPRETER_VALUE_FLAGS
+            or previous in OUTPUT_VALUE_FLAGS
+        ):
+            continue
+        cleaned = _strip_wrap(token)
+        if _is_path_shaped(cleaned):
+            is_outside = outside(cleaned)
+            if is_outside is True:
+                log.outside_target = True
+            elif is_outside is False:
+                log.inside_target = True
+        elif _is_path_like_token(cleaned) or cleaned.endswith(".py"):
+            if relative_outside:
+                log.outside_target = True
+            else:
+                log.inside_target = True
+
+
 def _validate_command_contents(
     command: str,
     *,
@@ -1197,6 +1287,8 @@ def _validate_command_contents(
                 assigned=assigned,
                 path_violations=path_violations,
             )
+        if isinstance(path_violations, _PathLog):
+            _record_test_targets(clause, assigned=assigned, log=path_violations)
 
     for clause in ordinary_clauses:
         for target in _url_targets_in_clause(clause):
@@ -1346,25 +1438,34 @@ def command_targets_outside_workdir(
     *,
     assigned_workdir: Path,
 ) -> bool:
-    """Return whether a validatable command targets paths outside the checkout.
+    """Return whether a validatable command tests *only* outside the checkout.
 
     Unlike :func:`command_is_admissible_evidence`, a command the guard cannot
     validate is *not* reported as outside: callers use this to relabel a run
-    as context, and an unvalidatable failure must stay authoritative.
+    as context, and an unvalidatable failure must stay authoritative.  A mixed
+    run that also names an in-checkout test target, or whose only outside
+    path is an option value such as a config or ignore path, is not context
+    either: its failure may be a real in-checkout failure.
     """
-    return bool(_command_path_violations(argv, assigned_workdir=assigned_workdir))
+    log = _command_path_violations(argv, assigned_workdir=assigned_workdir)
+    return (
+        isinstance(log, _PathLog)
+        and bool(log)
+        and log.outside_target
+        and not log.inside_target
+    )
 
 
 def _command_path_violations(
     argv: Sequence[str] | str,
     *,
     assigned_workdir: Path,
-) -> list[str] | None:
+) -> "_PathLog | None":
     """Out-of-checkout paths in ``argv``, or ``None`` when unvalidatable."""
     command = argv if isinstance(argv, str) else shlex.join(str(item) for item in argv)
     if not command.strip():
         return None
-    violations: list[str] = []
+    violations = _PathLog()
     try:
         _validate_single_command(
             command,
