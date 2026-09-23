@@ -97,6 +97,21 @@ class UnknownPriorItemDispositionError(AgentLoopError):
         super().__init__(message)
 
 
+class SemanticPatchPayloadRejection(AgentLoopError):
+    """A semantic-patch rejection that names content inside the patch payload.
+
+    Repair preserves a ``plan_revision_patch`` payload exactly and may change
+    only its envelope/footer, so no repair output can satisfy this rejection.
+    It is routed to the planner's bounded replan instead (#979).
+    """
+
+
+class SemanticPatchUnknownPriorItemDispositionError(
+    UnknownPriorItemDispositionError, SemanticPatchPayloadRejection
+):
+    """An unknown prior-item disposition inside a semantic patch payload."""
+
+
 class IssueImplementationConflictError(AgentLoopError):
     """A parsed implementation result cannot be handed off as reported.
 
@@ -147,6 +162,7 @@ class AgentInvocationError(AgentLoopError):
         terminal_public_response: str | None = None,
         containment: "ContainmentEvidence | None" = None,
         plan_validation_exhaustion: DeterministicPlanValidationExhaustion | None = None,
+        bounded_replan_rejection: DeterministicPlanValidationExhaustion | None = None,
     ) -> None:
         super().__init__(message)
         self.failure_category = failure_category
@@ -157,6 +173,9 @@ class AgentInvocationError(AgentLoopError):
         self.terminal_public_response = terminal_public_response
         self.containment = containment
         self.plan_validation_exhaustion = plan_validation_exhaustion
+        # A semantic-patch payload rejection that repair could never satisfy
+        # (#979). The planner's bounded replan consumes it as a diagnostic.
+        self.bounded_replan_rejection = bounded_replan_rejection
 
 
 class QuotaResetExceededError(AgentLoopError):

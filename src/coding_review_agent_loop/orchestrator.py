@@ -97,6 +97,8 @@ from .errors import (
     IssueImplementationConflictError,
     QuotaResetExceededError,
     ReviewSubstanceIntegrityError,
+    SemanticPatchPayloadRejection,
+    SemanticPatchUnknownPriorItemDispositionError,
     UnknownPriorItemDispositionError,
 )
 from .expected_closure import (
@@ -361,6 +363,7 @@ from .repair import (
     require_recoverable_review_substance,
 )
 from .repair_preservation import (
+    recover_payload,
     require_recoverable_semantic_patch,
     validate_repair_preservation,
 )
@@ -2984,6 +2987,45 @@ def _capture_terminal_plan_repair_rejection(
     return None
 
 
+def _semantic_patch_payload_rejection(
+    exc: AgentLoopError,
+    *,
+    text: str,
+    normalized: str | None,
+    payload_validator: Callable[[dict], object] | None,
+) -> tuple[str, str] | None:
+    """Return ``(candidate, diagnostic)`` when no envelope repair can succeed.
+
+    Repair preservation pins a ``plan_revision_patch`` payload byte-for-byte,
+    so the defects repair may fix are exactly the envelope/footer ones.  The
+    recovered payload is therefore checked on its own, independent of which
+    error the full validator reported first: an envelope defect can mask a
+    payload defect that no repair could clear.  Any payload rejection -- a
+    strict patch-schema failure or a ledger/disposition check -- is
+    unsatisfiable by repair and goes to the bounded replan instead (#979).
+    That includes a recovered JSON object with a missing or wrong ``kind``,
+    which the repair integrity gate would refuse anyway.  Only text with no
+    recoverable JSON object stays on the existing semantic-patch integrity
+    path.
+    """
+    if isinstance(exc, SemanticPatchPayloadRejection):
+        return text, str(exc)
+    if payload_validator is None:
+        return None
+    for candidate in (text, normalized):
+        if candidate is None:
+            continue
+        payload = recover_payload(candidate)
+        if not isinstance(payload, dict):
+            continue
+        try:
+            payload_validator(payload)
+        except AgentLoopError as payload_exc:
+            return candidate, str(payload_exc)
+        return None
+    return None
+
+
 def _history_strip_reason(ledger_incomplete: bool) -> str:
     """Log phrasing for why a history-proven strip was allowed."""
     return (
@@ -3043,6 +3085,7 @@ def _run_validated_agent(
     plan_validation_failure_handler: Callable[
         [DeterministicPlanValidationExhaustion, AgentInvocationError], None
     ] | None = None,
+    semantic_patch_payload_validator: Callable[[dict], object] | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -3102,6 +3145,7 @@ def _run_validated_agent(
     # re-parsing the message.
     terminal_public_response: str | None = None
     plan_validation_exhaustion: DeterministicPlanValidationExhaustion | None = None
+    bounded_replan_rejection: DeterministicPlanValidationExhaustion | None = None
     # This latch is reset per invocation attempt and set only at the exact
     # structured-validator capture point. It prevents a stale typed candidate
     # from reaching the persistence callback after an ineligible path.
@@ -3192,6 +3236,7 @@ def _run_validated_agent(
         # marker-safety, or containment failure must clear it.
         plan_validation_exhaustion = None
         plan_validation_capture_eligible = False
+        bounded_replan_rejection = None
         if result.log_path is not None:
             log_paths.append(result.log_path)
         text = _neutralize_untrusted_markers(result.text, config=config, agent_name=agent_name)
@@ -3971,7 +4016,41 @@ def _run_validated_agent(
                                 model_used=result.model_used,
                                 **_response_identity_fields(result),
                             )
-                if (
+                payload_rejection = (
+                    _semantic_patch_payload_rejection(
+                        exc,
+                        text=text,
+                        normalized=normalized,
+                        payload_validator=semantic_patch_payload_validator,
+                    )
+                    if (
+                        repair_expected_kind == "plan_revision_patch"
+                        and not public_text_is_transient
+                        and not response_failure_is_unsupported
+                    )
+                    else None
+                )
+                if payload_rejection is not None:
+                    # Repair may change only a semantic patch's envelope, and
+                    # this rejection names its payload: no repair output can
+                    # satisfy both. Hand it to the bounded replan (#979).
+                    candidate_text, rejection_diagnostic = payload_rejection
+                    log(
+                        config,
+                        f"{agent_name}: semantic patch payload rejected ({rejection_diagnostic}); "
+                        "repair may change only the envelope, routing to bounded replan",
+                    )
+                    bounded_replan_rejection = DeterministicPlanValidationExhaustion(
+                        candidate_kind="plan_revision",
+                        candidate_text=candidate_text,
+                        diagnostic=rejection_diagnostic,
+                        candidate_digest=hashlib.sha256(
+                            candidate_text.encode("utf-8")
+                        ).hexdigest(),
+                    )
+                    should_retry = False
+                    last_failure_category = "deterministic"
+                elif (
                     use_repair
                     and not public_text_is_transient
                     and not response_failure_is_unsupported
@@ -4344,6 +4423,7 @@ def _run_validated_agent(
         terminal_public_response=terminal_public_response,
         containment=last_result.containment if last_result is not None else None,
         plan_validation_exhaustion=plan_validation_exhaustion,
+        bounded_replan_rejection=bounded_replan_rejection,
     )
     if (
         plan_validation_failure_handler is not None
@@ -5196,17 +5276,7 @@ def _validate_plan_revision_patch_response(
     parsed = validate_structured_plan_revision_patch(text)
     if parsed is None:
         raise AgentLoopError("Semantic plan revision did not use the required structured patch format.")
-    allowed_ids = {item.item_id for item in unresolved_items}
-    unknown = {item.item_id for item in parsed.prior_plan_item_dispositions} - allowed_ids
-    if unknown:
-        raise UnknownPriorItemDispositionError(
-            unknown_ids=tuple(sorted(unknown)),
-            allowed_ids=tuple(sorted(allowed_ids)),
-            same_round_description=(
-                "Same-round findings are informational only and must not be dispositioned "
-                "as prior carried items."
-            ),
-        )
+    _check_plan_revision_patch_ledger(parsed, unresolved_items=unresolved_items)
     requirements_context = render_coder_human_requirements_prompt_context(
         human_requirements,
         requirement_scope="planning requirements",
@@ -5217,18 +5287,94 @@ def _validate_plan_revision_patch_response(
         surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
         requires_direct_discussion_ack=requirements_context.requires_direct_discussion_ack,
     )
+    _check_plan_revision_patch_human_requirement_dispositions(
+        parsed,
+        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+        inherited_human_requirement_dispositions=inherited_human_requirement_dispositions,
+    )
+    return parsed
+
+
+def _validate_plan_revision_patch_payload(
+    payload: dict,
+    *,
+    unresolved_items: Sequence[UnresolvedReviewItem] = (),
+    human_requirements=(),
+    inherited_human_requirement_dispositions: Sequence[object] | None = None,
+) -> object:
+    """Run every semantic-patch check that depends only on the JSON payload.
+
+    Repair preservation pins this payload exactly, so any failure here is
+    unsatisfiable by an envelope-only repair, whatever envelope error the full
+    validator happened to report first (#979).  Every failure is raised as a
+    ``SemanticPatchPayloadRejection``.
+    """
+    if payload.get("kind") != "plan_revision_patch":
+        # Repair never runs on a non-patch payload (the integrity gate refuses
+        # it), so a missing or wrong kind is a replan diagnostic too.
+        raise SemanticPatchPayloadRejection(
+            "Structured response kind mismatch: expected `plan_revision_patch`."
+        )
+    try:
+        parsed = parse_plan_revision_patch(payload)
+    except AgentLoopError as exc:
+        raise SemanticPatchPayloadRejection(str(exc)) from exc
+    _check_plan_revision_patch_ledger(parsed, unresolved_items=unresolved_items)
+    requirements_context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+    )
+    _check_plan_revision_patch_human_requirement_dispositions(
+        parsed,
+        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+        inherited_human_requirement_dispositions=inherited_human_requirement_dispositions,
+    )
+    return parsed
+
+
+def _check_plan_revision_patch_ledger(
+    parsed: PlanRevisionPatch,
+    *,
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> None:
+    allowed_ids = {item.item_id for item in unresolved_items}
+    unknown = {item.item_id for item in parsed.prior_plan_item_dispositions} - allowed_ids
+    if unknown:
+        # Payload-level: repair must preserve the patch payload exactly, so
+        # only the deterministic strip or a bounded replan can fix it (#979).
+        raise SemanticPatchUnknownPriorItemDispositionError(
+            unknown_ids=tuple(sorted(unknown)),
+            allowed_ids=tuple(sorted(allowed_ids)),
+            same_round_description=(
+                "Same-round findings are informational only and must not be dispositioned "
+                "as prior carried items."
+            ),
+        )
+
+
+def _check_plan_revision_patch_human_requirement_dispositions(
+    parsed: PlanRevisionPatch,
+    *,
+    surfaced_requirement_ids: Sequence[str],
+    inherited_human_requirement_dispositions: Sequence[object] | None,
+) -> None:
     dispositions = _effective_plan_revision_patch_dispositions(
         parsed,
         inherited_human_requirement_dispositions,
     )
     if dispositions is None:
         dispositions = ()
-    validate_human_requirement_dispositions(
-        dispositions,
-        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
-        context="plan_revision_patch.human_requirement_dispositions",
-    )
-    return parsed
+    try:
+        validate_human_requirement_dispositions(
+            dispositions,
+            surfaced_requirement_ids=surfaced_requirement_ids,
+            context="plan_revision_patch.human_requirement_dispositions",
+        )
+    except SemanticPatchPayloadRejection:
+        raise
+    except AgentLoopError as exc:
+        raise SemanticPatchPayloadRejection(str(exc)) from exc
 
 
 def _drop_repeated_carried_future_followups(
@@ -9744,29 +9890,44 @@ def _run_plan_first_loop(
         """
         diagnostic = initial_diagnostic
         for replan_attempt in range(MAX_INHERITED_MATRIX_REPLANS + 1):
-            response = invoke(diagnostic)
-            if is_clarification_request(response.text):
-                return response
-            # Candidate assembly runs on every plan-first run, not only child
-            # cycles: a deterministic assembly failure (for example a row-bound
-            # overflow) becomes a bounded-replan diagnostic, not a crash.
             try:
-                child_matrix = derive_matrix(response)
-                if inherited_matrix_binding is not None:
-                    check_inherited_candidate(child_matrix)
-                return response
-            except AgentLoopError as exc:
-                rejection = sanitize_plan_validation_diagnostic(str(exc))
-            failure_description = (
-                "weaken inherited parent matrix rows"
-                if inherited_matrix_binding is not None
-                else "fail deterministic plan assembly"
-            )
-            candidate_digest = hashlib.sha256(response.text.encode("utf-8")).hexdigest()
+                response = invoke(diagnostic)
+            except AgentInvocationError as exc:
+                # A semantic-patch payload rejection is unsatisfiable by the
+                # envelope-only repair model; it loses this candidate, not
+                # the run (#979).
+                if exc.bounded_replan_rejection is None:
+                    raise
+                candidate_text = exc.bounded_replan_rejection.candidate_text
+                rejection = sanitize_plan_validation_diagnostic(
+                    exc.bounded_replan_rejection.diagnostic
+                )
+                failure_description = "fail semantic patch payload validation"
+            else:
+                if is_clarification_request(response.text):
+                    return response
+                # Candidate assembly runs on every plan-first run, not only
+                # child cycles: a deterministic assembly failure (for example a
+                # row-bound overflow) becomes a bounded-replan diagnostic, not
+                # a crash.
+                try:
+                    child_matrix = derive_matrix(response)
+                    if inherited_matrix_binding is not None:
+                        check_inherited_candidate(child_matrix)
+                    return response
+                except AgentLoopError as exc:
+                    rejection = sanitize_plan_validation_diagnostic(str(exc))
+                candidate_text = response.text
+                failure_description = (
+                    "weaken inherited parent matrix rows"
+                    if inherited_matrix_binding is not None
+                    else "fail deterministic plan assembly"
+                )
+            candidate_digest = hashlib.sha256(candidate_text.encode("utf-8")).hexdigest()
             if replan_attempt >= MAX_INHERITED_MATRIX_REPLANS:
                 exhaustion = DeterministicPlanValidationExhaustion(
                     candidate_kind=candidate_kind,
-                    candidate_text=response.text,
+                    candidate_text=candidate_text,
                     diagnostic=rejection,
                     candidate_digest=candidate_digest,
                 )
@@ -12071,6 +12232,19 @@ def _run_plan_first_loop(
                     same_status="same-plan",
                 ),
                 operation_description="plan revision",
+                semantic_patch_payload_validator=(
+                    (lambda payload, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_payload(
+                        payload,
+                        unresolved_items=items,
+                        human_requirements=human_requirements,
+                        inherited_human_requirement_dispositions=(
+                            semantic_base.plan.human_requirement_dispositions
+                            if semantic_base is not None else None
+                        ),
+                    ))
+                    if semantic_revision
+                    else None
+                ),
                 plan_validation_failure_handler=(
                     None if semantic_revision else lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
                         runner,
