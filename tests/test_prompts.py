@@ -300,6 +300,32 @@ def test_semantic_plan_revision_prompt_renders_exact_disposition_contract(tmp_pa
     assert "do not use `rationale` or omit `disposition`" in prompt
 
 
+def test_semantic_plan_revision_prompt_names_every_patch_operation(tmp_path):
+    """Issue #922: planners must be told the matrix operation names and shapes."""
+    from coding_review_agent_loop.protocol import (
+        PLAN_REVISION_PATCH_OPERATION_KEYS,
+        PLAN_REVISION_PATCH_REPLACEABLE_FIELDS,
+    )
+
+    prompt = build_plan_revision_prompt(
+        922,
+        2,
+        "Authenticated prior plan.",
+        "Blocking review.",
+        make_config(tmp_path),
+        response_form="semantic-patch-v1",
+        base_round_number=1,
+        base_state_identity="a" * 64,
+    )
+
+    for op in PLAN_REVISION_PATCH_OPERATION_KEYS:
+        assert f'"op": "{op}"' in prompt
+    for field in PLAN_REVISION_PATCH_REPLACEABLE_FIELDS:
+        assert f"`{field}`" in prompt
+    assert "Never `replace` `risk_test_matrix`" in prompt
+    assert '"source_row_ids": ["row-a", "row-b"]' in prompt
+
+
 def test_plan_review_prompts_expose_complete_one_shot_and_staged_recommendations(tmp_path):
     config = make_config(tmp_path)
     one_shot = validate_structured_plan_state(
