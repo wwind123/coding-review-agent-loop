@@ -186,6 +186,153 @@ def test_one_shared_selector_verifies_every_row_it_covers() -> None:
     assert not result.diagnostics
 
 
+def test_builder_reports_dropped_unapproved_row_claims() -> None:
+    # Regression for #920: a claim dropped for citing a sibling phase's row is
+    # surfaced as a diagnostic while the valid claim still verifies its row.
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-1")
+    claims = SemanticRiskCoverageClaims(
+        (
+            SemanticRiskCoverageClaim(
+                row_id="row-ordinary",
+                execution_refs=("invocation:observation-1",),
+                test_identifiers=("test_row_ordinary",),
+                test_locations=("tests/test_protocol.py::test_row_ordinary",),
+                workflow_path_claim="The run covered this workflow path.",
+                outcome_assertions=("The row's test passed.",),
+                forbidden_effect_assertions=("No unauthorized evidence was accepted.",),
+            ),
+        ),
+        dropped_row_ids=("legacy-planning-metadata-fallback",),
+    )
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert [row.row_id for row in result.evidence.rows] == ["row-ordinary"]
+    assert [row.status for row in result.evidence.rows] == ["verified"]
+    assert [(item.row_id, item.code) for item in result.diagnostics] == [
+        ("legacy-planning-metadata-fallback", "unapproved-row-claim")
+    ]
+    message = result.diagnostics[0].message
+    assert "not in the approved enforceable matrix set for this turn" in message
+    assert "not in the approved matrix" in message
+
+
+def _followup_with_claims_920(claims) -> str:
+    text = structured_coder_followup()
+    payload, end = json.JSONDecoder().raw_decode(text)
+    payload["risk_test_matrix_claims"] = claims
+    return json.dumps(payload) + text[end:]
+
+
+def _staged_context_920():
+    payload = _matrix()
+    payload["rows"] = [
+        {**_row("row-first"), "execution_owner": "stage-first"},
+        {**_row("row-later"), "execution_owner": "stage-later"},
+    ]
+    matrix = parse_risk_test_matrix(payload)
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        render_risk_test_matrix_section(matrix),
+        expected_hash=None,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    return matrix, context
+
+
+def test_stage_owning_no_rows_drops_sibling_claim_and_names_owners() -> None:
+    """#920: an explicitly empty scoped set must not mean 'unrestricted'."""
+    matrix, context = _staged_context_920()
+    scoped = scope_approved_plan_matrix(
+        context,
+        execution_owner="stage-empty",
+        valid_stage_ids=("stage-first", "stage-later", "stage-empty"),
+    )
+    assert scoped.risk_test_matrix_expected_row_ids == ()
+    observation = _derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")
+    claim = {
+        "row_id": "row-first",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": ["tests/test_protocol.py::test_first"],
+        "test_locations": ["tests/test_protocol.py"],
+        "workflow_path_claim": "stage path",
+        "outcome_assertions": ["passed"],
+        "forbidden_effect_assertions": ["none"],
+    }
+
+    parsed = validate_structured_coder_followup(
+        _followup_with_claims_920([claim]),
+        delivered_risk_test_matrix_row_ids=scoped.risk_test_matrix_expected_row_ids,
+        execution_catalog=[observation],
+    )
+
+    assert parsed is not None
+    assert parsed.risk_test_matrix_claims.claims == ()
+    assert parsed.risk_test_matrix_claims.dropped_row_ids == ("row-first",)
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=parsed.risk_test_matrix_claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+        execution_owner=scoped.risk_test_matrix_execution_owner,
+    )
+    assert all(row.status != "verified" for row in result.evidence.rows)
+    dropped = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert [item.row_id for item in dropped] == ["row-first"]
+    assert "execution owner `stage-empty`" in dropped[0].message
+    assert "belongs to execution owner `stage-first`" in dropped[0].message
+
+
+def test_correction_keeps_the_original_dropped_row_audit_record() -> None:
+    """#920: a successful correction must not erase that a claim was dropped."""
+    original = validate_structured_coder_followup(
+        _followup_with_claims_920([
+            {"row_id": "row-sibling", "execution_refs": ["turn:observation-1"]},
+        ]),
+        delivered_risk_test_matrix_row_ids=("row-ordinary",),
+        execution_catalog=[_derived_observation(
+            execution_ref="turn:observation-1", receipt_id="receipt-1",
+        )],
+    )
+    assert original.risk_test_matrix_claims.dropped_row_ids == ("row-sibling",)
+    catalog = [_derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")]
+
+    corrected = orchestrator_module._parse_fresh_correction_claims(
+        _followup_with_claims_920([
+            {"row_id": "row-ordinary", "execution_refs": ["turn:observation-1"]},
+        ]),
+        original,
+        row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+
+    assert corrected is not None
+    assert [claim.row_id for claim in corrected.risk_test_matrix_claims.claims] == ["row-ordinary"]
+    assert corrected.risk_test_matrix_claims.dropped_row_ids == ("row-sibling",)
+    # The audit record neither triggers nor fails the bounded correction.
+    assert "unapproved-row-claim" in orchestrator_module._NON_ACTIONABLE_RISK_DIAGNOSTICS
+
+
 @pytest.mark.parametrize(
     "field",
     [

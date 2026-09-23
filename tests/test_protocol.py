@@ -2477,7 +2477,6 @@ def test_semantic_matrix_claim_empty_fact_normalizes_to_default(kind, field, val
         (lambda c: c.pop("execution_refs"), "missing required field"),
         (lambda c: c.update(execution_refs=[]), "at least one selector"),
         (lambda c: c.pop("row_id"), "missing required field"),
-        (lambda c: c.update(row_id="row-unknown"), "not an approved enforceable matrix row"),
         (lambda c: c.update(execution_refs=["turn:observation-1", "turn:observation-1"]), "more than once"),
         (lambda c: c.update(execution_refs=[f"cmd-{i}" for i in range(9)]), "8-item bound"),
         (lambda c: c.update(execution_refs=[3]), "must be a string"),
@@ -2492,6 +2491,46 @@ def test_semantic_matrix_claim_authority_defects_still_reject(kind, mutate, matc
 
     with pytest.raises(AgentLoopError, match=match):
         _validate_claims_envelope(kind, [claim])
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_for_unapproved_row_is_dropped_not_rejected(kind):
+    """#920: one claim citing a sibling phase's row must not discard the envelope."""
+    valid = _complete_semantic_claim()
+    sibling = {**_complete_semantic_claim(), "row_id": "legacy-planning-metadata-fallback"}
+    other_valid = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(
+        kind,
+        [valid, sibling, other_valid, dict(sibling)],
+        row_ids=("row-1", "row-2"),
+    )
+
+    assert parsed is not None
+    if kind == "issue_implementation":
+        assert parsed.pr_number == 77
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-1", "row-2"]
+    assert claims.dropped_row_ids == ("legacy-planning-metadata-fallback",)
+    # A dropped claim is not serialized back as coverage.
+    assert [item["row_id"] for item in claims.to_payload()] == ["row-1", "row-2"]
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_empty_approved_set_drops_every_claim(kind):
+    """#920: an explicitly empty scoped set is a restriction, not 'no restriction'."""
+    parsed = _validate_claims_envelope(kind, [_complete_semantic_claim()], row_ids=())
+
+    assert parsed.risk_test_matrix_claims.claims == ()
+    assert parsed.risk_test_matrix_claims.dropped_row_ids == ("row-1",)
+
+
+def test_semantic_matrix_claim_malformed_row_id_still_rejects():
+    """#920 degrades only well-formed unapproved ids; malformed ids still reject."""
+    claim = {**_complete_semantic_claim(), "row_id": 5}
+
+    with pytest.raises(AgentLoopError, match="row_id"):
+        _validate_claims_envelope("coder_followup", [claim], row_ids=("row-1",))
 
 
 @pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])

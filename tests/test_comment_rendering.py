@@ -2863,6 +2863,23 @@ def test_959_delta_render_escapes_wrapper_tags_in_row_text():
     assert rendered.index("<details>") < rendered.index(summary_line) < rendered.index("</details>")
 
 
+def test_920_dropped_unapproved_claim_renders_outside_the_wrapper():
+    from coding_review_agent_loop.protocol import PostAuthClaimDiagnostic
+
+    rendered = _render_risk_test_matrix_evidence(
+        _evidence_959(_rows_959(1)),
+        diagnostics=(
+            PostAuthClaimDiagnostic("row-sibling", "unapproved-row-claim", "Claim for row-sibling was dropped."),
+            PostAuthClaimDiagnostic("row-0", "missing-claim", "No claim."),
+        ),
+    )
+
+    line = "- Dropped claim: Claim for row-sibling was dropped."
+    assert line in rendered
+    assert rendered.index(line) < rendered.index("<details>")
+    assert "No claim." not in rendered
+
+
 def test_959_no_evidence_renders_no_section_or_wrapper():
     assert _render_risk_test_matrix_evidence(None) is None
     parsed = _validate_followup_959(structured_coder_followup(summary="No matrix."))
