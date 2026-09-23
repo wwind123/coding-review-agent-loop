@@ -3657,16 +3657,27 @@ def _rebind_record_payload(record: ChildPlanRebindRecord) -> dict[str, object]:
     }
 
 
-def format_child_plan_rebind_section(record: ChildPlanRebindRecord) -> str:
-    """Visible audit text plus the rebind audit record for the rebind comment."""
+def format_child_plan_rebind_section(
+    record: ChildPlanRebindRecord, *, transaction_era: bool = False
+) -> str:
+    """Visible audit text plus the rebind audit record for the rebind comment.
+
+    A transaction-era rebind (#827) reissues the PR contract in the same
+    workflow transaction, so its visible text says so.
+    """
     encoded = _encode_json_payload(_rebind_record_payload(record))
+    pr_side = (
+        "The PR contract is reissued in the same workflow transaction"
+        if transaction_era
+        else "No PR-side record changed"
+    )
     return "\n".join(
         [
             f"Child plan rebind: PR #{record.pr_number} is rebound from approved plan "
             f"{record.superseded_plan_hash} to approved plan {record.new_plan_hash}.",
             f"Signed supersession digest: {record.plan_supersession_digest}",
             f"Re-plan rounds: {record.first_replan_round} through {record.approved_round}.",
-            "No PR-side record changed; reviewer approvals recorded before this comment "
+            f"{pr_side}; reviewer approvals recorded before this comment "
             "do not count under the new plan.",
             f"<!-- AGENT_CHILD_PLAN_REBIND: {encoded} -->",
         ]

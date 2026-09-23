@@ -188,6 +188,10 @@ class PostedRoundMetadata:
     # not a ``scheduler_*`` field: a reviewer record that carries it is not a
     # scheduler checkpoint and must keep ``scheduler_metadata_status`` absent.
     plan_candidate_key: dict | None = None
+    # Workflow transaction whose record set tracks this comment as its initial
+    # coder round (#827).  Encoded only when set, so every record written
+    # without it round-trips byte-identically.
+    workflow_transaction_id: str | None = None
     # Planning-only scheduler auxiliary: the key the previous planning round
     # was scheduled against.  ``None`` on the first staged planning round.
     scheduler_plan_previous_key: dict | None = None
@@ -1950,6 +1954,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["reviewer_board_amendment_digest"] = metadata.reviewer_board_amendment_digest
     if metadata.plan_candidate_key is not None:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
+    if metadata.workflow_transaction_id is not None:
+        payload["workflow_transaction_id"] = metadata.workflow_transaction_id
     if metadata.risk_test_matrix_evidence_full_round is not None:
         payload["risk_test_matrix_evidence_full_round"] = (
             metadata.risk_test_matrix_evidence_full_round
@@ -1983,6 +1989,16 @@ def _decode_plan_supersession_field(payload: Mapping[str, object], key: str) -> 
     value = payload[key]
     if not isinstance(value, str) or not value:
         raise ValueError(f"{key} must be a non-empty string")
+    return value
+
+
+def _decode_workflow_transaction_id(payload: Mapping[str, object]) -> str | None:
+    # A present-but-malformed tag must not decode as an untagged comment.
+    if "workflow_transaction_id" not in payload:
+        return None
+    value = payload["workflow_transaction_id"]
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError("workflow_transaction_id must be a transaction ID")
     return value
 
 
@@ -2235,6 +2251,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 if isinstance(payload.get("plan_candidate_key"), dict)
                 else None
             ),
+            workflow_transaction_id=_decode_workflow_transaction_id(payload),
             plan_supersession_digest=_decode_plan_supersession_field(
                 payload, "plan_supersession_digest"
             ),

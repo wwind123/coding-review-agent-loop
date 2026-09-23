@@ -82,6 +82,8 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_revision,
 )
 from coding_review_agent_loop.salvage import SalvageContext
+FULL_HEAD = "abc123" + "0" * 34
+
 from agent_loop_helpers import (
     FakeRunner,
     command_index,
@@ -99,6 +101,8 @@ from agent_loop_helpers import (
 
 def test_pre_review_tests_can_be_disabled(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Created PR.\nTests: pytest passed.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
         ],
@@ -122,6 +126,8 @@ def test_pre_review_tests_can_be_disabled(tmp_path):
 
 def test_issue_mode_passes_complete_expected_closing_set_to_coder(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
         ],
@@ -193,6 +199,8 @@ def test_approved_plan_additional_closing_issue_reaches_implementation_flow(tmp_
 
 def test_staged_child_closes_child_and_refs_parent(tmp_path):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
         ],
@@ -229,8 +237,11 @@ def test_direct_pr_without_metadata_remains_contract_unknown(tmp_path):
 def test_direct_pr_explicit_metadata_uses_managed_origin_and_all_ids(tmp_path):
     runner = FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
-        pr_payload={"body": "Closes #847\nCloses #848"},
+        pr_payload={"body": "Closes #847\nCloses #848", "headRefOid": "a" * 40},
     )
+    # A PR with no records that needs a contract is upgraded by one `initial`
+    # workflow transaction (#827) rather than a version-1 contract.
+    runner.persist_rest_comment_posts = True
     config = make_config(
         tmp_path,
         expected_closing_issue_ids=(847, 848),
@@ -245,6 +256,7 @@ def test_direct_pr_explicit_metadata_uses_managed_origin_and_all_ids(tmp_path):
     ]
     assert len(contract_comments) == 1
     assert "Origin flow: managed-pr" in contract_comments[0]["body"]
+    assert "Workflow transaction: " in contract_comments[0]["body"]
 
 
 def test_direct_pr_supersession_lineage_survives_plain_reruns(tmp_path):
@@ -254,8 +266,11 @@ def test_direct_pr_supersession_lineage_survives_plain_reruns(tmp_path):
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
-        pr_payload={"body": "Closes #847\nCloses #848"},
+        pr_payload={"body": "Closes #847\nCloses #848", "headRefOid": "a" * 40},
     )
+    # The first run upgrades the record-less PR by an `initial` transaction;
+    # the widening is then a `closing-widening` successor (#827).
+    runner.persist_rest_comment_posts = True
 
     assert run_pr_loop(
         runner,
@@ -2763,6 +2778,8 @@ def test_clean_existing_auto_agent_dir_is_synced(tmp_path):
 @pytest.mark.parametrize("mode", ["issue", "task"])
 def test_issue_and_task_loops_use_repo_default_when_base_is_omitted(tmp_path, mode):
     runner = FakeRunner(
+        git_head=FULL_HEAD,
+        persist_rest_comment_posts=True,
         claude_outputs=[
             "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],

@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 from .agents.base import AgentName, AgentResult
@@ -114,6 +115,7 @@ from .errors import (
     SemanticPatchPayloadRejection,
     SemanticPatchUnknownPriorItemDispositionError,
     UnknownPriorItemDispositionError,
+    WorkflowTransactionError,
 )
 from .expected_closure import (
     ExpectedClosingContract,
@@ -158,6 +160,8 @@ from .github import (
     watch_pr_checks,
 )
 from .issue_pr_handoff import (
+    IssuePrHandoffMetadata,
+    _names_version_2_handoff,
     find_latest_issue_pr_handoff,
     authenticate_canonical_issue_pr,
     format_issue_pr_handoff_comment,
@@ -220,6 +224,7 @@ from .managed_ci import (
     authorize_fresh_issue_created_resume,
     authenticate_source_managed_resume,
     authenticate_issue_created_handoff,
+    build_issue_created_creation_payload,
     dispatch_final_qualification,
     intermediate_managed_checks,
     managed_label_present,
@@ -583,6 +588,12 @@ from .review_scheduling import (
     select_reviewers,
     undecodable_history_message,
 )
+from .workflow_transaction_publication import (
+    LegacyEra,
+    NoLiveHeadAuthority,
+    RoundAuthority,
+    resolve_round_authority,
+)
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
     CODER_DISPUTE_NOTE_PREFIX,
@@ -617,6 +628,284 @@ from .unresolved_items import (
     _validate_review_response,
     _validate_structured_coder_followup_items,
 )
+
+
+def _post_one_shot_parent_handoff_once(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    parent_issue: int,
+    plan_hash: str,
+    plan_subject: str,
+    pr_number: int,
+    pr_head_sha: str | None,
+    recommendation=None,
+) -> None:
+    """Post the one-shot parent phase handoff after the commit, at most once (#827).
+
+    It is a follow-on write, never a transaction entry: it runs only once the
+    PR's transaction committed, and the same-plan lookup keeps a rerun (after
+    this write failed, or after an interrupted publication was finished) from
+    posting a second one.
+    """
+    comments = get_issue_context(runner, config=config, issue_number=parent_issue).comments
+    if find_existing_one_shot_impl_handoff(
+        comments, parent_issue=parent_issue, plan_hash=plan_hash, mode="implement-one-shot"
+    ) is not None:
+        return
+    identity = recommendation.identity() if recommendation is not None else None
+    post_one_shot_impl_handoff_comment(
+        runner,
+        config=config,
+        parent_issue=parent_issue,
+        mode="implement-one-shot",
+        plan_hash=plan_hash,
+        plan_subject=plan_subject,
+        pr_number=pr_number,
+        pr_head_sha=pr_head_sha,
+        strategy=recommendation.strategy if recommendation is not None else None,
+        topology_source=str(identity["topology_source"]) if identity is not None else None,
+        execution_strategy_contract_version=1 if recommendation is not None else None,
+        recommendation_digest=(
+            str(identity["recommendation_sha256"]) if identity is not None else None
+        ),
+    )
+
+
+def _recorded_issue_handoff(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    issue_context: IssueContext,
+    defer_pending_successor: bool = False,
+):
+    """The issue's recorded handoff (flow and plan hash), across versions (#827).
+
+    A transaction-era handoff is read through authenticated discovery after an
+    interrupted publication is finished from its stored intent; the version-1
+    comment reader would reject it.  A legacy issue keeps today's reader.
+
+    ``defer_pending_successor`` (a planning child, which may be rebound this
+    run): a pending successor of any kind is not finished here.  The caller
+    reads the committed predecessor binding, and either the child-plan rebind
+    adopts the pending transaction or aborts it as superseded, or the later
+    interrupted-publication finisher finishes it when no rebind runs.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if not config.dry_run:
+        route = publication.route_issue_publication(runner, config, issue_context.number)
+        deferred = (
+            defer_pending_successor
+            and isinstance(route, publication.RecoverableSuccessor)
+            and publication.pending_successor(runner, config, route.pr_number) is not None
+        )
+        if not deferred:
+            _finish_interrupted_issue_publication(
+                runner, config, issue_number=issue_context.number
+            )
+            route = publication.route_issue_publication(
+                runner, config, issue_context.number
+            )
+        if deferred or (
+            isinstance(route, publication.RecoverableSuccessor)
+            and publication.pending_plan_replacement(runner, config, route.pr_number)
+            is not None
+        ):
+            # An interrupted child-plan rebind, or a pending successor a rebind
+            # may supersede: only the rebind writer (or the later finisher) can
+            # settle it, so preconditions read the committed predecessor
+            # binding.  Not authority; every authority consumer still refuses.
+            binding = route.predecessor
+            return SimpleNamespace(
+                issue_number=issue_context.number,
+                pr_number=route.pr_number,
+                flow=binding.flow,
+                plan_hash=binding.plan_hash,
+                expected_closing_issue_ids=binding.expected_closing_issue_ids,
+                pr_head_sha=binding.pr_head_sha,
+                contract_hash=binding.contract_hash,
+            )
+        discovered = publication.discover_canonical_issue_pr(
+            runner, config, issue_context.number
+        )
+        if discovered is not None and discovered.era == publication.ERA_TRANSACTION:
+            return discovered.handoff
+    return find_latest_issue_pr_handoff(
+        issue_context.comments,
+        issue_number=issue_context.number,
+        repo=config.repo,
+    )
+
+
+def _finish_interrupted_issue_publication(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    issue_number: int,
+) -> int | None:
+    """Finish an issue-origin publication a previous run interrupted (#827).
+
+    The routing form (never the authority form) classifies the issue's
+    candidate PRs.  A ``Recoverable`` or ``RecoverableSuccessor`` route is
+    finished from the stored intent without invoking the coder or opening a
+    PR: the seam adopts every entry already published and waives an initial
+    coder round this session cannot supply.  Returns the PR it finished, or
+    ``None`` when nothing was interrupted.  Writes nothing otherwise.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run:
+        return None
+    route = publication.route_issue_publication(runner, config, issue_number)
+    if not isinstance(route, (publication.Recoverable, publication.RecoverableSuccessor)):
+        return None
+    if isinstance(route, publication.RecoverableSuccessor) and (
+        publication.pending_plan_replacement(runner, config, route.pr_number) is not None
+    ):
+        # Its handoff carries the rebind audit record, which only the
+        # child-plan rebind can rebuild; that writer adopts and finishes it.
+        return None
+    log(
+        config,
+        f"Issue #{issue_number}: finishing the interrupted workflow transaction on "
+        f"PR #{route.pr_number} before resuming.",
+    )
+    validate_open_pr(runner, config=config, pr_number=route.pr_number)
+    _finish_pr_side_transaction(runner, config, pr_number=route.pr_number)
+    return route.pr_number
+
+
+def _finish_pr_side_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+) -> bool:
+    """Whether the PR is transaction-era; a pending transaction on it is finished.
+
+    A transaction-era PR never receives a version-1 record (#827), so the
+    legacy closing-reference resume writes nothing there; a transaction the
+    previous run left prepared-only is finished from its stored intent.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run:
+        return False
+    resolved = publication.read_pr_transaction_views(runner, config, pr_number, None)
+    if resolved.era != publication.ERA_TRANSACTION:
+        return False
+    head_sha = get_pr_review_context(runner, config=config, pr_number=pr_number).metadata.head_sha
+    publication.finish_pending_transaction(
+        runner, config, pr_number=pr_number, head_sha=str(head_sha or "")
+    )
+    return True
+
+
+def _publish_handed_off_plan_resume(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    issue_number: int,
+    pr_number: int,
+    plan_hash: str,
+    plan_subject: str | None,
+    plan_candidate_key: PlanCandidateKey | None,
+    plan_additions: tuple[int, ...],
+    staged=None,
+) -> bool:
+    """Publish an already-handed-off approved plan's resume through the seam (#827).
+
+    Returns whether the seam owns the PR: a transaction-era PR (whose pending
+    transaction is finished here) or a legacy PR published as one approved-plan
+    transaction.  False only when the authenticated actor never recorded the
+    plan, so no approved-plan intent can bind it and the caller keeps today's
+    version-1 handoff.  A malformed or unmatched scheduler history raises
+    before any write.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if _finish_pr_side_transaction(runner, config, pr_number=pr_number):
+        return True
+    plan_input = (
+        publication.ApprovedPlanInput(plan_hash, plan_subject, plan_candidate_key)
+        if plan_candidate_key is not None and plan_candidate_key.incompleteness_reason() is None
+        else publication.recover_approved_plan_input(
+            runner,
+            config,
+            plan_issue_number=(
+                staged.parent_issue
+                if staged is not None and staged.plan_owner == "parent"
+                else issue_number
+            ),
+            plan_hash=plan_hash,
+            plan_subject=plan_subject,
+        )
+    )
+    if plan_input is None:
+        return False
+    closing_contract = resolve_issue_contract(
+        primary_issue=issue_number,
+        cli_additions=config.expected_closing_issue_ids,
+        plan_additions=plan_additions,
+        recovered=None,
+        supersede=config.supersede_expected_closing_contract,
+    )
+    if staged is not None:
+        reject_parent_from_contract(closing_contract, parent_issue=staged.parent_issue)
+    pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    validate_pr_expected_closing_issues(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        expected_issue_ids=closing_contract.issue_ids,
+        body=pr_context.metadata.body,
+        reject_unexpected=False,
+    )
+    _pr_url, head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
+    publication.publish_transition(
+        runner,
+        config=config,
+        request=publication.TransitionRequest(
+            repository=config.repo,
+            pr_number=pr_number,
+            base=str(pr_context.metadata.base_branch or config.base),
+            head_sha=head_sha,
+            origin_path=(
+                publication.ORIGIN_STAGED_CHILD
+                if staged is not None
+                else publication.ORIGIN_APPROVED_PLAN
+            ),
+            expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+            primary_issue=issue_number,
+            staged=staged,
+            approved_plan=plan_input,
+        ),
+    )
+    return True
+
+
+def _staged_plan_owner(plan_issue: int, target_issue: int) -> str:
+    """Which staged issue owns the approved plan (#827).
+
+    A materialized split stage implements a child from the parent's plan, so the
+    parent owns it; a separately planned decomposition child owns its own plan.
+    """
+    return "parent" if plan_issue != target_issue else "child"
+
+
+def _staged_identity(parent_issue: int | None, child_issue: int, plan_owner: str | None):
+    """The transaction's staged identity, or None for a non-staged publication."""
+    if parent_issue is None:
+        return None
+    from .workflow_transaction import StagedIdentity
+
+    return StagedIdentity(parent_issue, child_issue, plan_owner or "child")
+
+
+def _canonical_trusted_body(text: str) -> TrustedBody:
+    expected = tuple(item.definition.token for item in scan_reserved_markers(text))
+    return TrustedBody.canonical(text, expected_tokens=expected)
 
 
 def _embed_pr_contract_marker(body: str | TrustedBody, contract: PrExpectedClosingContract) -> TrustedBody:
@@ -945,6 +1234,11 @@ def _merge_with_exact_head_proof(
     proof: ExactHeadCiProof,
 ) -> None:
     """Make the live-head read the final remote operation before merging."""
+    # A transaction-era PR merges only a head its committed workflow
+    # transaction binds; a legacy-era PR returns None and is unchanged (#827).
+    from .workflow_transaction_publication import require_merge_authority
+
+    require_merge_authority(runner, config, pr_number=pr_number, head_sha=proof.head_sha)
     # Fetch a fresh, minimal head as the final normal remote read. If GitHub
     # serves an inconsistent GraphQL projection while it is converging, fetch
     # the full live PR tuple and require that authoritative view to agree with
@@ -7859,7 +8153,9 @@ def _validate_tests_with_post_pr_context(
             f"{exc}\n\n"
             f"PR #{pr_number} was confirmed open, but the handoff/reviewer comments were not posted because "
             f"the {report_description} was invalid. The managed-CI authorization checkpoint, when required, "
-            "was persisted before this report was rejected. Correct the PR/comment if needed, then continue safely with "
+            "was persisted before this report was rejected, unless it is a waiver grant carried by the PR's initial "
+            "transaction: none exists yet, so a managed resume needs the explicit fresh issue-created authorization "
+            "(`--managed-ci-fresh`). Correct the PR/comment if needed, then continue safely with "
             f"`agent-loop pr {pr_number}` instead of rerunning implementation and creating a duplicate PR."
         ) from exc
 
@@ -8143,6 +8439,8 @@ def _implement_approved_issue(
     approved_plan_context: ApprovedPlanContext | None = None,
     parent_issue_context: IssueContext | None = None,
     execution_recommendation=None,
+    plan_candidate_key: PlanCandidateKey | None = None,
+    staged_plan_owner: str | None = None,
 ) -> int:
     implementation_config, reuse_planning_session = _approved_implementation_config(config)
     coder_name = agent_display_name(implementation_config.coder)
@@ -8247,11 +8545,105 @@ def _implement_approved_issue(
             resumed_pr_context = get_pr_review_context(
                 runner, config=implementation_config, pr_number=existing_pr_number
             )
+        # An unmanaged, non-staged approved-plan resume of a PR found by closing
+        # reference goes through the seam (#827, site a): a transaction-era PR
+        # has its pending transaction finished and never receives a version-1
+        # record; a legacy PR is published with the session's complete key or
+        # the durable recovery, which stops non-mutating on a malformed or
+        # unmatched scheduler history.  Only a plan the authenticated actor
+        # never recorded (no approved-plan intent can bind it) keeps today's
+        # version-1 writers.
+        resume_through_seam = False
+        resume_staged = _staged_identity(staged_parent_issue, issue_number, staged_plan_owner)
+        if (
+            resolved_pr.source == "legacy-closing-reference"
+            and not implementation_config.managed_ci
+            and (staged_parent_issue is None or staged_plan_owner is not None)
+            and not implementation_config.dry_run
+        ):
+            from . import workflow_transaction_publication as publication
+
+            resume_through_seam = _finish_pr_side_transaction(
+                runner, implementation_config, pr_number=existing_pr_number
+            )
+            if not resume_through_seam:
+                resume_plan_input = (
+                    publication.ApprovedPlanInput(
+                        plan_hash,
+                        plan_subject or approved_plan_context.plan_subject,
+                        plan_candidate_key,
+                    )
+                    if plan_candidate_key is not None
+                    and plan_candidate_key.incompleteness_reason() is None
+                    else publication.recover_approved_plan_input(
+                        runner,
+                        implementation_config,
+                        plan_issue_number=(
+                            resume_staged.parent_issue
+                            if resume_staged is not None and resume_staged.plan_owner == "parent"
+                            else issue_number
+                        ),
+                        plan_hash=plan_hash,
+                        plan_subject=plan_subject or approved_plan_context.plan_subject,
+                    )
+                )
+                if resume_plan_input is not None:
+                    resume_through_seam = True
+                    validate_pr_expected_closing_issues(
+                        runner,
+                        config=implementation_config,
+                        pr_number=existing_pr_number,
+                        expected_issue_ids=closing_contract.issue_ids,
+                        body=resumed_pr_context.metadata.body,
+                        reject_unexpected=False,
+                    )
+                    _pr_url, resumed_head_sha = require_pr_metadata_for_handoff(
+                        resumed_pr_context.metadata
+                    )
+                    publication.publish_transition(
+                        runner,
+                        config=implementation_config,
+                        request=publication.TransitionRequest(
+                            repository=implementation_config.repo,
+                            pr_number=existing_pr_number,
+                            base=str(
+                                resumed_pr_context.metadata.base_branch
+                                or implementation_config.base
+                            ),
+                            head_sha=resumed_head_sha,
+                            origin_path=(
+                                publication.ORIGIN_STAGED_CHILD
+                                if resume_staged is not None
+                                else publication.ORIGIN_APPROVED_PLAN
+                            ),
+                            expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                            primary_issue=issue_number,
+                            staged=resume_staged,
+                            approved_plan=resume_plan_input,
+                        ),
+                    )
+        # On a transaction-era PR the parent phase handoff is a follow-on write,
+        # only after the commit, and at most once across reruns.
+        parent_handoff_once = resume_through_seam or (
+            resolved_pr.source == "canonical"
+            and not isinstance(resolved_pr.evidence, IssuePrHandoffMetadata)
+        )
+        if parent_handoff_once and one_shot_parent_issue is not None:
+            _post_one_shot_parent_handoff_once(
+                runner,
+                implementation_config,
+                parent_issue=one_shot_parent_issue,
+                plan_hash=plan_hash,
+                plan_subject=plan_subject or "",
+                pr_number=existing_pr_number,
+                pr_head_sha=resumed_pr_context.metadata.head_sha,
+                recommendation=execution_recommendation,
+            )
         # Explicit managed recovery may be resuming a PR whose implementation
         # report was rejected before the canonical handoff checkpoint. Its
         # durable authorization is sufficient to enter the PR loop, but must
         # not launder that rejected report into a canonical handoff.
-        if resolved_pr.source == "legacy-closing-reference":
+        if resolved_pr.source == "legacy-closing-reference" and not resume_through_seam:
             pr_url, pr_head_sha = require_pr_metadata_for_handoff(resumed_pr_context.metadata)
             validate_pr_expected_closing_issues(
                 runner,
@@ -8291,7 +8683,7 @@ def _implement_approved_issue(
                     expected_closing_issue_ids=closing_contract.issue_ids,
                     supersedes_hash=closing_contract.supersedes_hash,
                 )
-        if one_shot_parent_issue is not None:
+        if one_shot_parent_issue is not None and not parent_handoff_once:
             post_one_shot_impl_handoff_comment(
                 runner,
                 config=implementation_config,
@@ -8488,7 +8880,18 @@ def _implement_approved_issue(
                 implementation_config,
                 managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
             )
-        if managed_ci_handoff is not None:
+        # A waiver-path grant on a seam-eligible approved plan is no longer
+        # published before post-PR validation: it becomes the bound
+        # authorization entry of the fresh PR's initial transaction, so a
+        # rejected report leaves no authorization at all (#827).
+        managed_through_seam = (
+            managed_ci_handoff.override_nonce is not None
+            and plan_candidate_key is not None
+            and plan_candidate_key.incompleteness_reason() is None
+            and (staged_parent_issue is None or staged_plan_owner is not None)
+            and not implementation_config.dry_run
+        )
+        if not managed_through_seam:
             managed_ci_handoff = _publish_issue_authorization_with_recovery(
                 runner,
                 config=implementation_config,
@@ -8498,6 +8901,7 @@ def _implement_approved_issue(
                 approved_plan_hash_value=plan_hash,
             )
     else:
+        managed_through_seam = False
         reject_forged_protocol_markers(
             initial_pr_context.metadata.body or "",
             surface=f"pull-request #{pr_number} body",
@@ -8542,58 +8946,74 @@ def _implement_approved_issue(
         ),
     )
     initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_context.metadata)
-    pr_contract = make_pr_contract(
-        repository=implementation_config.repo,
-        pr_number=pr_number,
-        origin_flow="approved-plan-implementation",
-        primary_issue_number=issue_number,
-        expected_closing_issue_ids=closing_contract.issue_ids,
-        supersedes_hash=closing_contract.supersedes_hash,
+    # An unmanaged approved plan with a complete candidate key publishes one
+    # transaction (#827, site b); a staged child does so with its staged
+    # identity (both handoff and PR contract, child-only closing scope) when
+    # the caller names the plan owner.  The one-shot parent phase handoff then
+    # follows the commit.  Anything else keeps the version-1 writers until its
+    # path is on the seam.
+    publish_through_seam = (
+        plan_candidate_key is not None
+        and plan_candidate_key.incompleteness_reason() is None
+        and (managed_ci_handoff is None or managed_through_seam)
+        and (staged_parent_issue is None or staged_plan_owner is not None)
+        and not implementation_config.dry_run
     )
-    post_trusted_pr_contract_record(
-        runner,
-        config=implementation_config,
-        pr_number=pr_number,
-        body=TrustedBody.canonical(
-            format_pr_contract_comment(pr_contract),
-            expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
-        ),
-    )
-    post_issue_pr_handoff_comment(
-        runner,
-        config=implementation_config,
-        issue_number=issue_number,
-        pr_number=pr_number,
-        pr_url=initial_pr_url,
-        pr_head_sha=initial_pr_head_sha,
-        flow="approved-plan-implementation",
-        plan_hash=plan_hash,
-        expected_closing_issue_ids=closing_contract.issue_ids,
-        supersedes_hash=closing_contract.supersedes_hash,
-    )
-    if one_shot_parent_issue is not None:
-        post_one_shot_impl_handoff_comment(
+    def _post_parent_phase_handoff() -> None:
+        if one_shot_parent_issue is not None:
+            post_one_shot_impl_handoff_comment(
+                runner,
+                config=implementation_config,
+                parent_issue=one_shot_parent_issue,
+                mode="implement-one-shot",
+                plan_hash=plan_hash,
+                plan_subject=plan_subject or "",
+                pr_number=pr_number,
+                pr_head_sha=initial_pr_context.metadata.head_sha,
+                strategy=(execution_recommendation.strategy if execution_recommendation is not None else None),
+                topology_source=(
+                    str(execution_identity["topology_source"])
+                    if execution_identity is not None else None
+                ),
+                execution_strategy_contract_version=(
+                    1 if execution_recommendation is not None else None
+                ),
+                recommendation_digest=(
+                    str(execution_identity["recommendation_sha256"])
+                    if execution_identity is not None else None
+                ),
+            )
+    if not publish_through_seam:
+        pr_contract = make_pr_contract(
+            repository=implementation_config.repo,
+            pr_number=pr_number,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=issue_number,
+            expected_closing_issue_ids=closing_contract.issue_ids,
+            supersedes_hash=closing_contract.supersedes_hash,
+        )
+        post_trusted_pr_contract_record(
             runner,
             config=implementation_config,
-            parent_issue=one_shot_parent_issue,
-            mode="implement-one-shot",
-            plan_hash=plan_hash,
-            plan_subject=plan_subject or "",
             pr_number=pr_number,
-            pr_head_sha=initial_pr_context.metadata.head_sha,
-            strategy=(execution_recommendation.strategy if execution_recommendation is not None else None),
-            topology_source=(
-                str(execution_identity["topology_source"])
-                if execution_identity is not None else None
-            ),
-            execution_strategy_contract_version=(
-                1 if execution_recommendation is not None else None
-            ),
-            recommendation_digest=(
-                str(execution_identity["recommendation_sha256"])
-                if execution_identity is not None else None
+            body=TrustedBody.canonical(
+                format_pr_contract_comment(pr_contract),
+                expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
             ),
         )
+        post_issue_pr_handoff_comment(
+            runner,
+            config=implementation_config,
+            issue_number=issue_number,
+            pr_number=pr_number,
+            pr_url=initial_pr_url,
+            pr_head_sha=initial_pr_head_sha,
+            flow="approved-plan-implementation",
+            plan_hash=plan_hash,
+            expected_closing_issue_ids=closing_contract.issue_ids,
+            supersedes_hash=closing_contract.supersedes_hash,
+        )
+        _post_parent_phase_handoff()
     implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
         implementation_result,
         approved_plan_context=approved_plan_context,
@@ -8614,54 +9034,128 @@ def _implement_approved_issue(
         legacy_tests_run=implementation_result.tests_run,
         cwd=active_workdir(implementation_config),
     )
-    initial_coder_body = _attach_round_metadata(
-        render_public_agent_comment(
-            kind="issue_implementation",
-            parsed=implementation_result,
-            agent=implementation_config.coder,
+    def _render_initial_coder_body(workflow_transaction_id: str | None) -> str:
+        return _attach_round_metadata(
+            render_public_agent_comment(
+                kind="issue_implementation",
+                parsed=implementation_result,
+                agent=implementation_config.coder,
+                config=implementation_config,
+                model_used=coder_response.model_used,
+                local_test_evidence=initial_local_test_evidence,
+                current_test_turn_id=coder_response.acquisition_test_turn_id,
+            ),
+            PostedRoundMetadata(
+                flow="pr",
+                role="coder",
+                agent=coder_name,
+                round_number=1,
+                subject=str(initial_pr_context.metadata.head_sha or "unknown"),
+                prior_items=(),
+                workflow_transaction_id=workflow_transaction_id,
+                raw_structured_coder_response=coder_output,
+                local_test_evidence=initial_local_test_evidence,
+                risk_test_matrix_evidence=(
+                    implementation_result.risk_test_matrix_evidence.to_payload()
+                    if implementation_result.risk_test_matrix_evidence is not None
+                    else None
+                ),
+                # The establishing comment renders the full row list (#959).
+                risk_test_matrix_evidence_full_round=(
+                    1 if implementation_result.risk_test_matrix_evidence is not None else None
+                ),
+                risk_test_matrix_diagnostics=tuple(
+                    diagnostic.to_payload()
+                    for diagnostic in implementation_result.risk_test_matrix_diagnostics
+                ),
+                model_used=coder_response.model_used,
+                **_metadata_identity_fields(coder_response),
+                **_architecture_metadata_fields(
+                    implementation_config,
+                    impact=getattr(implementation_result, "architecture_impact", None),
+                ),
+                acquisition_outcome=coder_response.acquisition_outcome,
+                acquisition_returncode=coder_response.acquisition_returncode,
+            ),
+        )
+    if publish_through_seam:
+        from . import workflow_transaction_publication as publication
+        from .workflow_transaction import ENTRY_AUTHORIZATION
+
+        creation_payload = None
+        managed_request: dict[str, object] = {}
+        if managed_through_seam:
+            from .managed_ci_bound_authorization import BoundAuthorizationCodec
+
+            creation_payload = build_issue_created_creation_payload(
+                runner,
+                config=implementation_config,
+                handoff=managed_ci_handoff,
+                metadata=initial_pr_context.metadata,
+                approved_plan_hash=plan_hash,
+            )
+            managed_request = dict(
+                managed=publication.Granted(creation_payload, creation_payload.generation()),
+                authorization_codec=BoundAuthorizationCodec(),
+            )
+        committed = publication.publish_transition(
+            runner,
             config=implementation_config,
-            model_used=coder_response.model_used,
-            local_test_evidence=initial_local_test_evidence,
-            current_test_turn_id=coder_response.acquisition_test_turn_id,
-        ),
-        PostedRoundMetadata(
-            flow="pr",
-            role="coder",
-            agent=coder_name,
-            round_number=1,
-            subject=str(initial_pr_context.metadata.head_sha or "unknown"),
-            prior_items=(),
-            raw_structured_coder_response=coder_output,
-            local_test_evidence=initial_local_test_evidence,
-            risk_test_matrix_evidence=(
-                implementation_result.risk_test_matrix_evidence.to_payload()
-                if implementation_result.risk_test_matrix_evidence is not None
-                else None
+            request=publication.TransitionRequest(
+                repository=implementation_config.repo,
+                pr_number=pr_number,
+                base=str(initial_pr_context.metadata.base_branch or implementation_config.base),
+                head_sha=initial_pr_head_sha,
+                origin_path=(
+                    publication.ORIGIN_STAGED_CHILD
+                    if staged_parent_issue is not None
+                    else publication.ORIGIN_APPROVED_PLAN
+                ),
+                expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                primary_issue=issue_number,
+                staged=_staged_identity(staged_parent_issue, issue_number, staged_plan_owner),
+                approved_plan=publication.ApprovedPlanInput(
+                    plan_hash,
+                    plan_subject or approved_plan_context.plan_subject,
+                    plan_candidate_key,
+                ),
+                initial_coder_round=publication.InitialCoderRound(
+                    lambda transaction_id: _canonical_trusted_body(
+                        _render_initial_coder_body(transaction_id)
+                    )
+                ),
+                **managed_request,
             ),
-            # The establishing comment renders the full row list (#959).
-            risk_test_matrix_evidence_full_round=(
-                1 if implementation_result.risk_test_matrix_evidence is not None else None
-            ),
-            risk_test_matrix_diagnostics=tuple(
-                diagnostic.to_payload()
-                for diagnostic in implementation_result.risk_test_matrix_diagnostics
-            ),
-            model_used=coder_response.model_used,
-            **_metadata_identity_fields(coder_response),
-            **_architecture_metadata_fields(
+        )
+        if creation_payload is not None:
+            # The PR loop continues from the committed bound creation record.
+            managed_ci_handoff = dataclasses_replace(
+                managed_ci_handoff,
+                active_label_event_id=creation_payload.label_event_id,
+                authorization_kind="creation",
+                authorization_comment_id=committed.entry_comment_id(ENTRY_AUTHORIZATION),
+                approved_plan_hash=plan_hash,
+                transaction_bound=True,
+            )
+        # The parent phase handoff is a follow-on write, only after the commit.
+        if one_shot_parent_issue is not None:
+            _post_one_shot_parent_handoff_once(
+                runner,
                 implementation_config,
-                impact=getattr(implementation_result, "architecture_impact", None),
-            ),
-            acquisition_outcome=coder_response.acquisition_outcome,
-            acquisition_returncode=coder_response.acquisition_returncode,
-        ),
-    )
-    post_trusted_pr_comment(
-        runner,
-        config=implementation_config,
-        pr_number=pr_number,
-        body=_embed_pr_contract_marker(initial_coder_body, pr_contract),
-    )
+                parent_issue=one_shot_parent_issue,
+                plan_hash=plan_hash,
+                plan_subject=plan_subject or "",
+                pr_number=pr_number,
+                pr_head_sha=initial_pr_context.metadata.head_sha,
+                recommendation=execution_recommendation,
+            )
+    else:
+        post_trusted_pr_comment(
+            runner,
+            config=implementation_config,
+            pr_number=pr_number,
+            body=_embed_pr_contract_marker(_render_initial_coder_body(None), pr_contract),
+        )
     return run_pr_loop(
         runner,
         pr_number=pr_number,
@@ -9106,6 +9600,8 @@ def verify_child_plan_rebind(
     stage_id: str,
     pr_number: int,
     require_admissible: bool = True,
+    runner: Runner | None = None,
+    config: AgentLoopConfig | None = None,
 ) -> ApprovedPlanContext | None:
     """Verify a planning child's same-PR plan-replacement handoff.
 
@@ -9121,40 +9617,68 @@ def verify_child_plan_rebind(
     the plan became the binding, so a legitimately rebound plan that a later
     contract tightening made inadmissible can still be superseded, while an
     unverified replacement can never be laundered through a new authorization.
+
+    A transaction-era PR (#827) is read through its committed lineage when a
+    ``runner`` is supplied: the edge is the latest committed plan-replacement
+    transaction, and its audit record must ride in the handoff that
+    transaction committed.
     """
-    lineage = resolve_issue_pr_handoff_lineage(
-        child_comments, issue_number=child_issue, repo=repo
-    )
-    if lineage is None or lineage.replaced is None or lineage.replacement is None:
-        return None
-    handoff = lineage.replacement
-    replaced = lineage.replaced
+    transaction_edge = None
+    if runner is not None and config is not None and _names_version_2_handoff(child_comments):
+        from . import workflow_transaction_publication as publication
+
+        era, transaction_edge = publication.committed_plan_replacement(
+            runner, config, pr_number=pr_number, issue_number=child_issue
+        )
+        if era == publication.ERA_TRANSACTION and transaction_edge is None:
+            return None
+        if era != publication.ERA_TRANSACTION:
+            transaction_edge = None
+    if transaction_edge is not None:
+        replaced_hash = transaction_edge.replaced_plan_hash
+        new_hash = transaction_edge.new_plan_hash
+        handoff_pr = transaction_edge.pr_number
+        audit_comments = (
+            [SimpleNamespace(body=transaction_edge.handoff_body)]
+            if transaction_edge.handoff_body is not None
+            else []
+        )
+        records = list(find_child_plan_rebind_records(audit_comments))
+    else:
+        lineage = resolve_issue_pr_handoff_lineage(
+            child_comments, issue_number=child_issue, repo=repo
+        )
+        if lineage is None or lineage.replaced is None or lineage.replacement is None:
+            return None
+        replaced_hash = lineage.replaced.plan_hash
+        new_hash = lineage.replacement.plan_hash
+        handoff_pr = lineage.replacement.pr_number
+        records = [
+            record
+            for record in find_child_plan_rebind_records(child_comments)
+            if record.comment_index == lineage.replacement_comment_index
+        ]
 
     def fail(reason: str) -> AgentLoopError:
         return AgentLoopError(
             f"Human repair required: child issue #{child_issue} carries a same-PR approved-plan "
-            f"replacement handoff ({replaced.plan_hash} -> {handoff.plan_hash}) for PR "
-            f"#{handoff.pr_number} that cannot be verified: {reason}. No reviewer, coder, "
+            f"replacement handoff ({replaced_hash} -> {new_hash}) for PR "
+            f"#{handoff_pr} that cannot be verified: {reason}. No reviewer, coder, "
             "qualification, or merge step ran and no corrective record was posted. Restore the "
             "signed child-plan supersession record and the rebind comment, or remove the "
             "unverifiable handoff comment, then rerun."
         )
 
-    if handoff.pr_number != pr_number:
-        raise fail(f"it names PR #{handoff.pr_number}, not PR #{pr_number}")
-    records = [
-        record
-        for record in find_child_plan_rebind_records(child_comments)
-        if record.comment_index == lineage.replacement_comment_index
-    ]
+    if handoff_pr != pr_number:
+        raise fail(f"it names PR #{handoff_pr}, not PR #{pr_number}")
     if len(records) != 1:
         raise fail("its comment does not carry exactly one rebind audit record")
     record = records[0]
     if (
         record.child_issue != child_issue
-        or record.pr_number != handoff.pr_number
-        or record.new_plan_hash != handoff.plan_hash
-        or record.superseded_plan_hash != replaced.plan_hash
+        or record.pr_number != handoff_pr
+        or record.new_plan_hash != new_hash
+        or record.superseded_plan_hash != replaced_hash
     ):
         raise fail(
             "its rebind audit record disagrees with the handoff on child issue, PR number, or "
@@ -9203,6 +9727,8 @@ def verified_retired_child_plan_hashes(
     parent_issue: int,
     stage_id: str,
     pr_number: int,
+    runner: Runner | None = None,
+    config: AgentLoopConfig | None = None,
 ) -> frozenset[str]:
     """Approved plans that a verified signed supersession chain replaced (#988).
 
@@ -9220,7 +9746,41 @@ def verified_retired_child_plan_hashes(
     standalone audit record with no handoff transition retires nothing.  The
     walk stops at the first edge that does not verify, so an unexplained hash
     divergence keeps failing closed at the execution-decision check.
+
+    A transaction-era PR (#827) carries its handoffs as version-2 records that
+    the version-1 lineage reader cannot decode.  With a ``runner`` its edge is
+    the latest committed plan-replacement transaction, which
+    ``verify_child_plan_rebind`` verifies; that edge's replaced plan is the
+    one retired.
     """
+    if runner is not None and config is not None and _names_version_2_handoff(child_comments):
+        from . import workflow_transaction_publication as publication
+
+        era, edge = publication.committed_plan_replacement(
+            runner, config, pr_number=pr_number, issue_number=child_issue
+        )
+        if era == publication.ERA_TRANSACTION:
+            if edge is None or not edge.replaced_plan_hash:
+                return frozenset()
+            replacement = verify_child_plan_rebind(
+                child_comments,
+                repo=repo,
+                parent_plan_context=parent_plan_context,
+                child_issue=child_issue,
+                parent_issue=parent_issue,
+                stage_id=stage_id,
+                pr_number=pr_number,
+                require_admissible=False,
+                runner=runner,
+                config=config,
+            )
+            if (
+                replacement is None
+                or replacement.plan_hash != edge.new_plan_hash
+                or edge.replaced_plan_hash == edge.new_plan_hash
+            ):
+                return frozenset()
+            return frozenset({edge.replaced_plan_hash})
     replacement = verify_child_plan_rebind(
         child_comments,
         repo=repo,
@@ -9301,7 +9861,13 @@ def _managed_ci_retired_plan_hashes(
 
     Returns the retired hashes and the (possibly newly fetched) parent issue
     context so the caller does not refetch it.
+
+    A transaction-era PR (#827) retires nothing here: its managed authority is
+    the committed bound record, which the resume audit reads through consumer
+    mode without consulting unbound history.
     """
+    if _names_version_2_handoff(issue_context.comments):
+        return frozenset(), parent_issue_context
     lineage = resolve_issue_pr_handoff_lineage(
         issue_context.comments, issue_number=issue_context.number, repo=config.repo
     )
@@ -9413,6 +9979,23 @@ def _rebind_superseded_child_plan(
             f"{plan_supersession.superseded_hash}; PR #{plan_supersession.pr_number} was not "
             "rebound and nothing was posted."
         )
+    from . import workflow_transaction_publication as publication
+
+    # Sibling-tolerant: prepared-only rebind siblings reach the seam.
+    era, _edge = publication.committed_plan_replacement(
+        runner, config, pr_number=plan_supersession.pr_number, issue_number=issue_number
+    )
+    if era == publication.ERA_TRANSACTION:
+        _rebind_transaction_era_child_plan(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            issue_context=issue_context,
+            plan_supersession=plan_supersession,
+            plan_hash=plan_hash,
+            replan=replan,
+        )
+        return
     handoff_lineage = resolve_issue_pr_handoff_lineage(
         issue_context.comments, issue_number=issue_number, repo=config.repo
     )
@@ -9502,6 +10085,219 @@ def _rebind_superseded_child_plan(
     )
 
 
+def _interrupted_rebind_pr_is_open(runner: Runner, config: AgentLoopConfig, pr_number: int) -> bool:
+    """Whether the PR carries a pending successor the rebind must settle (#827).
+
+    True when a prepared-only successor of any kind is pending on the
+    committed chain: an interrupted plan-replacement rebind is adopted, and
+    any other pending successor (for example a head advance) is aborted as
+    superseded by the seam.  The PR must then still be OPEN, or nothing
+    proceeds.  The authority form would refuse both states.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if publication.pending_successor(runner, config, pr_number) is None:
+        return False
+    validate_open_pr(runner, config=config, pr_number=pr_number)
+    return True
+
+
+def _rebind_transaction_era_child_plan(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    issue_context: IssueContext,
+    plan_supersession: _PlanSupersessionBinding,
+    plan_hash: str,
+    replan: AuthorizedReplanLineage,
+) -> None:
+    """Rebind a transaction-era child PR as one plan-replacement successor (#827).
+
+    The seam reissues the handoff, carrying the rebind audit record, and the
+    PR contract, then commits; nothing is written outside it.  The last
+    committed transaction is the binding: an already-rebound PR is verified
+    and nothing is posted, and a binding that names neither plan is refused.
+    """
+    from . import workflow_transaction_publication as publication
+
+    pr_number = plan_supersession.pr_number
+    committed = publication.latest_committed_intent(runner, config, pr_number)
+    if committed is None:
+        raise AgentLoopError(
+            f"Human repair required: PR #{pr_number} has no committed workflow transaction; "
+            "the re-planned child plan was not rebound and nothing was posted."
+        )
+    if committed.primary_issue != issue_number:
+        raise AgentLoopError(
+            f"Human repair required: PR #{pr_number}'s committed workflow transaction is bound "
+            f"to issue #{committed.primary_issue}, not child issue #{issue_number}; the "
+            "re-planned child plan was not rebound and nothing was posted."
+        )
+    if _interrupted_rebind_pr_is_open(runner, config, pr_number):
+        # Resuming an interrupted rebind: the seam adopts the stored
+        # plan-replacement intent (or aborts it as obsolete) below.
+        authenticated = SimpleNamespace(pr_number=pr_number, state="OPEN")
+    else:
+        authenticated = authenticate_canonical_issue_pr(
+            runner, config=config, issue_number=issue_number, issue_context=issue_context
+        )
+    if (
+        authenticated is None
+        or authenticated.pr_number != pr_number
+        or authenticated.state != "OPEN"
+    ):
+        raise AgentLoopError(
+            f"Human repair required: canonical PR #{pr_number} for issue #{issue_number} is "
+            f"{authenticated.state if authenticated is not None else 'not recorded'}, not OPEN "
+            "with the same number as the superseded handoff. The re-planned child plan was not "
+            "rebound, no superseding handoff was posted, and no implementation turn was started; "
+            "abandoning or replacing the existing PR is not supported."
+        )
+    if committed.approved_plan_hash == plan_hash:
+        verify_child_plan_rebind(
+            issue_context.comments,
+            repo=config.repo,
+            parent_plan_context=plan_supersession.parent_plan_context,
+            child_issue=issue_number,
+            parent_issue=plan_supersession.parent_issue,
+            stage_id=plan_supersession.stage_id,
+            pr_number=pr_number,
+            runner=runner,
+            config=config,
+        )
+        return
+    if committed.approved_plan_hash != plan_supersession.superseded_hash:
+        raise AgentLoopError(
+            f"Human repair required: PR #{pr_number}'s committed workflow transaction binds plan "
+            f"{committed.approved_plan_hash}, neither superseded plan "
+            f"{plan_supersession.superseded_hash} nor approved revision {plan_hash}; nothing "
+            "was posted."
+        )
+    plan_context = recover_approved_plan_context(issue_context.comments, expected_hash=plan_hash)
+    plan_input = publication.recover_approved_plan_input(
+        runner,
+        config,
+        plan_issue_number=issue_number,
+        plan_hash=plan_hash,
+        plan_subject=plan_context.plan_subject if plan_context.is_available else None,
+    )
+    if plan_input is None:
+        raise AgentLoopError(
+            f"Human repair required: approved plan {plan_hash} on issue #{issue_number} has no "
+            "record authored by this invocation's actor, so no plan-replacement transaction can "
+            f"bind it; PR #{pr_number} was not rebound and nothing was posted."
+        )
+    rebind_section = format_child_plan_rebind_section(
+        ChildPlanRebindRecord(
+            child_issue=issue_number,
+            pr_number=pr_number,
+            superseded_plan_hash=plan_supersession.superseded_hash,
+            new_plan_hash=plan_hash,
+            plan_supersession_digest=plan_supersession.digest,
+            first_replan_round=replan.first_round,
+            approved_round=replan.latest_round,
+        ),
+        transaction_era=True,
+    )
+    pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    _pr_url, head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
+    managed, codec = _rebind_managed_input(
+        runner, config, committed=committed, issue_number=issue_number,
+        plan_hash=plan_hash, live_head=head_sha,
+    )
+    publication.publish_transition(
+        runner,
+        config=config,
+        request=publication.TransitionRequest(
+            repository=config.repo,
+            pr_number=pr_number,
+            base=str(pr_context.metadata.base_branch or config.base),
+            head_sha=head_sha,
+            origin_path=publication.ORIGIN_CHILD_PLAN_REBIND,
+            managed=managed,
+            authorization_codec=codec,
+            # The closing scope is never changed by a rebind.
+            expected_closing_issue_ids=tuple(committed.expected_closing_issue_ids),
+            primary_issue=issue_number,
+            staged=_staged_identity(plan_supersession.parent_issue, issue_number, "child"),
+            approved_plan=plan_input,
+            handoff_extra_section=rebind_section,
+        ),
+    )
+    log(
+        config,
+        f"Issue #{issue_number}: rebound PR #{pr_number} from approved plan "
+        f"{plan_supersession.superseded_hash} to {plan_hash} with one plan-replacement "
+        "workflow transaction",
+    )
+
+
+def _rebind_managed_input(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    committed,
+    issue_number: int,
+    plan_hash: str,
+    live_head: str,
+):
+    """The managed-CI input of a transaction-era rebind, and its codec (#827).
+
+    A null committed generation needs none.  A granted one is reissued in the
+    same plan-replacement transaction as a deterministic ``plan-rebind``
+    record naming the new plan (nothing is minted, no fresh grant is needed);
+    a released one stays inherited under the unchanged released generation.
+    A live head that moved past the committed granted record stops before any
+    write: the PR loop commits the head successor first.
+    """
+    from . import managed_ci_bound_authorization as bound
+    from . import workflow_transaction_publication as publication
+
+    generation = committed.managed_ci_generation
+    if generation is None:
+        return publication.Unmanaged(), None
+    resolved = publication.read_pr_transaction_views(
+        runner, config, committed.pr_number, issue_number
+    )
+    view = bound.builder_authorization_view(resolved.views.pr_view, resolved.lineage)
+    effective = view.effective
+    if effective is not None and not effective.record.granted:
+        return (
+            publication.Released(effective.record, generation),
+            bound.BoundAuthorizationCodec(),
+        )
+    payload = (
+        bound.build_plan_rebind_payload(
+            effective.record,
+            committed_comment_id=effective.comment_id,
+            new_plan_hash=plan_hash,
+            live_head=live_head,
+        )
+        if effective is not None
+        else None
+    )
+    if payload is None:
+        raise WorkflowTransactionError(
+            f"PR #{committed.pr_number}'s managed-CI authorization cannot be reissued for "
+            f"approved plan {plan_hash}; the re-planned child plan was not rebound and nothing "
+            "was written",
+            transaction_ids=(committed.transaction_id,),
+            problems=(
+                "managed head has no continuity provenance"
+                if effective is not None and effective.record.head_sha != live_head
+                else "no committed granted authorization to reissue",
+                f"live head {live_head}, committed head {committed.head_sha}",
+            ),
+            recovery_action=publication.RECOVERY_RERUN,
+            code=publication.CODE_MANAGED_UNAVAILABLE,
+        )
+    return (
+        publication.Granted(payload, payload.generation()),
+        bound.BoundAuthorizationCodec(),
+    )
+
+
 def _route_child_plan_handoff(
     runner: Runner,
     *,
@@ -9535,6 +10331,8 @@ def _route_child_plan_handoff(
         stage_id=fresh_child.stage_id,
         pr_number=handoff.pr_number,
         require_admissible=False,
+        runner=runner,
+        config=config,
     )
     failure = _child_plan_admissibility_failure(
         fresh_child.parent_plan_context, child_plan_context, stage_id=fresh_child.stage_id
@@ -9568,6 +10366,10 @@ def _route_child_plan_handoff(
         )
     signed = matching[0]
     if config.dry_run:
+        pr_number = handoff.pr_number
+    elif _interrupted_rebind_pr_is_open(runner, config, handoff.pr_number):
+        # An interrupted rebind: the committed predecessor stays the binding
+        # and the authority form refuses until the rebind writer commits.
         pr_number = handoff.pr_number
     else:
         authenticated = authenticate_canonical_issue_pr(
@@ -9612,6 +10414,7 @@ def _require_admissible_pr_child_plan(
     binding: _PlanningChildBinding,
     child_plan_context: ApprovedPlanContext,
     pr_number: int,
+    runner: Runner | None = None,
 ) -> None:
     """PR-mode provenance gate for a planning child's bound plan (#936).
 
@@ -9632,6 +10435,8 @@ def _require_admissible_pr_child_plan(
         stage_id=binding.stage_id,
         pr_number=pr_number,
         require_admissible=False,
+        runner=runner,
+        config=config,
     )
     failure = _child_plan_admissibility_failure(
         binding.parent_plan_context, child_plan_context, stage_id=binding.stage_id
@@ -12324,7 +13129,14 @@ def _run_plan_first_loop(
                 # plan-hash-scoped) one-shot handoff lookup below, so a stale
                 # canonical record fails safely instead of being bypassed by
                 # it (#589). It is scoped to the selected target issue, since
-                # a split-stage plan implements a child, not the parent.
+                # a split-stage plan implements a child, not the parent.  An
+                # interrupted publication on the target (for example a staged
+                # child's) is finished first, so the authority lookup sees it
+                # committed instead of refusing a partial candidate (#827).
+                if target_issue_number != issue_number:
+                    _finish_interrupted_issue_publication(
+                        runner, config, issue_number=target_issue_number
+                    )
                 resolved_pr = resolve_canonical_pr_for_issue(
                     runner,
                     config=config,
@@ -12364,7 +13176,42 @@ def _run_plan_first_loop(
                             pr_number=resolved_pr.pr_number,
                             issue_number=staged_parent_issue,
                         )
-                    if resolved_pr.source == "legacy-closing-reference":
+                    # An unmanaged, non-staged already-handed-off resume goes
+                    # through the seam (#827, site c): a transaction-era PR has
+                    # its pending transaction finished and never receives a
+                    # version-1 record; a legacy PR is published as one
+                    # approved-plan transaction (handoff and PR contract).  A
+                    # plan the authenticated actor never recorded keeps v1.
+                    handed_off_through_seam = False
+                    if (
+                        resolved_pr.source == "legacy-closing-reference"
+                        and not config.managed_ci
+                        and not config.dry_run
+                    ):
+                        handed_off_through_seam = _publish_handed_off_plan_resume(
+                            runner,
+                            config,
+                            issue_number=target_issue_number,
+                            pr_number=resolved_pr.pr_number,
+                            plan_hash=plan_hash,
+                            plan_subject=current_plan_subject,
+                            plan_candidate_key=current_plan_key,
+                            # A staged child's closing scope is the child only.
+                            plan_additions=(
+                                ()
+                                if staged_parent_issue is not None
+                                else _extract_current_expected_closing_issue_ids(current_plan)
+                            ),
+                            staged=_staged_identity(
+                                staged_parent_issue,
+                                target_issue_number,
+                                _staged_plan_owner(issue_number, target_issue_number),
+                            ),
+                        )
+                    if (
+                        resolved_pr.source == "legacy-closing-reference"
+                        and not handed_off_through_seam
+                    ):
                         resumed_pr_context = get_pr_review_context(
                             runner, config=config, pr_number=resolved_pr.pr_number
                         )
@@ -12488,6 +13335,12 @@ def _run_plan_first_loop(
                     plan_subject=plan_subject,
                     staged_parent_issue=staged_parent_issue,
                     execution_recommendation=recommendation,
+                    plan_candidate_key=current_plan_key,
+                    staged_plan_owner=(
+                        _staged_plan_owner(issue_number, target_issue_number)
+                        if staged_parent_issue is not None
+                        else None
+                    ),
                 )
             raise AgentLoopError(f"Unknown plan execution mode: {mode}")
 
@@ -13127,10 +13980,13 @@ def run_issue_loop(
             # resuming the newest plan would silently change the implementation
             # contract. Fall back to the latest reconstructable round only when
             # no approved-plan handoff has selected a plan yet.
-            recorded_plan_handoff = find_latest_issue_pr_handoff(
-                issue_context.comments,
-                issue_number=issue_number,
-                repo=config.repo,
+            recorded_plan_handoff = _recorded_issue_handoff(
+                runner,
+                config,
+                issue_context=issue_context,
+                defer_pending_successor=(
+                    fresh_child is not None and fresh_child.route.is_planning
+                ),
             )
             if (
                 recorded_plan_handoff is not None
@@ -13233,8 +14089,15 @@ def run_issue_loop(
                 parent_issue=fresh_child.parent_issue,
                 stage_id=fresh_child.stage_id,
                 pr_number=recorded_plan_handoff.pr_number,
+                runner=runner,
+                config=config,
             )
 
+        # An interrupted transaction publication is finished from its stored
+        # intent before the authority lookup below, which refuses it (#827).
+        _finish_interrupted_issue_publication(
+            runner, config, issue_number=issue_number
+        )
         # Resolve the canonical AGENT_ISSUE_PR_HANDOFF record (or, failing
         # that, the legacy exactly-one-open-PR search) before invoking a
         # coder in either direct or plan-first mode, so a rerun after an
@@ -13421,7 +14284,9 @@ def run_issue_loop(
             # Keep rejected issue-implementation evidence rejected during an
             # explicit managed recovery. The PR loop authenticates the
             # authorization record independently of this legacy association.
-            if resolved_pr.source == "legacy-closing-reference":
+            if resolved_pr.source == "legacy-closing-reference" and not _finish_pr_side_transaction(
+                runner, config, pr_number=resolved_pr.pr_number
+            ):
                 pr_context = get_pr_review_context(runner, config=config, pr_number=resolved_pr.pr_number)
                 validate_pr_expected_closing_issues(
                     runner,
@@ -13432,43 +14297,137 @@ def run_issue_loop(
                     reject_unexpected=config.managed_ci,
                 )
                 pr_url, pr_head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
-                pr_contract = make_pr_contract(
-                    repository=config.repo,
-                    pr_number=resolved_pr.pr_number,
-                    origin_flow=(
-                        "approved-plan-implementation"
-                        if plan_first and recovered_plan_hash is not None
-                        else "issue-implementation"
-                    ),
-                    primary_issue_number=issue_number,
-                    expected_closing_issue_ids=closing_contract.issue_ids,
-                    supersedes_hash=closing_contract.supersedes_hash,
-                )
-                post_trusted_pr_comment(
-                    runner,
-                    config=config,
-                    pr_number=resolved_pr.pr_number,
-                    body=TrustedBody.canonical(
-                        format_pr_contract_comment(pr_contract),
-                        expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
-                    ),
-                )
-                if not config.managed_ci:
-                    post_issue_pr_handoff_comment(
+                # A plan-first resume of an unmanaged, non-staged approved plan
+                # publishes through the seam as well (#827, site a).  The
+                # candidate key is recovered from durable records; a malformed,
+                # unmatched, or unordered scheduler history stops here before
+                # any write and never falls back to version-1 records.  Only a
+                # plan the authenticated actor never recorded keeps today's path.
+                recovered_plan_input = None
+                if (
+                    plan_first
+                    and recovered_plan_hash is not None
+                    and recovered_plan_context is not None
+                    and recovered_plan_context.is_available
+                    and staged_parent_issue is None
+                    and not config.managed_ci
+                    and not config.dry_run
+                ):
+                    from . import workflow_transaction_publication as publication
+
+                    recovered_plan_input = publication.recover_approved_plan_input(
+                        runner,
+                        config,
+                        plan_issue_number=issue_number,
+                        plan_hash=recovered_plan_hash,
+                        plan_subject=recovered_plan_context.plan_subject,
+                    )
+                if recovered_plan_input is not None:
+                    publication.publish_transition(
                         runner,
                         config=config,
-                        issue_number=issue_number,
+                        request=publication.TransitionRequest(
+                            repository=config.repo,
+                            pr_number=resolved_pr.pr_number,
+                            base=str(pr_context.metadata.base_branch or config.base),
+                            head_sha=pr_head_sha,
+                            origin_path=publication.ORIGIN_APPROVED_PLAN,
+                            expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                            primary_issue=issue_number,
+                            approved_plan=recovered_plan_input,
+                        ),
+                    )
+                elif not plan_first and not config.managed_ci and not config.dry_run:
+                    # Direct unmanaged resume (#827, site d): one transaction that
+                    # restates or upgrades whatever the PR already records; a
+                    # consistent legacy PR receives no write.
+                    from . import workflow_transaction_publication as publication
+
+                    publication.publish_transition(
+                        runner,
+                        config=config,
+                        request=publication.TransitionRequest(
+                            repository=config.repo,
+                            pr_number=resolved_pr.pr_number,
+                            base=str(pr_context.metadata.base_branch or config.base),
+                            head_sha=pr_head_sha,
+                            origin_path=publication.ORIGIN_DIRECT_ISSUE,
+                            expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                            primary_issue=issue_number,
+                        ),
+                    )
+                else:
+                    pr_contract = make_pr_contract(
+                        repository=config.repo,
                         pr_number=resolved_pr.pr_number,
-                        pr_url=pr_url,
-                        pr_head_sha=pr_head_sha,
-                        flow=(
+                        origin_flow=(
                             "approved-plan-implementation"
                             if plan_first and recovered_plan_hash is not None
                             else "issue-implementation"
                         ),
-                        plan_hash=recovered_plan_hash if plan_first else None,
+                        primary_issue_number=issue_number,
                         expected_closing_issue_ids=closing_contract.issue_ids,
                         supersedes_hash=closing_contract.supersedes_hash,
+                    )
+                    post_trusted_pr_comment(
+                        runner,
+                        config=config,
+                        pr_number=resolved_pr.pr_number,
+                        body=TrustedBody.canonical(
+                            format_pr_contract_comment(pr_contract),
+                            expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+                        ),
+                    )
+                    if not config.managed_ci:
+                        post_issue_pr_handoff_comment(
+                            runner,
+                            config=config,
+                            issue_number=issue_number,
+                            pr_number=resolved_pr.pr_number,
+                            pr_url=pr_url,
+                            pr_head_sha=pr_head_sha,
+                            flow=(
+                                "approved-plan-implementation"
+                                if plan_first and recovered_plan_hash is not None
+                                else "issue-implementation"
+                            ),
+                            plan_hash=recovered_plan_hash if plan_first else None,
+                            expected_closing_issue_ids=closing_contract.issue_ids,
+                            supersedes_hash=closing_contract.supersedes_hash,
+                        )
+            if (
+                plan_first
+                and not config.dry_run
+                and staged_parent_issue is None
+                and recovered_execution is not None
+                and recovered_execution.recommendation is not None
+                and recovered_execution.strategy == "one-shot"
+                and recovered_plan_hash is not None
+                and recovered_plan_context is not None
+                and recovered_plan_context.is_available
+            ):
+                # A committed transaction-era one-shot PR whose follow-on parent
+                # phase handoff was never posted (the publication was finished
+                # by this rerun, or that write failed) gets it now, once (#827).
+                from . import workflow_transaction_publication as publication
+
+                if publication.committed_pr_binding(
+                    runner, config, resolved_pr.pr_number
+                ) is not None:
+                    _post_one_shot_parent_handoff_once(
+                        runner,
+                        config,
+                        parent_issue=issue_number,
+                        plan_hash=recovered_plan_hash,
+                        plan_subject=(
+                            recovered_plan_context.plan_subject
+                            or _plan_subject(recovered_plan_context.canonical_text or "")
+                        ),
+                        pr_number=resolved_pr.pr_number,
+                        pr_head_sha=get_pr_review_context(
+                            runner, config=config, pr_number=resolved_pr.pr_number
+                        ).metadata.head_sha,
+                        recommendation=recovered_execution.recommendation,
                     )
             return run_pr_loop(
                 runner,
@@ -13684,14 +14643,22 @@ def run_issue_loop(
                     config,
                     managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
                 )
-            managed_ci_handoff = _publish_issue_authorization_with_recovery(
-                runner,
-                config=config,
-                handoff=managed_ci_handoff,
-                metadata=initial_pr_context.metadata,
-                issue_number=issue_number,
+            # As at site b, a waiver-path grant becomes the bound authorization
+            # entry of the fresh PR's initial transaction instead of a
+            # version-1 record written before post-PR validation (#827, site e).
+            managed_through_seam = (
+                managed_ci_handoff.override_nonce is not None and not config.dry_run
             )
+            if not managed_through_seam:
+                managed_ci_handoff = _publish_issue_authorization_with_recovery(
+                    runner,
+                    config=config,
+                    handoff=managed_ci_handoff,
+                    metadata=initial_pr_context.metadata,
+                    issue_number=issue_number,
+                )
         else:
+            managed_through_seam = False
             reject_forged_protocol_markers(
                 initial_pr_context.metadata.body or "",
                 surface=f"pull-request #{pr_number} body",
@@ -13736,33 +14703,40 @@ def run_issue_loop(
             ),
         )
         initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_metadata)
-        pr_contract = make_pr_contract(
-            repository=config.repo,
-            pr_number=pr_number,
-            origin_flow="issue-implementation",
-            primary_issue_number=issue_number,
-            expected_closing_issue_ids=closing_contract.issue_ids,
-        )
-        post_trusted_pr_contract_record(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            body=TrustedBody.canonical(
-                format_pr_contract_comment(pr_contract),
-                expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
-            ),
-        )
-        post_issue_pr_handoff_comment(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            pr_number=pr_number,
-            pr_url=initial_pr_url,
-            pr_head_sha=initial_pr_head_sha,
-            flow="issue-implementation",
-            plan_hash=None,
-            expected_closing_issue_ids=closing_contract.issue_ids,
-        )
+        # A strict-protection managed grant is still published by the version-1
+        # writers, so it keeps the version-1 handoff and contract; every other
+        # direct fresh PR publishes one transaction (#827, site e).
+        publish_through_seam = (
+            managed_ci_handoff is None or managed_through_seam
+        ) and not config.dry_run
+        if not publish_through_seam:
+            pr_contract = make_pr_contract(
+                repository=config.repo,
+                pr_number=pr_number,
+                origin_flow="issue-implementation",
+                primary_issue_number=issue_number,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+            )
+            post_trusted_pr_contract_record(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                body=TrustedBody.canonical(
+                    format_pr_contract_comment(pr_contract),
+                    expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+                ),
+            )
+            post_issue_pr_handoff_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                pr_number=pr_number,
+                pr_url=initial_pr_url,
+                pr_head_sha=initial_pr_head_sha,
+                flow="issue-implementation",
+                plan_hash=None,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+            )
         implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
             implementation_result,
             approved_plan_context=None,
@@ -13783,51 +14757,101 @@ def run_issue_loop(
             legacy_tests_run=implementation_result.tests_run,
             cwd=active_workdir(config),
         )
-        initial_coder_body = _attach_round_metadata(
-            render_public_agent_comment(
-                kind="issue_implementation",
-                parsed=implementation_result,
-                agent=config.coder,
+        def _render_initial_coder_body(workflow_transaction_id: str | None) -> str:
+            return _attach_round_metadata(
+                render_public_agent_comment(
+                    kind="issue_implementation",
+                    parsed=implementation_result,
+                    agent=config.coder,
+                    config=config,
+                    model_used=coder_response.model_used,
+                    local_test_evidence=initial_local_test_evidence,
+                    current_test_turn_id=coder_response.acquisition_test_turn_id,
+                ),
+                PostedRoundMetadata(
+                    flow="pr",
+                    role="coder",
+                    agent=agent_display_name(config.coder),
+                    round_number=1,
+                    subject=str(initial_pr_metadata.head_sha or "unknown"),
+                    prior_items=(),
+                    workflow_transaction_id=workflow_transaction_id,
+                    raw_structured_coder_response=coder_output,
+                    local_test_evidence=initial_local_test_evidence,
+                    risk_test_matrix_evidence=(
+                        implementation_result.risk_test_matrix_evidence.to_payload()
+                        if implementation_result.risk_test_matrix_evidence is not None
+                        else None
+                    ),
+                    # The establishing comment renders the full row list (#959).
+                    risk_test_matrix_evidence_full_round=(
+                        1 if implementation_result.risk_test_matrix_evidence is not None else None
+                    ),
+                    risk_test_matrix_diagnostics=tuple(
+                        diagnostic.to_payload()
+                        for diagnostic in implementation_result.risk_test_matrix_diagnostics
+                    ),
+                    model_used=coder_response.model_used,
+                    **_metadata_identity_fields(coder_response),
+                    acquisition_outcome=coder_response.acquisition_outcome,
+                    acquisition_returncode=coder_response.acquisition_returncode,
+                    **_architecture_metadata_fields(config, impact=getattr(implementation_result, "architecture_impact", None)),
+                ),
+            )
+        if publish_through_seam:
+            from . import workflow_transaction_publication as publication
+            from .workflow_transaction import ENTRY_AUTHORIZATION
+
+            creation_payload = None
+            managed_request: dict[str, object] = {}
+            if managed_through_seam:
+                from .managed_ci_bound_authorization import BoundAuthorizationCodec
+
+                creation_payload = build_issue_created_creation_payload(
+                    runner,
+                    config=config,
+                    handoff=managed_ci_handoff,
+                    metadata=initial_pr_metadata,
+                )
+                managed_request = dict(
+                    managed=publication.Granted(creation_payload, creation_payload.generation()),
+                    authorization_codec=BoundAuthorizationCodec(),
+                )
+            committed = publication.publish_transition(
+                runner,
                 config=config,
-                model_used=coder_response.model_used,
-                local_test_evidence=initial_local_test_evidence,
-                current_test_turn_id=coder_response.acquisition_test_turn_id,
-            ),
-            PostedRoundMetadata(
-                flow="pr",
-                role="coder",
-                agent=agent_display_name(config.coder),
-                round_number=1,
-                subject=str(initial_pr_metadata.head_sha or "unknown"),
-                prior_items=(),
-                raw_structured_coder_response=coder_output,
-                local_test_evidence=initial_local_test_evidence,
-                risk_test_matrix_evidence=(
-                    implementation_result.risk_test_matrix_evidence.to_payload()
-                    if implementation_result.risk_test_matrix_evidence is not None
-                    else None
+                request=publication.TransitionRequest(
+                    repository=config.repo,
+                    pr_number=pr_number,
+                    base=str(initial_pr_metadata.base_branch or config.base),
+                    head_sha=initial_pr_head_sha,
+                    origin_path=publication.ORIGIN_DIRECT_ISSUE,
+                    expected_closing_issue_ids=tuple(closing_contract.issue_ids),
+                    primary_issue=issue_number,
+                    initial_coder_round=publication.InitialCoderRound(
+                        lambda transaction_id: _canonical_trusted_body(
+                            _render_initial_coder_body(transaction_id)
+                        )
+                    ),
+                    **managed_request,
                 ),
-                # The establishing comment renders the full row list (#959).
-                risk_test_matrix_evidence_full_round=(
-                    1 if implementation_result.risk_test_matrix_evidence is not None else None
-                ),
-                risk_test_matrix_diagnostics=tuple(
-                    diagnostic.to_payload()
-                    for diagnostic in implementation_result.risk_test_matrix_diagnostics
-                ),
-                model_used=coder_response.model_used,
-                **_metadata_identity_fields(coder_response),
-                acquisition_outcome=coder_response.acquisition_outcome,
-                acquisition_returncode=coder_response.acquisition_returncode,
-                **_architecture_metadata_fields(config, impact=getattr(implementation_result, "architecture_impact", None)),
-            ),
-        )
-        post_trusted_pr_comment(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            body=_embed_pr_contract_marker(initial_coder_body, pr_contract),
-        )
+            )
+            if creation_payload is not None:
+                # The PR loop continues from the committed bound creation record.
+                managed_ci_handoff = dataclasses_replace(
+                    managed_ci_handoff,
+                    active_label_event_id=creation_payload.label_event_id,
+                    authorization_kind="creation",
+                    authorization_comment_id=committed.entry_comment_id(ENTRY_AUTHORIZATION),
+                    transaction_bound=True,
+                )
+        else:
+            post_trusted_pr_comment(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                body=_embed_pr_contract_marker(_render_initial_coder_body(None), pr_contract),
+            )
         return run_pr_loop(
             runner,
             pr_number=pr_number,
@@ -16096,6 +17120,341 @@ def _is_completed_full_board_scheduler_record(
         return False
 
 
+def _entry_head_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str | None,
+) -> None:
+    """Head-advance point 1 (#827): loop entry is a writer path and keeps raising.
+
+    Commits the ``head-advance`` successor a new live head needs, then gates:
+    a prepared-only, deleted, or contradictory transaction stops the PR command
+    with the diagnostic before any round starts.  A legacy-era PR is untouched.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run or not head_sha:
+        return
+    publication.ensure_live_head_transaction(
+        runner, config, pr_number=pr_number, head_sha=head_sha
+    )
+    publication.require_live_head_authority(
+        runner, config, pr_number=pr_number, head_sha=head_sha
+    )
+
+
+def _committed_pr_binding(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+):
+    """The committed transaction-era binding the PR loop reads, or ``None`` (#827).
+
+    ``None`` for a legacy-era PR and for a dry run, whose consumers keep the
+    version-1 readers.  Read-only.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run:
+        return None
+    return publication.committed_pr_binding(runner, config, pr_number)
+
+
+def _legacy_upgrade_applies(
+    config: AgentLoopConfig,
+    *,
+    closing_contract: PrExpectedClosingContract,
+    managed_resume,
+    managed_ci,
+    ordinary_recovery_selected: bool,
+) -> bool:
+    """Whether the PR loop upgrades a legacy PR through the seam (#827, site f).
+
+    Unmanaged direct-issue, direct-PR, and managed-source PRs are upgraded by an
+    ``initial`` transaction.  Approved-plan PRs (which need the approved
+    candidate key) and PRs carrying a managed authorization or selection keep
+    the version-1 writes until the managed lifecycle is on the seam.
+    """
+    from . import workflow_transaction_publication as publication
+
+    return (
+        not config.dry_run
+        and closing_contract.origin_flow in publication.LEGACY_UPGRADE_FLOWS
+        and managed_resume is None
+        and managed_ci is None
+        and not ordinary_recovery_selected
+    )
+
+
+def _issue_handoff_for_pr_loop(
+    transaction_binding,
+    issue_context: IssueContext,
+    *,
+    config: AgentLoopConfig,
+) -> IssuePrHandoffMetadata | None:
+    """The issue handoff the PR loop checks: the committed version-2 handoff viewed
+    as version 1 on a transaction-era PR, else today's version-1 reader."""
+    if transaction_binding is None:
+        return find_latest_issue_pr_handoff(
+            issue_context.comments,
+            issue_number=issue_context.number,
+            repo=config.repo,
+        )
+    if issue_context.number != transaction_binding.contract.primary_issue_number:
+        return None
+    return transaction_binding.handoff
+
+
+def _entry_transaction_precheck(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str | None,
+) -> None:
+    """Entry check (#827) that runs before any version-1 PR reader.
+
+    A pending prepared record left by an interrupted publication is finished
+    (or superseded) through the seam from its stored intent.  A transaction-era
+    PR whose lineage is still partial afterwards (no committed transaction, or
+    a finishing write that failed) stops the PR command here with the
+    transaction diagnostic, before any round or selection.  Writes nothing
+    when nothing is pending.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run or not head_sha:
+        return
+    resolved = publication.read_pr_transaction_views(runner, config, pr_number, None)
+    if resolved.era != publication.ERA_TRANSACTION:
+        return
+    lineage = resolved.lineage
+    if lineage.pending is not None:
+        # Entry is a writer path: finish (or supersede) the interrupted
+        # publication from its stored intent.  A write that still fails keeps
+        # the transaction prepared-only and stops the command here.
+        validate_open_pr(runner, config=config, pr_number=pr_number)
+        publication.finish_pending_transaction(
+            runner, config, pr_number=pr_number, head_sha=head_sha
+        )
+    if lineage.latest_committed is None or lineage.pending is not None:
+        publication.require_live_head_authority(
+            runner, config, pr_number=pr_number, head_sha=head_sha
+        )
+
+
+def _managed_coder_head_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    handoff,
+    predecessor_head: str,
+    new_head: str,
+    round_comment_ids: tuple[int, ...],
+    retained: dict[str, object] | None = None,
+    raise_recoverable: bool = False,
+):
+    """Head-advance point 4 on a granted managed PR (#827).
+
+    Replaces the version-1 continuity publication: the coder head's
+    ``head-advance`` successor reissues a bound ``continuity`` record that
+    extends the committed effective grant and names the correlated dispatched
+    round metadata, under today's actor-owned active label event.  Returns the
+    handoff to continue with, or ``None`` on a legacy-era PR or a null
+    committed generation, where today's publication runs unchanged.  A
+    recoverable failure writes nothing more and does not raise: the round has
+    no live-head managed authority until a rerun commits the successor.
+
+    ``retained`` keeps that correlation (predecessor head, new head, dispatched
+    round comment IDs, handoff) after a recoverable failure, so the next
+    round's head binding (point 2) retries exactly this continuity; it is
+    cleared once the successor commits.  ``raise_recoverable`` re-raises the
+    recoverable error for that retry, which maps it to no live-head authority.
+    """
+    import secrets
+
+    from . import managed_ci as managed_ci_module
+    from . import managed_ci_bound_authorization as bound
+    from . import workflow_transaction_publication as publication
+    from .workflow_transaction import ENTRY_AUTHORIZATION
+
+    if config.dry_run or handoff.override_nonce is None:
+        return None
+    event = managed_ci_module._active_managed_label_event(
+        runner, config=config, pr_number=pr_number
+    )
+    owned = (
+        event is not None
+        and event[1].casefold() == handoff.trusted_actor_login.casefold()
+        and event[2] == handoff.trusted_actor_id
+    )
+    built: list[object] = []
+
+    def build(effective):
+        if not owned:
+            return None
+        payload = bound.build_continuity_payload(
+            effective.record,
+            effective_comment_id=effective.comment_id,
+            predecessor_head=predecessor_head,
+            new_head=new_head,
+            round_comment_ids=round_comment_ids,
+            label_event_id=event[0],
+            nonce=secrets.token_urlsafe(24),
+        )
+        built.append(payload)
+        return payload
+
+    try:
+        committed = publication.ensure_managed_continuity_transaction(
+            runner, config, pr_number=pr_number, head_sha=new_head, build=build
+        )
+    except WorkflowTransactionError as exc:
+        if not publication.is_recoverable(exc):
+            raise
+        if retained is not None:
+            retained.clear()
+            retained.update(
+                pr_number=pr_number,
+                predecessor_head=predecessor_head,
+                new_head=new_head,
+                round_comment_ids=tuple(round_comment_ids),
+                handoff=handoff,
+            )
+        if raise_recoverable:
+            raise
+        log(
+            config,
+            f"PR #{pr_number}: managed head {new_head} has no committed continuity yet; "
+            f"the next round retries it and nothing grants it until then. {exc}",
+        )
+        return handoff
+    if retained is not None:
+        retained.clear()
+    if committed is None:
+        return None
+    resolved = publication.read_pr_transaction_views(runner, config, pr_number, None)
+    effective = bound.builder_authorization_view(
+        resolved.views.pr_view, resolved.lineage
+    ).effective
+    if effective is None or effective.record.head_sha != new_head:
+        return handoff
+    return dataclasses_replace(
+        handoff,
+        head_sha=new_head,
+        active_label_event_id=effective.record.label_event_id,
+        authorization_kind=effective.record.kind,
+        authorization_comment_id=committed.entry_comment_id(ENTRY_AUTHORIZATION),
+        override_nonce=effective.record.nonce,
+        transaction_bound=True,
+    )
+
+
+def _dispatched_coder_head_transaction(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str | None,
+) -> None:
+    """Head-advance point 4 (#827): a head produced by a dispatched coder turn.
+
+    Commits its ``head-advance`` successor.  A recoverable failure does not
+    raise: the next round's head binding (point 2) retries it and meanwhile
+    reuses nothing.  An integrity failure stops the loop.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run or not head_sha:
+        return
+    try:
+        publication.ensure_live_head_transaction(
+            runner, config, pr_number=pr_number, head_sha=head_sha
+        )
+    except WorkflowTransactionError as exc:
+        if not publication.is_recoverable(exc):
+            raise
+        log(
+            config,
+            f"PR #{pr_number}: head {head_sha} successor not committed yet; the next "
+            f"round retries it. {exc}",
+        )
+
+
+def _round_live_head_authority(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str | None,
+    retained_continuity: dict[str, object] | None = None,
+) -> RoundAuthority:
+    """Resolve the per-round head binding (#827, point 2).
+
+    First commits the ``head-advance`` successor when the committed head
+    differs from the live head (the only write), then gates.  A legacy-era PR
+    yields ``LegacyEra`` and keeps today's reuse rules.  A transaction-era PR
+    yields its committed transaction for the live head, or
+    ``NoLiveHeadAuthority`` for a recoverable gap (a failed successor write, a
+    pending prepared record, or an unavailable managed input), under which the
+    round runs with fresh reviewers and
+    reuses nothing.  Integrity failures raise and stop the round.
+
+    A dry run has no authenticated actor, never qualifies, and never merges,
+    so it previews under today's rules.
+
+    A managed coder head whose continuity failed at point 4 is retried here
+    with its retained correlation, and only for exactly that head; the
+    committed handoff it yields is left in ``retained_continuity`` under
+    ``bound_handoff`` for the loop.  No other managed input is built here.
+    """
+    from . import workflow_transaction_publication as publication
+
+    if config.dry_run:
+        return LegacyEra()
+
+    live_head = str(head_sha or "")
+
+    def ensure() -> None:
+        retained = retained_continuity
+        if (
+            retained
+            and retained.get("pr_number") == pr_number
+            and retained.get("new_head") == live_head
+        ):
+            handoff = retained["handoff"]
+            bound_handoff = _managed_coder_head_transaction(
+                runner,
+                config,
+                pr_number=pr_number,
+                handoff=handoff,
+                predecessor_head=str(retained["predecessor_head"]),
+                new_head=live_head,
+                round_comment_ids=tuple(retained["round_comment_ids"]),
+                retained=retained,
+                raise_recoverable=True,
+            )
+            if bound_handoff is not None:
+                retained["bound_handoff"] = bound_handoff
+        elif retained:
+            # A different live head: the retained correlation no longer applies.
+            retained.clear()
+        publication.ensure_live_head_transaction(
+            runner, config, pr_number=pr_number, head_sha=live_head
+        )
+
+    def gate() -> object:
+        return publication.require_live_head_authority(
+            runner, config, pr_number=pr_number, head_sha=live_head
+        )
+
+    return resolve_round_authority(ensure, gate)
+
+
 def _managed_binding_retired_plan_hashes(
     handoff: AuthenticatedIssueCreatedHandoff | None,
 ) -> frozenset[str]:
@@ -16183,6 +17542,19 @@ def _fresh_pr_qualification_snapshot(
         else None
     )
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    # A transaction-era PR qualifies only a head its committed workflow
+    # transaction binds; a legacy-era PR returns None and is unchanged (#827).
+    # Point 3 (#827): ensure the head successor first (the only case in which
+    # the snapshot writes), re-read, then gate the live head.
+    from . import workflow_transaction_publication as publication
+
+    if publication.ensure_live_head_transaction(
+        runner, config, pr_number=pr_number, head_sha=context.metadata.head_sha
+    ):
+        context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    publication.require_live_head_authority(
+        runner, config, pr_number=pr_number, head_sha=context.metadata.head_sha
+    )
     approved_identity = _latest_pr_approval_architecture_identity(
         context.comments, head_sha=context.metadata.head_sha
     )
@@ -16391,6 +17763,8 @@ def _fresh_pr_qualification_snapshot(
                     parent_issue=planning_child_binding.parent_issue,
                     stage_id=planning_child_binding.stage_id,
                     pr_number=pr_number,
+                    runner=runner,
+                    config=config,
                 )
                 if (
                     verified_replacement is None
@@ -16537,6 +17911,36 @@ def _recover_managed_ci_approved_plan(
     if parent_candidate.is_available:
         return parent_candidate
     return candidate
+
+
+def _bind_managed_release_hook(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    contract: ManagedCiContract | None,
+) -> None:
+    """Commit a released workflow transaction before a dispatch-time label release.
+
+    Only an issue-created managed PR whose handoff proof came from a committed
+    transaction-bound authorization can carry a granted generation.  A
+    legacy-era or null-generation PR gets no hook at all, so its release
+    performs no transaction read and stays exactly as today (#827).
+    """
+    resume = contract.authenticated_resume if contract is not None else None
+    handoff = resume.issue_created_handoff if resume is not None else None
+    if (
+        contract is None
+        or contract.origin != "issue-created"
+        or handoff is None
+        or not handoff.transaction_bound
+    ):
+        return
+    from .workflow_transaction_publication import managed_release_hook
+
+    contract.before_label_release = managed_release_hook(
+        runner, config, pr_number=pr_number, issue_number=handoff.issue_number
+    )
 
 
 def run_pr_loop(
@@ -16934,10 +18338,26 @@ def run_pr_loop(
                     managed_branch=managed_branch,
                     override_nonce=override_nonce,
                 )
-        recorded_pr_contract = find_latest_pr_contract(
-            initial_pr_context.comments,
-            repository=config.repo,
-            pr_number=pr_number,
+        # The authenticated transaction reads below run in the agent workdir,
+        # so the workdirs must exist (and be validated) first.
+        if not workdirs_ready:
+            ensure_agent_workdirs(config, runner)
+            workdirs_ready = True
+        _entry_transaction_precheck(
+            runner, config, pr_number=pr_number,
+            head_sha=initial_pr_context.metadata.head_sha,
+        )
+        # A committed transaction-era PR is read through the seam: the
+        # version-1 readers reject version-2 records (#827).
+        transaction_binding = _committed_pr_binding(runner, config, pr_number=pr_number)
+        recorded_pr_contract = (
+            transaction_binding.contract
+            if transaction_binding is not None
+            else find_latest_pr_contract(
+                initial_pr_context.comments,
+                repository=config.repo,
+                pr_number=pr_number,
+            )
         )
         # A caller-provided issue snapshot may predate plan approval. Refresh
         # it before deriving requirements or handoff provenance.  The managed-CI
@@ -17132,10 +18552,8 @@ def run_pr_loop(
         )
         issue_handoff_to_update = None
         if issue_context is not None and recorded_pr_contract is not None:
-            issue_handoff_to_update = find_latest_issue_pr_handoff(
-                issue_context.comments,
-                issue_number=issue_context.number,
-                repo=config.repo,
+            issue_handoff_to_update = _issue_handoff_for_pr_loop(
+                transaction_binding, issue_context, config=config
             )
             if (
                 contract_needs_persisting
@@ -17201,10 +18619,8 @@ def run_pr_loop(
                         runner, config=config, issue_number=staged_parent_number
                     )
                     parent_issue_context_refreshed = True
-            issue_handoff = find_latest_issue_pr_handoff(
-                issue_context.comments,
-                issue_number=issue_context.number,
-                repo=config.repo,
+            issue_handoff = _issue_handoff_for_pr_loop(
+                transaction_binding, issue_context, config=config
             )
             # These values are populated only for a validated decomposition
             # phase marker.  Keep ordinary approved-plan resumes on the normal
@@ -17531,6 +18947,7 @@ def run_pr_loop(
                                         binding=planning_child_binding,
                                         child_plan_context=child_plan_context,
                                         pr_number=pr_number,
+                                        runner=runner,
                                     )
                                     approved_plan_context = child_plan_context
                                 if phase_handoff is None:
@@ -17573,6 +18990,7 @@ def run_pr_loop(
                                         binding=planning_child_binding,
                                         child_plan_context=child_plan_context,
                                         pr_number=pr_number,
+                                        runner=runner,
                                     )
                                     # The child has its own approved plan, so
                                     # its matrix owners are authoritative for
@@ -17689,10 +19107,8 @@ def run_pr_loop(
             and issue_context is not None
             and issue_handoff_to_update is None
         ):
-            issue_handoff_to_update = find_latest_issue_pr_handoff(
-                issue_context.comments,
-                issue_number=issue_context.number,
-                repo=config.repo,
+            issue_handoff_to_update = _issue_handoff_for_pr_loop(
+                transaction_binding, issue_context, config=config
             )
             if (
                 issue_handoff_to_update is not None
@@ -17767,6 +19183,9 @@ def run_pr_loop(
                 return 0
         else:
             managed_ci = activation
+            _bind_managed_release_hook(
+                runner, config=config, pr_number=pr_number, contract=managed_ci
+            )
         log(config, f"Validating PR #{pr_number}")
         validate_open_pr(runner, config=config, pr_number=pr_number)
         if closing_contract is not None:
@@ -17778,6 +19197,55 @@ def run_pr_loop(
                 body=initial_pr_context.metadata.body,
                 reject_unexpected=config.managed_ci and issue_context is not None,
             )
+            if contract_needs_persisting and transaction_binding is not None:
+                # Transaction era: no version-1 record is ever appended; a
+                # widened closing contract is a `closing-widening` successor.
+                if tuple(closing_contract.expected_closing_issue_ids) != tuple(
+                    transaction_binding.contract.expected_closing_issue_ids
+                ):
+                    from . import workflow_transaction_publication as publication
+
+                    publication.publish_closing_widening(
+                        runner,
+                        config,
+                        pr_number=pr_number,
+                        head_sha=str(initial_pr_context.metadata.head_sha or ""),
+                        expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
+                    )
+                contract_needs_persisting = False
+            if contract_needs_persisting and _legacy_upgrade_applies(
+                config,
+                closing_contract=closing_contract,
+                managed_resume=authenticated_managed_resume,
+                managed_ci=managed_ci,
+                ordinary_recovery_selected=ordinary_recovery_selected,
+            ):
+                # Legacy era that needs a write: one `initial` transaction
+                # restates or widens the version-1 records instead of
+                # appending more of them.
+                upgrade_issue = closing_contract.primary_issue_number
+                if (
+                    upgrade_issue is not None
+                    and issue_context is not None
+                    and issue_context.number != upgrade_issue
+                ):
+                    raise AgentLoopError(
+                        "The linked issue context does not match the issue-origin PR contract; "
+                        "resume with the authoritative issue or PR metadata."
+                    )
+                from . import workflow_transaction_publication as publication
+
+                publication.publish_legacy_upgrade(
+                    runner,
+                    config,
+                    pr_number=pr_number,
+                    base=str(initial_pr_context.metadata.base_branch or ""),
+                    head_sha=str(initial_pr_context.metadata.head_sha or ""),
+                    origin_flow=closing_contract.origin_flow,
+                    primary_issue=upgrade_issue,
+                    expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
+                )
+                contract_needs_persisting = False
             if contract_needs_persisting:
                 post_trusted_pr_comment(
                     runner,
@@ -17814,6 +19282,10 @@ def run_pr_loop(
                     expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
                     supersedes_hash=closing_contract.supersedes_hash,
                 )
+        _entry_head_transaction(
+            runner, config, pr_number=pr_number,
+            head_sha=initial_pr_context.metadata.head_sha,
+        )
         def managed_ci_active(metadata: PullRequestMetadata) -> bool:
             """Drop adopted filtering immediately when its live handshake changes."""
             nonlocal managed_ci
@@ -18126,6 +19598,9 @@ def run_pr_loop(
         # range large enough to reach both; ``allowed_rounds`` remains the
         # authoritative guard and prevents either slot from being used unless
         # its corresponding watcher transition grants it.
+        # A managed coder head whose continuity did not commit keeps its
+        # correlation here, so the next round's head binding retries it (#827).
+        retained_continuity: dict[str, object] = {}
         for round_number in range(start_round_number, config.max_rounds + 3):
             if round_number > allowed_rounds:
                 raise AgentLoopError(
@@ -18271,6 +19746,36 @@ def run_pr_loop(
                 parent_issue_context=parent_issue_context,
             )
             human_requirements = requirements_context.effective_requirements
+            # Per-round head binding (#827, point 2): a transaction-era PR may
+            # reuse a qualification checkpoint, an interrupted round's reviews,
+            # or unchanged-head approvals only when a committed transaction
+            # binds the live head.  A recoverable gap keeps the round running
+            # with fresh reviewers; an integrity failure stops it.
+            round_authority = _round_live_head_authority(
+                runner, config, pr_number=pr_number, head_sha=pr_metadata.head_sha,
+                retained_continuity=retained_continuity,
+            )
+            retried_handoff = retained_continuity.pop("bound_handoff", None)
+            if retried_handoff is not None:
+                managed_ci_handoff = retried_handoff
+                authenticated_managed_resume = AuthenticatedManagedResume(
+                    origin="issue-created",
+                    lifecycle=managed_ci_handoff.lifecycle,
+                    issue_created_handoff=managed_ci_handoff,
+                    override_nonce=managed_ci_handoff.override_nonce,
+                )
+            round_reuse_allowed = not isinstance(round_authority, NoLiveHeadAuthority)
+            if not round_reuse_allowed:
+                log(
+                    config,
+                    f"Round {round_number}: PR #{pr_number} head {pr_metadata.head_sha} has no "
+                    "committed workflow transaction; reviewing without checkpoint or approval "
+                    f"reuse. {round_authority.diagnostic}",
+                )
+                if qualification_checkpoint is not None and qualification_checkpoint.valid:
+                    qualification_checkpoint = QualificationCheckpoint.invalid(
+                        "live head has no committed workflow transaction"
+                    )
             if qualification_checkpoint is not None and qualification_checkpoint.valid:
                 checkpoint_plan = (
                     approved_plan_context.plan_hash
@@ -18380,7 +19885,11 @@ def run_pr_loop(
             approved_review_outputs: list[tuple[str, str]] = []
             completed_by_name = {
                 record.metadata.agent: record
-                for record in (current_resume.completed_reviews if current_resume is not None else ())
+                for record in (
+                    current_resume.completed_reviews
+                    if current_resume is not None and round_reuse_allowed
+                    else ()
+                )
             }
             resumed_by_name = {
                 name: record
@@ -18482,16 +19991,20 @@ def run_pr_loop(
                     )
                 )
             }
-            unchanged_head_approvals = _latest_pr_approved_reviews_for_head(
-                pr_comments,
-                head_sha=pr_metadata.head_sha,
-                configured_reviewers=configured_reviewers,
-                approved_plan_context=approved_plan_context,
-                human_requirements=human_requirements,
-                require_architecture_contract=config.architecture_context_enabled,
-                reviewer_acquisition_contract=(
-                    reviewer_acquisition_contract if selective_policy else None
-                ),
+            unchanged_head_approvals = (
+                _latest_pr_approved_reviews_for_head(
+                    pr_comments,
+                    head_sha=pr_metadata.head_sha,
+                    configured_reviewers=configured_reviewers,
+                    approved_plan_context=approved_plan_context,
+                    human_requirements=human_requirements,
+                    require_architecture_contract=config.architecture_context_enabled,
+                    reviewer_acquisition_contract=(
+                        reviewer_acquisition_contract if selective_policy else None
+                    ),
+                )
+                if round_reuse_allowed
+                else {}
             )
             if panel_evidence is not None:
                 # Causal approval eligibility: a secondary approval counts only
@@ -22032,13 +23545,27 @@ def run_pr_loop(
                             managed_ci_handoff.authorization_comment_id or 0
                         ),
                     )
-                    managed_ci_handoff = publish_issue_created_continuity_authorization(
+                    bound_handoff = _managed_coder_head_transaction(
                         runner,
-                        config=config,
+                        config,
+                        pr_number=pr_number,
                         handoff=managed_ci_handoff,
                         predecessor_head=predecessor_head,
                         new_head=new_head,
                         round_comment_ids=round_comment_ids,
+                        retained=retained_continuity,
+                    )
+                    managed_ci_handoff = (
+                        bound_handoff
+                        if bound_handoff is not None
+                        else publish_issue_created_continuity_authorization(
+                            runner,
+                            config=config,
+                            handoff=managed_ci_handoff,
+                            predecessor_head=predecessor_head,
+                            new_head=new_head,
+                            round_comment_ids=round_comment_ids,
+                        )
                     )
                     authenticated_managed_resume = AuthenticatedManagedResume(
                         origin="issue-created",
@@ -22069,6 +23596,10 @@ def run_pr_loop(
                     "review of the same diff cannot change the verdict. Stopping before round "
                     f"{round_number + 1}; human review required.{route}"
                 )
+            _dispatched_coder_head_transaction(
+                runner, config, pr_number=pr_number,
+                head_sha=updated_pr_context.metadata.head_sha,
+            )
             log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")
             pre_review_test_pending = True
             if external_recovery_full_board:

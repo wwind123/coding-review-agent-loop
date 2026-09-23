@@ -59,6 +59,7 @@ MARKERS = (
         f"<!-- AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1: {_b64({'actor': 'agent-loop', 'actor_id': 1, 'base': 'main', 'head': 'abc', 'issue': 1, 'kind': 'creation', 'label_event_id': 1, 'nonce': 'n', 'pr': 1, 'protection': 'voluntary', 'repository': 'OWNER/REPO', 'version': 1, 'waiver': 'allow-unprotected-managed-ci'})} -->",
         PR_COMMENT_SURFACE,
     ),
+    ("AGENT_MANAGED_CI_BOUND_AUTHORIZATION_V2", f"<!-- AGENT_MANAGED_CI_BOUND_AUTHORIZATION_V2: {_b64({'kind': 'ordinary-release', 'version': 2})} -->", PR_COMMENT_SURFACE),
     ("AGENT_WORKFLOW_TRANSACTION", f"<!-- AGENT_WORKFLOW_TRANSACTION: {_b64({'phase': 'prepared', 'schema_version': 1})} -->", PR_COMMENT_SURFACE),
     ("AGENT_MANAGED_PR_SOURCE_V1", f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {_b64({'source_branch': 'fix', 'source_sha': 'a'})} -->", PR_BODY_SURFACE),
     ("AGENT_SPLIT_CHILD", "<!-- AGENT_SPLIT_CHILD: parent=1 key=" + "a" * 64 + " -->", ISSUE_BODY_SURFACE),
@@ -212,7 +213,7 @@ def test_ordinary_issue_comment_writer_enforces_issue_comment_surface():
 
 def test_source_inventory_has_no_unregistered_protocol_literals():
     assert_source_inventory(Path(__file__).parents[1])
-    assert len(RESERVED_MARKER_REGISTRY) == 31
+    assert len(RESERVED_MARKER_REGISTRY) == 32
 
 
 def test_issue_provenance_trailer_is_not_a_reserved_marker_or_forged_body_record():
@@ -490,7 +491,20 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
     }
     offenders: list[str] = []
     for path in sorted(source_root.rglob("*.py")):
-        if path.name == "workflow_transaction.py":
+        # Stage B adds the publication seam as the second sanctioned importer.
+        # The bound managed-CI authorization rule judges a record against its
+        # transaction, so it is the third.  ``managed_ci`` is the fourth: its single
+        # authorization accessor classifies the era with the stage A body rule and
+        # imports nothing that interprets or produces a version-2 record.
+        # ``issue_pr_handoff`` is the fifth: its canonical-PR authentication hands an
+        # issue whose handoff is version 2 to discovery and the committed gate.
+        if path.name in {
+            "workflow_transaction.py",
+            "workflow_transaction_publication.py",
+            "managed_ci_bound_authorization.py",
+            "managed_ci.py",
+            "issue_pr_handoff.py",
+        }:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -498,8 +512,20 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
                 module_name = node.module or ""
                 imported = {alias.name for alias in node.names}
                 if module_name.endswith("workflow_transaction") or "workflow_transaction" in imported:
-                    offenders.append(f"{path.name} imports workflow_transaction")
-                for name in sorted(imported & v2_names):
+                    # The orchestrator names the authorization entry and the staged
+                    # identity it hands to the seam; it interprets no record.
+                    if not (
+                        path.name == "orchestrator.py"
+                        and module_name.endswith("workflow_transaction")
+                        and imported <= {"ENTRY_AUTHORIZATION", "StagedIdentity"}
+                    ):
+                        offenders.append(f"{path.name} imports workflow_transaction")
+                allowed = (
+                    # The PR loop's head-advance points classify the seam's
+                    # error; they read and write only through the seam.
+                    {"WorkflowTransactionError"} if path.name == "orchestrator.py" else set()
+                )
+                for name in sorted((imported & v2_names) - allowed):
                     offenders.append(f"{path.name} imports {name}")
             elif isinstance(node, ast.Import):
                 for alias in node.names:

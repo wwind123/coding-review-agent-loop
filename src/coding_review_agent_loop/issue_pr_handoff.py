@@ -17,11 +17,11 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlparse
 
 from .config import AgentLoopConfig
-from .errors import AgentLoopError
+from .errors import AgentLoopError, WorkflowTransactionError
 from .expected_closure import contract_hash, normalize_issue_ids
 from .issue_pr_provenance import IssuePrProvenanceScope
 from .github import (
@@ -37,6 +37,9 @@ from .github import (
 from .pr_contract import PrExpectedClosingContract, find_latest_pr_contract
 from .runner import Runner
 from .protocol_markers import TrustedBody
+
+if TYPE_CHECKING:
+    from .workflow_transaction_publication import CanonicalHandoffView
 
 SCHEMA_VERSION = 1
 _VALID_FLOWS = {"issue-implementation", "approved-plan-implementation"}
@@ -95,14 +98,22 @@ class IssuePrHandoffMetadata:
 class ResolvedIssuePr:
     pr_number: int
     source: Literal["canonical", "legacy-closing-reference"]
-    evidence: IssuePrHandoffMetadata | OpenPrClosingMatch
+    evidence: "IssuePrHandoffMetadata | CanonicalHandoffView | OpenPrClosingMatch"
 
     @property
-    def metadata(self) -> IssuePrHandoffMetadata | None:
-        return self.evidence if isinstance(self.evidence, IssuePrHandoffMetadata) else None
+    def metadata(self) -> "IssuePrHandoffMetadata | CanonicalHandoffView | None":
+        """The canonical handoff binding: the fields both record versions share."""
+        return self.evidence if self.source == "canonical" else None
 
     @property
     def evidence_summary(self) -> str:
+        if self.source == "canonical" and not isinstance(self.evidence, IssuePrHandoffMetadata):
+            view = self.evidence
+            return (
+                "committed workflow transaction "
+                f"(flow={view.flow}, plan_hash={view.plan_hash or 'none'}, "
+                f"pr_url={view.pr_url}, transaction={view.transaction_id})"
+            )
         if self.metadata is not None:
             return (
                 "canonical marker "
@@ -417,7 +428,9 @@ class AuthenticatedCanonicalPr:
     same checks resume uses.
     """
 
-    record: IssuePrHandoffMetadata
+    # A version-1 record for a legacy-era PR; for a transaction-era PR the
+    # ``CanonicalHandoffView`` of the committed workflow transaction (#827).
+    record: "IssuePrHandoffMetadata | CanonicalHandoffView"
     state: str
 
     @property
@@ -427,6 +440,84 @@ class AuthenticatedCanonicalPr:
     @property
     def pr_url(self) -> str:
         return self.record.pr_url
+
+
+def _names_version_2_handoff(comments: Sequence[object]) -> bool:
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(body):
+            try:
+                if issue_pr_handoff_payload_schema_version(match.group("payload")) == 2:
+                    return True
+            except AgentLoopError:
+                continue
+    return False
+
+
+def _authenticate_transaction_era_issue_pr(
+    runner: Runner, *, config: AgentLoopConfig, issue_number: int
+) -> "AuthenticatedCanonicalPr | None":
+    """Authority form for an issue whose handoff is version 2 (#827).
+
+    Candidate-PR discovery and the committed-transaction gate replace the
+    version-1 cross-surface checks; both are read-only and fail closed on a
+    partial, pending, or contradictory transaction.  Returns ``None`` when the
+    authenticated actor's records are all version 1.
+    """
+    # Imported here: the publication module imports this one at module level.
+    from .managed_ci_bound_authorization import BoundAuthorizationCodec
+    from .workflow_transaction import ERA_TRANSACTION
+    from .workflow_transaction_publication import (
+        discover_canonical_issue_pr,
+        gate_canonical_issue_pr,
+    )
+
+    discovered = discover_canonical_issue_pr(runner, config, issue_number)
+    if discovered is None or discovered.era != ERA_TRANSACTION:
+        return None
+    view = discovered.handoff
+    try:
+        actual = get_pr_review_context(
+            runner, config=config, pr_number=discovered.pr_number
+        ).metadata
+        if actual.number != discovered.pr_number:
+            raise AgentLoopError(
+                f"GitHub returned PR #{actual.number} for canonical PR "
+                f"#{discovered.pr_number}."
+            )
+        if not actual.url:
+            raise AgentLoopError("GitHub returned no PR URL.")
+        _validate_issue_pr_handoff_url(
+            actual.url, repo=config.repo, pr_number=discovered.pr_number
+        )
+        if actual.url.casefold() != view.pr_url.casefold():
+            raise AgentLoopError(
+                f"recorded URL {view.pr_url!r} does not match GitHub URL {actual.url!r}"
+            )
+        if not actual.head_sha:
+            raise AgentLoopError("GitHub returned no PR head SHA.")
+        state = get_pr_state(runner, config=config, pr_number=discovered.pr_number)
+    except WorkflowTransactionError:
+        raise
+    except AgentLoopError as exc:
+        raise AgentLoopError(
+            f"Canonical handoff record for issue #{issue_number} references PR "
+            f"#{discovered.pr_number}, but its state could not be determined in {config.repo} "
+            f"({exc}). Verify the PR exists and rerun `agent-loop pr {discovered.pr_number}` "
+            "directly to continue, or close/select the correct duplicate."
+        ) from exc
+    gate_canonical_issue_pr(
+        runner,
+        config,
+        discovered,
+        issue_number=issue_number,
+        live_head=actual.head_sha,
+        pr_state=state,
+        authorization_codec=BoundAuthorizationCodec(),
+    )
+    return AuthenticatedCanonicalPr(record=view, state=state)
 
 
 def authenticate_canonical_issue_pr(
@@ -444,6 +535,16 @@ def authenticate_canonical_issue_pr(
     live PR state is returned; any mismatch raises, so an unauthenticatable
     record can never be read as evidence.
     """
+    # ``get_issue_context`` merges every REST handoff record into the snapshot,
+    # so a capped comment projection cannot hide a version-2 handoff here.
+    if _names_version_2_handoff(issue_context.comments):
+        transaction_era = _authenticate_transaction_era_issue_pr(
+            runner, config=config, issue_number=issue_number
+        )
+        if transaction_era is not None:
+            return transaction_era
+        # Only foreign-authored version-2 records exist: the version-1 path
+        # below still rejects them, exactly as before.
     lineage = resolve_issue_pr_handoff_lineage(
         issue_context.comments, issue_number=issue_number, repo=config.repo
     )

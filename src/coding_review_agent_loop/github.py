@@ -1918,11 +1918,15 @@ def _merge_issue_comment_transport_identity(
     # projection and are not duplicated into prompt context.  Round anchors
     # and sidecars are needed together: a canonical plan may use sidecars, and
     # the authenticated canonical anchor is what semantically supersedes a
-    # diagnostic during later recovery.
+    # diagnostic during later recovery.  Issue-to-PR handoff records are added
+    # too: canonical-PR authentication decides between the version-1 path and
+    # transaction-era discovery from this snapshot, so a capped projection must
+    # never hide a handoff (#827).
     transport_marker_names = (
         "AGENT_PLAN_VALIDATION_DIAGNOSTIC",
         "AGENT_LOOP_META",
         "AGENT_LOOP_SIDECAR",
+        "AGENT_ISSUE_PR_HANDOFF",
     )
     for transport in transport_comments:
         if (

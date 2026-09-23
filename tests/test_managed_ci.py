@@ -357,7 +357,13 @@ class V2ManagedRunner(ManagedRunner):
             return CommandResult(cmd, cwd_path, json.dumps({"sha": "base-sha"}), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
             cmd, cwd_path = self._record_command(args, cwd)
-            return CommandResult(cmd, cwd_path, json.dumps(self.intent_comments), "", 0)
+            # GitHub always stamps a comment; fixtures often omit it.
+            stamped = [
+                {**item, "created_at": item.get("created_at") or "2026-05-23T00:00:00Z"}
+                if isinstance(item, dict) else item
+                for item in self.intent_comments
+            ]
+            return CommandResult(cmd, cwd_path, json.dumps(stamped), "", 0)
         if endpoint == "repos/OWNER/REPO/issues/7/comments" and "POST" in cmd:
             cmd, cwd_path = self._record_command(args, cwd)
             body = self._form_value(cmd, "body")
@@ -6828,6 +6834,332 @@ def test_unverified_resume_audit_falls_back_to_ordinary_recovery(tmp_path):
     assert not any(
         command[:4] == ["gh", "pr", "merge", "7"] for command, _cwd in runner.commands
     )
+
+
+# ---------------------------------------------------------------------------
+# Single managed-CI authorization accessor (#827 / #946)
+# ---------------------------------------------------------------------------
+
+_ACCESSOR_ACTOR = ("agent-loop", 4242)
+
+
+def _accessor_record(**overrides) -> ManagedCiIssueAuthorization:
+    fields = dict(
+        kind="creation", repository="OWNER/REPO", issue_number=7, pr_number=11,
+        base_ref="main", head_sha="a" * 40, actor_login=_ACCESSOR_ACTOR[0],
+        actor_id=_ACCESSOR_ACTOR[1], protection="voluntary",
+        waiver="allow-unprotected-managed-ci", nonce="nonce-1", label_event_id=9001,
+    )
+    fields.update(overrides)
+    return ManagedCiIssueAuthorization(**fields)
+
+
+def _accessor_comment(comment_id, body, *, author=_ACCESSOR_ACTOR):
+    return {"id": comment_id, "body": str(body), "user": {"login": author[0], "id": author[1]}}
+
+
+def _accessor_scan(tmp_path, comments, **kwargs):
+    return managed_ci.read_managed_ci_authorizations(
+        FakeRunner(), config=make_config(tmp_path), pr_number=11,
+        actor_login=_ACCESSOR_ACTOR[0], actor_id=_ACCESSOR_ACTOR[1],
+        comments=comments, **kwargs,
+    )
+
+
+def _transaction_era_comment(comment_id, *, author=_ACCESSOR_ACTOR):
+    from workflow_transaction_helpers import direct_intent, prepared_comment
+
+    prepared = prepared_comment(comment_id, direct_intent())
+    return _accessor_comment(comment_id, prepared.body, author=author)
+
+
+def test_accessor_legacy_era_returns_actor_records_in_comment_order(tmp_path):
+    record = _accessor_record()
+    later = _accessor_record(kind="fresh", nonce="nonce-2")
+    scan = _accessor_scan(tmp_path, [
+        _accessor_comment(1, "ordinary comment"),
+        _accessor_comment(2, format_issue_created_authorization_comment(record)),
+        _accessor_comment(3, format_issue_created_authorization_comment(later)),
+    ])
+    assert scan.era == "legacy"
+    assert scan.records == ((2, record), (3, later))
+    assert scan.claimed == frozenset({1, 2})
+    assert scan.rejected is False
+
+
+def test_accessor_strict_read_raises_and_lenient_read_rejects_a_foreign_record(tmp_path):
+    forged = _accessor_comment(
+        2, format_issue_created_authorization_comment(_accessor_record()), author=("mallory", 666)
+    )
+    with pytest.raises(AgentLoopError, match="not authored by the authenticated actor"):
+        _accessor_scan(tmp_path, [forged])
+    scan = _accessor_scan(tmp_path, [forged], lenient=True)
+    assert scan.records == ()
+    assert scan.rejected is True
+
+
+def test_accessor_returns_no_unbound_record_on_a_transaction_era_pr(tmp_path):
+    unbound = _accessor_comment(2, format_issue_created_authorization_comment(_accessor_record()))
+    scan = _accessor_scan(tmp_path, [unbound, _transaction_era_comment(3)])
+    assert scan.era == "transaction"
+    assert scan.records == ()
+
+
+def test_accessor_ignores_a_forged_transaction_record_for_era_classification(tmp_path):
+    record = _accessor_record()
+    unbound = _accessor_comment(2, format_issue_created_authorization_comment(record))
+    scan = _accessor_scan(
+        tmp_path, [unbound, _transaction_era_comment(3, author=("mallory", 666))]
+    )
+    assert scan.era == "legacy"
+    assert scan.records == ((2, record),)
+
+
+def test_v1_publisher_refuses_to_extend_a_transaction_era_pr(tmp_path, monkeypatch):
+    unbound = _accessor_comment(2, format_issue_created_authorization_comment(_accessor_record()))
+    monkeypatch.setattr(
+        managed_ci, "_api_list", lambda *_a, **_k: [unbound, _transaction_era_comment(3)]
+    )
+    with pytest.raises(AgentLoopError, match="unbound managed-CI authorization grants nothing"):
+        managed_ci._legacy_authorization_records(
+            FakeRunner(), config=make_config(tmp_path), pr_number=11,
+            actor_login=_ACCESSOR_ACTOR[0], actor_id=_ACCESSOR_ACTOR[1],
+        )
+
+
+def test_resume_audit_grants_nothing_from_unbound_records_on_a_transaction_era_pr(
+    tmp_path, monkeypatch
+):
+    unbound = _accessor_comment(2, format_issue_created_authorization_comment(_accessor_record()))
+    comments = [unbound]
+    monkeypatch.setattr(managed_ci, "_api_list", lambda *_a, **_k: list(comments))
+    kwargs = dict(
+        config=make_config(tmp_path), pr_number=11, actor_login=_ACCESSOR_ACTOR[0],
+        actor_id=_ACCESSOR_ACTOR[1], base_ref="main", issue_number=7,
+    )
+    legacy = managed_ci._find_resume_audit(FakeRunner(), **kwargs)
+    assert legacy is not None and legacy[0] == 2
+    comments.append(_transaction_era_comment(3))
+    assert managed_ci._find_resume_audit(FakeRunner(), **kwargs) is None
+
+
+def test_no_authorization_scan_exists_outside_the_accessor():
+    """The v1 authorization token and parser are referenced only by the codec and the accessor."""
+    allowed = {
+        "format_issue_created_authorization_comment",
+        "parse_issue_created_authorization_comment",
+        "read_managed_ci_authorizations",
+    }
+    tokens = {"ISSUE_AUTHORIZATION_MARKER", "parse_issue_created_authorization_comment"}
+    for module in (managed_ci, orchestrator):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name in allowed:
+                continue
+            used = {
+                child.id for child in ast.walk(node)
+                if isinstance(child, ast.Name) and child.id in tokens
+            } | {
+                child.attr for child in ast.walk(node)
+                if isinstance(child, ast.Attribute) and child.attr in tokens
+            }
+            assert not used, f"{module.__name__}.{node.name} references {sorted(used)}"
+    source = Path(managed_ci.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    publishers = {
+        "publish_issue_created_authorization",
+        "publish_issue_created_continuity_authorization",
+        "authorize_fresh_issue_created_resume",
+        "_find_resume_audit",
+    }
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in publishers:
+            called = {
+                child.func.id for child in ast.walk(node)
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+            }
+            assert called & {"read_managed_ci_authorizations", "_legacy_authorization_records"}, node.name
+
+
+# ---------------------------------------------------------------------------
+# Pre-deletion release hook on the dispatch-time release (#827 / #946)
+# ---------------------------------------------------------------------------
+
+
+def _label_delete_commands(runner):
+    return [
+        command for command, _cwd in runner.commands
+        if command[:5] == [
+            "gh", "api", "--method", "DELETE",
+            f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+        ]
+    ]
+
+
+def _dispatch_with_ledger_failure(tmp_path, monkeypatch, contract):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    runner = V2ManagedRunner(issue_events=[label_event()])
+
+    def fail_intent(*args, **kwargs):
+        raise AgentLoopError("intent ledger unavailable")
+
+    monkeypatch.setattr(managed_ci, "_ensure_v2_intent", fail_intent)
+    return runner, lambda: _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+
+def test_dispatch_time_release_runs_the_hook_before_the_label_is_deleted(tmp_path, monkeypatch):
+    observed = []
+    contract = v2_contract(ordinary_recovery_capable=True)
+    runner, dispatch = _dispatch_with_ledger_failure(tmp_path, monkeypatch, contract)
+    contract.before_label_release = lambda head: observed.append(
+        (head, len(_label_delete_commands(runner)))
+    )
+
+    dispatch()
+
+    assert observed == [("abc123", 0)]
+    assert len(_label_delete_commands(runner)) == 1
+    assert contract.activation_path == "ordinary_fallback"
+
+
+def test_failing_dispatch_time_release_hook_leaves_the_label(tmp_path, monkeypatch):
+    contract = v2_contract(ordinary_recovery_capable=True)
+    runner, dispatch = _dispatch_with_ledger_failure(tmp_path, monkeypatch, contract)
+
+    def refuse(_head):
+        raise AgentLoopError("released successor did not commit")
+
+    contract.before_label_release = refuse
+
+    with pytest.raises(AgentLoopError, match="released successor did not commit"):
+        dispatch()
+
+    assert _label_delete_commands(runner) == []
+    assert contract.ordinary_recovery is None
+
+
+def test_release_hook_is_not_run_for_the_not_recovery_capable_fallback(tmp_path):
+    runner = V2ManagedRunner(issue_events=[label_event()])
+    called = []
+
+    result = _release_for_ordinary_recovery(
+        runner, config=make_config(tmp_path, managed_ci_trusted_actor="agent-loop"),
+        pr_number=7, base_ref="main", expected_head_sha="abc123",
+        active_event=(101, "agent-loop", 1), reason="not capable",
+        recovery_capable=False, before_label_release=lambda head: called.append(head),
+    )
+
+    assert result is None
+    assert called == []
+    assert _label_delete_commands(runner) == []
+
+
+def _issue_created_resume_contract(*, transaction_bound=True, **overrides):
+    handoff = managed_ci.AuthenticatedIssueCreatedHandoff(
+        pr_number=826, issue_number=813, repository="OWNER/REPO", base_ref="main",
+        head_sha="a" * 40, branch="agent-loop/managed-813", trusted_actor_login="agent-loop-bot",
+        trusted_actor_id=4242, protection_mode="voluntary", override_nonce="nonce-1",
+        transaction_bound=transaction_bound,
+    )
+    resume = managed_ci.AuthenticatedManagedResume(
+        origin="issue-created", lifecycle="draft-labeled", issue_created_handoff=handoff,
+    )
+    fields = dict(origin="issue-created", authenticated_resume=resume)
+    fields.update(overrides)
+    return managed_ci.ManagedCiContract(**fields)
+
+
+def test_pr_loop_binds_the_release_hook_only_for_an_issue_created_resume(tmp_path):
+    config = make_config(tmp_path)
+    bound = _issue_created_resume_contract()
+    orchestrator._bind_managed_release_hook(
+        FakeRunner(), config=config, pr_number=826, contract=bound
+    )
+    assert callable(bound.before_label_release)
+
+    # A legacy-era handoff (authenticated from an unbound record) gets no hook,
+    # so its release performs no transaction read before the label delete.
+    class NoReadRunner:
+        def run(self, args, **kwargs):
+            raise AssertionError(f"legacy release hook binding must not read: {args}")
+
+    legacy = _issue_created_resume_contract(transaction_bound=False)
+    orchestrator._bind_managed_release_hook(
+        NoReadRunner(), config=config, pr_number=826, contract=legacy
+    )
+    assert legacy.before_label_release is None
+
+    source_managed = managed_ci.ManagedCiContract(origin="source-managed")
+    orchestrator._bind_managed_release_hook(
+        FakeRunner(), config=config, pr_number=826, contract=source_managed
+    )
+    assert source_managed.before_label_release is None
+    orchestrator._bind_managed_release_hook(
+        FakeRunner(), config=config, pr_number=826, contract=None
+    )
+
+
+def test_bound_release_hook_commits_the_release_before_the_label_delete(tmp_path):
+    """Dispatch-time release on a granted transaction-era PR: commit first, then delete."""
+    from workflow_transaction_helpers import HEAD_1, ISSUE, PR, REPO, TransactionGitHub
+    from coding_review_agent_loop.managed_ci_bound_authorization import (
+        KIND_ORDINARY_RELEASE, BoundAuthorizationCodec, bind_v1_authorization,
+        parse_bound_authorization_comment,
+    )
+    from coding_review_agent_loop.workflow_transaction_publication import (
+        ORIGIN_DIRECT_ISSUE, Granted, TransitionRequest, publish_transition,
+    )
+
+    config = make_config(tmp_path, repo=REPO)
+    github = TransactionGitHub()
+    payload = bind_v1_authorization(
+        ManagedCiIssueAuthorization(
+            kind="creation", repository=REPO, issue_number=ISSUE, pr_number=PR, base_ref="main",
+            head_sha=HEAD_1, actor_login="agent-loop-bot", actor_id=4242, protection="voluntary",
+            waiver="allow-unprotected-managed-ci", nonce="nonce-1", label_event_id=9001,
+        ),
+        grant_anchor_event_id=9001,
+    )
+    publish_transition(
+        github, config=config,
+        request=TransitionRequest(
+            repository=REPO, pr_number=PR, base="main", head_sha=HEAD_1,
+            origin_path=ORIGIN_DIRECT_ISSUE, expected_closing_issue_ids=(ISSUE,),
+            primary_issue=ISSUE, managed=Granted(payload, payload.generation()),
+            authorization_codec=BoundAuthorizationCodec(),
+        ),
+    )
+    contract = _issue_created_resume_contract()
+    orchestrator._bind_managed_release_hook(github, config=config, pr_number=PR, contract=contract)
+    order = []
+
+    class ReleaseRunner:
+        def run(self, args, *, cwd=None, input_text=None, check=True, env=None):
+            args = [str(item) for item in args]
+            if "DELETE" in args:
+                kinds = [
+                    parse_bound_authorization_comment(item["body"]).kind
+                    for item in github.threads[PR]
+                    if "BOUND_AUTHORIZATION" in item["body"]
+                ]
+                order.append(("delete", tuple(kinds)))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    managed_ci._release_for_ordinary_recovery(
+        ReleaseRunner(), config=config, pr_number=PR, base_ref="main",
+        expected_head_sha=HEAD_1, active_event=None, reason="ledger failure",
+        recovery_capable=True, before_label_release=contract.before_label_release,
+    )
+
+    assert order == [("delete", ("creation", KIND_ORDINARY_RELEASE))]
 
 
 # --- #953: a spilled prior_items still carries the merge-conflict obligation ---

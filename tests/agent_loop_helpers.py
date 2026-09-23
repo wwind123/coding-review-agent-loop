@@ -8,6 +8,7 @@ import base64
 import datetime
 import json
 import os
+import hashlib
 import re
 import subprocess
 import sys
@@ -202,6 +203,23 @@ from coding_review_agent_loop.workdir_guard import (
 from unittest.mock import MagicMock, patch
 
 
+
+_REST_POST_ID_BASE = 1_000_000
+
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _next_fake_head(head: str, suffix: str) -> str:
+    """The head a fake push produces.
+
+    A full commit SHA stays a full commit SHA (workflow transactions bind only
+    full SHAs, #827); a short fixture head keeps the historical suffix form.
+    """
+    if _FULL_SHA_RE.match(str(head)):
+        return hashlib.sha1(f"{head}-{suffix}".encode("utf-8")).hexdigest()
+    return f"{head}-{suffix}"
+
+
 class FakeRunner(Runner):
     def __init__(
         self,
@@ -235,6 +253,7 @@ class FakeRunner(Runner):
         git_remote="git@github.com:OWNER/REPO.git",
         git_inside=True,
         git_head="abc123",
+        persist_rest_comment_posts=False,
         tracked_files=None,
         changed_files=None,
         diff_returncode=0,
@@ -293,7 +312,7 @@ class FakeRunner(Runner):
             "body": "PR description.",
             "headRefName": "feature/review-context",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": git_head,
             "comments": [],
             "reviews": [],
         }
@@ -353,6 +372,9 @@ class FakeRunner(Runner):
         self.git_remote = git_remote
         self.git_inside = git_inside
         self.git_head = git_head
+        # Opt-in (#827): persist REST comment writes so seam publications read
+        # their own records back.
+        self.persist_rest_comment_posts = persist_rest_comment_posts
         self.tracked_files = tracked_files or [
             "pyproject.toml",
             "README.md",
@@ -725,7 +747,20 @@ class FakeRunner(Runner):
         if not has_pr_identity:
             return
         self._agent_pr_counter += 1
-        self.git_head = f"{self.git_head}-agent-{self._agent_pr_counter}"
+        self.git_head = _next_fake_head(self.git_head, f"agent-{self._agent_pr_counter}")
+
+    def _next_write_stamp(self) -> str:
+        """One monotonic clock for every comment write in persisted-REST mode (#827).
+
+        REST writes and ``gh pr/issue comment`` writes must order by time the
+        way they were issued, later than every seeded fixture.
+        """
+        self._write_clock = getattr(self, "_write_clock", 0) + 1
+        sequence = self._write_clock
+        return (
+            f"2030-01-01T{sequence // 3600 % 24:02d}:"
+            f"{sequence // 60 % 60:02d}:{sequence % 60:02d}Z"
+        )
 
     def _maybe_advance_pr_head_for_coder_followup(self, cmd) -> None:
         if not self.advance_pr_head_on_coder_followup:
@@ -734,7 +769,7 @@ class FakeRunner(Runner):
             return
         self._coder_followup_counter += 1
         head_sha = self.pr_payload.get("headRefOid", self.git_head)
-        new_head_sha = f"{head_sha}-coder-{self._coder_followup_counter}"
+        new_head_sha = _next_fake_head(head_sha, f"coder-{self._coder_followup_counter}")
         self.pr_payload["headRefOid"] = new_head_sha
         self.git_head = new_head_sha
 
@@ -1025,7 +1060,11 @@ class FakeRunner(Runner):
             self.pr_payload.setdefault("comments", []).append(
                 {
                     "author": {"login": "coding-review-agent-loop"},
-                    "createdAt": f"2026-05-23T00:00:{len(self.pr_payload.get('comments', [])):02d}Z",
+                    "createdAt": (
+                        self._next_write_stamp()
+                        if getattr(self, "persist_rest_comment_posts", False)
+                        else f"2026-05-23T00:00:{len(self.pr_payload.get('comments', [])):02d}Z"
+                    ),
                     "body": raw_body,
                 }
             )
@@ -1043,7 +1082,11 @@ class FakeRunner(Runner):
             self.issue_comments.append(
                 {
                     "author": {"login": "coding-review-agent-loop"},
-                    "createdAt": f"2026-05-23T00:00:{len(self.issue_comments):02d}Z",
+                    "createdAt": (
+                        self._next_write_stamp()
+                        if getattr(self, "persist_rest_comment_posts", False)
+                        else f"2026-05-23T00:00:{len(self.issue_comments):02d}Z"
+                    ),
                     "body": raw_body,
                 }
             )
@@ -1150,6 +1193,116 @@ class FakeRunner(Runner):
                 "comments": self._issue_comments_for(number),
             }
             return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
+
+        actor_login, actor_id = getattr(
+            self, "authenticated_actor", ("coding-review-agent-loop", 4242)
+        )
+        if cmd[:3] == ["gh", "api", "user"]:
+            return CommandResult(
+                cmd, cwd_path, json_dumps({"login": actor_login, "id": actor_id}), "", 0
+            )
+
+        rest_post = (
+            re.search(r"^repos/[^/]+/[^/]+/issues/(\d+)/comments$", cmd[4])
+            if getattr(self, "persist_rest_comment_posts", False)
+            and cmd[:4] == ["gh", "api", "--method", "POST"]
+            and len(cmd) > 6
+            else None
+        )
+        if rest_post is not None:
+            # Opt-in (#827): persist a REST comment write so a real seam
+            # publication can read its own record back.
+            number = int(rest_post.group(1))
+            if cmd[5:7] == ["--input", "-"]:
+                body = json.loads(input_text or "{}").get("body", "")
+            else:
+                body = cmd[6].removeprefix("body=")
+            # Opt-in failure injection: 1-based ordinals of REST writes that
+            # fail before anything is stored.
+            self.rest_post_count = getattr(self, "rest_post_count", 0) + 1
+            if self.rest_post_count in getattr(self, "rest_post_failures", ()):
+                return CommandResult(cmd, cwd_path, "", "injected write failure", 1)
+            if self.rest_post_count in getattr(self, "rest_post_malformed", ()):
+                # A successful but unverifiable response; nothing is stored.
+                return CommandResult(cmd, cwd_path, "{}", "", 0)
+            if number == self._pr_payload_for(str(number)).get("number"):
+                thread = self._pr_payload_for(str(number)).setdefault("comments", [])
+            elif (
+                number not in self.issue_comments_by_number
+                and number == self.issue_payload.get("number")
+            ):
+                # The default issue's thread: never shadow its seeded comments.
+                thread = self.issue_comments
+            else:
+                thread = self.issue_comments_by_number.setdefault(number, [])
+            known = [
+                int(item["id"])
+                for items in (
+                    self.pr_payload.get("comments", []),
+                    self.issue_comments,
+                    *self.issue_comments_by_number.values(),
+                )
+                for item in items
+                if isinstance(item, dict) and isinstance(item.get("id"), int)
+            ]
+            # A separate high ID range: gh-shaped comments are listed with
+            # positional IDs, which must never collide with a REST write.
+            comment_id = max(known + [_REST_POST_ID_BASE]) + 1
+            # Later than every seeded fixture; one clock orders REST and gh writes.
+            stamp = self._next_write_stamp()
+            comment = {
+                "id": comment_id,
+                "user": {"login": actor_login, "id": actor_id},
+                "author": {"login": actor_login},
+                "created_at": stamp,
+                "createdAt": stamp,
+                "body": body,
+            }
+            thread.append(comment)
+            return CommandResult(cmd, cwd_path, json_dumps(comment), "", 0)
+
+        rest_comments = re.search(
+            r"/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)$", cmd[2]
+        ) if cmd[:2] == ["gh", "api"] else None
+        if rest_comments is not None:
+            # The exhaustive authenticated comment read (#827): serve the same
+            # conversation the GraphQL-shaped payloads hold, in REST shape.
+            number, per_page, page = (int(group) for group in rest_comments.groups())
+            if number == self._pr_payload_for(str(number)).get("number"):
+                source = self._pr_payload_for(str(number)).get("comments", [])
+            else:
+                source = self._issue_comments_for(number)
+            rows = []
+            for index, comment in enumerate(source, start=1):
+                if "user" in comment:
+                    # Already REST-shaped (seeded from a transaction fixture).
+                    # GitHub always stamps a comment; fixtures often omit it.
+                    if not comment.get("created_at"):
+                        comment = {
+                            **comment,
+                            "created_at": comment.get("createdAt")
+                            or f"2026-05-23T00:{index // 60:02d}:{index % 60:02d}Z",
+                        }
+                    rows.append(comment)
+                    continue
+                login = (comment.get("author") or {}).get("login") or "ghost"
+                rows.append(
+                    {
+                        "id": index,
+                        "user": {
+                            "login": login,
+                            "id": actor_id if login == actor_login else 9000 + index,
+                        },
+                        # GitHub always stamps a comment; fixtures often omit it.
+                        "created_at": comment.get("createdAt")
+                        or f"2026-05-23T00:{index // 60:02d}:{index % 60:02d}Z",
+                        "body": comment.get("body", ""),
+                    }
+                )
+            start = (page - 1) * per_page
+            return CommandResult(
+                cmd, cwd_path, json_dumps(rows[start : start + per_page]), "", 0
+            )
 
         if cmd[:2] == ["gh", "api"] and "/issues/" in cmd[2]:
             match = re.search(r"/issues/(\d+)", cmd[2])

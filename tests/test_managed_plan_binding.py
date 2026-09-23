@@ -191,6 +191,12 @@ def _snapshot(
     monkeypatch.setattr(
         orchestrator, "verify_managed_pr_plan_binding", lambda *a, **k: calls.append(k)
     )
+    # A legacy-era PR: the workflow-transaction head gate (#827) needs no write
+    # and grants the legacy path, so these cases exercise only the plan binding.
+    import coding_review_agent_loop.workflow_transaction_publication as publication
+
+    monkeypatch.setattr(publication, "ensure_live_head_transaction", lambda *a, **k: False)
+    monkeypatch.setattr(publication, "require_live_head_authority", lambda *a, **k: None)
     config = make_config(tmp_path, managed_ci=managed_ci, managed_ci_trusted_actor="agent-loop")
     result = orchestrator._fresh_pr_qualification_snapshot(
         object(), config=config, pr_number=7, issue_context=issue,
