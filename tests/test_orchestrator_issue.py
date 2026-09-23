@@ -11986,6 +11986,57 @@ def test_unsatisfied_artifact_exhaustion_preserves_the_artifact(tmp_path, return
     ]
 
 
+@pytest.mark.parametrize("returncode", [1, None], ids=["nonzero", "timeout"])
+def test_artifact_canonicalization_failure_is_deterministic_not_transport(tmp_path, returncode):
+    # A corroborated `modified` artifact parses with a record, but its strict
+    # re-parse fails the canonical comparison: the attempt keeps the
+    # canonicalization diagnostic and is never classified as a timeout or
+    # command failure, nor as an unsatisfied architecture contract.
+    artifact = _deg_with(structured_issue_implementation(), _DEG_CORROBORATED)
+    mismatched = validate_structured_issue_implementation(
+        _deg_with(structured_issue_implementation(pr_number=99), dict(_DEG_CORROBORATED, status="changed"))
+    )
+    runner = _r2_FakeRunner(
+        claude_outputs=[("provider diagnostics only", returncode)],
+        public_response_outputs=[artifact],
+    )
+    usage = _r2_new_usage_context(make_config(tmp_path))
+    validators = dict(_deg_issue_validators(), strict_revalidate=lambda _text: mismatched)
+    with pytest.raises(_DegInvocationError) as error:
+        orchestrator_module._run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=1),
+            prompt="Implement the issue.",
+            marker_description="structured issue_implementation result",
+            **validators, require_architecture_impact_contract=True, usage_context=usage,
+        )
+    assert error.value.failure_category == "deterministic"
+    reason = str(error.value).split("Reason: ", 1)[1].split(". Required marker", 1)[0]
+    assert reason.startswith("Accepted-text canonicalization failed")
+    assert "timed out" not in reason and "exited with" not in reason
+    assert "architecture_impact" not in reason
+    assert error.value.preserved_unsatisfied_response is None
+    assert len(_r2_claude_prompts(runner)) == 1
+    assert usage.records[0].validation_status == "invalid"
+
+
+def test_metadata_helper_rejects_an_unlisted_assessment_bearing_object():
+    # An object carrying an assessment but outside the enumerated carriers is
+    # never persisted as fully assessed with its records silently dropped.
+    impostor = SimpleNamespace(
+        architecture_impact=validate_structured_issue_implementation(
+            _deg_with(structured_issue_implementation(), _DEG_CORROBORATED),
+            architecture_status_mode="degradable",
+        ).architecture_impact,
+        architecture_impact_degradations=(),
+    )
+    with pytest.raises(AgentLoopError, match="not an enumerated"):
+        orchestrator_module._architecture_result_fields(impostor)
+    with pytest.raises(AgentLoopError, match="not an enumerated"):
+        orchestrator_module._architecture_metadata_fields(
+            make_config_for_metadata(), result=impostor
+        )
+
+
 @pytest.mark.parametrize("form", ["artifact", "text"])
 def test_completion_recovery_routes_an_unsatisfied_contract_to_the_ordinary_retry(tmp_path, form):
     unsatisfied = _deg_with(structured_issue_implementation(), None)

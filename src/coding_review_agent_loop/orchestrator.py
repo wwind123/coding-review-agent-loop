@@ -3509,6 +3509,10 @@ def _run_validated_agent(
         # An authoritative artifact whose only defect is the architecture
         # contract is a deterministic field refusal, never a transport failure.
         artifact_contract_refusal: _ArchitectureImpactContractUnsatisfied | None = None
+        # An artifact that parses but whose accepted text cannot be
+        # canonicalized keeps its own deterministic diagnostic; it is never
+        # reclassified as a timeout or command failure.
+        artifact_canonicalization_failure: _AcceptedTextCanonicalizationError | None = None
         # Preserve the normal zero-exit path below, including its marker
         # recovery diagnostic. Failed exits alone may be salvaged from the
         # per-invocation response-file artifact.
@@ -3533,6 +3537,8 @@ def _run_validated_agent(
                     artifact_marker_value = validate(artifact)
                 except _ArchitectureImpactContractUnsatisfied as exc:
                     artifact_contract_refusal = exc
+                except _AcceptedTextCanonicalizationError as exc:
+                    artifact_canonicalization_failure = exc
                 except AgentLoopError:
                     pass
                 else:
@@ -3737,6 +3743,22 @@ def _run_validated_agent(
                 usage_record.validation_status = "invalid"
             should_retry = True
             pending_contract_reprompt = last_error
+        elif artifact_canonicalization_failure is not None:
+            # The authoritative artifact was otherwise valid but its accepted
+            # text failed the strict canonical comparison.  Report that
+            # diagnostic as a deterministic failure, never as transport, and
+            # never as an unsatisfied architecture contract.
+            last_error = str(artifact_canonicalization_failure)
+            last_classification_text = artifact
+            last_failure_category = "deterministic"
+            if usage_record is not None:
+                usage_record.validation_status = "invalid"
+            log(
+                config,
+                f"{agent_name}: response-file artifact not accepted "
+                f"({artifact_canonicalization_failure})"[:600],
+            )
+            break
         elif result.returncode is None and artifact_unavailable is None:
             # Timed out (returncode=None from Runner.run_with_log). Detected
             # before transient classification: a kill deadline is not a
@@ -4876,9 +4898,8 @@ def _architecture_result_fields(
         return None, ()
     if isinstance(result, _ARCHITECTURE_RECORD_CARRIERS):
         return result.architecture_impact, tuple(result.architecture_impact_degradations)
-    if hasattr(result, "architecture_impact") and not hasattr(result, "architecture_impact_contract"):
-        # An assembled plan object carries a strict assessment and no records.
-        return getattr(result, "architecture_impact"), ()
+    # An assembled semantic-patch plan is a StructuredPlanRevision, already
+    # enumerated above; no duck-typed fallback may silently drop records.
     raise AgentLoopError(
         f"Internal error: {type(result).__name__} is not an enumerated architecture-impact "
         "result type for round metadata."
