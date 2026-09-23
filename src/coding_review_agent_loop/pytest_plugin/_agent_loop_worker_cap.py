@@ -13,8 +13,8 @@ the armed spec for its own Config and reports under its own session id;
 Configs nested inside an active claim and child processes that inherit the
 plugin environment only write a best-effort ``nested`` marker.
 
-The wrapper's ``PYTEST_PLUGINS`` entry is withdrawn from ``os.environ`` at
-import and for the whole of every claimed session, so a test that launches a
+The wrapper's ``PYTEST_PLUGINS`` entry is withdrawn from ``os.environ`` for
+the whole of every claimed session, so a test that launches a
 nested pytest with a replaced ``PYTHONPATH`` never inherits an entry it cannot
 import (issue #1008).  It is restored when a claim ends so a later sequential
 ``pytest.main`` in the same launcher process still loads the plugin.
@@ -84,7 +84,6 @@ def _restore_env_entry() -> None:
         os.environ[_PLUGINS_ENV] = ",".join([*entries, _SELF])
 
 
-_ENV_ENTRY = _withdraw_env_entry()
 _ARMED = _load_spec()
 if _ARMED is not None:
     # Only the report path is published; never the budget, mode or spec.
@@ -149,6 +148,7 @@ def count_specs(specs):
 
 class _Session:
     def __init__(self, spec, config):
+        self.env_entry = False  # whether this claim withdrew the PYTEST_PLUGINS entry
         self.budget = spec["budget"]
         self.mode = spec["mode"]
         self.report = spec["report"]
@@ -233,7 +233,7 @@ if _pluggy_supports_wrappers():
             if _CLAIM is None:
                 state = _Session(_ARMED, config)
                 _CLAIM = state
-                _withdraw_env_entry()
+                state.env_entry = _withdraw_env_entry()
             else:
                 _emit(
                     _ARMED["report"],
@@ -249,7 +249,7 @@ if _pluggy_supports_wrappers():
         finally:
             if _CLAIM is state:
                 _CLAIM = None
-                if _ENV_ENTRY:
+                if state.env_entry:
                     _restore_env_entry()
 
     def _option_gate(state, config):

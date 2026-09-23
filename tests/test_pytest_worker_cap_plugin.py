@@ -482,6 +482,30 @@ def test_env_only_sequential_sessions_each_claim_after_withdrawal(tmp_path):
     assert [row["effective"] for row in confirmed] == [1, 2]
 
 
+def test_env_only_session_after_early_usage_error_still_claims(tmp_path):
+    """A pytest.main that fails before claiming must not withdraw the env entry."""
+    project = _project(tmp_path)
+    runner = project.parent / "runner.py"
+    runner.write_text(
+        textwrap.dedent(
+            """
+            import os, sys, pytest
+            early = pytest.main(["--no-such-agent-loop-option"])
+            assert int(early) == 4, early
+            assert "_agent_loop_worker_cap" in sys.modules
+            assert "_agent_loop_worker_cap" in os.environ.get("PYTEST_PLUGINS", "")
+            sys.exit(int(pytest.main(["-p", "no:cacheprovider", "-q", "-n", "16"])))
+            """
+        ),
+        encoding="utf-8",
+    )
+    proc, rows, ran = _run(project, [], budget=2, command=[sys.executable, str(runner)])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    (confirmed,) = _only(rows, "confirmed")
+    assert confirmed["effective"] == 2 and confirmed["action"] == "clamped"
+    assert sorted(ran) == ["four", "one", "three", "two"]
+
+
 def test_filtered_child_pytest_is_unobservable_top_level_only(tmp_path):
     child_test = """
     import os, subprocess, sys
