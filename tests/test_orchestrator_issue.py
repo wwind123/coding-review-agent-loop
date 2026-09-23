@@ -12337,7 +12337,17 @@ def _ack_staged_run(
         return repaired
 
     outcome = None
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    repair_results = []
+    real_structured_repair = orchestrator_module._run_structured_repair
+
+    def spy_repair(*args, **kwargs):
+        result = real_structured_repair(*args, **kwargs)
+        repair_results.append(result)
+        return result
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator_module, "_run_structured_repair", spy_repair
+    ):
         try:
             outcome = run_issue_loop(
                 runner, issue_number=56,
@@ -12354,6 +12364,7 @@ def _ack_staged_run(
         record for record in _plan_round_records(runner)
         if record.role == "reviewer" and record.agent == "Codex"
     ]
+    _ack_staged_run.repair_results = repair_results
     return outcome, codex_records, repair_calls, requirement
 
 
@@ -12379,12 +12390,24 @@ def test_staged_acknowledgement_repair_keeps_the_degraded_assessment_and_record(
     assert codex_records[-1].surfaced_reviewer_requirement_ids == (requirement.requirement_id,)
 
 
+_ACK_REFUSAL = {"unchanged": "must not introduce one", "none": "must be `changed` or `unchanged`"}
+
+
+def _assert_refused_by(repair_results, status):
+    assert repair_results
+    for _text, validated, attempts in repair_results:
+        assert validated is None
+        assert _ACK_REFUSAL[status] in attempts[-1].diagnostic
+
+
 @pytest.mark.parametrize("status", ["unchanged", "none"])
 def test_staged_acknowledgement_repair_cannot_add_an_assessment(tmp_path, monkeypatch, status):
     outcome, codex_records, repair_calls, _requirement = _ack_staged_run(
         tmp_path, monkeypatch, repaired_impact=None, repaired_status=status, max_rounds=1
     )
     assert repair_calls, "the acknowledgement repair must run through the flow"
+    # The refusal comes from the absence pin or strict validation.
+    _assert_refused_by(_ack_staged_run.repair_results, status)
     # The refused repair is never published: no record asserts an assessment,
     # and the primary's approval is never carried as acknowledged.
     assert outcome != 0
@@ -12425,7 +12448,17 @@ def _ack_nonstaged_run(tmp_path, monkeypatch, *, repaired_status=None):
         tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
         agent_max_retries=0, agent_retry_backoff_seconds=0,
     )
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    repair_results = []
+    real_structured_repair = orchestrator_module._run_structured_repair
+
+    def spy_repair(*args, **kwargs):
+        result = real_structured_repair(*args, **kwargs)
+        repair_results.append(result)
+        return result
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator_module, "_run_structured_repair", spy_repair
+    ):
         try:
             outcome = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
         except AgentLoopError as exc:
@@ -12434,6 +12467,7 @@ def _ack_nonstaged_run(tmp_path, monkeypatch, *, repaired_status=None):
         record for record in _plan_round_records(runner)
         if record.role == "reviewer" and record.agent == "Codex"
     ]
+    _ack_nonstaged_run.repair_results = repair_results
     return outcome, codex_records, repair_calls
 
 
@@ -12461,7 +12495,209 @@ def test_nonstaged_acknowledgement_repair_cannot_add_an_assessment(
         tmp_path, monkeypatch, repaired_status=status
     )
     assert repair_calls
+    _assert_refused_by(_ack_nonstaged_run.repair_results, status)
     assert outcome != 0
     assert len(codex_records) == 1
     assert codex_records[0].architecture_impact is None
 
+
+
+
+def _ack_plan_resume_run(tmp_path, monkeypatch, *, parallel, codex_impact, repaired_impact):
+    """Interrupt a plan round at its acknowledgement repair, then resume it.
+
+    ``parallel`` selects the early-publication path, whose record stores the
+    canonical JSON response; otherwise the record is an authoritative
+    rendered-prose post.
+    """
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    unacknowledged = _deg_with(unacknowledged, codex_impact)
+    repaired = _deg_with(repaired, repaired_impact)
+    runner = _FakeRunner(
+        claude_outputs=[plan_output] * 4,
+        codex_outputs=[unacknowledged] * 4,
+        gemini_outputs=[panel] * 4,
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
+        agent_max_retries=0, agent_retry_backoff_seconds=0, review_parallel=parallel,
+    )
+
+    def interrupt(raw, cmd, **kwargs):
+        raise KeyboardInterrupt
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    agents_before = [cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"claude", "codex", "gemini"}]
+
+    carriers, pinned, repair_results, repair_calls = [], [], [], []
+    real_pin = orchestrator_module._pin_acknowledgement_repair
+    real_structured_repair = orchestrator_module._run_structured_repair
+
+    def spy_pin(accepted, repaired_value, **kwargs):
+        carriers.append(accepted)
+        result = real_pin(accepted, repaired_value, **kwargs)
+        pinned.append((repaired_value, result))
+        return result
+
+    def spy_repair(*args, **kwargs):
+        result = real_structured_repair(*args, **kwargs)
+        repair_results.append(result)
+        return result
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator_module, "_pin_acknowledgement_repair", spy_pin
+    ), patch.object(orchestrator_module, "_run_structured_repair", spy_repair):
+        try:
+            outcome = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        except AgentLoopError as exc:
+            outcome = exc
+    agents_after = [cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"claude", "codex", "gemini"}]
+    records = [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    return SimpleNamespace(
+        outcome=outcome, carriers=carriers, pinned=pinned, repair_results=repair_results,
+        repair_calls=repair_calls, records=records,
+        resumed_without_reinvocation=agents_before == agents_after,
+    )
+
+
+def _assert_degraded_carrier(carrier):
+    assert carrier.architecture_impact is None
+    assert [r.outcome for r in carrier.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+
+
+def test_resumed_authoritative_plan_review_keeps_metadata_carrier_and_is_not_repaired(
+    tmp_path, monkeypatch
+):
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=False,
+        codex_impact=_DEG_UNCORROBORATED, repaired_impact=None,
+    )
+    assert run.resumed_without_reinvocation
+    assert [record.phase for record in run.records] == ["authoritative"]
+    # The carrier is rebuilt from round metadata, never from rendered prose.
+    (carrier,) = run.carriers
+    _assert_degraded_carrier(carrier)
+    # The existing substance gate refuses the prose source before any repair
+    # model runs, and nothing new is posted for the reviewer.
+    assert run.repair_calls == []
+    assert run.outcome != 0
+    assert len(run.records) == 1
+
+
+def test_resumed_publication_plan_review_accepts_acknowledgement_only_repair(
+    tmp_path, monkeypatch
+):
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=True,
+        codex_impact=_DEG_UNCORROBORATED, repaired_impact=None,
+    )
+    assert run.resumed_without_reinvocation
+    assert [record.phase for record in run.records] == ["publication"]
+    (carrier,) = run.carriers
+    _assert_degraded_carrier(carrier)
+    assert len(run.repair_calls) == 1
+    assert '"modified"' not in run.repair_calls[0]
+    ((_repaired, pinned),) = run.pinned
+    _assert_degraded_carrier(pinned)
+    assert run.outcome == 0
+
+
+@pytest.mark.parametrize(
+    "status,diagnostic",
+    [("unchanged", "must not introduce one"), ("none", "must be `changed` or `unchanged`")],
+)
+def test_resumed_publication_plan_review_repair_cannot_add_an_assessment(
+    tmp_path, monkeypatch, status, diagnostic
+):
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=True, codex_impact=_DEG_UNCORROBORATED,
+        repaired_impact={"status": status, "rationale": "No architectural change."},
+    )
+    assert run.resumed_without_reinvocation
+    (carrier,) = run.carriers
+    _assert_degraded_carrier(carrier)
+    # The refusal comes from the absence pin (or, for `none`, from strict
+    # validation of the new repair output), not from an unrelated failure.
+    ((_text, validated, attempts),) = run.repair_results
+    assert validated is None
+    assert diagnostic in attempts[-1].diagnostic
+    assert run.outcome != 0
+    assert all(record.architecture_impact is None for record in run.records)
+
+
+def test_resumed_publication_corroborated_review_refuses_a_changed_assessment(
+    tmp_path, monkeypatch
+):
+    # A corroborated `modified` is accepted as `changed` with its record.  A
+    # repair that rewrites the accepted assessment is refused; the accepted
+    # status is pinned in preservation, and the equality check backs it up.
+    changed = dict(_DEG_CORROBORATED, status="unchanged")
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=True,
+        codex_impact=_DEG_CORROBORATED, repaired_impact=changed,
+    )
+    (carrier,) = run.carriers
+    assert carrier.architecture_impact.status == "changed"
+    assert [r.outcome for r in carrier.architecture_impact_degradations] == [
+        "normalized-to-changed"
+    ]
+    ((_text, validated, attempts),) = run.repair_results
+    assert validated is None
+    assert "architecture_impact.status" in attempts[-1].diagnostic
+    ((_repaired, pinned),) = run.pinned
+    assert pinned is None
+    assert run.outcome != 0
+    assert all(
+        record.architecture_impact is None or record.architecture_impact["status"] == "changed"
+        for record in run.records
+    )
+
+
+def test_acknowledgement_equality_check_refuses_a_changed_assessment_directly(tmp_path):
+    # Defense in depth behind preservation: any durable difference fails.
+    accepted = validate_structured_plan_state(
+        _deg_with(structured_plan_state(), dict(_DEG_CORROBORATED, status="changed"))
+    )
+    altered = replace(
+        accepted,
+        architecture_impact=replace(accepted.architecture_impact, rationale="Different."),
+    )
+    assert orchestrator_module._pin_acknowledgement_repair(
+        accepted, altered, config=make_config(tmp_path), reviewer_name="Codex"
+    ) is None
+
+
+def test_resumed_publication_genuine_omission_cannot_gain_an_assessment(
+    tmp_path, monkeypatch
+):
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=True, codex_impact=None,
+        repaired_impact={"status": "unchanged", "rationale": "No architectural change."},
+    )
+    (carrier,) = run.carriers
+    assert carrier.architecture_impact is None
+    assert carrier.architecture_impact_degradations == ()
+    ((_text, validated, attempts),) = run.repair_results
+    assert validated is None
+    assert "must not introduce one" in attempts[-1].diagnostic
+    assert run.outcome != 0
