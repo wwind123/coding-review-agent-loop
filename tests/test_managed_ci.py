@@ -1900,6 +1900,127 @@ def test_fresh_authorization_after_same_head_rebind_uses_the_retired_grant(tmp_p
     assert len(runner.intent_comments) == posted
 
 
+def _same_head_rebound(tmp_path):
+    """A creation grant under plan ``a``, then a same-head fresh grant under ``b``."""
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    first = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata(),
+        approved_plan_hash="a" * 64,
+    )
+    runner.compare_payload = {"status": "identical"}
+    rebound = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+        approved_plan_hash="b" * 64,
+        retired_plan_hashes=frozenset({"a" * 64}),
+    )
+    return runner, config, first, rebound
+
+
+def _advance_head(runner):
+    runner.intent_comments.extend([
+        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="next-head", round_number=2),
+    ])
+    runner.rest_pr["head"]["sha"] = "next-head"
+
+
+def _inject_authorization(runner, comment_id, record):
+    runner.intent_comments.append({
+        "id": comment_id,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": str(format_issue_created_authorization_comment(record)),
+    })
+
+
+def _retired_plan_record(**overrides):
+    record = ManagedCiIssueAuthorization(
+        kind="fresh", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        nonce="retired-fresh", label_event_id=101, approved_plan_hash="a" * 64,
+    )
+    return replace(record, **overrides)
+
+
+def test_continuity_after_same_head_rebind_chains_to_the_rebound_grant(tmp_path):
+    runner, config, _first, rebound = _same_head_rebound(tmp_path)
+    _advance_head(runner)
+
+    continued = publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=rebound, predecessor_head="abc123",
+        new_head="next-head", round_comment_ids=(88, 89),
+    )
+
+    assert continued.authorization_kind == "continuity"
+    assert continued.retired_plan_hashes == frozenset({"a" * 64})
+    parsed = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert parsed is not None
+    assert parsed.approved_plan_hash == "b" * 64
+    assert parsed.predecessor_comment_id == rebound.authorization_comment_id
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="next-head",
+        expected_handoff=continued, expected_protection="voluntary",
+        require_actor_owned_label_event=True,
+    )
+    assert audit is not None
+    assert audit[0] == continued.authorization_comment_id
+
+
+def test_continuity_after_same_head_rebind_without_retirement_refuses(tmp_path):
+    runner, config, _first, rebound = _same_head_rebound(tmp_path)
+    _advance_head(runner)
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="conflicting prior authorizations"):
+        publish_issue_created_continuity_authorization(
+            runner, config=config,
+            handoff=replace(rebound, retired_plan_hashes=frozenset()),
+            predecessor_head="abc123", new_head="next-head", round_comment_ids=(88, 89),
+        )
+    assert len(runner.intent_comments) == posted
+
+
+def test_continuity_refuses_retired_plan_record_with_inconsistent_fields(tmp_path):
+    runner, config, _first, rebound = _same_head_rebound(tmp_path)
+    _inject_authorization(runner, 60, _retired_plan_record(protection="plan_limited"))
+    _advance_head(runner)
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="conflicting prior authorizations"):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=rebound, predecessor_head="abc123",
+            new_head="next-head", round_comment_ids=(88, 89),
+        )
+    assert len(runner.intent_comments) == posted
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"protection": "plan_limited"}, {"label_event_id": 999}],
+)
+def test_resume_audit_retires_only_the_plan_hash(tmp_path, overrides):
+    runner, config, _first, rebound = _same_head_rebound(tmp_path)
+    audit_kwargs = dict(
+        config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123",
+        expected_handoff=rebound, expected_protection="voluntary",
+        require_actor_owned_label_event=True,
+    )
+    # A consistent retired-plan grant is history.
+    _inject_authorization(runner, 60, _retired_plan_record())
+    audit = _find_resume_audit(runner, **audit_kwargs)
+    assert audit is not None and audit[0] == rebound.authorization_comment_id
+    # One whose non-plan fields disagree still fails closed.
+    _inject_authorization(runner, 61, _retired_plan_record(nonce="other", **overrides))
+    assert _find_resume_audit(runner, **audit_kwargs) is None
+
+
 def test_fresh_authorization_same_head_plan_change_without_retirement_refuses(tmp_path):
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     config = make_config(

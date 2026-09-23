@@ -1741,6 +1741,29 @@ def publish_issue_created_continuity_authorization(
         and record.base_ref == handoff.base_ref
         and record.kind in {"creation", "fresh", "continuity"}
     ]
+    # A signed rebind that kept the head leaves the retired-plan grant next to
+    # the live-plan grant at this head (#993).  It is history, not a second
+    # predecessor, but only when every non-plan field is still consistent.
+    retired_history = [
+        record
+        for _comment_id, record in predecessor_records
+        if _is_retired_plan_history(record, handoff)
+    ]
+    if any(
+        record.actor_login.casefold() != handoff.trusted_actor_login.casefold()
+        or record.actor_id != handoff.trusted_actor_id
+        or record.protection != handoff.protection_mode
+        or record.waiver != "allow-unprotected-managed-ci"
+        for record in retired_history
+    ):
+        raise AgentLoopError(
+            "Managed-CI head continuity found conflicting prior authorizations for the predecessor head; refusing to proceed."
+        )
+    predecessor_records = [
+        (comment_id, record)
+        for comment_id, record in predecessor_records
+        if not _is_retired_plan_history(record, handoff)
+    ]
     if not predecessor_records:
         raise AgentLoopError(
             "Managed-CI head continuity has no unique prior authorization for the predecessor head."
@@ -3219,6 +3242,8 @@ def _find_resume_audit(
     def authorization_matches(
         authorization: ManagedCiIssueAuthorization,
         comment_id: int,
+        *,
+        history: bool = False,
     ) -> bool:
         if (
             authorization.actor_login.casefold() != actor_login.casefold()
@@ -3263,6 +3288,10 @@ def _find_resume_audit(
                 expected_nonce = expected_handoff.override_nonce
             if expected_nonce is not None and authorization.nonce != expected_nonce:
                 return False
+        if history:
+            # A retired-plan record is never the terminal, so the terminal
+            # identity checks below do not apply to it (#993).
+            return True
         if (
             authorization.kind == "fresh"
             and expected_handoff.authorization_kind == "fresh"
@@ -3335,7 +3364,17 @@ def _find_resume_audit(
                 continue
             if _is_retired_plan_history(authorization, expected_handoff):
                 # History under a plan a verified signed rebind replaced (#993):
-                # neither a competing grant nor part of the live chain.
+                # neither a competing grant nor part of the live chain.  Only
+                # the plan hash is retired; every other field must still match.
+                if not authorization_matches(
+                    replace(
+                        authorization,
+                        approved_plan_hash=expected_handoff.approved_plan_hash,
+                    ),
+                    cid,
+                    history=True,
+                ):
+                    malformed = True
                 continue
             if not authorization_matches(authorization, cid):
                 malformed = True
