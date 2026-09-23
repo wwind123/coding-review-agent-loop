@@ -1845,6 +1845,82 @@ def test_fresh_authorization_retired_plan_does_not_excuse_other_field_mismatch(t
         )
 
 
+def test_fresh_authorization_after_same_head_rebind_uses_the_retired_grant(tmp_path):
+    # A signed rebind posts only an issue comment; the PR head is unchanged.
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    live = replace(metadata(), head_branch="agent-loop/managed-643")
+    first = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata(),
+        approved_plan_hash="a" * 64,
+    )
+    # GitHub reports an identical head, which never proves a descendant.
+    runner.compare_payload = {"status": "identical"}
+
+    rebound = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643, metadata=live,
+        approved_plan_hash="b" * 64,
+        retired_plan_hashes=frozenset({"a" * 64}),
+    )
+
+    assert rebound.authorization_kind == "fresh"
+    assert rebound.head_sha == "abc123"
+    parsed = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert parsed is not None
+    assert parsed.approved_plan_hash == "b" * 64
+    assert parsed.predecessor_head == "abc123"
+    assert parsed.predecessor_comment_id == first.authorization_comment_id
+
+    audit_kwargs = dict(
+        config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123",
+        expected_protection="voluntary", require_actor_owned_label_event=True,
+    )
+    # Activation resolves the rebound grant; the retired grant is history.
+    resume = _find_resume_audit(runner, expected_handoff=rebound, **audit_kwargs)
+    assert resume is not None
+    assert resume[0] == rebound.authorization_comment_id
+    # Without the verified retired set the old grant still fails closed.
+    assert _find_resume_audit(
+        runner, expected_handoff=replace(rebound, retired_plan_hashes=frozenset()),
+        **audit_kwargs,
+    ) is None
+
+    # A rerun reuses the rebound grant instead of posting another.
+    posted = len(runner.intent_comments)
+    again = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643, metadata=live,
+        approved_plan_hash="b" * 64,
+        retired_plan_hashes=frozenset({"a" * 64}),
+    )
+    assert again.authorization_comment_id == rebound.authorization_comment_id
+    assert len(runner.intent_comments) == posted
+
+
+def test_fresh_authorization_same_head_plan_change_without_retirement_refuses(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata(),
+        approved_plan_hash="a" * 64,
+    )
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="conflicting actor-owned record"):
+        authorize_fresh_issue_created_resume(
+            runner, config=config, pr_number=7, issue_number=643,
+            metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+            approved_plan_hash="b" * 64,
+        )
+    assert len(runner.intent_comments) == posted
+
+
 def test_fresh_authorization_rejects_actor_owned_record_with_unknown_label_event(tmp_path):
     forged = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,

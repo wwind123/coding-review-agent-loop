@@ -228,10 +228,15 @@ With exactly one matching record and an open canonical PR, planning reopens:
   plan hash likewise stay as history. The explicit fresh authorization
   (`--managed-ci-fresh`) uses the same verified chain: an actor-owned record
   whose only difference is a plan hash the chain replaced is not a conflict,
-  and the new grant is bound to the rebound plan. A record that differs in any
-  other field, or names a plan hash no verified transition replaced, still
-  refuses. A PR stuck on this conflict recovers by rerunning the fresh
-  authorization command the ordinary path recommends.
+  and the new grant is bound to the rebound plan. A rebind does not move the PR
+  head, so a retired-plan grant at the live head is accepted as the new grant's
+  predecessor without a descendant proof; any other predecessor still needs
+  GitHub to prove the live head descends from it. Ordinary managed resume and
+  PR qualification carry the same verified set, so later runs resolve the
+  rebound grant and skip the retired ones instead of failing on them. A record
+  that differs in any other field, or names a plan hash no verified transition
+  replaced, still refuses. A PR stuck on this conflict recovers by rerunning
+  the fresh authorization command the ordinary path recommends.
 
 `agent-loop pr <n>` never re-plans or rebinds; it prints the issue-mode route.
 That includes an admissible bound plan with a pending matching signed record:

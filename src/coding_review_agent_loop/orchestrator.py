@@ -9226,7 +9226,7 @@ def verified_retired_child_plan_hashes(
     return frozenset(retired)
 
 
-def _managed_ci_fresh_retired_plan_hashes(
+def _managed_ci_retired_plan_hashes(
     runner: Runner,
     *,
     config: AgentLoopConfig,
@@ -9234,11 +9234,12 @@ def _managed_ci_fresh_retired_plan_hashes(
     parent_issue_context: IssueContext | None,
     pr_number: int,
 ) -> tuple[frozenset[str], IssueContext | None]:
-    """Plans a verified signed re-plan retired, for a fresh managed-CI grant (#993).
+    """Plans a verified signed re-plan retired, for a managed-CI resume (#993).
 
     A rebind leaves the managed-CI authorization recorded under the
     superseded plan on the PR, just as it leaves the execution decision on
-    the issue (#988).  Only a fresh decomposition child whose live handoff
+    the issue (#988).  Both the explicit fresh grant and the ordinary resume
+    carry this set on the handoff so those grants read as history.  Only a fresh decomposition child whose live handoff
     lineage carries a same-PR plan-replacement edge can retire anything; the
     retired set comes from ``verified_retired_child_plan_hashes``, so an
     unexplained plan divergence still retires nothing and keeps refusing.
@@ -16040,6 +16041,13 @@ def _is_completed_full_board_scheduler_record(
         return False
 
 
+def _managed_binding_retired_plan_hashes(
+    handoff: AuthenticatedIssueCreatedHandoff | None,
+) -> frozenset[str]:
+    """Plans a verified signed rebind retired for this managed handoff (#993)."""
+    return handoff.retired_plan_hashes if handoff is not None else frozenset()
+
+
 def _managed_binding_protection_mode(
     handoff: AuthenticatedIssueCreatedHandoff | None,
 ) -> str | None:
@@ -16111,6 +16119,7 @@ def _fresh_pr_qualification_snapshot(
     allow_plan_handoff_change: bool = False,
     planning_child_binding: _PlanningChildBinding | None = None,
     managed_protection_mode: str | None = None,
+    managed_retired_plan_hashes: frozenset[str] = frozenset(),
 ) -> tuple[PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None, AgentLoopConfig]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
     staged_owner = (
@@ -16279,6 +16288,7 @@ def _fresh_pr_qualification_snapshot(
                     issue_number=fresh_issue.number,
                     live_head=context.metadata.head_sha,
                     approved_plan_hash=approved_plan_context.plan_hash,
+                    retired_plan_hashes=managed_retired_plan_hashes,
                 )
         elif (
             fresh_handoff is None
@@ -16626,7 +16636,7 @@ def run_pr_loop(
                     (
                         fresh_retired_plan_hashes,
                         fetched_parent_issue_context,
-                    ) = _managed_ci_fresh_retired_plan_hashes(
+                    ) = _managed_ci_retired_plan_hashes(
                         runner,
                         config=config,
                         issue_context=issue_context,
@@ -16807,9 +16817,31 @@ def run_pr_loop(
                                 "the canonical issue plan."
                             )
                         approved_plan_context = recovered_scope
+                        ordinary_retired: frozenset[str] = frozenset()
+                        if canonical_handoff is not None:
+                            # A verified signed rebind leaves grants under the
+                            # superseded plan on the PR as history (#993).
+                            (
+                                ordinary_retired,
+                                fetched_parent_issue_context,
+                            ) = _managed_ci_retired_plan_hashes(
+                                runner,
+                                config=config,
+                                issue_context=issue_context,
+                                parent_issue_context=parent_issue_context,
+                                pr_number=pr_number,
+                            )
+                            if fetched_parent_issue_context is not parent_issue_context:
+                                parent_issue_context = fetched_parent_issue_context
+                                parent_issue_context_refreshed = True
                         managed_ci_handoff = dataclasses_replace(
                             managed_ci_handoff,
                             approved_plan_hash=recovered_scope.plan_hash,
+                            retired_plan_hashes=(
+                                frozenset()
+                                if recovered_scope.plan_hash in ordinary_retired
+                                else ordinary_retired
+                            ),
                         )
                     managed_ci_handoff = revalidate_issue_created_handoff(
                         runner,
@@ -20124,6 +20156,7 @@ def run_pr_loop(
                         allow_plan_handoff_change=True,
                         planning_child_binding=planning_child_binding,
                         managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                        managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                     )
                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                         log(
@@ -20486,6 +20519,7 @@ def run_pr_loop(
                                 allow_plan_handoff_change=True,
                                 planning_child_binding=planning_child_binding,
                                 managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                                managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                             )
                             if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                 unresolved_items = _advance_machine_obligations_for_head(
@@ -20869,6 +20903,7 @@ def run_pr_loop(
                             allow_plan_handoff_change=True,
                             planning_child_binding=planning_child_binding,
                             managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                            managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             prefetched_pr_context = fresh_context
@@ -20895,6 +20930,7 @@ def run_pr_loop(
                             allow_plan_handoff_change=True,
                             planning_child_binding=planning_child_binding,
                             managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                            managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             log(
@@ -21138,6 +21174,7 @@ def run_pr_loop(
                                         allow_plan_handoff_change=True,
                                         planning_child_binding=planning_child_binding,
                                         managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                                        managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                                     )
                                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                         prefetched_pr_context = fresh_context

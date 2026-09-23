@@ -2233,6 +2233,16 @@ def authorize_fresh_issue_created_resume(
         )
     predecessor: tuple[int, ManagedCiIssueAuthorization] | None = None
     for candidate in sorted(scoped_records, key=lambda item: item[0], reverse=True):
+        # A signed rebind changes only the plan, not the PR head (#993).  A
+        # grant at the live head under a verified retired plan is therefore
+        # the predecessor of this plan transition; any other same-head record
+        # would have been reused above or refused as incompatible.
+        if (
+            candidate[1].head_sha == metadata.head_sha
+            and candidate[1].approved_plan_hash in retired
+        ):
+            predecessor = candidate
+            break
         if _github_proves_descendant(
             runner,
             config=config,
@@ -3039,6 +3049,7 @@ def verify_managed_pr_plan_binding(
     issue_number: int,
     live_head: str | None,
     approved_plan_hash: str,
+    retired_plan_hashes: Collection[str] = (),
 ) -> None:
     """Require the PR-side authorization chain to bind this PR to the plan.
 
@@ -3065,6 +3076,9 @@ def verify_managed_pr_plan_binding(
         raise fail("no trusted managed-CI actor is configured")
     if not live_head:
         raise fail("the live head is unknown")
+    retired = frozenset(retired_plan_hashes)
+    if approved_plan_hash in retired:
+        retired = frozenset()
     comments = _api_list(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
@@ -3132,6 +3146,14 @@ def verify_managed_pr_plan_binding(
         if current is None or current.kind not in {"creation", "fresh"}:
             continue
         chain.append(current)
+        if all(
+            record.approved_plan_hash != approved_plan_hash
+            and record.approved_plan_hash in retired
+            for record in chain
+        ):
+            # A whole chain under verified retired plans is history left at
+            # the live head by a signed rebind that kept the head (#993).
+            continue
         if any(record.approved_plan_hash != approved_plan_hash for record in chain):
             raise fail("the authorization chain names a different approved plan")
         bound_terminals.add(terminal)
@@ -3147,6 +3169,19 @@ def verify_managed_pr_plan_binding(
             and len(fresh_roots) == 1
         ):
             raise fail("more than one distinct authorization terminal reaches the live head")
+
+
+def _is_retired_plan_history(
+    authorization: ManagedCiIssueAuthorization,
+    handoff: AuthenticatedIssueCreatedHandoff | None,
+) -> bool:
+    """Whether ``authorization`` was granted under a verified retired plan (#993)."""
+    return (
+        handoff is not None
+        and authorization.approved_plan_hash is not None
+        and authorization.approved_plan_hash != handoff.approved_plan_hash
+        and authorization.approved_plan_hash in handoff.retired_plan_hashes
+    )
 
 
 def _find_resume_audit(
@@ -3294,9 +3329,15 @@ def _find_resume_audit(
                 or authorization.base_ref != base_ref
                 or authorization.pr_number != pr_number
                 or (issue_number is not None and authorization.issue_number != issue_number)
-                or not authorization_matches(authorization, cid)
                 or not isinstance(cid, int)
             ):
+                malformed = True
+                continue
+            if _is_retired_plan_history(authorization, expected_handoff):
+                # History under a plan a verified signed rebind replaced (#993):
+                # neither a competing grant nor part of the live chain.
+                continue
+            if not authorization_matches(authorization, cid):
                 malformed = True
                 continue
             candidates.append(
