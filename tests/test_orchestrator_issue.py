@@ -4907,6 +4907,135 @@ def test_issue_loop_plan_first_resumes_with_only_missing_reviewer_for_current_pl
     assert runner.comments[-1].startswith("Planning complete for issue #56.")
 
 @pytest.mark.parametrize(
+    "persisted_as_machine", ["legacy", "promoted", "promoted-with-reviewer-notes"]
+)
+def test_issue_loop_plan_first_resume_clears_orchestrator_item_on_unanimous_approval(
+    tmp_path, persisted_as_machine
+):
+    """An orchestrator-authored plan item stays reviewer-clearable after resume (#1005).
+
+    Recovery used to promote it to an ``unknown`` machine obligation, which no
+    planning participant can clear, so every unanimous approval was followed by
+    another revision forever.  A ledger that already persisted the promoted
+    form must be recoverable too.
+    """
+    current_plan = "Revised plan.\n- Add state reconstruction.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    subject = _plan_subject(current_plan)
+    orchestrator_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Orchestrator",
+        source_round=1,
+        text="Reviewer(s) Codex approved without acknowledging the signed human requirements.",
+        status="blocking",
+        source_status="blocking",
+    )
+    if persisted_as_machine != "legacy":
+        notes = ("Synthetic machine record lacked trusted orchestrator lineage.",)
+        if persisted_as_machine == "promoted-with-reviewer-notes":
+            # Evidence appended by earlier approval rounds that could not clear it.
+            notes = (*notes, "Codex: Acknowledged in the revised plan.")
+        orchestrator_item = replace(
+            orchestrator_item,
+            authority="unknown",
+            obligation_kind="unknown",
+            lifecycle="repair_required",
+            obligation_identity="unknown:item-1",
+            notes=notes,
+        )
+    summary_comment = _attach_round_metadata(
+        "Orchestrator plan review.",
+        PostedRoundMetadata(
+            flow="plan",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject=subject,
+            new_items=(orchestrator_item,),
+        ),
+    )
+    coder_comment = _attach_round_metadata(
+        current_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=2,
+            subject=subject,
+            prior_items=(orchestrator_item,),
+        ),
+    )
+    runner = FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": summary_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:05:00Z", "body": coder_comment},
+        ],
+        codex_outputs=[
+            "Plan looks sound."
+            + prior_plan_item_dispositions("[item-1] resolved: acknowledged in the revised plan")
+            + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex",), max_rounds=3)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    agent_commands = [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
+    assert agent_commands == ["codex"]
+    assert runner.comments[-1].startswith("Planning complete for issue #56.")
+
+
+def test_issue_loop_plan_first_stops_when_only_unclearable_items_block_approval(tmp_path):
+    """A malformed plan machine record fails closed instead of revising forever (#1005).
+
+    Recovery restores only the recognized legacy promotion; any other machine
+    record (here the decoder's invalid-record blocker) must neither be cleared
+    by a reviewer approval nor drive another revision.
+    """
+    current_plan = "Revised plan.\n- Add state reconstruction.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    subject = _plan_subject(current_plan)
+    machine_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Orchestrator",
+        source_round=1,
+        text="Synthetic orchestrator blocker.",
+        status="blocking",
+        source_status="blocking",
+        authority="unknown",
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="invalid-machine-record",
+        notes=("Invalid persisted machine record: corrupted.",),
+    )
+    coder_comment = _attach_round_metadata(
+        current_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=2,
+            subject=subject,
+            prior_items=(machine_item,),
+        ),
+    )
+    runner = FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:05:00Z", "body": coder_comment},
+        ],
+        codex_outputs=[
+            "Plan looks sound."
+            + prior_plan_item_dispositions("[item-1] resolved: nothing remains")
+            + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex",), max_rounds=3)
+
+    with pytest.raises(AgentLoopError, match=r"item-1 \(owner Orchestrator, kind unknown\)"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+
+
+@pytest.mark.parametrize(
     "line",
     [
         "[item-1] same-plan: none",

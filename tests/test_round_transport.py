@@ -1273,6 +1273,302 @@ def test_legacy_machine_item_requires_orchestrator_lineage_for_promotion() -> No
     assert ambiguous_item.obligation_kind == "unknown"
 
 
+def test_plan_flow_never_promotes_orchestrator_item_to_machine_obligation() -> None:
+    """Planning has no machine clearance path, so recovery keeps the finding form (#1005)."""
+    legacy = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Reviewer(s) Codex approved without acknowledging the signed human requirements.",
+        status="blocking",
+        source_status="blocking",
+    )
+    body = _attach_round_metadata(
+        "Orchestrator plan review.",
+        PostedRoundMetadata(
+            flow="plan",
+            role="summary",
+            agent="Orchestrator",
+            round_number=3,
+            subject="plan-subject",
+            new_items=(legacy,),
+        ),
+    )
+
+    plan_item = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.new_items[0]
+
+    assert not plan_item.is_machine_obligation
+    assert plan_item.reviewer == "Orchestrator"
+    remaining, _future = _apply_unresolved_item_dispositions(
+        [plan_item],
+        {
+            "item-7": [
+                ReviewItemDisposition(
+                    reviewer="Codex",
+                    item_id="item-7",
+                    disposition="resolved",
+                    note="Acknowledged.",
+                )
+            ]
+        },
+        same_status="same-plan",
+    )
+    assert remaining == []
+
+
+def test_plan_flow_demotes_persisted_machine_obligation_to_reviewer_finding() -> None:
+    promoted = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Reviewer(s) Codex approved without acknowledging the signed human requirements.",
+        status="blocking",
+        source_status="blocking",
+        authority=UNKNOWN_MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="unknown:item-7",
+        notes=("Known machine item could not be bound to a failed head.",),
+    )
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=4,
+            subject="plan-subject",
+            prior_items=(promoted,),
+        ),
+    )
+
+    demoted = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert not demoted.is_machine_obligation
+    assert demoted.item_id == "item-7"
+    assert demoted.status == "blocking"
+    assert demoted.text == promoted.text
+    assert any("#1005" in note for note in demoted.notes)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # The decoder's blocker for an invalid persisted machine field/record.
+        {
+            "obligation_identity": "invalid-machine-record",
+            "notes": ("Invalid persisted machine field: authority",),
+        },
+        # A machine record that is not the legacy promotion shape.
+        {"reviewer": "Codex"},
+        {"obligation_identity": "unknown:item-99"},
+        # The legacy promotion clears ownership; contradictory ownership is
+        # not identifiable as that promotion.
+        {"resolution_owners": ("Codex",), "owner_states": (("Codex", "pending"),)},
+        # Authority/head combinations the legacy promotion cannot emit.
+        {"failed_head_sha": "plan-subject"},
+        {"notes": ()},
+        {"authority": MACHINE_AUTHORITY},
+        # The diagnostic must be followed only by reviewer disposition notes.
+        {
+            "notes": (
+                "Known machine item could not be bound to a failed head.",
+                "free-form tampering",
+            )
+        },
+        {
+            "notes": (
+                "Known machine item could not be bound to a failed head.",
+                "Synthetic machine record lacked trusted orchestrator lineage.",
+            )
+        },
+    ],
+)
+def test_plan_flow_keeps_unrecognized_machine_record_fail_closed(overrides) -> None:
+    item = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic blocker.",
+        status="blocking",
+        source_status="blocking",
+        authority=UNKNOWN_MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="unknown:item-7",
+        notes=("Known machine item could not be bound to a failed head.",),
+    )
+    from dataclasses import replace as _replace
+
+    item = _replace(item, **overrides)
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=4,
+            subject="plan-subject",
+            prior_items=(item,),
+        ),
+    )
+
+    kept = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert kept.is_machine_obligation
+    remaining, _future = _apply_unresolved_item_dispositions(
+        [kept],
+        {
+            "item-7": [
+                ReviewItemDisposition(
+                    reviewer="Codex", item_id="item-7", disposition="resolved", note="Looks fine."
+                )
+            ]
+        },
+        same_status="same-plan",
+    )
+    assert [entry.item_id for entry in remaining] == ["item-7"]
+
+
+def test_plan_flow_demotes_promotion_carrying_later_reviewer_notes() -> None:
+    """Disposition evidence appended after the promotion must not block recovery."""
+    promoted = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic blocker.",
+        status="blocking",
+        source_status="blocking",
+        notes=(
+            "Synthetic machine record lacked trusted orchestrator lineage.",
+            "Codex: Acknowledged in the revised plan.",
+            "Antigravity: Covered by step 2.",
+        ),
+        authority=UNKNOWN_MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="unknown:item-7",
+    )
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=5,
+            subject="plan-subject", prior_items=(promoted,),
+        ),
+    )
+
+    demoted = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert not demoted.is_machine_obligation
+    remaining, _future = _apply_unresolved_item_dispositions(
+        [demoted],
+        {
+            "item-7": [
+                ReviewItemDisposition(
+                    reviewer="Codex", item_id="item-7", disposition="resolved", note="Done."
+                )
+            ]
+        },
+        same_status="same-plan",
+    )
+    assert remaining == []
+
+
+def test_plan_flow_demotes_trusted_machine_authority_promotion() -> None:
+    promoted = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic blocker.",
+        status="blocking",
+        source_status="blocking",
+        authority=MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        failed_head_sha="plan-subject",
+        obligation_identity="unknown:item-7",
+    )
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=4,
+            subject="plan-subject", prior_items=(promoted,),
+        ),
+    )
+
+    demoted = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert not demoted.is_machine_obligation
+
+
+def test_plan_flow_keeps_invalid_persisted_authority_fail_closed() -> None:
+    payload = {
+        "flow": "plan",
+        "role": "coder",
+        "agent": "Claude",
+        "round_number": 4,
+        "subject": "plan-subject",
+        "prior_items": [
+            {
+                "item_id": "item-7",
+                "reviewer": "Orchestrator",
+                "source_round": 3,
+                "text": "Synthetic blocker.",
+                "status": "blocking",
+                "source_status": "blocking",
+                "authority": 17,
+                "obligation_kind": "unknown",
+            }
+        ],
+    }
+
+    kept = _extract_round_metadata_records(
+        [SimpleNamespace(body=_comment(payload))], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert kept.is_machine_obligation
+    assert kept.obligation_identity == "invalid-machine-record"
+
+
+def test_pr_flow_still_promotes_orchestrator_item_to_unknown_machine_obligation() -> None:
+    legacy = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic orchestrator blocker.",
+        status="blocking",
+        source_status="blocking",
+    )
+    body = _attach_round_metadata(
+        "Orchestrator summary.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=3,
+            subject="head123",
+            new_items=(legacy,),
+        ),
+    )
+
+    pr_item = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="pr"
+    )[0].metadata.new_items[0]
+
+    assert pr_item.is_machine_obligation
+    assert pr_item.obligation_kind == "unknown"
+
+
 def test_legacy_coder_checkpoint_recovers_failed_head_from_scheduler_provenance() -> None:
     legacy = UnresolvedReviewItem(
         item_id="item-30",

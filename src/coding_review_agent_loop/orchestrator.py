@@ -11823,6 +11823,25 @@ def _run_plan_first_loop(
                         for name, output in approved_review_outputs
                     ]
 
+        # A machine obligation has no planning clearance path: reviewer
+        # dispositions are evidence only, so after a unanimous approval it
+        # would drive another revision every round forever (#1005).  Recovery
+        # demotes only the recognized legacy promotion; a malformed or
+        # unrecognized machine record stays fail-closed here, stopping with a
+        # diagnostic naming the items instead of revising again.
+        unclearable_plan_items = [item for item in must_fix_items if item.is_machine_obligation]
+        if all_approved and unclearable_plan_items:
+            raise AgentLoopError(
+                f"Planning round {round_number}: every reviewer approved, but plan item(s) "
+                + ", ".join(
+                    f"{item.item_id} (owner {item.reviewer or 'unknown'}, kind "
+                    f"{item.obligation_kind or 'unknown'})"
+                    for item in unclearable_plan_items
+                )
+                + " are machine obligations that no planning participant can clear. "
+                "Stopping instead of revising an approved plan indefinitely; inspect the "
+                "item's round metadata and rerun."
+            )
         # The final gate evaluates every required plan reviewer, carried and
         # current alike.  A paused reviewer counts only through a qualifying
         # exact-key carried approval; a reviewer that blocked this round loses
