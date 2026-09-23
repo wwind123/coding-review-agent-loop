@@ -70,8 +70,12 @@ def _finite_number(value: object, *, name: str) -> float:
     return number
 
 
-def host_memory_bytes() -> int:
-    """Return physical memory, with a conservative portable fallback."""
+def probe_host_memory_bytes() -> int | None:
+    """Return physical memory, or ``None`` when no source is readable.
+
+    Worker-budget derivation needs to distinguish an unreadable host from a
+    genuinely small one; ``host_memory_bytes`` keeps its historic fallback.
+    """
     try:
         for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
             if line.startswith("MemTotal:"):
@@ -84,7 +88,12 @@ def host_memory_bytes() -> int:
             return int(value)
     except (AttributeError, OSError, ValueError):
         pass
-    return 1024 * 1024 * 1024
+    return None
+
+
+def host_memory_bytes() -> int:
+    """Return physical memory, with a conservative portable fallback."""
+    return probe_host_memory_bytes() or 1024 * 1024 * 1024
 
 
 def parse_limit(value: object, *, name: str, total_bytes: int | None = None) -> int | None:
@@ -994,6 +1003,29 @@ class InvocationHandle:
         env: Mapping[str, str] | None = None,
         manifest: CapabilityManifest | None = None,
     ) -> "InvocationHandle":
+        handle = cls.admit(policy, role=role, env=env, manifest=manifest)
+        try:
+            handle.bind_target(target_argv)
+        except BaseException:
+            handle.close()
+            raise
+        return handle
+
+    @classmethod
+    def admit(
+        cls,
+        policy: ContainmentPolicy,
+        *,
+        role: str,
+        env: Mapping[str, str] | None = None,
+        manifest: CapabilityManifest | None = None,
+    ) -> "InvocationHandle":
+        """Acquire the aggregate lease and resolve limits without a target.
+
+        ``bind_target`` later builds the launcher for the effective command
+        under the same lease, so a caller can size work from the admitted
+        limits before it decides which argv to run.
+        """
         manifest = manifest or preflight_containment(policy)
         invocation_id = (env or {}).get("AGENT_LOOP_INVOCATION_ID") or uuid.uuid4().hex
         limits = policy.role_limits(role)
@@ -1015,21 +1047,26 @@ class InvocationHandle:
         report = root / "reports" / f"{invocation_id}.json"
         report.unlink(missing_ok=True)
         unit = f"agent-loop-{invocation_id[:20]}.scope"
-        launch = tuple(target_argv)
         backend = manifest.backend
-        if manifest.memory_ceiling_claimed:
+        return cls(
+            policy, role, invocation_id, unit, report, (), limits, aggregate,
+            backend, manifest, lease, diagnostics=diagnostics,
+        )
+
+    def bind_target(self, target_argv: Sequence[str]) -> tuple[str, ...]:
+        """Build the launcher for ``target_argv`` without reacquiring the lease."""
+        launch = tuple(str(item) for item in target_argv)
+        if self.capabilities is not None and self.capabilities.memory_ceiling_claimed:
             # Re-resolve the child profile against the effective aggregate in
             # case another process holds a stricter active lease.
             launch = tuple(
                 build_scope_argv(
-                    policy, target_argv, report_path=report, unit_name=unit,
-                    limits=limits,
+                    self.policy, launch, report_path=self.report_path, unit_name=self.unit_name,
+                    limits=self.child_limits,
                 )
             )
-        return cls(
-            policy, role, invocation_id, unit, report, launch, limits, aggregate,
-            backend, manifest, lease, diagnostics=diagnostics,
-        )
+        self.launcher_argv = launch
+        return launch
 
     @property
     def managed(self) -> bool:

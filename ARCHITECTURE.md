@@ -769,6 +769,18 @@ recognized duplicate commands, not all overlapping work in arbitrary shells.
 Backend turn timeouts, whole-test-command watchdogs, and framework per-test
 timeouts are independent limits. See [containment](docs/local_agent_loop.md#process-tree-containment).
 
+A containment-aware test-worker budget (`test_workers.py`) is derived after
+admission from the limits that apply on each path (managed handle limits,
+cgroup ancestry, usable host memory, CPU affinity/quota) and exported to coder
+and repair agents as `AGENT_LOOP_TEST_WORKERS`. The parent-owned broker is the
+enforcement boundary: it applies the stricter of the parent and client values
+and injects a stdlib-only pytest plugin that clamps or refuses the final
+resolved pytest-xdist worker count and reports the gateways actually created.
+The local fallback is advisory by comparison, and the plugin is a prompt-slip
+safety net, not a sandbox. In clamp and refuse one test command per invocation
+holds a worker-budget lock. See
+[Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
+
 ## Other Entry Paths
 
 - `discuss` coordinates non-implementation debate, with optional research,
