@@ -1957,6 +1957,7 @@ from coding_review_agent_loop import orchestrator as _deg_orchestrator  # noqa: 
 from coding_review_agent_loop.protocol import (  # noqa: E402
     validate_structured_issue_implementation as _deg_validate_issue_implementation,
     parse_structured_pr_review as _deg_parse_pr_review,
+    parse_structured_plan_review as _deg_parse_plan_review,
 )
 from coding_review_agent_loop.repair_preservation import (  # noqa: E402
     normalize_architecture_impact_near_miss,
@@ -2086,6 +2087,10 @@ def _deg_run_repair(tmp_path, source, repaired, *, path, required=True, kind="is
         else (lambda text: _deg_parse_pr_review(
             text, reviewer="OpenAI Codex", architecture_status_mode="degradable"
         ))
+        if kind == "pr_review"
+        else (lambda text: _deg_parse_plan_review(
+            text, reviewer="OpenAI Codex", architecture_status_mode="degradable"
+        ))
     )
     extra = (
         {"require_architecture_impact_contract": True, "contract_refusal": contract_refusal}
@@ -2188,3 +2193,51 @@ def test_non_required_review_repair_keeps_todays_behavior(tmp_path, path):
     )
     assert parsed is not None
     assert parsed.architecture_impact.status == "unchanged"
+
+
+def _deg_review_text(kind, impact, *, extra_key=False):
+    from agent_loop_helpers import structured_plan_review
+
+    rendered = (
+        _deg_pr_review(summary="Looks good overall.")
+        if kind == "pr_review"
+        else structured_plan_review(summary="Looks good overall.")
+    )
+    return _deg_text(impact, extra_key=extra_key, rendered=rendered)
+
+
+@pytest.mark.parametrize("path", ["legacy", "execute"])
+@pytest.mark.parametrize("kind", ["pr_review", "plan_review"])
+@pytest.mark.parametrize("fabricated", ["unchanged", "changed"])
+def test_review_repair_cannot_restore_a_normalization_removed_assessment(
+    tmp_path, path, kind, fabricated
+):
+    # Through the real repair seam, with no required contract: pre-repair
+    # normalization removes the uncorroborated `modified`, and a repair that
+    # puts back any assessment is refused on both repair paths.
+    source = _deg_review_text(kind, _DEG_UNCORROBORATED, extra_key=True)
+    laundered = (
+        _DEG_FABRICATED_UNCHANGED
+        if fabricated == "unchanged"
+        else dict(_DEG_CORROBORATED, status="changed")
+    )
+    (repaired, parsed, attempts), _refusals = _deg_run_repair(
+        tmp_path, source, _deg_review_text(kind, laundered), path=path, required=False, kind=kind
+    )
+    assert parsed is None
+    assert attempts[-1].outcome == "invalid_output"
+    assert "must not introduce one" in attempts[-1].diagnostic
+
+
+@pytest.mark.parametrize("path", ["legacy", "execute"])
+@pytest.mark.parametrize("kind", ["pr_review", "plan_review"])
+def test_review_repair_without_an_assessment_is_accepted_with_the_record(tmp_path, path, kind):
+    source = _deg_review_text(kind, _DEG_UNCORROBORATED, extra_key=True)
+    (repaired, parsed, attempts), _refusals = _deg_run_repair(
+        tmp_path, source, _deg_review_text(kind, None), path=path, required=False, kind=kind
+    )
+    assert parsed is not None
+    assert parsed.architecture_impact is None
+    assert [r.outcome for r in parsed.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]

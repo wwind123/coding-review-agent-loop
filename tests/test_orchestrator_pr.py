@@ -13253,3 +13253,105 @@ def test_m985_unchanged_head_count_resets_after_an_external_head_advance():
     assert tracker.observe("C", "C") == 1
     # An unknown reviewed head never counts.
     assert tracker.observe(None, None) == 0
+
+
+# --- #925 round 5: the PR acknowledgement repair through the real flow -------
+
+_ACK_UNCORROBORATED = {"status": "modified", "rationale": "Something changed."}
+
+
+def _ack_with_impact(rendered, impact):
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    if impact is None:
+        payload.pop("architecture_impact", None)
+    else:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload) + rendered[split:]
+
+
+def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the current audit trail.",
+    )
+    metadata = PullRequestMetadata(
+        number=77, repo="OWNER/REPO", title="Acknowledgement repair",
+        head_branch="feature/review-context", base_branch="main",
+        head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: PullRequestReviewContext(
+            metadata=metadata, comments=(), human_requirements=(requirement,)
+        ),
+    )
+    # The reviewer approves with an uncorroborated near miss and no
+    # acknowledgement; acceptance removes the assessment and records it.
+    unacknowledged = _ack_with_impact(
+        structured_pr_review(summary="Codex approves.", reviewer="OpenAI Codex"),
+        _ACK_UNCORROBORATED,
+    )
+    repaired = _ack_with_impact(
+        structured_pr_review(
+            summary="Codex approves.", reviewer="OpenAI Codex",
+            human_requirements_resolved=True,
+        ),
+        None if repaired_status is None
+        else {"status": repaired_status, "rationale": "No architectural change."},
+    )
+    runner = FakeRunner(codex_outputs=[unacknowledged] * 3)
+    repair_calls = []
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    config = make_config(
+        tmp_path, reviewer="codex", max_rounds=1,
+        agent_max_retries=0, agent_retry_backoff_seconds=0,
+    )
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+        try:
+            outcome = run_pr_loop(runner, pr_number=77, config=config)
+        except AgentLoopError as exc:
+            outcome = exc
+    records = []
+    for comment in runner.pr_payload["comments"]:
+        match = re.search(
+            r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", comment["body"]
+        )
+        if match:
+            decoded = _decode_round_metadata(match.group("payload"))
+            if decoded.role == "reviewer":
+                records.append(decoded)
+    return outcome, records, repair_calls
+
+
+def test_pr_acknowledgement_repair_keeps_the_accepted_assessment_and_record(
+    tmp_path, monkeypatch
+):
+    outcome, records, repair_calls = _ack_pr_run(tmp_path, monkeypatch)
+    assert repair_calls, "the acknowledgement repair must run through the flow"
+    assert '"modified"' not in repair_calls[0]
+    # Exactly one reviewer publication, made from the accepted carrier before
+    # the gate; the successful repair posts nothing new.
+    assert len(records) == 1
+    assert records[0].architecture_impact is None
+    assert [r.outcome for r in records[0].architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+    assert outcome == 0, outcome
+
+
+@pytest.mark.parametrize("status", ["unchanged", "none"])
+def test_pr_acknowledgement_repair_cannot_add_an_assessment(tmp_path, monkeypatch, status):
+    outcome, records, repair_calls = _ack_pr_run(tmp_path, monkeypatch, repaired_status=status)
+    assert repair_calls
+    # The refused repair leaves the approval unacknowledged: nothing merges.
+    assert outcome != 0
+    assert all(record.architecture_impact is None for record in records)

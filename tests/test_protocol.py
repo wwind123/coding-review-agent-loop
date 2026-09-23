@@ -5344,6 +5344,74 @@ def test_patch_replace_rejects_every_synonym_with_route_forward(spelling):
     assert f"`{spelling}` is not accepted in a patch" in str(error.value)
 
 
+@pytest.mark.parametrize(
+    "spelling", ["Unchanged", "Changed", "UNCHANGED", "no change", "no_change", " none ", "Same"]
+)
+def test_case_and_separator_variants_degrade_instead_of_rejecting_the_envelope(spelling):
+    # The legacy table looked statuses up after case and separator
+    # normalization; degradable mode must degrade those variants, never
+    # reject the whole review envelope (#925 round 5).
+    from coding_review_agent_loop.protocol import parse_structured_plan_review
+
+    payload = json.dumps({
+        "schema_version": 1,
+        "kind": "plan_review",
+        "state": "approved",
+        "summary": "Plan looks good.",
+        "blocking_plan_issues": [],
+        "same_plan_followups": [],
+        "future_followups": [],
+        "prior_plan_item_dispositions": [],
+        "architecture_impact": dict(_CORROBORATED_IMPACT, status=spelling),
+    }) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+
+    parsed = parse_structured_plan_review(
+        payload, reviewer="OpenAI Codex", architecture_status_mode="degradable"
+    )
+    assert parsed.architecture_impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    (record,) = parsed.architecture_impact_degradations
+    assert record.outcome == "degraded-to-undetermined"
+    assert record.observed_preview == spelling.strip()
+    # Strict mode still rejects every variant.
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_structured_plan_review(payload, reviewer="OpenAI Codex")
+
+
+@pytest.mark.parametrize("spelling", ["Modified", "MODIFIED", " modified "])
+def test_case_variant_of_modified_honors_the_alias_when_corroborated(spelling):
+    impact, record = parse_architecture_impact_degradable(dict(_CORROBORATED_IMPACT, status=spelling))
+    assert impact.status == "changed"
+    assert record.outcome == "normalized-to-changed"
+    uncorroborated, record = parse_architecture_impact_degradable(
+        {"status": spelling, "rationale": "Something moved."}
+    )
+    assert uncorroborated.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert record.outcome == "degraded-to-undetermined"
+
+
+def test_case_variant_required_contract_response_survives_as_unsatisfied():
+    text = _with_impact(_deg_plan_state(), dict(_CORROBORATED_IMPACT, status="Unchanged"))
+    parsed = validate_structured_plan_state(
+        text, required_architecture_impact_contract=1, architecture_status_mode="degradable"
+    )
+    assert parsed.architecture_impact_contract.satisfied is False
+    assert [r.outcome for r in parsed.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+
+
+@pytest.mark.parametrize("spelling", ["Modified", "no_change", "None"])
+def test_patch_replace_route_forward_covers_case_and_separator_variants(spelling):
+    from coding_review_agent_loop.protocol import _parse_plan_patch_field_value
+
+    with pytest.raises(AgentLoopError) as error:
+        _parse_plan_patch_field_value(
+            "architecture_impact", dict(_CORROBORATED_IMPACT, status=spelling),
+            context="plan_revision_patch.operations[0].value",
+        )
+    assert "is not accepted in a patch" in str(error.value)
+
+
 def test_every_parser_call_site_in_src_chooses_its_mode_explicitly():
     """Static classification: no parser or helper call silently takes a default."""
     import ast

@@ -12297,3 +12297,171 @@ def test_refused_repair_candidate_is_decided_per_candidate_before_success(tmp_pa
     (record,) = usage.records
     assert record.outcome == "architecture_contract_unsatisfied"
     assert record.validation_status == "invalid"
+
+
+# --- #925 round 5: acknowledgement repairs through the real planning flow ----
+
+
+def _ack_staged_run(
+    tmp_path, monkeypatch, *, repaired_impact, repaired_status=None, max_rounds=None
+):
+    """Run staged planning whose primary approves with a degraded assessment.
+
+    The primary's review carries an uncorroborated `modified`, so acceptance
+    removes the assessment and records the degradation; it also lacks the
+    signed-human acknowledgement, which the post-acceptance repair adds.
+    """
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    unacknowledged = _deg_with(unacknowledged, _DEG_UNCORROBORATED)
+    if repaired_status is not None:
+        repaired_impact = {"status": repaired_status, "rationale": "No architectural change."}
+    repaired = _deg_with(repaired, repaired_impact)
+    runner = _FakeRunner(
+        claude_outputs=[plan_output] * 4,
+        codex_outputs=[unacknowledged] * 4,
+        gemini_outputs=[panel] * 4,
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    repair_calls = []
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    outcome = None
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+        try:
+            outcome = run_issue_loop(
+                runner, issue_number=56,
+                config=(
+                    _staged_plan_config(tmp_path)
+                    if max_rounds is None
+                    else _staged_plan_config(tmp_path, max_rounds=max_rounds)
+                ),
+                plan_first=True,
+            )
+        except AgentLoopError as exc:
+            outcome = exc
+    codex_records = [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    return outcome, codex_records, repair_calls, requirement
+
+
+def test_staged_acknowledgement_repair_keeps_the_degraded_assessment_and_record(
+    tmp_path, monkeypatch
+):
+    outcome, codex_records, repair_calls, requirement = _ack_staged_run(
+        tmp_path, monkeypatch, repaired_impact=None
+    )
+    assert outcome == 0
+    assert repair_calls, "the acknowledgement repair must run through the flow"
+    # The repair source is the canonical accepted text: the degraded
+    # assessment was already removed at acceptance.
+    assert '"modified"' not in repair_calls[0]
+    # Both the first record and the superseding re-post carry a null
+    # assessment plus the original degradation record.
+    assert len(codex_records) >= 2
+    for record in codex_records:
+        assert record.architecture_impact is None
+        assert [r.outcome for r in record.architecture_impact_degradations] == [
+            "degraded-to-undetermined"
+        ]
+    assert codex_records[-1].surfaced_reviewer_requirement_ids == (requirement.requirement_id,)
+
+
+@pytest.mark.parametrize("status", ["unchanged", "none"])
+def test_staged_acknowledgement_repair_cannot_add_an_assessment(tmp_path, monkeypatch, status):
+    outcome, codex_records, repair_calls, _requirement = _ack_staged_run(
+        tmp_path, monkeypatch, repaired_impact=None, repaired_status=status, max_rounds=1
+    )
+    assert repair_calls, "the acknowledgement repair must run through the flow"
+    # The refused repair is never published: no record asserts an assessment,
+    # and the primary's approval is never carried as acknowledged.
+    assert outcome != 0
+    for record in codex_records:
+        assert record.architecture_impact is None
+        assert record.surfaced_reviewer_requirement_ids == ()
+
+
+def _ack_nonstaged_run(tmp_path, monkeypatch, *, repaired_status=None):
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    unacknowledged = _deg_with(unacknowledged, _DEG_UNCORROBORATED)
+    repaired = _deg_with(
+        repaired,
+        None if repaired_status is None
+        else {"status": repaired_status, "rationale": "No architectural change."},
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output] * 4,
+        codex_outputs=[unacknowledged] * 4,
+        gemini_outputs=[panel] * 4,
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    repair_calls = []
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
+        agent_max_retries=0, agent_retry_backoff_seconds=0,
+    )
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+        try:
+            outcome = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        except AgentLoopError as exc:
+            outcome = exc
+    codex_records = [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    return outcome, codex_records, repair_calls
+
+
+def test_nonstaged_acknowledgement_repair_posts_one_comment_with_the_record(
+    tmp_path, monkeypatch
+):
+    outcome, codex_records, repair_calls = _ack_nonstaged_run(tmp_path, monkeypatch)
+    assert outcome == 0, outcome
+    assert repair_calls, "the acknowledgement repair must run through the flow"
+    # The comment posted before the gate, from the accepted carrier, is the
+    # only reviewer publication; a successful repair posts nothing new.
+    assert len(codex_records) == 1
+    (record,) = codex_records
+    assert record.architecture_impact is None
+    assert [r.outcome for r in record.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+
+
+@pytest.mark.parametrize("status", ["unchanged", "none"])
+def test_nonstaged_acknowledgement_repair_cannot_add_an_assessment(
+    tmp_path, monkeypatch, status
+):
+    outcome, codex_records, repair_calls = _ack_nonstaged_run(
+        tmp_path, monkeypatch, repaired_status=status
+    )
+    assert repair_calls
+    assert outcome != 0
+    assert len(codex_records) == 1
+    assert codex_records[0].architecture_impact is None
+

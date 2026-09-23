@@ -408,7 +408,7 @@ def _normalize_architecture_status(
     if status in {"changed", "unchanged"}:
         return status, None
     enum_error = AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
-    key = re.sub(r"[\s_]+", "-", status.strip().lower())
+    key = architecture_status_near_miss_key(status)
     canonical = _ARCHITECTURE_STATUS_SYNONYMS.get(key)
     if canonical is None:
         raise enum_error
@@ -566,6 +566,11 @@ def architecture_impact_near_miss_corroborated(payload: Mapping[str, object]) ->
 ARCHITECTURE_IMPACT_CLOSED_ENUM_RULE = "status-not-in-closed-enum"
 
 
+def architecture_status_near_miss_key(status: str) -> str:
+    """The legacy synonym-table key: trimmed, lower-cased, separators as `-`."""
+    return re.sub(r"[\s_]+", "-", status.strip().lower())
+
+
 def classify_architecture_status_near_miss(
     impact: Mapping[str, object], *, context: str
 ) -> tuple[str, ParseDegradation] | None:
@@ -579,17 +584,23 @@ def classify_architecture_status_near_miss(
     status_value = impact.get("status")
     if not isinstance(status_value, str) or status_value in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
         return None
-    if status_value in ARCHITECTURE_IMPACT_STATUS_ALIASES:
+    # Look the table up exactly as the legacy normalization did, so a case or
+    # separator variant (`Unchanged`, `Modified`, `no_change`) degrades one
+    # field instead of rejecting the envelope.
+    key = architecture_status_near_miss_key(status_value)
+    if key in ARCHITECTURE_IMPACT_STATUS_ALIASES:
         failure = _near_miss_predicate_failure(impact)
         if failure is None:
-            resolved = ARCHITECTURE_IMPACT_STATUS_ALIASES[status_value]
+            resolved = ARCHITECTURE_IMPACT_STATUS_ALIASES[key]
             rule = ARCHITECTURE_IMPACT_NEAR_MISS_RULE
             outcome = "normalized-to-changed"
         else:
             resolved = ARCHITECTURE_IMPACT_UNDETERMINED
             rule = f"{ARCHITECTURE_IMPACT_NEAR_MISS_RULE}; positive evidence missing: {failure}"
             outcome = "degraded-to-undetermined"
-    elif status_value in _ARCHITECTURE_STATUS_SYNONYMS:
+    elif key in _ARCHITECTURE_STATUS_SYNONYMS:
+        # Includes case variants of the declared values: only the exact
+        # spellings are declared, so `Unchanged` is never read as `unchanged`.
         resolved = ARCHITECTURE_IMPACT_UNDETERMINED
         rule = ARCHITECTURE_IMPACT_CLOSED_ENUM_RULE
         outcome = "degraded-to-undetermined"
@@ -7534,7 +7545,7 @@ def _parse_plan_patch_field_value(field_name: str, value: object, *, context: st
         if (
             isinstance(status_value, str)
             and status_value not in ARCHITECTURE_IMPACT_DECLARED_STATUSES
-            and status_value in _ARCHITECTURE_STATUS_SYNONYMS
+            and architecture_status_near_miss_key(status_value) in _ARCHITECTURE_STATUS_SYNONYMS
         ):
             raise AgentLoopError(
                 f"{context}.status must be `changed` or `unchanged`; "
