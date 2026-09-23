@@ -1330,6 +1330,7 @@ def test_plan_flow_demotes_persisted_machine_obligation_to_reviewer_finding() ->
         obligation_kind="unknown",
         lifecycle="repair_required",
         obligation_identity="unknown:item-7",
+        notes=("Known machine item could not be bound to a failed head.",),
     )
     body = _attach_round_metadata(
         "Revised plan.",
@@ -1368,6 +1369,10 @@ def test_plan_flow_demotes_persisted_machine_obligation_to_reviewer_finding() ->
         # The legacy promotion clears ownership; contradictory ownership is
         # not identifiable as that promotion.
         {"resolution_owners": ("Codex",), "owner_states": (("Codex", "pending"),)},
+        # Authority/head combinations the legacy promotion cannot emit.
+        {"failed_head_sha": "plan-subject"},
+        {"notes": ()},
+        {"authority": MACHINE_AUTHORITY},
     ],
 )
 def test_plan_flow_keeps_unrecognized_machine_record_fail_closed(overrides) -> None:
@@ -1382,6 +1387,7 @@ def test_plan_flow_keeps_unrecognized_machine_record_fail_closed(overrides) -> N
         obligation_kind="unknown",
         lifecycle="repair_required",
         obligation_identity="unknown:item-7",
+        notes=("Known machine item could not be bound to a failed head.",),
     )
     from dataclasses import replace as _replace
 
@@ -1415,6 +1421,35 @@ def test_plan_flow_keeps_unrecognized_machine_record_fail_closed(overrides) -> N
         same_status="same-plan",
     )
     assert [entry.item_id for entry in remaining] == ["item-7"]
+
+
+def test_plan_flow_demotes_trusted_machine_authority_promotion() -> None:
+    promoted = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic blocker.",
+        status="blocking",
+        source_status="blocking",
+        authority=MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        failed_head_sha="plan-subject",
+        obligation_identity="unknown:item-7",
+    )
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=4,
+            subject="plan-subject", prior_items=(promoted,),
+        ),
+    )
+
+    demoted = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert not demoted.is_machine_obligation
 
 
 def test_plan_flow_keeps_invalid_persisted_authority_fail_closed() -> None:

@@ -2300,6 +2300,10 @@ _LEGACY_MACHINE_REVIEWERS = {
 }
 
 
+_LEGACY_UNTRUSTED_LINEAGE_NOTE = "Synthetic machine record lacked trusted orchestrator lineage."
+_LEGACY_UNBOUND_HEAD_NOTE = "Known machine item could not be bound to a failed head."
+
+
 def _legacy_machine_kind(item: UnresolvedReviewItem) -> str | None:
     if item.item_id == "item-merge-conflict":
         return "merge-conflict"
@@ -2347,7 +2351,7 @@ def _legacy_machine_promotion(
             failed_head_sha=None,
             candidate_head_sha=None,
             obligation_identity=f"unknown:{item.item_id}",
-            notes=(*item.notes, "Synthetic machine record lacked trusted orchestrator lineage."),
+            notes=(*item.notes, _LEGACY_UNTRUSTED_LINEAGE_NOTE),
             resolution_owners=(),
             owner_states=(),
         )
@@ -2377,7 +2381,7 @@ def _legacy_machine_promotion(
             obligation_kind="unknown",
             lifecycle="repair_required",
             obligation_identity=f"unknown:{item.item_id}",
-            notes=(*item.notes, "Known machine item could not be bound to a failed head."),
+            notes=(*item.notes, _LEGACY_UNBOUND_HEAD_NOTE),
             resolution_owners=(),
             owner_states=(),
         )
@@ -2441,6 +2445,18 @@ def _is_legacy_promoted_plan_item(item: UnresolvedReviewItem) -> bool:
         and item.obligation_identity == f"unknown:{item.item_id}"
         and item.lifecycle == "repair_required"
         and item.candidate_head_sha is None
+        # Only the authority/head combinations the promotion can emit: machine
+        # authority bound to a failed head, or unknown authority with no head
+        # plus the diagnostic note the promotion appended for that outcome.
+        and (
+            (item.authority == MACHINE_AUTHORITY and bool(item.failed_head_sha))
+            or (
+                item.authority == UNKNOWN_MACHINE_AUTHORITY
+                and not item.failed_head_sha
+                and bool(item.notes)
+                and item.notes[-1] in {_LEGACY_UNTRUSTED_LINEAGE_NOTE, _LEGACY_UNBOUND_HEAD_NOTE}
+            )
+        )
         # The legacy promotion always clears ownership; a machine record that
         # still names owners is not identifiable as that promotion.
         and not item.resolution_owners

@@ -4934,6 +4934,7 @@ def test_issue_loop_plan_first_resume_clears_orchestrator_item_on_unanimous_appr
             obligation_kind="unknown",
             lifecycle="repair_required",
             obligation_identity="unknown:item-1",
+            notes=("Synthetic machine record lacked trusted orchestrator lineage.",),
         )
     summary_comment = _attach_round_metadata(
         "Orchestrator plan review.",
