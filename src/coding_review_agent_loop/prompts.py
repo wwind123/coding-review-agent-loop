@@ -3114,6 +3114,28 @@ text; do not use `rationale` or omit `disposition`.
 <!-- AGENT_PLAN_STATE: blocking -->
 -- {coder_signature}
 
+Whole-field `replace` accepts only these fields: `summary`, `plan_steps`,
+`architecture_impact`, `additional_closing_issue_ids`,
+`human_requirement_dispositions`, `execution_recommendation`,
+`external_dependencies`, `deferred_work`, `plan_actions`, `deferred_stages`.
+Never `replace` `risk_test_matrix` and never re-emit the whole matrix; revise it
+with these per-row operations (each object uses exactly the keys shown, and
+every `row`/`target_row`/`target_rows` entry is a complete matrix row):
+- `{{"op": "matrix_add", "row": {{...}}, "final_position": 0, "rationale": "..."}}`
+  adds a new row at a zero-based position in the revised matrix.
+- `{{"op": "matrix_edit", "row_id": "existing-row", "row": {{...}}, "rationale": "..."}}`
+  replaces one existing row, for example to correct its `expected_outcome`.
+- `{{"op": "matrix_retire", "row_id": "existing-row", "rationale": "..."}}`
+  removes one existing row.
+- `{{"op": "matrix_split", "source_row_id": "existing-row", "target_rows": [{{...}}, {{...}}], "rationale": "..."}}`
+  replaces one row with two or more rows.
+- `{{"op": "matrix_merge", "source_row_ids": ["row-a", "row-b"], "target_row": {{...}}, "rationale": "..."}}`
+  consolidates two or more rows into one.
+- `{{"op": "matrix_metadata_replace", "value": {{"applicability": "applicable", "important_exclusions": ["..."]}}, "audit_operation": "change", "rationale": "..."}}`
+  replaces matrix-level metadata; `audit_operation` is `change`, `split`, or
+  `merge`, and `value` may add `not_applicable_rationale`.
+No other operation names exist.
+
 Operations are applied atomically and simultaneously. The patch must contain
 at least one real change, and its binding must match the authenticated values
 above exactly. Repair may fix only response-envelope presentation; it cannot

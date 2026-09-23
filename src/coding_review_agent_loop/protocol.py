@@ -6947,6 +6947,19 @@ PLAN_REVISION_PATCH_REPLACEABLE_FIELDS = frozenset(
         "deferred_stages",
     }
 )
+# Fields that cannot take a wholesale ``replace`` but do have a write path
+# through dedicated per-row operations.  Diagnostics name these operations so
+# an author who picked the wrong operation can recover on the next attempt.
+PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS: dict[str, tuple[str, ...]] = {
+    "risk_test_matrix": (
+        "matrix_add",
+        "matrix_edit",
+        "matrix_retire",
+        "matrix_split",
+        "matrix_merge",
+        "matrix_metadata_replace",
+    ),
+}
 _PLAN_REVISION_PATCH_IDENTITY_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -7194,15 +7207,35 @@ def _parse_matrix_metadata(value: object, *, context: str) -> RiskTestMatrixMeta
     )
 
 
+def _format_operation_names(names: Sequence[str]) -> str:
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + " or " + names[-1]
+
+
+def _ordered_patch_operation_keys() -> tuple[str, ...]:
+    matrix_ops = PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS["risk_test_matrix"]
+    return ("replace", *matrix_ops, *sorted(PLAN_REVISION_PATCH_OPERATION_KEYS - {"replace", *matrix_ops}))
+
+
 def _parse_plan_revision_patch_operation(value: object, *, context: str) -> PlanRevisionPatchOperation:
     payload = _expect_object(value, context=context)
     op = _expect_non_empty_string(payload.get("op"), context=f"{context}.op")
     if op not in PLAN_REVISION_PATCH_OPERATION_KEYS:
-        raise AgentLoopError(f"{context}.op is unknown: {op!r}.")
+        raise AgentLoopError(
+            f"{context}.op is unknown: {op!r}; valid operations are "
+            f"{_format_operation_names(_ordered_patch_operation_keys())}."
+        )
     if op == "replace":
         _expect_exact_keys(payload, context=context, required={"op", "field", "value"})
         field_name = _expect_non_empty_string(payload["field"], context=f"{context}.field")
         if field_name not in PLAN_REVISION_PATCH_REPLACEABLE_FIELDS:
+            dedicated = PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS.get(field_name)
+            if dedicated:
+                raise AgentLoopError(
+                    f"{context}: `{field_name}` cannot be revised with `replace`; "
+                    f"use {_format_operation_names(dedicated)}."
+                )
             raise AgentLoopError(f"{context}.field `{field_name}` is derived or not writable.")
         return PlanRevisionPatchOperation(
             op=op,

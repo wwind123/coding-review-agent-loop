@@ -16,6 +16,8 @@ from coding_review_agent_loop.plan_assembly import (
     structured_plan_revision_to_payload,
 )
 from coding_review_agent_loop.protocol import (
+    PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS,
+    PLAN_REVISION_PATCH_OPERATION_KEYS,
     RISK_MATRIX_MAX_ROWS,
     parse_plan_revision_patch,
     validate_structured_plan_revision_patch,
@@ -98,6 +100,46 @@ def test_patch_parser_is_strict_and_distinguishes_legacy_plan_revision() -> None
         parse_plan_revision_patch({**payload, "kind": "plan_revision"})
     with pytest.raises(AgentLoopError, match="unknown field"):
         parse_plan_revision_patch({**payload, "unexpected": True})
+
+
+def test_replace_on_matrix_names_dedicated_operations_instead_of_non_writable() -> None:
+    """Issue #922: the rejection must be truthful and name a usable operation."""
+    state = _state(_base([_row("row-a")]))
+    payload = _patch(
+        state,
+        [
+            {"op": "replace", "field": "summary", "value": "Revised summary."},
+            {"op": "replace", "field": "risk_test_matrix", "value": {"applicability": "applicable"}},
+        ],
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        parse_plan_revision_patch(payload)
+    message = str(excinfo.value)
+    assert "derived or not writable" not in message
+    assert "plan_revision_patch.operations[1]: `risk_test_matrix` cannot be revised with `replace`" in message
+    assert (
+        "use matrix_add, matrix_edit, matrix_retire, matrix_split, matrix_merge or matrix_metadata_replace."
+        in message
+    )
+    assert set(PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS["risk_test_matrix"]) <= PLAN_REVISION_PATCH_OPERATION_KEYS
+
+
+def test_replace_on_genuinely_derived_field_keeps_non_writable_wording() -> None:
+    state = _state(_base([_row("row-a")]))
+    payload = _patch(state, [{"op": "replace", "field": "risk_test_matrix_changes", "value": []}])
+    with pytest.raises(AgentLoopError, match="`risk_test_matrix_changes` is derived or not writable"):
+        parse_plan_revision_patch(payload)
+
+
+def test_unknown_operation_names_every_valid_operation() -> None:
+    state = _state(_base([_row("row-a")]))
+    payload = _patch(state, [{"op": "change", "row_id": "row-a", "row": _row("row-a")}])
+    with pytest.raises(AgentLoopError) as excinfo:
+        parse_plan_revision_patch(payload)
+    message = str(excinfo.value)
+    assert "op is unknown: 'change'" in message
+    for op in PLAN_REVISION_PATCH_OPERATION_KEYS:
+        assert op in message
 
 
 def test_single_field_replacement_preserves_undeclared_authenticated_payload() -> None:
