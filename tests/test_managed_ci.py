@@ -1757,6 +1757,94 @@ def test_fresh_authorization_supersedes_prior_grant_for_verified_descendant(tmp_
     assert resume[1]["nonce"] == advanced.override_nonce
 
 
+def _rebound_plan_fresh_setup(tmp_path):
+    """A pre-rebind grant under plan ``a`` and a descendant head (#993)."""
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    first = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+        approved_plan_hash="a" * 64,
+    )
+    runner.rest_pr["head"]["sha"] = "descendant"
+    runner.compare_payload = {
+        "status": "ahead",
+        "base_commit": {"sha": "abc123"},
+        "merge_base_commit": {"sha": "abc123"},
+    }
+    live = replace(
+        metadata(), head_branch="agent-loop/managed-643", head_sha="descendant"
+    )
+    return runner, config, first, live
+
+
+def test_fresh_authorization_treats_verified_retired_plan_grant_as_history(tmp_path):
+    runner, config, first, live = _rebound_plan_fresh_setup(tmp_path)
+
+    rebound = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643, metadata=live,
+        approved_plan_hash="b" * 64,
+        retired_plan_hashes=frozenset({"a" * 64}),
+    )
+
+    assert rebound.authorization_kind == "fresh"
+    assert rebound.approved_plan_hash == "b" * 64
+    assert rebound.retired_plan_hashes == frozenset({"a" * 64})
+    parsed = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert parsed is not None
+    assert parsed.approved_plan_hash == "b" * 64
+    assert parsed.predecessor_comment_id == first.authorization_comment_id
+
+    # A rerun reuses the new grant, and re-validation keeps the retired set.
+    posted = len(runner.intent_comments)
+    revalidated = revalidate_issue_created_handoff(
+        runner, config=config, handoff=rebound, metadata=live
+    )
+    assert revalidated.authorization_comment_id == rebound.authorization_comment_id
+    assert revalidated.retired_plan_hashes == frozenset({"a" * 64})
+    assert len(runner.intent_comments) == posted
+
+
+@pytest.mark.parametrize(
+    "retired",
+    [
+        frozenset(),
+        frozenset({"c" * 64}),
+        # The live plan itself can never be retired.
+        frozenset({"a" * 64, "b" * 64}),
+    ],
+)
+def test_fresh_authorization_still_refuses_unexplained_plan_divergence(tmp_path, retired):
+    runner, config, _first, live = _rebound_plan_fresh_setup(tmp_path)
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="conflicting actor-owned record"):
+        authorize_fresh_issue_created_resume(
+            runner, config=config, pr_number=7, issue_number=643, metadata=live,
+            approved_plan_hash="b" * 64,
+            retired_plan_hashes=retired,
+        )
+
+    assert len(runner.intent_comments) == posted
+
+
+def test_fresh_authorization_retired_plan_does_not_excuse_other_field_mismatch(tmp_path):
+    runner, config, _first, live = _rebound_plan_fresh_setup(tmp_path)
+    # The retired-plan grant also carries an unknown label event: still a conflict.
+    runner.issue_events.clear()
+    runner.issue_events.append(label_event(202))
+
+    with pytest.raises(AgentLoopError, match="conflicting actor-owned record"):
+        authorize_fresh_issue_created_resume(
+            runner, config=config, pr_number=7, issue_number=643, metadata=live,
+            approved_plan_hash="b" * 64,
+            retired_plan_hashes=frozenset({"a" * 64}),
+        )
+
+
 def test_fresh_authorization_rejects_actor_owned_record_with_unknown_label_event(tmp_path):
     forged = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,

@@ -9226,6 +9226,55 @@ def verified_retired_child_plan_hashes(
     return frozenset(retired)
 
 
+def _managed_ci_fresh_retired_plan_hashes(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    parent_issue_context: IssueContext | None,
+    pr_number: int,
+) -> tuple[frozenset[str], IssueContext | None]:
+    """Plans a verified signed re-plan retired, for a fresh managed-CI grant (#993).
+
+    A rebind leaves the managed-CI authorization recorded under the
+    superseded plan on the PR, just as it leaves the execution decision on
+    the issue (#988).  Only a fresh decomposition child whose live handoff
+    lineage carries a same-PR plan-replacement edge can retire anything; the
+    retired set comes from ``verified_retired_child_plan_hashes``, so an
+    unexplained plan divergence still retires nothing and keeps refusing.
+
+    Returns the retired hashes and the (possibly newly fetched) parent issue
+    context so the caller does not refetch it.
+    """
+    lineage = resolve_issue_pr_handoff_lineage(
+        issue_context.comments, issue_number=issue_context.number, repo=config.repo
+    )
+    if lineage is None or lineage.replaced is None or lineage.latest.pr_number != pr_number:
+        return frozenset(), parent_issue_context
+    if _fresh_phase_marker_payload(issue_context) is None:
+        return frozenset(), parent_issue_context
+    staged_parent = _infer_staged_parent_issue(issue_context)
+    if parent_issue_context is None and staged_parent is not None:
+        parent_issue_context = get_issue_context(
+            runner, config=config, issue_number=staged_parent
+        )
+    fresh_child = _resolve_fresh_child_provenance(
+        issue_context=issue_context, parent_issue_context=parent_issue_context
+    )
+    if fresh_child is None or not fresh_child.route.is_planning:
+        return frozenset(), parent_issue_context
+    retired = verified_retired_child_plan_hashes(
+        issue_context.comments,
+        repo=config.repo,
+        parent_plan_context=fresh_child.parent_plan_context,
+        child_issue=issue_context.number,
+        parent_issue=fresh_child.parent_issue,
+        stage_id=fresh_child.stage_id,
+        pr_number=pr_number,
+    )
+    return retired, parent_issue_context
+
+
 def _require_authorized_replan_state(
     comments: Sequence[object],
     *,
@@ -16538,6 +16587,7 @@ def run_pr_loop(
                 issue_number=fresh_issue_number,
                 repo=config.repo,
             )
+            fresh_retired_plan_hashes: frozenset[str] = frozenset()
             if canonical_handoff is not None:
                 if canonical_handoff.pr_number != pr_number:
                     raise AgentLoopError(
@@ -16573,6 +16623,19 @@ def run_pr_loop(
                             "match the canonical issue plan."
                         )
                     approved_plan_context = recovered
+                    (
+                        fresh_retired_plan_hashes,
+                        fetched_parent_issue_context,
+                    ) = _managed_ci_fresh_retired_plan_hashes(
+                        runner,
+                        config=config,
+                        issue_context=issue_context,
+                        parent_issue_context=parent_issue_context,
+                        pr_number=pr_number,
+                    )
+                    if fetched_parent_issue_context is not parent_issue_context:
+                        parent_issue_context = fetched_parent_issue_context
+                        parent_issue_context_refreshed = True
             else:
                 resumed_plan = _resume_plan_round(
                     issue_context.comments,
@@ -16625,6 +16688,7 @@ def run_pr_loop(
                     approved_plan_context.plan_hash
                     if approved_plan_context is not None else None
                 ),
+                retired_plan_hashes=fresh_retired_plan_hashes,
             )
             authenticated_managed_resume = AuthenticatedManagedResume(
                 origin="issue-created",

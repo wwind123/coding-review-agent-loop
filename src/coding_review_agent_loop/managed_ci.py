@@ -8,7 +8,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import datetime
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -222,6 +222,9 @@ class AuthenticatedIssueCreatedHandoff:
     authorization_kind: Literal["creation", "fresh", "continuity"] = "creation"
     authorization_comment_id: int | None = None
     approved_plan_hash: str | None = None
+    # Approved plans a verified signed child-plan supersession retired (#993).
+    # Carried so a fresh re-validation treats their authorizations as history.
+    retired_plan_hashes: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1989,8 +1992,19 @@ def authorize_fresh_issue_created_resume(
     issue_number: int,
     metadata: PullRequestMetadata,
     approved_plan_hash: str | None = None,
+    retired_plan_hashes: Collection[str] = (),
 ) -> AuthenticatedIssueCreatedHandoff:
-    """Create a new operator grant for a PR whose original checkpoint is absent."""
+    """Create a new operator grant for a PR whose original checkpoint is absent.
+
+    ``retired_plan_hashes`` names approved plans that a verified signed
+    child-plan supersession replaced (#993).  An authorization recorded under
+    such a plan is history, not a competing grant, so its plan hash alone does
+    not make it conflicting.  Every other field is still compared, and a plan
+    divergence with no verified supersession edge still refuses.
+    """
+    retired = frozenset(retired_plan_hashes)
+    if approved_plan_hash is None or approved_plan_hash in retired:
+        retired = frozenset()
     if not config.allow_unprotected_managed_ci:
         raise AgentLoopError(
             "Managed-CI fresh authorization requires --allow-unprotected-managed-ci."
@@ -2161,6 +2175,7 @@ def authorize_fresh_issue_created_resume(
             authorization_kind=record.kind,
             authorization_comment_id=comment_id,
             approved_plan_hash=record.approved_plan_hash,
+            retired_plan_hashes=retired,
         )
     issue_timeline = _api_list(
         runner,
@@ -2207,7 +2222,10 @@ def authorize_fresh_issue_created_resume(
         or record.protection != protection.state
         or record.waiver != "allow-unprotected-managed-ci"
         or record.label_event_id not in valid_label_event_ids
-        or (record.approved_plan_hash or None) != (approved_plan_hash or None)
+        or (
+            (record.approved_plan_hash or None) != (approved_plan_hash or None)
+            and record.approved_plan_hash not in retired
+        )
     ]
     if incompatible_records:
         raise AgentLoopError(
@@ -2287,6 +2305,7 @@ def authorize_fresh_issue_created_resume(
         authorization_kind="fresh",
         authorization_comment_id=comment_id,
         approved_plan_hash=approved_plan_hash,
+        retired_plan_hashes=retired,
     )
 
 
@@ -2308,6 +2327,7 @@ def revalidate_issue_created_handoff(
             issue_number=handoff.issue_number,
             metadata=metadata,
             approved_plan_hash=handoff.approved_plan_hash,
+            retired_plan_hashes=handoff.retired_plan_hashes,
         )
         # A fresh retry may find a continuity terminal for the live head.  It
         # is still a fresh operator invocation, but the terminal's nonce is
@@ -2370,6 +2390,7 @@ def revalidate_issue_created_handoff(
         override_nonce=terminal_override_nonce,
         opening_override_nonce=opening_override_nonce,
         approved_plan_hash=handoff.approved_plan_hash,
+        retired_plan_hashes=handoff.retired_plan_hashes,
     )
 
 
