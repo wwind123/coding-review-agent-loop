@@ -1343,14 +1343,9 @@ def test_managed_ci_resume_rejects_supplied_scope_conflicting_with_parent_plan(
     assert_no_agent_process(runner)
 
 
-def test_child_planning_cycle_resets_the_staged_planning_policy(tmp_path, monkeypatch):
-    """`derived-configs-neutralize-planning-policy` (#905, from #841)."""
+def _capture_child_planning_config(tmp_path, monkeypatch, capsys, **config_overrides):
     parent_config = make_config(
-        tmp_path,
-        reviewer=("codex", "gemini"),
-        plan_review_policy="primary-then-panel",
-        primary_plan_reviewer="codex",
-        plan_review_force_full=True,
+        tmp_path, reviewer=("codex", "gemini"), quiet=False, **config_overrides
     )
     captured = {}
 
@@ -1377,15 +1372,61 @@ def test_child_planning_cycle_resets_the_staged_planning_policy(tmp_path, monkey
         parent_issue=55,
         child_issue_number=56,
     ) == 0
+    return parent_config, captured["config"], capsys.readouterr().err
 
-    child_config = captured["config"]
+
+def test_child_planning_cycle_resets_the_staged_planning_scheduler_state(
+    tmp_path, monkeypatch, capsys
+):
+    """`derived-configs-neutralize-planning-policy` (#905, from #841; narrowed by #929)."""
+    parent_config, child_config, err = _capture_child_planning_config(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+        plan_review_force_full=True,
+    )
+
+    # Parent scheduling state never crosses the boundary: the child plan is a
+    # fresh artifact, so the force-full latch and the execution mode reset.
     assert child_config.plan_execution_mode == "auto"
-    # The child plan review stays full-board by configuration reset, not by
-    # convention: the parent's staged policy is never inherited.
+    assert child_config.plan_review_force_full is False
+    assert child_config.reviewer == parent_config.reviewer
+    # The dropped explicit override is reported once rather than inferred.
+    assert err.count("does not inherit --plan-review-force-full") == 1
+
+
+def test_child_planning_cycle_inherits_the_operator_plan_review_policy(
+    tmp_path, monkeypatch, capsys
+):
+    """#929: the operator's run-wide policy choice applies to child plans."""
+    _parent_config, child_config, err = _capture_child_planning_config(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+
+    assert child_config.plan_review_policy == "primary-then-panel"
+    assert child_config.primary_plan_reviewer == "codex"
+    assert child_config.plan_review_force_full is False
+    # Nothing explicit was overridden, so nothing divergent is reported.
+    assert "does not inherit" not in err
+
+
+def test_child_planning_cycle_keeps_the_default_full_board_policy(
+    tmp_path, monkeypatch, capsys
+):
+    _parent_config, child_config, err = _capture_child_planning_config(
+        tmp_path, monkeypatch, capsys
+    )
+
     assert child_config.plan_review_policy == "all-reviewers"
     assert child_config.primary_plan_reviewer is None
     assert child_config.plan_review_force_full is False
-    assert child_config.reviewer == parent_config.reviewer
+    assert "does not inherit" not in err
 
 
 # --- #931: field-classified inherited-row comparison -----------------------

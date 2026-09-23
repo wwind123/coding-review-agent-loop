@@ -547,7 +547,8 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     assert "never recover class D" in text
     # Carried approvals and the exclusions.
     assert "HUMAN_REQUIREMENTS_RESOLVED" in text
-    assert "Discussion-mode scheduling and the child-planning cycle always invoke the full" in text
+    assert "Discussion-mode scheduling always invokes the full board" in text
+    assert "A child-planning cycle inherits the operator's `--plan-review-policy`" in text
 
 
 def test_docs_document_the_flow_aware_planning_policy_evaluation():

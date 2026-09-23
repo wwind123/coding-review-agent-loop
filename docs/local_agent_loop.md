@@ -2462,10 +2462,16 @@ than carrying the plan into implementation.
 
 #### Exclusions
 
-Discussion-mode scheduling and the child-planning cycle always invoke the full
-board, enforced by configuration reset rather than by convention: the child
-planning configuration and the semantic-dedupe isolated provider configuration
-both reset the planning policy, primary, and force-full fields. PR-flow
+Discussion-mode scheduling always invokes the full board, enforced by
+configuration reset rather than by convention: the semantic-dedupe isolated
+provider configuration resets the planning policy, primary, and force-full
+fields. A child-planning cycle inherits the operator's `--plan-review-policy`
+and `--primary-plan-reviewer`, because they express how plan review is
+conducted across the run, but no parent scheduling state crosses the boundary:
+the child configuration resets the force-full latch and uses the `auto`
+execution mode, since the child plan is a fresh artifact that no parent
+approval covers. When the parent run was given `--plan-review-force-full`, the
+child cycle logs once that the override is not inherited. PR-flow
 scheduling, qualification, managed CI, branch protection, and merge behavior are
 unchanged. The staged planning policy remains non-default until a flow-separated
 frozen evaluation justifies the latency and cost tradeoff. That comparison is
