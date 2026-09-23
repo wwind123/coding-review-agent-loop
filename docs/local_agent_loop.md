@@ -164,6 +164,16 @@ stops for a human decision. Identical duplicates collapse; records for different
 superseded hashes coexist (one per historical re-plan); two distinct records for
 the same superseded hash always stop for a human decision.
 
+The record is consulted for every handed-off plan, not only an inadmissible
+one: admissibility asks whether the plan is broken, the signed record asks
+whether a human authorized replacing it. An admissible plan with no matching
+record resumes its PR unchanged; an admissible plan with a matching record (a
+deliberate re-plan such as an authorized scope reduction) reopens planning
+exactly like an inadmissible one. In that case the planner receives the
+record's rationale as the revision instruction, and a resumed approval of the
+superseded plan runs the revision instead of approving and rebinding the plan
+the human asked to replace.
+
 With exactly one matching record and an open canonical PR, planning reopens:
 
 - The record's digest is written into the round metadata of every planner round
@@ -205,6 +215,13 @@ With exactly one matching record and an open canonical PR, planning reopens:
   before the rebind counts under the new plan.
 
 `agent-loop pr <n>` never re-plans or rebinds; it prints the issue-mode route.
+That includes an admissible bound plan with a pending matching signed record:
+PR mode stops before any reviewer runs rather than reviewing the PR against a
+scope no approved plan contains, since a PR-mode coder turn cannot produce the
+replacement plan. The same check runs again on the freshly fetched child issue
+at qualification and before every approval or merge, under every review
+policy and with or without `--auto-merge`. A record posted while reviewers
+were running therefore stops the run before it approves or merges.
 Keep the signed record on the child issue after the rebind. Re-planning
 continues the child's round numbering, so a higher `--max-rounds` may be needed.
 Not supported: abandoning or replacing the PR, re-planning direct-implementation
@@ -3716,6 +3733,19 @@ being relevant the moment the base advances.
   for merging. If the head is still unchanged the next time a conflict round
   would be dispatched (the coder made no progress), the loop stops cleanly
   with an explanatory comment instead of looping.
+
+### Unchanged-head follow-ups
+
+A PR follow-up coder turn that leaves the PR head
+unchanged is counted. After two consecutive such turns the loop stops with a
+human-review error instead of starting another review of the same diff, which
+could only repeat the same verdict until `--max-rounds` ran out. A turn that
+moves the head resets the count, and the count belongs to one head: a round
+that starts on a different head, for example after an external push, starts
+from zero. For a planning child, the error also names the
+signed child-plan supersession route and the issue-mode rerun command, because
+a finding that requires re-planning can never be satisfied by a PR-mode coder
+turn.
 
 ### Focused, bounded local test selection
 
