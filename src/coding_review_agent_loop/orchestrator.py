@@ -8959,6 +8959,11 @@ class _PlanSupersessionBinding:
     rationale: str = ""
 
 
+# Consecutive PR follow-up coder turns allowed to leave the head unchanged
+# before the loop stops instead of re-reviewing an identical diff (#985).
+MAX_UNCHANGED_HEAD_CODER_TURNS = 2
+
+
 def _child_plan_admissibility_failure(
     parent_plan_context: ApprovedPlanContext,
     child_plan_context: ApprovedPlanContext,
@@ -16310,6 +16315,29 @@ def run_pr_loop(
     # Captured once by the provenance block for a fresh planning child and
     # passed to every qualification snapshot (#936); ``None`` otherwise.
     planning_child_binding: _PlanningChildBinding | None = None
+
+    def recheck_pending_child_plan_supersession() -> None:
+        """Refetch the child issue before any approval or merge (#985).
+
+        A signed supersession posted while reviewers ran must stop the run on
+        every finalization path, not only those that take a qualification
+        snapshot.
+        """
+        if planning_child_binding is None or approved_plan_context is None:
+            return
+        fresh_child_issue = get_issue_context(
+            runner, config=config, issue_number=planning_child_binding.child_issue
+        )
+        _reject_pending_child_plan_supersession(
+            fresh_child_issue.comments,
+            binding=planning_child_binding,
+            plan_hash=approved_plan_context.plan_hash,
+            pr_number=pr_number,
+            stopped="no approval or merge was attempted",
+        )
+
+    # Consecutive coder follow-ups that left the PR head unchanged (#985).
+    unchanged_head_coder_turns = 0
     try:
         bootstrap_cwd = github_bootstrap_cwd(config)
         initial_pr_context = get_pr_review_context(
@@ -20104,6 +20132,7 @@ def run_pr_loop(
                             f"PR #{pr_number} was released to ordinary CI, but recovery provenance "
                             "could not be correlated; no merge attempted."
                         )
+                    recheck_pending_child_plan_supersession()
                     merged = _finalize_ordinary_recovery_checked(
                         runner,
                         config=config,
@@ -20327,6 +20356,7 @@ def run_pr_loop(
                         unresolved_items = _clear_machine_obligations(
                             unresolved_items, kind="github-pr-checks"
                         )
+                        recheck_pending_child_plan_supersession()
                         _ensure_finalization_ready(
                             pr_number=pr_number,
                             round_number=round_number,
@@ -20833,6 +20863,7 @@ def run_pr_loop(
                                         f"PR #{pr_number} managed resume could not be correlated to ordinary "
                                         "recovery CI; no merge attempted."
                                     )
+                                recheck_pending_child_plan_supersession()
                                 merged = _finalize_ordinary_recovery_checked(
                                     runner,
                                     config=config,
@@ -20923,6 +20954,7 @@ def run_pr_loop(
                                 unresolved_items = _clear_machine_obligations(
                                     unresolved_items, kind="managed-exact-head-ci"
                                 )
+                                recheck_pending_child_plan_supersession()
                                 _ensure_finalization_ready(
                                     pr_number=pr_number,
                                     round_number=round_number,
@@ -21112,6 +21144,7 @@ def run_pr_loop(
                                     f"PR #{pr_number} ordinary recovery provenance is unavailable; "
                                     "no merge attempted."
                                 )
+                            recheck_pending_child_plan_supersession()
                             merged = _finalize_ordinary_recovery_checked(
                                 runner,
                                 config=config,
@@ -21140,6 +21173,7 @@ def run_pr_loop(
                             )["coder_blockers"]
                         )
                     if not must_fix_items:
+                        recheck_pending_child_plan_supersession()
                         _ensure_finalization_ready(
                             pr_number=pr_number,
                             round_number=round_number,
@@ -21719,6 +21753,30 @@ def run_pr_loop(
                         issue_created_handoff=managed_ci_handoff,
                         override_nonce=managed_ci_handoff.override_nonce,
                     )
+            previous_head = pr_metadata.head_sha
+            if previous_head and updated_pr_context.metadata.head_sha == previous_head:
+                unchanged_head_coder_turns += 1
+            else:
+                unchanged_head_coder_turns = 0
+            if unchanged_head_coder_turns >= MAX_UNCHANGED_HEAD_CODER_TURNS:
+                # Re-reviewing an identical diff reaches the same verdict every
+                # round; a finding a PR-mode coder turn cannot satisfy (such as
+                # a required re-plan) must stop with a route, not consume the
+                # round budget (#985).
+                route = (
+                    " If the blocking finding requires re-planning the child plan, post the "
+                    "signed child-plan supersession record on child issue "
+                    f"#{planning_child_binding.child_issue} and rerun "
+                    f"`{_child_resume_hint(planning_child_binding.child_issue, EXECUTION_DISPOSITION_PLANNING)}`."
+                    if planning_child_binding is not None
+                    else ""
+                )
+                raise AgentLoopError(
+                    f"PR #{pr_number}: {coder_name} left head {previous_head} unchanged in "
+                    f"{unchanged_head_coder_turns} consecutive follow-up rounds, so another "
+                    "review of the same diff cannot change the verdict. Stopping before round "
+                    f"{round_number + 1}; human review required.{route}"
+                )
             log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")
             pre_review_test_pending = True
             if external_recovery_full_board:

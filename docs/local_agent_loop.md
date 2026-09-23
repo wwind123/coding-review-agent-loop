@@ -219,8 +219,9 @@ That includes an admissible bound plan with a pending matching signed record:
 PR mode stops before any reviewer runs rather than reviewing the PR against a
 scope no approved plan contains, since a PR-mode coder turn cannot produce the
 replacement plan. The same check runs again on the freshly fetched child issue
-at qualification, so a record posted while reviewers were running stops the
-run before any final sweep, merge, or managed-CI gate.
+at qualification and before every approval or merge, under every review
+policy and with or without `--auto-merge`. A record posted while reviewers
+were running therefore stops the run before it approves or merges.
 Keep the signed record on the child issue after the rebind. Re-planning
 continues the child's round numbering, so a higher `--max-rounds` may be needed.
 Not supported: abandoning or replacing the PR, re-planning direct-implementation
@@ -3732,6 +3733,17 @@ being relevant the moment the base advances.
   for merging. If the head is still unchanged the next time a conflict round
   would be dispatched (the coder made no progress), the loop stops cleanly
   with an explanatory comment instead of looping.
+
+### Unchanged-head follow-ups
+
+A PR follow-up coder turn that leaves the PR head
+unchanged is counted. After two consecutive such turns the loop stops with a
+human-review error instead of starting another review of the same diff, which
+could only repeat the same verdict until `--max-rounds` ran out. A turn that
+moves the head resets the count. For a planning child, the error also names the
+signed child-plan supersession route and the issue-mode rerun command, because
+a finding that requires re-planning can never be satisfied by a PR-mode coder
+turn.
 
 ### Focused, bounded local test selection
 

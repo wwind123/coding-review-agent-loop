@@ -3313,3 +3313,26 @@ def test_m985_qualification_rechecks_a_signed_record_posted_during_review(tmp_pa
     # A record for another plan hash does not block qualification.
     world.comments[-1] = comment(world.signed_record(superseded_plan_hash="0" * 16))
     _m936_snapshot(world, binding=_m936_binding(world), approved_plan_context=old_context)
+
+
+def test_m985_record_posted_during_default_policy_review_blocks_approval(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
+    record = comment(world.signed_record(rationale="Reduce scope mid-review."))
+
+    def issue_context(_runner, *, config, issue_number):
+        context = world._issue_context(_runner, config=config, issue_number=issue_number)
+        if issue_number == 56 and world.runner is not None and world.agent_calls("codex"):
+            # The human posts the record after the PR-entry gate, while reviewers run.
+            return dataclasses.replace(context, comments=(*context.comments, record))
+        return context
+
+    monkeypatch.setattr(orchestrator, "get_issue_context", issue_context)
+    config = world.config()
+    assert not config.auto_merge
+    with pytest.raises(AgentLoopError) as excinfo:
+        world.run_pr(codex_outputs=[PR_APPROVAL])
+    message = str(excinfo.value)
+    assert "authorizes replacing" in message and "no approval or merge was attempted" in message
+    assert "agent-loop issue 56 --plan-first --plan-execution-mode auto" in message
+    assert len(world.agent_calls("codex")) == 1
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in world.runner.commands)

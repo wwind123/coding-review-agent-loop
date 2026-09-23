@@ -13195,3 +13195,36 @@ def test_pr_board_amendment_qualification_refuses_a_digest_on_a_contract_neutral
         run_pr_loop(runner, pr_number=77, config=reduced)
     assert injected
     assert "contract-neutral" in str(gate.value)
+
+
+def test_m985_pr_loop_stops_after_two_unchanged_head_coder_turns(tmp_path):
+    from coding_review_agent_loop.errors import AgentLoopError
+
+    blocking = structured_pr_review(
+        state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            blocking,
+            structured_pr_review(
+                state="blocking",
+                summary="Still needs a re-plan.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
+                ],
+            ),
+            structured_pr_review(state="approved"),
+        ],
+        claude_outputs=[
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+        ],
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
+    with pytest.raises(Exception) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert isinstance(excinfo.value, AgentLoopError)
+    assert "unchanged in 2 consecutive follow-up rounds" in str(excinfo.value)
+    # The identical head is not reviewed a third time.
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2

@@ -518,7 +518,10 @@ receives the rationale, reviewer approval of the superseded plan never approves
 it again, and the revision is rebound to the same PR as above. While such a
 record is pending, `agent-loop pr <n>` stops before any reviewer runs and prints
 the issue-mode rerun command instead of reviewing the PR against a scope no
-plan approved.
+plan approved. The check is repeated on the freshly fetched child issue before
+every approval or merge, so a record posted during review also stops the run.
+A PR follow-up coder turn that leaves the head unchanged twice in a row stops the
+run with a human-review error instead of re-reviewing an identical diff.
 
 Rules: keep exactly one signed record per superseded plan hash (two distinct
 records for one hash always stop for a human decision; records are never
