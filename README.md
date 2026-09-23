@@ -875,8 +875,10 @@ approve the exact final plan. Because each phase advance costs a planning round,
 raise `--max-rounds` when enabling it. `--plan-review-force-full` authorizes the
 complete plan board and recovers the two ownership-ambiguity diagnostics; it
 cannot recover an unreadable planning history. Omitting the flags keeps today's
-full-board planning behavior unchanged, and discussion-mode and child-planning
-cycles always stay full-board. `review-evaluation` reports planning runs in
+full-board planning behavior unchanged, and discussion-mode cycles always stay
+full-board. A child-planning cycle inherits `--plan-review-policy` and
+`--primary-plan-reviewer` but never the parent's `--plan-review-force-full`
+override or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board
 planning can be compared on calls, tokens, latency, overlap, severity-weighted
 marginal findings, and escaped plan defects before any proposal to change the

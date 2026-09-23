@@ -6497,15 +6497,23 @@ def _run_child_planning_cycle(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> int:
     """Run the child's own plan/review cycle (policy ``auto``) after its handoff."""
-    # Child plan review always runs the full board: staged planning scheduling
-    # is a parent-run decision and is never inherited (#905, from #841).
+    # The child inherits the operator's run-wide plan-review policy and primary
+    # plan reviewer (#929), but no parent scheduling state crosses the
+    # boundary: the child plan is a fresh artifact, so the force-full latch is
+    # reset and the execution mode is ``auto`` (#905, from #841).
     child_config = dataclasses_replace(
         config,
         plan_execution_mode="auto",
-        plan_review_policy="all-reviewers",
-        primary_plan_reviewer=None,
         plan_review_force_full=False,
     )
+    if config.plan_review_force_full:
+        log(
+            config,
+            f"Issue #{parent_issue}: child #{child_issue_number} plan review does not "
+            "inherit --plan-review-force-full; the child plan starts under "
+            f"--plan-review-policy {config.plan_review_policy} without the "
+            "parent's full-board override",
+        )
     child_issue_context = get_issue_context(
         runner, config=child_config, issue_number=child_issue_number
     )
