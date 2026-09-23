@@ -1856,7 +1856,7 @@ def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
             "Body:",
             body,
             "",
-            "Raw prior issue comments are omitted in compact planning context. Durable reviewer findings must appear in the active unresolved ledger or the append-only compact prior ledger below.",
+            "Raw prior issue comments are omitted in compact planning context. Open reviewer findings appear in the active unresolved ledger; findings that left it are summarized in the bounded compact prior ledger below, where older entries may be reduced to headers or folded into an omission notice.",
             "",
         ]
     )
@@ -3712,8 +3712,10 @@ def _compact_pr_review_issue_context_block(
         [
             "",
             "Raw prior PR-review comments are omitted in compact PR review context. "
-            "Durable reviewer findings must appear in the active unresolved ledger or "
-            "the append-only compact prior ledger below.",
+            "Open reviewer findings appear in the active unresolved ledger; findings "
+            "that left it are summarized in the bounded compact prior ledger below, "
+            "where older entries may be reduced to headers or folded into an "
+            "omission notice.",
             "",
         ]
     )
