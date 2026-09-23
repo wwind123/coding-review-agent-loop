@@ -164,6 +164,16 @@ stops for a human decision. Identical duplicates collapse; records for different
 superseded hashes coexist (one per historical re-plan); two distinct records for
 the same superseded hash always stop for a human decision.
 
+The record is consulted for every handed-off plan, not only an inadmissible
+one: admissibility asks whether the plan is broken, the signed record asks
+whether a human authorized replacing it. An admissible plan with no matching
+record resumes its PR unchanged; an admissible plan with a matching record (a
+deliberate re-plan such as an authorized scope reduction) reopens planning
+exactly like an inadmissible one. In that case the planner receives the
+record's rationale as the revision instruction, and a resumed approval of the
+superseded plan runs the revision instead of approving and rebinding the plan
+the human asked to replace.
+
 With exactly one matching record and an open canonical PR, planning reopens:
 
 - The record's digest is written into the round metadata of every planner round
@@ -203,8 +213,39 @@ With exactly one matching record and an open canonical PR, planning reopens:
   plan round was posted; the requirement is recomputed from the issue history.
   PR reviewer approvals are keyed by plan hash and subject, so none recorded
   before the rebind counts under the new plan.
+- The execution decision record the original planning run left under the
+  superseded plan hash stays on the issue as history. After a rebind, issue
+  mode walks the live PR's plan-changing handoff transitions back from the
+  latest one. Each transition must carry its own rebind audit record and a
+  verified signed re-plan lineage, and a standalone audit record with no
+  transition counts for nothing. A decision bound to a plan hash that the
+  chain replaced is skipped, and the resumed run
+  records the decision for the rebound plan. A decision under any other plan
+  hash is still a competing topology and fails closed. An issue that got
+  stuck on this conflict before the fix recovers by rerunning the same
+  issue-mode command, with no manual edit.
+- The managed-CI authorization records on the PR that name the superseded
+  plan hash likewise stay as history. The explicit fresh authorization
+  (`--managed-ci-fresh`) uses the same verified chain: an actor-owned record
+  whose only difference is a plan hash the chain replaced is not a conflict,
+  and the new grant is bound to the rebound plan. A rebind does not move the PR
+  head, so a retired-plan grant at the live head is accepted as the new grant's
+  predecessor without a descendant proof; any other predecessor still needs
+  GitHub to prove the live head descends from it. Ordinary managed resume and
+  PR qualification carry the same verified set, so later runs resolve the
+  rebound grant and skip the retired ones instead of failing on them. A record
+  that differs in any other field, or names a plan hash no verified transition
+  replaced, still refuses. A PR stuck on this conflict recovers by rerunning
+  the fresh authorization command the ordinary path recommends.
 
 `agent-loop pr <n>` never re-plans or rebinds; it prints the issue-mode route.
+That includes an admissible bound plan with a pending matching signed record:
+PR mode stops before any reviewer runs rather than reviewing the PR against a
+scope no approved plan contains, since a PR-mode coder turn cannot produce the
+replacement plan. The same check runs again on the freshly fetched child issue
+at qualification and before every approval or merge, under every review
+policy and with or without `--auto-merge`. A record posted while reviewers
+were running therefore stops the run before it approves or merges.
 Keep the signed record on the child issue after the rebind. Re-planning
 continues the child's round numbering, so a higher `--max-rounds` may be needed.
 Not supported: abandoning or replacing the PR, re-planning direct-implementation
@@ -858,6 +899,12 @@ authority, are unbounded input, or are owned elsewhere:
   real broker handle, so selecting it is an authority decision, not a format
   defect;
 - legacy canonical evidence fields in a fresh response.
+
+Catalog collisions and non-passing or non-authoritative in-catalog selectors
+are not repairable by reformatting, so they skip the structured repair pass
+and its model fallback chain entirely. The run reports `Failure category:
+semantic-evidence-rejection` with the selector named, rather than a repair
+timeout (#990).
 
 Broader handoff atomicity for other envelope failures after a PR is pushed is
 owned by #827 and #828.
@@ -2415,10 +2462,16 @@ than carrying the plan into implementation.
 
 #### Exclusions
 
-Discussion-mode scheduling and the child-planning cycle always invoke the full
-board, enforced by configuration reset rather than by convention: the child
-planning configuration and the semantic-dedupe isolated provider configuration
-both reset the planning policy, primary, and force-full fields. PR-flow
+Discussion-mode scheduling always invokes the full board, enforced by
+configuration reset rather than by convention: the semantic-dedupe isolated
+provider configuration resets the planning policy, primary, and force-full
+fields. A child-planning cycle inherits the operator's `--plan-review-policy`
+and `--primary-plan-reviewer`, because they express how plan review is
+conducted across the run, but no parent scheduling state crosses the boundary:
+the child configuration resets the force-full latch and uses the `auto`
+execution mode, since the child plan is a fresh artifact that no parent
+approval covers. When the parent run was given `--plan-review-force-full`, the
+child cycle logs once that the override is not inherited. PR-flow
 scheduling, qualification, managed CI, branch protection, and merge behavior are
 unchanged. The staged planning policy remains non-default until a flow-separated
 frozen evaluation justifies the latency and cost tradeoff. That comparison is
@@ -3716,6 +3769,19 @@ being relevant the moment the base advances.
   for merging. If the head is still unchanged the next time a conflict round
   would be dispatched (the coder made no progress), the loop stops cleanly
   with an explanatory comment instead of looping.
+
+### Unchanged-head follow-ups
+
+A PR follow-up coder turn that leaves the PR head
+unchanged is counted. After two consecutive such turns the loop stops with a
+human-review error instead of starting another review of the same diff, which
+could only repeat the same verdict until `--max-rounds` ran out. A turn that
+moves the head resets the count, and the count belongs to one head: a round
+that starts on a different head, for example after an external push, starts
+from zero. For a planning child, the error also names the
+signed child-plan supersession route and the issue-mode rerun command, because
+a finding that requires re-planning can never be satisfied by a PR-mode coder
+turn.
 
 ### Focused, bounded local test selection
 

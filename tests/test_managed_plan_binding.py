@@ -214,6 +214,7 @@ def test_managed_qualification_uses_the_pr_side_binding_without_issue_handoff(
     assert calls == [{
         "config": calls[0]["config"], "pr_number": 7, "issue_number": 959,
         "live_head": "head-1", "approved_plan_hash": PLAN,
+        "retired_plan_hashes": frozenset(),
     }]
 
 
@@ -318,3 +319,49 @@ def test_only_a_recordless_strict_handoff_skips_the_chain(protection_mode, overr
     handoff = SimpleNamespace(protection_mode=protection_mode, override_nonce=override_nonce)
     assert orchestrator._managed_binding_protection_mode(handoff) == expected
     assert orchestrator._managed_binding_protection_mode(None) is None
+
+
+# A signed rebind keeps the PR head, so the retired-plan grant stays at the
+# live head next to the fresh grant under the rebound plan (#993).
+OLD_PLAN = "06e70cb22cf97db3"
+
+
+def _same_head_rebind():
+    return [
+        _auth_comment(41, _root(approved_plan_hash=OLD_PLAN)),
+        _auth_comment(100, _root(
+            kind="fresh", nonce="fresh", predecessor_head="head-0", predecessor_comment_id=41,
+        )),
+    ]
+
+
+def test_same_head_retired_plan_grant_is_history(tmp_path):
+    verify_managed_pr_plan_binding(
+        CommentsRunner(_same_head_rebind()), config=_config(tmp_path),
+        pr_number=7, issue_number=959, live_head="head-0", approved_plan_hash=PLAN,
+        retired_plan_hashes=frozenset({OLD_PLAN}),
+    )
+
+
+@pytest.mark.parametrize(
+    "retired",
+    [frozenset(), frozenset({"0" * 16}), frozenset({OLD_PLAN, PLAN})],
+)
+def test_same_head_unretired_plan_grant_still_fails_closed(tmp_path, retired):
+    with pytest.raises(AgentLoopError, match="names a different approved plan"):
+        verify_managed_pr_plan_binding(
+            CommentsRunner(_same_head_rebind()), config=_config(tmp_path),
+            pr_number=7, issue_number=959, live_head="head-0", approved_plan_hash=PLAN,
+            retired_plan_hashes=retired,
+        )
+
+
+def test_retired_root_does_not_launder_a_mixed_chain(tmp_path):
+    comments = _chain()
+    comments[0] = _auth_comment(41, _root(approved_plan_hash=OLD_PLAN))
+    with pytest.raises(AgentLoopError, match="names a different approved plan"):
+        verify_managed_pr_plan_binding(
+            CommentsRunner(comments), config=_config(tmp_path),
+            pr_number=7, issue_number=959, live_head="head-1", approved_plan_hash=PLAN,
+            retired_plan_hashes=frozenset({OLD_PLAN}),
+        )

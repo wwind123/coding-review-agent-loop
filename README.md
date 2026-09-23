@@ -508,6 +508,21 @@ Child plan supersession:
    plan. `agent-loop pr <n>` never re-plans or rebinds; on an inadmissible
    binding it fails closed and prints the same route.
 
+**Deliberate re-plan of an admissible plan.** The same signed record also
+authorizes replacing a bound child plan that is still admissible, for example
+a human-approved scope reduction. The record is consulted for every bound plan,
+not only an inadmissible one: post it naming the bound plan hash (printed in the
+`plan_hash=` log line) with the reason as `rationale`, then rerun
+`agent-loop issue <child> --plan-first --plan-execution-mode auto`. The planner
+receives the rationale, reviewer approval of the superseded plan never approves
+it again, and the revision is rebound to the same PR as above. While such a
+record is pending, `agent-loop pr <n>` stops before any reviewer runs and prints
+the issue-mode rerun command instead of reviewing the PR against a scope no
+plan approved. The check is repeated on the freshly fetched child issue before
+every approval or merge, so a record posted during review also stops the run.
+A PR follow-up coder turn that leaves the head unchanged twice in a row stops the
+run with a human-review error instead of re-reviewing an identical diff.
+
 Rules: keep exactly one signed record per superseded plan hash (two distinct
 records for one hash always stop for a human decision; records are never
 chosen by comment order), and leave the record in place afterwards because the
@@ -860,8 +875,10 @@ approve the exact final plan. Because each phase advance costs a planning round,
 raise `--max-rounds` when enabling it. `--plan-review-force-full` authorizes the
 complete plan board and recovers the two ownership-ambiguity diagnostics; it
 cannot recover an unreadable planning history. Omitting the flags keeps today's
-full-board planning behavior unchanged, and discussion-mode and child-planning
-cycles always stay full-board. `review-evaluation` reports planning runs in
+full-board planning behavior unchanged, and discussion-mode cycles always stay
+full-board. A child-planning cycle inherits `--plan-review-policy` and
+`--primary-plan-reviewer` but never the parent's `--plan-review-force-full`
+override or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board
 planning can be compared on calls, tokens, latency, overlap, severity-weighted
 marginal findings, and escaped plan defects before any proposal to change the

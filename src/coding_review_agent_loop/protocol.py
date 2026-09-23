@@ -10,7 +10,11 @@ from collections.abc import Mapping, Sequence
 import dataclasses
 from dataclasses import dataclass, field
 
-from .errors import AgentLoopError, IssueImplementationConflictError
+from .errors import (
+    AgentLoopError,
+    IssueImplementationConflictError,
+    NonRepairableEvidenceRejection,
+)
 from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
 from .test_runtime import TestRuntimeConfigurationError, parse_managed_test_command
@@ -3372,7 +3376,7 @@ def _parse_semantic_risk_coverage_claims(
             if execution_ref is None:
                 continue
             if execution_ref in catalog_by_ref:
-                raise AgentLoopError(
+                raise NonRepairableEvidenceRejection(
                     f"{context} cannot validate a colliding execution_ref `{execution_ref}`."
                 )
             catalog_by_ref[execution_ref] = observation
@@ -3434,12 +3438,14 @@ def _parse_semantic_risk_coverage_claims(
             if execution_catalog is not None:
                 observation = catalog_by_ref[ref]
                 semantics, _rich = _observation_semantics(observation)
+                # Authority decisions over real broker handles: repair cannot
+                # satisfy them, so they must not route to it (#990).
                 if semantics["outcome"] != "passed" or semantics["provenance"] != "parent-observed":
-                    raise AgentLoopError(
+                    raise NonRepairableEvidenceRejection(
                         f"{claim_context}.execution_refs selector `{ref}` is not an admissible passing observation."
                     )
                 if not _known_launch_integrity_passes(observation):
-                    raise AgentLoopError(
+                    raise NonRepairableEvidenceRejection(
                         f"{claim_context}.execution_refs selector `{ref}` has known non-authoritative "
                         "launch-integrity state and cannot be selected before authentication."
                     )

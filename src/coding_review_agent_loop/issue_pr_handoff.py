@@ -306,6 +306,12 @@ class IssuePrHandoffLineage:
     replacement: IssuePrHandoffMetadata | None = None
     replacement_comment_index: int = -1
     latest_comment_index: int = -1
+    # Every plan-changing edge of the current PR's lineage, oldest first, as
+    # ``(replaced, replacement, comment_index)`` (#988).  The last entry is the
+    # ``replaced``/``replacement`` edge above.
+    replacement_edges: tuple[
+        tuple[IssuePrHandoffMetadata, IssuePrHandoffMetadata, int], ...
+    ] = ()
 
     @property
     def is_plan_replacement(self) -> bool:
@@ -328,6 +334,7 @@ def resolve_issue_pr_handoff_lineage(
     replacement: IssuePrHandoffMetadata | None = None
     replacement_index = -1
     found_index = -1
+    edges: list[tuple[IssuePrHandoffMetadata, IssuePrHandoffMetadata, int]] = []
     for comment_index, comment in enumerate(comments):
         body = getattr(comment, "body", None)
         if not isinstance(body, str):
@@ -363,6 +370,7 @@ def resolve_issue_pr_handoff_lineage(
                         # plan-changing edge in its own right.
                         replaced, replacement = found, metadata
                         replacement_index = comment_index
+                        edges.append((found, metadata, comment_index))
                     found = closing_base = metadata
                     found_index = comment_index
                     continue
@@ -380,6 +388,7 @@ def resolve_issue_pr_handoff_lineage(
                 ):
                     replaced, replacement = found, metadata
                     replacement_index = comment_index
+                    edges.append((found, metadata, comment_index))
                     found = metadata
                     found_index = comment_index
                     continue
@@ -392,6 +401,7 @@ def resolve_issue_pr_handoff_lineage(
                 closing_base = metadata
                 replaced = replacement = None
                 replacement_index = -1
+                edges = []
                 found_index = comment_index
             found = metadata
     if found is None:
@@ -404,6 +414,7 @@ def resolve_issue_pr_handoff_lineage(
         replacement=replacement,
         replacement_comment_index=replacement_index,
         latest_comment_index=found_index,
+        replacement_edges=tuple(edges),
     )
 
 

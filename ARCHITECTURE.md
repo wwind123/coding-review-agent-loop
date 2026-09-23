@@ -248,7 +248,11 @@ each row still verifies only on its own facts. Authority violations stay fatal:
 unknown keys, bad row IDs, empty selector lists, an admissible selector
 repeated within one row, catalog collisions, in-catalog selectors that are non-passing or
 whose launch integrity is failing or unknown (real broker handles, so
-selecting one is an authority decision), and legacy canonical fields. Repair
+selecting one is an authority decision), and legacy canonical fields. The
+catalog-authority rejections (collisions and non-passing or non-authoritative
+selectors) never route to structured repair, since reformatting cannot change
+them: the run stops once, naming the rejection as a
+`semantic-evidence-rejection` rather than a repair timeout (#990). Repair
 does not generate matrix identities, canonical rows, receipt IDs, mappings,
 statuses, or evidence envelopes. Derived evidence and diagnostics are the
 durable replay artifact; live execution selectors are not. Historical accepted
