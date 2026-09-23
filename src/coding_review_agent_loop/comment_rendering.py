@@ -15,6 +15,7 @@ from .errors import AgentLoopError
 from .expected_closure import normalize_issue_ids
 from .agents.registry import agent_display_name, agent_signature
 from .protocol import (
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     ANY_HEADING_RE,
     HTML_COMMENT_RE,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
@@ -649,6 +650,7 @@ def _render_risk_test_matrix_evidence(
     evidence: RiskTestMatrixEvidence | None,
     *,
     render_decision: MatrixEvidenceRenderDecision | None = None,
+    diagnostics: Sequence[object] = (),
 ) -> str | None:
     if evidence is None:
         return None
@@ -658,6 +660,13 @@ def _render_risk_test_matrix_evidence(
         "### Risk-based mode and transition test matrix evidence",
         f"- Matrix identity: `{safe(evidence.matrix_identity)}`",
     ]
+    # Outside the collapsed block, so an operator sees that coverage was
+    # dropped rather than silently reduced (#920).
+    lines.extend(
+        f"- Dropped claim: {safe(getattr(diagnostic, 'message', ''))}"
+        for diagnostic in diagnostics
+        if getattr(diagnostic, "code", None) == UNAPPROVED_ROW_CLAIM_DIAGNOSTIC
+    )
     unchanged_line: str | None = None
     if render_decision is not None and render_decision.mode == "delta":
         assert render_decision.previous_evidence is not None
@@ -1400,6 +1409,7 @@ def _render_public_coder_followup_comment(
     matrix_evidence = _render_risk_test_matrix_evidence(
         parsed_followup.risk_test_matrix_evidence,
         render_decision=matrix_evidence_render_decision,
+        diagnostics=parsed_followup.risk_test_matrix_diagnostics,
     )
     if matrix_evidence:
         sections.append(matrix_evidence)
@@ -1461,7 +1471,10 @@ def _render_public_issue_implementation_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
-    matrix_evidence = _render_risk_test_matrix_evidence(parsed.risk_test_matrix_evidence)
+    matrix_evidence = _render_risk_test_matrix_evidence(
+        parsed.risk_test_matrix_evidence,
+        diagnostics=parsed.risk_test_matrix_diagnostics,
+    )
     if matrix_evidence:
         sections.append(matrix_evidence)
     human_section = render_human_requirement_dispositions(

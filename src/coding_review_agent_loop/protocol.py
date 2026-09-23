@@ -1723,6 +1723,32 @@ def _observation_command_text(observation: object) -> str:
     return str(command or "local test execution")
 
 
+UNAPPROVED_ROW_CLAIM_DIAGNOSTIC = "unapproved-row-claim"
+
+
+def _unapproved_row_claim_message(
+    row_id: str,
+    *,
+    row_owner: str | None,
+    execution_owner: str | None,
+) -> str:
+    """Name the dropped row, the scope it violated, and its real owner."""
+    scope = (
+        f"execution owner `{_dropped_ref_preview(execution_owner)}`"
+        if execution_owner
+        else "this turn"
+    )
+    if row_owner is None:
+        origin = "The row is not in the approved matrix."
+    else:
+        origin = f"The row belongs to execution owner `{_dropped_ref_preview(row_owner)}`."
+    return (
+        f"A semantic coverage claim for row `{_dropped_ref_preview(row_id)}` was dropped "
+        f"because the row is not in the approved enforceable matrix set for {scope}. "
+        f"{origin} The claim asserted no coverage."
+    )
+
+
 def _claims_value(
     claims: SemanticRiskCoverageClaims | Sequence[SemanticRiskCoverageClaim] | None,
 ) -> tuple[SemanticRiskCoverageClaim, ...]:
@@ -1746,6 +1772,7 @@ def derive_risk_test_matrix_evidence(
     authenticated_tree_clean: bool | None = None,
     predecessor_head: str | None = None,
     expected_identity: str | None = None,
+    execution_owner: str | None = None,
 ) -> DerivedRiskEvidenceResult:
     """Derive canonical evidence from trusted matrix/journal/head inputs.
 
@@ -1830,13 +1857,18 @@ def derive_risk_test_matrix_evidence(
         and not _observation_value(observation, "superseded_by")
     ]
     if isinstance(claims, SemanticRiskCoverageClaims):
+        owner_by_row = {row.row_id: row.execution_owner for row in parsed_matrix.rows}
         for dropped_row_id in claims.dropped_row_ids:
             # Dropped before authentication (#920): the claim asserted nothing
             # for this turn, but the operator should see that it was discarded.
             diagnostics.append(PostAuthClaimDiagnostic(
-                dropped_row_id, "unapproved-row-claim",
-                f"A semantic coverage claim for row `{_dropped_ref_preview(dropped_row_id)}` was "
-                "dropped because the row is not in this turn's approved enforceable matrix set.",
+                dropped_row_id,
+                UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+                _unapproved_row_claim_message(
+                    dropped_row_id,
+                    row_owner=owner_by_row.get(dropped_row_id),
+                    execution_owner=execution_owner,
+                ),
             ))
     result_rows: list[RiskTestMatrixEvidenceRow] = []
     for row in parsed_matrix.rows:
@@ -3390,7 +3422,10 @@ def _parse_semantic_risk_coverage_claims(
         raise AgentLoopError(
             f"{context} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_ROWS}-row bound."
         )
-    allowed_rows = set(expected_row_ids or ())
+    # ``None`` means no approved set was delivered (historical and unit
+    # callers).  An explicitly empty set is a real scope -- a stage that owns
+    # no enforceable rows -- so every claim is outside it (#920).
+    allowed_rows = None if expected_row_ids is None else set(expected_row_ids)
     catalog_by_ref: dict[str, object] = {}
     if execution_catalog is not None:
         for observation in execution_catalog:
@@ -3415,7 +3450,7 @@ def _parse_semantic_risk_coverage_claims(
             optional=set(SEMANTIC_RISK_CLAIM_FACT_KEYS + SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS),
         )
         row_id = _validate_risk_row_id(payload["row_id"], context=f"{claim_context}.row_id")
-        if allowed_rows and row_id not in allowed_rows:
+        if allowed_rows is not None and row_id not in allowed_rows:
             # A claim for a row outside this turn's approved enforceable set
             # (for example a sibling phase's row) asserts nothing this turn
             # can own.  Drop just that claim (#920): the row is simply not

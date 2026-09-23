@@ -314,6 +314,8 @@ from .protocol import (
     StructuredIssueImplementation,
     DerivedRiskEvidenceResult,
     PostAuthClaimDiagnostic,
+    SemanticRiskCoverageClaims,
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     StructuredPlanState,
     StructuredPlanRevision,
     PlanRevisionPatch,
@@ -4692,13 +4694,34 @@ def _parse_fresh_correction_claims(
         return None
     # The correction continuation is not a second coder handoff. Preserve all
     # coder-owned facts from the authenticated response and accept only its
-    # newly validated semantic claim set.
+    # newly validated semantic claim set.  Claims the original response lost
+    # to an unapproved row stay on the audit record (#920) even when the
+    # correction omits them.
+    claims = candidate.risk_test_matrix_claims
+    original_dropped = (
+        original.risk_test_matrix_claims.dropped_row_ids
+        if original.risk_test_matrix_claims is not None
+        else ()
+    )
+    if original_dropped:
+        claims = claims or SemanticRiskCoverageClaims()
+        claims = dataclasses_replace(
+            claims,
+            dropped_row_ids=tuple(dict.fromkeys((*original_dropped, *claims.dropped_row_ids))),
+        )
     return dataclasses_replace(
         original,
-        risk_test_matrix_claims=candidate.risk_test_matrix_claims,
+        risk_test_matrix_claims=claims,
         risk_test_matrix_evidence=None,
         risk_test_matrix_diagnostics=(),
     )
+
+
+_NON_ACTIONABLE_RISK_DIAGNOSTICS = frozenset({
+    "missing-claim",
+    "unsuperseded-journal-failure",
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+})
 
 
 def _derive_authenticated_risk_evidence_for_coder(
@@ -4798,11 +4821,14 @@ def _derive_authenticated_risk_evidence_for_coder(
         authenticated_tree_clean=authenticated_tree_clean,
         predecessor_head=predecessor_head,
         expected_identity=identity,
+        execution_owner=approved_plan_context.risk_test_matrix_execution_owner,
     )
+    # A dropped unapproved-row claim (#920) is an audit record, not something
+    # a correction may relabel onto another row, so it never triggers or
+    # fails the bounded correction.
     actionable = tuple(
         diagnostic for diagnostic in result.diagnostics
-        if diagnostic.code != "missing-claim"
-        and diagnostic.code != "unsuperseded-journal-failure"
+        if diagnostic.code not in _NON_ACTIONABLE_RISK_DIAGNOSTICS
     )
     if (
         actionable
@@ -4860,7 +4886,7 @@ def _derive_authenticated_risk_evidence_for_coder(
                     _correction_attempted=True,
                 )
                 if corrected_result is not None and any(
-                    diagnostic.code not in {"missing-claim", "unsuperseded-journal-failure"}
+                    diagnostic.code not in _NON_ACTIONABLE_RISK_DIAGNOSTICS
                     for diagnostic in corrected_result.diagnostics
                 ):
                     exhausted = PostAuthClaimDiagnostic(

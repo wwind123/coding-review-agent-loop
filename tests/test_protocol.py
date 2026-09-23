@@ -2516,6 +2516,15 @@ def test_semantic_matrix_claim_for_unapproved_row_is_dropped_not_rejected(kind):
     assert [item["row_id"] for item in claims.to_payload()] == ["row-1", "row-2"]
 
 
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_empty_approved_set_drops_every_claim(kind):
+    """#920: an explicitly empty scoped set is a restriction, not 'no restriction'."""
+    parsed = _validate_claims_envelope(kind, [_complete_semantic_claim()], row_ids=())
+
+    assert parsed.risk_test_matrix_claims.claims == ()
+    assert parsed.risk_test_matrix_claims.dropped_row_ids == ("row-1",)
+
+
 def test_semantic_matrix_claim_malformed_row_id_still_rejects():
     """#920 degrades only well-formed unapproved ids; malformed ids still reject."""
     claim = {**_complete_semantic_claim(), "row_id": 5}
