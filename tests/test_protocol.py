@@ -5003,8 +5003,10 @@ def test_declared_statuses_parse_identically_with_no_record():
         assert impact == parse_architecture_impact(payload)
 
 
-@pytest.mark.parametrize("status", ["undetermined", "altered", "Modified"])
+@pytest.mark.parametrize("status", ["undetermined", "Undetermined", "altered", "partially"])
 def test_wire_undetermined_and_other_unknown_statuses_still_raise(status):
+    # Values outside the synonym table still raise; case variants of table
+    # entries such as `Modified` degrade instead (#925 round 5).
     with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
         parse_architecture_impact_degradable(_deg_uncorroborated(status=status))
 
