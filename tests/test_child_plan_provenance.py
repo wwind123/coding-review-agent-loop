@@ -3466,3 +3466,101 @@ def _m988_plan_subject(match):
 
 def _m988_digest(match):
     return str(_m988_payload(match)["recommendation_digest"])
+
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    AuthorizedReplanLineage,
+    ChildPlanRebindRecord,
+    format_child_plan_rebind_section,
+)
+
+_M988_EARLIER = "e" * 16
+
+
+def _m988_earlier_rebind_section(world):
+    return format_child_plan_rebind_section(ChildPlanRebindRecord(
+        child_issue=56, pr_number=77, superseded_plan_hash=_M988_EARLIER,
+        new_plan_hash=world.old_hash, plan_supersession_digest="a" * 64,
+        first_replan_round=1, approved_round=1,
+    ))
+
+
+def _m988_accept_earlier_lineage(monkeypatch, world):
+    """Treat the earlier edge's re-plan lineage as verified, isolating the handoff check."""
+    original = orchestrator.authorized_replan_lineage
+
+    def lineage(comments, *, superseded_hash, **kwargs):
+        if superseded_hash == _M988_EARLIER:
+            return AuthorizedReplanLineage(round_numbers=(1,), latest_plan_hash=world.old_hash)
+        return original(comments, superseded_hash=superseded_hash, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "authorized_replan_lineage", lineage)
+
+
+def _m988_retired(world):
+    return orchestrator.verified_retired_child_plan_hashes(
+        world.comments, repo="OWNER/REPO",
+        parent_plan_context=orchestrator.make_approved_plan_context(
+            _m936_parent_plan(), source_locator="parent"
+        ),
+        child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
+    )
+
+
+def _m988_old_handoff_index(world):
+    return next(
+        index for index, item in enumerate(world.comments)
+        if AGENT_ISSUE_PR_HANDOFF_RE.search(item.body)
+    )
+
+
+def test_m988_standalone_earlier_audit_record_retires_nothing(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+    index = _m988_old_handoff_index(world)
+    # An earlier audit record with no handoff transition behind it, and a
+    # decision under the plan it claims to have replaced.
+    world.comments.insert(index, comment(_m988_earlier_rebind_section(world)))
+    world.comments.insert(index, comment(format_execution_decision(_m988_decision(_M988_EARLIER))))
+    _m988_accept_earlier_lineage(monkeypatch, world)
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    world.settle()
+    assert _m988_retired(world) == frozenset({world.old_hash})
+    with pytest.raises(AgentLoopError, match="Conflicting execution decision exists"):
+        world.run_issue(codex_outputs=[PR_APPROVAL])
+    assert world.agent_calls("codex") == [] and world.posted() == []
+
+
+def test_m988_earlier_edge_with_its_handoff_transition_is_retired(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+    index = _m988_old_handoff_index(world)
+    handoff = dict(
+        issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123", flow="approved-plan-implementation",
+    )
+    earlier = format_issue_pr_handoff_comment(plan_hash=_M988_EARLIER, **handoff)
+    earlier_meta = find_latest_issue_pr_handoff(
+        [comment(earlier)], issue_number=56, repo="OWNER/REPO"
+    )
+    # The earlier plan was bound first, then rebound to the old plan in one
+    # comment carrying both the handoff transition and its audit record.
+    world.comments[index:index + 1] = [
+        comment(format_execution_decision(_m988_decision(_M988_EARLIER))),
+        comment(earlier),
+        comment(
+            _m988_earlier_rebind_section(world) + "\n" + format_issue_pr_handoff_comment(
+                plan_hash=world.old_hash, supersedes_hash=earlier_meta.contract_hash, **handoff
+            )
+        ),
+    ]
+    _m988_accept_earlier_lineage(monkeypatch, world)
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    world.settle()
+    assert _m988_retired(world) == frozenset({world.old_hash, _M988_EARLIER})
+    assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
+    assert len(world.agent_calls("codex")) == 1

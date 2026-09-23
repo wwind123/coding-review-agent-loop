@@ -9154,12 +9154,16 @@ def verified_retired_child_plan_hashes(
     A rebind moves the PR binding to the replacement plan, but the execution
     decision recorded under the superseded plan stays on the issue.  That
     decision is history, not a competing topology, exactly when the plan it
-    names was replaced through a verified signed re-plan.  The chain is
-    walked backwards from the live handoff: the latest edge is verified by
-    ``verify_child_plan_rebind`` (which raises on an unverifiable
-    replacement), and each earlier edge must carry one consistent rebind
-    audit record whose digest-bound re-plan lineage verifies.  The walk
-    stops at the first edge that does not verify, so an unexplained hash
+    names was replaced through a verified signed re-plan.
+
+    The chain is the ordered sequence of plan-changing handoff edges of the
+    live PR lineage, walked backwards from the live handoff.  The latest edge
+    is verified by ``verify_child_plan_rebind`` (which raises on an
+    unverifiable replacement).  Each earlier edge must be a real handoff
+    transition whose own comment carries exactly one rebind audit record
+    agreeing with it, and whose digest-bound re-plan lineage verifies.  A
+    standalone audit record with no handoff transition retires nothing.  The
+    walk stops at the first edge that does not verify, so an unexplained hash
     divergence keeps failing closed at the execution-decision check.
     """
     replacement = verify_child_plan_rebind(
@@ -9174,50 +9178,51 @@ def verified_retired_child_plan_hashes(
     )
     if replacement is None or not replacement.plan_hash:
         return frozenset()
+    lineage = resolve_issue_pr_handoff_lineage(
+        child_comments, issue_number=child_issue, repo=repo
+    )
+    if lineage is None or lineage.latest.pr_number != pr_number:
+        return frozenset()
     supersessions = collect_child_plan_supersessions(
         child_comments, child_issue=child_issue, parent_issue=parent_issue, stage_id=stage_id
     )
-    rebinds = [
-        record
-        for record in find_child_plan_rebind_records(child_comments)
-        if record.child_issue == child_issue and record.pr_number == pr_number
-    ]
+    rebinds = find_child_plan_rebind_records(child_comments)
     retired: set[str] = set()
-    current = replacement.plan_hash
-    while True:
-        edges = {
-            (
-                record.superseded_plan_hash,
-                record.plan_supersession_digest,
-                record.first_replan_round,
-                record.approved_round,
-            )
-            for record in rebinds
-            if record.new_plan_hash == current
-        }
-        if len(edges) != 1:
-            # No edge ends the chain; two different edges into one plan are
-            # ambiguous and never chosen between.
+    current = lineage.latest.plan_hash
+    for replaced, successor, comment_index in reversed(lineage.replacement_edges):
+        if successor.plan_hash != current or successor.pr_number != pr_number:
             break
-        superseded, digest, first_round, approved_round = next(iter(edges))
-        if superseded in retired or superseded == replacement.plan_hash:
+        records = [record for record in rebinds if record.comment_index == comment_index]
+        if len(records) != 1:
+            break
+        record = records[0]
+        if (
+            record.child_issue != child_issue
+            or record.pr_number != pr_number
+            or record.new_plan_hash != successor.plan_hash
+            or record.superseded_plan_hash != replaced.plan_hash
+        ):
+            break
+        if record.superseded_plan_hash in retired or record.superseded_plan_hash == (
+            lineage.latest.plan_hash
+        ):
             break
         replan = authorized_replan_lineage(
             child_comments,
-            superseded_hash=superseded,
-            digest=digest,
+            superseded_hash=record.superseded_plan_hash,
+            digest=record.plan_supersession_digest,
             supersessions=supersessions,
-            through_round=approved_round,
+            through_round=record.approved_round,
         )
         if (
             isinstance(replan, str)
-            or replan.first_round != first_round
-            or replan.latest_round != approved_round
-            or replan.latest_plan_hash != current
+            or replan.first_round != record.first_replan_round
+            or replan.latest_round != record.approved_round
+            or replan.latest_plan_hash != record.new_plan_hash
         ):
             break
-        retired.add(superseded)
-        current = superseded
+        retired.add(record.superseded_plan_hash)
+        current = replaced.plan_hash
     return frozenset(retired)
 
 
