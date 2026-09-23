@@ -671,9 +671,17 @@ class SemanticRiskCoverageClaim:
 
 @dataclass(frozen=True)
 class SemanticRiskCoverageClaims:
-    """Bounded shared semantic-claims carrier for both coder response kinds."""
+    """Bounded shared semantic-claims carrier for both coder response kinds.
+
+    ``dropped_row_ids`` records claims whose ``row_id`` was not in the turn's
+    approved enforceable set (#920).  Those claims are discarded before
+    authentication rather than rejecting the whole envelope: a dropped claim
+    asserts nothing, so its row stays pending, and derivation reports each
+    dropped id as an ``unapproved-row-claim`` diagnostic.
+    """
 
     claims: tuple[SemanticRiskCoverageClaim, ...] = ()
+    dropped_row_ids: tuple[str, ...] = ()
 
     @property
     def rows(self) -> tuple[SemanticRiskCoverageClaim, ...]:
@@ -1821,6 +1829,15 @@ def derive_risk_test_matrix_evidence(
         }
         and not _observation_value(observation, "superseded_by")
     ]
+    if isinstance(claims, SemanticRiskCoverageClaims):
+        for dropped_row_id in claims.dropped_row_ids:
+            # Dropped before authentication (#920): the claim asserted nothing
+            # for this turn, but the operator should see that it was discarded.
+            diagnostics.append(PostAuthClaimDiagnostic(
+                dropped_row_id, "unapproved-row-claim",
+                f"A semantic coverage claim for row `{_dropped_ref_preview(dropped_row_id)}` was "
+                "dropped because the row is not in this turn's approved enforceable matrix set.",
+            ))
     result_rows: list[RiskTestMatrixEvidenceRow] = []
     for row in parsed_matrix.rows:
         if row.applicability not in {"applicable", "required"}:
@@ -3346,9 +3363,14 @@ def _parse_semantic_risk_coverage_claims(
     can still be authenticated and the row derives as unverified with an
     ``unknown-execution-ref`` diagnostic.
 
+    A claim whose well-formed ``row_id`` is outside the approved enforceable
+    set (for example a sibling phase's row) is dropped whole and its id is
+    recorded on ``dropped_row_ids`` (#920).  The rest of the envelope is kept;
+    derivation reports the dropped id as an ``unapproved-row-claim``
+    diagnostic and the row's own coverage stays pending.
+
     Still fatal, because they forge or corrupt authority, are unbounded input,
-    or are owned elsewhere: unknown keys; invalid, unapproved, or duplicate
-    row IDs; a missing ``execution_refs`` key or an empty list (#855); more
+    or are owned elsewhere: unknown keys; invalid or duplicate row IDs; a missing ``execution_refs`` key or an empty list (#855); more
     than eight refs, non-string or blank refs, or refs over the hard cap;
     an admissible selector repeated within one row (#865: the same
     admissible selector may be cited by several rows, because one wrapper
@@ -3382,6 +3404,7 @@ def _parse_semantic_risk_coverage_claims(
             catalog_by_ref[execution_ref] = observation
     result: list[SemanticRiskCoverageClaim] = []
     seen_rows: set[str] = set()
+    dropped_row_ids: list[str] = []
     for index, raw_claim in enumerate(value):
         claim_context = f"{context}[{index}]"
         payload = _expect_object(raw_claim, context=claim_context)
@@ -3393,9 +3416,13 @@ def _parse_semantic_risk_coverage_claims(
         )
         row_id = _validate_risk_row_id(payload["row_id"], context=f"{claim_context}.row_id")
         if allowed_rows and row_id not in allowed_rows:
-            raise AgentLoopError(
-                f"{claim_context}.row_id `{row_id}` is not an approved enforceable matrix row."
-            )
+            # A claim for a row outside this turn's approved enforceable set
+            # (for example a sibling phase's row) asserts nothing this turn
+            # can own.  Drop just that claim (#920): the row is simply not
+            # claimed, which is stricter than losing every other valid claim.
+            if row_id not in dropped_row_ids:
+                dropped_row_ids.append(row_id)
+            continue
         if row_id in seen_rows:
             raise AgentLoopError(f"{context} contains duplicate claim for row `{row_id}`.")
         seen_rows.add(row_id)
@@ -3508,7 +3535,7 @@ def _parse_semantic_risk_coverage_claims(
             truncated_fact_fields=tuple(field for field, _ in truncated_facts),
         )
         result.append(claim)
-    return SemanticRiskCoverageClaims(tuple(result))
+    return SemanticRiskCoverageClaims(tuple(result), dropped_row_ids=tuple(dropped_row_ids))
 
 
 def _expect_optional_string_list(

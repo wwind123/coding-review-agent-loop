@@ -186,6 +186,46 @@ def test_one_shared_selector_verifies_every_row_it_covers() -> None:
     assert not result.diagnostics
 
 
+def test_builder_reports_dropped_unapproved_row_claims() -> None:
+    # Regression for #920: a claim dropped for citing a sibling phase's row is
+    # surfaced as a diagnostic while the valid claim still verifies its row.
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-1")
+    claims = SemanticRiskCoverageClaims(
+        (
+            SemanticRiskCoverageClaim(
+                row_id="row-ordinary",
+                execution_refs=("invocation:observation-1",),
+                test_identifiers=("test_row_ordinary",),
+                test_locations=("tests/test_protocol.py::test_row_ordinary",),
+                workflow_path_claim="The run covered this workflow path.",
+                outcome_assertions=("The row's test passed.",),
+                forbidden_effect_assertions=("No unauthorized evidence was accepted.",),
+            ),
+        ),
+        dropped_row_ids=("legacy-planning-metadata-fallback",),
+    )
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert [row.row_id for row in result.evidence.rows] == ["row-ordinary"]
+    assert [row.status for row in result.evidence.rows] == ["verified"]
+    assert [(item.row_id, item.code) for item in result.diagnostics] == [
+        ("legacy-planning-metadata-fallback", "unapproved-row-claim")
+    ]
+    assert "not in this turn's approved enforceable" in result.diagnostics[0].message
+
+
 @pytest.mark.parametrize(
     "field",
     [
