@@ -2,6 +2,7 @@ import base64
 import dataclasses
 import json
 import re
+import zlib
 
 import pytest
 
@@ -23,7 +24,9 @@ from coding_review_agent_loop.decomposition import (
     TopologyCheckpoint,
     PhaseImplementationHandoffMetadata,
     _decode_phase_implementation_handoff_metadata,
+    _decode_json_payload,
     _decode_metadata,
+    _encode_json_payload,
     _encode_phase_implementation_handoff_metadata,
     _encode_metadata,
     _fresh_phase_payload,
@@ -908,8 +911,8 @@ def test_child_disposition_persistence_is_optional_and_legacy_stable():
     assert _decode_metadata(_encode_metadata(decomposition_metadata)) == decomposition_metadata
     legacy_metadata = dataclasses.replace(decomposition_metadata, dispositions=())
     encoded_legacy_metadata = _encode_metadata(legacy_metadata)
-    assert "dispositions" not in json.loads(
-        base64.urlsafe_b64decode(encoded_legacy_metadata).decode("utf-8")
+    assert "dispositions" not in _decode_json_payload(
+        encoded_legacy_metadata, marker_name="AGENT_PLAN_DECOMPOSITION"
     )
     assert _decode_metadata(encoded_legacy_metadata) == legacy_metadata
 
@@ -2096,6 +2099,134 @@ def test_non_ascii_retained_excerpt_is_shortened_in_the_parent_summary(unit):
     assert len(metadata.retained_parent_scope.excerpt) < len(huge_excerpt)
 
 
+def _retained_decomposition_metadata(excerpt: str) -> DecompositionMetadata:
+    return DecompositionMetadata(
+        parent_issue=909,
+        plan_hash="a" * 16,
+        mode="implement-by-phase",
+        phase_count=1,
+        phase_titles=("Stage one",),
+        automation=("agent-pr",),
+        children=(("Stage one", "https://example/issues/910", 910),),
+        topology_source="approved-plan-v1",
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="b" * 64, plan_hash="a" * 16, excerpt=excerpt,
+        ),
+        final_integration_work=ExecutionAllocation("none", (), (), ()),
+        strategy="staged",
+        execution_strategy_contract_version=1,
+        recommendation_digest="r" * 64,
+        plan_subject="b" * 64,
+        stage_ids=("stage-one",),
+        phase_identities=("identity-one",),
+    )
+
+
+def _plain_decomposition_payload(encoded: str) -> str:
+    """Re-encode a record the way summaries were published before #909."""
+    return _encode_json_payload(
+        _decode_json_payload(encoded, marker_name="AGENT_PLAN_DECOMPOSITION")
+    )
+
+
+@pytest.mark.parametrize(
+    "excerpt",
+    [
+        pytest.param("Retained scope line: keep the adapter contract.\n" * 400, id="ascii"),
+        pytest.param("保留された親スコープの詳細な説明文です。\n" * 400, id="cjk"),
+    ],
+)
+def test_decomposition_record_is_compressed_and_round_trips(excerpt):
+    """#909: the summary record is compressed and decodes to the same metadata."""
+    metadata = _retained_decomposition_metadata(excerpt)
+    encoded = _encode_metadata(metadata)
+    plain = _plain_decomposition_payload(encoded)
+
+    assert encoded.startswith("v1_")
+    assert plain.startswith("ey")
+    assert _decode_metadata(encoded) == metadata
+    # Repetitive plan text costs a small fraction of the plain base64 form,
+    # including a non-ASCII excerpt that the plain form escapes per character.
+    assert len(encoded) * 20 < len(plain)
+
+
+def test_decomposition_record_still_decodes_plain_published_summaries():
+    """#909: summaries published before compression stay recoverable."""
+    metadata = _retained_decomposition_metadata("Keep the adapter contract.")
+    compressed_body = format_decomposition_parent_summary(
+        parent_issue=metadata.parent_issue,
+        mode=metadata.mode,
+        plan_hash=metadata.plan_hash,
+        created=(
+            CreatedPhaseIssue(
+                phase=PlanPhase(
+                    title="Stage one",
+                    scope="Implement the reviewed stage contract.",
+                    non_goals="No rollout.",
+                    dependency_notes="No dependencies.",
+                    rollout_risk="low.",
+                    validation="Run the focused tests.",
+                    parent_context="Approved parent plan.",
+                    automation="agent-pr",
+                    depends_on=(),
+                ),
+                issue_url="https://example/issues/910",
+                issue_number=910,
+            ),
+        ),
+        retained_parent_scope=metadata.retained_parent_scope,
+    )
+    marker = re.search(r"<!-- AGENT_PLAN_DECOMPOSITION: (\S+) -->", compressed_body)
+    assert marker is not None and marker.group(1).startswith("v1_")
+    plain_body = compressed_body.replace(
+        marker.group(1), _plain_decomposition_payload(marker.group(1))
+    )
+
+    recovered_plain = find_existing_decomposition(
+        [IssueComment(author=None, created_at=None, body=plain_body)], parent_issue=909, plan_hash="a" * 16
+    )
+    recovered_compressed = find_existing_decomposition(
+        [IssueComment(author=None, created_at=None, body=compressed_body)], parent_issue=909, plan_hash="a" * 16
+    )
+    assert recovered_plain is not None
+    assert recovered_plain == recovered_compressed
+    # A plain summary and a re-posted compressed one of the same metadata are
+    # one decomposition, not a divergent pair.
+    assert find_existing_decomposition(
+        [IssueComment(author=None, created_at=None, body=plain_body), IssueComment(author=None, created_at=None, body=compressed_body)],
+        parent_issue=909,
+        plan_hash="a" * 16,
+    ) == recovered_plain
+
+
+@pytest.mark.parametrize(
+    "packed",
+    [
+        pytest.param(zlib.compress(b" " * 16_000_001, 9), id="oversized"),
+        pytest.param(zlib.compress(b'{"a":1}', 9)[:-4], id="truncated"),
+        pytest.param(b"not zlib data", id="garbage"),
+        pytest.param(zlib.compress(b'{"a":1}', 9) + b"junk", id="trailing-junk"),
+        pytest.param(
+            zlib.compress(b'{"a":1}', 9) + zlib.compress(b'{"b":2}', 9),
+            id="concatenated-stream",
+        ),
+    ],
+)
+def test_compressed_record_payload_rejects_malformed_or_oversized_data(packed):
+    encoded = "v1_" + base64.urlsafe_b64encode(packed).decode("ascii")
+    with pytest.raises(AgentLoopError, match="Invalid AGENT_PLAN_DECOMPOSITION payload"):
+        _decode_metadata(encoded)
+    # Recovery reads summaries straight from comments, so the decoder itself
+    # must reject the record rather than rely on writer canonicalization.
+    body = f"<!-- AGENT_PLAN_DECOMPOSITION: {encoded} -->"
+    with pytest.raises(AgentLoopError, match="Invalid AGENT_PLAN_DECOMPOSITION payload"):
+        find_existing_decomposition(
+            [IssueComment(author=None, created_at=None, body=body)],
+            parent_issue=909,
+            plan_hash=None,
+        )
+
+
 def test_parent_summary_overflow_names_the_surface_when_nothing_can_be_cut():
     """A summary whose fixed sections overflow raises a precise diagnostic."""
     from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
@@ -2113,7 +2244,9 @@ def test_parent_summary_overflow_names_the_surface_when_nothing_can_be_cut():
     )
     created = tuple(
         CreatedPhaseIssue(phase=phase, issue_url=f"https://example/issues/{n}", issue_number=n)
-        for n in range(1, 120)
+        # Enough rows that the visible table alone overflows: the compressed
+        # record no longer doubles the cost of each title (#909).
+        for n in range(1, 200)
     )
 
     with pytest.raises(AgentLoopError) as excinfo:
@@ -3287,3 +3420,221 @@ def test_valid_checkpoint_reuses_unchanged_through_the_orchestrator_decode(tmp_p
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in second.commands)
     assert len(second.issues) == 1
     assert not any("parse degradations" in c for c in second.comments)
+
+
+# ---------------------------------------------------------------------------
+# Signed child-plan supersession, digest-bound re-plan lineage (#936)
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    AuthorizedReplanLineage,
+    ChildPlanRebindRecord,
+    authorized_replan_lineage,
+    child_plan_supersession_digest,
+    collect_child_plan_supersessions,
+    find_child_plan_rebind_records,
+    format_child_plan_rebind_section,
+    format_child_plan_supersession_comment,
+    parse_child_plan_supersession_records,
+)
+from coding_review_agent_loop.decomposition import approved_plan_hash as _m936_plan_hash  # noqa: E402
+from coding_review_agent_loop.round_state import (  # noqa: E402
+    PostedRoundMetadata as _M936Metadata,
+    _attach_round_metadata as _m936_attach,
+    _decode_round_metadata as _m936_decode,
+    _encode_round_metadata as _m936_encode,
+    _plan_subject as _m936_subject,
+)
+
+
+class _M936Comment:
+    def __init__(self, body):
+        self.body = body
+
+
+def _m936_signed(superseded="aaaa000000000001", **overrides):
+    fields = dict(
+        child_issue=56, parent_issue=55, stage_id="stage-one",
+        superseded_plan_hash=superseded, rationale="Contract tightened.",
+    )
+    fields.update(overrides)
+    return format_child_plan_supersession_comment(**fields)
+
+
+def _m936_collect(comments):
+    return collect_child_plan_supersessions(
+        [_M936Comment(body) for body in comments],
+        child_issue=56, parent_issue=55, stage_id="stage-one",
+    )
+
+
+def test_m936_supersession_record_round_trips_with_a_stable_digest():
+    body = _m936_signed()
+    records, ignored = parse_child_plan_supersession_records(
+        body, comment_locator="child issue #56 comment 1", comment_index=0
+    )
+    assert ignored == () and len(records) == 1
+    record = records[0]
+    assert (record.child_issue, record.parent_issue, record.stage_id) == (56, 55, "stage-one")
+    assert record.superseded_plan_hash == "aaaa000000000001"
+    payload = json.loads(body.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert record.digest == child_plan_supersession_digest(payload)
+    assert re.fullmatch(r"[0-9a-f]{64}", record.digest)
+    # Key order in the posted JSON never changes the digest.
+    assert record.digest == child_plan_supersession_digest(dict(reversed(list(payload.items()))))
+
+
+def test_m936_unsigned_and_malformed_records_never_authorize():
+    unsigned = _m936_signed().replace("\n-- Human Reviewer", "")
+    malformed = _m936_signed().replace('"rationale": "Contract tightened."', '"rationale": ""')
+    extra_key = _m936_signed().replace('"kind"', '"surprise": 1,\n  "kind"')
+    ignored = []
+    found = collect_child_plan_supersessions(
+        [_M936Comment(unsigned), _M936Comment(malformed), _M936Comment(extra_key)],
+        child_issue=56, parent_issue=55, stage_id="stage-one", ignored_sink=ignored,
+    )
+    assert found == ()
+    assert len(ignored) == 2 and all("ignored" in note for note in ignored)
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"child_issue": 57}, {"parent_issue": 54}, {"stage_id": "stage-two"}]
+)
+def test_m936_signed_record_for_another_identity_fails_closed(overrides):
+    with pytest.raises(AgentLoopError, match="Human decision required"):
+        _m936_collect([_m936_signed(**overrides)])
+
+
+def test_m936_duplicates_collapse_and_distinct_hashes_coexist():
+    found = _m936_collect(
+        [_m936_signed(), _m936_signed(), _m936_signed(superseded="bbbb000000000002")]
+    )
+    assert [record.superseded_plan_hash for record in found] == [
+        "aaaa000000000001", "bbbb000000000002",
+    ]
+    # The earliest identical record keeps its comment position.
+    assert found[0].comment_index == 0
+
+
+def test_m936_two_distinct_records_for_one_hash_fail_closed_naming_both():
+    with pytest.raises(AgentLoopError) as excinfo:
+        _m936_collect([_m936_signed(), _m936_signed(rationale="A different reason.")])
+    message = str(excinfo.value)
+    assert "comment 1" in message and "comment 2" in message
+    assert "never chosen by comment order" in message
+
+
+def _m936_round(plan, number, *, prior=None, digest=None, superseded=None):
+    return _m936_attach(plan, _M936Metadata(
+        flow="plan", role="coder", agent="Claude", round_number=number,
+        subject=_m936_subject(plan),
+        prior_plan_subject=_m936_subject(prior) if prior is not None else None,
+        canonical_plan=plan,
+        plan_supersession_digest=digest, plan_supersession_superseded_hash=superseded,
+    ))
+
+
+def _m936_lineage(bodies, *, through_round=None, signed_bodies=None):
+    comments = [_M936Comment(body) for body in bodies]
+    supersessions = collect_child_plan_supersessions(
+        [_M936Comment(body) for body in (signed_bodies if signed_bodies is not None else bodies)],
+        child_issue=56, parent_issue=55, stage_id="stage-one",
+    )
+    old_hash = _m936_plan_hash("Old plan.")
+    digest = _m936_collect([_m936_signed(superseded=old_hash)])[0].digest
+    return authorized_replan_lineage(
+        comments, superseded_hash=old_hash, digest=digest,
+        supersessions=supersessions, through_round=through_round,
+    ), digest, old_hash
+
+
+def test_m936_valid_lineage_spans_reviewer_only_round_gaps():
+    old_hash = _m936_plan_hash("Old plan.")
+    signed = _m936_signed(superseded=old_hash)
+    digest = _m936_collect([signed])[0].digest
+    bodies = [
+        _m936_round("Old plan.", 1),
+        signed,
+        _m936_round("New plan.", 3, prior="Old plan.", digest=digest, superseded=old_hash),
+        _m936_round("Newer plan.", 5, prior="New plan.", digest=digest, superseded=old_hash),
+    ]
+    lineage, _digest, _old = _m936_lineage(bodies)
+    assert isinstance(lineage, AuthorizedReplanLineage)
+    assert lineage.round_numbers == (3, 5)
+    assert lineage.latest_plan_hash == _m936_plan_hash("Newer plan.")
+    bounded, _digest, _old = _m936_lineage(bodies, through_round=3)
+    assert isinstance(bounded, AuthorizedReplanLineage) and bounded.round_numbers == (3,)
+
+
+def test_m936_lineage_rejects_every_unauthorized_shape():
+    old_hash = _m936_plan_hash("Old plan.")
+    signed = _m936_signed(superseded=old_hash)
+    digest = _m936_collect([signed])[0].digest
+    other = "f" * 64
+    bound = dict(digest=digest, superseded=old_hash)
+    cases = {
+        "no digest": [_m936_round("Old plan.", 1), _m936_round("Later plan.", 2, prior="Old plan."), signed],
+        "different record": [
+            _m936_round("Old plan.", 1), signed,
+            _m936_round("New plan.", 2, prior="Old plan.", **bound),
+            _m936_round("Newer plan.", 3, prior="New plan.", digest=other, superseded=old_hash),
+        ],
+        "unbound follower": [
+            _m936_round("Old plan.", 1), signed,
+            _m936_round("New plan.", 2, prior="Old plan.", **bound),
+            _m936_round("Newer plan.", 3, prior="New plan."),
+        ],
+        "gap": [
+            _m936_round("Old plan.", 1), signed,
+            _m936_round("New plan.", 2, prior="Old plan.", **bound),
+            _m936_round("Newest plan.", 4, prior="Deleted middle plan.", **bound),
+        ],
+        "not based on superseded": [
+            _m936_round("Old plan.", 1), _m936_round("Other plan.", 2, prior="Old plan."), signed,
+            _m936_round("New plan.", 3, prior="Other plan.", **bound),
+        ],
+        "before signed comment": [
+            _m936_round("Old plan.", 1),
+            _m936_round("New plan.", 2, prior="Old plan.", **bound),
+            signed,
+        ],
+    }
+    for name, bodies in cases.items():
+        lineage, _digest, _old = _m936_lineage(bodies)
+        assert isinstance(lineage, str), name
+    # The bound signed record was deleted after binding.
+    deleted, _digest, _old = _m936_lineage(
+        [_m936_round("Old plan.", 1), _m936_round("New plan.", 2, prior="Old plan.", **bound)],
+        signed_bodies=[],
+    )
+    assert isinstance(deleted, str) and "not discoverable" in deleted
+
+
+def test_m936_round_metadata_encoding_is_byte_stable_without_the_binding():
+    legacy = _M936Metadata(
+        flow="plan", role="coder", agent="Claude", round_number=1, subject="s",
+        canonical_plan="Plan.",
+    )
+    from coding_review_agent_loop.round_transport import decode_mapping
+
+    assert not any(key.startswith("plan_supersession") for key in decode_mapping(_m936_encode(legacy)))
+    assert _m936_decode(_m936_encode(legacy)) == legacy
+    bound = dataclasses.replace(
+        legacy, plan_supersession_digest="a" * 64, plan_supersession_superseded_hash="b" * 16
+    )
+    decoded = _m936_decode(_m936_encode(bound))
+    assert decoded.plan_supersession_digest == "a" * 64
+    assert decoded.plan_supersession_superseded_hash == "b" * 16
+    with pytest.raises(ValueError):
+        dataclasses.replace(legacy, plan_supersession_digest="a" * 64)
+
+
+def test_m936_rebind_audit_record_round_trips_with_its_comment_index():
+    record = ChildPlanRebindRecord(
+        child_issue=56, pr_number=77, superseded_plan_hash="a" * 16, new_plan_hash="b" * 16,
+        plan_supersession_digest="c" * 64, first_replan_round=2, approved_round=3,
+    )
+    found = find_child_plan_rebind_records(
+        [_M936Comment("noise"), _M936Comment(format_child_plan_rebind_section(record))]
+    )
+    assert found == (dataclasses.replace(record, comment_index=1),)

@@ -65,8 +65,9 @@ Source paths below are relative to
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py`, `plan_review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head or a candidate plan. |
-| Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. |
+| Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. Structured plan coder comments additionally have a bounded visible digest, selected only when the full comment overflows the body budget (see *Compact-on-overflow plan presentation*). The visible coder matrix-evidence section is collapsed and, on PR coder follow-ups, projected as a delta against the previous coder round, while canonical evidence stays complete (see *Delta matrix-evidence presentation*). |
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier. |
+| Workflow transaction model (#827, stage A) | `workflow_transaction.py` | Typed transition intent whose canonical hash is the transaction ID; append-only prepared/terminal transaction record codec (PR-comment-only); version-2 handoff and PR contract derivation; lineage, era, approved-plan anchor, scheduler-checkpoint, and legacy-root resolvers. Every resolver accepts only the author-authenticated comment view read by `github.read_authenticated_protocol_comments`. Model only: no writer emits these records and no orchestration call site consumes them yet; the version-1 reader entry points are unchanged and still reject version 2. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
 | Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. |
@@ -132,7 +133,79 @@ row-level incomplete and test-receipt caveats. During staged execution, the
 approved topology assigns each applicable row to one owner: a generated child
 enforces only its owned rows while retaining sibling, later, and final rows as
 read-only pending obligations, and a separately planned child must link its
-rows to inherited parent obligations or surface a provenance conflict.
+rows to inherited parent obligations or surface a provenance conflict. That
+link is a field-classified preserve-or-strengthen contract, compared on exact
+sanitized strings with no case or whitespace normalization: applicability is
+ordered (`not-applicable` < `applicable` < `required`) and may only stay or
+rise; every parent forbidden side effect must survive as an exactly equal
+entry; the scenario coverage fields (entry path or mode, initial state, event,
+expected outcome) must retain the parent text verbatim and may only extend it;
+proposed test level and location may change but are always surfaced; the label,
+scope links, ordering, child-local rows, and the execution owner are free. A
+rejection names each weakened row and field with a route forward and fits the
+plan-validation diagnostic bound by construction. Admissible differences are
+reviewed deltas: child plan reviewers receive a deterministic parent-versus-child
+coverage delta, recomputed on resume and never persisted, with a duty to block
+any narrowing of coverage or test reachability. The same comparison runs inside
+the child plan-first cycle, from both parent dispatch and the direct child
+entry, as an orchestrator-owned bounded replan that is independent of structured
+repair: a weakening candidate stays unpublished in memory, the planner is
+re-invoked with the field-level diagnostic over the unchanged authenticated
+base, and exhausting `MAX_INHERITED_MATRIX_REPLANS` persists one authenticated
+plan-validation diagnostic record and stops deterministically before any
+reviewer or implementation turn; the next invocation recovers that record for
+its first planner turn. The same loop also absorbs deterministic plan-assembly
+failures on every plan-first run and semantic-patch payload rejections: repair
+may change only a semantic patch's envelope, so the recovered patch payload is
+validated on its own before repair is considered. Any payload rejection (a
+strict patch-schema failure including a missing or wrong kind, an unknown
+prior-item disposition, or an invalid
+human-requirement disposition), including one masked by an envelope error,
+skips the repair model and becomes a replan diagnostic instead. Every plan prompt form carries the inherited obligations
+through one shared lossless renderer that shows exactly the compared form. Both
+prompt blocks fail closed rather than truncate: oversized parent obligations
+stop child planning before any planner turn, and an oversized delta set rejects
+the candidate into the replan loop. Parent dispatch, direct child invocation,
+and both skill-runner PR-validation branches apply the same function.
+
+A historical approved child plan that fails this comparison has two audited
+recovery edges instead of a dead end. Before any implementation handoff, the
+approval-to-implementation guard in the plan-first loop posts one plain audit
+comment and re-enters the enforced, mechanically checked revision turn with the
+diagnostic attributed to the orchestrator, no synthetic reviewer item, and a
+latched complete board for the next round. After a handoff, issue routing judges
+the handed-off plan through the shared admissibility helper before resolving
+the canonical PR, and reopens planning only under a signed
+`child-plan-supersession` record discovered on the child issue (exact keys,
+standalone human signature, child/parent/stage identity, one record per
+superseded plan hash). The record digest is carried in two optional planning
+round-metadata fields, omitted from the encoding when absent, and
+`authorized_replan_lineage` is the single authority that accepts only a chained,
+digest-bound planner-round lineage starting from the superseded plan. On
+approval the existing open PR is rebound by one atomic issue-side comment
+holding the superseding issue-to-PR handoff record and a rebind audit record;
+nothing is written on the PR, so no partial cross-side state exists.
+Cross-side authentication compares the unchanged PR-side closing contract with
+the closing-contract lineage base (the latest issue-side record that is not a
+same-PR equal-ID plan replacement) and takes the plan hash from the latest
+record; the closing-ID digest never identifies a plan replacement. The resolver
+also keeps the most recent plan-changing handoff edge and its comment locator
+independently of that base, so a later closing-ID superset never hides a rebind
+from verification. One verifier,
+`verify_child_plan_rebind`, runs at issue entry, at both PR-loop provenance
+sites, and on the plan-identity-change branch of the PR qualification snapshot
+(through a planning-child binding captured once per PR run), so an unverified or
+inadmissible replacement never reaches review, final sweep, merge, or
+managed-CI gates. Provenance and current-contract admissibility are separate
+checks: how a plan became the binding is verified first on every entry path,
+before any new signed authorization for that plan is accepted, so an unverified
+replacement cannot be laundered while a verified one that later became
+inadmissible can still be superseded. The complete-board latch for the round
+that reviews such a revision is reconstructed on resume from durable state (the
+supersession binding on the latest planner round, or the guard's audit comment
+for the plan it revises), so a restart right after the revised round cannot
+narrow the board. PR approvals stay keyed by plan hash and subject, so none
+recorded before a rebind is carried.
 
 The validated matrix wire schema is the canonical source for planner and
 repair prompt key lists and minimal applicable/not-applicable examples. Repair
@@ -173,7 +246,11 @@ each row still verifies only on its own facts. Authority violations stay fatal:
 unknown keys, bad row IDs, empty selector lists, an admissible selector
 repeated within one row, catalog collisions, in-catalog selectors that are non-passing or
 whose launch integrity is failing or unknown (real broker handles, so
-selecting one is an authority decision), and legacy canonical fields. Repair
+selecting one is an authority decision), and legacy canonical fields. The
+catalog-authority rejections (collisions and non-passing or non-authoritative
+selectors) never route to structured repair, since reformatting cannot change
+them: the run stops once, naming the rejection as a
+`semantic-evidence-rejection` rather than a repair timeout (#990). Repair
 does not generate matrix identities, canonical rows, receipt IDs, mappings,
 statuses, or evidence envelopes. Derived evidence and diagnostics are the
 durable replay artifact; live execution selectors are not. Historical accepted
@@ -324,7 +401,23 @@ availability failure; it is never repaired into a verdict.
 The default policy invokes all reviewers. Opt-in selective intermediate review
 can pause already-approved reviewers for bounded fixes, but their old approvals
 remain head-bound. Changed scope, incomplete state, and final qualification can
-require a full review. The scheduler contract is immutable across a resume.
+require a full review. The scheduler contract is immutable across a resume,
+with one audited exception (#943). A signed human `reviewer-board-amendment`
+record may remove unavailable non-primary reviewers. It is read from the same
+comment surface as the round records it amends: the issue for planning, the PR
+for PR review. `board_amendment.resolve_contract_lineage` is the single
+resolver used at plan resume, PR startup, and the PR qualification gate. Only
+contract-bearing scheduler records take part. The base contract comes from the
+earliest persisted record, and each record is judged by exactly one
+amendment-chain link. Every post-amendment scheduler record must carry the
+amended contract and the record's digest in the optional
+`reviewer_board_amendment_digest` round-metadata field, which is omitted when
+absent. Any other contract refuses resume, qualification, and merge.
+Activation is pinned to the round the resume re-enters. Findings owned only by
+a removed reviewer are reassigned in a derived ledger view that never rewrites
+persisted in-round `prior_items`, and approvals banked by the removed reviewer
+remain history only. A comment carrying only such a record is excluded from
+signed human requirements.
 The opt-in `primary-then-panel` policy adds a phase-aware contract with one
 primary reviewer and a non-empty secondary panel. It keeps the primary as the
 only normal reviewer until exact-head approval, then dispatches an independent
@@ -435,6 +528,26 @@ explicitly `unavailable`, findings are namespaced by run with unique per-policy
 run identities, validated severity labels, and validated non-empty contributor
 arrays (a valid finding is never silently dropped from coverage), and the
 evaluator has no GitHub or reviewer-call dependency.
+
+PR and plan reviewer prompts, in both full and compact forms, share one static
+exhaustiveness rule: report every independently substantiated defect on the
+reviewed head or plan in one response, enumerate same-path defects together,
+and state genuine masking in the finding text and `summary`. It changes no
+response schema and sits inside the compact stable prefixes. To measure it,
+runs may carry a validated `review_contract` label (`first-finding-permitted`,
+the absent-key default, or `exhaustive`) with optional
+`review_contract_provenance`. The report adds
+`flows.<flow>.review_contracts.<contract>.policies.<policy>` cells holding
+rounds, reviewer calls, and escaped defects per run; a cell is `verified` only
+when every run has verified metric provenance and verified label provenance,
+and there is deliberately no per-flow or cross-policy contract rollup, because
+scheduling policy itself drives calls, rounds, and escapes. Two artifact pairs
+are checked in under `docs/evaluation/`: the synthetic regression fixture
+(`frozen_review_artifacts.json` and `frozen_review_report.json`), which never
+receives real runs, and the real-run pair (`review_contract_runs.json` and
+`review_contract_report.json`), which ships empty and is extended only by the
+documented data-only
+[freezing procedure](docs/local_agent_loop.md#freezing-a-real-run).
 
 Findings have stable IDs, provenance, dispositions, and, where applicable,
 resolution ownership. The coder reports addressed, remaining, and disputed
@@ -552,6 +665,23 @@ operator to fresh authorization. PR bodies, branches, labels, draft state,
 commits, and coder-authored comments remain corroboration only; they are not
 authority or a persistence substitute.
 
+The same chain is also a PR-qualification input. Managed recovery does not
+synthesize the issue-side handoff, so when a managed approved-plan PR has none,
+the fresh qualification snapshot reads the plan binding from the PR side
+instead (#966). On a voluntary or plan-limited base it re-reads the PR comments
+and requires every authorization record to be authored by the configured trusted
+actor (the comment author ID must match the record) and to name this
+repository, issue, PR, and base. It also requires exactly one distinct terminal
+at the live head. The only accepted exception follows resume: a single fresh
+grant may supersede the creation record at the same head. That terminal must
+link through round-backed continuity records to a creation or fresh root, the
+chain must not fork, and every record in it must carry the approved plan hash.
+A strictly protected base publishes no authorization record, so the binding
+comes from the same sources its resume used: the reserved managed branch for
+the issue, plus the issue's completely approved canonical plan, whose hash must
+still equal the bound plan. Any gap fails qualification closed. Runs that do
+have an issue-side handoff, and all non-managed runs, keep the issue-side check.
+
 The merge-conflict resolution round is the one automatic transition that has no
 reviewer to correlate. When the live head conflicts with the base branch the
 orchestrator skips reviewers by construction and routes the round to the coder,
@@ -666,6 +796,18 @@ recognized duplicate commands, not all overlapping work in arbitrary shells.
 Backend turn timeouts, whole-test-command watchdogs, and framework per-test
 timeouts are independent limits. See [containment](docs/local_agent_loop.md#process-tree-containment).
 
+A containment-aware test-worker budget (`test_workers.py`) is derived after
+admission from the limits that apply on each path (managed handle limits,
+cgroup ancestry, usable host memory, CPU affinity/quota) and exported to coder
+and repair agents as `AGENT_LOOP_TEST_WORKERS`. The parent-owned broker is the
+enforcement boundary: it applies the stricter of the parent and client values
+and injects a stdlib-only pytest plugin that clamps or refuses the final
+resolved pytest-xdist worker count and reports the gateways actually created.
+The local fallback is advisory by comparison, and the plugin is a prompt-slip
+safety net, not a sandbox. In clamp and refuse one test command per invocation
+holds a worker-budget lock. See
+[Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
+
 ## Other Entry Paths
 
 - `discuss` coordinates non-implementation debate, with optional research,
@@ -749,6 +891,85 @@ same assembler. The response form is durable round metadata, so a legacy or
 in-flight round cannot silently switch forms. Matrix-less and pre-rollout
 records remain on the legacy path and are never backfilled.
 
+### Compact-on-overflow plan presentation (#948)
+
+The transport spills round *metadata* into authenticated sidecars, but the
+visible Markdown of a structured plan comment had no spill path, so a plan whose
+prose alone exceeded the 60,000-character body budget (typically a separately
+planned child that must preserve many inherited matrix rows verbatim) could not
+be posted. Structured `plan_state` and `plan_revision` coder comments therefore
+have two presentations of the same plan:
+
+- **Full form** (default). Unchanged and byte-identical to earlier releases. It
+  is used whenever `round_transport.round_comment_fits` reports that the
+  assembled comment can be transported, with or without the existing spills.
+- **Bounded visible digest.** Selected by the shared publication helper
+  `_assemble_structured_plan_round_body` only when the fit check reports the
+  dedicated `RoundCommentOverflowError`. Every other transport failure
+  (malformed structured record, non-serializable metadata, provenance failure,
+  oversized sidecar part) propagates and aborts publication; it never selects
+  the digest. Round metadata is always built from the full canonical rendering
+  before either presentation is chosen, so `canonical_plan`, the plan subject,
+  the rendered-plan identity, the assembled plan sidecar and the matrix identity
+  are identical for both forms.
+
+The digest is a pure deterministic function of the parsed plan. Its budgeted
+sections (summary, prior plan item dispositions as ID plus disposition, plan
+steps, additional closing issue IDs, deferred stages and each typed stage
+category by title) share one aggregate budget,
+`COMPACT_PLAN_DIGEST_BUDGET_CHARS` (12,000 characters). Each section owns a
+fixed share that already includes its heading and its omitted-entry line; entries
+are emitted in canonical order, each sanitized and clipped to a fixed per-entry
+ceiling, until the next entry would exceed the share, and the section then ends
+with one line stating how many of how many entries were omitted. Unused share is
+never redistributed, so the bound holds by construction for any entry count or
+string length, and the renderer asserts it.
+
+Record contract of the digest:
+
+- *Visible-anchor set* (always present): the risk-matrix record with its
+  renderer boundary, the execution-recommendation record with its renderer
+  boundary, the signed-requirements acknowledgement record when the raw response
+  carried one, the plan-state footer, the signature, and the round metadata
+  record. The matrix and recommendation sections come from the unchanged section
+  renderers; the transport's existing authenticated reference rewrites of those
+  two payloads and of the round metadata payload are the only rewrites allowed.
+- *Canonical-metadata-only set* (deliberately absent): the deferred-stage,
+  typed-stage and expected-closing payload records. Their sections appear only
+  as bounded indexes. They remain lossless because identical records stay inside
+  `canonical_plan` in authenticated (spillable) round metadata and the assembled
+  plan sidecar carries the same collections as structured state. Every reader of
+  these records (`_extract_current_deferred_stages`,
+  `_extract_current_expected_closing_issue_ids` and the typed-stage extractors
+  in `orchestrator.py`) takes the canonical plan text, never the visible body of
+  a plan coder round comment.
+- *Signed requirement IDs are never omitted.* The acknowledgement block keeps
+  its record, heading, every requirement ID line and the direct-discussion
+  sentence; the dispositions section lists every requirement ID. Only
+  explanatory evidence text is clipped, and a clip never cuts inside an ID. These
+  sections are outside the omitted-entry policy and bounded only by the prompt's
+  surfaced-ID cap. For a fresh `plan_state` the parsed plan does not retain the
+  raw acknowledgement, so the compact path alone reads the validated raw
+  response (`raw_text`); the full rendering ignores it. Before posting, the
+  helper revalidates the digest with the same surfaced IDs and direct-discussion
+  flag that validated the raw response, and refuses to post a digest that fails.
+
+On resume, authenticated round metadata and its sidecars are the sole source of
+everything the digest omitted: plan resume reads `metadata.canonical_plan`,
+reviewers are prompted with the complete plan, and child matrix validation reads
+the hydrated structured matrix. The digest is never parsed back as plan text.
+Free-form (unstructured) plans are not compacted, because their visible text is
+their only representation. Reviewer, PR-review and discuss comments keep their
+current rendering.
+
+When even the digest cannot fit (unspilled round metadata, the signed-requirement
+sections at their cap, or a free-form plan), publication fails before any
+comment or sidecar is posted. The overflow error keeps its leading sentence and
+adds size attribution: visible characters outside the round metadata record,
+residual encoded metadata characters, and the names and encoded sizes of the
+largest unspilled metadata fields. It reports names and integers only, never
+content.
+
 Repair runs before assembly and is lossless for semantic patches: it may fix
 only the response envelope and cannot add operations, change rationales, or
 alter base bindings. A cross-form, approved, stale, incomplete, or identity-
@@ -756,3 +977,59 @@ mismatched response fails before publication. The assembled generation-1
 Markdown and its existing subject/hash remain the downstream review and
 implementation surface; the sidecar is the durable authority used for
 hydration.
+
+### Delta matrix-evidence presentation (#959)
+
+The visible `### Risk-based mode and transition test matrix evidence` section of
+coder comments is presentation only: reviewers and resume read the canonical
+`risk_test_matrix_evidence` in round metadata (and the matrix sidecar), which
+always carries every row. The section therefore keeps its heading and
+`- Matrix identity:` line visible but wraps the row list in a renderer-emitted
+`<details><summary>…</summary>` block, padded with blank lines so GitHub renders
+the Markdown inside it collapsed. The summary text is built only from counts and
+integer round numbers; row text is still sanitized.
+
+`comment_rendering.resolve_matrix_evidence_render` is the single place that
+chooses the presentation. It returns a frozen `MatrixEvidenceRenderDecision`
+(`mode`, `anchor_round`, `previous_evidence`, `previous_round`), never raises,
+and `_render_risk_test_matrix_evidence` follows the decision without comparing
+anything itself:
+
+- **Full** (anchor = the coder record's own round number). Chosen when there is
+  no previous coder metadata, the previous evidence is absent or fails
+  `parse_risk_test_matrix_evidence`, the matrix identity differs, the row-ID sets
+  differ, or the previous anchor is unusable. A full decision carries no
+  previous evidence. Every row is rendered.
+- **Delta**. Chosen only for the same identity and the same row-ID set with a
+  usable anchor. Only rows whose comparison key changed are shown, followed by
+  `N rows unchanged since round P; full matrix in round F.`; with no changes that
+  line is the only content. The comparison key is the row payload with each
+  citation reduced to `(command, claim)`, so a fresh per-turn receipt ID alone is
+  not a change. The anchor is carried forward unchanged.
+
+The PR coder follow-up computes the posted record's round number once
+(`round_number + 1`) and uses it both as the helper's `current_round` and as the
+metadata `round_number`; it passes the same decision to
+`render_public_agent_comment(matrix_evidence_render_decision=...)` and persists
+its `anchor_round`. When the derived current evidence is `None` the helper is not
+called, no decision is passed, the section is omitted and no anchor is written;
+a later round with evidence then renders full. Issue-implementation comments that
+carry canonical evidence always render the full list, and both issue-to-PR
+metadata sites persist their own round as the anchor. The structured no-PR and
+rejected-conflict terminal comments carry no canonical evidence and omit the
+section.
+
+The anchor is the optional `PostedRoundMetadata.risk_test_matrix_evidence_full_round`
+integer, written only when not `None` (so earlier encodings stay byte-identical)
+and set if and only if the record persists matrix evidence. It is a small
+unspillable scalar. A non-serialized
+`risk_test_matrix_evidence_full_round_status` distinguishes decode quality, in
+the same style as `scheduler_metadata_status`: a missing key decodes as
+`absent`; a positive non-bool integer decodes as `valid`; any other present value
+(bool, zero, negative, string, null, float) decodes as anchor `None` with status
+`invalid`, without raising. Construction with an anchor promotes the status to
+`valid`, so in-process and decoded records agree, and an anchor combined with
+`invalid` is rejected. The helper treats a `valid` anchor as usable only when it
+is a positive integer no later than the previous record's round; an `absent`
+status on a record with evidence is a pre-#959 record, which rendered the full
+list itself, so its own round is the anchor; `invalid` forces a full render.

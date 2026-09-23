@@ -88,6 +88,268 @@ checkpoint, handoff, child plan, implementation handoff, and canonical PR, so
 the route cannot change because context was truncated or the command was run
 again.
 
+A child plan does not have to reproduce its inherited rows byte for byte. For
+each inherited row it must keep the row ID, never lower applicability
+(`not-applicable` < `applicable` < `required`), copy every parent forbidden side
+effect exactly (case and whitespace included; additions and reordering are
+fine), and keep the text of the entry path or mode, initial state, event, and
+expected outcome verbatim, adding refinements after it. The label, scope links,
+and execution owner are free, child-local rows may be added, and the proposed
+test level and location may change. Every admissible difference other than
+label, scope links, and ordering is shown to the child plan reviewers as a
+parent-versus-child coverage delta, and reviewers block any extension or test
+placement change that narrows the inherited coverage.
+
+The child planner and reviewers are shown the inherited rows in full in every
+plan prompt form, in exactly the form the validator compares. The check runs
+during child planning, before a candidate plan is posted: a candidate that
+weakens an inherited row is never published or reviewed, and the planner is
+re-invoked with a diagnostic naming each row and field, at most two times per
+planning round. If every candidate is rejected, one authenticated diagnostic
+record is posted and the run stops before any reviewer or implementation turn;
+rerunning the same `--plan-first` command feeds that record to the next planner
+turn. Neither prompt block is ever truncated: inherited rows too large to show
+losslessly stop child planning with a sizing diagnostic that points at the
+parent plan, and a child whose deltas are too large to show is replanned. PR
+validation applies the same comparison on parent dispatch, direct child
+invocation, and skill mode, so an already approved child plan that satisfies
+these rules resumes PR review without replanning.
+
+### Re-planning an approved child plan
+
+The planning-time check above prevents a *new* child plan from being approved
+while it weakens inherited rows. A plan approved earlier, for example before the
+contract tightened, is a historical artifact that can still fail the check. It
+is never grandfathered and the comparison is never relaxed; instead the failure
+names one of two supported routes.
+
+**Before any implementation handoff.** When a resumed, fully approved child
+plan fails the check, the loop posts one plain audit comment (keyed by the plan
+hash, so a rerun does not repeat it) and runs an enforced revision turn: the
+planner receives the field-level diagnostic attributed to the orchestrator, no
+reviewer item is invented, the revision is mechanically rechecked before it is
+published (at most two replans, with the usual persisted diagnostic on
+exhaustion), and the next round runs the complete reviewer board with no
+approval carried from the superseded plan. If the round budget is already
+spent, the run stops with a message naming `--max-rounds`. No signed record is
+needed here, because nothing downstream is bound to the plan.
+
+**After a handoff, with an open PR.** Issue mode judges the handed-off plan
+before it resolves the canonical PR. If the plan is inadmissible and no signed
+record matches, the run stops before any agent turn or write, printing the
+weakening diagnostic, this record pre-filled for the child, and the rerun
+command:
+
+````markdown
+Child plan supersession:
+
+```json
+{
+  "child_issue": 925,
+  "kind": "child-plan-supersession",
+  "parent_issue": 924,
+  "rationale": "Approved before the inherited-matrix contract tightened.",
+  "schema_version": 1,
+  "stage_id": "stage-1",
+  "superseded_plan_hash": "<16-hex plan hash printed by the diagnostic>"
+}
+```
+-- Human Reviewer
+````
+
+The record is read only from the child issue and only from a comment carrying
+the standalone human reviewer signature. Malformed or unsigned records are
+reported and ignored. A signed record naming another child, parent, or stage
+stops for a human decision. Identical duplicates collapse; records for different
+superseded hashes coexist (one per historical re-plan); two distinct records for
+the same superseded hash always stop for a human decision.
+
+The record is consulted for every handed-off plan, not only an inadmissible
+one: admissibility asks whether the plan is broken, the signed record asks
+whether a human authorized replacing it. An admissible plan with no matching
+record resumes its PR unchanged; an admissible plan with a matching record (a
+deliberate re-plan such as an authorized scope reduction) reopens planning
+exactly like an inadmissible one. In that case the planner receives the
+record's rationale as the revision instruction, and a resumed approval of the
+superseded plan runs the revision instead of approving and rebinding the plan
+the human asked to replace.
+
+With exactly one matching record and an open canonical PR, planning reopens:
+
+- The record's digest is written into the round metadata of every planner round
+  of the re-plan. Only a plan whose planner rounds start from the superseded
+  plan, chain to each other without a gap, all carry that digest, were posted
+  after the signed comment, and resolve to one discoverable signed record is
+  treated as produced by the authorized re-plan. A later plan that predates or
+  bypasses the authorization, a round bound to another record, a gap, or a
+  deleted record fails closed before any agent runs.
+- When the revision is approved, the existing PR is re-authenticated (open, same
+  number) and rebound by **one** issue comment containing the superseding
+  issue-to-PR handoff record and a rebind audit record (child, PR, both plan
+  hashes, digest, first re-plan round, approved round). The PR-side closing
+  contract is never rewritten, so an interruption leaves either the old binding
+  (the rerun performs the rebind only) or the new one (the rerun resumes the
+  PR). The write is skipped when it already exists. A plan-only invocation
+  stops after approval; the next rerun performs only the rebind.
+- The PR-side closing contract keeps authenticating against the closing-contract
+  lineage base: the most recent issue-side handoff record that is not a same-PR
+  equal-ID plan replacement. The plan hash comes from the latest record. The
+  closing-ID contract digest never identifies a plan replacement, since every
+  unchanged-ID rebind shares it.
+- Every path on which a replacement plan can become a PR's plan context, issue
+  entry, `agent-loop pr <n>` entry, and mid-run adoption at a qualification
+  gate, runs one verifier: the rebind audit record must be in the same comment
+  and agree with the handoff, the digest-bound rounds, and a discoverable signed
+  record, and the replacement plan must itself pass the inherited check.
+  Otherwise the run stops with a human-repair diagnostic and posts nothing.
+  The verifier follows the most recent plan-changing handoff record, so a
+  closing-issue superset recorded after a rebind never hides it. How the
+  current plan became the binding is verified before a new signed record for
+  that plan is accepted: an unverified replacement cannot be re-planned away,
+  while a verified plan that a later contract tightening made inadmissible can
+  be superseded again with its own signed record.
+- The round that reviews the revision runs the complete reviewer board under
+  staged planning, including when the run restarted right after the revised
+  plan round was posted; the requirement is recomputed from the issue history.
+  PR reviewer approvals are keyed by plan hash and subject, so none recorded
+  before the rebind counts under the new plan.
+- The execution decision record the original planning run left under the
+  superseded plan hash stays on the issue as history. After a rebind, issue
+  mode walks the live PR's plan-changing handoff transitions back from the
+  latest one. Each transition must carry its own rebind audit record and a
+  verified signed re-plan lineage, and a standalone audit record with no
+  transition counts for nothing. A decision bound to a plan hash that the
+  chain replaced is skipped, and the resumed run
+  records the decision for the rebound plan. A decision under any other plan
+  hash is still a competing topology and fails closed. An issue that got
+  stuck on this conflict before the fix recovers by rerunning the same
+  issue-mode command, with no manual edit.
+- The managed-CI authorization records on the PR that name the superseded
+  plan hash likewise stay as history. The explicit fresh authorization
+  (`--managed-ci-fresh`) uses the same verified chain: an actor-owned record
+  whose only difference is a plan hash the chain replaced is not a conflict,
+  and the new grant is bound to the rebound plan. A rebind does not move the PR
+  head, so a retired-plan grant at the live head is accepted as the new grant's
+  predecessor without a descendant proof; any other predecessor still needs
+  GitHub to prove the live head descends from it. Ordinary managed resume and
+  PR qualification carry the same verified set, so later runs resolve the
+  rebound grant and skip the retired ones instead of failing on them. A record
+  that differs in any other field, or names a plan hash no verified transition
+  replaced, still refuses. A PR stuck on this conflict recovers by rerunning
+  the fresh authorization command the ordinary path recommends.
+
+`agent-loop pr <n>` never re-plans or rebinds; it prints the issue-mode route.
+That includes an admissible bound plan with a pending matching signed record:
+PR mode stops before any reviewer runs rather than reviewing the PR against a
+scope no approved plan contains, since a PR-mode coder turn cannot produce the
+replacement plan. The same check runs again on the freshly fetched child issue
+at qualification and before every approval or merge, under every review
+policy and with or without `--auto-merge`. A record posted while reviewers
+were running therefore stops the run before it approves or merges.
+Keep the signed record on the child issue after the rebind. Re-planning
+continues the child's round numbering, so a higher `--max-rounds` may be needed.
+Not supported: abandoning or replacing the PR, re-planning direct-implementation
+or non-child issues, parent-plan revision, rewriting the PR-side contract, and
+any unsigned or flag-only bypass once a handoff exists.
+
+**Migration note.** A tightened inherited-matrix contract makes children
+approved under the looser contract inadmissible the next time the loop touches
+them. Both routes above are the intended migration path.
+
+### Removing an unavailable reviewer from an in-flight run
+
+A persisted scheduler contract (the required reviewer board, the policy, and
+the primary) is immutable for the run. If one reviewer's backend becomes
+unavailable, for example because its quota is exhausted, rerunning without that
+reviewer stops with the contract-drift error. That error now also prints a
+filled-in **signed reviewer-board amendment** record. A human operator posts it
+to record a deliberate, audited reduction of the board:
+
+````markdown
+Reviewer board amendment:
+
+```json
+{
+  "effective_from_round": 3,
+  "flow": "plan",
+  "issue": 942,
+  "kind": "reviewer-board-amendment",
+  "original_required_reviewers": [
+    "Codex",
+    "Claude",
+    "Antigravity"
+  ],
+  "policy": "primary-then-panel",
+  "pr_number": null,
+  "primary_reviewer": "Codex",
+  "rationale": "Antigravity weekly quota exhausted.",
+  "reason": "backend-unavailable",
+  "removed_reviewers": [
+    "Antigravity"
+  ],
+  "schema_version": 1
+}
+```
+-- Human Reviewer
+````
+
+- **Where to post it.** Post a `plan` record (`issue` set, `pr_number` null)
+  on the issue being planned. Post a `pr` record (`pr_number` set, `issue`
+  null) on the PR itself, including standalone `agent-loop pr` runs. A record
+  on the wrong surface, a record naming another issue or PR, and a `pr` record
+  on the owning issue all stop for a human decision.
+- **Choosing `effective_from_round`.** Use the round number the drift error
+  prints. That is the round the resume re-enters, whether the round is only
+  partly recorded or already reconciled, and it is not always the latest
+  visible round number. Any other value stops before any agent turn or comment
+  and prints the corrected template.
+- **Retroactive use.** The record rescues runs whose contract was persisted
+  before this feature existed. Earlier rounds are never rewritten. Inside the
+  re-entered round, reviews already posted by the remaining reviewers are
+  reused, and the removed reviewer is never invoked again.
+- **What stays immutable.** `policy` and `primary_reviewer` must match the
+  persisted contract. The primary cannot be removed, and a `primary-then-panel`
+  board must keep at least one secondary. Re-adding a removed reviewer is
+  contract drift. Every scheduler record posted after the amendment carries the
+  amended board and the record's digest; any other contract fails closed, and
+  at PR qualification it refuses the merge. Amendments can chain, with each
+  record's `original_required_reviewers` equal to the previous amended board.
+  Two different records that amend the same board always stop for a human
+  decision.
+- **Findings and approvals.** An active finding whose only pending owner was
+  removed is reassigned to the primary, or to every remaining reviewer when
+  there is no primary. It stays blocking until a new owner clears it; nothing
+  is auto-cleared. Approvals the removed reviewer already gave remain in the
+  history but are no longer required. The run posts one audit comment naming
+  the record, the activation round, and every reassignment. Scheduler audits,
+  completion messages, and (for PR runs, on every completion path including
+  managed CI) one plain completion comment on the PR note that the run
+  finished on a reduced board. The activation round always posts a fresh
+  scheduler checkpoint carrying the amended board and digest, even when every
+  remaining reviewer's review is reused.
+- Unsigned or malformed records are ignored with a logged diagnostic. A comment
+  that contains only the record is not treated as a signed human requirement.
+  All-reviewers PR runs and the non-staged plan path persist no contract, so
+  there you change the reviewer flags directly and must not post a record.
+
+**Lineage rules.** Only scheduler records that carry a contract are compared:
+the plan `scheduler-prelaunch` checkpoint and PR scheduler records written under
+a selective policy. Coder, reviewer, and phase-advance records are never
+compared and never carry the digest. The base contract is the one on the
+earliest contract-bearing record. Each record is judged by exactly one link of
+the amendment chain: the latest amendment whose comment precedes the record and
+whose `effective_from_round` is at or before the record's round. The record must
+carry that link's board and digest exactly. A record that precedes every
+amendment carries the original board and no digest. Plan resume, PR startup, and
+the PR qualification gate all use this one resolver, and the gate re-reads the
+amendments from the same fresh PR comment fetch as the scheduler records.
+
+**Ledger view.** Persisted `prior_items` inside a round are never rewritten.
+The reassignment is a derived view that the scheduler, disposition
+reconciliation, and completion check recompute from the record on every run.
+The ledger handed to the next round is built from that view, so from then on
+the persisted items carry explicit owners that exclude the removed reviewer.
+
 ### Risk-based mode and transition matrices
 
 For planning work involving multiple modes, lifecycle transitions,
@@ -316,7 +578,203 @@ descendants remain part of the host session and receive prompt guidance plus
 the managed wrapper when used. The aggregate is per user manager, not a
 cross-user host isolation boundary.
 
+Parallel test workers are budgeted against these limits; see
+[Parallel test-worker budget](#parallel-test-worker-budget).
+
+### Parallel test-worker budget
+
+Parallel test workers multiply memory, so every loop derives an explicit
+test-worker budget from the containment that actually applies, exports it to
+coder and repair agents as `AGENT_LOOP_TEST_WORKERS` (with the enforcement mode
+in `AGENT_LOOP_TEST_WORKER_ENFORCEMENT`), and enforces it for pytest-xdist in
+`agent-loop run-tests`.
+
+**Derivation.** `workers = min(cpu_term, mem_term)`, never below 1.
+
+- The CPU term uses `os.sched_getaffinity` where it exists and returns a
+  non-empty set, then `os.cpu_count()`, then 1, so derivation never raises on
+  macOS or other hosts without affinity support. It is further capped by
+  `ceil(quota / period)` of every `cpu.max` quota in the process's own cgroup
+  ancestry. `CPUWeight` is proportional sharing, not a cap, and is not used.
+- The memory ceiling is the minimum of a candidate set: usable host memory
+  (physical memory minus `--containment-os-headroom-percent`, always a
+  candidate when readable), the admitted child and aggregate `MemoryHigh`
+  (else `MemoryMax`) when the backend is the managed `systemd-cgroup-v2`
+  scope, and every `memory.high`/`memory.max` in the orchestrator's own cgroup
+  ancestry (for example an operator's outer
+  `systemd-run --user --scope -p MemoryHigh=9G`). A limit above physical
+  memory therefore never raises the ceiling.
+  `mem_term = floor((ceiling - 1 GiB reserve) / per-worker estimate)`, with a
+  1 GiB default per-worker estimate (`--test-worker-memory SIZE`).
+- With containment `off`, a process-group fallback, macOS, or non-systemd
+  hosts, the finite default policy values are advisory and ignored. If no
+  memory candidate is readable, the budget is `max(1, cpu_term // 2)` with
+  limiting factor `memory-unknown`. Preflight and prompts say
+  `no agent-loop memory ceiling enforced` unless a managed or ancestry limit
+  exists.
+- Only `/proc/self/cgroup`, host memory, and `cpu.max`, `memory.high` and
+  `memory.max` in the process's own cgroup ancestry are read; missing or racing
+  files are skipped.
+
+**Per-path sizing and timing.** Coder and repair budgets are derived *after*
+containment admission from the admitted handle, including a stricter live
+aggregate lease held by another agent-loop process, and the same value is
+exported to the agent and handed to its test broker. Broker tests attach to
+the requesting coder/repair scope, so they use that budget. A broker-unavailable
+`run-tests` inside a coder/repair scope inherits the exported value and may only
+lower it (child flags, ancestry limits). Only a genuinely standalone managed
+`run-tests` (no invocation ID) sizes from the admitted `test-gate` limits: it
+admits the scope first and binds the launcher to the effective command under
+the same lease. The prompt shows a preliminary pre-admission estimate; the
+launch-time environment value is authoritative. `containment-preflight` prints
+a preliminary budget with its source, limiting factor, backend and whether a
+ceiling is enforced.
+
+**Precedence.** In loop flows (`issue`, `pr`, ...) and standalone `run-tests`,
+`--test-workers N` replaces the derivation (raising or lowering it) and
+`--test-worker-enforcement {clamp,refuse,off}` sets the mode (default `clamp`).
+A `run-tests` with a parent (an inherited `AGENT_LOOP_TEST_WORKERS` or a broker)
+may only lower the budget and only tighten the mode (`off < clamp < refuse`);
+unparseable inherited values fail closed to 1 worker. The three flags are also
+accepted by the managed-command parser in both `--flag value` and
+`--flag=value` forms, so flagged wrappers keep workdir validation, evidence
+extraction and normalization.
+
+**Enforcement.** In `clamp` and `refuse` the wrapper injects a stdlib-only,
+in-process pytest plugin (`_agent_loop_worker_cap`, shipped as package data)
+through `PYTHONPATH` and `PYTEST_PLUGINS`, plus a wrapper-private
+`AGENT_LOOP_WORKER_CAP_SPEC`. A direct pytest command (after `env`, `timeout`,
+`nice`, `stdbuf`, `nohup`, `time` or `command` prefixes) also gets
+`-p _agent_loop_worker_cap` after its entry point; that later argv token
+re-enables the plugin even if config or `PYTEST_ADDOPTS` disables it. Every
+other command (make, scripts, tox, nox, npm, go, cargo, ...) keeps its argv
+unchanged, including any `env -i`/`-u` prefix, and receives the same inert
+environment; it is enforced whenever that environment reaches a pytest process
+and is recorded `not-observed` otherwise (for example tox without `passenv` for
+both variables, or an `env -i make test` prefix). `off` injects nothing. For a
+direct pytest, inline `env` segments cannot remove or forge the controlled
+variables: `-i`, `-u` and assignments are rewritten so the plugin, spec and (in
+clamp) the auto cap survive. The plugin requires pytest >= 8 (new-style pluggy wrappers); on
+older pluggy it defines no hooks and the run is reported unverified.
+
+The plugin acts on pytest's own final resolved options, whatever supplied them
+(any config file chosen by pytest's rootdir rules, `-c`, TOML or INI,
+`-o addopts`, `PYTEST_ADDOPTS`, argv, or a repository
+`pytest_xdist_auto_num_workers` hook):
+
+1. A pre-yield `pytest_cmdline_main` wrapper runs before xdist resolves
+   `-n`. Clamp lowers an over-budget integer (budget 1 becomes serial) and caps
+   `--maxprocesses` for `auto`/`logical`. Refuse judges
+   `min(value, maxprocesses)`, so `pytest -n 8 --maxprocesses=2` under budget 2
+   runs.
+2. A `pytest_xdist_auto_num_workers` wrapper takes the winning result
+   (xdist's or the repository's) and returns `min(result, budget)` in clamp; a
+   lower result is kept exactly. In clamp the wrapper also lowers the caller's
+   `PYTEST_XDIST_AUTO_NUM_WORKERS`; refuse leaves it untouched so the plugin can
+   refuse the real request.
+3. A tryfirst `pytest_xdist_setupnodes` wrapper trims the expanded spec list
+   (and `--tx`) to the budget, or refuses, after session-start and inner
+   setupnodes changes. Every gateway type counts (`popen`, `socket`, `ssh`,
+   ...); clamp keeps the first specs in order. An explicit `--tx` list needs
+   `--dist`/`-d` to distribute at all. It then writes the pre-creation
+   **decision** record: the enforced plan, not an observed count.
+4. `pytest_xdist_newgateway` counts the gateways NodeManager actually creates.
+5. A `pytest_runtestloop` wrapper writes the **confirmation** record before any
+   test runs, with the observed gateway count (`effective`), remote gateways,
+   and action `clamped`, `unchanged` or `exceeded`. Worker-restart gateways are
+   not counted. A first-test **executed** marker is informational only.
+
+Every refusal writes its refused record first and then raises a usage error,
+so pytest exits 4 before any gateway or test exists. Report writes are best
+effort: a write failure prints one stderr line and never changes pytest's exit
+status. xdist worker processes never enforce or write. Each top-level
+`pytest.main` in a process claims the spec for its own Config and reports under
+its own session; configs nested inside an active claim (pytester,
+`pytest.main` in a test) and child processes that inherit the environment are
+never enforced and write only a best-effort nested marker.
+
+The enforcement contract is deliberately narrow. A repository tryfirst
+`pytest_xdist_setupnodes` wrapper registered after the plugin can add gateways
+after the trim; the plugin cannot prevent that, reports `exceeded` with a
+warning, and never labels such a run enforced. A repository can also unregister
+the plugin. The plugin is a safety net against prompt slips, **not a sandbox**:
+cgroup memory limits remain the hard boundary.
+
+**Verification and evidence.** After a clamp/refuse run the wrapper reads the
+report. Evidence is suppressed only when it proves no test ran: a direct pytest
+whose single session wrote only a refused record (and no nested marker) exits
+with the wrapper configuration status 2, records no runtime observation or
+launcher-health row, and the broker returns `worker-budget-refused`. The only
+pre-spawn refusal is an argv `-p no:_agent_loop_worker_cap` in refuse mode (in
+clamp it is stripped with a notice). Every other report containing a refused
+record, for example a script running several pytest sessions, keeps the
+command's own exit status and evidence with caveat
+`worker-budget-refused-session`, because a missing report line never proves that
+no test ran. A direct pytest with no valid report is recorded with
+`worker-budget-unverified` whatever its exit status, including 4. Other caveats
+are `worker-budget-not-observed`, `-mixed`, `-partial-observation`, `-nested-session`,
+`-remote-gateways`, `-exceeded` and `-descendants-terminated`.
+
+**Broker boundary.** The parent-owned budget passed to the broker is
+authoritative. The broker takes the stricter of the parent and the client's
+requested values, overwrites the spec, control variables, plugin environment
+and (in clamp) the auto cap in the spawned environment, and applies its own
+effective mode to a plugin-disabling argv token. Results carry the executed
+argv, the report-derived cohort and the enforcement status; the journal keeps
+the requested argv plus a worker-budget caveat. The local fallback trusts the
+inherited environment and is advisory by comparison.
+
+**One command at a time.** In clamp and refuse the budget is a simultaneous
+ceiling for the whole invocation. Only the process that spawns the target (the
+broker handler or the local fallback) takes the command lane and a
+non-blocking per-invocation worker-budget lock, never the `run-tests` client.
+A second concurrent test command in the same invocation, including a nested
+`run-tests` launched from inside a running test command, gets
+`worker-budget-busy` (exit 125, nothing recorded). The lock lives in a
+uid-owned directory (`/run/user/<uid>/agent-loop/worker-budget`, else
+`/tmp/coding-review-agent-loop-<uid>/worker-budget`) that no caller environment
+can choose; an unsafe directory fails closed. The command lane is keyed on the
+requested command with worker-selection tokens removed and no budget or mode,
+so every worker spelling of one command shares a lane in every mode. After the
+target exits, its process group is terminated before the lock is released:
+the group is always signalled with `killpg` (SIGTERM, then SIGKILL after a
+short grace), independently of `/proc`, and the lock is released only once no
+live member remains. If a member survives the bounded wait after SIGKILL, a
+warning is printed and a small detached watcher inherits the lock and holds it
+until the group is gone, so the next command of the invocation keeps getting
+`worker-budget-busy` until then. Processes that escape into a new session (`setsid`, double fork) are outside
+the ceiling and bounded only by cgroup limits. Off mode takes no worker-budget
+lock and terminates nothing. Test suites that exercise `run-tests` itself must
+give the inner call its own environment (clear `AGENT_LOOP_INVOCATION_ID` and
+run from its own cwd), as this repository's `tests/conftest.py` does.
+
+**Runtime cohorts.** `test-runtime.json` cohorts are keyed on
+`(normalized command, environment fingerprint, workers)`. The normalized
+command never includes the injected plugin token. In clamp and refuse the
+`workers` label comes only from the plugin report: `serial` or a count needs a
+direct pytest with exactly one confirmed session with no remote gateways, action
+`clamped` or `unchanged`, and no nested marker. It describes the top-level
+runner only: a child pytest that a test launches with a filtered environment is
+unobservable test-body workload. Everything else, including every `other`
+command, is `unknown`. Off-mode runs and legacy rows are `serial` only when the
+direct-pytest argv ends xdist loading with `-p no:xdist`, and `unknown`
+otherwise (including `-n 0`, `-n N` and `--tx`), because `--maxprocesses` from
+any source or a repository `pytest_configure` can change the gateway count.
+Unknown rows are retained but never feed serial or explicit-count
+recommendations, so after upgrade most legacy commands restart timeout
+learning. Use clamp or refuse with direct pytest for learned parallel timings.
+
+**Concurrent loops and containment tiers.** Different invocations (for example
+two loops on different repositories in separate capped user scopes) never
+contend for the worker-budget lock; each sizes from its own scope's limits and
+memory governs. Coder and repair budgets come from their own admitted child
+profiles, reviewer turns get no budget, and the `test-gate` profile only sizes a
+standalone managed `run-tests`.
+
 ### Local test evidence
+
+Test commands are also subject to the
+[parallel test-worker budget](#parallel-test-worker-budget).
 
 Coder and repair turns start an invocation-local test broker when the managed
 wrapper is available. The broker uses a fresh mode-0700 runtime directory and
@@ -465,6 +923,12 @@ authority, are unbounded input, or are owned elsewhere:
   real broker handle, so selecting it is an authority decision, not a format
   defect;
 - legacy canonical evidence fields in a fresh response.
+
+Catalog collisions and non-passing or non-authoritative in-catalog selectors
+are not repairable by reformatting, so they skip the structured repair pass
+and its model fallback chain entirely. The run reports `Failure category:
+semantic-evidence-rejection` with the selector named, rather than a repair
+timeout (#990).
 
 Broader handoff atomicity for other envelope failures after a PR is pushed is
 owned by #827 and #828.
@@ -689,6 +1153,11 @@ allowed GitHub surfaces. Trusted producers compose immutable `TrustedBody`
 segments, and writers verify a one-to-one match between every visible
 occurrence and its authorized canonical segment before posting.
 
+The workflow transaction record (#827) is registered as a PR-comment-only
+record. Nothing reads or writes it yet; the visible effect today is that
+look-alike text in untrusted prose or agent output is neutralized like any
+other reserved record.
+
 Naming a reserved record in issue or pull-request prose is safe. Untrusted
 GitHub text — an issue title or body, a pull-request title or body, a comment,
 or the body of a signed human requirement, which is itself an ordinary
@@ -869,7 +1338,10 @@ duplicate phase titles, invalid automation classes, unknown dependencies,
 self-dependencies, and forward dependencies; `depends_on` may reference only
 earlier phase titles. Parent decomposition metadata
 (`AGENT_PLAN_DECOMPOSITION`) and phase handoff metadata
-(`AGENT_PLAN_PHASE_IMPLEMENTATION`) make reruns idempotent. While an
+(`AGENT_PLAN_PHASE_IMPLEMENTATION`) make reruns idempotent. The decomposition
+metadata payload is `v1_`-prefixed zlib-compressed URL-safe base64, like the
+topology checkpoint; summaries published in the earlier plain-base64 form
+remain readable. While an
 `implement-by-phase` child is still open, rerun that child issue directly
 instead of expecting the parent to restart it; once it is closed with a merged
 PR, rerun the parent to advance to the next phase.
@@ -1044,6 +1516,89 @@ marker and its payload are unchanged, and older marker-only sidecars (which
 GitHub renders as "No description provided.") remain valid. Keep those
 sidecars with the anchor: resume fails loudly if one is missing or corrupt, at
 which point restore the sidecars or remove the incomplete anchor and rerun.
+
+Two review-state fields grow with use rather than with the change under
+review: the accumulated review items (`prior_items`) and the canonical
+risk/test-matrix evidence (`risk_test_matrix_evidence`). They are the last
+fields considered for spilling, so they move into sidecars only when the anchor
+would still overflow after every other spillable field has moved; a comment
+that fits is posted byte-for-byte as before. Matrix evidence never spills
+without the review items also spilling, and neither field ever spills in a
+discuss round. Resume needs these sidecars like any other.
+
+An older agent-loop binary never treats one of these spill references as data,
+but it does not always fail with an error either:
+
+- Resume and round-record extraction raise an invalid round-metadata error.
+- The plan-candidate existence check skips the record as absent.
+- Managed-CI continuity cannot see a merge-conflict obligation carried in
+  spilled review items, so it declines a conflict-only head transition (one with
+  no blocking-review record) instead of granting it. Transitions with a
+  reviewer pair are unaffected.
+- Discuss comments never carry these spills, so older discuss classification is
+  unchanged.
+
+Downgrading across such a comment is unsupported: upgrade the binary before
+resuming. Before this change such a comment could not be posted at all.
+
+The visible risk/test-matrix evidence section of coder comments is collapsed
+under a `<details>` summary and, on PR coder follow-ups, shows only the rows
+whose status, assertions, citations (ignoring receipt IDs) or caveats changed
+since the previous coder round, followed by a line such as `21 rows unchanged
+since round 26; full matrix in round 23.` The full row list is rendered in the
+issue-implementation comment, in the first follow-up that carries evidence,
+whenever the matrix identity or row set changes, and whenever the previous
+round's evidence or its recorded full-matrix round cannot be used. That round is
+kept in the optional `risk_test_matrix_evidence_full_round` round-metadata field;
+records written before this change are treated as having rendered the full list
+themselves. The canonical `risk_test_matrix_evidence` in `AGENT_LOOP_META` and
+the matrix sidecar still carry every row, so resume and reviewer prompts are
+unaffected.
+
+Sidecars carry metadata only. When the visible text of a structured plan comment
+(`plan_state` or `plan_revision`) would still push the comment over the
+60,000-character budget, the loop posts a **compact plan digest** instead of the
+full plan prose. This typically affects a separately planned child that must
+reproduce many inherited risk-matrix rows verbatim. The digest is chosen only
+for that size overflow and logs one line when selected; a plan that fits is
+posted exactly as before, and any other transport error still aborts
+publication.
+
+- The digest starts with a "Compact plan digest" notice and shows a bounded
+  summary: the plan summary, then plan steps, prior item dispositions, additional
+  closing issues, deferred stages and structured scope categories, each cut off
+  at a fixed share with a line such as `... 212 more of 300 omitted; complete
+  list in the authenticated attachments`. These sections together never exceed
+  12,000 characters.
+- Still visible in the comment: the risk/test matrix and execution
+  recommendation sections with their records (their payloads may be carried as
+  authenticated references, as before), the signed-requirements acknowledgement,
+  the plan-state footer, the signature and `AGENT_LOOP_META`. Signed requirement
+  IDs are never omitted or count-summarized; only their evidence text is
+  shortened, and the digest is revalidated against the surfaced IDs before it is
+  posted.
+- Only in authenticated metadata: the deferred-stage, typed-stage and
+  expected-closing records, along with every omitted entry. The complete plan
+  lives in `canonical_plan` and the assembled plan sidecar inside
+  `AGENT_LOOP_META` and its attachments. Resume, reviewer prompts, plan hashes
+  and child-plan validation read that complete plan, never the digest, so keep
+  the attachments with the anchor.
+
+Free-form (unstructured) plans cannot be compacted. If a comment still cannot
+fit, nothing is posted and the error explains where the size is, for example:
+
+```text
+Round comment exceeds 60000 characters even after metadata spill; shorten the
+visible response or metadata. Size attribution: visible body outside round
+metadata 52120 characters; residual encoded round metadata 9544 characters;
+largest unspilled metadata fields (encoded characters): architecture_impact=891, ...
+```
+
+When the round-metadata marker alone, with its framing and an empty visible
+body, would exceed the budget, the message says so instead: `the derived round
+metadata alone needs N characters, so shortening the visible response cannot
+fix it.` The same size attribution follows. The attribution lists field names
+and sizes only, never their content.
 
 Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
 require multiple reviewers:
@@ -1583,6 +2138,166 @@ runs. The checked-in
 `docs/evaluation/frozen_review_report.json` is regenerated from the fixture
 artifact and asserted by `tests/test_review_evaluation.py`.
 
+#### Review contract comparison
+
+Each run may also carry a `review_contract` label naming the reviewer prompt
+contract every review round of that run used. There are exactly two values:
+`first-finding-permitted`, the historical contract under which a reviewer could
+return after substantiating a single blocking defect, and `exhaustive`, the
+contract introduced with the reviewer exhaustiveness rule (see
+[Protocol](#protocol)). An absent key
+defaults to `first-finding-permitted`, mirroring the absent-`flow` default, so
+artifacts frozen before this dimension keep loading with an unchanged artifact
+hash. An explicitly present null, non-string, blank, or unknown value is
+rejected at load time and by direct evaluation, naming the run and the field,
+and the CLI exits non-zero without writing a report. The label is not part of
+run identity: duplicates are still detected per `(flow, policy, run_id)`.
+
+`review_contract_provenance` is an optional `{"source": ..., "verified": ...}`
+object recording the evidence for the label. A malformed object is rejected
+like any other provenance, and the object is rejected on a run that names no
+`review_contract`, because evidence cannot vouch for a label nobody wrote down.
+
+The JSON report gains an additive section per flow,
+`flows.<flow>.review_contracts.<contract>.policies.<policy>`. Runs are
+partitioned by flow, then review contract, then scheduling policy; both
+contracts and every policy the flow can run are always enumerated, so the shape
+is stable. Each `(flow, review_contract, policy)` cell carries `run_count`, the
+summed `review_rounds`, `reviewer_calls`, `coder_followup_rounds`, and
+`escaped_defects`, and the derived `review_rounds_per_run`,
+`reviewer_calls_per_run`, and `escaped_defects_per_run`. A cell value is
+`verified` only when every run in the cell has both the verified underlying
+measurement and verified `review_contract_provenance`. A run whose label was
+defaulted, or whose label provenance is absent or `verified: false`, makes
+every value of its cell `unavailable` with a reason naming the runs, so a
+mislabelled or unevidenced run can never yield a verified comparison. A cell
+with no runs is `unavailable` with the reason `no frozen runs for this review
+contract and policy`; nothing is estimated and an empty cell is never divided.
+The existing `flows.*.policies` rows and the top-level `policies` alias are
+unchanged by this section.
+
+The text report prints a `Review contract comparison (within scheduling
+policy)` block after each flow's policy rows. For every policy it lists the
+`first-finding-permitted` and `exhaustive` per-run values side by side, and it
+states that the before/after comparison is unavailable for that policy when
+either contract lacks a fully verified cell under it.
+
+Two reading rules apply:
+
+- Read the effect of the contract only within the same flow and the same
+  scheduling policy. Policies differ in reviewer calls, rounds, and escapes by
+  design, so comparing an `exhaustive` cell under one policy with a
+  `first-finding-permitted` cell under another would attribute a scheduling
+  effect to the prompt contract. For the same reason no pooled contract figure
+  is produced: there is no per-flow or cross-policy contract rollup.
+- Read rounds per run and reviewer calls per run together with escaped defects
+  per run. Fewer rounds are an improvement only if they were not bought with
+  missed defects.
+
+There are two checked-in artifact pairs, and they never mix:
+
+- `docs/evaluation/frozen_review_artifacts.json` with
+  `docs/evaluation/frozen_review_report.json` is the synthetic regression
+  fixture. Its runs are unlabeled, so they count in the
+  `first-finding-permitted` cell of their own policy with `unavailable` values.
+  It is never extended with real runs, so fixture records can neither pool into
+  a real baseline cell nor count toward its run minimum, and real data can
+  never break the fixture's pinned test values.
+- `docs/evaluation/review_contract_runs.json` with
+  `docs/evaluation/review_contract_report.json` is reserved for real
+  review-contract runs. It ships with an empty `runs` list, whose report has
+  every contract cell `unavailable`. `tests/test_review_evaluation.py` asserts
+  that the report equals regeneration and checks per-run invariants without
+  pinning any metric value, so data-only additions need no test edit.
+
+#### Freezing a real run
+
+Follow this procedure when adding a completed agent-loop run to
+`docs/evaluation/review_contract_runs.json`. It is a data-only change: do not
+edit the regression fixture, its report, the evaluator, or the tests.
+
+1. **Eligibility.** Freeze only completed runs. Every real run carries an
+   explicit `review_contract`; never rely on the absent-key default. A run
+   whose review rounds straddle the prompt change (for example a PR resumed
+   after the tool was upgraded) belongs to neither contract and must not be
+   frozen under either label.
+2. **Metrics.** Take the figures from the run's own records, not from memory:
+   `review_rounds` is the number of review rounds the orchestrator ran for the
+   PR or plan, as recorded by its per-round review comments and round
+   metadata; `reviewer_calls` is the number of reviewer invocations across
+   those rounds, one per reviewer log under `.agent-loop-logs/` (see
+   [Logs](#logs)), which under a selective policy is fewer than rounds times
+   reviewers; `coder_followup_rounds` is the number of coder follow-up turns
+   between reviews. Record `flow`, `policy`, and, for `primary-then-panel`,
+   `primary_reviewer` as the run was configured.
+3. **Metric and finding provenance.** Set the run-level `provenance` to
+   `{"source": "<where the figures were read>", "verified": true}` only when
+   the figures were checked against those records; otherwise set `verified:
+   false` or leave the run out. Never upgrade a run that could not be
+   verified. Set `label_provenance` the same way for the maintainer-triaged
+   finding `valid` labels. Provenance sources starting with `frozen-fixture:`
+   are reserved for the synthetic fixture and are rejected by the real-run
+   test.
+4. **Contract label evidence.** Record the evidence in
+   `review_contract_provenance.source`: either the tool commit used for every
+   review round of the run relative to the commit that merged the
+   exhaustiveness rule, or the captured reviewer prompt in the per-run agent
+   log showing the presence or absence of the rule in every round. Mark it
+   `verified: true` only when that evidence covers every review round.
+5. **Escaped defects.** Use a fixed escaped-defect observation window of 14
+   days after the run's PR merge, identical for both contracts. For a plan-flow
+   run the window is measured from the merge of the implementation PR produced
+   from the plan. Count only defects reported inside the window and traced to
+   the run's merged change, for historical baselines as well as new runs, so a
+   longer-exposed baseline is truncated to the same window and a just-merged
+   run is not credited with an unobserved zero. Always give the metric its own
+   `metric_provenance.escaped_defects` entry, whose `source` records the merge
+   date, the window end date, the observation date, and where defects were
+   searched (issues and PRs referencing the merged change); the real-run test
+   rejects a run that carries `escaped_defects` with only run-level
+   provenance. `escaped_defects` may be frozen as `verified: true` only after
+   the window has closed. Before that, either wait or freeze the entry with
+   `verified: false`, which the per-metric override reports as `unavailable`
+   and which makes only that cell's escaped-defect values unavailable while
+   rounds and calls stay verified. Do not report a comparison while the window
+   is still open for any run counted toward either contract.
+6. **Regenerate and check.**
+
+   ```bash
+   agent-loop review-evaluation docs/evaluation/review_contract_runs.json \
+     --output docs/evaluation/review_contract_report.json
+   python3 -m pytest tests/test_review_evaluation.py -q -p no:cacheprovider
+   ```
+
+A frozen run looks like this:
+
+```json
+{
+  "run_id": "pr-<number>",
+  "flow": "pr",
+  "policy": "primary-then-panel",
+  "primary_reviewer": "<reviewer>",
+  "review_contract": "exhaustive",
+  "review_contract_provenance": {
+    "source": "tool commit <sha> (after the rule merged in <sha>) for all review rounds",
+    "verified": true
+  },
+  "provenance": {"source": "PR <number> round metadata and .agent-loop-logs", "verified": true},
+  "label_provenance": {"source": "maintainer triage <date>", "verified": true},
+  "metric_provenance": {
+    "escaped_defects": {
+      "source": "merged <date>; window end <date>; observed <date>; searched issues and PRs referencing the merge",
+      "verified": true
+    }
+  },
+  "metrics": {"review_rounds": 0, "reviewer_calls": 0, "coder_followup_rounds": 0, "escaped_defects": 0},
+  "findings": []
+}
+```
+
+The zeros above are placeholders for the shape only; never freeze an invented
+or estimated measurement.
+
 The policy remains non-default until a separate frozen-history review shows
 severity-weighted marginal coverage justifies its latency and cost tradeoff.
 
@@ -1771,10 +2486,16 @@ than carrying the plan into implementation.
 
 #### Exclusions
 
-Discussion-mode scheduling and the child-planning cycle always invoke the full
-board, enforced by configuration reset rather than by convention: the child
-planning configuration and the semantic-dedupe isolated provider configuration
-both reset the planning policy, primary, and force-full fields. PR-flow
+Discussion-mode scheduling always invokes the full board, enforced by
+configuration reset rather than by convention: the semantic-dedupe isolated
+provider configuration resets the planning policy, primary, and force-full
+fields. A child-planning cycle inherits the operator's `--plan-review-policy`
+and `--primary-plan-reviewer`, because they express how plan review is
+conducted across the run, but no parent scheduling state crosses the boundary:
+the child configuration resets the force-full latch and uses the `auto`
+execution mode, since the child plan is a fresh artifact that no parent
+approval covers. When the parent run was given `--plan-review-force-full`, the
+child cycle logs once that the override is not inherited. PR-flow
 scheduling, qualification, managed CI, branch protection, and merge behavior are
 unchanged. The staged planning policy remains non-default until a flow-separated
 frozen evaluation justifies the latency and cost tradeoff. That comparison is
@@ -2420,8 +3141,9 @@ withhold code approval.
 
 The checked-in workflow for `wwind123/coding-review-agent-loop` is the
 base-branch security boundary for managed CI. It declares the literal
-`AGENT_LOOP_MANAGED_CI_V2` and
-`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` capabilities and subscribes to
+`AGENT_LOOP_MANAGED_CI_V2`,
+`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1`, and
+`AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1` capabilities and subscribes to
 exactly `opened`, `synchronize`, `reopened`, and `unlabeled` pull-request
 activities. A trusted same-repository draft on `main` with a reserved
 `agent-loop/managed-*` head may suppress the opening matrix before its label is
@@ -2859,6 +3581,18 @@ accepts neither green nor red same-context statuses unless publisher, nonce,
 attached run, and latest attempt all correlate. A failure is reported from the
 validated run's failing jobs, not base-ref PR checks.
 
+The workflow fullmatches the whole stripped intent comment body, so a trusted
+comment can never carry prose or a second record alongside the authorization.
+When the base workflow also advertises
+`AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1`, its envelope additionally admits one
+fixed visible line ahead of the hidden record, exactly
+`Managed CI authorization for exact head <sha>.` followed by a blank line, and
+the workflow rejects the record when that SHA differs from the payload's
+`expected_head_sha`. Agent-loop emits that line only for a base workflow that
+advertises the capability; against an older workflow, which accepts only the
+bare record, the comment stays marker-only. The bare form remains accepted by
+the current workflow for this transition.
+
 The v2 intent lifecycle is deliberately limited to `prepared`,
 `dispatch-requested`, `attached`, and `completed`. `prepared` and
 `dispatch-requested` always serialize `run_id: null` and `run_attempt: null`,
@@ -3060,6 +3794,19 @@ being relevant the moment the base advances.
   would be dispatched (the coder made no progress), the loop stops cleanly
   with an explanatory comment instead of looping.
 
+### Unchanged-head follow-ups
+
+A PR follow-up coder turn that leaves the PR head
+unchanged is counted. After two consecutive such turns the loop stops with a
+human-review error instead of starting another review of the same diff, which
+could only repeat the same verdict until `--max-rounds` ran out. A turn that
+moves the head resets the count, and the count belongs to one head: a round
+that starts on a different head, for example after an external push, starts
+from zero. For a planning child, the error also names the
+signed child-plan supersession route and the issue-mode rerun command, because
+a finding that requires re-planning can never be satisfied by a PR-mode coder
+turn.
+
 ### Focused, bounded local test selection
 
 A same-PR follow-up scoped to a wording correction in two files does not
@@ -3225,6 +3972,39 @@ A plan review uses `kind: "plan_review"`, `blocking_plan_issues`,
 `AGENT_STATE` or `AGENT_PLAN_STATE` footer. Blocking reviews must not hide
 current-round work in `future_followups`; approved reviews must not contain
 active blocking, Same-PR, Same-plan, or carried-forward active items.
+
+Each plan-review finding entry is normally a string. A reviewer may instead
+emit a finding object using only the keys `title`, `text`, `issue`, `finding`,
+`description`, `summary`, `location`, `evidence`, `rationale`, `impact`,
+`required_change`, `recommendation`, `suggested_fix`, and the reviewer-local
+labels `item_id`/`id` (#957). The parser flattens such an object mechanically,
+in that fixed key order, into one finding string that keeps every prose value
+verbatim (labelled values such as `Evidence:` and `Required change:` keep their
+label); the local labels are dropped. No repair model runs for this shape, so a
+container-type mismatch can no longer discard a well-grounded review. Unknown
+keys and non-string values are still rejected.
+
+When a structured response is recognized but fails schema validation, the
+terminal error leads with the validation reason and reports `Failure category:
+schema-validation`: the rejection is deterministic for that output, but model
+output varies between runs, so re-running the same command may succeed.
+
+Reviews are exhaustive. The full and compact PR review prompts and the full and
+compact plan review prompts share one static rule: report every defect that can
+be independently substantiated on the reviewed head or plan, not only the
+first; substantiating one blocking defect does not end the review; and when a
+defect is found in a function, code path, or plan step, re-read that whole
+function or path and enumerate every other independently evidenced defect
+there as separate entries in the same response. Each entry still needs its own
+evidence, and speculation or padding with items the reviewer cannot evidence
+is forbidden. When a defect genuinely prevents the reviewer from evaluating
+the code or plan content behind it, the reviewer says so in that entry's text
+and in `summary`, naming what could not be evaluated, so the coder knows
+another round is expected; masking must not be claimed merely to stop early.
+The rule changes no response schema: masking is conveyed through the existing
+finding text and `summary`. Coder, discuss, repair, and decomposition prompts
+do not carry it. Its effect on rounds per run is measured with the
+[review contract comparison](#review-contract-comparison).
 
 Published prior-item dispositions put the current status immediately after the
 item ID, before evidence and the original finding:

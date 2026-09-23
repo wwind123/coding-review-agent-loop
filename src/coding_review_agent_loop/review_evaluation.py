@@ -12,6 +12,15 @@ flow: a planning run can never pool its calls, tokens, latency, findings, or
 escaped defects into a PR row, or the reverse.  A run that omits ``flow``
 defaults to ``pr``, so PR-only artifacts written before the flow dimension keep
 loading and produce byte-identical PR rows.
+
+Runs may also carry a ``review_contract`` label (``first-finding-permitted``,
+the historical reviewer contract, or ``exhaustive``) with optional
+``review_contract_provenance`` evidence.  The contract comparison is reported
+per ``(flow, review_contract, policy)`` cell and is never pooled across
+scheduling policies: a policy determines reviewer calls and influences rounds
+and escapes, so a pooled cohort would attribute scheduling effects to the
+prompt contract.  An absent label defaults to ``first-finding-permitted`` but,
+lacking label evidence, never yields a verified cell.
 """
 
 from __future__ import annotations
@@ -35,6 +44,17 @@ FLOW_POLICIES: dict[str, tuple[str, ...]] = {"pr": POLICIES, "plan": PLAN_POLICI
 # Sentinel distinguishing an absent ``flow`` key, which defaults for legacy
 # PR-only artifacts, from an explicitly present null value, which does not.
 _ABSENT = object()
+REVIEW_CONTRACTS = ("first-finding-permitted", "exhaustive")
+DEFAULT_REVIEW_CONTRACT = "first-finding-permitted"
+# Summed per (flow, review contract, policy) cell, then divided by the cell's
+# run count for the ``*_per_run`` values named on the right.
+_CONTRACT_METRIC_KEYS = ("review_rounds", "reviewer_calls", "coder_followup_rounds", "escaped_defects")
+_CONTRACT_PER_RUN_KEYS = {
+    "review_rounds": "review_rounds_per_run",
+    "reviewer_calls": "reviewer_calls_per_run",
+    "escaped_defects": "escaped_defects_per_run",
+}
+CONTRACT_COMPARISON_TITLE = "Review contract comparison (within scheduling policy)"
 FLOW_TITLES = {
     "pr": "Frozen PR review policy evaluation",
     "plan": "Frozen plan review policy evaluation",
@@ -224,6 +244,60 @@ def _run_policy(value: object, flow: str, label: str) -> str:
     return policy
 
 
+def _run_review_contract(value: object, label: str) -> str:
+    """Return the validated review contract for a run; only an absent key defaults.
+
+    Mirrors ``_run_flow``: a run frozen before the contract dimension carries
+    no ``review_contract`` key and defaults to the historical
+    ``first-finding-permitted`` contract.  An explicitly present null, blank,
+    non-string, or unknown value is a labeled run whose label is unusable, so
+    it is rejected rather than silently assigned to the default cohort.
+    """
+    if value is _ABSENT:
+        return DEFAULT_REVIEW_CONTRACT
+    if value is None:
+        raise AgentLoopError(
+            f"Frozen evaluation {label} has an explicit null review_contract; omit the field "
+            f"entirely to keep the legacy {DEFAULT_REVIEW_CONTRACT!r} default, or name one of: "
+            f"{', '.join(REVIEW_CONTRACTS)}."
+        )
+    contract = _nonblank_string(value, f"{label} review_contract").lower()
+    if contract not in REVIEW_CONTRACTS:
+        raise AgentLoopError(
+            f"Frozen evaluation {label} has unsupported review_contract {contract!r}; "
+            f"expected one of: {', '.join(REVIEW_CONTRACTS)}."
+        )
+    return contract
+
+
+def _run_review_contract_provenance(run: Mapping[str, object], label: str) -> dict[str, object] | None:
+    """Return the run's label evidence, rejecting evidence for a defaulted label.
+
+    Provenance attached to a run that names no ``review_contract`` would vouch
+    for a label nobody wrote down, so it is rejected; a defaulted label can
+    therefore never produce a verified contract cell.
+    """
+    provenance = _provenance(run.get("review_contract_provenance"), f"{label} review_contract")
+    if provenance is not None and "review_contract" not in run:
+        raise AgentLoopError(
+            f"Frozen evaluation {label} carries review_contract_provenance without an explicit "
+            "review_contract label; name the contract the evidence supports."
+        )
+    return provenance
+
+
+def _resolved_contracts(
+    runs: list[Mapping[str, object]],
+) -> list[tuple[str, dict[str, object] | None]]:
+    """Pair each run with its validated review contract and label provenance."""
+    resolved: list[tuple[str, dict[str, object] | None]] = []
+    for index, run in enumerate(runs):
+        label = f"run {index}"
+        contract = _run_review_contract(run.get("review_contract", _ABSENT), label)
+        resolved.append((contract, _run_review_contract_provenance(run, label)))
+    return resolved
+
+
 def _resolved_runs(runs: list[object]) -> list[tuple[Mapping[str, object], str, str]]:
     """Pair each run with its validated flow and policy, failing closed.
 
@@ -268,6 +342,8 @@ def _validate_run(run: object, index: int) -> dict[str, object]:
     flow = _run_flow(run.get("flow", _ABSENT), f"run {index}")
     policy = _run_policy(run.get("policy"), flow, f"run {index}")
     run_id = _nonblank_string(run.get("run_id", str(index + 1)), f"run {index} ID")
+    review_contract = _run_review_contract(run.get("review_contract", _ABSENT), f"run {run_id}")
+    review_contract_provenance = _run_review_contract_provenance(run, f"run {run_id}")
     run_provenance = _provenance(run.get("provenance"), f"run {run_id}")
     label_provenance = _provenance(run.get("label_provenance"), f"run {run_id} label")
     raw_metric_provenance = run.get("metric_provenance")
@@ -310,7 +386,7 @@ def _validate_run(run: object, index: int) -> dict[str, object]:
     metrics = run.get("metrics")
     if metrics is not None and not isinstance(metrics, dict):
         raise AgentLoopError(f"Frozen evaluation run {run_id} metrics must be an object.")
-    return {
+    normalized: dict[str, object] = {
         "run_id": run_id,
         "flow": flow,
         "policy": policy,
@@ -324,6 +400,13 @@ def _validate_run(run: object, index: int) -> dict[str, object]:
         "label_provenance": label_provenance,
         "metric_provenance": metric_provenance,
     }
+    # The contract keys are carried through only when the run names them, so a
+    # defaulted label stays distinguishable from an explicit one and an
+    # artifact frozen before the contract dimension keeps its artifact hash.
+    if "review_contract" in run:
+        normalized["review_contract"] = review_contract
+        normalized["review_contract_provenance"] = review_contract_provenance
+    return normalized
 
 
 def load_frozen_artifacts(path: str | Path) -> dict[str, object]:
@@ -551,6 +634,54 @@ def _policy_row(policy_runs: list[Mapping[str, object]]) -> dict[str, object]:
     }
 
 
+def _contract_cell(
+    cell_runs: list[tuple[Mapping[str, object], Mapping[str, object] | None]],
+) -> dict[str, object]:
+    """Return one ``(flow, review contract, policy)`` cell from only its own runs.
+
+    A value is ``verified`` only when every run in the cell has both the
+    verified underlying measurement and verified ``review_contract_provenance``.
+    A defaulted or unevidenced label makes every value of the cell
+    ``unavailable``, naming the runs, so a mislabelled run can never yield a
+    verified before/after comparison.  Nothing is estimated and an empty cell
+    is never divided.
+    """
+    cell: dict[str, object] = {"run_count": len(cell_runs)}
+    unlabelled = [
+        str(run.get("run_id")) for run, provenance in cell_runs if not _is_verified(provenance)
+    ]
+    for key in _CONTRACT_METRIC_KEYS:
+        per_run_key = _CONTRACT_PER_RUN_KEYS.get(key)
+        if not cell_runs:
+            row = _unavailable("no frozen runs for this review contract and policy")
+            per_run = dict(row)
+        elif unlabelled:
+            row = _unavailable(
+                "review contract label absent or without verified provenance for runs: "
+                + ", ".join(unlabelled)
+            )
+            per_run = dict(row)
+        else:
+            values = [_metric_measurement(run, key) for run, _ in cell_runs]
+            missing = [
+                str(run.get("run_id")) for (run, _), value in zip(cell_runs, values) if value is None
+            ]
+            if missing:
+                row = _unavailable(
+                    "measurement absent or without verified provenance for runs: "
+                    + ", ".join(missing)
+                )
+                per_run = dict(row)
+            else:
+                total = sum(values)
+                row = {"value": total, "status": "verified"}
+                per_run = {"value": total / len(cell_runs), "status": "verified"}
+        cell[key] = row
+        if per_run_key is not None:
+            cell[per_run_key] = per_run
+    return cell
+
+
 def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, object]:
     """Return a stable report for every flow and its policies.
 
@@ -571,6 +702,7 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
     # none of that flow's policy rows.
     resolved = _resolved_runs(list(runs))
     _reject_duplicate_runs([run for run, _, _ in resolved])
+    contracts = _resolved_contracts([run for run, _, _ in resolved])
     canonical = json.dumps(dict(artifacts), separators=(",", ":"), sort_keys=True, ensure_ascii=False)
     report: dict[str, object] = {
         "schema_version": 1,
@@ -582,6 +714,11 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
         flow_runs = [
             (run, run_policy) for run, run_flow, run_policy in resolved if run_flow == flow
         ]
+        flow_contract_runs = [
+            (run, run_policy, contract, provenance)
+            for (run, run_flow, run_policy), (contract, provenance) in zip(resolved, contracts)
+            if run_flow == flow
+        ]
         report["flows"][flow] = {
             "title": FLOW_TITLES[flow],
             "run_count": len(flow_runs),
@@ -590,6 +727,23 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
                     [run for run, run_policy in flow_runs if run_policy == policy]
                 )
                 for policy in FLOW_POLICIES[flow]
+            },
+            # Partitioned by flow, then contract, then policy.  There is
+            # deliberately no per-flow or cross-policy contract rollup.
+            "review_contracts": {
+                contract: {
+                    "policies": {
+                        policy: _contract_cell(
+                            [
+                                (run, provenance)
+                                for run, run_policy, run_contract, provenance in flow_contract_runs
+                                if run_contract == contract and run_policy == policy
+                            ]
+                        )
+                        for policy in FLOW_POLICIES[flow]
+                    }
+                }
+                for contract in REVIEW_CONTRACTS
             },
         }
     # Backward-compatible alias: the PR flow's rows stay reachable at the
@@ -609,6 +763,54 @@ def _flow_policy_rows(report: Mapping[str, object], flow: str) -> Mapping[str, o
         return {}
     policies = report.get("policies")
     return policies if isinstance(policies, dict) else {}
+
+
+def _flow_contract_cells(report: Mapping[str, object], flow: str) -> Mapping[str, object]:
+    """Return one flow's review-contract section, tolerating older reports."""
+    flows = report.get("flows")
+    row = flows.get(flow) if isinstance(flows, dict) else None
+    contracts = row.get("review_contracts") if isinstance(row, dict) else None
+    return contracts if isinstance(contracts, dict) else {}
+
+
+def _contract_cell_value(cell: object, key: str) -> tuple[str, bool]:
+    row = cell.get(key) if isinstance(cell, dict) else None
+    if isinstance(row, dict) and row.get("status") == "verified":
+        return str(row.get("value")), True
+    status = row.get("status", "unavailable") if isinstance(row, dict) else "unavailable"
+    return str(status), False
+
+
+def _render_contract_comparison(report: Mapping[str, object], flow: str) -> list[str]:
+    """Render both contracts side by side, one scheduling policy at a time."""
+    contracts = _flow_contract_cells(report, flow)
+    lines = [f"\n{CONTRACT_COMPARISON_TITLE}"]
+    comparison_keys = (*_CONTRACT_PER_RUN_KEYS.values(),)
+    for policy in FLOW_POLICIES[flow]:
+        cells = {}
+        for contract in REVIEW_CONTRACTS:
+            section = contracts.get(contract)
+            policies = section.get("policies") if isinstance(section, dict) else None
+            cells[contract] = policies.get(policy, {}) if isinstance(policies, dict) else {}
+        counts = ", ".join(
+            f"{contract} {cells[contract].get('run_count', 0)} runs" for contract in REVIEW_CONTRACTS
+        )
+        lines.append(f"  {policy} ({counts})")
+        lacking: list[str] = []
+        for key in comparison_keys:
+            rendered = []
+            for contract in REVIEW_CONTRACTS:
+                text, verified = _contract_cell_value(cells[contract], key)
+                rendered.append(f"{contract}={text}")
+                if not verified and contract not in lacking:
+                    lacking.append(contract)
+            lines.append(f"    {key}: " + " | ".join(rendered))
+        if lacking:
+            lines.append(
+                f"    before/after comparison unavailable for {policy}: no fully verified cell under "
+                + ", ".join(lacking)
+            )
+    return lines
 
 
 def render_evaluation_report(report: Mapping[str, object], *, human: bool = False) -> str:
@@ -646,6 +848,7 @@ def render_evaluation_report(report: Mapping[str, object], *, human: bool = Fals
                         lines.append(f"  {key}: {value.get('value') if status == 'verified' else status}")
                     else:
                         lines.append(f"  {key}: {value}")
+        lines.extend(_render_contract_comparison(report, flow))
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 

@@ -300,6 +300,32 @@ def test_semantic_plan_revision_prompt_renders_exact_disposition_contract(tmp_pa
     assert "do not use `rationale` or omit `disposition`" in prompt
 
 
+def test_semantic_plan_revision_prompt_names_every_patch_operation(tmp_path):
+    """Issue #922: planners must be told the matrix operation names and shapes."""
+    from coding_review_agent_loop.protocol import (
+        PLAN_REVISION_PATCH_OPERATION_KEYS,
+        PLAN_REVISION_PATCH_REPLACEABLE_FIELDS,
+    )
+
+    prompt = build_plan_revision_prompt(
+        922,
+        2,
+        "Authenticated prior plan.",
+        "Blocking review.",
+        make_config(tmp_path),
+        response_form="semantic-patch-v1",
+        base_round_number=1,
+        base_state_identity="a" * 64,
+    )
+
+    for op in PLAN_REVISION_PATCH_OPERATION_KEYS:
+        assert f'"op": "{op}"' in prompt
+    for field in PLAN_REVISION_PATCH_REPLACEABLE_FIELDS:
+        assert f"`{field}`" in prompt
+    assert "Never `replace` `risk_test_matrix`" in prompt
+    assert '"source_row_ids": ["row-a", "row-b"]' in prompt
+
+
 def test_plan_review_prompts_expose_complete_one_shot_and_staged_recommendations(tmp_path):
     config = make_config(tmp_path)
     one_shot = validate_structured_plan_state(
@@ -1278,6 +1304,10 @@ def test_compact_plan_review_prompt_preserves_canonical_context_and_omits_raw_pr
     assert "Current plan payload." in tail
     assert "Planning round: 2" in tail
     assert "subject-a" in tail
+    assert "append-only" not in prompt.lower()
+    assert "bounded compact prior ledger below" in prefix
+    assert "Compact prior item ledger (bounded)" in prefix
+    assert "(details compacted)" in prefix
 
 def test_compact_plan_revision_prompt_preserves_context_and_omits_raw_prose(tmp_path):
     config = make_config(tmp_path)
@@ -1313,6 +1343,10 @@ def test_compact_plan_revision_prompt_preserves_context_and_omits_raw_prose(tmp_
     assert "Blocking review payload." in tail
     assert "Planning round: 2" in tail
     assert "subject-b" in tail
+    assert "append-only" not in prompt.lower()
+    assert "bounded compact prior ledger below" in prefix
+    assert "Compact prior item ledger (bounded)" in prefix
+    assert "(details compacted)" in prefix
     assert "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->" in prompt
     assert "### Human requirements" in prompt
     assert "after the JSON object and before the `AGENT_PLAN_STATE` footer" in prompt
@@ -1449,6 +1483,10 @@ def test_compact_pr_review_prompt_preserves_context_and_omits_raw_history(tmp_pa
     assert "Unrelated future-only item should not stay active" not in prefix
     assert "UNRELATED RAW PRIOR PR REVIEW HISTORY" not in prompt
     assert "[item-4] resolved: old resolved item" in prefix
+    assert "append-only" not in prompt.lower()
+    assert "bounded compact prior ledger below" in prefix
+    assert "Compact prior item ledger (bounded)" in prefix
+    assert "(details compacted)" in prefix
     assert "Coder says the compact mode wiring is complete." in tail
     assert "python -m pytest tests/test_agent_loop.py -k compact_pr" in tail
     assert "Use Future follow-ups only for independent later work" in prefix
@@ -4449,3 +4487,396 @@ def test_superseded_prepanel_plan_review_context_block_is_non_authoritative(tmp_
             56, 2, "Plan.", staged_config, reviewer="gemini", compact_context=compact
         )
         assert "Superseded pre-panel plan review context" not in plain
+
+
+# --- #931: inherited-obligation and coverage-delta prompt blocks ------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    InheritedMatrixBinding,
+    inherited_matrix_reviewed_deltas,
+    validate_separately_planned_child_matrix,
+)
+from coding_review_agent_loop.errors import AgentLoopError as _M931AgentLoopError  # noqa: E402
+from coding_review_agent_loop.prompts import (  # noqa: E402
+    build_plan_revision_prompt as _m931_build_plan_revision_prompt,
+    render_inherited_coverage_delta,
+    render_inherited_matrix_obligations,
+)
+
+_M931_CASE = "Do not unset $HOME_Dir or write /Var/Agent/State."
+_M931_SPACE = "Do not run `git  push   --force origin main`."
+
+
+def _m931_row(row_id, owner="api", **overrides):
+    return {
+        "row_id": row_id, "label": f"Label {row_id}",
+        "entry_path_or_mode": "Issue  Mode via `agent-loop issue`",
+        "initial_state": "Review complete", "event": "Repaired head passes",
+        "expected_outcome": "The transition completes.",
+        "forbidden_side_effects": [_M931_CASE, _M931_SPACE],
+        "proposed_test_level": "orchestrator", "proposed_test_location": "tests/test_x.py",
+        "applicability": "required", "related_scope_item_ids": ["scope-1"],
+        "execution_owner": owner, **overrides,
+    }
+
+
+def _m931_matrix(*rows):
+    return {"applicability": "applicable", "rows": list(rows), "important_exclusions": []}
+
+
+def _m931_binding(*rows):
+    return InheritedMatrixBinding(
+        parent_issue=55, stage_id="api",
+        parent_matrix=_m931_matrix(*(rows or (_m931_row("row-owned"), _m931_row("row-later", "later")))),
+    )
+
+
+def _m931_prompt_forms(tmp_path, **bound):
+    config = make_config(tmp_path)
+    planner = {key: value for key, value in bound.items() if key == "inherited_matrix_binding"}
+    forms = {"plan": build_issue_plan_prompt(56, config, **planner)}
+    for name, kwargs in (
+        ("revision-full", {}),
+        ("revision-compact", {"compact_context": True}),
+        ("revision-semantic", {
+            "response_form": "semantic-patch-v1", "base_round_number": 1,
+            "base_state_identity": "a" * 64,
+        }),
+    ):
+        forms[name] = _m931_build_plan_revision_prompt(
+            56, 2, "Plan.", "Review.", config, **kwargs, **planner
+        )
+    for name, compact in (("review-full", False), ("review-compact", True)):
+        forms[name] = build_plan_review_prompt(
+            56, 1, "Plan.", config, reviewer="codex", compact_context=compact, **bound
+        )
+    return forms
+
+
+def test_m931_unbound_plan_prompts_are_byte_identical(tmp_path):
+    baseline = _m931_prompt_forms(tmp_path)
+    explicit = _m931_prompt_forms(
+        tmp_path, inherited_matrix_binding=None, inherited_reviewed_deltas=None,
+        inherited_check_failure=None,
+    )
+    assert explicit == baseline
+    assert all("Inherited" not in prompt for prompt in baseline.values())
+    assert render_inherited_matrix_obligations(None) == ""
+    # A binding whose stage owns no rows renders nothing either.
+    ownerless = InheritedMatrixBinding(55, "other", _m931_matrix(_m931_row("row-owned")))
+    assert render_inherited_matrix_obligations(ownerless) == ""
+    assert render_inherited_coverage_delta(ownerless, ()) == ""
+
+
+def test_m931_every_bound_plan_prompt_form_carries_the_shared_obligation_block(tmp_path):
+    binding = _m931_binding()
+    block = render_inherited_matrix_obligations(binding)
+    forms = _m931_prompt_forms(tmp_path, inherited_matrix_binding=binding)
+    assert len(forms) == 6
+    for name, prompt in forms.items():
+        assert block in prompt, name
+    assert "row-later" not in block
+    assert "parent issue #55, stage `api`" in block
+    for rule in ("never lower applicability", "copy every forbidden side effect exactly",
+                 "verbatim and add refinements after it", "child-local rows may be added"):
+        assert rule in block
+    # Case and internal whitespace survive exactly.
+    for value in (_M931_CASE, _M931_SPACE, "Issue  Mode via `agent-loop issue`", "required"):
+        assert json.dumps(value) in block
+
+
+def test_m931_prompt_shown_form_is_the_form_the_validator_compares():
+    binding = _m931_binding()
+    block = render_inherited_matrix_obligations(binding).split("Descriptive tier:", 1)[0]
+    shown = [json.loads(line.split(": ", 1)[1] if ": " in line and not line.lstrip().startswith("- \"")
+                        else line.strip()[2:])
+             for line in block.split("Enforceable tier:\n", 1)[1].strip().split("\n")
+             if not line.endswith("forbidden_side_effects:")]
+    row_id, applicability, entry, initial, event, outcome, *effects = shown
+    copied = _m931_row(
+        row_id, "one-shot", label="Anything", applicability=applicability,
+        entry_path_or_mode=entry, initial_state=initial, event=event,
+        expected_outcome=outcome, forbidden_side_effects=effects,
+        related_scope_item_ids=["child-scope"],
+    )
+    assert validate_separately_planned_child_matrix(
+        binding.parent_matrix, _m931_matrix(copied), execution_owner="api"
+    ) == ("row-owned",)
+    assert inherited_matrix_reviewed_deltas(
+        binding.parent_matrix, _m931_matrix(copied), execution_owner="api"
+    ) == ()
+
+
+def test_m931_maximum_matrix_under_the_cap_is_lossless_and_drops_only_the_descriptive_tier(
+    tmp_path, monkeypatch
+):
+    rows = [
+        _m931_row(
+            f"row-{index:02d}",
+            entry_path_or_mode=f"Mode {index}  " + "M" * 380,
+            forbidden_side_effects=[f"Effect {index}-{n}  " + "eE" * 190 for n in range(6)],
+        )
+        for index in range(24)
+    ]
+    binding = _m931_binding(*rows)
+    enforceable = prompts_module.inherited_obligations_enforceable_size(binding)
+    # Cap just above the enforceable tier: budget pressure drops the
+    # descriptive tier as a whole, never an enforceable value.
+    monkeypatch.setattr(prompts_module, "INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES", enforceable + 8)
+    forms = _m931_prompt_forms(tmp_path, inherited_matrix_binding=binding)
+    for name, prompt in forms.items():
+        assert "Descriptive tier (labels and proposed tests) omitted as a whole" in prompt, name
+        assert "Label row-00" not in prompt
+        for row in rows:
+            assert json.dumps(row["entry_path_or_mode"]) in prompt
+            for effect in row["forbidden_side_effects"]:
+                assert json.dumps(effect) in prompt
+    monkeypatch.setattr(prompts_module, "INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES", enforceable - 1)
+    with pytest.raises(_M931AgentLoopError) as error:
+        render_inherited_matrix_obligations(binding)
+    assert f"measure {enforceable} bytes" in str(error.value)
+    assert f"{enforceable - 1}-byte" in str(error.value) and "issue #55" in str(error.value)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_m931_review_prompts_render_every_reviewed_delta_with_the_per_dimension_duty(
+    tmp_path, compact
+):
+    binding = _m931_binding(_m931_row("row-owned", applicability="applicable"))
+    parent = binding.parent_matrix["rows"][0]
+    child = _m931_row(
+        "row-owned", "one-shot", applicability="required",
+        forbidden_side_effects=[_M931_CASE, _M931_SPACE, "No duplicate  Record."],
+        event=parent["event"] + "  on the SECOND attempt " + "detail " * 60,
+        proposed_test_level="unit",
+    )
+    deltas = inherited_matrix_reviewed_deltas(
+        binding.parent_matrix, _m931_matrix(child), execution_owner="api"
+    )
+    assert [delta.field for delta in deltas] == [
+        "applicability", "forbidden_side_effects", "event", "proposed_test_level",
+    ]
+    config = make_config(tmp_path)
+    prompt = build_plan_review_prompt(
+        56, 1, "Plan.", config, reviewer="codex", compact_context=compact,
+        inherited_matrix_binding=binding, inherited_reviewed_deltas=deltas,
+    )
+    assert render_inherited_coverage_delta(binding, deltas) in prompt
+    for delta in deltas:
+        assert f"row {json.dumps(delta.row_id)} field `{delta.field}`" in prompt
+        for value in (delta.parent_value, delta.child_value):
+            if value:
+                assert json.dumps(value) in prompt
+    for dimension in ("entry path or mode", "initial state", "event", "expected outcome",
+                      "forbidden side effects", "test reachability"):
+        assert dimension in prompt
+    assert "is a blocking plan issue naming the row and field" in prompt
+
+    no_delta = build_plan_review_prompt(
+        56, 1, "Plan.", config, reviewer="codex", compact_context=compact,
+        inherited_matrix_binding=binding, inherited_reviewed_deltas=(),
+    )
+    assert "Inherited coverage delta: none;" in no_delta
+    failed = build_plan_review_prompt(
+        56, 1, "Plan.", config, reviewer="codex", compact_context=compact,
+        inherited_matrix_binding=binding, inherited_check_failure="row-owned: event replaced",
+    )
+    assert "Inherited coverage check FAILED" in failed and "row-owned: event replaced" in failed
+
+
+def test_m931_over_cap_delta_block_fails_closed_instead_of_truncating(monkeypatch):
+    binding = _m931_binding()
+    child = _m931_row("row-owned", "one-shot", proposed_test_level="unit")
+    deltas = inherited_matrix_reviewed_deltas(
+        binding.parent_matrix, _m931_matrix(child), execution_owner="api"
+    )
+    monkeypatch.setattr(prompts_module, "INHERITED_COVERAGE_DELTA_MAX_BYTES", 16)
+    with pytest.raises(_M931AgentLoopError, match="never truncated"):
+        render_inherited_coverage_delta(binding, deltas)
+
+
+# --- Reviewer exhaustiveness rule (#894) -----------------------------------
+
+_EXHAUSTIVENESS_MARKER = "Review exhaustively: report every defect you can independently substantiate"
+
+
+def _exhaustiveness_clauses(flow):
+    blocking, followups, subject, full_pass, behind = {
+        "pr": ("blocking_items", "same_pr_followups", "reviewed head", "full diff", "code"),
+        "plan": ("blocking_plan_issues", "same_plan_followups", "reviewed plan", "full plan", "plan content"),
+    }[flow]
+    return (
+        f"report every defect you can independently substantiate on the {subject}, not only the first.",
+        "Substantiating one blocking defect does not end the review; "
+        f"finish the pass over the {full_pass} before responding.",
+        "re-read that whole function or path and enumerate every other independently evidenced "
+        f"defect there as separate `{blocking}` or `{followups}` entries in the same response.",
+        "Each entry still needs its own evidence; speculation, or padding the review with items "
+        "you cannot evidence, is forbidden.",
+        f"If a defect genuinely prevents you from evaluating {behind} behind it, say so in that "
+        "entry's text and in `summary`, naming what could not be evaluated, so the coder knows "
+        "another round is expected.",
+        "Do not claim masking merely to stop early.",
+    )
+
+
+def _exhaustive_reviewer_prompt(config, flow, compact):
+    if flow == "pr":
+        return build_review_prompt(77, 2, config, reviewer="codex", compact_context=compact)
+    return build_plan_review_prompt(56, 2, "Plan.", config, reviewer="codex", compact_context=compact)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("flow", ["pr", "plan"])
+def test_every_reviewer_prompt_form_carries_the_flow_correct_exhaustiveness_rule(tmp_path, flow, compact):
+    prompt = _exhaustive_reviewer_prompt(make_config(tmp_path), flow, compact)
+    assert prompt.count(_EXHAUSTIVENESS_MARKER) == 1
+    flat = " ".join(prompt.split())
+    for clause in _exhaustiveness_clauses(flow):
+        assert clause in flat
+    other = "plan" if flow == "pr" else "pr"
+    assert _exhaustiveness_clauses(other)[2] not in flat
+    # The full and compact forms share one helper, so they cannot drift.
+    assert prompts_module._reviewer_exhaustiveness_guidance(flow) in prompt
+
+
+def test_exhaustiveness_rule_is_static_per_flow_and_keeps_existing_review_rules(tmp_path):
+    assert prompts_module._reviewer_exhaustiveness_guidance("pr") == prompts_module._reviewer_exhaustiveness_guidance("pr")
+    with pytest.raises(KeyError):
+        prompts_module._reviewer_exhaustiveness_guidance("discuss")
+    config = make_config(tmp_path)
+    for compact in (False, True):
+        flat = " ".join(_exhaustive_reviewer_prompt(config, "pr", compact).split())
+        assert '"kind": "pr_review"' in flat
+        assert "Pending or unavailable GitHub checks are an external wait state" in flat
+        assert "Do not defer your review to wait for CI checks to finish." in flat
+        assert "Only items listed under `Prior unresolved review items from earlier rounds`" in flat
+        plan_flat = " ".join(_exhaustive_reviewer_prompt(config, "plan", compact).split())
+        assert '"kind": "plan_review"' in plan_flat
+        assert "A concern or paraphrase belongs in exactly one current-round list" in plan_flat
+        assert "Do not duplicate or reclassify the same concern across Same-plan and Future follow-up lists." in plan_flat
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize(
+    "approved_followups", ["ignore", "summarize", "issue", "fix-and-summarize", "fix-and-issue"]
+)
+def test_pr_exhaustiveness_rule_appears_for_every_followup_mode(tmp_path, approved_followups, compact):
+    config = make_config(tmp_path, approved_followups=approved_followups)
+    prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
+    assert prompt.count(_EXHAUSTIVENESS_MARKER) == 1
+    baseline = build_review_prompt(
+        77, 1, make_config(tmp_path, approved_followups="ignore"), reviewer="codex", compact_context=compact
+    )
+    assert prompts_module._build_followup_guidance(config) in prompt or approved_followups == "ignore"
+    assert (approved_followups == "ignore") == (prompt == baseline)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("reviewer", ["codex", "gemini"])
+def test_exhaustiveness_rule_appears_under_primary_then_panel(tmp_path, reviewer, compact):
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="primary-then-panel",
+        plan_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+        primary_plan_reviewer="codex",
+    )
+    pr_prompt = build_review_prompt(77, 3, config, reviewer=reviewer, compact_context=compact)
+    assert pr_prompt.count(_EXHAUSTIVENESS_MARKER) == 1
+    assert "primary-then-panel" in pr_prompt
+    plan_prompt = build_plan_review_prompt(56, 3, "Plan.", config, reviewer=reviewer, compact_context=compact)
+    assert plan_prompt.count(_EXHAUSTIVENESS_MARKER) == 1
+
+
+def test_exhaustiveness_rule_sits_inside_the_compact_stable_prefixes(tmp_path):
+    for plan_execution_mode in ("auto", "plan-only"):
+        config = make_config(tmp_path, plan_execution_mode=plan_execution_mode)
+        pr_prefixes, plan_prefixes = [], []
+        for round_number, head in ((2, "abc123"), (3, "def456")):
+            pr_prompt = build_review_prompt(
+                77, round_number, config, reviewer="codex", compact_context=True,
+                compact_tail=CompactPrReviewTailContext(
+                    head_sha=head, round_number=round_number, action=f"Review {head}."
+                ),
+            )
+            prefix, tail = pr_prompt.split(COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER, 1)
+            assert _EXHAUSTIVENESS_MARKER in prefix and _EXHAUSTIVENESS_MARKER not in tail
+            pr_prefixes.append(prefix)
+            plan_prompt = build_plan_review_prompt(
+                56, round_number, f"Plan {head}.", config, reviewer="codex", compact_context=True,
+                compact_tail=CompactPlanTailContext(subject=f"subject-{head}", action=f"Review {head}."),
+            )
+            prefix, tail = plan_prompt.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)
+            assert _EXHAUSTIVENESS_MARKER in prefix and _EXHAUSTIVENESS_MARKER not in tail
+            plan_prefixes.append(prefix)
+        assert pr_prefixes[0].encode() == pr_prefixes[1].encode()
+        assert plan_prefixes[0].encode() == plan_prefixes[1].encode()
+
+
+def test_non_reviewer_prompts_do_not_carry_the_exhaustiveness_rule(tmp_path):
+    import coding_review_agent_loop.repair as repair_module
+
+    config = make_config(tmp_path)
+    prompts = {
+        "coder-followup": build_followup_prompt(77, 1, "Needs tests.", config),
+        "same-pr-followup": build_same_pr_followup_prompt(77, 1, "Tighten docs.", config),
+        "plan-revision": build_plan_revision_prompt(783, 2, "Previous plan", "Blocking review", config),
+        "compact-plan-revision": build_plan_revision_prompt(
+            783, 2, "Previous plan", "Blocking review", config, compact_context=True
+        ),
+        "discuss-review": build_discuss_review_prompt(56, config, reviewer="codex", round_number=1),
+        "repair-pr-review": repair_module._build_repair_prompt("{}", expected_kind="pr_review"),
+        "repair-plan-review": repair_module._build_repair_prompt("{}", expected_kind="plan_review"),
+        "repair-coder": repair_module._build_repair_prompt("{}", expected_kind="coder_followup"),
+    }
+    for name, prompt in prompts.items():
+        assert "Review exhaustively" not in prompt, name
+        assert "Do not claim masking merely to stop early." not in " ".join(prompt.split()), name
+
+
+# ---------------------------------------------------------------------------
+# Parallel test-worker budget guidance (issue #848)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fixture, supported",
+    [
+        ({"pyproject.toml": '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n'}, True),
+        ({"README.md": "```\npytest -n 6\n```\n"}, True),
+        ({"README.md": "Someday we may use pytest-xdist with pytest -n 6.\n"}, False),
+        ({}, False),
+    ],
+)
+@pytest.mark.parametrize(
+    "mode, sentence",
+    [
+        ("clamp", "Over-budget worker requests are lowered to the budget."),
+        ("refuse", "Over-budget worker requests are refused and the run does not execute."),
+        ("off", "The budget is advisory; nothing enforces it."),
+    ],
+)
+def test_coder_prompt_parallel_worker_guidance(tmp_path, fixture, supported, mode, sentence):
+    config = make_config(tmp_path, test_workers=3, test_worker_enforcement=mode)
+    for name, text in fixture.items():
+        (config.claude_dir / name).write_text(text, encoding="utf-8")
+    prompt = " ".join(build_issue_prompt(56, config).split())
+    assert "Parallel test workers: `$AGENT_LOOP_TEST_WORKERS`" in prompt
+    assert "3 worker(s) (operator-supplied" in prompt
+    assert sentence in prompt
+    if mode != "clamp":
+        assert "lowered to the budget" not in prompt
+    if supported:
+        assert "keep focused single-file runs serial" in prompt
+    else:
+        assert "do not add parallel worker flags" in prompt
+
+
+def test_reviewer_prompt_has_no_parallel_worker_guidance(tmp_path):
+    config = make_config(tmp_path)
+    (config.claude_dir / "pyproject.toml").write_text('dev = ["pytest-xdist"]\n', encoding="utf-8")
+    prompt = build_review_prompt(77, 1, config, reviewer="codex")
+    assert "Parallel test workers" not in prompt
+    assert "AGENT_LOOP_TEST_WORKERS" not in prompt

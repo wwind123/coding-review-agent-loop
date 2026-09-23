@@ -10,7 +10,11 @@ from collections.abc import Mapping, Sequence
 import dataclasses
 from dataclasses import dataclass, field
 
-from .errors import AgentLoopError, IssueImplementationConflictError
+from .errors import (
+    AgentLoopError,
+    IssueImplementationConflictError,
+    NonRepairableEvidenceRejection,
+)
 from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
 from .test_runtime import TestRuntimeConfigurationError, parse_managed_test_command
@@ -361,6 +365,64 @@ class ArchitectureImpact:
     uncertainty: tuple[str, ...] = ()
 
 
+_ARCHITECTURE_CHANGED_REQUIRED_KEYS = frozenset({
+    "affected_components", "dependencies", "execution_data_flows",
+    "persistence", "public_contracts", "security_boundaries",
+    "canonical_document_action", "canonical_document_path",
+    "canonical_document_rationale",
+})
+
+# Deterministic near-miss vocabulary for the closed ``status`` enum (#916).
+# Reviewers repeatedly wrote ``modified`` for ``changed``; rejecting the whole
+# round for one off-vocabulary word discarded otherwise valid reviewed work.
+# Keys are compared after lowercasing and folding ``_``/spaces to ``-``.  Any
+# value outside this explicit table still fails closed.
+_ARCHITECTURE_STATUS_SYNONYMS: Mapping[str, str] = {
+    "changed": "changed",
+    "change": "changed",
+    "changes": "changed",
+    "modified": "changed",
+    "modifies": "changed",
+    "modify": "changed",
+    "updated": "changed",
+    "unchanged": "unchanged",
+    "no-change": "unchanged",
+    "no-changes": "unchanged",
+    "not-changed": "unchanged",
+    "unmodified": "unchanged",
+    "none": "unchanged",
+    "same": "unchanged",
+    "no-impact": "unchanged",
+}
+
+
+def _normalize_architecture_status(
+    status: str, payload: Mapping[str, object], *, context: str
+) -> tuple[str, str | None]:
+    """Map a near-miss status onto the closed enum, returning an audit note.
+
+    A synonym for ``changed`` is accepted only when the payload is corroborated
+    by the complete ``changed``-only required field set; otherwise the value is
+    too ambiguous to guess and the original enum error is raised.
+    """
+    if status in {"changed", "unchanged"}:
+        return status, None
+    enum_error = AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
+    key = re.sub(r"[\s_]+", "-", status.strip().lower())
+    canonical = _ARCHITECTURE_STATUS_SYNONYMS.get(key)
+    if canonical is None:
+        raise enum_error
+    if canonical == "changed" and not _ARCHITECTURE_CHANGED_REQUIRED_KEYS <= set(payload):
+        raise enum_error
+    shown = sanitize_historical_text(status.strip())[:40]
+    note = (
+        f"agent-loop normalized {context}.status from `{shown}` to "
+        f"`{canonical}` (deterministic closed-enum synonym)."
+    )
+    return canonical, note
+
+
+
 ARCHITECTURE_IMPACT_DECLARED_STATUSES = frozenset({"changed", "unchanged"})
 # Parser-only status for a degraded assessment.  It has no wire form: the
 # response parsers reject it like any unknown status, strict decoders never
@@ -478,11 +540,9 @@ def architecture_impact_near_miss_corroborated(payload: Mapping[str, object]) ->
     for key in ("affected_components", "dependencies", "persistence", "public_contracts", "security_boundaries"):
         if not _non_blank_string_entries(payload.get(key)):
             return False
-    if not (
-        _non_blank_string_entries(payload.get("execution_data_flows"))
-        or _non_blank_string_entries(payload.get("execution_flows"))
-        or _non_blank_string_entries(payload.get("data_flows"))
-    ):
+    # Literal key only: the flow aliases do not satisfy the `changed`
+    # required-key check, so counting them here would reject the envelope.
+    if not _non_blank_string_entries(payload.get("execution_data_flows")):
         return False
     action = payload.get("canonical_document_action")
     if not isinstance(action, str) or not action.strip() or action.strip() == "no-change":
@@ -520,13 +580,24 @@ def parse_architecture_impact_degradable(
     return _parse_architecture_impact_degradable(value, context=context)
 
 
-def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureImpact:
-    """Strict parse: checkpoint decode, re-authentication and patch values."""
-    return _parse_architecture_impact_payload(_expect_object(value, context=context), context=context)
+ARCHITECTURE_STATUS_MODES = frozenset({"strict", "legacy"})
+
+
+def _parse_architecture_impact(
+    value: object, *, context: str, architecture_status_mode: str = "strict"
+) -> ArchitectureImpact:
+    """Strict by default; `legacy` keeps the #916 synonym decode for stored text."""
+    if architecture_status_mode not in ARCHITECTURE_STATUS_MODES:
+        raise AgentLoopError(f"Unknown architecture_status_mode {architecture_status_mode!r}.")
+    return _parse_architecture_impact_payload(
+        _expect_object(value, context=context),
+        context=context,
+        legacy=architecture_status_mode == "legacy",
+    )
 
 
 def _parse_architecture_impact_payload(
-    payload: dict[str, object], *, context: str, status: str | None = None
+    payload: dict[str, object], *, context: str, status: str | None = None, legacy: bool = False
 ) -> ArchitectureImpact:
     _expect_exact_keys(
         payload,
@@ -539,23 +610,25 @@ def _parse_architecture_impact_payload(
             "canonical_document_path", "canonical_document_rationale", "uncertainty",
         },
     )
+    normalization_note: str | None = None
     if status is None:
-        status = _expect_non_empty_string(payload["status"], context=f"{context}.status")
-        if status not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
-            raise AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
+        raw_status = _expect_non_empty_string(payload["status"], context=f"{context}.status")
+        if legacy:
+            # Compatibility decode of text stored or posted before #925 (#916).
+            status, normalization_note = _normalize_architecture_status(
+                raw_status, payload, context=context
+            )
+        else:
+            status = raw_status
+            if status not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+                raise AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
     action = _expect_non_empty_string(
         payload.get("canonical_document_action", "no-change"),
         context=f"{context}.canonical_document_action",
     )
     rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")
     if status == "changed":
-        required_changed = {
-            "affected_components", "dependencies", "execution_data_flows",
-            "persistence", "public_contracts", "security_boundaries",
-            "canonical_document_action", "canonical_document_path",
-            "canonical_document_rationale",
-        }
-        missing = sorted(required_changed - set(payload))
+        missing = sorted(_ARCHITECTURE_CHANGED_REQUIRED_KEYS - set(payload))
         if missing:
             raise AgentLoopError(
                 f"{context} changed assessments must include: {', '.join(missing)}."
@@ -589,13 +662,23 @@ def _parse_architecture_impact_payload(
             if payload.get("canonical_document_rationale") not in (None, "")
             else ""
         ),
-        uncertainty=_expect_string_list(payload.get("uncertainty", []), context=f"{context}.uncertainty", item_context=context),
+        uncertainty=(
+            *_expect_string_list(payload.get("uncertainty", []), context=f"{context}.uncertainty", item_context=context),
+            *((normalization_note,) if normalization_note else ()),
+        ),
     )
 
 
-def parse_architecture_impact(value: object, *, context: str = "architecture_impact") -> ArchitectureImpact:
+def parse_architecture_impact(
+    value: object,
+    *,
+    context: str = "architecture_impact",
+    architecture_status_mode: str = "strict",
+) -> ArchitectureImpact:
     """Validate an impact object for protocol extensions outside response envelopes."""
-    return _parse_architecture_impact(value, context=context)
+    return _parse_architecture_impact(
+        value, context=context, architecture_status_mode=architecture_status_mode
+    )
 
 
 def sanitize_architecture_impact(value: object | None) -> dict[str, object] | None:
@@ -779,9 +862,17 @@ class SemanticRiskCoverageClaim:
 
 @dataclass(frozen=True)
 class SemanticRiskCoverageClaims:
-    """Bounded shared semantic-claims carrier for both coder response kinds."""
+    """Bounded shared semantic-claims carrier for both coder response kinds.
+
+    ``dropped_row_ids`` records claims whose ``row_id`` was not in the turn's
+    approved enforceable set (#920).  Those claims are discarded before
+    authentication rather than rejecting the whole envelope: a dropped claim
+    asserts nothing, so its row stays pending, and derivation reports each
+    dropped id as an ``unapproved-row-claim`` diagnostic.
+    """
 
     claims: tuple[SemanticRiskCoverageClaim, ...] = ()
+    dropped_row_ids: tuple[str, ...] = ()
 
     @property
     def rows(self) -> tuple[SemanticRiskCoverageClaim, ...]:
@@ -1833,6 +1924,32 @@ def _observation_command_text(observation: object) -> str:
     return str(command or "local test execution")
 
 
+UNAPPROVED_ROW_CLAIM_DIAGNOSTIC = "unapproved-row-claim"
+
+
+def _unapproved_row_claim_message(
+    row_id: str,
+    *,
+    row_owner: str | None,
+    execution_owner: str | None,
+) -> str:
+    """Name the dropped row, the scope it violated, and its real owner."""
+    scope = (
+        f"execution owner `{_dropped_ref_preview(execution_owner)}`"
+        if execution_owner
+        else "this turn"
+    )
+    if row_owner is None:
+        origin = "The row is not in the approved matrix."
+    else:
+        origin = f"The row belongs to execution owner `{_dropped_ref_preview(row_owner)}`."
+    return (
+        f"A semantic coverage claim for row `{_dropped_ref_preview(row_id)}` was dropped "
+        f"because the row is not in the approved enforceable matrix set for {scope}. "
+        f"{origin} The claim asserted no coverage."
+    )
+
+
 def _claims_value(
     claims: SemanticRiskCoverageClaims | Sequence[SemanticRiskCoverageClaim] | None,
 ) -> tuple[SemanticRiskCoverageClaim, ...]:
@@ -1856,6 +1973,7 @@ def derive_risk_test_matrix_evidence(
     authenticated_tree_clean: bool | None = None,
     predecessor_head: str | None = None,
     expected_identity: str | None = None,
+    execution_owner: str | None = None,
 ) -> DerivedRiskEvidenceResult:
     """Derive canonical evidence from trusted matrix/journal/head inputs.
 
@@ -1939,6 +2057,20 @@ def derive_risk_test_matrix_evidence(
         }
         and not _observation_value(observation, "superseded_by")
     ]
+    if isinstance(claims, SemanticRiskCoverageClaims):
+        owner_by_row = {row.row_id: row.execution_owner for row in parsed_matrix.rows}
+        for dropped_row_id in claims.dropped_row_ids:
+            # Dropped before authentication (#920): the claim asserted nothing
+            # for this turn, but the operator should see that it was discarded.
+            diagnostics.append(PostAuthClaimDiagnostic(
+                dropped_row_id,
+                UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+                _unapproved_row_claim_message(
+                    dropped_row_id,
+                    row_owner=owner_by_row.get(dropped_row_id),
+                    execution_owner=execution_owner,
+                ),
+            ))
     result_rows: list[RiskTestMatrixEvidenceRow] = []
     for row in parsed_matrix.rows:
         if row.applicability not in {"applicable", "required"}:
@@ -3464,9 +3596,14 @@ def _parse_semantic_risk_coverage_claims(
     can still be authenticated and the row derives as unverified with an
     ``unknown-execution-ref`` diagnostic.
 
+    A claim whose well-formed ``row_id`` is outside the approved enforceable
+    set (for example a sibling phase's row) is dropped whole and its id is
+    recorded on ``dropped_row_ids`` (#920).  The rest of the envelope is kept;
+    derivation reports the dropped id as an ``unapproved-row-claim``
+    diagnostic and the row's own coverage stays pending.
+
     Still fatal, because they forge or corrupt authority, are unbounded input,
-    or are owned elsewhere: unknown keys; invalid, unapproved, or duplicate
-    row IDs; a missing ``execution_refs`` key or an empty list (#855); more
+    or are owned elsewhere: unknown keys; invalid or duplicate row IDs; a missing ``execution_refs`` key or an empty list (#855); more
     than eight refs, non-string or blank refs, or refs over the hard cap;
     an admissible selector repeated within one row (#865: the same
     admissible selector may be cited by several rows, because one wrapper
@@ -3486,7 +3623,10 @@ def _parse_semantic_risk_coverage_claims(
         raise AgentLoopError(
             f"{context} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_ROWS}-row bound."
         )
-    allowed_rows = set(expected_row_ids or ())
+    # ``None`` means no approved set was delivered (historical and unit
+    # callers).  An explicitly empty set is a real scope -- a stage that owns
+    # no enforceable rows -- so every claim is outside it (#920).
+    allowed_rows = None if expected_row_ids is None else set(expected_row_ids)
     catalog_by_ref: dict[str, object] = {}
     if execution_catalog is not None:
         for observation in execution_catalog:
@@ -3494,12 +3634,13 @@ def _parse_semantic_risk_coverage_claims(
             if execution_ref is None:
                 continue
             if execution_ref in catalog_by_ref:
-                raise AgentLoopError(
+                raise NonRepairableEvidenceRejection(
                     f"{context} cannot validate a colliding execution_ref `{execution_ref}`."
                 )
             catalog_by_ref[execution_ref] = observation
     result: list[SemanticRiskCoverageClaim] = []
     seen_rows: set[str] = set()
+    dropped_row_ids: list[str] = []
     for index, raw_claim in enumerate(value):
         claim_context = f"{context}[{index}]"
         payload = _expect_object(raw_claim, context=claim_context)
@@ -3510,10 +3651,14 @@ def _parse_semantic_risk_coverage_claims(
             optional=set(SEMANTIC_RISK_CLAIM_FACT_KEYS + SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS),
         )
         row_id = _validate_risk_row_id(payload["row_id"], context=f"{claim_context}.row_id")
-        if allowed_rows and row_id not in allowed_rows:
-            raise AgentLoopError(
-                f"{claim_context}.row_id `{row_id}` is not an approved enforceable matrix row."
-            )
+        if allowed_rows is not None and row_id not in allowed_rows:
+            # A claim for a row outside this turn's approved enforceable set
+            # (for example a sibling phase's row) asserts nothing this turn
+            # can own.  Drop just that claim (#920): the row is simply not
+            # claimed, which is stricter than losing every other valid claim.
+            if row_id not in dropped_row_ids:
+                dropped_row_ids.append(row_id)
+            continue
         if row_id in seen_rows:
             raise AgentLoopError(f"{context} contains duplicate claim for row `{row_id}`.")
         seen_rows.add(row_id)
@@ -3556,12 +3701,14 @@ def _parse_semantic_risk_coverage_claims(
             if execution_catalog is not None:
                 observation = catalog_by_ref[ref]
                 semantics, _rich = _observation_semantics(observation)
+                # Authority decisions over real broker handles: repair cannot
+                # satisfy them, so they must not route to it (#990).
                 if semantics["outcome"] != "passed" or semantics["provenance"] != "parent-observed":
-                    raise AgentLoopError(
+                    raise NonRepairableEvidenceRejection(
                         f"{claim_context}.execution_refs selector `{ref}` is not an admissible passing observation."
                     )
                 if not _known_launch_integrity_passes(observation):
-                    raise AgentLoopError(
+                    raise NonRepairableEvidenceRejection(
                         f"{claim_context}.execution_refs selector `{ref}` has known non-authoritative "
                         "launch-integrity state and cannot be selected before authentication."
                     )
@@ -3624,7 +3771,7 @@ def _parse_semantic_risk_coverage_claims(
             truncated_fact_fields=tuple(field for field, _ in truncated_facts),
         )
         result.append(claim)
-    return SemanticRiskCoverageClaims(tuple(result))
+    return SemanticRiskCoverageClaims(tuple(result), dropped_row_ids=tuple(dropped_row_ids))
 
 
 def _expect_optional_string_list(
@@ -3641,6 +3788,74 @@ def _expect_optional_string_list(
         context=context,
         item_context=item_context,
         min_length=min_length,
+    )
+
+
+# Structured plan-review finding objects (#957).  Reviewers asked for grounded,
+# itemised findings often emit objects instead of strings.  Each object is
+# flattened mechanically, in this fixed order, into one finding string that
+# keeps every supplied prose value verbatim, so no model repair is needed and
+# no qualifier can be lost.  Identifier keys are dropped: they are the
+# reviewer's local labels, not orchestrator item IDs.  Unknown keys and
+# non-string values are still rejected.
+PLAN_REVIEW_FINDING_TEXT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("title", ""),
+    ("text", ""),
+    ("issue", ""),
+    ("finding", ""),
+    ("description", ""),
+    ("summary", ""),
+    ("location", "Location"),
+    ("evidence", "Evidence"),
+    ("rationale", "Rationale"),
+    ("impact", "Impact"),
+    ("required_change", "Required change"),
+    ("recommendation", "Recommendation"),
+    ("suggested_fix", "Suggested fix"),
+)
+PLAN_REVIEW_FINDING_ID_FIELDS = frozenset({"item_id", "id"})
+
+
+def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
+    if isinstance(raw, str):
+        return _expect_non_empty_string(raw, context=item_context)
+    if not isinstance(raw, dict):
+        raise AgentLoopError(f"{item_context} must be a string or a finding object.")
+    text_fields = {name for name, _label in PLAN_REVIEW_FINDING_TEXT_FIELDS}
+    unknown = sorted(set(raw) - text_fields - PLAN_REVIEW_FINDING_ID_FIELDS)
+    if unknown:
+        allowed = ", ".join(sorted(text_fields | PLAN_REVIEW_FINDING_ID_FIELDS))
+        raise AgentLoopError(
+            f"{item_context} has unsupported finding key(s) {', '.join(unknown)}; "
+            f"use a string or an object with only: {allowed}."
+        )
+    for name in sorted(PLAN_REVIEW_FINDING_ID_FIELDS & set(raw)):
+        if not isinstance(raw[name], str):
+            raise AgentLoopError(f"{item_context}.{name} must be a string.")
+    parts: list[str] = []
+    for name, label in PLAN_REVIEW_FINDING_TEXT_FIELDS:
+        if name not in raw:
+            continue
+        value = _expect_non_empty_string(raw[name], context=f"{item_context}.{name}").strip()
+        parts.append(f"{label}: {value}" if label else value)
+    if not parts:
+        raise AgentLoopError(f"{item_context} finding object has no text field.")
+    return " ".join(parts)
+
+
+def _expect_plan_review_finding_list(
+    payload: dict[str, object],
+    field_name: str,
+    *,
+    context: str,
+) -> tuple[str, ...]:
+    """Accept plan-review findings as strings or flattenable objects (#957)."""
+    value = payload.get(field_name, [])
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    return tuple(
+        _flatten_plan_review_finding(raw, item_context=f"{context} at index {index}")
+        for index, raw in enumerate(value)
     )
 
 
@@ -4893,23 +5108,20 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
     summary = review_freeform_summary_text(
         _expect_non_empty_string(payload["summary"], context="plan_review.summary")
     )
-    blocking_items = _expect_optional_string_list(
+    blocking_items = _expect_plan_review_finding_list(
         payload,
         "blocking_plan_issues",
         context="plan_review.blocking_plan_issues",
-        item_context="plan_review.blocking_plan_issues",
     )
-    same_plan_followups = _expect_optional_string_list(
+    same_plan_followups = _expect_plan_review_finding_list(
         payload,
         "same_plan_followups",
         context="plan_review.same_plan_followups",
-        item_context="plan_review.same_plan_followups",
     )
-    future_followups = _expect_optional_string_list(
+    future_followups = _expect_plan_review_finding_list(
         payload,
         "future_followups",
         context="plan_review.future_followups",
-        item_context="plan_review.future_followups",
     )
     dispositions = _expect_disposition_list(
         payload["prior_plan_item_dispositions"],
@@ -7018,6 +7230,19 @@ PLAN_REVISION_PATCH_REPLACEABLE_FIELDS = frozenset(
         "deferred_stages",
     }
 )
+# Fields that cannot take a wholesale ``replace`` but do have a write path
+# through dedicated per-row operations.  Diagnostics name these operations so
+# an author who picked the wrong operation can recover on the next attempt.
+PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS: dict[str, tuple[str, ...]] = {
+    "risk_test_matrix": (
+        "matrix_add",
+        "matrix_edit",
+        "matrix_retire",
+        "matrix_split",
+        "matrix_merge",
+        "matrix_metadata_replace",
+    ),
+}
 _PLAN_REVISION_PATCH_IDENTITY_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -7275,15 +7500,35 @@ def _parse_matrix_metadata(value: object, *, context: str) -> RiskTestMatrixMeta
     )
 
 
+def _format_operation_names(names: Sequence[str]) -> str:
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + " or " + names[-1]
+
+
+def _ordered_patch_operation_keys() -> tuple[str, ...]:
+    matrix_ops = PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS["risk_test_matrix"]
+    return ("replace", *matrix_ops, *sorted(PLAN_REVISION_PATCH_OPERATION_KEYS - {"replace", *matrix_ops}))
+
+
 def _parse_plan_revision_patch_operation(value: object, *, context: str) -> PlanRevisionPatchOperation:
     payload = _expect_object(value, context=context)
     op = _expect_non_empty_string(payload.get("op"), context=f"{context}.op")
     if op not in PLAN_REVISION_PATCH_OPERATION_KEYS:
-        raise AgentLoopError(f"{context}.op is unknown: {op!r}.")
+        raise AgentLoopError(
+            f"{context}.op is unknown: {op!r}; valid operations are "
+            f"{_format_operation_names(_ordered_patch_operation_keys())}."
+        )
     if op == "replace":
         _expect_exact_keys(payload, context=context, required={"op", "field", "value"})
         field_name = _expect_non_empty_string(payload["field"], context=f"{context}.field")
         if field_name not in PLAN_REVISION_PATCH_REPLACEABLE_FIELDS:
+            dedicated = PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS.get(field_name)
+            if dedicated:
+                raise AgentLoopError(
+                    f"{context}: `{field_name}` cannot be revised with `replace`; "
+                    f"use {_format_operation_names(dedicated)}."
+                )
             raise AgentLoopError(f"{context}.field `{field_name}` is derived or not writable.")
         return PlanRevisionPatchOperation(
             op=op,

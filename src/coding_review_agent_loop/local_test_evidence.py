@@ -105,6 +105,11 @@ ENVIRONMENT_EXCLUSIONS = frozenset(
         "AGENT_LOOP_TEST_BROKER_PROTOCOL",
         "AGENT_LOOP_INVOCATION_ID",
         "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS",
+        # Worker-budget control values and wrapper-private plugin state.
+        "AGENT_LOOP_TEST_WORKERS",
+        "AGENT_LOOP_TEST_WORKER_ENFORCEMENT",
+        "AGENT_LOOP_WORKER_CAP_SPEC",
+        "AGENT_LOOP_WORKER_CAP_NESTED",
         "AGENT_LOOP_PUBLIC_RESPONSE_BELOW",
         "PWD",
         "OLDPWD",
@@ -1704,6 +1709,25 @@ class BrokerRunResult:
     inner_exec: str = "not-attempted"
     suite_start: str = "not-started"
     diagnostic: str = ""
+    executed_argv: tuple[str, ...] = ()
+    workers_cohort: str | None = None
+    worker_enforcement: str | None = None
+    worker_caveats: tuple[str, ...] = ()
+    worker_environment: Mapping[str, str] = field(default_factory=dict)
+
+
+def _bounded_argv(values: Sequence[object]) -> list[str]:
+    """Apply the request argv caps to a response argv."""
+    bounded: list[str] = []
+    total = 0
+    for item in list(values)[:BROKER_MAX_ARGV]:
+        text = str(item)
+        size = len(text.encode("utf-8", errors="replace"))
+        if size > BROKER_MAX_ARG_BYTES or total + size > BROKER_MAX_ARGV_TOTAL:
+            break
+        total += size
+        bounded.append(text)
+    return bounded
 
 
 @dataclass
@@ -1763,6 +1787,8 @@ class TestBrokerServer:
         self._process_finished: Any | None = None
         self._active_processes: dict[int, Any] = {}
         self._pinned_root: Any | None = None
+        self._worker_budget: Any | None = None
+        self._worker_lock_root: Path | None = None
 
     def set_execution_context(
         self,
@@ -1770,11 +1796,51 @@ class TestBrokerServer:
         containment_handle: Any | None,
         process_started: Any,
         process_finished: Any,
+        worker_budget: Any | None = None,
     ) -> None:
-        """Bind broker children to the live requesting turn before requests run."""
+        """Bind broker children to the live requesting turn before requests run.
+
+        ``worker_budget`` is the parent-owned, post-admission budget.  It is
+        authoritative: a client may only lower it or tighten its mode.
+        """
         self._parent_containment_handle = containment_handle
         self._process_started = process_started
         self._process_finished = process_finished
+        self._worker_budget = worker_budget
+
+    def effective_worker_budget(self, environment: Mapping[str, str]) -> Any | None:
+        """Stricter of the parent budget and the client's requested values."""
+        parent = self._worker_budget
+        if parent is None:
+            return None
+        from dataclasses import replace as _replace
+
+        from .test_workers import (
+            ENV_TEST_WORKER_ENFORCEMENT,
+            ENV_TEST_WORKERS,
+            WorkerBudgetError,
+            parse_enforcement,
+            parse_worker_count,
+            stricter_mode,
+        )
+
+        workers = parent.workers
+        mode = parent.enforcement
+        try:
+            requested = parse_worker_count(environment.get(ENV_TEST_WORKERS, ""), name=ENV_TEST_WORKERS)
+        except WorkerBudgetError:
+            requested = None
+        if requested is not None and requested < workers:
+            workers = requested
+        try:
+            requested_mode = parse_enforcement(
+                environment.get(ENV_TEST_WORKER_ENFORCEMENT), name=ENV_TEST_WORKER_ENFORCEMENT
+            )
+        except WorkerBudgetError:
+            requested_mode = None
+        if requested_mode is not None:
+            mode = stricter_mode(mode, requested_mode)
+        return _replace(parent, workers=workers, enforcement=mode, source="inherited")
 
     @property
     def endpoint(self) -> str:
@@ -2097,6 +2163,8 @@ class TestBrokerServer:
 
                 result = run_foreground_test(
                     argv,
+                    worker_budget=self.effective_worker_budget(environment),
+                    worker_lock_root=self._worker_lock_root,
                     cwd=cwd,
                     cwd_fd=confined.fd,
                     timeout_seconds=float(request["timeout_seconds"]),
@@ -2129,7 +2197,23 @@ class TestBrokerServer:
         receipt_id = uuid.uuid4().hex
         execution_ref: str | None = None
         suite_start = str(getattr(result, "suite_start", "unknown"))
-        if suite_start != "not-started" and str(getattr(result, "outcome", "")) != "overlap-rejected":
+        worker_enforcement = getattr(result, "worker_enforcement", None)
+        worker_caveats = tuple(str(item) for item in getattr(result, "worker_caveats", ()) or ())
+        journal_caveats: tuple[str, ...] = ("output stream was broker-forwarded",)
+        if worker_enforcement is not None and (
+            worker_enforcement in {"clamped", "unverified", "exceeded", "refused-in-command"}
+            or worker_caveats
+        ):
+            journal_caveats += (
+                "worker budget (top-level runner): "
+                + str(worker_enforcement)
+                + (f"; {', '.join(worker_caveats)}" if worker_caveats else "")
+                + "; executed argv: "
+                + " ".join(str(item) for item in getattr(result, "args", argv))[:512],
+            )
+        if suite_start != "not-started" and str(getattr(result, "outcome", "")) not in {
+            "overlap-rejected", "worker-budget-busy", "worker-budget-refused",
+        }:
             observation = LocalTestObservation(
                 command=argv,
                 outcome=str(result.outcome),
@@ -2144,7 +2228,7 @@ class TestBrokerServer:
                 attribution=attribution,
                 environment_state="not-compared",
                 environment_identity=identity,
-                caveats=("output stream was broker-forwarded",),
+                caveats=journal_caveats,
                 diagnostic=getattr(result, "output_tail", None),
                 wrapper_bootstrap=str(getattr(result, "wrapper_bootstrap", "unknown")),
                 inner_exec=str(getattr(result, "inner_exec", "not-attempted")),
@@ -2165,7 +2249,26 @@ class TestBrokerServer:
             "inner_exec": str(getattr(result, "inner_exec", "not-attempted")),
             "suite_start": suite_start,
             "diagnostic": _safe_text(getattr(result, "diagnostic", ""), MAX_SAFE_CAVEAT_BYTES),
+            "executed_argv": _bounded_argv(getattr(result, "args", argv) or argv),
+            "workers_cohort": getattr(result, "workers_cohort", None),
+            "worker_enforcement": worker_enforcement,
+            "worker_caveats": list(worker_caveats)[:16],
+            "worker_environment": self._worker_environment_summary(environment),
         }
+
+    def _worker_environment_summary(self, environment: Mapping[str, str]) -> dict[str, str]:
+        """Effective controlled values, without PYTHONPATH/PYTEST_PLUGINS contents."""
+        budget = self.effective_worker_budget(environment)
+        if budget is None:
+            return {}
+        from .test_workers import ENV_TEST_WORKER_ENFORCEMENT, ENV_TEST_WORKERS
+
+        summary = {
+            ENV_TEST_WORKERS: str(budget.workers),
+            ENV_TEST_WORKER_ENFORCEMENT: str(budget.enforcement),
+            "plugin": "present" if budget.enforcement != "off" else "absent",
+        }
+        return summary
 
 
 class TestBrokerClient:
@@ -2184,7 +2287,12 @@ class TestBrokerClient:
         return bool(self.endpoint and self.capability and self.protocol == BROKER_PROTOCOL and self.turn_id)
 
     def run(
-        self, argv: Sequence[str], *, timeout_seconds: float, cwd: Path | None = None
+        self,
+        argv: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        environment_overrides: Mapping[str, str] | None = None,
     ) -> BrokerRunResult:
         if not self.available:
             raise BrokerProtocolError("test broker is unavailable")
@@ -2196,6 +2304,10 @@ class TestBrokerClient:
         for name in (BROKER_ENDPOINT_ENV, BROKER_CAPABILITY_ENV, BROKER_PROTOCOL_ENV):
             snapshot_environment.pop(name, None)
         snapshot_environment["AGENT_LOOP_INVOCATION_ID"] = self.turn_id
+        if environment_overrides:
+            # The client's requested worker values; the broker only honours
+            # them when they are stricter than the parent-owned budget.
+            snapshot_environment.update({str(k): str(v) for k, v in environment_overrides.items()})
         request = {
             "turn_id": self.turn_id,
                 "nonce": (
@@ -2243,6 +2355,26 @@ class TestBrokerClient:
                     inner_exec=str(response.get("inner_exec", "not-attempted")),
                     suite_start=str(response.get("suite_start", "not-started")),
                     diagnostic=str(response.get("diagnostic", "")),
+                    executed_argv=tuple(
+                        str(item) for item in (response.get("executed_argv") or ())
+                        if isinstance(item, str)
+                    ),
+                    workers_cohort=(
+                        str(response["workers_cohort"])
+                        if isinstance(response.get("workers_cohort"), str) else None
+                    ),
+                    worker_enforcement=(
+                        str(response["worker_enforcement"])
+                        if isinstance(response.get("worker_enforcement"), str) else None
+                    ),
+                    worker_caveats=tuple(
+                        str(item) for item in (response.get("worker_caveats") or ())
+                        if isinstance(item, str)
+                    ),
+                    worker_environment={
+                        str(key): str(value)
+                        for key, value in dict(response.get("worker_environment") or {}).items()
+                    },
                 )
 
 

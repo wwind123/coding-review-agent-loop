@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -93,6 +93,11 @@ class LauncherProbeResult:
     state: str
     diagnostic: str = ""
     identity: str = ""
+    # Argv the real target must be spawned with for the probe result to hold.
+    # Empty means ``candidate`` itself.  A normalized ``env`` prefix is bound
+    # here to the authenticated system ``env`` path so a mutable spelling
+    # (bare ``env`` on PATH, a symlink) cannot be swapped after the probe.
+    launch_argv: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.state not in WRAPPER_BOOTSTRAP_STATES:
@@ -137,10 +142,13 @@ class CommandLaneLock:
         *,
         cwd: Path,
         env: Mapping[str, str] | None = None,
+        identity: str | None = None,
     ) -> "CommandLaneLock | None":
         values = env if env is not None else os.environ
         invocation_id = values.get("AGENT_LOOP_INVOCATION_ID", "standalone")
-        normalized = normalize_test_command(argv, cwd=cwd)
+        # ``identity`` replaces only the normalized-argv component; cwd and
+        # the invocation stay in the key exactly as before.
+        normalized = identity if identity is not None else normalize_test_command(argv, cwd=cwd)
         key = f"{cwd.resolve()}\0{normalized}\0{invocation_id}"
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         root = Path(values.get("XDG_RUNTIME_DIR", "")) / "agent-loop" / COMMAND_LANE_LOCK_DIR
@@ -196,9 +204,13 @@ class CommandLaneLock:
 
 
 def acquire_command_lane(
-    argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None = None,
+    identity: str | None = None,
 ) -> CommandLaneLock | None:
-    return CommandLaneLock.acquire(argv, cwd=cwd, env=env)
+    return CommandLaneLock.acquire(argv, cwd=cwd, env=env, identity=identity)
 
 
 @dataclass(frozen=True)
@@ -209,6 +221,20 @@ class ManagedTestInvocation:
     timeout_seconds: float | None = None
     memory_dir: Path | None = None
     prefix_argv: tuple[str, ...] = ()
+    test_workers: int | None = None
+    test_worker_memory: int | None = None
+    test_worker_enforcement: str | None = None
+
+
+_MANAGED_RUN_TESTS_OPTIONS = frozenset(
+    {
+        "--timeout-seconds",
+        "--memory-dir",
+        "--test-workers",
+        "--test-worker-memory",
+        "--test-worker-enforcement",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -356,6 +382,9 @@ def parse_managed_test_invocation(
 
     timeout: float | None = None
     memory_dir: Path | None = None
+    test_workers: int | None = None
+    test_worker_memory: int | None = None
+    test_worker_enforcement: str | None = None
     seen: set[str] = set()
     index = prefix_len
     delimiter = False
@@ -370,7 +399,7 @@ def parse_managed_test_invocation(
                 "managed run-tests options must end with `--` before the inner command."
             )
         name, equals, value = token.partition("=")
-        if name not in {"--timeout-seconds", "--memory-dir"} or name in seen:
+        if name not in _MANAGED_RUN_TESTS_OPTIONS or name in seen:
             raise TestRuntimeConfigurationError(f"unknown or duplicate run-tests option: {token}")
         seen.add(name)
         if not equals:
@@ -380,6 +409,23 @@ def parse_managed_test_invocation(
             index += 1
         if name == "--timeout-seconds":
             timeout = _finite_positive(value, name="--timeout-seconds")
+        elif name in {"--test-workers", "--test-worker-memory", "--test-worker-enforcement"}:
+            from .test_workers import (
+                WorkerBudgetError,
+                parse_enforcement,
+                parse_worker_count,
+                parse_worker_memory,
+            )
+
+            try:
+                if name == "--test-workers":
+                    test_workers = parse_worker_count(value)
+                elif name == "--test-worker-memory":
+                    test_worker_memory = parse_worker_memory(value)
+                else:
+                    test_worker_enforcement = parse_enforcement(value)
+            except WorkerBudgetError as exc:
+                raise TestRuntimeConfigurationError(str(exc)) from exc
         else:
             if not value or value.startswith("-"):
                 raise TestRuntimeConfigurationError("--memory-dir requires a path value.")
@@ -389,7 +435,10 @@ def parse_managed_test_invocation(
         raise TestRuntimeConfigurationError(
             "managed run-tests requires `--` followed by a non-empty inner command."
         )
-    return ManagedTestInvocation(tokens[index:], timeout, memory_dir, tokens[:prefix_len])
+    return ManagedTestInvocation(
+        tokens[index:], timeout, memory_dir, tokens[:prefix_len],
+        test_workers, test_worker_memory, test_worker_enforcement,
+    )
 
 
 _MANAGED_EXECUTION_PREFIX_VALUE_OPTIONS = {
@@ -1352,8 +1401,17 @@ def record_test_observation(
     timestamp: datetime | None = None,
     containment: Mapping[str, object] | None = None,
     lane: str | None = None,
+    workers: str | None = None,
+    executed_argv: Sequence[str] | None = None,
+    worker_enforcement: str | None = None,
+    caveats: Sequence[str] = (),
 ) -> bool:
-    """Append a bounded observation; persistence failure never affects execution."""
+    """Append a bounded observation; persistence failure never affects execution.
+
+    ``workers`` is the cohort label (``serial``, a count or ``unknown``).  When
+    omitted it is derived from ``argv`` with the proven-serial rule, so an
+    unconfirmed run never gains a numeric cohort.
+    """
     if memory_dir is None:
         return False
     try:
@@ -1381,15 +1439,28 @@ def record_test_observation(
             }
             if lane is not None:
                 observation["lane"] = lane
+            from .test_workers import argv_only_workers_label, row_workers_label
+
+            observation["workers"] = workers or argv_only_workers_label(argv)
+            if executed_argv is not None:
+                observation["executed_argv"] = [str(item) for item in executed_argv]
+            if worker_enforcement is not None:
+                observation["worker_enforcement"] = worker_enforcement
+            if caveats:
+                observation["caveats"] = [str(item) for item in caveats]
             if containment is not None:
                 # Evidence is already bounded by the runner.  Keep only JSON
                 # values and expose unsupported telemetry explicitly.
                 observation["containment"] = dict(containment)
             rows = payload["observations"]
             rows.append(observation)
-            by_cohort: dict[tuple[str, str], list[dict]] = defaultdict(list)
+            by_cohort: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
             for row in rows:
-                key = (str(row.get("normalized_command", "")), str(row.get("environment_fingerprint", "")))
+                key = (
+                    str(row.get("normalized_command", "")),
+                    str(row.get("environment_fingerprint", "")),
+                    row_workers_label(row),
+                )
                 by_cohort[key].append(row)
             cohorts = sorted(
                 by_cohort.items(),
@@ -2087,19 +2158,150 @@ def verified_wrapper_prefix(**kwargs: object) -> tuple[str, ...] | None:
     return None
 
 
+_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+# Only the system ``env`` is trusted to exec the remaining argv unchanged.  A
+# lookalike reached through a caller-controlled PATH or an arbitrary absolute
+# path could ignore its argv and exit 0 while the probe verified the real
+# interpreter, so such prefixes stay unrecognized.
+_TRUSTED_ENV_PATHS = (Path("/usr/bin/env"), Path("/bin/env"))
+
+
+def _root_protected_chain(path: Path) -> bool:
+    """Return whether ``path`` and every ancestor are root-owned and unwritable.
+
+    ``path`` must already be canonical (symlink-free), so a non-root user can
+    neither replace the file nor any directory entry leading to it.
+    """
+    for entry in (path, *path.parents):
+        try:
+            info = entry.lstat()
+        except OSError:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            return False
+    return True
+
+
+def _trusted_env_executable(token: str, *, environment: Mapping[str, str]) -> str | None:
+    """Return the canonical root-protected system ``env`` that ``token`` names.
+
+    ``token`` (a bare ``env`` looked up on the caller's PATH, or an absolute
+    path) must currently resolve to the same file as a system ``env`` whose
+    canonical path is root-protected end to end.  The returned canonical path
+    is what the target is then spawned with, so the check does not depend on
+    the mutable lookup path staying unchanged until spawn.
+    """
+    if os.name != "posix":
+        return None
+    if token == "env":
+        located = shutil.which(token, path=environment.get("PATH"))
+        if located is None:
+            return None
+        candidate = Path(located)
+    elif Path(token).is_absolute():
+        candidate = Path(token)
+    else:
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    for trusted in _TRUSTED_ENV_PATHS:
+        try:
+            canonical = trusted.resolve(strict=True)
+        except OSError:
+            continue
+        if canonical == resolved and _root_protected_chain(canonical):
+            return str(canonical)
+    return None
+
+
+def _split_env_prefix(
+    tokens: Sequence[str], *, environment: Mapping[str, str]
+) -> tuple[dict[str, str], tuple[str, ...], str | None] | None:
+    """Strip a leading ``env [--] NAME=VALUE...`` prefix from a launcher argv.
+
+    Returns ``({}, tokens, None)`` unchanged when there is no ``env`` prefix,
+    the assignments, remaining target argv, and canonical trusted ``env`` path
+    when the prefix is a plain assignment list, and ``None`` when ``env`` is spelled in a way whose
+    effect on the target cannot be reproduced for the probe: any ``env``
+    option (``-i``, ``-u``, ``-S``, ``--chdir``...), an ``env`` that is not
+    the root-owned system executable (``./env``, ``/tmp/env``, or a bare
+    ``env`` shadowed on ``PATH``), a malformed assignment, a nested ``env``,
+    or no command.
+    """
+    tokens = tuple(tokens)
+    if not tokens or Path(tokens[0]).name != "env":
+        return {}, tokens, None
+    env_path = _trusted_env_executable(tokens[0], environment=environment)
+    if env_path is None:
+        return None
+    assignments: dict[str, str] = {}
+    index = 1
+    if index < len(tokens) and tokens[index] == "--":
+        index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("-"):
+            return None
+        if "=" not in token:
+            break
+        if not _ENV_ASSIGNMENT_RE.match(token):
+            return None
+        name, _, value = token.partition("=")
+        assignments[name] = value
+        index += 1
+    remaining = tokens[index:]
+    if not remaining or Path(remaining[0]).name == "env":
+        return None
+    return assignments, remaining, env_path
+
+
+def _recognized_inner_probe_with_environment(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str], tuple[str, ...]] | None:
+    """Return ``(probe, target, env_assignments, launch_argv)`` if recognized.
+
+    A leading plain ``env NAME=VALUE...`` prefix is normalized away so the
+    probe runs the real interpreter; the stripped assignments must be applied
+    to the probe environment so it observes what the target will observe.
+    """
+    tokens = tuple(str(item) for item in argv)
+    values: Mapping[str, str] = environment if environment is not None else os.environ
+    split = _split_env_prefix(tokens, environment=values)
+    if split is None:
+        return None
+    assignments, target, env_path = split
+    if assignments:
+        # ``env`` resolves the command with the modified PATH, so resolve the
+        # interpreter against the same merged environment.
+        values = {**values, **assignments}
+    probe = _recognized_inner_probe_tokens(target, cwd=cwd, environment=values)
+    if probe is None:
+        return None
+    launch = (env_path, *tokens[1:]) if env_path is not None else tokens
+    return probe, target, assignments, launch
+
+
 def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None) -> tuple[str, ...] | None:
     """Return the only inner launcher forms eligible for a safe bootstrap probe."""
-    tokens = tuple(str(item) for item in argv)
+    recognized = _recognized_inner_probe_with_environment(argv, cwd=cwd, environment=environment)
+    return recognized[0] if recognized is not None else None
+
+
+def _recognized_inner_probe_tokens(
+    tokens: tuple[str, ...], *, cwd: Path, environment: Mapping[str, str]
+) -> tuple[str, ...] | None:
     if not tokens:
         return None
-    values = environment if environment is not None else os.environ
+    values = environment
     first = Path(tokens[0]).name
     if first in {"pytest", "py.test"}:
         executable = tokens[0]
         if not Path(executable).is_absolute() and (tokens[0].startswith((".", "~")) or Path(tokens[0]).parent != Path(".")):
             executable = str((cwd / Path(tokens[0])).resolve(strict=False))
         elif not Path(executable).is_absolute():
-            executable = shutil.which(executable, path=(environment or os.environ).get("PATH")) or executable
+            executable = shutil.which(executable, path=values.get("PATH")) or executable
         return (executable, "--version")
     if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
         interpreter = _python_interpreter_path(tokens[0], cwd=cwd, environment=values)
@@ -2124,11 +2326,33 @@ def probe_inner_launcher(
         else ({**os.environ, **environment} if environment is not None else dict(os.environ))
     )
     original = tuple(str(item) for item in argv)
-    probe = recognized_inner_probe(original, cwd=cwd, environment=values)
-    if probe is None:
+    recognized = _recognized_inner_probe_with_environment(original, cwd=cwd, environment=values)
+    if recognized is None:
         return LauncherProbeResult(original, "unknown", "unrecognized inner launcher")
-    identity = launcher_candidate_identity(original, cwd=cwd, environment=values, kind="inner")
+    probe, target, env_assignments, launch_argv = recognized
+    if env_assignments:
+        values = {**values, **env_assignments}
+    identity = launcher_candidate_identity(target, cwd=cwd, environment=values, kind="inner")
+    if target != original:
+        # Distinguish ``env A=1 python -m pytest`` from ``env A=2 ...`` and
+        # from the unprefixed spelling in the per-invocation probe cache.
+        identity["env_prefix_sha256"] = hashlib.sha256(
+            json.dumps([launch_argv[0], *original[1: len(original) - len(target)]]).encode("utf-8")
+        ).hexdigest()
     identity_key = _identity_key(identity)
+    rebound = launch_argv if launch_argv != original else ()
+
+    def bind(result: LauncherProbeResult) -> LauncherProbeResult:
+        # The cache holds only launcher authentication keyed by identity,
+        # which ignores pytest's trailing arguments.  Always bind the returned
+        # result to *this* command so a cache hit never launches or reports an
+        # earlier command's argv.
+        return replace(
+            result,
+            candidate=original,
+            launch_argv=rebound if result.state == "verified" else (),
+        )
+
     invocation = values.get("AGENT_LOOP_INVOCATION_ID")
     cache_key = (invocation, identity_key) if invocation else None
     flight: threading.Event | None = None
@@ -2139,7 +2363,7 @@ def probe_inner_launcher(
             _touch_invocation_locked(invocation)
             cached = _INNER_PREFLIGHT_CACHE.get(cache_key)
             if cached is not None:
-                return cached
+                return bind(cached)
             flight = _INNER_PREFLIGHT_INFLIGHT.get(cache_key)
             if flight is not None:
                 owner = False
@@ -2164,7 +2388,7 @@ def probe_inner_launcher(
             with _INNER_PREFLIGHT_LOCK:
                 cached = _INNER_PREFLIGHT_CACHE.get(cache_key)  # type: ignore[arg-type]
             if cached is not None:
-                return cached
+                return bind(cached)
         return LauncherProbeResult(
             original,
             "unknown",
@@ -2177,7 +2401,11 @@ def probe_inner_launcher(
             completed = _run_bounded_probe(
                 probe,
                 cwd=cwd,
-                env=(values if environment_is_complete or environment is not None else None),
+                env=(
+                    values
+                    if environment_is_complete or environment is not None or env_assignments
+                    else None
+                ),
                 timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
@@ -2192,7 +2420,7 @@ def probe_inner_launcher(
                 result = LauncherProbeResult(original, "verified", output, identity_key)
             else:
                 result = LauncherProbeResult(original, "failed", output or f"bootstrap exited {completed.returncode}", identity_key)
-        return result
+        return bind(result)
     finally:
         if cache_key is not None:
             assert flight is not None
@@ -2235,8 +2463,17 @@ def recommend_timeout(
     now: datetime | None = None,
     normalized_command_override: str | None = None,
     fingerprint_override: str | None = None,
+    workers: str | None = None,
 ) -> RuntimeRecommendation:
+    """Recommend a watchdog from the (command, fingerprint, workers) cohort.
+
+    ``workers`` defaults to the proven-serial argv label.  Unknown rows only
+    feed an unknown-cohort lookup, never serial or explicit-count ones.
+    """
+    from .test_workers import argv_only_workers_label, row_workers_label
+
     ceiling = validate_timeout_ceiling(policy_ceiling_seconds, name="policy ceiling")
+    cohort = workers or argv_only_workers_label(argv)
     normalized = (
         normalized_command_override
         if normalized_command_override is not None
@@ -2253,6 +2490,8 @@ def recommend_timeout(
     matching: list[dict] = []
     for row in rows:
         if row.get("normalized_command") != normalized or row.get("environment_fingerprint") != fingerprint:
+            continue
+        if row_workers_label(row) != cohort:
             continue
         stamp = _timestamp(row.get("timestamp"))
         if stamp is None or stamp < cutoff:

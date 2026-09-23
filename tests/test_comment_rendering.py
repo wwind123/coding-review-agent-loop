@@ -2413,3 +2413,597 @@ def test_parse_degradation_section_is_bounded_sanitized_and_empty_without_record
     assert section.count("\n- ") == 9  # eight records plus the omission line
     assert "4 more record(s) omitted." in section
     assert all(len(line) < 700 for line in section.splitlines())
+
+
+# --- #948: bounded visible plan digest ---
+
+import coding_review_agent_loop.comment_rendering as _m948_rendering  # noqa: E402
+from coding_review_agent_loop.comment_rendering import render_canonical_plan_state  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    validate_human_requirements_acknowledgement as _m948_validate_ack,
+    validate_structured_plan_revision as _m948_validate_revision,
+    validate_structured_plan_state as _m948_validate_state,
+)
+
+_M948_FOOTER = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+_M948_IDS = tuple(f"hr-{index:064x}" for index in range(1, 9))
+_M948_DIRECT = "I checked the relevant GitHub discussion directly before responding."
+_M948_CANONICAL_ONLY_RECORDS = (
+    "AGENT_DEFERRED_STAGES:",
+    "AGENT_TYPED_PLAN_STAGES:",
+    "AGENT_PLAN_EXPECTED_CLOSING_ISSUES:",
+)
+
+
+def _m948_payload(kind="plan_state", *, count=2_000, text="entry", hr_ids=()):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    stage = lambda prefix: [  # noqa: E731
+        {"title": f"{prefix} {index} {text}", "summary": f"summary {index} {text}"}
+        for index in range(count)
+    ]
+    payload.update(
+        kind=kind,
+        summary=f"Adversarial summary {text}",
+        plan_steps=[f"Step {index} {text}" for index in range(count)],
+        additional_closing_issue_ids=list(range(1_000, 1_000 + min(count, 500))),
+        deferred_stages=stage("Deferred"),
+        external_dependencies=stage("External"),
+        deferred_work=stage("Later"),
+        plan_actions=stage("Action"),
+        human_requirement_dispositions=[
+            {"requirement_id": item, "disposition": "addressed", "evidence": "EVIDENCE " * 400}
+            for item in hr_ids
+        ],
+    )
+    if kind == "plan_revision":
+        payload["prior_plan_item_dispositions"] = [
+            {"item_id": f"item-{index}", "disposition": "resolved", "note": f"note {text}"}
+            for index in range(1, count + 1)
+        ]
+    return payload
+
+
+def _m948_with_child_stages(parsed, *, count, text):
+    # A generation-1 response cannot declare top-level child stages, but the
+    # renderer is a pure function of the parsed plan and must bound that
+    # category too.
+    from dataclasses import replace
+    from coding_review_agent_loop.protocol import ChildStage
+
+    children = tuple(
+        ChildStage(title=f"Child {index} {text}", summary=f"summary {index} {text}")
+        for index in range(count)
+    )
+    return replace(parsed, typed_stages=replace(parsed.typed_stages, child_stages=children))
+
+
+def _m948_ack_block(ids, *, direct=False):
+    lines = ["", "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->", "### Human requirements"]
+    if direct:
+        lines.append(f"- {_M948_DIRECT}")
+    lines.extend(f"- {item}: addressed because " + "EVIDENCE " * 400 for item in ids)
+    return "\n".join(lines)
+
+
+def _m948_budgeted_part(digest):
+    start = digest.index(_m948_rendering.COMPACT_PLAN_DIGEST_NOTICE)
+    end = digest.index("<!-- risk-test-matrix-section:")
+    return digest[start:end].rstrip()
+
+
+def _m948_prior_items(count):
+    return [
+        UnresolvedReviewItem(f"item-{index}", "codex", 1, "Finding", "blocking")
+        for index in range(1, count + 1)
+    ]
+
+
+@pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
+@pytest.mark.parametrize(
+    ("count", "text"), [(2_000, "entry"), (3, "LONG" * 20_000)], ids=["many-entries", "long-strings"]
+)
+def test_m948_budgeted_digest_is_bounded_deterministic_and_counts_omissions(kind, count, text):
+    raw = json.dumps(_m948_payload(kind, count=count, text=text)) + _M948_FOOTER
+    if kind == "plan_state":
+        parsed = _m948_with_child_stages(_m948_validate_state(raw), count=count, text=text)
+        render = lambda **kw: render_public_agent_comment(  # noqa: E731
+            kind="plan_state", parsed=parsed, agent="claude", raw_text=raw, **kw
+        )
+        canonical = render_canonical_plan_state(parsed)
+    else:
+        parsed = _m948_with_child_stages(_m948_validate_revision(raw), count=count, text=text)
+        prior_items = _m948_prior_items(count)
+        render = lambda **kw: render_public_agent_comment(  # noqa: E731
+            kind="plan_revision", parsed=parsed, agent="claude", raw_text=raw,
+            prior_items=prior_items, **kw,
+        )
+        canonical = render_canonical_plan_revision(parsed, prior_items)
+
+    digest = render(compact=True)
+    assert digest == render(compact=True)
+    budgeted = _m948_budgeted_part(digest)
+    assert len(budgeted) <= _m948_rendering.COMPACT_PLAN_DIGEST_BUDGET_CHARS
+    full = render()
+    assert len(full) > len(digest)
+
+    # Canonical-metadata-only records: absent from the digest, present canonically.
+    for record in _M948_CANONICAL_ONLY_RECORDS:
+        assert record not in digest
+        assert record in canonical
+        assert record in full
+    # Visible-anchor set.
+    for record in (
+        "AGENT_RISK_TEST_MATRIX:", "risk-test-matrix-section:",
+        "AGENT_EXECUTION_RECOMMENDATION:", "execution-recommendation-section:",
+        "<!-- AGENT_PLAN_STATE: blocking -->", "-- Anthropic Claude",
+    ):
+        assert record in digest
+
+    if count > 100:
+        omitted = re.findall(r"- \.\.\. (\d+) more of (\d+) omitted; complete list", budgeted)
+        sections = 8 if kind == "plan_revision" else 7
+        assert len(omitted) == sections
+        steps_section = budgeted.split("### Plan steps (digest)\n", 1)[1].split("\n\n", 1)[0]
+        shown = len(re.findall(r"(?m)^\d+\. Step ", steps_section))
+        assert (str(count - shown), str(count)) in omitted
+        assert shown > 0
+    else:
+        assert "omitted; complete list" not in budgeted
+        assert "LONG" * 600 not in budgeted
+
+
+@pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
+@pytest.mark.parametrize("direct", [False, True], ids=["surfaced-ids", "direct-discussion"])
+def test_m948_digest_keeps_every_signed_requirement_id_and_revalidates(kind, direct):
+    payload = _m948_payload(kind, count=5, hr_ids=_M948_IDS)
+    raw = json.dumps(payload) + _m948_ack_block(_M948_IDS, direct=direct) + _M948_FOOTER
+    _m948_validate_ack(raw, surfaced_requirement_ids=_M948_IDS, requires_direct_discussion_ack=direct)
+    if kind == "plan_state":
+        parsed = _m948_validate_state(raw)
+        kwargs = {}
+    else:
+        parsed = _m948_validate_revision(raw)
+        kwargs = {"prior_items": _m948_prior_items(5)}
+
+    digest = render_public_agent_comment(
+        kind=kind, parsed=parsed, agent="claude", raw_text=raw, compact=True, **kwargs
+    )
+
+    assert digest.count("<!-- HUMAN_REQUIREMENTS_ADDRESSED -->") == 1
+    block = digest[digest.index("<!-- HUMAN_REQUIREMENTS_ADDRESSED -->"):]
+    _m948_validate_ack(block, surfaced_requirement_ids=_M948_IDS, requires_direct_discussion_ack=direct)
+    assert (_M948_DIRECT in block) is direct
+    dispositions = digest.split("### Human requirement dispositions\n", 1)[1].split("\n\n", 1)[0]
+    for item in _M948_IDS:
+        assert f"- **{item}** — `addressed`: " in dispositions
+        assert re.search(rf"(?m)^- {item}: addressed because ", block)
+    # Only evidence is clipped.
+    assert "EVIDENCE " * 100 not in digest
+    assert len(block) < 8 * 400 + 600
+
+
+def test_m948_acknowledgement_clip_never_shortens_a_numbered_requirement():
+    line = "- " + "x" * 290 + " Requirement 12 and Requirement 3 " + "y" * 400
+    block = "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n### Human requirements\n" + line
+    compact = _m948_rendering._compact_human_requirements_block(block)
+    assert len(compact) < len(block)
+    _m948_validate_ack(
+        compact,
+        surfaced_requirement_ids=("Requirement 12", "Requirement 3"),
+        requires_direct_discussion_ack=False,
+    )
+
+
+def test_m948_fresh_plan_state_without_acknowledgement_block_adds_none():
+    raw = json.dumps(_m948_payload(count=5, hr_ids=_M948_IDS)) + _M948_FOOTER
+    parsed = _m948_validate_state(raw)
+    digest = render_public_agent_comment(
+        kind="plan_state", parsed=parsed, agent="claude", raw_text=raw, compact=True
+    )
+    assert "HUMAN_REQUIREMENTS_ADDRESSED" not in digest
+    assert all(f"- **{item}** — `addressed`" in digest for item in _M948_IDS)
+
+
+def test_m948_default_rendering_is_byte_identical_and_ignores_raw_text():
+    ids = _M948_IDS[:2]
+    raw_state = json.dumps(_m948_payload(count=4, hr_ids=ids)) + _m948_ack_block(ids) + _M948_FOOTER
+    parsed_state = _m948_validate_state(raw_state)
+    without_raw = render_public_agent_comment(kind="plan_state", parsed=parsed_state, agent="claude")
+    with_raw = render_public_agent_comment(
+        kind="plan_state", parsed=parsed_state, agent="claude", raw_text=raw_state
+    )
+    assert with_raw == without_raw == render_public_agent_comment(
+        kind="plan_state", parsed=parsed_state, agent="claude", raw_text=raw_state, compact=False
+    )
+    assert "HUMAN_REQUIREMENTS_ADDRESSED" not in with_raw
+    assert with_raw.startswith("## Plan\n\n")
+    assert all(record in with_raw for record in _M948_CANONICAL_ONLY_RECORDS)
+    assert _m948_rendering.COMPACT_PLAN_DIGEST_NOTICE not in with_raw
+
+    raw_revision = (
+        json.dumps(_m948_payload("plan_revision", count=4, hr_ids=ids))
+        + _m948_ack_block(ids) + _M948_FOOTER
+    )
+    parsed_revision = _m948_validate_revision(raw_revision)
+    prior_items = _m948_prior_items(4)
+    assert render_public_agent_comment(
+        kind="plan_revision", parsed=parsed_revision, agent="claude",
+        raw_text=raw_revision, prior_items=prior_items,
+    ) == "\n\n".join([
+        "## Revised plan",
+        render_canonical_plan_revision(parsed_revision, prior_items),
+        _m948_ack_block(ids).strip(),
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        "-- Anthropic Claude",
+    ])
+
+
+# --- #959: collapsed, delta-rendered matrix evidence -----------------------
+
+from dataclasses import replace as _replace_959
+
+from coding_review_agent_loop.comment_rendering import (
+    MatrixEvidenceRenderDecision,
+    _render_risk_test_matrix_evidence,
+    resolve_matrix_evidence_render,
+)
+from coding_review_agent_loop.protocol import (
+    parse_risk_test_matrix_evidence as _parse_evidence_959,
+    validate_structured_coder_followup as _validate_followup_959,
+)
+from coding_review_agent_loop.round_state import PostedRoundMetadata as _Meta959
+
+_IDENTITY_959 = "a" * 64
+_EVIDENCE_HEADING_959 = "### Risk-based mode and transition test matrix evidence"
+
+
+def _evidence_row_959(row_id, *, status="missing", receipt="receipt-1", caveats=()):
+    return {
+        "row_id": row_id,
+        "status": status,
+        "test_identifiers": [f"tests/test_x.py::test_{row_id.replace('-', '_')}"],
+        "test_locations": ["tests/test_x.py"],
+        "workflow_path_claim": f"path for {row_id}",
+        "outcome_assertions": ["outcome"],
+        "forbidden_effect_assertions": ["forbidden"],
+        "evidence_citations": [{
+            "command": "python3 -m pytest tests/test_x.py -q",
+            "receipt_id": receipt,
+            "claim": "current-result",
+        }],
+        "caveats": list(caveats),
+    }
+
+
+def _evidence_payload_959(rows, *, identity=_IDENTITY_959):
+    return {"matrix_identity": identity, "rows": rows}
+
+
+def _evidence_959(rows, *, identity=_IDENTITY_959):
+    return _parse_evidence_959(_evidence_payload_959(rows, identity=identity))
+
+
+def _rows_959(count=3, **overrides):
+    return [_evidence_row_959(f"row-{index}", **overrides) for index in range(count)]
+
+
+def _previous_959(rows, *, round_number=2, anchor=None, status=None, identity=_IDENTITY_959, raw=None):
+    kwargs = {}
+    if anchor is not None:
+        kwargs["risk_test_matrix_evidence_full_round"] = anchor
+    if status is not None:
+        kwargs["risk_test_matrix_evidence_full_round_status"] = status
+    return _Meta959(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=round_number,
+        subject="abc",
+        risk_test_matrix_evidence=(
+            raw if raw is not None else _evidence_payload_959(rows, identity=identity)
+        ),
+        **kwargs,
+    )
+
+
+def test_959_decision_invariants_reject_mixed_modes():
+    previous = _evidence_959(_rows_959())
+    with pytest.raises(ValueError):
+        MatrixEvidenceRenderDecision(mode="full", anchor_round=2, previous_evidence=previous)
+    with pytest.raises(ValueError):
+        MatrixEvidenceRenderDecision(mode="full", anchor_round=2, previous_round=1)
+    with pytest.raises(ValueError):
+        MatrixEvidenceRenderDecision(mode="delta", anchor_round=1)
+    with pytest.raises(ValueError):
+        MatrixEvidenceRenderDecision(mode="delta", anchor_round=1, previous_evidence=previous)
+    with pytest.raises(ValueError):
+        MatrixEvidenceRenderDecision(mode="other", anchor_round=1)
+    for bad_anchor in (0, -1, True, "1"):
+        with pytest.raises(ValueError):
+            MatrixEvidenceRenderDecision(mode="full", anchor_round=bad_anchor)
+
+
+def test_959_helper_returns_full_without_previous_metadata_or_evidence():
+    current = _evidence_959(_rows_959())
+    assert resolve_matrix_evidence_render(current, None, 3) == MatrixEvidenceRenderDecision(
+        mode="full", anchor_round=3
+    )
+    no_evidence = _Meta959(flow="pr", role="coder", agent="Claude", round_number=2, subject="abc")
+    decision = resolve_matrix_evidence_render(current, no_evidence, 3)
+    assert decision.mode == "full" and decision.anchor_round == 3
+    assert decision.previous_evidence is None and decision.previous_round is None
+
+
+@pytest.mark.parametrize(
+    "previous_kwargs",
+    [
+        pytest.param({"identity": "b" * 64}, id="identity-change"),
+        pytest.param({"rows": _rows_959(4)}, id="row-added"),
+        pytest.param({"rows": _rows_959(2)}, id="row-removed"),
+        pytest.param({"raw": {"matrix_identity": "not-a-digest", "rows": []}}, id="unparseable"),
+        pytest.param({"raw": {"rows": "nope"}}, id="malformed-shape"),
+        pytest.param({"status": "invalid"}, id="invalid-anchor"),
+        pytest.param({"anchor": 3}, id="future-anchor"),
+    ],
+)
+def test_959_helper_falls_back_to_full(previous_kwargs):
+    current = _evidence_959(_rows_959())
+    kwargs = dict(previous_kwargs)
+    rows = kwargs.pop("rows", _rows_959())
+    previous = _previous_959(rows, round_number=2, **kwargs)
+    decision = resolve_matrix_evidence_render(current, previous, 3)
+    assert decision == MatrixEvidenceRenderDecision(mode="full", anchor_round=3)
+
+
+def test_959_helper_falls_back_to_full_when_prior_parser_raises_unexpectedly(monkeypatch):
+    # A decoded prior payload may carry lone surrogates from JSON escapes; the
+    # parser's UTF-8 length check raises UnicodeEncodeError on them.
+    current = _evidence_959(_rows_959())
+    bad_rows = _rows_959()
+    bad_rows[0]["workflow_path_claim"] = "path \ud800"
+    previous = _previous_959(_rows_959(), round_number=2, raw=_evidence_payload_959(bad_rows))
+    assert resolve_matrix_evidence_render(current, previous, 3) == MatrixEvidenceRenderDecision(
+        mode="full", anchor_round=3
+    )
+
+    # Any other parser failure is equally presentation-only and must not raise.
+    import coding_review_agent_loop.comment_rendering as rendering
+
+    def _explode(_raw):
+        raise RuntimeError("unexpected parser failure")
+
+    monkeypatch.setattr(rendering, "parse_risk_test_matrix_evidence", _explode)
+    previous = _previous_959(_rows_959(), round_number=2)
+    assert resolve_matrix_evidence_render(current, previous, 3) == MatrixEvidenceRenderDecision(
+        mode="full", anchor_round=3
+    )
+
+
+@pytest.mark.parametrize("bad_anchor", [0, -1])
+def test_959_helper_rejects_non_positive_valid_anchor(bad_anchor):
+    # A directly constructed record cannot normally carry these, so emulate a
+    # corrupted in-memory record that bypassed decode.
+    current = _evidence_959(_rows_959())
+    previous = _previous_959(_rows_959(), round_number=2, anchor=1)
+    object.__setattr__(previous, "risk_test_matrix_evidence_full_round", bad_anchor)
+    assert resolve_matrix_evidence_render(current, previous, 3).mode == "full"
+
+
+def test_959_helper_legacy_absent_anchor_uses_previous_round():
+    current = _evidence_959(_rows_959())
+    previous = _previous_959(_rows_959(), round_number=4)
+    assert previous.risk_test_matrix_evidence_full_round_status == "absent"
+    decision = resolve_matrix_evidence_render(current, previous, 5)
+    assert decision.mode == "delta"
+    assert decision.anchor_round == 4
+    assert decision.previous_round == 4
+    assert decision.previous_evidence == _evidence_959(_rows_959())
+
+
+def test_959_helper_carries_valid_anchor_forward():
+    current = _evidence_959(_rows_959())
+    previous = _previous_959(_rows_959(), round_number=4, anchor=2)
+    decision = resolve_matrix_evidence_render(current, previous, 5)
+    assert (decision.mode, decision.anchor_round, decision.previous_round) == ("delta", 2, 4)
+
+
+def test_959_full_render_is_collapsed_with_every_row():
+    evidence = _evidence_959(_rows_959(3))
+    for decision in (None, MatrixEvidenceRenderDecision(mode="full", anchor_round=1)):
+        rendered = _render_risk_test_matrix_evidence(evidence, render_decision=decision)
+        heading, identity_line = rendered.splitlines()[:2]
+        assert heading == _EVIDENCE_HEADING_959
+        assert identity_line == f"- Matrix identity: `{_IDENTITY_959}`"
+        assert "\n\n<details>\n<summary>Full matrix evidence (3 rows)</summary>\n\n" in rendered
+        assert rendered.endswith("\n\n</details>")
+        assert rendered.index("<details>") > rendered.index("Matrix identity")
+        for index in range(3):
+            assert f"**row-{index}**" in rendered
+        assert "unchanged since round" not in rendered
+    html = MarkdownIt("commonmark").render(rendered)
+    assert "<details>" in html and "<li><strong>row-0</strong>" in html
+
+
+def test_959_delta_render_lists_only_changed_rows():
+    previous_rows = _rows_959(4)
+    current_rows = [dict(row) for row in previous_rows]
+    current_rows[2] = _evidence_row_959("row-2", caveats=["now flaky"])
+    decision = MatrixEvidenceRenderDecision(
+        mode="delta",
+        anchor_round=2,
+        previous_evidence=_evidence_959(previous_rows),
+        previous_round=6,
+    )
+    rendered = _render_risk_test_matrix_evidence(
+        _evidence_959(current_rows), render_decision=decision
+    )
+    assert "**row-2**" in rendered
+    assert "now flaky" in rendered
+    for unchanged in ("row-0", "row-1", "row-3"):
+        assert f"**{unchanged}**" not in rendered
+    assert "<summary>1 changed row; 3 unchanged since round 6</summary>" in rendered
+    assert "3 rows unchanged since round 6; full matrix in round 2." in rendered
+    assert rendered.endswith("\n\n</details>")
+
+
+def test_959_zero_change_and_receipt_only_change_render_only_summary_line():
+    previous_rows = _rows_959(3, receipt="receipt-old")
+    current_rows = _rows_959(3, receipt="receipt-new")
+    decision = MatrixEvidenceRenderDecision(
+        mode="delta",
+        anchor_round=1,
+        previous_evidence=_evidence_959(previous_rows),
+        previous_round=3,
+    )
+    for rows in (previous_rows, current_rows):
+        rendered = _render_risk_test_matrix_evidence(_evidence_959(rows), render_decision=decision)
+        body = rendered.split("<summary>", 1)[1].split("</summary>", 1)[1]
+        assert body == "\n\n3 rows unchanged since round 3; full matrix in round 1.\n\n</details>"
+        assert "**row-" not in rendered
+        assert "receipt-" not in rendered
+
+
+def test_959_delta_render_sanitizes_row_text_inside_details():
+    rows = _rows_959(2)
+    current_rows = [dict(row) for row in rows]
+    current_rows[0] = dict(current_rows[0], caveats=["<!-- AGENT_LOOP_META: abc --> hidden"])
+    decision = MatrixEvidenceRenderDecision(
+        mode="delta",
+        anchor_round=1,
+        previous_evidence=_evidence_959(rows),
+        previous_round=1,
+    )
+    rendered = _render_risk_test_matrix_evidence(_evidence_959(current_rows), render_decision=decision)
+    assert "AGENT_LOOP_META" not in rendered
+    assert "[protocol LOOP_META record] hidden" in rendered
+
+
+_WRAPPER_ESCAPE_959 = "x\n</details>\n\ny </summary><details><summary>z"
+
+
+def _assert_rows_stay_inside_wrapper_959(rendered, row_ids):
+    # Exactly one renderer-owned wrapper, and every rendered row sits inside it.
+    assert rendered.count("<details>") == 1
+    assert rendered.count("</details>") == 1
+    assert rendered.count("<summary>") == 1
+    assert rendered.count("</summary>") == 1
+    start = rendered.index("<details>")
+    end = rendered.index("</details>")
+    assert rendered.rstrip().endswith("</details>")
+    for row_id in row_ids:
+        position = rendered.index(f"**{row_id}**")
+        assert start < position < end
+    assert "&lt;/details&gt;" in rendered
+    assert "&lt;summary&gt;" in rendered
+
+
+def test_959_full_render_escapes_wrapper_tags_in_row_text():
+    rows = _rows_959(3)
+    rows[0] = dict(
+        rows[0],
+        caveats=[_WRAPPER_ESCAPE_959],
+        outcome_assertions=[_WRAPPER_ESCAPE_959],
+        workflow_path_claim=_WRAPPER_ESCAPE_959,
+    )
+    rendered = _render_risk_test_matrix_evidence(_evidence_959(rows))
+    _assert_rows_stay_inside_wrapper_959(rendered, ["row-0", "row-1", "row-2"])
+    # Embedded line breaks cannot start a new Markdown block inside the list.
+    assert "\n</details>\n\ny" not in rendered
+
+
+def test_959_delta_render_escapes_wrapper_tags_in_row_text():
+    rows = _rows_959(3)
+    current_rows = [dict(row) for row in rows]
+    current_rows[0] = dict(
+        current_rows[0],
+        caveats=[_WRAPPER_ESCAPE_959],
+        forbidden_effect_assertions=[_WRAPPER_ESCAPE_959],
+    )
+    current_rows[1] = dict(current_rows[1], test_identifiers=["tests/x.py::t</details>"])
+    decision = MatrixEvidenceRenderDecision(
+        mode="delta",
+        anchor_round=1,
+        previous_evidence=_evidence_959(rows),
+        previous_round=2,
+    )
+    rendered = _render_risk_test_matrix_evidence(_evidence_959(current_rows), render_decision=decision)
+    _assert_rows_stay_inside_wrapper_959(rendered, ["row-0", "row-1"])
+    assert "**row-2**" not in rendered
+    summary_line = "1 row unchanged since round 2; full matrix in round 1."
+    assert rendered.index("<details>") < rendered.index(summary_line) < rendered.index("</details>")
+
+
+def test_920_dropped_unapproved_claim_renders_outside_the_wrapper():
+    from coding_review_agent_loop.protocol import PostAuthClaimDiagnostic
+
+    rendered = _render_risk_test_matrix_evidence(
+        _evidence_959(_rows_959(1)),
+        diagnostics=(
+            PostAuthClaimDiagnostic("row-sibling", "unapproved-row-claim", "Claim for row-sibling was dropped."),
+            PostAuthClaimDiagnostic("row-0", "missing-claim", "No claim."),
+        ),
+    )
+
+    line = "- Dropped claim: Claim for row-sibling was dropped."
+    assert line in rendered
+    assert rendered.index(line) < rendered.index("<details>")
+    assert "No claim." not in rendered
+
+
+def test_959_no_evidence_renders_no_section_or_wrapper():
+    assert _render_risk_test_matrix_evidence(None) is None
+    parsed = _validate_followup_959(structured_coder_followup(summary="No matrix."))
+    assert parsed is not None and parsed.risk_test_matrix_evidence is None
+    rendered = render_public_agent_comment(
+        kind="coder_followup", parsed=parsed, agent="claude"
+    )
+    assert _EVIDENCE_HEADING_959 not in rendered
+    assert "<details>" not in rendered
+
+
+@pytest.mark.parametrize(
+    "previous_kwargs", [{"status": "invalid"}, {"anchor": 9}], ids=["invalid", "future"]
+)
+def test_959_public_comment_with_unusable_anchor_renders_every_row(previous_kwargs):
+    rows = _rows_959(3)
+    parsed = _validate_followup_959(structured_coder_followup(summary="Matrix follow-up."))
+    parsed = _replace_959(parsed, risk_test_matrix_evidence=_evidence_959(rows))
+    previous = _previous_959(rows, round_number=4, **previous_kwargs)
+    decision = resolve_matrix_evidence_render(parsed.risk_test_matrix_evidence, previous, 5)
+    assert decision == MatrixEvidenceRenderDecision(mode="full", anchor_round=5)
+    rendered = render_public_agent_comment(
+        kind="coder_followup",
+        parsed=parsed,
+        agent="claude",
+        matrix_evidence_render_decision=decision,
+    )
+    for index in range(3):
+        assert f"**row-{index}**" in rendered
+    assert "unchanged since round" not in rendered
+    assert "<summary>Full matrix evidence (3 rows)</summary>" in rendered
+
+
+def test_959_issue_implementation_renders_full_collapsed_rows():
+    rows = _rows_959(2)
+    raw = json.dumps({
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "Implemented.",
+        "pr_number": 12,
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+    })
+    from coding_review_agent_loop.protocol import validate_structured_issue_implementation
+
+    parsed = validate_structured_issue_implementation(
+        raw + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    assert parsed is not None
+    without = render_public_agent_comment(kind="issue_implementation", parsed=parsed, agent="claude")
+    assert _EVIDENCE_HEADING_959 not in without and "<details>" not in without
+    parsed = _replace_959(parsed, risk_test_matrix_evidence=_evidence_959(rows))
+    rendered = render_public_agent_comment(kind="issue_implementation", parsed=parsed, agent="claude")
+    assert "<summary>Full matrix evidence (2 rows)</summary>" in rendered
+    assert "**row-0**" in rendered and "**row-1**" in rendered
+    assert "unchanged since round" not in rendered

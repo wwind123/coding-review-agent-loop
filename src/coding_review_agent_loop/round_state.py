@@ -231,10 +231,51 @@ class PostedRoundMetadata:
     aggregate_plan_identity: str | None = None
     raw_patch_provenance: dict | None = None
     assembled_plan_sidecar: dict | None = None
+    # Causal binding of a signed child-plan re-plan (#936).  Both are absent
+    # on every historical record and omitted from the encoding when absent.
+    plan_supersession_digest: str | None = None
+    plan_supersession_superseded_hash: str | None = None
+    # Signed reviewer-board amendment binding (#943).  Written only on
+    # contract-bearing scheduler records posted under an amended contract;
+    # absent on every historical record and omitted from the encoding.
+    reviewer_board_amendment_digest: str | None = None
+    # Coder record round that last rendered the full visible matrix-evidence
+    # row list (#959).  Writers set it iff they persist matrix evidence; it is
+    # omitted from the encoding when None so legacy records stay byte-stable.
+    risk_test_matrix_evidence_full_round: int | None = None
+    # In-memory decode-quality signal for the anchor, never serialized:
+    # ``absent`` is a legacy (pre-#959) record, ``invalid`` a present but
+    # malformed value.  Constructing with an anchor promotes it to ``valid``.
+    risk_test_matrix_evidence_full_round_status: str = "absent"
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
+        if self.risk_test_matrix_evidence_full_round_status not in {"absent", "valid", "invalid"}:
+            raise ValueError("invalid matrix evidence full-round status")
+        if self.risk_test_matrix_evidence_full_round is not None:
+            if self.risk_test_matrix_evidence_full_round_status == "invalid":
+                raise ValueError("a matrix evidence full-round anchor cannot be invalid")
+            if self.risk_test_matrix_evidence_full_round_status == "absent":
+                object.__setattr__(
+                    self, "risk_test_matrix_evidence_full_round_status", "valid"
+                )
+        if (self.plan_supersession_digest is None) != (
+            self.plan_supersession_superseded_hash is None
+        ):
+            raise ValueError("plan supersession digest and superseded hash must be set together")
+        if self.plan_supersession_digest is not None and (
+            not isinstance(self.plan_supersession_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.plan_supersession_digest)
+            or not isinstance(self.plan_supersession_superseded_hash, str)
+            or not self.plan_supersession_superseded_hash.strip()
+        ):
+            raise ValueError("invalid plan supersession binding")
+        if self.reviewer_board_amendment_digest is not None and (
+            not isinstance(self.reviewer_board_amendment_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.reviewer_board_amendment_digest)
+        ):
+            raise ValueError("invalid reviewer board amendment digest")
         if self.scheduler_force_full_source is not None and (
             self.scheduler_force_full_source not in FORCE_FULL_SOURCES
             or self.scheduler_force_full is not True
@@ -1906,9 +1947,20 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
                 if key not in _SCHEDULER_AUXILIARY_KEYS or value not in (None, [])
             }
         )
+    if metadata.plan_supersession_digest is not None:
+        payload["plan_supersession_digest"] = metadata.plan_supersession_digest
+        payload["plan_supersession_superseded_hash"] = (
+            metadata.plan_supersession_superseded_hash
+        )
+    if metadata.reviewer_board_amendment_digest is not None:
+        payload["reviewer_board_amendment_digest"] = metadata.reviewer_board_amendment_digest
     if metadata.plan_candidate_key is not None:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
-    matrix_present = _risk_test_matrix_metadata_present(metadata)
+    if metadata.risk_test_matrix_evidence_full_round is not None:
+        payload["risk_test_matrix_evidence_full_round"] = (
+            metadata.risk_test_matrix_evidence_full_round
+        )
+    matrix_present =_risk_test_matrix_metadata_present(metadata)
     matrix_values = {
         "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,
         "risk_test_matrix_payload": _matrix_json(metadata.risk_test_matrix_payload),
@@ -1948,8 +2000,38 @@ def _decode_architecture_impact_degradations(value: object) -> tuple[ParseDegrad
     return tuple(records)
 
 
+def _decode_plan_supersession_field(payload: Mapping[str, object], key: str) -> str | None:
+    # A present-but-malformed binding must not decode as legacy absence.
+    if key not in payload:
+        return None
+    value = payload[key]
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{key} must be a non-empty string")
+    return value
+
+
+def _decode_matrix_evidence_full_round(payload: Mapping[str, object]) -> dict[str, object]:
+    # Missing is legacy absence; a present malformed value never raises and
+    # stays distinguishable from absence so it cannot claim the legacy rule.
+    if "risk_test_matrix_evidence_full_round" not in payload:
+        return {"risk_test_matrix_evidence_full_round_status": "absent"}
+    value = payload["risk_test_matrix_evidence_full_round"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return {"risk_test_matrix_evidence_full_round_status": "invalid"}
+    return {
+        "risk_test_matrix_evidence_full_round": value,
+        "risk_test_matrix_evidence_full_round_status": "valid",
+    }
+
+
 def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
     try:
+        for key in ("prior_items", "risk_test_matrix_evidence"):
+            # A spill reference must be hydrated first; never read it as
+            # review items or canonical matrix evidence (#953).
+            value = payload.get(key)
+            if isinstance(value, Mapping) and "$round_transport_spill" in value:
+                raise ValueError(f"{key} is an unhydrated transport reference")
         semantic_keys_present = _SEMANTIC_METADATA_FIELDS.intersection(payload)
         if semantic_keys_present:
             # Do not coerce malformed new authority to None: None is reserved
@@ -2180,6 +2262,16 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 if isinstance(payload.get("plan_candidate_key"), dict)
                 else None
             ),
+            plan_supersession_digest=_decode_plan_supersession_field(
+                payload, "plan_supersession_digest"
+            ),
+            plan_supersession_superseded_hash=_decode_plan_supersession_field(
+                payload, "plan_supersession_superseded_hash"
+            ),
+            reviewer_board_amendment_digest=_decode_plan_supersession_field(
+                payload, "reviewer_board_amendment_digest"
+            ),
+            **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
@@ -2254,6 +2346,10 @@ _LEGACY_MACHINE_REVIEWERS = {
 }
 
 
+_LEGACY_UNTRUSTED_LINEAGE_NOTE = "Synthetic machine record lacked trusted orchestrator lineage."
+_LEGACY_UNBOUND_HEAD_NOTE = "Known machine item could not be bound to a failed head."
+
+
 def _legacy_machine_kind(item: UnresolvedReviewItem) -> str | None:
     if item.item_id == "item-merge-conflict":
         return "merge-conflict"
@@ -2301,7 +2397,7 @@ def _legacy_machine_promotion(
             failed_head_sha=None,
             candidate_head_sha=None,
             obligation_identity=f"unknown:{item.item_id}",
-            notes=(*item.notes, "Synthetic machine record lacked trusted orchestrator lineage."),
+            notes=(*item.notes, _LEGACY_UNTRUSTED_LINEAGE_NOTE),
             resolution_owners=(),
             owner_states=(),
         )
@@ -2331,7 +2427,7 @@ def _legacy_machine_promotion(
             obligation_kind="unknown",
             lifecycle="repair_required",
             obligation_identity=f"unknown:{item.item_id}",
-            notes=(*item.notes, "Known machine item could not be bound to a failed head."),
+            notes=(*item.notes, _LEGACY_UNBOUND_HEAD_NOTE),
             resolution_owners=(),
             owner_states=(),
         )
@@ -2378,6 +2474,114 @@ def _promote_legacy_machine_items(records: Sequence[PostedRoundRecord]) -> tuple
     return tuple(promoted)
 
 
+PLAN_DEMOTED_MACHINE_ITEM_NOTE = (
+    "Planning has no machine-obligation clearance path; this orchestrator-authored "
+    "plan item was restored to an ordinary reviewer-dispositionable finding (#1005)."
+)
+
+
+_REVIEWER_DISPOSITION_NOTE_RE = re.compile(r"[A-Za-z][A-Za-z0-9 ._-]*: \S")
+
+
+def _has_legacy_promotion_note_tail(notes: Sequence[str]) -> bool:
+    """True when the promotion's diagnostic note is followed only by reviewer notes.
+
+    ``_apply_unresolved_item_dispositions`` appends ``"<reviewer>: <note>"``
+    evidence to a machine record each round it is dispositioned, so a promoted
+    item carried through approval rounds holds those notes after the diagnostic.
+    """
+    diagnostics = {_LEGACY_UNTRUSTED_LINEAGE_NOTE, _LEGACY_UNBOUND_HEAD_NOTE}
+    positions = [index for index, note in enumerate(notes) if note in diagnostics]
+    if len(positions) != 1:
+        return False
+    return all(
+        _REVIEWER_DISPOSITION_NOTE_RE.match(note) for note in notes[positions[0] + 1:]
+    )
+
+
+def _is_legacy_promoted_plan_item(item: UnresolvedReviewItem) -> bool:
+    """Recognize exactly what ``_legacy_machine_promotion`` made of a plan item."""
+    return (
+        item.is_machine_obligation
+        and item.reviewer == "Orchestrator"
+        and item.item_id not in {"item-merge-conflict", "item-human-requirements-acknowledgement"}
+        and item.authority in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY}
+        and item.obligation_kind == "unknown"
+        and item.obligation_identity == f"unknown:{item.item_id}"
+        and item.lifecycle == "repair_required"
+        and item.candidate_head_sha is None
+        # Only the authority/head combinations the promotion can emit: machine
+        # authority bound to a failed head, or unknown authority with no head
+        # plus the diagnostic note the promotion appended for that outcome.
+        and (
+            (item.authority == MACHINE_AUTHORITY and bool(item.failed_head_sha))
+            or (
+                item.authority == UNKNOWN_MACHINE_AUTHORITY
+                and not item.failed_head_sha
+                and _has_legacy_promotion_note_tail(item.notes)
+            )
+        )
+        # The legacy promotion always clears ownership; a machine record that
+        # still names owners is not identifiable as that promotion.
+        and not item.resolution_owners
+        and not item.owner_states
+        and item.status in {"blocking", "same-pr"}
+        and not any(note.startswith("Invalid persisted machine") for note in item.notes)
+    )
+
+
+def _demote_plan_machine_item(item: UnresolvedReviewItem) -> UnresolvedReviewItem:
+    """Return a plan-flow machine record to the ordinary finding representation.
+
+    The planning loop never mints machine obligations and has no path that
+    clears one: reviewer dispositions are evidence only for machine records,
+    and the human-requirements/merge-conflict/CI clearance paths are PR-only.
+    A machine-authority item in a plan ledger (historically the legacy
+    promotion of the orchestrator's human-requirements re-injection item)
+    would therefore stay blocking forever and force a revision after every
+    unanimous approval (#1005).  Restoring the legacy representation lets the
+    reviewers disposition it like every other plan finding; the
+    human-requirements gate still re-checks acknowledgements each round and
+    re-injects a fresh item if they remain missing.
+
+    Only the exact legacy-promotion shape is restored.  A malformed or
+    otherwise unrecognized machine record (for example the ``unknown`` blocker
+    the decoder mints for an invalid persisted field) stays a machine
+    obligation, so the planning loop stops on it with a diagnostic instead of
+    letting a reviewer approval clear corrupted state.
+    """
+    if not _is_legacy_promoted_plan_item(item):
+        return item
+    notes = item.notes
+    if PLAN_DEMOTED_MACHINE_ITEM_NOTE not in notes:
+        notes = (*notes, PLAN_DEMOTED_MACHINE_ITEM_NOTE)
+    return replace(
+        item,
+        authority=None,
+        obligation_kind=None,
+        lifecycle=None,
+        failed_head_sha=None,
+        candidate_head_sha=None,
+        obligation_identity=None,
+        notes=notes,
+        resolution_owners=(),
+        owner_states=(),
+    )
+
+
+def _demote_plan_machine_items(records: Sequence[PostedRoundRecord]) -> tuple[PostedRoundRecord, ...]:
+    demoted: list[PostedRoundRecord] = []
+    for record in records:
+        metadata = record.metadata
+        prior = tuple(_demote_plan_machine_item(item) for item in metadata.prior_items)
+        new_items = tuple(_demote_plan_machine_item(item) for item in metadata.new_items)
+        if prior != metadata.prior_items or new_items != metadata.new_items:
+            metadata = replace(metadata, prior_items=prior, new_items=new_items)
+            record = replace(record, metadata=metadata)
+        demoted.append(record)
+    return tuple(demoted)
+
+
 def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) -> tuple[PostedRoundRecord, ...]:
     records: list[PostedRoundRecord] = []
     bodies = tuple(body for comment in comments if isinstance((body := getattr(comment, "body", None)), str))
@@ -2417,6 +2621,10 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
                 body=_strip_round_metadata(body),
             )
         )
+    if flow == "plan":
+        # Legacy machine promotion exists for PR ledgers, whose machine gates
+        # have clearance paths.  A plan ledger has none (#1005).
+        return _demote_plan_machine_items(tuple(records))
     return _promote_legacy_machine_items(tuple(records))
 
 
@@ -3147,6 +3355,72 @@ def _legacy_freeform_plan_candidates(record: PostedRoundRecord) -> tuple[str, ..
         if spaced:
             spaced_candidates.append(spaced)
     return tuple(dict.fromkeys(spaced_candidates))
+
+
+@dataclass(frozen=True)
+class ApprovedPlanComment:
+    """The planner comment that carries an approved plan, for presentation."""
+
+    comment: object
+    # Structured steps from the authenticated plan sidecar, or ``None`` when
+    # the record has no sidecar bound to the approved rendered plan.
+    plan_steps: tuple[str, ...] | None
+
+
+def _sidecar_plan_steps(metadata: PostedRoundMetadata, rendered_plan: str) -> tuple[str, ...] | None:
+    if metadata.assembled_plan_sidecar is None:
+        return None
+    try:
+        sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+    except AgentLoopError:
+        return None
+    if (
+        sidecar.rendered_plan_identity is not None
+        and sidecar.rendered_plan_identity != rendered_plan_identity(rendered_plan)
+    ):
+        return None
+    steps = sidecar.canonical_json.get("plan_steps")
+    if not isinstance(steps, list) or not steps or not all(isinstance(step, str) for step in steps):
+        return None
+    return tuple(steps)
+
+
+def find_approved_plan_comment(
+    comments: Sequence[object],
+    *,
+    expected_hash: str,
+) -> ApprovedPlanComment | None:
+    """Return the latest planner comment carrying the approved plan.
+
+    Presentation only (#941): the approval announcement links here and uses
+    the structured steps to summarize them instead of repeating them.  Any
+    lookup failure yields ``None`` so the announcement degrades to the full
+    plan text rather than failing.
+    """
+    try:
+        records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError:
+        return None
+    for record in reversed(records):
+        if record.metadata.role != "coder":
+            continue
+        raw = record.metadata.canonical_plan or record.metadata.raw_structured_coder_response
+        candidates = (raw,) if raw is not None else _legacy_freeform_plan_candidates(record)
+        matched = next(
+            (
+                candidate.strip()
+                for candidate in candidates
+                if candidate and _approved_plan_hash(candidate) == expected_hash
+            ),
+            None,
+        )
+        if matched is None:
+            continue
+        return ApprovedPlanComment(
+            comment=comments[record.index],
+            plan_steps=_sidecar_plan_steps(record.metadata, matched),
+        )
+    return None
 
 
 def recover_approved_plan_context(

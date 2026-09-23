@@ -34,6 +34,19 @@ from .config import (
     sync_coder_pr_before_validation,
     sync_reviewer_pr_before_review,
 )
+from .board_amendment import (
+    ContractLineage,
+    amendment_audit_already_posted,
+    amendment_summary_line,
+    apply_board_amendment_to_ledger,
+    collect_reviewer_board_amendments,
+    format_reviewer_board_amendment_comment,
+    missing_from_config,
+    reject_misplaced_pr_amendments,
+    render_amendment_audit_comment,
+    require_amendment_activation,
+    resolve_contract_lineage,
+)
 from .decomposition import (
     _decode_json_payload,
     CreatedPhaseIssue,
@@ -54,6 +67,16 @@ from .decomposition import (
     normalize_execution_recommendation,
     validate_risk_matrix_ownership,
     validate_separately_planned_child_matrix,
+    AuthorizedReplanLineage,
+    ChildPlanRebindRecord,
+    authorized_replan_lineage,
+    collect_child_plan_supersessions,
+    find_child_plan_rebind_records,
+    format_child_plan_rebind_section,
+    format_child_plan_supersession_comment,
+    InheritedMatrixBinding,
+    InheritedRowDifference,
+    inherited_matrix_reviewed_deltas,
     risk_matrix_row_ids_for_owner,
     recover_execution_recommendation,
     ExecutionDecision,
@@ -86,8 +109,11 @@ from .errors import (
     HumanDecisionRequiredError,
     IssueImplementationConflictError,
     PreservedUnsatisfiedResponse,
+    NonRepairableEvidenceRejection,
     QuotaResetExceededError,
     ReviewSubstanceIntegrityError,
+    SemanticPatchPayloadRejection,
+    SemanticPatchUnknownPriorItemDispositionError,
     UnknownPriorItemDispositionError,
 )
 from .expected_closure import (
@@ -116,6 +142,7 @@ from .github import (
     post_issue_comment,
     post_pr_comment,
     post_trusted_pr_contract_record,
+    post_trusted_issue_comment,
     post_trusted_pr_comment,
     post_verified_trusted_issue_round_comment,
     post_verified_trusted_issue_protocol_comment,
@@ -133,7 +160,10 @@ from .github import (
 )
 from .issue_pr_handoff import (
     find_latest_issue_pr_handoff,
+    authenticate_canonical_issue_pr,
+    format_issue_pr_handoff_comment,
     post_issue_pr_handoff_comment,
+    resolve_issue_pr_handoff_lineage,
     require_pr_metadata_for_handoff,
     resolve_canonical_pr_for_issue,
 )
@@ -208,6 +238,7 @@ from .managed_ci import (
     recover_issue_created_handoff,
     render_managed_ci_resume_command,
     validate_ordinary_recovery_capability,
+    verify_managed_pr_plan_binding,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
@@ -228,7 +259,11 @@ from .prompts import (
     build_completion_recovery_prompt,
     build_followup_prompt,
     build_issue_implementation_prompt,
+    INHERITED_COVERAGE_DELTA_MAX_BYTES,
+    INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES,
     build_issue_plan_prompt,
+    inherited_coverage_delta_size,
+    inherited_obligations_enforceable_size,
     build_issue_prompt,
     build_plan_decomposition_prompt,
     build_plan_review_prompt,
@@ -280,6 +315,8 @@ from .protocol import (
     StructuredIssueImplementation,
     DerivedRiskEvidenceResult,
     PostAuthClaimDiagnostic,
+    SemanticRiskCoverageClaims,
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     StructuredPlanState,
     StructuredPlanRevision,
     PlanRevisionPatch,
@@ -346,6 +383,7 @@ from .repair import (
 )
 from .repair_preservation import (
     normalize_architecture_impact_near_miss,
+    recover_payload,
     require_recoverable_semantic_patch,
     require_repair_architecture_impact_absent,
     validate_repair_preservation,
@@ -410,6 +448,7 @@ from .ci_health import (
     is_wholly_infrastructure_blocked,
 )
 from .comment_rendering import (
+    _extract_plan_human_requirements_block,
     DEFERRED_STAGES_MARKER_RE,
     render_decomposition_degradation_comment,
     render_plan_phase_advance,
@@ -434,6 +473,7 @@ from .comment_rendering import (
     normalize_freeform_signature,
     render_discuss_round_summary_comment,
     render_public_agent_comment,
+    resolve_matrix_evidence_render,
     render_agent_unavailable_comment,
     render_canonical_plan_revision,
     render_canonical_plan_state,
@@ -501,7 +541,7 @@ from .round_state import (
     recover_plan_validation_diagnostic,
     sanitize_plan_validation_diagnostic,
 )
-from .round_transport import is_round_transport_sidecar
+from .round_transport import decode_mapping, is_round_transport_sidecar, round_comment_fits
 from .plan_assembly import (
     AssembledPlanSidecar,
     AuthenticatedPlanState,
@@ -520,6 +560,7 @@ from .plan_review_scheduling import (
     PlanRevisionDescriptor,
     PlanReviewSchedulingContract,
     PlanSchedulerSnapshot,
+    PlanSchedulingDecision,
     classify_plan_history,
     classify_plan_transition,
     make_plan_contract,
@@ -558,6 +599,7 @@ from .unresolved_items import (
     _apply_dispute_evidence,
     _apply_unresolved_item_dispositions,
     _collect_prior_compact_summaries,
+    bound_compact_prior_summaries,
     _clear_human_requirements_ack_item,
     _clear_merge_conflict_item,
     _format_same_pr_unresolved_items,
@@ -1365,6 +1407,30 @@ def _is_retryable_marker_near_miss(text: str) -> bool:
     )
 
 
+_STRUCTURED_SCHEMA_REJECTION_RE = re.compile(
+    r"^structured [a-z_]+ (?:response|repair) failed trusted validation$"
+)
+
+
+# Classification text for a semantic evidence rejection that skipped repair
+# (#990). The terminal category names this rejection, not a repair symptom.
+_SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION = (
+    "structured response failed semantic evidence validation"
+)
+
+
+def _is_structured_schema_rejection(classification_text: str) -> bool:
+    """True when a recognized structured envelope failed schema validation (#957).
+
+    The rejection is deterministic for that output, but the output came from a
+    stochastic model, so the operator guidance must not discourage a rerun.
+    """
+    return any(
+        _STRUCTURED_SCHEMA_REJECTION_RE.match(line.strip())
+        for line in (classification_text or "").splitlines()
+    )
+
+
 def _failure_category(
     text: str,
     *,
@@ -1963,6 +2029,12 @@ def _failure_suggestion(
             return "Suggestion: clean up the dirty working tree or workdir, then re-run."
         return f"Suggestion: check that {agent_name} is installed and authenticated, then re-run."
     if category == "deterministic":
+        if _is_structured_schema_rejection(classification_text):
+            return (
+                "Suggestion: re-run the same command — the agent's structured response "
+                "failed schema validation, and model output varies between runs, so a "
+                "retry may succeed. If the same rejection recurs, inspect the log above."
+            )
         if "repair invocation failure" in reason and "invalid_output" in reason:
             return (
                 "Suggestion: re-run the same command — "
@@ -2037,6 +2109,20 @@ def _format_invalid_agent_response_error(
         category_hint = " Failure category: transient (rerun may succeed)."
     elif category == "non-retryable":
         category_hint = " Failure category: non-retryable (check credentials or billing)."
+    elif (
+        category == "deterministic"
+        and classification_text == _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
+    ):
+        category_hint = (
+            " Failure category: semantic-evidence-rejection (a risk-matrix claim selected a "
+            "test observation that cannot carry authority; repair was skipped because "
+            "reformatting cannot change it)."
+        )
+    elif category == "deterministic" and _is_structured_schema_rejection(classification_text):
+        category_hint = (
+            " Failure category: schema-validation (the agent's structured response did not "
+            "match the schema; model output varies between runs, so a rerun may succeed)."
+        )
     elif category == "deterministic":
         category_hint = " Failure category: deterministic (may require a code fix)."
     elif category == "timeout":
@@ -2087,7 +2173,7 @@ def _format_invalid_agent_response_error(
     return (
         f"{agent_name} failed before producing a valid public response. "
         "No review result was recorded. "
-        f"Required marker: {marker_description}. Reason: {reason}.{exit_context}"
+        f"Reason: {reason}. Required marker: {marker_description}.{exit_context}"
         f"{category_hint}"
         f"{log_context}"
         f"{suggestion_line}"
@@ -3018,6 +3104,45 @@ def _capture_terminal_plan_repair_rejection(
     return None
 
 
+def _semantic_patch_payload_rejection(
+    exc: AgentLoopError,
+    *,
+    text: str,
+    normalized: str | None,
+    payload_validator: Callable[[dict], object] | None,
+) -> tuple[str, str] | None:
+    """Return ``(candidate, diagnostic)`` when no envelope repair can succeed.
+
+    Repair preservation pins a ``plan_revision_patch`` payload byte-for-byte,
+    so the defects repair may fix are exactly the envelope/footer ones.  The
+    recovered payload is therefore checked on its own, independent of which
+    error the full validator reported first: an envelope defect can mask a
+    payload defect that no repair could clear.  Any payload rejection -- a
+    strict patch-schema failure or a ledger/disposition check -- is
+    unsatisfiable by repair and goes to the bounded replan instead (#979).
+    That includes a recovered JSON object with a missing or wrong ``kind``,
+    which the repair integrity gate would refuse anyway.  Only text with no
+    recoverable JSON object stays on the existing semantic-patch integrity
+    path.
+    """
+    if isinstance(exc, SemanticPatchPayloadRejection):
+        return text, str(exc)
+    if payload_validator is None:
+        return None
+    for candidate in (text, normalized):
+        if candidate is None:
+            continue
+        payload = recover_payload(candidate)
+        if not isinstance(payload, dict):
+            continue
+        try:
+            payload_validator(payload)
+        except AgentLoopError as payload_exc:
+            return candidate, str(payload_exc)
+        return None
+    return None
+
+
 def _history_strip_reason(ledger_incomplete: bool) -> str:
     """Log phrasing for why a history-proven strip was allowed."""
     return (
@@ -3078,6 +3203,7 @@ def _run_validated_agent(
         [DeterministicPlanValidationExhaustion, AgentInvocationError], None
     ] | None = None,
     require_architecture_impact_contract: bool = False,
+    semantic_patch_payload_validator: Callable[[dict], object] | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -3175,6 +3301,7 @@ def _run_validated_agent(
     # re-parsing the message.
     terminal_public_response: str | None = None
     plan_validation_exhaustion: DeterministicPlanValidationExhaustion | None = None
+    bounded_replan_rejection: DeterministicPlanValidationExhaustion | None = None
     # This latch is reset per invocation attempt and set only at the exact
     # structured-validator capture point. It prevents a stale typed candidate
     # from reaching the persistence callback after an ineligible path.
@@ -3265,6 +3392,7 @@ def _run_validated_agent(
         # marker-safety, or containment failure must clear it.
         plan_validation_exhaustion = None
         plan_validation_capture_eligible = False
+        bounded_replan_rejection = None
         if result.log_path is not None:
             log_paths.append(result.log_path)
         text = _neutralize_untrusted_markers(result.text, config=config, agent_name=agent_name)
@@ -3824,6 +3952,9 @@ def _run_validated_agent(
                     ledger_incomplete or repair_expected_kind == "plan_revision_patch"
                 )
                 normalized: str | None = None
+                # An authority rejection exposed only once the envelope is
+                # normalized is as unrepairable as one on the raw text (#990).
+                normalized_evidence_rejection: NonRepairableEvidenceRejection | None = None
                 if (
                     use_repair
                     and not public_text_is_transient
@@ -3942,6 +4073,8 @@ def _run_validated_agent(
                                             model_used=result.model_used,
                                             **_response_identity_fields(result),
                                         )
+                        except NonRepairableEvidenceRejection as norm_exc:
+                            normalized_evidence_rejection = norm_exc
                         except AgentLoopError:
                             pass
                         else:
@@ -4051,7 +4184,66 @@ def _run_validated_agent(
                                 model_used=result.model_used,
                                 **_response_identity_fields(result),
                             )
-                if (
+                payload_rejection = (
+                    _semantic_patch_payload_rejection(
+                        exc,
+                        text=text,
+                        normalized=normalized,
+                        payload_validator=semantic_patch_payload_validator,
+                    )
+                    if (
+                        repair_expected_kind == "plan_revision_patch"
+                        and not public_text_is_transient
+                        and not response_failure_is_unsupported
+                    )
+                    else None
+                )
+                if payload_rejection is not None:
+                    # Repair may change only a semantic patch's envelope, and
+                    # this rejection names its payload: no repair output can
+                    # satisfy both. Hand it to the bounded replan (#979).
+                    candidate_text, rejection_diagnostic = payload_rejection
+                    log(
+                        config,
+                        f"{agent_name}: semantic patch payload rejected ({rejection_diagnostic}); "
+                        "repair may change only the envelope, routing to bounded replan",
+                    )
+                    bounded_replan_rejection = DeterministicPlanValidationExhaustion(
+                        candidate_kind="plan_revision",
+                        candidate_text=candidate_text,
+                        diagnostic=rejection_diagnostic,
+                        candidate_digest=hashlib.sha256(
+                            candidate_text.encode("utf-8")
+                        ).hexdigest(),
+                    )
+                    should_retry = False
+                    last_failure_category = "deterministic"
+                elif (
+                    evidence_rejection := (
+                        exc
+                        if isinstance(exc, NonRepairableEvidenceRejection)
+                        else normalized_evidence_rejection
+                    )
+                ) is not None:
+                    # Selecting a real broker handle that is not an
+                    # authoritative passing observation is an authority
+                    # decision. Repair may only reshape the envelope around
+                    # the coder's claims, so it cannot satisfy this; running
+                    # it (and its fallback chain) only burns its timeout and
+                    # then misreports the stop as that timeout (#990).
+                    log(
+                        config,
+                        f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
+                        "not repairable by reformatting, skipping repair pass",
+                    )
+                    last_error = (
+                        f"{evidence_rejection} (semantic evidence rejection; "
+                        "repair skipped because reformatting cannot change it)"
+                    )
+                    last_classification_text = _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
+                    should_retry = False
+                    last_failure_category = "deterministic"
+                elif (
                     use_repair
                     and not public_text_is_transient
                     and not response_failure_is_unsupported
@@ -4470,6 +4662,7 @@ def _run_validated_agent(
         containment=last_result.containment if last_result is not None else None,
         plan_validation_exhaustion=plan_validation_exhaustion,
         preserved_unsatisfied_response=preserved_unsatisfied,
+        bounded_replan_rejection=bounded_replan_rejection,
     )
     if (
         plan_validation_failure_handler is not None
@@ -4803,13 +4996,34 @@ def _parse_fresh_correction_claims(
         return None
     # The correction continuation is not a second coder handoff. Preserve all
     # coder-owned facts from the authenticated response and accept only its
-    # newly validated semantic claim set.
+    # newly validated semantic claim set.  Claims the original response lost
+    # to an unapproved row stay on the audit record (#920) even when the
+    # correction omits them.
+    claims = candidate.risk_test_matrix_claims
+    original_dropped = (
+        original.risk_test_matrix_claims.dropped_row_ids
+        if original.risk_test_matrix_claims is not None
+        else ()
+    )
+    if original_dropped:
+        claims = claims or SemanticRiskCoverageClaims()
+        claims = dataclasses_replace(
+            claims,
+            dropped_row_ids=tuple(dict.fromkeys((*original_dropped, *claims.dropped_row_ids))),
+        )
     return dataclasses_replace(
         original,
-        risk_test_matrix_claims=candidate.risk_test_matrix_claims,
+        risk_test_matrix_claims=claims,
         risk_test_matrix_evidence=None,
         risk_test_matrix_diagnostics=(),
     )
+
+
+_NON_ACTIONABLE_RISK_DIAGNOSTICS = frozenset({
+    "missing-claim",
+    "unsuperseded-journal-failure",
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+})
 
 
 def _derive_authenticated_risk_evidence_for_coder(
@@ -4909,11 +5123,14 @@ def _derive_authenticated_risk_evidence_for_coder(
         authenticated_tree_clean=authenticated_tree_clean,
         predecessor_head=predecessor_head,
         expected_identity=identity,
+        execution_owner=approved_plan_context.risk_test_matrix_execution_owner,
     )
+    # A dropped unapproved-row claim (#920) is an audit record, not something
+    # a correction may relabel onto another row, so it never triggers or
+    # fails the bounded correction.
     actionable = tuple(
         diagnostic for diagnostic in result.diagnostics
-        if diagnostic.code != "missing-claim"
-        and diagnostic.code != "unsuperseded-journal-failure"
+        if diagnostic.code not in _NON_ACTIONABLE_RISK_DIAGNOSTICS
     )
     if (
         actionable
@@ -4971,7 +5188,7 @@ def _derive_authenticated_risk_evidence_for_coder(
                     _correction_attempted=True,
                 )
                 if corrected_result is not None and any(
-                    diagnostic.code not in {"missing-claim", "unsuperseded-journal-failure"}
+                    diagnostic.code not in _NON_ACTIONABLE_RISK_DIAGNOSTICS
                     for diagnostic in corrected_result.diagnostics
                 ):
                     exhausted = PostAuthClaimDiagnostic(
@@ -5452,17 +5669,7 @@ def _validate_plan_revision_patch_response(
     parsed = validate_structured_plan_revision_patch(text)
     if parsed is None:
         raise AgentLoopError("Semantic plan revision did not use the required structured patch format.")
-    allowed_ids = {item.item_id for item in unresolved_items}
-    unknown = {item.item_id for item in parsed.prior_plan_item_dispositions} - allowed_ids
-    if unknown:
-        raise UnknownPriorItemDispositionError(
-            unknown_ids=tuple(sorted(unknown)),
-            allowed_ids=tuple(sorted(allowed_ids)),
-            same_round_description=(
-                "Same-round findings are informational only and must not be dispositioned "
-                "as prior carried items."
-            ),
-        )
+    _check_plan_revision_patch_ledger(parsed, unresolved_items=unresolved_items)
     requirements_context = render_coder_human_requirements_prompt_context(
         human_requirements,
         requirement_scope="planning requirements",
@@ -5473,18 +5680,94 @@ def _validate_plan_revision_patch_response(
         surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
         requires_direct_discussion_ack=requirements_context.requires_direct_discussion_ack,
     )
+    _check_plan_revision_patch_human_requirement_dispositions(
+        parsed,
+        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+        inherited_human_requirement_dispositions=inherited_human_requirement_dispositions,
+    )
+    return parsed
+
+
+def _validate_plan_revision_patch_payload(
+    payload: dict,
+    *,
+    unresolved_items: Sequence[UnresolvedReviewItem] = (),
+    human_requirements=(),
+    inherited_human_requirement_dispositions: Sequence[object] | None = None,
+) -> object:
+    """Run every semantic-patch check that depends only on the JSON payload.
+
+    Repair preservation pins this payload exactly, so any failure here is
+    unsatisfiable by an envelope-only repair, whatever envelope error the full
+    validator happened to report first (#979).  Every failure is raised as a
+    ``SemanticPatchPayloadRejection``.
+    """
+    if payload.get("kind") != "plan_revision_patch":
+        # Repair never runs on a non-patch payload (the integrity gate refuses
+        # it), so a missing or wrong kind is a replan diagnostic too.
+        raise SemanticPatchPayloadRejection(
+            "Structured response kind mismatch: expected `plan_revision_patch`."
+        )
+    try:
+        parsed = parse_plan_revision_patch(payload)
+    except AgentLoopError as exc:
+        raise SemanticPatchPayloadRejection(str(exc)) from exc
+    _check_plan_revision_patch_ledger(parsed, unresolved_items=unresolved_items)
+    requirements_context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+    )
+    _check_plan_revision_patch_human_requirement_dispositions(
+        parsed,
+        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+        inherited_human_requirement_dispositions=inherited_human_requirement_dispositions,
+    )
+    return parsed
+
+
+def _check_plan_revision_patch_ledger(
+    parsed: PlanRevisionPatch,
+    *,
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> None:
+    allowed_ids = {item.item_id for item in unresolved_items}
+    unknown = {item.item_id for item in parsed.prior_plan_item_dispositions} - allowed_ids
+    if unknown:
+        # Payload-level: repair must preserve the patch payload exactly, so
+        # only the deterministic strip or a bounded replan can fix it (#979).
+        raise SemanticPatchUnknownPriorItemDispositionError(
+            unknown_ids=tuple(sorted(unknown)),
+            allowed_ids=tuple(sorted(allowed_ids)),
+            same_round_description=(
+                "Same-round findings are informational only and must not be dispositioned "
+                "as prior carried items."
+            ),
+        )
+
+
+def _check_plan_revision_patch_human_requirement_dispositions(
+    parsed: PlanRevisionPatch,
+    *,
+    surfaced_requirement_ids: Sequence[str],
+    inherited_human_requirement_dispositions: Sequence[object] | None,
+) -> None:
     dispositions = _effective_plan_revision_patch_dispositions(
         parsed,
         inherited_human_requirement_dispositions,
     )
     if dispositions is None:
         dispositions = ()
-    validate_human_requirement_dispositions(
-        dispositions,
-        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
-        context="plan_revision_patch.human_requirement_dispositions",
-    )
-    return parsed
+    try:
+        validate_human_requirement_dispositions(
+            dispositions,
+            surfaced_requirement_ids=surfaced_requirement_ids,
+            context="plan_revision_patch.human_requirement_dispositions",
+        )
+    except SemanticPatchPayloadRejection:
+        raise
+    except AgentLoopError as exc:
+        raise SemanticPatchPayloadRejection(str(exc)) from exc
 
 
 def _drop_repeated_carried_future_followups(
@@ -6543,17 +6826,26 @@ def _run_child_planning_cycle(
     usage_context: RunUsageContext,
     parent_issue: int,
     child_issue_number: int,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> int:
     """Run the child's own plan/review cycle (policy ``auto``) after its handoff."""
-    # Child plan review always runs the full board: staged planning scheduling
-    # is a parent-run decision and is never inherited (#905, from #841).
+    # The child inherits the operator's run-wide plan-review policy and primary
+    # plan reviewer (#929), but no parent scheduling state crosses the
+    # boundary: the child plan is a fresh artifact, so the force-full latch is
+    # reset and the execution mode is ``auto`` (#905, from #841).
     child_config = dataclasses_replace(
         config,
         plan_execution_mode="auto",
-        plan_review_policy="all-reviewers",
-        primary_plan_reviewer=None,
         plan_review_force_full=False,
     )
+    if config.plan_review_force_full:
+        log(
+            config,
+            f"Issue #{parent_issue}: child #{child_issue_number} plan review does not "
+            "inherit --plan-review-force-full; the child plan starts under "
+            f"--plan-review-policy {config.plan_review_policy} without the "
+            "parent's full-board override",
+        )
     child_issue_context = get_issue_context(
         runner, config=child_config, issue_number=child_issue_number
     )
@@ -6570,6 +6862,7 @@ def _run_child_planning_cycle(
         issue_context=child_issue_context,
         requested_policy="auto",
         usage_context=usage_context,
+        inherited_matrix_binding=inherited_matrix_binding,
     )
 
 
@@ -6645,6 +6938,11 @@ def _dispatch_decomposition_child(
             usage_context=usage_context,
             parent_issue=parent_issue,
             child_issue_number=created.issue_number,
+            inherited_matrix_binding=_inherited_matrix_binding(
+                parent_issue=parent_issue,
+                stage_id=stage_id,
+                parent_plan_context=approved_plan_context,
+            ),
         )
     if existing_handoff is None:
         # Persist the parent-owned assignment before child execution so
@@ -7064,6 +7362,7 @@ def _persist_execution_decision_if_needed(
     recommendation,
     requested_policy: str,
     resolved_execution: ResolvedExecution | None = None,
+    retired_plan_hashes: frozenset[str] = frozenset(),
 ) -> None:
     if resolved_execution is not None:
         recommendation = resolved_execution.recommendation
@@ -7102,6 +7401,7 @@ def _persist_execution_decision_if_needed(
         plan_subject=plan_subject,
         strategy=recommendation.strategy,
         recommendation_digest=str(identity["recommendation_sha256"]),
+        retired_plan_hashes=retired_plan_hashes,
     )
     if existing is None:
         post_execution_decision(runner, config=config, decision=decision)
@@ -7116,6 +7416,7 @@ def _preflight_fresh_staged_topology(
     issue_context: IssueContext,
     mode: str,
     normalized_topology,
+    retired_plan_hashes: frozenset[str] = frozenset(),
 ) -> tuple[CreatedPhaseIssue, ...] | NeedsHumanDecision:
     """Validate fresh staged recovery without publishing or creating anything."""
     decomposition, retained_parent_scope = normalized_topology
@@ -7138,6 +7439,7 @@ def _preflight_fresh_staged_topology(
         plan_subject=plan_subject,
         strategy="staged",
         recommendation_digest=decomposition.recommendation_digest,
+        retired_plan_hashes=retired_plan_hashes,
     )
     existing_pr = resolve_canonical_pr_for_issue(
         runner,
@@ -7499,6 +7801,7 @@ def _preflight_fresh_one_shot_recovery(
     config: AgentLoopConfig,
     issue_context: IssueContext,
     recommendation=None,
+    retired_plan_hashes: frozenset[str] = frozenset(),
 ) -> None:
     """Validate existing one-shot handoffs before the decision record is posted."""
     plan_hash = approved_plan_hash(approved_plan)
@@ -7516,6 +7819,7 @@ def _preflight_fresh_one_shot_recovery(
             plan_subject=plan_subject,
             strategy="one-shot",
             recommendation_digest=str(identity["recommendation_sha256"]),
+            retired_plan_hashes=retired_plan_hashes,
         )
     _preflight_fresh_split_topology(
         runner,
@@ -7598,7 +7902,23 @@ def _preflight_fresh_one_shot_recovery(
         parent_issue=issue_number,
         mode="implement-one-shot",
     )
-    if existing_handoff is None and any_handoff is not None and any_handoff.plan_hash != plan_hash:
+    # A same-PR plan rebind (#936) leaves the older one-shot record in place
+    # by design: the authoritative canonical handoff already binds that same
+    # PR to the current plan, so the older record is history, not a conflict.
+    canonical_rebinds_same_pr = bool(
+        any_handoff is not None
+        and resolved_pr is not None
+        and resolved_pr.source == "canonical"
+        and resolved_pr.metadata is not None
+        and resolved_pr.metadata.plan_hash == plan_hash
+        and resolved_pr.pr_number == any_handoff.pr_number
+    )
+    if (
+        existing_handoff is None
+        and any_handoff is not None
+        and any_handoff.plan_hash != plan_hash
+        and not canonical_rebinds_same_pr
+    ):
         try:
             older_state = get_pr_state(
                 runner,
@@ -8651,6 +8971,10 @@ def _implement_approved_issue(
                 if implementation_result.risk_test_matrix_evidence is not None
                 else None
             ),
+            # The establishing comment renders the full row list (#959).
+            risk_test_matrix_evidence_full_round=(
+                1 if implementation_result.risk_test_matrix_evidence is not None else None
+            ),
             risk_test_matrix_diagnostics=tuple(
                 diagnostic.to_payload()
                 for diagnostic in implementation_result.risk_test_matrix_diagnostics
@@ -8844,9 +9168,11 @@ def _decompose_approved_plan(
             architecture_impact=(
                 parse_architecture_impact(
                     # The checkpoint decoder restores lists as tuples; give the
-                    # unchanged strict parser its JSON-array wire shape back.
+                    # parser its JSON-array wire shape back.  Stored text keeps
+                    # the explicit legacy decode, exactly as before #925.
                     sanitize_architecture_impact(checkpoint.architecture_impact),
                     context="checkpoint.architecture_impact",
+                    architecture_status_mode="legacy",
                 )
                 if checkpoint.architecture_impact is not None else None
             ),
@@ -8981,6 +9307,775 @@ def _plan_validation_contract_versions(
     )
 
 
+# Inherited-obligation replans per coder round: two replans, three candidates.
+MAX_INHERITED_MATRIX_REPLANS = 2
+
+
+@dataclass(frozen=True)
+class _InheritedReplanDiagnostic:
+    """In-memory correction context for an unpublished rejected candidate."""
+
+    diagnostic: str
+    failure_attempt: int
+    candidate_digest: str
+
+
+def _inherited_matrix_binding(
+    *, parent_issue: int, stage_id: str, parent_plan_context: ApprovedPlanContext
+) -> InheritedMatrixBinding | None:
+    """Binding for a child plan-first cycle, or ``None`` when nothing is inherited."""
+    payload = (
+        parent_plan_context.risk_test_matrix_payload
+        if parent_plan_context.matrix_available else None
+    )
+    if not isinstance(payload, dict) or not risk_matrix_row_ids_for_owner(payload, stage_id):
+        return None
+    return InheritedMatrixBinding(
+        parent_issue=parent_issue, stage_id=stage_id, parent_matrix=payload
+    )
+
+
+@dataclass(frozen=True)
+class _PlanningChildBinding:
+    """Identity of a fresh planning child, captured once per entry path (#936)."""
+
+    child_issue: int
+    parent_issue: int
+    stage_id: str
+    parent_plan_context: ApprovedPlanContext
+
+
+@dataclass(frozen=True)
+class _PlanSupersessionBinding:
+    """A signed re-plan authorization bound to the existing canonical PR (#936)."""
+
+    digest: str
+    superseded_hash: str
+    pr_number: int
+    parent_issue: int
+    stage_id: str
+    parent_plan_context: ApprovedPlanContext
+    # The signed record's human rationale.  It is the instruction the forced
+    # revision turn carries, so an admissible plan is re-planned for the
+    # reason a human gave rather than re-approved unchanged (#985).
+    rationale: str = ""
+
+
+# Consecutive PR follow-up coder turns allowed to leave the head unchanged
+# before the loop stops instead of re-reviewing an identical diff (#985).
+MAX_UNCHANGED_HEAD_CODER_TURNS = 2
+
+
+class _UnchangedHeadTracker:
+    """Count consecutive coder follow-ups that left one PR head unchanged (#985).
+
+    The count belongs to a single head: a follow-up on any other head,
+    including one advanced externally between rounds, starts a fresh count,
+    and a follow-up that moves the head clears it.
+    """
+
+    def __init__(self) -> None:
+        self.head_sha: str | None = None
+        self.count = 0
+
+    def observe(self, reviewed_head: str | None, head_after_followup: str | None) -> int:
+        if not reviewed_head or head_after_followup != reviewed_head:
+            self.head_sha, self.count = None, 0
+        elif reviewed_head == self.head_sha:
+            self.count += 1
+        else:
+            self.head_sha, self.count = reviewed_head, 1
+        return self.count
+
+
+def _child_plan_admissibility_failure(
+    parent_plan_context: ApprovedPlanContext,
+    child_plan_context: ApprovedPlanContext,
+    *,
+    stage_id: str,
+) -> str | None:
+    """Judge a recorded approved child plan against its inherited parent rows.
+
+    The one admissibility rule shared by issue routing, the plan-loop guard,
+    PR-loop entry, and mid-run plan adoption.  Returns the sanitized
+    weakening diagnostic, or ``None`` for an admissible plan.
+    """
+    try:
+        validate_separately_planned_child_matrix(
+            parent_plan_context.risk_test_matrix_payload
+            if parent_plan_context.matrix_available else None,
+            child_plan_context.risk_test_matrix_payload
+            if child_plan_context.matrix_available else None,
+            execution_owner=stage_id,
+        )
+    except AgentLoopError as exc:
+        return sanitize_plan_validation_diagnostic(str(exc))
+    return None
+
+
+def _child_plan_supersession_route(
+    *, child_issue: int, parent_issue: int, stage_id: str, superseded_plan_hash: str
+) -> str:
+    """Route-forward text naming the signed record and the issue-mode rerun."""
+    template = format_child_plan_supersession_comment(
+        child_issue=child_issue,
+        parent_issue=parent_issue,
+        stage_id=stage_id,
+        superseded_plan_hash=superseded_plan_hash,
+        rationale="<why this approved child plan must be re-planned>",
+    )
+    return (
+        f"Supported route: approved child plan {superseded_plan_hash} is already bound to an "
+        f"implementation PR, so it can only be re-planned under a signed human authorization. "
+        f"Post this signed record as a comment on child issue #{child_issue} (fill in the "
+        "rationale, keep the signature line, and leave the record in place afterwards):\n\n"
+        f"{template}\n\n"
+        f"Then rerun `{_child_resume_hint(child_issue, EXECUTION_DISPOSITION_PLANNING)}`. The "
+        "child is re-planned, and after approval the same PR is rebound to the revised plan; "
+        "`agent-loop pr` never re-plans or rebinds. Re-planning continues the child's existing "
+        "round numbering, so a higher --max-rounds may be needed."
+    )
+
+
+def verify_child_plan_rebind(
+    child_comments: Sequence[object],
+    *,
+    repo: str,
+    parent_plan_context: ApprovedPlanContext,
+    child_issue: int,
+    parent_issue: int,
+    stage_id: str,
+    pr_number: int,
+    require_admissible: bool = True,
+) -> ApprovedPlanContext | None:
+    """Verify a planning child's same-PR plan-replacement handoff.
+
+    Returns ``None`` when the PR's bound plan never came from a plan
+    replacement, and the verified replacement plan otherwise.  Every path on
+    which a replacement plan can become a PR's plan context calls this; a
+    missing, inconsistent, unauthorized, or inadmissible rebind raises a
+    human-repair diagnostic and nothing is ever posted to correct it.
+
+    The check follows the most recent plan-changing handoff edge, which a
+    later closing-ID superset never erases.  Provenance and current-contract
+    admissibility are separate: ``require_admissible=False`` verifies only how
+    the plan became the binding, so a legitimately rebound plan that a later
+    contract tightening made inadmissible can still be superseded, while an
+    unverified replacement can never be laundered through a new authorization.
+    """
+    lineage = resolve_issue_pr_handoff_lineage(
+        child_comments, issue_number=child_issue, repo=repo
+    )
+    if lineage is None or lineage.replaced is None or lineage.replacement is None:
+        return None
+    handoff = lineage.replacement
+    replaced = lineage.replaced
+
+    def fail(reason: str) -> AgentLoopError:
+        return AgentLoopError(
+            f"Human repair required: child issue #{child_issue} carries a same-PR approved-plan "
+            f"replacement handoff ({replaced.plan_hash} -> {handoff.plan_hash}) for PR "
+            f"#{handoff.pr_number} that cannot be verified: {reason}. No reviewer, coder, "
+            "qualification, or merge step ran and no corrective record was posted. Restore the "
+            "signed child-plan supersession record and the rebind comment, or remove the "
+            "unverifiable handoff comment, then rerun."
+        )
+
+    if handoff.pr_number != pr_number:
+        raise fail(f"it names PR #{handoff.pr_number}, not PR #{pr_number}")
+    records = [
+        record
+        for record in find_child_plan_rebind_records(child_comments)
+        if record.comment_index == lineage.replacement_comment_index
+    ]
+    if len(records) != 1:
+        raise fail("its comment does not carry exactly one rebind audit record")
+    record = records[0]
+    if (
+        record.child_issue != child_issue
+        or record.pr_number != handoff.pr_number
+        or record.new_plan_hash != handoff.plan_hash
+        or record.superseded_plan_hash != replaced.plan_hash
+    ):
+        raise fail(
+            "its rebind audit record disagrees with the handoff on child issue, PR number, or "
+            "plan hashes"
+        )
+    supersessions = collect_child_plan_supersessions(
+        child_comments, child_issue=child_issue, parent_issue=parent_issue, stage_id=stage_id
+    )
+    replan = authorized_replan_lineage(
+        child_comments,
+        superseded_hash=record.superseded_plan_hash,
+        digest=record.plan_supersession_digest,
+        supersessions=supersessions,
+        through_round=record.approved_round,
+    )
+    if isinstance(replan, str):
+        raise fail(replan)
+    if (
+        replan.first_round != record.first_replan_round
+        or replan.latest_round != record.approved_round
+        or replan.latest_plan_hash != record.new_plan_hash
+    ):
+        raise fail(
+            "its rebind audit record disagrees with the digest-bound re-plan rounds on the "
+            "first re-plan round, the approved round, or the approved plan hash"
+        )
+    replacement = recover_approved_plan_context(child_comments, expected_hash=record.new_plan_hash)
+    if not replacement.is_available:
+        raise fail(f"replacement plan {record.new_plan_hash} is not recoverable")
+    if not require_admissible:
+        return replacement
+    inadmissible = _child_plan_admissibility_failure(
+        parent_plan_context, replacement, stage_id=stage_id
+    )
+    if inadmissible is not None:
+        raise fail(f"the replacement plan is itself inadmissible.\n{inadmissible}")
+    return replacement
+
+
+def verified_retired_child_plan_hashes(
+    child_comments: Sequence[object],
+    *,
+    repo: str,
+    parent_plan_context: ApprovedPlanContext,
+    child_issue: int,
+    parent_issue: int,
+    stage_id: str,
+    pr_number: int,
+) -> frozenset[str]:
+    """Approved plans that a verified signed supersession chain replaced (#988).
+
+    A rebind moves the PR binding to the replacement plan, but the execution
+    decision recorded under the superseded plan stays on the issue.  That
+    decision is history, not a competing topology, exactly when the plan it
+    names was replaced through a verified signed re-plan.
+
+    The chain is the ordered sequence of plan-changing handoff edges of the
+    live PR lineage, walked backwards from the live handoff.  The latest edge
+    is verified by ``verify_child_plan_rebind`` (which raises on an
+    unverifiable replacement).  Each earlier edge must be a real handoff
+    transition whose own comment carries exactly one rebind audit record
+    agreeing with it, and whose digest-bound re-plan lineage verifies.  A
+    standalone audit record with no handoff transition retires nothing.  The
+    walk stops at the first edge that does not verify, so an unexplained hash
+    divergence keeps failing closed at the execution-decision check.
+    """
+    replacement = verify_child_plan_rebind(
+        child_comments,
+        repo=repo,
+        parent_plan_context=parent_plan_context,
+        child_issue=child_issue,
+        parent_issue=parent_issue,
+        stage_id=stage_id,
+        pr_number=pr_number,
+        require_admissible=False,
+    )
+    if replacement is None or not replacement.plan_hash:
+        return frozenset()
+    lineage = resolve_issue_pr_handoff_lineage(
+        child_comments, issue_number=child_issue, repo=repo
+    )
+    if lineage is None or lineage.latest.pr_number != pr_number:
+        return frozenset()
+    supersessions = collect_child_plan_supersessions(
+        child_comments, child_issue=child_issue, parent_issue=parent_issue, stage_id=stage_id
+    )
+    rebinds = find_child_plan_rebind_records(child_comments)
+    retired: set[str] = set()
+    current = lineage.latest.plan_hash
+    for replaced, successor, comment_index in reversed(lineage.replacement_edges):
+        if successor.plan_hash != current or successor.pr_number != pr_number:
+            break
+        records = [record for record in rebinds if record.comment_index == comment_index]
+        if len(records) != 1:
+            break
+        record = records[0]
+        if (
+            record.child_issue != child_issue
+            or record.pr_number != pr_number
+            or record.new_plan_hash != successor.plan_hash
+            or record.superseded_plan_hash != replaced.plan_hash
+        ):
+            break
+        if record.superseded_plan_hash in retired or record.superseded_plan_hash == (
+            lineage.latest.plan_hash
+        ):
+            break
+        replan = authorized_replan_lineage(
+            child_comments,
+            superseded_hash=record.superseded_plan_hash,
+            digest=record.plan_supersession_digest,
+            supersessions=supersessions,
+            through_round=record.approved_round,
+        )
+        if (
+            isinstance(replan, str)
+            or replan.first_round != record.first_replan_round
+            or replan.latest_round != record.approved_round
+            or replan.latest_plan_hash != record.new_plan_hash
+        ):
+            break
+        retired.add(record.superseded_plan_hash)
+        current = replaced.plan_hash
+    return frozenset(retired)
+
+
+def _managed_ci_retired_plan_hashes(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    parent_issue_context: IssueContext | None,
+    pr_number: int,
+) -> tuple[frozenset[str], IssueContext | None]:
+    """Plans a verified signed re-plan retired, for a managed-CI resume (#993).
+
+    A rebind leaves the managed-CI authorization recorded under the
+    superseded plan on the PR, just as it leaves the execution decision on
+    the issue (#988).  Both the explicit fresh grant and the ordinary resume
+    carry this set on the handoff so those grants read as history.  Only a fresh decomposition child whose live handoff
+    lineage carries a same-PR plan-replacement edge can retire anything; the
+    retired set comes from ``verified_retired_child_plan_hashes``, so an
+    unexplained plan divergence still retires nothing and keeps refusing.
+
+    Returns the retired hashes and the (possibly newly fetched) parent issue
+    context so the caller does not refetch it.
+    """
+    lineage = resolve_issue_pr_handoff_lineage(
+        issue_context.comments, issue_number=issue_context.number, repo=config.repo
+    )
+    if lineage is None or lineage.replaced is None or lineage.latest.pr_number != pr_number:
+        return frozenset(), parent_issue_context
+    if _fresh_phase_marker_payload(issue_context) is None:
+        return frozenset(), parent_issue_context
+    staged_parent = _infer_staged_parent_issue(issue_context)
+    if parent_issue_context is None and staged_parent is not None:
+        parent_issue_context = get_issue_context(
+            runner, config=config, issue_number=staged_parent
+        )
+    fresh_child = _resolve_fresh_child_provenance(
+        issue_context=issue_context, parent_issue_context=parent_issue_context
+    )
+    if fresh_child is None or not fresh_child.route.is_planning:
+        return frozenset(), parent_issue_context
+    retired = verified_retired_child_plan_hashes(
+        issue_context.comments,
+        repo=config.repo,
+        parent_plan_context=fresh_child.parent_plan_context,
+        child_issue=issue_context.number,
+        parent_issue=fresh_child.parent_issue,
+        stage_id=fresh_child.stage_id,
+        pr_number=pr_number,
+    )
+    return retired, parent_issue_context
+
+
+def _require_authorized_replan_state(
+    comments: Sequence[object],
+    *,
+    issue_number: int,
+    plan_supersession: _PlanSupersessionBinding,
+    latest_plan: str | None,
+    latest_round: int | None,
+) -> AuthorizedReplanLineage | None:
+    """Fail closed unless the latest plan round belongs to the authorized re-plan.
+
+    Returns ``None`` when the latest plan round is the superseded plan itself
+    and no digest-bound round exists yet (the enforced revision runs next), or
+    the valid digest-bound lineage.  Anything else is never revised,
+    approved, or rebound.
+    """
+    supersessions = collect_child_plan_supersessions(
+        comments,
+        child_issue=issue_number,
+        parent_issue=plan_supersession.parent_issue,
+        stage_id=plan_supersession.stage_id,
+    )
+    lineage = authorized_replan_lineage(
+        comments,
+        superseded_hash=plan_supersession.superseded_hash,
+        digest=plan_supersession.digest,
+        supersessions=supersessions,
+    )
+    if isinstance(lineage, AuthorizedReplanLineage):
+        return lineage
+    bound_round_exists = any(
+        record.metadata.role == "coder"
+        and record.metadata.plan_supersession_superseded_hash
+        == plan_supersession.superseded_hash
+        for record in _extract_round_metadata_records(comments, flow="plan")
+    )
+    if (
+        latest_plan is not None
+        and not bound_round_exists
+        and approved_plan_hash(latest_plan) == plan_supersession.superseded_hash
+    ):
+        return None
+    raise AgentLoopError(
+        f"Human repair required: issue #{issue_number} has a signed child-plan supersession for "
+        f"approved plan {plan_supersession.superseded_hash}, but its latest plan round "
+        f"({'round ' + str(latest_round) if latest_round is not None else 'none reconstructable'}"
+        f"{', plan ' + approved_plan_hash(latest_plan) if latest_plan is not None else ''}) is "
+        f"not part of the authorized re-plan: {lineage}. A plan outside the digest-bound "
+        "lineage is never revised, approved, or rebound, and no agent was invoked. Remove the "
+        "offending plan round comment(s) or restore the signed record, then rerun."
+    )
+
+
+def _rebind_superseded_child_plan(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    issue_context: IssueContext,
+    plan_supersession: _PlanSupersessionBinding,
+    plan_hash: str,
+) -> None:
+    """Rebind the existing PR to the approved revision with one issue comment.
+
+    The superseding handoff record and the rebind audit record share one
+    comment, and no PR-side record is written, so an interruption leaves
+    either the fully old or the fully new binding.  Idempotent: an existing
+    verified rebind to ``plan_hash`` posts nothing.
+    """
+    replan = _require_authorized_replan_state(
+        issue_context.comments,
+        issue_number=issue_number,
+        plan_supersession=plan_supersession,
+        latest_plan=None,
+        latest_round=None,
+    )
+    if replan is None or replan.latest_plan_hash != plan_hash:
+        raise AgentLoopError(
+            f"Human repair required: approved plan {plan_hash} on issue #{issue_number} is not "
+            "the latest plan of the digest-bound re-plan lineage for superseded plan "
+            f"{plan_supersession.superseded_hash}; PR #{plan_supersession.pr_number} was not "
+            "rebound and nothing was posted."
+        )
+    handoff_lineage = resolve_issue_pr_handoff_lineage(
+        issue_context.comments, issue_number=issue_number, repo=config.repo
+    )
+    current = handoff_lineage.latest if handoff_lineage is not None else None
+    if current is None or current.pr_number != plan_supersession.pr_number:
+        raise AgentLoopError(
+            f"Human repair required: the issue-to-PR handoff for issue #{issue_number} no longer "
+            f"names PR #{plan_supersession.pr_number}; the re-planned child plan was not rebound "
+            "and no implementation turn was started."
+        )
+    authenticated = authenticate_canonical_issue_pr(
+        runner, config=config, issue_number=issue_number, issue_context=issue_context
+    )
+    if (
+        authenticated is None
+        or authenticated.pr_number != plan_supersession.pr_number
+        or authenticated.state != "OPEN"
+    ):
+        raise AgentLoopError(
+            f"Human repair required: canonical PR #{plan_supersession.pr_number} for issue "
+            f"#{issue_number} is "
+            f"{authenticated.state if authenticated is not None else 'not recorded'}, not OPEN "
+            "with the same number as the superseded handoff. The re-planned child plan was not "
+            "rebound, no superseding handoff was posted, and no implementation turn was started; "
+            "abandoning or replacing the existing PR is not supported."
+        )
+    if current.plan_hash == plan_hash:
+        verify_child_plan_rebind(
+            issue_context.comments,
+            repo=config.repo,
+            parent_plan_context=plan_supersession.parent_plan_context,
+            child_issue=issue_number,
+            parent_issue=plan_supersession.parent_issue,
+            stage_id=plan_supersession.stage_id,
+            pr_number=plan_supersession.pr_number,
+        )
+        return
+    if current.plan_hash != plan_supersession.superseded_hash:
+        raise AgentLoopError(
+            f"Human repair required: the issue-to-PR handoff for issue #{issue_number} names plan "
+            f"{current.plan_hash}, neither superseded plan {plan_supersession.superseded_hash} nor "
+            f"approved revision {plan_hash}; nothing was posted."
+        )
+    handoff_lines = format_issue_pr_handoff_comment(
+        issue_number=issue_number,
+        pr_number=current.pr_number,
+        pr_url=current.pr_url,
+        pr_head_sha=current.pr_head_sha,
+        flow="approved-plan-implementation",
+        plan_hash=plan_hash,
+        expected_closing_issue_ids=current.expected_closing_issue_ids,
+        # The annotation the same-PR approved-plan replacement rule requires.
+        # It never identifies the replacement: unchanged-ID rebinds all share it.
+        supersedes_hash=current.contract_hash,
+    ).split("\n")
+    marker_position = next(
+        index
+        for index, line in enumerate(handoff_lines)
+        if line.startswith("<!-- AGENT_ISSUE_PR_HANDOFF:")
+    )
+    rebind_section = format_child_plan_rebind_section(
+        ChildPlanRebindRecord(
+            child_issue=issue_number,
+            pr_number=current.pr_number,
+            superseded_plan_hash=plan_supersession.superseded_hash,
+            new_plan_hash=plan_hash,
+            plan_supersession_digest=plan_supersession.digest,
+            first_replan_round=replan.first_round,
+            approved_round=replan.latest_round,
+        )
+    )
+    body = "\n".join(
+        [*handoff_lines[:marker_position], rebind_section, *handoff_lines[marker_position:]]
+    )
+    post_trusted_issue_comment(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        body=TrustedBody.canonical(
+            body, expected_tokens=("AGENT_ISSUE_PR_HANDOFF", "AGENT_CHILD_PLAN_REBIND")
+        ),
+    )
+    log(
+        config,
+        f"Issue #{issue_number}: rebound PR #{current.pr_number} from approved plan "
+        f"{plan_supersession.superseded_hash} to {plan_hash} with one issue comment",
+    )
+
+
+def _route_child_plan_handoff(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    issue_context: IssueContext,
+    fresh_child,
+    handoff,
+    child_plan_context: ApprovedPlanContext,
+) -> _PlanSupersessionBinding | None:
+    """Issue-mode routing for a planning child's handed-off plan (#936, #985).
+
+    Admissibility and authorization are separate questions: admissibility asks
+    whether the bound plan is broken, a signed supersession record asks whether
+    a human authorized replacing it.  The signed records are therefore
+    consulted for every bound plan.  Exactly one matching signed record:
+    authenticate the canonical PR and return the binding that reopens planning,
+    whether or not the plan is admissible.  No matching record: an admissible
+    plan returns ``None`` so the PR resumes unchanged, and an inadmissible one
+    fails closed with the record template, before any agent or write.
+    """
+    # How the handed-off plan became the binding is verified first and on
+    # every branch: a signed authorization for the current hash never
+    # excuses an unverified replacement that produced that hash.
+    verify_child_plan_rebind(
+        issue_context.comments,
+        repo=config.repo,
+        parent_plan_context=fresh_child.parent_plan_context,
+        child_issue=issue_number,
+        parent_issue=fresh_child.parent_issue,
+        stage_id=fresh_child.stage_id,
+        pr_number=handoff.pr_number,
+        require_admissible=False,
+    )
+    failure = _child_plan_admissibility_failure(
+        fresh_child.parent_plan_context, child_plan_context, stage_id=fresh_child.stage_id
+    )
+    ignored: list[str] = []
+    supersessions = collect_child_plan_supersessions(
+        issue_context.comments,
+        child_issue=issue_number,
+        parent_issue=fresh_child.parent_issue,
+        stage_id=fresh_child.stage_id,
+        ignored_sink=ignored,
+    )
+    for note in ignored:
+        log(config, f"Issue #{issue_number}: {note}")
+    matching = [
+        record for record in supersessions if record.superseded_plan_hash == handoff.plan_hash
+    ]
+    if not matching:
+        if failure is None:
+            return None
+        raise AgentLoopError(
+            f"Approved child plan {handoff.plan_hash} on issue #{issue_number}, bound to PR "
+            f"#{handoff.pr_number}, is inadmissible under the inherited-matrix contract. No agent "
+            f"was invoked and nothing was posted.\n{failure}\n\n"
+            + _child_plan_supersession_route(
+                child_issue=issue_number,
+                parent_issue=fresh_child.parent_issue,
+                stage_id=fresh_child.stage_id,
+                superseded_plan_hash=handoff.plan_hash,
+            )
+        )
+    signed = matching[0]
+    if config.dry_run:
+        pr_number = handoff.pr_number
+    else:
+        authenticated = authenticate_canonical_issue_pr(
+            runner, config=config, issue_number=issue_number, issue_context=issue_context
+        )
+        if (
+            authenticated is None
+            or authenticated.pr_number != handoff.pr_number
+            or authenticated.state != "OPEN"
+        ):
+            raise AgentLoopError(
+                f"Human repair required: issue #{issue_number} carries a signed child-plan "
+                f"supersession for plan {handoff.plan_hash}, but canonical PR "
+                f"#{handoff.pr_number} is "
+                f"{authenticated.state if authenticated is not None else 'not recorded'}, not "
+                "OPEN. Re-planning only rebinds the existing open PR; abandoning or replacing "
+                "it is not supported. No agent was invoked."
+            )
+        pr_number = authenticated.pr_number
+    log(
+        config,
+        f"Issue #{issue_number}: approved child plan {handoff.plan_hash} is "
+        f"{'inadmissible' if failure is not None else 'admissible'}; "
+        f"re-planning under signed supersession {signed.digest} ({signed.comment_locator}) "
+        f"for PR #{pr_number}",
+    )
+    return _PlanSupersessionBinding(
+        digest=signed.digest,
+        superseded_hash=handoff.plan_hash,
+        pr_number=pr_number,
+        parent_issue=fresh_child.parent_issue,
+        stage_id=fresh_child.stage_id,
+        parent_plan_context=fresh_child.parent_plan_context,
+        rationale=signed.rationale,
+    )
+
+
+def _require_admissible_pr_child_plan(
+    child_comments: Sequence[object],
+    *,
+    config: AgentLoopConfig,
+    binding: _PlanningChildBinding,
+    child_plan_context: ApprovedPlanContext,
+    pr_number: int,
+) -> None:
+    """PR-mode provenance gate for a planning child's bound plan (#936).
+
+    PR mode never re-plans and never rebinds: an inadmissible binding fails
+    closed naming the issue-mode supersession route, and a same-PR plan
+    replacement must pass rebind verification before any reviewer runs.  A
+    signed supersession naming the bound plan also fails closed (#985): the
+    human authorized a re-plan, reviewers cannot judge the PR against a scope
+    no plan approved, and a PR-mode coder turn can never produce the
+    replacement, so reviewing would only repeat the same verdict.
+    """
+    verify_child_plan_rebind(
+        child_comments,
+        repo=config.repo,
+        parent_plan_context=binding.parent_plan_context,
+        child_issue=binding.child_issue,
+        parent_issue=binding.parent_issue,
+        stage_id=binding.stage_id,
+        pr_number=pr_number,
+        require_admissible=False,
+    )
+    failure = _child_plan_admissibility_failure(
+        binding.parent_plan_context, child_plan_context, stage_id=binding.stage_id
+    )
+    if failure is not None:
+        raise AgentLoopError(
+            f"{failure}\n\nPR #{pr_number} is bound to approved child plan "
+            f"{child_plan_context.plan_hash}, which is inadmissible; no reviewer ran. "
+            + _child_plan_supersession_route(
+                child_issue=binding.child_issue,
+                parent_issue=binding.parent_issue,
+                stage_id=binding.stage_id,
+                superseded_plan_hash=child_plan_context.plan_hash or "",
+            )
+        )
+    _reject_pending_child_plan_supersession(
+        child_comments,
+        binding=binding,
+        plan_hash=child_plan_context.plan_hash,
+        pr_number=pr_number,
+        stopped="no reviewer ran",
+    )
+
+
+def _reject_pending_child_plan_supersession(
+    child_comments: Sequence[object],
+    *,
+    binding: _PlanningChildBinding,
+    plan_hash: str | None,
+    pr_number: int,
+    stopped: str,
+) -> None:
+    """Fail closed while a signed record authorizes replacing the bound plan (#985).
+
+    Checked at PR entry and again on the freshly fetched child issue at
+    qualification, so a record posted while reviewers ran cannot be bypassed.
+    """
+    pending = [
+        record
+        for record in collect_child_plan_supersessions(
+            child_comments,
+            child_issue=binding.child_issue,
+            parent_issue=binding.parent_issue,
+            stage_id=binding.stage_id,
+        )
+        if record.superseded_plan_hash == plan_hash
+    ]
+    if pending:
+        raise AgentLoopError(
+            f"PR #{pr_number} is bound to approved child plan {plan_hash}, "
+            f"which the signed child-plan supersession at {pending[0].comment_locator} "
+            f"authorizes replacing; {stopped}. The authorization permits a re-plan but is "
+            "not itself an approved plan, and `agent-loop pr` never re-plans or rebinds. Rerun "
+            f"`{_child_resume_hint(binding.child_issue, EXECUTION_DISPOSITION_PLANNING)}`: the "
+            "child is re-planned, and after approval this PR is rebound to the revised plan."
+        )
+
+
+def _inadmissible_plan_audit_line(plan_hash: str) -> str:
+    """The guard's audit sentence; also the durable key that stops a repeat."""
+    return (
+        f"Approved plan {plan_hash} is inadmissible under the inherited-matrix "
+        "contract and is being revised."
+    )
+
+
+def _resumed_inherited_replan_force_full(comments: Sequence[object]) -> bool:
+    """Reconstruct the complete-board latch after an inherited-matrix re-plan.
+
+    The latch is set in memory just before the revision turn.  A run that
+    stops after the revised plan round is durable, but before the next
+    scheduling record, would otherwise lose it and let staged planning
+    narrow the board that must review the revision.  It is recomputed here
+    from durable state only: the latest plan coder round either carries a
+    signed supersession binding, or revises a plan for which the guard's
+    audit comment exists.  Once the next round has run, its scheduling
+    record carries the automatic latch through the existing recovery.
+    """
+    coder_records = [
+        record
+        for record in _extract_round_metadata_records(comments, flow="plan")
+        if record.metadata.role == "coder"
+    ]
+    if not coder_records:
+        return False
+    latest = coder_records[-1].metadata
+    if latest.plan_supersession_digest is not None:
+        return True
+    if latest.prior_plan_subject is None:
+        return False
+    bodies = [
+        body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
+    ]
+    for record in coder_records[:-1]:
+        plan = record.metadata.canonical_plan
+        if record.metadata.subject != latest.prior_plan_subject or plan is None:
+            continue
+        audit_line = _inadmissible_plan_audit_line(approved_plan_hash(plan))
+        if any(audit_line in body for body in bodies):
+            return True
+    return False
+
+
 def _recover_current_plan_validation_diagnostic(
     runner: Runner,
     *,
@@ -9089,6 +10184,92 @@ def _persist_exhausted_plan_validation_diagnostic(
             containment=original_error.containment,
             plan_validation_exhaustion=exhaustion,
         ) from exc
+
+
+def _assemble_structured_plan_round_body(
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    kind: Literal["plan_state", "plan_revision"],
+    parsed_plan: StructuredPlanState | StructuredPlanRevision,
+    full_comment: str,
+    metadata: PostedRoundMetadata,
+    raw_text: str,
+    prior_items: Sequence[UnresolvedReviewItem],
+    model_used: str | None,
+    surfaced_requirement_ids: Sequence[str],
+    requires_direct_discussion_ack: bool,
+) -> TrustedBody:
+    """Assemble a structured plan coder round, compacting only on body overflow (#948).
+
+    The full public comment is used whenever the transport can carry it.  Only
+    the dedicated body-budget overflow selects the bounded visible digest; any
+    other transport failure propagates and aborts publication.  Metadata is
+    always the one derived from the full canonical plan, so the digest changes
+    presentation only.
+    """
+    full_body = _attach_round_metadata(full_comment, metadata)
+    if round_comment_fits(full_body):
+        return full_body
+    compact_comment = render_public_agent_comment(
+        kind=kind,
+        parsed=parsed_plan,
+        agent=config.coder,
+        prior_items=prior_items,
+        raw_text=raw_text,
+        config=config,
+        model_used=model_used,
+        compact=True,
+    )
+    if surfaced_requirement_ids or requires_direct_discussion_ack:
+        # Never post a digest whose signed-requirement content differs from
+        # what validated the raw response.
+        if parse_human_requirements_acknowledgement(
+            _extract_plan_human_requirements_block(raw_text)
+        ).marker_present:
+            validate_human_requirements_acknowledgement(
+                _compact_digest_acknowledgement_text(compact_comment),
+                surfaced_requirement_ids=surfaced_requirement_ids,
+                requires_direct_discussion_ack=requires_direct_discussion_ack,
+            )
+        expected_ids = [item.requirement_id for item in parsed_plan.human_requirement_dispositions]
+        rendered_ids = _compact_digest_disposition_ids(compact_comment)
+        if rendered_ids != expected_ids:
+            raise AgentLoopError(
+                "Compact plan digest does not list exactly the plan's signed human "
+                "requirement dispositions; refusing to post it."
+            )
+    log(
+        config,
+        f"Planning issue #{issue_number}: full plan comment exceeds the comment budget; "
+        "posting the bounded visible digest (complete plan stays in authenticated round metadata)",
+    )
+    return _attach_round_metadata(compact_comment, metadata)
+
+
+_COMPACT_DIGEST_DISPOSITION_LINE_RE = re.compile(r"^- \*\*(?P<id>[^*]+)\*\* — `")
+
+
+def _compact_digest_disposition_ids(comment: str) -> list[str]:
+    ids: list[str] = []
+    active = False
+    for line in comment.splitlines():
+        if line.strip() == "### Human requirement dispositions":
+            active = True
+            continue
+        if not active:
+            continue
+        match = _COMPACT_DIGEST_DISPOSITION_LINE_RE.match(line)
+        if match is None:
+            break
+        ids.append(match.group("id"))
+    return ids
+
+
+def _compact_digest_acknowledgement_text(comment: str) -> str:
+    """Acknowledgement text of a rendered digest: the block after the dispositions."""
+    marker_index = comment.find(HUMAN_REQUIREMENTS_ADDRESSED_MARKER)
+    return comment[marker_index:] if marker_index >= 0 else ""
 
 
 def _post_plan_coder_round_comment(
@@ -9211,6 +10392,8 @@ def _run_plan_first_loop(
     requested_policy: str | None = None,
     implement_after_approval: bool = False,
     usage_context: RunUsageContext,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    plan_supersession: _PlanSupersessionBinding | None = None,
 ) -> int:
     if config.review_parallel:
         _ensure_parallel_reviewer_workdirs(config, flag_name="--review-parallel", role_label="reviewer")
@@ -9262,6 +10445,160 @@ def _run_plan_first_loop(
         )
         raise PlanPrePanelSafetyError(message)
 
+    if inherited_matrix_binding is not None:
+        inherited_measured = inherited_obligations_enforceable_size(inherited_matrix_binding)
+        if inherited_measured > INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES:
+            # Fail closed before any planner or reviewer turn: the block is
+            # never truncated, and the retention check is never relaxed.
+            stop_plan_pre_panel(
+                f"inherited parent matrix obligations for stage "
+                f"`{inherited_matrix_binding.stage_id}` measure {inherited_measured} bytes, above "
+                f"the permitted {INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES} bytes for a "
+                "lossless planning prompt; reduce or split the rows the approved plan on "
+                f"parent issue #{inherited_matrix_binding.parent_issue} allocates to this stage, "
+                "then rerun child planning.",
+                round_number=None,
+            )
+
+    def check_inherited_candidate(
+        child_matrix: object,
+    ) -> tuple[InheritedRowDifference, ...]:
+        """Mechanical inherited-row check plus the fail-closed delta cap."""
+        assert inherited_matrix_binding is not None
+        validate_separately_planned_child_matrix(
+            inherited_matrix_binding.parent_matrix,
+            child_matrix,  # type: ignore[arg-type]
+            execution_owner=inherited_matrix_binding.stage_id,
+        )
+        deltas = inherited_matrix_reviewed_deltas(
+            inherited_matrix_binding.parent_matrix,
+            child_matrix,  # type: ignore[arg-type]
+            execution_owner=inherited_matrix_binding.stage_id,
+        )
+        delta_measured = inherited_coverage_delta_size(deltas)
+        if delta_measured > INHERITED_COVERAGE_DELTA_MAX_BYTES:
+            raise AgentLoopError(
+                f"Separately planned child departs from its inherited parent matrix rows by "
+                f"{delta_measured} bytes of reviewed deltas, above the permitted "
+                f"{INHERITED_COVERAGE_DELTA_MAX_BYTES} bytes that reviewers can be shown without "
+                "truncation. Make fewer or smaller departures from the inherited text: keep "
+                "inherited rows closer to the parent values and move new coverage into "
+                "child-local rows."
+            )
+        return deltas
+
+    def inherited_review_context(
+        plan_text: str,
+    ) -> tuple[tuple[InheritedRowDifference, ...], str | None]:
+        """Reviewed deltas recomputed from the canonical plan; never persisted."""
+        if inherited_matrix_binding is None:
+            return (), None
+        matrix_match = RISK_TEST_MATRIX_MARKER_RE.search(plan_text)
+        try:
+            child_matrix = (
+                decode_risk_test_matrix_marker(matrix_match.group("payload"))["matrix"]
+                if matrix_match is not None
+                else None
+            )
+            return check_inherited_candidate(child_matrix), None
+        except AgentLoopError as exc:
+            # Only a historical plan published before this check can reach a
+            # reviewer in this state; reviewers are told to block it so the
+            # revision turn re-enters the enforced replan path.
+            return (), sanitize_plan_validation_diagnostic(str(exc))
+
+    def run_inherited_checked_planner_turn(
+        invoke: Callable[[object | None], ValidatedAgentResponse],
+        *,
+        derive_matrix: Callable[[ValidatedAgentResponse], object],
+        initial_diagnostic: object | None,
+        candidate_kind: Literal["plan_state", "plan_revision"],
+        target_coder_round: int,
+        prior_plan_subject: str | None,
+    ) -> ValidatedAgentResponse:
+        """Orchestrator-owned bounded replan over unpublished candidates.
+
+        Deliberately outside ``_run_validated_agent``: the envelope-only repair
+        model never sees an inherited-row rejection.  A rejected candidate
+        stays in local memory only, so the authenticated base is untouched.
+        """
+        diagnostic = initial_diagnostic
+        for replan_attempt in range(MAX_INHERITED_MATRIX_REPLANS + 1):
+            try:
+                response = invoke(diagnostic)
+            except AgentInvocationError as exc:
+                # A semantic-patch payload rejection is unsatisfiable by the
+                # envelope-only repair model; it loses this candidate, not
+                # the run (#979).
+                if exc.bounded_replan_rejection is None:
+                    raise
+                candidate_text = exc.bounded_replan_rejection.candidate_text
+                rejection = sanitize_plan_validation_diagnostic(
+                    exc.bounded_replan_rejection.diagnostic
+                )
+                failure_description = "fail semantic patch payload validation"
+            else:
+                if is_clarification_request(response.text):
+                    return response
+                # Candidate assembly runs on every plan-first run, not only
+                # child cycles: a deterministic assembly failure (for example a
+                # row-bound overflow) becomes a bounded-replan diagnostic, not
+                # a crash.
+                try:
+                    child_matrix = derive_matrix(response)
+                    if inherited_matrix_binding is not None:
+                        check_inherited_candidate(child_matrix)
+                    return response
+                except AgentLoopError as exc:
+                    rejection = sanitize_plan_validation_diagnostic(str(exc))
+                candidate_text = response.text
+                failure_description = (
+                    "weaken inherited parent matrix rows"
+                    if inherited_matrix_binding is not None
+                    else "fail deterministic plan assembly"
+                )
+            candidate_digest = hashlib.sha256(candidate_text.encode("utf-8")).hexdigest()
+            if replan_attempt >= MAX_INHERITED_MATRIX_REPLANS:
+                exhaustion = DeterministicPlanValidationExhaustion(
+                    candidate_kind=candidate_kind,
+                    candidate_text=candidate_text,
+                    diagnostic=rejection,
+                    candidate_digest=candidate_digest,
+                )
+                error = AgentInvocationError(
+                    f"{coder_name} produced {MAX_INHERITED_MATRIX_REPLANS + 1} consecutive plan "
+                    f"candidates that {failure_description}; stopping before any "
+                    f"reviewer or implementation turn.\n{rejection}",
+                    failure_category="deterministic",
+                    plan_validation_exhaustion=exhaustion,
+                )
+                _persist_exhausted_plan_validation_diagnostic(
+                    runner,
+                    config=config,
+                    issue_context=issue_context,
+                    issue_number=issue_number,
+                    original_error=error,
+                    exhaustion=exhaustion,
+                    target_coder_round=target_coder_round,
+                    prior_plan_subject=prior_plan_subject,
+                    candidate_kind=candidate_kind,
+                    require_execution_strategy_contract=require_fresh_execution_contract,
+                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                )
+                raise error
+            log(
+                config,
+                f"Planning issue #{issue_number}: unpublished candidate failed deterministic "
+                f"plan validation; bounded replan {replan_attempt + 1} of "
+                f"{MAX_INHERITED_MATRIX_REPLANS}",
+            )
+            diagnostic = _InheritedReplanDiagnostic(
+                diagnostic=rejection,
+                failure_attempt=replan_attempt + 1,
+                candidate_digest=candidate_digest,
+            )
+        raise AssertionError("unreachable inherited replan state")
+
     def plan_history_records(
         *, refresh: bool = False, round_number: int | None = None
     ) -> tuple[PostedRoundRecord, ...]:
@@ -9303,25 +10640,60 @@ def _run_plan_first_loop(
         except AgentLoopError:
             return ()
 
-    for record in planning_contract_drift_records():
-        metadata = record.metadata
-        try:
-            persisted_contract = _plan_scheduler_contract_from_metadata(metadata)
-        except AgentLoopError:
-            persisted_contract = None
-        if persisted_contract is not None and persisted_contract != plan_scheduler_contract:
-            raise AgentLoopError(
-                "Plan review scheduler contract changed during resume; the required "
-                "reviewer board, the planning policy, and the primary plan reviewer "
-                "must remain immutable for the run. This run is configured with "
-                f"--plan-review-policy {config.plan_review_policy} and primary "
-                f"{plan_primary_name or '(none)'}, but issue #{issue_number} already "
-                "carries a planning scheduler contract for policy "
-                f"{persisted_contract.policy} with primary "
-                f"{persisted_contract.primary_reviewer or '(none)'} and reviewer board "
-                f"{', '.join(persisted_contract.required_reviewers)}. Rerun with the "
-                "persisted planning policy, primary, and reviewer board."
+    def plan_contract_drift_error(
+        persisted_contract: PlanReviewSchedulingContract, detail: str
+    ) -> AgentLoopError:
+        def template_round() -> int | None:
+            resumed = _resume_plan_round(
+                issue_context.comments, configured_reviewers=configured_reviewers
             )
+            return resumed[1].round_number if resumed is not None else 1
+
+        return AgentLoopError(
+            "Plan review scheduler contract changed during resume; the required "
+            "reviewer board, the planning policy, and the primary plan reviewer "
+            "must remain immutable for the run. This run is configured with "
+            f"--plan-review-policy {config.plan_review_policy} and primary "
+            f"{plan_primary_name or '(none)'}, but issue #{issue_number} already "
+            "carries a planning scheduler contract for policy "
+            f"{persisted_contract.policy} with primary "
+            f"{persisted_contract.primary_reviewer or '(none)'} and reviewer board "
+            f"{', '.join(persisted_contract.required_reviewers)} ({detail}). Rerun with the "
+            "persisted planning policy, primary, and reviewer board."
+            + _board_amendment_route_clause(
+                flow="plan",
+                issue_number=issue_number,
+                pr_number=None,
+                persisted=persisted_contract,
+                configured=plan_scheduler_contract,
+                start_round_number=template_round,
+            )
+        )
+
+    # Signed reviewer-board amendments (#943) are read from the same issue
+    # comment list the plan round records live in, so comment order is
+    # always comparable.  Without an amendment this is exactly the historical
+    # immutability rule.
+    plan_amendment_diagnostics: list[str] = []
+    plan_board_amendments = collect_reviewer_board_amendments(
+        issue_context.comments,
+        flow="plan",
+        issue_number=issue_number,
+        ignored_sink=plan_amendment_diagnostics,
+    )
+    for diagnostic in plan_amendment_diagnostics:
+        log(config, f"Planning issue #{issue_number}: {diagnostic}")
+    plan_drift_records = planning_contract_drift_records()
+    plan_contract_lineage: ContractLineage = resolve_contract_lineage(
+        plan_drift_records,
+        plan_board_amendments,
+        plan_scheduler_contract,
+        contract_from_metadata=_plan_contract_or_none,
+        drift_error=plan_contract_drift_error,
+    )
+    plan_amendment_digest = plan_contract_lineage.active_digest
+    for record in plan_drift_records:
+        metadata = record.metadata
         if not staged_planning:
             continue
         if (
@@ -9359,6 +10731,90 @@ def _run_plan_first_loop(
     # run does for every item the resumed round carried.
     plan_accounted_item_ids: set[str] = set()
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
+    # Amendment activation (#943) runs right after resume reconstruction and
+    # before any agent invocation or comment post: an amendment no
+    # digest-bound record has used must start at the round this resume
+    # re-enters.
+    plan_amendment_start_round = resume_state[1].round_number if resume_state is not None else 1
+    require_amendment_activation(
+        plan_contract_lineage,
+        start_round_number=plan_amendment_start_round,
+        template=lambda amendment, round_number: _board_amendment_template(
+            flow="plan",
+            issue_number=issue_number,
+            pr_number=None,
+            persisted=plan_contract_lineage.contracts[
+                plan_contract_lineage.amendments.index(amendment)
+            ],
+            removed=amendment.removed_reviewers,
+            start_round_number=round_number,
+        ),
+    )
+    plan_amendment_reassignments = ()
+    plan_amendment_note: str | None = None
+    if plan_contract_lineage.active_amendment is not None:
+        plan_amended_contract = plan_contract_lineage.contracts[-1]
+        _view, plan_amendment_reassignments = apply_board_amendment_to_ledger(
+            (
+                (*resume_state[1].prior_items, *resume_state[1].current_round_new_items)
+                if resume_state is not None
+                else ()
+            ),
+            removed_reviewers=plan_contract_lineage.removed_reviewers,
+            remaining_reviewers=plan_amended_contract.required_reviewers,
+            primary_reviewer=plan_amended_contract.primary_reviewer,
+        )
+        plan_amendment_note = amendment_summary_line(
+            plan_contract_lineage, plan_amendment_reassignments
+        )
+        log(config, f"Planning issue #{issue_number}: {plan_amendment_note}")
+        if not amendment_audit_already_posted(
+            issue_context.comments, plan_contract_lineage.active_amendment.digest
+        ):
+            post_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=render_amendment_audit_comment(
+                    plan_contract_lineage,
+                    start_round_number=plan_amendment_start_round,
+                    reassignments=plan_amendment_reassignments,
+                ),
+            )
+
+    def plan_ledger_view(
+        items: Sequence[UnresolvedReviewItem],
+    ) -> tuple[UnresolvedReviewItem, ...]:
+        """Derived ledger with removed reviewers' ownership reassigned (#943).
+
+        Persisted ``prior_items`` inside a round are never rewritten; this
+        view feeds scheduler obligations, dispositions, and completion.
+        """
+        if plan_contract_lineage.active_amendment is None:
+            return tuple(items)
+        amended = plan_contract_lineage.contracts[-1]
+        view, _reassignments = apply_board_amendment_to_ledger(
+            items,
+            removed_reviewers=plan_contract_lineage.removed_reviewers,
+            remaining_reviewers=amended.required_reviewers,
+            primary_reviewer=amended.primary_reviewer,
+        )
+        return view
+
+    if plan_supersession is not None:
+        # Classify the latest reconstructable plan round before any agent
+        # turn (#936): only the superseded plan itself, or a plan produced by
+        # the digest-bound re-plan, may be revised, approved, or rebound.
+        _require_authorized_replan_state(
+            issue_context.comments,
+            issue_number=issue_number,
+            plan_supersession=plan_supersession,
+            latest_plan=resume_state[0] if resume_state is not None else None,
+            latest_round=resume_state[1].round_number if resume_state is not None else None,
+        )
+    # Set by the approval guard when an approved plan fails the inherited
+    # check; the revision turn then runs with no reviewer item.
+    inherited_guard_revision: str | None = None
     plan_validation_diagnostic: PlanValidationDiagnosticTransport | None = None
     if resume_state is None:
         plan_validation_diagnostic = _recover_current_plan_validation_diagnostic(
@@ -9378,59 +10834,82 @@ def _run_plan_first_loop(
             requirement_scope="planning requirements",
             full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
         )
-        plan_response = _run_validated_agent(
-            runner,
-            agent=config.coder,
-            config=config,
-            prompt=build_issue_plan_prompt(
-                issue_number,
-                config,
-                memory,
-                issue_context=issue_context,
-                plan_validation_diagnostic=plan_validation_diagnostic,
-            ),
-            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking --> or <!-- AGENT_CLARIFY -->",
-            require_architecture_impact_contract=True,
-            validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
-                text,
-                marker_validator=lambda text: _require_plan_state_or_clarification(
-                    text,
-                    # Fresh planner turns always use the v1 impact contract.
-                    # Document availability controls prompt material, not the
-                    # response protocol or the assessment requirement.
-                    required_architecture_impact_contract=1,
-                    require_execution_strategy_contract=(
-                        1 if require_fresh_execution_contract else 0
-                    ),
-                    require_risk_test_matrix_contract=(
-                        1 if require_fresh_matrix_contract else 0
-                    ),
-                ),
-                human_requirements=human_requirements,
-                requirement_scope="planning requirements",
-                full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
-            ),
-            usage_context=usage_context,
-            use_repair=True,
-            repair_expected_kind="plan_state",
-            repair_surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
-            repair_requires_direct_discussion_ack=plan_human_requirements_context.requires_direct_discussion_ack,
-            require_execution_strategy_contract=require_fresh_execution_contract,
-            require_risk_test_matrix_contract=require_fresh_matrix_contract,
-            operation_description="planning",
-            plan_validation_failure_handler=lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
+        def invoke_fresh_planner(turn_diagnostic: object | None) -> ValidatedAgentResponse:
+            return _run_validated_agent(
                 runner,
+                agent=config.coder,
                 config=config,
-                issue_context=issue_context,
-                issue_number=issue_number,
-                original_error=error,
-                exhaustion=exhaustion,
-                target_coder_round=1,
-                prior_plan_subject=None,
-                candidate_kind="plan_state",
+                prompt=build_issue_plan_prompt(
+                    issue_number,
+                    config,
+                    memory,
+                    issue_context=issue_context,
+                    plan_validation_diagnostic=turn_diagnostic,
+                    inherited_matrix_binding=inherited_matrix_binding,
+                ),
+                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking --> or <!-- AGENT_CLARIFY -->",
+                require_architecture_impact_contract=True,
+                validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
+                    text,
+                    marker_validator=lambda text: _require_plan_state_or_clarification(
+                        text,
+                        # Fresh planner turns always use the v1 impact contract.
+                        # Document availability controls prompt material, not the
+                        # response protocol or the assessment requirement.
+                        required_architecture_impact_contract=1,
+                        require_execution_strategy_contract=(
+                            1 if require_fresh_execution_contract else 0
+                        ),
+                        require_risk_test_matrix_contract=(
+                            1 if require_fresh_matrix_contract else 0
+                        ),
+                    ),
+                    human_requirements=human_requirements,
+                    requirement_scope="planning requirements",
+                    full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
+                ),
+                usage_context=usage_context,
+                use_repair=True,
+                repair_expected_kind="plan_state",
+                repair_surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
+                repair_requires_direct_discussion_ack=plan_human_requirements_context.requires_direct_discussion_ack,
                 require_execution_strategy_contract=require_fresh_execution_contract,
                 require_risk_test_matrix_contract=require_fresh_matrix_contract,
-            ),
+                operation_description="planning",
+                plan_validation_failure_handler=lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
+                    runner,
+                    config=config,
+                    issue_context=issue_context,
+                    issue_number=issue_number,
+                    original_error=error,
+                    exhaustion=exhaustion,
+                    target_coder_round=1,
+                    prior_plan_subject=None,
+                    candidate_kind="plan_state",
+                    require_execution_strategy_contract=require_fresh_execution_contract,
+                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                ),
+            )
+
+        def fresh_candidate_matrix(response: ValidatedAgentResponse) -> object:
+            candidate = validate_structured_plan_state(
+                response.text,
+                require_execution_strategy_contract=(
+                    1 if require_fresh_execution_contract else 0
+                ),
+                require_risk_test_matrix_contract=(
+                    1 if require_fresh_matrix_contract else 0
+                ),
+            )
+            return getattr(candidate, "risk_test_matrix", None)
+
+        plan_response = run_inherited_checked_planner_turn(
+            invoke_fresh_planner,
+            derive_matrix=fresh_candidate_matrix,
+            initial_diagnostic=plan_validation_diagnostic,
+            candidate_kind="plan_state",
+            target_coder_round=1,
+            prior_plan_subject=None,
         )
         plan_output = plan_response.text
         coder_session_id = plan_response.session_id
@@ -9564,7 +11043,24 @@ def _run_plan_first_loop(
                 "Could not record the plan round metadata for round 1 "
                 f"(response form {current_response_form or 'free-form'}): {exc}"
             ) from exc
-        plan_round_body = _attach_round_metadata(public_plan_output, plan_round_metadata)
+        if isinstance(structured_plan, StructuredPlanState):
+            plan_round_body = _assemble_structured_plan_round_body(
+                config=config,
+                issue_number=issue_number,
+                kind="plan_state",
+                parsed_plan=structured_plan,
+                full_comment=public_plan_output,
+                metadata=plan_round_metadata,
+                raw_text=plan_output,
+                prior_items=(),
+                model_used=plan_response.model_used,
+                surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
+                requires_direct_discussion_ack=(
+                    plan_human_requirements_context.requires_direct_discussion_ack
+                ),
+            )
+        else:
+            plan_round_body = _attach_round_metadata(public_plan_output, plan_round_metadata)
         if _post_plan_coder_round_comment(
             runner,
             config=config,
@@ -9585,7 +11081,9 @@ def _run_plan_first_loop(
         current_plan, resumed_round = resume_state
         current_coder_output = resumed_round.coder_output
         unresolved_items = list(resumed_round.prior_items)
-        compact_prior_summaries = list(resumed_round.compact_prior_summaries)
+        compact_prior_summaries = list(
+            bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
+        )
         next_unresolved_item_number = resumed_round.next_unresolved_item_number
         start_round_number = resumed_round.round_number
         if resumed_round.coder_metadata is not None and resumed_round.coder_metadata.assembled_plan_sidecar is not None:
@@ -9605,6 +11103,12 @@ def _run_plan_first_loop(
             for item in (*resumed_round.prior_items, *resumed_round.current_round_new_items)
         )
         log(config, f"Planning issue #{issue_number}: resuming round {start_round_number}")
+        if inherited_matrix_binding is not None and _resumed_inherited_replan_force_full(
+            issue_context.comments
+        ):
+            # The revision of an inadmissible approved plan gets the complete
+            # board even when the run restarted right after that round (#936).
+            plan_automatic_force_full = True
         # A resumed round carries its planning-generation discriminator in
         # durable coder metadata. Historical rounds intentionally have no
         # discriminator and must remain legacy-undecided; applying the fresh
@@ -9703,52 +11207,12 @@ def _run_plan_first_loop(
                 panel_evidence=plan_panel_evidence,
                 primary_reviewer=plan_primary_name,
             )
-            latest_scheduler_record = next(
-                (
-                    record
-                    for record in reversed(plan_records)
-                    if record.metadata.scheduler_metadata_status == "valid"
-                    and record.metadata.scheduler_contract is not None
-                ),
-                None,
+            plan_history = _classify_staged_plan_history(
+                plan_records, current_key=current_plan_key
             )
-            if latest_scheduler_record is not None:
-                plan_previous_key = _plan_key_from_payload(
-                    latest_scheduler_record.metadata.plan_candidate_key
-                )
-            # The four-class degraded-history partition.  Exactly one outcome
-            # each; classes A, B, and C always continue under a conservative
-            # fallback and only a transport extraction failure stops (handled
-            # by ``plan_history_records``).
-            has_planning_history = any(
-                record.metadata.role == "reviewer" for record in plan_records
-            )
-            key_contradiction = bool(
-                plan_previous_key is not None
-                and plan_previous_key.subject == current_plan_key.subject
-                and not plan_previous_key.matches(current_plan_key)
-            )
-            # Degradation is scoped to the current recoverable boundary: the
-            # latest valid planning scheduler checkpoint.  An invalid record
-            # written before it is historical audit state that stays listed in
-            # the audit but must not pin every later round to the fallback
-            # forever, which would suppress each fresh exact-key primary
-            # approval until the round budget ran out.
-            recovery_boundary_index = (
-                latest_scheduler_record.index if latest_scheduler_record is not None else -1
-            )
-            if any(
-                record.index > recovery_boundary_index
-                and record.metadata.scheduler_metadata_status == "invalid"
-                for record in plan_records
-            ):
-                plan_history_class = classify_plan_history("invalid")
-            elif has_planning_history and latest_scheduler_record is None:
-                plan_history_class = classify_plan_history("absent")
-            else:
-                plan_history_class = classify_plan_history(
-                    "valid", key_contradiction=key_contradiction
-                )
+            latest_scheduler_record = plan_history.latest_scheduler_record
+            plan_previous_key = plan_history.previous_key
+            plan_history_class = plan_history.history_class
             if plan_history_class == PLAN_HISTORY_CONTRADICTORY_KEY:
                 # A contradictory persisted key can supply neither an approval
                 # nor a panel opening.
@@ -9772,7 +11236,7 @@ def _run_plan_first_loop(
                 previous_key=plan_previous_key,
                 current_key=current_plan_key,
                 obligations=_scheduler_obligations(
-                    prior_unresolved_items,
+                    plan_ledger_view(prior_unresolved_items),
                     required_reviewers=plan_reviewer_names,
                     active_statuses=frozenset({"blocking", "same-plan"}),
                 ),
@@ -9801,6 +11265,15 @@ def _run_plan_first_loop(
             except PlanPrePanelSafetyError as exc:
                 stop_plan_pre_panel(str(exc), round_number=round_number)
                 raise
+            plan_scheduler_decision = _keep_reused_amendment_round_reviews(
+                plan_scheduler_decision,
+                lineage=plan_contract_lineage,
+                round_number=round_number,
+                current_resume=current_resume,
+                eligible=lambda name: (
+                    name == plan_primary_name or plan_panel_evidence.opened
+                ),
+            )
             if plan_scheduler_decision.latches_force_full:
                 plan_automatic_force_full = True
             plan_scheduler_calls_avoided += plan_scheduler_decision.calls_avoided
@@ -9829,14 +11302,15 @@ def _run_plan_first_loop(
                 f"force_full={plan_recorded_force_full} "
                 f"(source: {plan_recorded_force_full_source or 'none'}); "
                 f"degraded_history={plan_history_class}; "
-                f"calls_avoided_cumulative={plan_scheduler_calls_avoided}",
+                f"calls_avoided_cumulative={plan_scheduler_calls_avoided}"
+                + (f"; {plan_amendment_note}" if plan_amendment_note else ""),
             )
             post_issue_comment(
                 runner,
                 config=config,
                 issue_number=issue_number,
                 body=_attach_round_metadata(
-                    render_plan_scheduling_audit(
+                    _append_board_amendment_note(render_plan_scheduling_audit(
                         phase=plan_scheduler_decision.phase,
                         reason=plan_scheduler_decision.reason,
                         selected=plan_scheduler_decision.selected_reviewers,
@@ -9854,7 +11328,7 @@ def _run_plan_first_loop(
                             () if plan_panel_evidence.opened
                             else plan_panel_evidence.unqualified_artifacts
                         ),
-                    ),
+                    ), plan_amendment_note),
                     PostedRoundMetadata(
                         flow="plan",
                         role="summary",
@@ -9864,6 +11338,7 @@ def _run_plan_first_loop(
                         prior_items=prior_unresolved_items,
                         phase="scheduler-prelaunch",
                         scheduler_contract=plan_scheduler_contract.as_dict(),
+                        reviewer_board_amendment_digest=plan_amendment_digest,
                         scheduler_obligation_digest=hashlib.sha256(
                             repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                         ).hexdigest()[:16],
@@ -10001,6 +11476,10 @@ def _run_plan_first_loop(
                     + " as non-authoritative context only",
                 )
 
+        inherited_review_deltas, inherited_review_failure = inherited_review_context(
+            current_plan
+        )
+
         def _build_plan_review_prompt(reviewer: AgentName) -> str:
             # Built once per reviewer from pre-round state only, so the same
             # prompt is produced regardless of sequential or parallel launch.
@@ -10026,6 +11505,9 @@ def _run_plan_first_loop(
                 superseded_prepanel_review=_superseded_prepanel_plan_review(
                     superseded_plan_prepanel.get(agent_display_name(reviewer))
                 ),
+                inherited_matrix_binding=inherited_matrix_binding,
+                inherited_reviewed_deltas=inherited_review_deltas,
+                inherited_check_failure=inherited_review_failure,
             )
 
         plan_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -10419,19 +11901,29 @@ def _run_plan_first_loop(
             raise plan_fatal_errors[0][1]
 
         unresolved_items, _ = _apply_unresolved_item_dispositions(
-            prior_unresolved_items,
+            plan_ledger_view(prior_unresolved_items),
             prior_dispositions,
             same_status="same-plan",
             retain_future=True,
         )
-        compact_prior_summaries.extend(
-            _collect_prior_compact_summaries(
-                prior_unresolved_items,
-                unresolved_items,
-                prior_dispositions,
+        compact_prior_summaries = list(
+            bound_compact_prior_summaries(
+                [
+                    *compact_prior_summaries,
+                    *_collect_prior_compact_summaries(
+                        plan_ledger_view(prior_unresolved_items),
+                        unresolved_items,
+                        prior_dispositions,
+                    ),
+                ]
             )
         )
-        unresolved_items = [*unresolved_items, *round_new_unresolved_items]
+        # The ledger handed to the next round is built from the amended view,
+        # so from the next round on persisted ``prior_items`` carry explicit
+        # ownership that excludes removed reviewers (#943).
+        unresolved_items = list(
+            plan_ledger_view([*unresolved_items, *round_new_unresolved_items])
+        )
         # Items minted and cleared inside one round never reappear as prior
         # items, so record them here too.
         plan_accounted_item_ids.update(item.item_id for item in unresolved_items)
@@ -10646,6 +12138,25 @@ def _run_plan_first_loop(
                         for name, output in approved_review_outputs
                     ]
 
+        # A machine obligation has no planning clearance path: reviewer
+        # dispositions are evidence only, so after a unanimous approval it
+        # would drive another revision every round forever (#1005).  Recovery
+        # demotes only the recognized legacy promotion; a malformed or
+        # unrecognized machine record stays fail-closed here, stopping with a
+        # diagnostic naming the items instead of revising again.
+        unclearable_plan_items = [item for item in must_fix_items if item.is_machine_obligation]
+        if all_approved and unclearable_plan_items:
+            raise AgentLoopError(
+                f"Planning round {round_number}: every reviewer approved, but plan item(s) "
+                + ", ".join(
+                    f"{item.item_id} (owner {item.reviewer or 'unknown'}, kind "
+                    f"{item.obligation_kind or 'unknown'})"
+                    for item in unclearable_plan_items
+                )
+                + " are machine obligations that no planning participant can clear. "
+                "Stopping instead of revising an approved plan indefinitely; inspect the "
+                "item's round metadata and rerun."
+            )
         # The final gate evaluates every required plan reviewer, carried and
         # current alike.  A paused reviewer counts only through a qualifying
         # exact-key carried approval; a reviewer that blocked this round loses
@@ -10696,7 +12207,76 @@ def _run_plan_first_loop(
             else None
         )
 
-        if all_approved and not must_fix_items and not plan_missing_approvals:
+        inherited_guard_revision = None
+        # The signed re-plan has not produced a revision yet: the current plan
+        # is still the one the human authorized replacing.
+        supersession_revision_pending = (
+            plan_supersession is not None
+            and approved_plan_hash(current_plan) == plan_supersession.superseded_hash
+        )
+        if (
+            all_approved
+            and not must_fix_items
+            and not plan_missing_approvals
+            and inherited_review_failure is not None
+        ):
+            # Only a historical candidate published before the planning-time
+            # check can reach this guard.  It is revised through the enforced
+            # replan path instead of dead-ending the run (#936).
+            inadmissible_hash = approved_plan_hash(current_plan)
+            if round_number == config.max_rounds:
+                raise AgentLoopError(
+                    f"Approved child plan {inadmissible_hash} on issue #{issue_number} is "
+                    "inadmissible under the inherited-matrix contract and must be revised, but "
+                    f"the planning round budget ({config.max_rounds}) is exhausted. Raise "
+                    "--max-rounds and rerun; re-planning continues the existing round "
+                    f"numbering.\n{inherited_review_failure}"
+                )
+            audit_line = _inadmissible_plan_audit_line(inadmissible_hash)
+            if not any(
+                isinstance(getattr(comment, "body", None), str)
+                and audit_line in comment.body
+                for comment in issue_context.comments
+            ):
+                # Plain audit text only: no round metadata a resume could read.
+                post_issue_comment(
+                    runner,
+                    config=config,
+                    issue_number=issue_number,
+                    body=(
+                        f"{audit_line}\n\nNo reviewer reported a blocker; the orchestrator's "
+                        "mechanical inherited-row check rejected the approved plan. The planner "
+                        "revises it next, the revision is rechecked before publication, and the "
+                        "complete reviewer board reviews the result.\n\n"
+                        f"{inherited_review_failure}\n-- Orchestrator"
+                    ),
+                )
+            inherited_guard_revision = inherited_review_failure
+        elif (
+            all_approved
+            and not must_fix_items
+            and not plan_missing_approvals
+            and supersession_revision_pending
+        ):
+            # An admissible plan under a signed supersession (#985): reviewer
+            # approval of the superseded plan is not approval of its
+            # replacement, so the authorized revision runs instead of
+            # approving and rebinding the plan the human asked to replace.
+            if round_number == config.max_rounds:
+                raise AgentLoopError(
+                    f"Approved child plan {plan_supersession.superseded_hash} on issue "
+                    f"#{issue_number} must be re-planned under its signed supersession, but "
+                    f"the planning round budget ({config.max_rounds}) is exhausted. Raise "
+                    "--max-rounds and rerun; re-planning continues the existing round "
+                    "numbering."
+                )
+        elif all_approved and not must_fix_items and not plan_missing_approvals:
+            if plan_amendment_note:
+                log(
+                    config,
+                    f"Planning issue #{issue_number}: plan approved on a reduced board. "
+                    f"{plan_amendment_note}",
+                )
             # Re-read both sides at the approval-to-implementation boundary so
             # a human instruction posted during planning cannot be hidden by
             # the original snapshot. New signed IDs require a fresh planning
@@ -10783,6 +12363,45 @@ def _run_plan_first_loop(
             )
             mode = resolved_execution.action
             canonical_strategy = resolved_execution.strategy
+            if plan_supersession is not None:
+                # Signed re-plan (#936): the existing PR is rebound to the
+                # approved revision.  No fresh implementation turn runs and no
+                # second PR is opened.
+                if mode == "plan-only":
+                    print(
+                        f"Issue #{issue_number} re-planned child plan {plan_hash} approved by "
+                        f"{format_agent_list(configured_reviewers)}; rerun without plan-only to "
+                        f"rebind PR #{plan_supersession.pr_number}."
+                    )
+                    return 0
+                _rebind_superseded_child_plan(
+                    runner,
+                    config=config,
+                    issue_number=issue_number,
+                    issue_context=issue_context,
+                    plan_supersession=plan_supersession,
+                    plan_hash=plan_hash,
+                )
+                issue_context = get_issue_context(
+                    runner, config=config, issue_number=issue_number
+                )
+                if parent_issue_context is not None:
+                    validate_pr_body_does_not_close_issue(
+                        runner,
+                        config=config,
+                        pr_number=plan_supersession.pr_number,
+                        issue_number=parent_issue_context.number,
+                    )
+                return run_pr_loop(
+                    runner,
+                    pr_number=plan_supersession.pr_number,
+                    config=config,
+                    issue_context=issue_context,
+                    approved_plan_context=approved_plan_context,
+                    parent_issue_context=parent_issue_context,
+                    usage_context=usage_context,
+                    managed_ci_issue_number=issue_number,
+                )
             if (
                 canonical_strategy == "staged"
                 and mode != "plan-only"
@@ -10921,6 +12540,7 @@ def _run_plan_first_loop(
             if mode == "plan-only":
                 print(
                     f"Issue #{issue_number} plan approved by {format_agent_list(configured_reviewers)}."
+                    + (f" {plan_amendment_note}" if plan_amendment_note else "")
                 )
                 return 0
 
@@ -11296,6 +12916,33 @@ def _run_plan_first_loop(
             continue
 
         combined_review = "\n\n".join(f"{name} plan review:\n\n{review}" for name, review in blocking_reviews)
+        revision_initial_diagnostic: object | None = plan_validation_diagnostic
+        if inherited_guard_revision is not None:
+            # Attributed to the orchestrator; no synthetic reviewer item exists.
+            combined_review = (
+                "Orchestrator inherited-matrix check (not a reviewer finding):\n\n"
+                f"{inherited_guard_revision}"
+            )
+            revision_initial_diagnostic = _InheritedReplanDiagnostic(
+                diagnostic=inherited_guard_revision,
+                failure_attempt=1,
+                candidate_digest=hashlib.sha256(current_plan.encode("utf-8")).hexdigest(),
+            )
+            # The revised subject gets the complete board and carries no
+            # approval from the superseded one.
+            plan_automatic_force_full = True
+        if supersession_revision_pending:
+            # The signed authorization is the revision's instruction; the
+            # planner must actually replace the plan, not return it (#985).
+            authorization = (
+                "Signed child-plan supersession (human authorization, not a reviewer "
+                f"finding): approved plan {plan_supersession.superseded_hash} must be "
+                f"replaced. Human rationale:\n\n{plan_supersession.rationale}"
+            )
+            combined_review = (
+                f"{authorization}\n\n{combined_review}" if combined_review else authorization
+            )
+            plan_automatic_force_full = True
         log(
             config,
             f"Planning round {round_number}: {coder_name} revising the plan "
@@ -11318,114 +12965,155 @@ def _run_plan_first_loop(
             # Hydration is a pre-prompt gate. Missing or conflicting durable
             # authority must not be papered over with the visible Markdown.
             semantic_base = hydrate_authenticated_plan_state(current_plan_sidecar)
-        plan_response = _run_validated_agent(
-            runner,
-            agent=config.coder,
-            config=config,
-            prompt=build_plan_revision_prompt(
-                issue_number,
-                round_number,
-                current_plan,
-                combined_review,
-                config,
-                memory,
-                issue_context=issue_context,
-                unresolved_items=must_fix_items,
-                compact_context=use_compact_context,
-                compact_prior=CompactPriorContext(tuple(compact_prior_summaries)),
-                compact_tail=CompactPlanTailContext(
-                    subject=current_plan_subject,
-                    action="Revise the implementation plan to address the blocking plan review.",
-                ),
-                require_risk_test_matrix_contract=require_fresh_matrix_contract,
-                plan_validation_diagnostic=plan_validation_diagnostic,
-                response_form=("semantic-patch-v1" if semantic_revision else None),
-                base_round_number=(semantic_base.round_number if semantic_base is not None else None),
-                base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
-            ),
-            session_id=coder_session_id,
-            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-            # A semantic patch carries no assessment of its own; the assembled
-            # plan inherits the base or a strict patch replace.
-            require_architecture_impact_contract=not semantic_revision,
-            validate=(
-                (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_response(
-                    text,
-                    unresolved_items=items,
-                    human_requirements=human_requirements,
-                    inherited_human_requirement_dispositions=(
-                        semantic_base.plan.human_requirement_dispositions
-                        if semantic_base is not None else None
+        def invoke_revision_planner(turn_diagnostic: object | None) -> ValidatedAgentResponse:
+            return _run_validated_agent(
+                runner,
+                agent=config.coder,
+                config=config,
+                prompt=build_plan_revision_prompt(
+                    issue_number,
+                    round_number,
+                    current_plan,
+                    combined_review,
+                    config,
+                    memory,
+                    issue_context=issue_context,
+                    unresolved_items=must_fix_items,
+                    compact_context=use_compact_context,
+                    compact_prior=CompactPriorContext(tuple(compact_prior_summaries)),
+                    compact_tail=CompactPlanTailContext(
+                        subject=current_plan_subject,
+                        action="Revise the implementation plan to address the blocking plan review.",
                     ),
-                ))
-                if semantic_revision
-                else (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_response_with_human_requirements(
-                    text,
-                    marker_validator=lambda revised_text: _validate_plan_revision_response(
-                        revised_text,
+                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                    plan_validation_diagnostic=turn_diagnostic,
+                    inherited_matrix_binding=inherited_matrix_binding,
+                    response_form=("semantic-patch-v1" if semantic_revision else None),
+                    base_round_number=(semantic_base.round_number if semantic_base is not None else None),
+                    base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
+                ),
+                session_id=coder_session_id,
+                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+                # A semantic patch carries no assessment of its own; the assembled
+                # plan inherits the base or a strict patch replace.
+                require_architecture_impact_contract=not semantic_revision,
+                validate=(
+                    (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_response(
+                        text,
                         unresolved_items=items,
-                        require_architecture_impact=True,
+                        human_requirements=human_requirements,
+                        inherited_human_requirement_dispositions=(
+                            semantic_base.plan.human_requirement_dispositions
+                            if semantic_base is not None else None
+                        ),
+                    ))
+                    if semantic_revision
+                    else (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_response_with_human_requirements(
+                        text,
+                        marker_validator=lambda revised_text: _validate_plan_revision_response(
+                            revised_text,
+                            unresolved_items=items,
+                            require_architecture_impact=True,
+                            require_execution_strategy_contract=require_fresh_execution_contract,
+                            require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                            reject_unsolicited_risk_test_matrix_contract=(
+                                not require_fresh_matrix_contract
+                            ),
+                        ),
+                        human_requirements=human_requirements,
+                        requirement_scope="planning requirements",
+                        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+                    ))
+                ),
+                usage_context=usage_context,
+                use_repair=True,
+                repair_expected_kind=("plan_revision_patch" if semantic_revision else "plan_revision"),
+                repair_surfaced_requirement_ids=(
+                    plan_revision_human_requirements_context.surfaced_requirement_ids
+                ),
+                repair_requires_direct_discussion_ack=(
+                    plan_revision_human_requirements_context.requires_direct_discussion_ack
+                ),
+                require_execution_strategy_contract=(
+                    False if semantic_revision else require_fresh_execution_contract
+                ),
+                require_risk_test_matrix_contract=(
+                    False if semantic_revision else require_fresh_matrix_contract
+                ),
+                reject_unsolicited_risk_test_matrix_contract=(
+                    False if semantic_revision else not require_fresh_matrix_contract
+                ),
+                repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
+                ledger_incomplete=round_ledger_incomplete,
+                # The revision runs after this round's dispositions were applied,
+                # so its proof must cover the items this round resolved. The
+                # pre-round value still carries them, and the pre-loop comment
+                # snapshot cannot replay the round that cleared them, so the proof
+                # also reads this round's in-process dispositions (#874).
+                repair_resolved_history_item_ids=_post_round_resolved_history_item_ids(
+                    prior_unresolved_items=prior_unresolved_items,
+                    dispositions_by_item=prior_dispositions,
+                    carried_items=unresolved_items,
+                    comments=issue_context.comments,
+                    flow="plan",
+                    reconciliation_mode="aggregate",
+                    same_status="same-plan",
+                ),
+                operation_description="plan revision",
+                semantic_patch_payload_validator=(
+                    (lambda payload, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_payload(
+                        payload,
+                        unresolved_items=items,
+                        human_requirements=human_requirements,
+                        inherited_human_requirement_dispositions=(
+                            semantic_base.plan.human_requirement_dispositions
+                            if semantic_base is not None else None
+                        ),
+                    ))
+                    if semantic_revision
+                    else None
+                ),
+                plan_validation_failure_handler=(
+                    None if semantic_revision else lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
+                        runner,
+                        config=config,
+                        issue_context=issue_context,
+                        issue_number=issue_number,
+                        original_error=error,
+                        exhaustion=exhaustion,
+                        target_coder_round=round_number + 1,
+                        prior_plan_subject=current_plan_subject,
+                        candidate_kind="plan_revision",
                         require_execution_strategy_contract=require_fresh_execution_contract,
                         require_risk_test_matrix_contract=require_fresh_matrix_contract,
-                        reject_unsolicited_risk_test_matrix_contract=(
-                            not require_fresh_matrix_contract
-                        ),
-                    ),
-                    human_requirements=human_requirements,
-                    requirement_scope="planning requirements",
-                    full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
-                ))
-            ),
-            usage_context=usage_context,
-            use_repair=True,
-            repair_expected_kind=("plan_revision_patch" if semantic_revision else "plan_revision"),
-            repair_surfaced_requirement_ids=(
-                plan_revision_human_requirements_context.surfaced_requirement_ids
-            ),
-            repair_requires_direct_discussion_ack=(
-                plan_revision_human_requirements_context.requires_direct_discussion_ack
-            ),
-            require_execution_strategy_contract=(
-                False if semantic_revision else require_fresh_execution_contract
-            ),
-            require_risk_test_matrix_contract=(
-                False if semantic_revision else require_fresh_matrix_contract
-            ),
-            reject_unsolicited_risk_test_matrix_contract=(
-                False if semantic_revision else not require_fresh_matrix_contract
-            ),
-            repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
-            ledger_incomplete=round_ledger_incomplete,
-            # The revision runs after this round's dispositions were applied,
-            # so its proof must cover the items this round resolved. The
-            # pre-round value still carries them, and the pre-loop comment
-            # snapshot cannot replay the round that cleared them, so the proof
-            # also reads this round's in-process dispositions (#874).
-            repair_resolved_history_item_ids=_post_round_resolved_history_item_ids(
-                prior_unresolved_items=prior_unresolved_items,
-                dispositions_by_item=prior_dispositions,
-                carried_items=unresolved_items,
-                comments=issue_context.comments,
-                flow="plan",
-                reconciliation_mode="aggregate",
-                same_status="same-plan",
-            ),
-            operation_description="plan revision",
-            plan_validation_failure_handler=(
-                None if semantic_revision else lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
-                    runner,
-                    config=config,
-                    issue_context=issue_context,
-                    issue_number=issue_number,
-                    original_error=error,
-                    exhaustion=exhaustion,
-                    target_coder_round=round_number + 1,
-                    prior_plan_subject=current_plan_subject,
-                    candidate_kind="plan_revision",
-                    require_execution_strategy_contract=require_fresh_execution_contract,
-                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                    )
+                ),
+            )
+
+        def revision_candidate_matrix(response: ValidatedAgentResponse) -> object:
+            if semantic_revision:
+                if not isinstance(response.marker_value, PlanRevisionPatch):
+                    raise AgentLoopError(
+                        "Semantic planning response crossed the pinned response form."
+                    )
+                assert semantic_base is not None
+                # Assembled against the unchanged authenticated base; the
+                # result stays local until the candidate passes.
+                assembled_candidate, _ = assemble_authenticated_plan_revision(
+                    semantic_base,
+                    response.marker_value,
+                    result_round_number=round_number + 1,
                 )
-            ),
+                return assembled_candidate.risk_test_matrix
+            return getattr(response.marker_value, "risk_test_matrix", None)
+
+        plan_response = run_inherited_checked_planner_turn(
+            invoke_revision_planner,
+            derive_matrix=revision_candidate_matrix,
+            initial_diagnostic=revision_initial_diagnostic,
+            candidate_kind="plan_revision",
+            target_coder_round=round_number + 1,
+            prior_plan_subject=current_plan_subject,
         )
         canonical_plan: str | None = None
         public_comment = plan_response.text
@@ -11616,6 +13304,15 @@ def _run_plan_first_loop(
                     ),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
+                    # Every coder round of a signed re-plan carries the
+                    # authorization digest (#936); absent otherwise.
+                    plan_supersession_digest=(
+                        plan_supersession.digest if plan_supersession is not None else None
+                    ),
+                    plan_supersession_superseded_hash=(
+                        plan_supersession.superseded_hash
+                        if plan_supersession is not None else None
+                    ),
             )
         except ValueError as exc:
             # A contradictory metadata record must not escape as a bare
@@ -11625,7 +13322,26 @@ def _run_plan_first_loop(
                 f"{round_number + 1} (response form "
                 f"{current_response_form or 'free-form'}): {exc}"
             ) from exc
-        plan_round_body = _attach_round_metadata(public_comment, plan_round_metadata)
+        if metadata_plan is not None:
+            plan_round_body = _assemble_structured_plan_round_body(
+                config=config,
+                issue_number=issue_number,
+                kind="plan_revision",
+                parsed_plan=metadata_plan,
+                full_comment=public_comment,
+                metadata=plan_round_metadata,
+                raw_text=plan_response.text,
+                prior_items=must_fix_items,
+                model_used=plan_response.model_used,
+                surfaced_requirement_ids=(
+                    plan_revision_human_requirements_context.surfaced_requirement_ids
+                ),
+                requires_direct_discussion_ack=(
+                    plan_revision_human_requirements_context.requires_direct_discussion_ack
+                ),
+            )
+        else:
+            plan_round_body = _attach_round_metadata(public_comment, plan_round_metadata)
         if _post_plan_coder_round_comment(
             runner,
             config=config,
@@ -11775,6 +13491,7 @@ def run_issue_loop(
         recovered_plan_hash: str | None = None
         recovered_plan_additions: tuple[int, ...] | None = None
         recovered_plan_context: ApprovedPlanContext | None = None
+        recorded_plan_handoff = None
         if plan_first:
             # Prefer the plan hash recorded by the issue-side handoff. A later
             # planning round may be unrelated to the PR already handed off, so
@@ -11817,6 +13534,77 @@ def run_issue_loop(
                     recovered_plan_additions = _extract_current_expected_closing_issue_ids(
                         recovered_plan_state[0]
                     )
+
+        # A planning child's handed-off plan is judged against its inherited
+        # parent rows before the canonical PR is resolved (#936).  A matching
+        # signed supersession record reopens planning whether or not the plan
+        # is admissible (#985); without one, an inadmissible plan fails closed
+        # and an admissible one resumes its PR.  A same-PR plan replacement
+        # must verify.
+        plan_supersession: _PlanSupersessionBinding | None = None
+        if (
+            plan_first
+            and fresh_child is not None
+            and fresh_child.route.is_planning
+            and recorded_plan_handoff is not None
+            and recorded_plan_handoff.flow == "approved-plan-implementation"
+            and recovered_plan_context is not None
+            and recovered_plan_context.is_available
+        ):
+            plan_supersession = _route_child_plan_handoff(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                issue_context=issue_context,
+                fresh_child=fresh_child,
+                handoff=recorded_plan_handoff,
+                child_plan_context=recovered_plan_context,
+            )
+            if plan_supersession is not None and config.dry_run:
+                print(
+                    f"Issue #{issue_number}: dry run; approved child plan "
+                    f"{plan_supersession.superseded_hash} would be re-planned under its signed "
+                    f"supersession record and PR #{plan_supersession.pr_number} rebound."
+                )
+                return 0
+        if plan_supersession is not None:
+            memory = prepare_agent_memory(runner, config)
+            return _run_plan_first_loop(
+                runner,
+                issue_number=issue_number,
+                config=config,
+                memory=memory,
+                issue_context=issue_context,
+                requested_policy=requested_policy,
+                implement_after_approval=implement_after_approval,
+                usage_context=usage_context,
+                inherited_matrix_binding=_inherited_matrix_binding(
+                    parent_issue=fresh_child.parent_issue,
+                    stage_id=fresh_child.stage_id,
+                    parent_plan_context=fresh_child.parent_plan_context,
+                ),
+                plan_supersession=plan_supersession,
+            )
+        # A verified signed re-plan retires the execution decision recorded
+        # under each superseded plan (#988); the resumed run then records the
+        # decision for the rebound plan instead of failing on the old one.
+        retired_plan_hashes: frozenset[str] = frozenset()
+        if (
+            plan_first
+            and fresh_child is not None
+            and fresh_child.route.is_planning
+            and recorded_plan_handoff is not None
+            and recorded_plan_handoff.flow == "approved-plan-implementation"
+        ):
+            retired_plan_hashes = verified_retired_child_plan_hashes(
+                issue_context.comments,
+                repo=config.repo,
+                parent_plan_context=fresh_child.parent_plan_context,
+                child_issue=issue_number,
+                parent_issue=fresh_child.parent_issue,
+                stage_id=fresh_child.stage_id,
+                pr_number=recorded_plan_handoff.pr_number,
+            )
 
         # Resolve the canonical AGENT_ISSUE_PR_HANDOFF record (or, failing
         # that, the legacy exactly-one-open-PR search) before invoking a
@@ -11880,6 +13668,7 @@ def run_issue_loop(
                         issue_context=issue_context,
                         mode=recovered_execution.action,
                         normalized_topology=recovered_topology,
+                        retired_plan_hashes=retired_plan_hashes,
                     )
                 elif (
                     recovered_execution.recommendation is not None
@@ -11897,6 +13686,7 @@ def run_issue_loop(
                         config=config,
                         issue_context=issue_context,
                         recommendation=recovered_execution.recommendation,
+                        retired_plan_hashes=retired_plan_hashes,
                     )
             closing_contract = resolve_issue_contract(
                 primary_issue=issue_number,
@@ -11955,6 +13745,7 @@ def run_issue_loop(
                         recommendation=recovered_execution.recommendation,
                         requested_policy=recovered_execution.requested_policy,
                         resolved_execution=recovered_execution,
+                        retired_plan_hashes=retired_plan_hashes,
                     )
             if plan_first and resolved_pr.source == "canonical" and resolved_metadata is not None:
                 if resolved_metadata.flow == "approved-plan-implementation" and recovered_plan_hash is None:
@@ -12072,6 +13863,15 @@ def run_issue_loop(
                 requested_policy=requested_policy,
                 implement_after_approval=implement_after_approval,
                 usage_context=usage_context,
+                inherited_matrix_binding=(
+                    _inherited_matrix_binding(
+                        parent_issue=fresh_child.parent_issue,
+                        stage_id=fresh_child.stage_id,
+                        parent_plan_context=fresh_child.parent_plan_context,
+                    )
+                    if fresh_child is not None and fresh_child.route.is_planning
+                    else None
+                ),
             )
 
         closing_contract = resolve_issue_contract(
@@ -12378,6 +14178,10 @@ def run_issue_loop(
                     implementation_result.risk_test_matrix_evidence.to_payload()
                     if implementation_result.risk_test_matrix_evidence is not None
                     else None
+                ),
+                # The establishing comment renders the full row list (#959).
+                risk_test_matrix_evidence_full_round=(
+                    1 if implementation_result.risk_test_matrix_evidence is not None else None
                 ),
                 risk_test_matrix_diagnostics=tuple(
                     diagnostic.to_payload()
@@ -13679,6 +15483,134 @@ def _outstanding_plan_phase(
         return "secondary-audit"
 
 
+def _board_amendment_template(
+    *,
+    flow: str,
+    issue_number: int | None,
+    pr_number: int | None,
+    persisted: object,
+    removed: Sequence[str],
+    start_round_number: int | str,
+) -> str:
+    """Filled-in signed amendment template printed by fail-closed errors (#943)."""
+    return format_reviewer_board_amendment_comment(
+        flow=flow,
+        issue=issue_number if flow == "plan" else None,
+        pr_number=pr_number if flow == "pr" else None,
+        original_required_reviewers=tuple(getattr(persisted, "required_reviewers")),
+        policy=str(getattr(persisted, "policy")),
+        primary_reviewer=getattr(persisted, "primary_reviewer"),
+        removed_reviewers=tuple(removed),
+        effective_from_round=start_round_number,  # type: ignore[arg-type]
+    )
+
+
+def _board_amendment_route_clause(
+    *,
+    flow: str,
+    issue_number: int | None,
+    pr_number: int | None,
+    persisted: object,
+    configured: object | None,
+    start_round_number: Callable[[], int | None],
+) -> str:
+    """The amendment-route clause appended to a contract-drift error (#943)."""
+    removed = missing_from_config(persisted, configured)
+    if removed is None:
+        return ""
+    try:
+        round_number: int | str | None = start_round_number()
+    except Exception:  # noqa: BLE001 - the template is advisory text only
+        round_number = None
+    if round_number is None:
+        round_number = "<N: the round this resume re-enters>"
+    surface = f"issue #{issue_number}" if flow == "plan" else f"PR #{pr_number}"
+    template = _board_amendment_template(
+        flow=flow,
+        issue_number=issue_number,
+        pr_number=pr_number,
+        persisted=persisted,
+        removed=removed,
+        start_round_number=round_number,
+    )
+    return (
+        " If a reviewer backend is unavailable, a human operator may instead remove it "
+        f"with a signed reviewer-board amendment posted on {surface}; replace the "
+        "rationale placeholder and keep the effective round printed here:\n\n"
+        + template
+    )
+
+
+def _append_board_amendment_note(body: str, note: str | None) -> str:
+    """Insert the reduced-board note before a comment's trailing signature."""
+    if not note:
+        return body
+    lines = body.splitlines()
+    index = len(lines)
+    while index > 0 and (
+        not lines[index - 1].strip()
+        or lines[index - 1].startswith("-- ")
+        or lines[index - 1].lstrip().startswith("<!--")
+    ):
+        index -= 1
+    return "\n".join([*lines[:index], f"- {note}", *lines[index:]])
+
+
+def _keep_reused_amendment_round_reviews(
+    decision: PlanSchedulingDecision,
+    *,
+    lineage: ContractLineage,
+    round_number: int,
+    current_resume: ResumedReviewRound | None,
+    eligible: Callable[[str], bool],
+) -> PlanSchedulingDecision:
+    """Keep remaining reviewers' round-N reviews in the amended selection (#943).
+
+    Re-entering the amendment's activation round reruns scheduler selection
+    under the amended contract.  A remaining reviewer that already posted a
+    usable review in that round stays selected so its review (and its item
+    dispositions) is reused rather than dropped as a carried approval; it is
+    never re-invoked.
+    """
+    active = lineage.active_amendment
+    if (
+        active is None
+        or current_resume is None
+        or round_number != active.effective_from_round
+    ):
+        return decision
+    required = getattr(lineage.contracts[-1], "required_reviewers")
+    posted = {record.metadata.agent for record in current_resume.completed_reviews}
+    keep = [
+        name
+        for name in required
+        if name in posted and name not in decision.selected_reviewers and eligible(name)
+    ]
+    if not keep:
+        return decision
+    selected = tuple(
+        name for name in required if name in decision.selected_reviewers or name in keep
+    )
+    return dataclasses_replace(
+        decision,
+        selected_reviewers=selected,
+        paused_reviewers=tuple(
+            (name, why) for name, why in decision.paused_reviewers if name not in keep
+        ),
+        reason=(
+            f"{decision.reason}; reviewer board amendment re-entry reuses the round "
+            f"{round_number} review(s) already posted by {', '.join(keep)}"
+        ),
+    )
+
+
+def _plan_contract_or_none(metadata: PostedRoundMetadata) -> PlanReviewSchedulingContract | None:
+    try:
+        return _plan_scheduler_contract_from_metadata(metadata)
+    except AgentLoopError:
+        return None
+
+
 def _plan_scheduler_contract_from_metadata(
     metadata: PostedRoundMetadata,
 ) -> PlanReviewSchedulingContract | None:
@@ -13840,6 +15772,156 @@ def _carried_plan_approvals(
         # A later record for the same reviewer supersedes an earlier one.
         carried[metadata.agent] = bool(qualifies)
     return tuple(sorted(name for name, ok in carried.items() if ok))
+
+
+@dataclass(frozen=True)
+class _StagedPlanHistory:
+    history_class: str
+    previous_key: PlanCandidateKey | None
+    latest_scheduler_record: PostedRoundRecord | None
+
+
+def _classify_staged_plan_history(
+    plan_records: Sequence[PostedRoundRecord],
+    *,
+    current_key: PlanCandidateKey,
+) -> _StagedPlanHistory:
+    """Classify staged planning history against the current candidate key.
+
+    The four-class degraded-history partition.  Exactly one outcome each;
+    classes A, B, and C continue the live scheduler under a conservative
+    fallback, and only a transport extraction failure stops (handled by the
+    caller's record extraction).  Shared by the live planning scheduler and
+    managed-CI plan recovery so both read the same history as authoritative.
+    """
+    latest_scheduler_record = next(
+        (
+            record
+            for record in reversed(plan_records)
+            if record.metadata.scheduler_metadata_status == "valid"
+            and record.metadata.scheduler_contract is not None
+        ),
+        None,
+    )
+    previous_key = (
+        _plan_key_from_payload(latest_scheduler_record.metadata.plan_candidate_key)
+        if latest_scheduler_record is not None
+        else None
+    )
+    has_planning_history = any(
+        record.metadata.role == "reviewer" for record in plan_records
+    )
+    key_contradiction = bool(
+        previous_key is not None
+        and previous_key.subject == current_key.subject
+        and not previous_key.matches(current_key)
+    )
+    # Degradation is scoped to the current recoverable boundary: the latest
+    # valid planning scheduler checkpoint.  An invalid record written before
+    # it is historical audit state that stays listed in the audit but must not
+    # pin every later round to the fallback forever, which would suppress each
+    # fresh exact-key primary approval until the round budget ran out.
+    recovery_boundary_index = (
+        latest_scheduler_record.index if latest_scheduler_record is not None else -1
+    )
+    if any(
+        record.index > recovery_boundary_index
+        and record.metadata.scheduler_metadata_status == "invalid"
+        for record in plan_records
+    ):
+        history_class = classify_plan_history("invalid")
+    elif has_planning_history and latest_scheduler_record is None:
+        history_class = classify_plan_history("absent")
+    else:
+        history_class = classify_plan_history(
+            "valid", key_contradiction=key_contradiction
+        )
+    return _StagedPlanHistory(
+        history_class=history_class,
+        previous_key=previous_key,
+        latest_scheduler_record=latest_scheduler_record,
+    )
+
+
+def _require_complete_canonical_plan_approval(
+    comments: Sequence[object],
+    *,
+    config: AgentLoopConfig,
+    plan_text: str,
+    plan_round: ResumedReviewRound,
+    human_requirements: Sequence[HumanReviewRequirement],
+    error_message: str,
+) -> None:
+    """Fail closed unless every configured reviewer approved the resumed plan.
+
+    Shared by the managed-CI fresh-authorization and ordinary-resume paths so
+    the two cannot drift.  Under ``all-reviewers`` every reviewer reviews every
+    round, so the resumed round must carry the complete approval set.  A
+    staged policy splits approvals across rounds by construction (the primary
+    approves, then the panel approves while the primary is paused), so the
+    union of qualifying exact-key approvals carried from the whole planning
+    history is always consulted instead — the same carry the final planning gate
+    uses.  A reviewer whose latest record for the exact plan is not an
+    approval still leaves the set incomplete (#962).
+    """
+    configured_names = {agent_display_name(reviewer) for reviewer in reviewers(config)}
+    if not plan_policy_capabilities(config.plan_review_policy).scheduler_enabled:
+        round_approved = {
+            record.metadata.agent
+            for record in plan_round.completed_reviews
+            if record.metadata.state == "approved"
+        }
+        if round_approved != configured_names:
+            raise AgentLoopError(error_message)
+        return
+    # Every staged recovery goes through the exact-key gate, even when one
+    # full-board round holds the whole set: an approval bound to a stale key
+    # or surfaced-requirement set must never satisfy it.
+    coder_metadata = plan_round.coder_metadata
+    if coder_metadata is None or coder_metadata.assembled_plan_sidecar is None:
+        raise AgentLoopError(error_message)
+    sidecar = decode_assembled_plan_sidecar(coder_metadata.assembled_plan_sidecar)
+    required_names = tuple(agent_display_name(reviewer) for reviewer in reviewers(config))
+    contract = make_plan_contract(
+        required_names,
+        config.plan_review_policy,
+        (
+            agent_display_name(config.primary_plan_reviewer)
+            if config.primary_plan_reviewer is not None
+            else None
+        ),
+    )
+    surfaced_ids = _surfaced_reviewer_requirement_ids(
+        human_requirements,
+        requirement_scope="planning requirements",
+    )
+    current_key = _plan_candidate_key_for(
+        plan_subject=_plan_subject(plan_text),
+        sidecar=sidecar,
+        surfaced_requirement_ids=surfaced_ids,
+    )
+    records = _extract_round_metadata_records(comments, flow="plan")
+    # Only history the live scheduler itself treats as authoritative for this
+    # key may supply approvals; any degraded class would make it re-review.
+    if (
+        _classify_staged_plan_history(records, current_key=current_key).history_class
+        != PLAN_HISTORY_INTACT
+    ):
+        raise AgentLoopError(error_message)
+    carried = _carried_plan_approvals(
+        records,
+        current_key=current_key,
+        required_reviewers=required_names,
+        surfaced_requirement_ids=surfaced_ids,
+        panel_evidence=_derive_plan_panel_evidence(
+            records,
+            primary_reviewer=contract.primary_reviewer,
+            required_reviewers=required_names,
+        ),
+        primary_reviewer=contract.primary_reviewer,
+    )
+    if set(carried) != configured_names:
+        raise AgentLoopError(error_message)
 
 
 def _plan_cross_cutting_contracts(
@@ -14273,6 +16355,90 @@ def _scheduler_contract_from_metadata(
     return _Contract.from_mapping(metadata.scheduler_contract)
 
 
+def _pr_contract_drift_error(
+    persisted: ReviewSchedulingContract,
+    detail: str,
+    *,
+    pr_number: int,
+    configured: ReviewSchedulingContract | None,
+    start_round_number: Callable[[], int | None],
+    during: str = "resume",
+) -> AgentLoopError:
+    """The fail-closed PR contract-drift error, with the amendment route (#943)."""
+    return AgentLoopError(
+        f"PR review scheduler contract changed during {during}; "
+        + ("no qualification or merge is permitted; " if during == "qualification" else "")
+        + "required reviewers, policy, and broad-path rules must remain immutable. PR "
+        f"#{pr_number} carries a scheduler contract for policy {persisted.policy} with "
+        f"primary {persisted.primary_reviewer or '(none)'} and reviewer board "
+        f"{', '.join(persisted.required_reviewers)} ({detail})."
+        + (
+            ""
+            if during == "qualification"
+            else _board_amendment_route_clause(
+                flow="pr",
+                issue_number=None,
+                pr_number=pr_number,
+                persisted=persisted,
+                configured=configured,
+                start_round_number=start_round_number,
+            )
+        )
+    )
+
+
+REDUCED_BOARD_COMPLETION_HEADING = "Review completed on a reduced reviewer board."
+
+
+def _post_reduced_board_completion_note(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    digest: str,
+    note: str,
+) -> None:
+    """Post one plain completion note per amendment digest (no round metadata)."""
+    try:
+        comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
+    except AgentLoopError:
+        comments = ()
+    if any(
+        REDUCED_BOARD_COMPLETION_HEADING in (getattr(comment, "body", "") or "")
+        and digest in (getattr(comment, "body", "") or "")
+        for comment in comments
+    ):
+        return
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=(
+            f"{REDUCED_BOARD_COMPLETION_HEADING}\n\n- {note}\n"
+            f"- Signed amendment digest: `{digest}`\n\n-- Orchestrator"
+        ),
+    )
+
+
+def _pr_amendment_start_round(
+    pr_context: PullRequestReviewContext,
+    configured_reviewers: Sequence[AgentName],
+    scheduler_capabilities: object,
+) -> int:
+    """The round a PR resume would re-enter; only used to fill an error template."""
+    resumed = _resume_pr_round(
+        pr_context.comments,
+        head_sha=pr_context.metadata.head_sha,
+        configured_reviewers=configured_reviewers,
+        reconciliation_mode=(
+            "owner-scoped"
+            if getattr(scheduler_capabilities, "owner_scoped_reconciliation", False)
+            else "aggregate"
+        ),
+    )
+    return resumed.round_number if resumed is not None else 1
+
+
 def _is_completed_full_board_scheduler_record(
     record: PostedRoundRecord,
     *,
@@ -14303,6 +16469,72 @@ def _is_completed_full_board_scheduler_record(
         return False
 
 
+def _managed_binding_retired_plan_hashes(
+    handoff: AuthenticatedIssueCreatedHandoff | None,
+) -> frozenset[str]:
+    """Plans a verified signed rebind retired for this managed handoff (#993)."""
+    return handoff.retired_plan_hashes if handoff is not None else frozenset()
+
+
+def _managed_binding_protection_mode(
+    handoff: AuthenticatedIssueCreatedHandoff | None,
+) -> str | None:
+    """Return ``strict`` only for a handoff that publishes no PR-side record.
+
+    Authorization records are skipped exactly when the authenticated handoff
+    carries no override nonce; any other handoff must bind through them.
+    """
+    if handoff is not None and handoff.protection_mode == "strict" and handoff.override_nonce is None:
+        return "strict"
+    return None
+
+
+def _verify_strict_managed_plan_binding(
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    issue_context: IssueContext,
+    metadata: PullRequestMetadata,
+    expected_plan_hash: str,
+) -> None:
+    """Bind a strict-protection managed PR to the issue's canonical plan.
+
+    A strictly protected base never publishes a PR-side authorization record,
+    and managed recovery never synthesizes the issue-side handoff.  The durable
+    binding is therefore the one the managed resume itself used: the reserved
+    managed branch for this issue and the issue's canonical, completely
+    approved plan, whose hash must still be the plan the reviewers were bound
+    to.  GitHub's exact-head protection independently gates the merge.
+    """
+
+    def fail(reason: str) -> AgentLoopError:
+        return AgentLoopError(
+            "Approved-plan/handoff identity changed or disappeared during PR qualification; "
+            f"the strict managed-CI binding does not tie PR #{pr_number} to approved plan "
+            f"{expected_plan_hash} ({reason}). Stale approvals cannot be used for this head."
+        )
+
+    if metadata.head_branch != f"agent-loop/managed-{issue_context.number}" or not metadata.head_sha:
+        raise fail(f"the PR is not the reserved managed branch for issue #{issue_context.number}")
+    resumed_plan = _resume_plan_round(
+        issue_context.comments,
+        configured_reviewers=reviewers(config),
+    )
+    if resumed_plan is None:
+        raise fail("the issue carries no canonical approved plan")
+    plan_text, plan_round = resumed_plan
+    _require_complete_canonical_plan_approval(
+        issue_context.comments,
+        config=config,
+        plan_text=plan_text,
+        plan_round=plan_round,
+        human_requirements=issue_context.human_requirements,
+        error_message=str(fail("the canonical plan is not completely approved")),
+    )
+    if approved_plan_hash(plan_text) != expected_plan_hash:
+        raise fail("the issue's canonical approved plan changed")
+
+
 def _fresh_pr_qualification_snapshot(
     runner: Runner,
     *,
@@ -14313,6 +16545,9 @@ def _fresh_pr_qualification_snapshot(
     approved_plan_context: ApprovedPlanContext | None = None,
     scheduler_contract: ReviewSchedulingContract | None = None,
     allow_plan_handoff_change: bool = False,
+    planning_child_binding: _PlanningChildBinding | None = None,
+    managed_protection_mode: str | None = None,
+    managed_retired_plan_hashes: frozenset[str] = frozenset(),
 ) -> tuple[PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None, AgentLoopConfig]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
     staged_owner = (
@@ -14360,6 +16595,7 @@ def _fresh_pr_qualification_snapshot(
         fresh_scheduler_records = _extract_round_metadata_records(
             context.comments, flow="pr"
         )
+        superseded_invalid_indexes: set[int] = set()
         for record_position, record in enumerate(fresh_scheduler_records):
             status = record.metadata.scheduler_metadata_status
             if status == "invalid":
@@ -14374,6 +16610,7 @@ def _fresh_pr_qualification_snapshot(
                     # Resume recovery deliberately selected the full board.
                     # A later completed reconciliation checkpoint supersedes
                     # this historical malformed optimization record.
+                    superseded_invalid_indexes.add(record.index)
                     continue
                 raise AgentLoopError(
                     "Malformed or contradictory PR review scheduler metadata was observed "
@@ -14382,27 +16619,66 @@ def _fresh_pr_qualification_snapshot(
             if status != "valid":
                 continue
             try:
-                fresh_contract = _scheduler_contract_from_metadata(record.metadata)
+                _scheduler_contract_from_metadata(record.metadata)
             except AgentLoopError as exc:
                 raise AgentLoopError(
                     "Malformed PR review scheduler contract was observed during qualification; "
                     "no qualification or merge is permitted."
                 ) from exc
-            if fresh_contract != scheduler_contract:
-                raise AgentLoopError(
-                    "PR review scheduler contract changed during qualification; "
-                    "no qualification or merge is permitted."
-                )
             if record.metadata.scheduler_current_sha != record.metadata.subject:
                 raise AgentLoopError(
                     "Contradictory PR review scheduler head metadata was observed during "
                     "qualification; no qualification or merge is permitted."
                 )
+        # Amendments are re-read from this same fresh PR comment fetch (#943),
+        # so the gate never relies on a stale or separately refreshed source.
+        # Pre-amendment contracts are accepted only by the lineage rules, and
+        # a post-amendment record only with the exact amendment digest.
+        try:
+            # Every fresh record takes part, contract-neutral ones included,
+            # so a digest on a coder or reviewer record posted during managed
+            # CI fails closed; only an invalid optimization record already
+            # superseded by the recovery rule above is left out.
+            resolve_contract_lineage(
+                tuple(
+                    record
+                    for record in fresh_scheduler_records
+                    if record.index not in superseded_invalid_indexes
+                ),
+                collect_reviewer_board_amendments(
+                    context.comments, flow="pr", pr_number=pr_number
+                ),
+                scheduler_contract,
+                contract_from_metadata=_scheduler_contract_from_metadata,
+                drift_error=lambda persisted, detail: _pr_contract_drift_error(
+                    persisted,
+                    detail,
+                    pr_number=pr_number,
+                    configured=scheduler_contract,
+                    start_round_number=lambda: None,
+                    during="qualification",
+                ),
+            )
+        except AgentLoopError as exc:
+            if "no qualification or merge is permitted" in str(exc):
+                raise
+            raise AgentLoopError(
+                f"{exc} No qualification or merge is permitted."
+            ) from exc
     fresh_issue = issue_context
     fresh_parent = parent_issue_context
     fresh_approved_plan_context = approved_plan_context
     if issue_context is not None:
         fresh_issue = get_issue_context(runner, config=config, issue_number=issue_context.number)
+        if scheduler_contract is not None:
+            try:
+                reject_misplaced_pr_amendments(
+                    fresh_issue.comments, issue_number=fresh_issue.number
+                )
+            except AgentLoopError as exc:
+                raise AgentLoopError(
+                    f"{exc} No qualification or merge is permitted."
+                ) from exc
     if parent_issue_context is not None:
         fresh_parent = get_issue_context(
             runner, config=config, issue_number=parent_issue_context.number
@@ -14418,7 +16694,31 @@ def _fresh_pr_qualification_snapshot(
             issue_number=fresh_issue.number,
             repo=config.repo,
         )
-        if (
+        if fresh_handoff is None and config.managed_ci:
+            # Managed-CI recovery deliberately does not synthesize the
+            # issue-side handoff (#966).  A voluntary or plan-limited base binds
+            # through the trusted PR-side authorization chain; a strictly
+            # protected base publishes no such record, so it is bound the way
+            # its resume was: reserved branch plus the issue's canonical plan.
+            if managed_protection_mode == "strict":
+                _verify_strict_managed_plan_binding(
+                    config=config,
+                    pr_number=pr_number,
+                    issue_context=fresh_issue,
+                    metadata=context.metadata,
+                    expected_plan_hash=approved_plan_context.plan_hash,
+                )
+            else:
+                verify_managed_pr_plan_binding(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    issue_number=fresh_issue.number,
+                    live_head=context.metadata.head_sha,
+                    approved_plan_hash=approved_plan_context.plan_hash,
+                    retired_plan_hashes=managed_retired_plan_hashes,
+                )
+        elif (
             fresh_handoff is None
             or fresh_handoff.pr_number != pr_number
             or fresh_handoff.flow != "approved-plan-implementation"
@@ -14427,7 +16727,7 @@ def _fresh_pr_qualification_snapshot(
                 "Approved-plan/handoff identity changed or disappeared during PR qualification; "
                 "stale approvals cannot be used for this head."
             )
-        if fresh_handoff.plan_hash != approved_plan_context.plan_hash:
+        if fresh_handoff is not None and fresh_handoff.plan_hash != approved_plan_context.plan_hash:
             if not allow_plan_handoff_change:
                 raise AgentLoopError(
                     "Approved-plan/handoff identity changed or disappeared during PR qualification; "
@@ -14451,6 +16751,31 @@ def _fresh_pr_qualification_snapshot(
                     "replacement approved plan could not be recovered; stale approvals cannot "
                     "be used for this head."
                 )
+            if planning_child_binding is not None:
+                # Mid-run adoption (#936): a planning child's replacement
+                # plan passes the same rebind verifier and admissibility rule
+                # as the entry paths before it can reach a final sweep, merge,
+                # or managed-CI gate.  Non-child PRs keep today's behavior.
+                verified_replacement = verify_child_plan_rebind(
+                    fresh_issue.comments,
+                    repo=config.repo,
+                    parent_plan_context=planning_child_binding.parent_plan_context,
+                    child_issue=planning_child_binding.child_issue,
+                    parent_issue=planning_child_binding.parent_issue,
+                    stage_id=planning_child_binding.stage_id,
+                    pr_number=pr_number,
+                )
+                if (
+                    verified_replacement is None
+                    or verified_replacement.plan_hash != fresh_handoff.plan_hash
+                ):
+                    raise AgentLoopError(
+                        f"Human repair required: the approved-plan handoff for child issue "
+                        f"#{planning_child_binding.child_issue} changed to plan "
+                        f"{fresh_handoff.plan_hash} while PR #{pr_number} was under review, but "
+                        "it is not a verified same-PR plan replacement with a rebind audit "
+                        "record; no final sweep, merge, or managed-CI gate ran."
+                    )
             fresh_approved_plan_context = replacement_plan
         # The handoff hash alone is not enough: recover the canonical plan
         # again from the freshly fetched issue/parent comments and require the
@@ -14487,6 +16812,16 @@ def _fresh_pr_qualification_snapshot(
             raise AgentLoopError(
                 "Approved plan identity changed or disappeared during PR qualification; "
                 "stale approvals cannot be used for this head."
+            )
+        if planning_child_binding is not None:
+            # A signed supersession posted while reviewers ran must not be
+            # bypassed by qualifying the plan it authorizes replacing (#985).
+            _reject_pending_child_plan_supersession(
+                fresh_issue.comments,
+                binding=planning_child_binding,
+                plan_hash=fresh_approved_plan_context.plan_hash,
+                pr_number=pr_number,
+                stopped="no final sweep, merge, or managed-CI gate ran",
             )
     if (
         staged_owner
@@ -14602,6 +16937,31 @@ def run_pr_loop(
     managed_ci_qualified = False
     managed_pr_recovered = False
     authenticated_managed_resume: AuthenticatedManagedResume | None = None
+    # Captured once by the provenance block for a fresh planning child and
+    # passed to every qualification snapshot (#936); ``None`` otherwise.
+    planning_child_binding: _PlanningChildBinding | None = None
+
+    def recheck_pending_child_plan_supersession() -> None:
+        """Refetch the child issue before any approval or merge (#985).
+
+        A signed supersession posted while reviewers ran must stop the run on
+        every finalization path, not only those that take a qualification
+        snapshot.
+        """
+        if planning_child_binding is None or approved_plan_context is None:
+            return
+        fresh_child_issue = get_issue_context(
+            runner, config=config, issue_number=planning_child_binding.child_issue
+        )
+        _reject_pending_child_plan_supersession(
+            fresh_child_issue.comments,
+            binding=planning_child_binding,
+            plan_hash=approved_plan_context.plan_hash,
+            pr_number=pr_number,
+            stopped="no approval or merge was attempted",
+        )
+
+    unchanged_head_tracker = _UnchangedHeadTracker()
     try:
         bootstrap_cwd = github_bootstrap_cwd(config)
         initial_pr_context = get_pr_review_context(
@@ -14665,6 +17025,7 @@ def run_pr_loop(
                 issue_number=fresh_issue_number,
                 repo=config.repo,
             )
+            fresh_retired_plan_hashes: frozenset[str] = frozenset()
             if canonical_handoff is not None:
                 if canonical_handoff.pr_number != pr_number:
                     raise AgentLoopError(
@@ -14700,6 +17061,19 @@ def run_pr_loop(
                             "match the canonical issue plan."
                         )
                     approved_plan_context = recovered
+                    (
+                        fresh_retired_plan_hashes,
+                        fetched_parent_issue_context,
+                    ) = _managed_ci_retired_plan_hashes(
+                        runner,
+                        config=config,
+                        issue_context=issue_context,
+                        parent_issue_context=parent_issue_context,
+                        pr_number=pr_number,
+                    )
+                    if fetched_parent_issue_context is not parent_issue_context:
+                        parent_issue_context = fetched_parent_issue_context
+                        parent_issue_context_refreshed = True
             else:
                 resumed_plan = _resume_plan_round(
                     issue_context.comments,
@@ -14707,19 +17081,17 @@ def run_pr_loop(
                 )
                 if resumed_plan is not None:
                     plan_text, resumed_plan_round = resumed_plan
-                    configured_names = {
-                        agent_display_name(reviewer) for reviewer in reviewers(config)
-                    }
-                    approved_names = {
-                        record.metadata.agent
-                        for record in resumed_plan_round.completed_reviews
-                        if record.metadata.state == "approved"
-                    }
-                    if approved_names != configured_names:
-                        raise AgentLoopError(
+                    _require_complete_canonical_plan_approval(
+                        issue_context.comments,
+                        config=config,
+                        plan_text=plan_text,
+                        plan_round=resumed_plan_round,
+                        human_requirements=issue_context.human_requirements,
+                        error_message=(
                             "Managed-CI fresh authorization found planning state without "
                             "a complete canonical reviewer approval."
-                        )
+                        ),
+                    )
                     recovered_plan_context = make_approved_plan_context(
                         plan_text,
                         source_locator=(
@@ -14754,6 +17126,7 @@ def run_pr_loop(
                     approved_plan_context.plan_hash
                     if approved_plan_context is not None else None
                 ),
+                retired_plan_hashes=fresh_retired_plan_hashes,
             )
             authenticated_managed_resume = AuthenticatedManagedResume(
                 origin="issue-created",
@@ -14844,18 +17217,17 @@ def run_pr_loop(
                         )
                         if resumed_plan is not None:
                             plan_text, resumed_plan_round = resumed_plan
-                            configured_names = {
-                                agent_display_name(reviewer) for reviewer in reviewers(config)
-                            }
-                            approved_names = {
-                                record.metadata.agent
-                                for record in resumed_plan_round.completed_reviews
-                                if record.metadata.state == "approved"
-                            }
-                            if approved_names != configured_names:
-                                raise AgentLoopError(
-                                    "Managed-CI ordinary resume found incomplete canonical plan approval."
-                                )
+                            _require_complete_canonical_plan_approval(
+                                issue_context.comments,
+                                config=config,
+                                plan_text=plan_text,
+                                plan_round=resumed_plan_round,
+                                human_requirements=issue_context.human_requirements,
+                                error_message=(
+                                    "Managed-CI ordinary resume found incomplete canonical "
+                                    "plan approval."
+                                ),
+                            )
                             recovered_scope = make_approved_plan_context(
                                 plan_text,
                                 source_locator=(
@@ -14873,9 +17245,31 @@ def run_pr_loop(
                                 "the canonical issue plan."
                             )
                         approved_plan_context = recovered_scope
+                        ordinary_retired: frozenset[str] = frozenset()
+                        if canonical_handoff is not None:
+                            # A verified signed rebind leaves grants under the
+                            # superseded plan on the PR as history (#993).
+                            (
+                                ordinary_retired,
+                                fetched_parent_issue_context,
+                            ) = _managed_ci_retired_plan_hashes(
+                                runner,
+                                config=config,
+                                issue_context=issue_context,
+                                parent_issue_context=parent_issue_context,
+                                pr_number=pr_number,
+                            )
+                            if fetched_parent_issue_context is not parent_issue_context:
+                                parent_issue_context = fetched_parent_issue_context
+                                parent_issue_context_refreshed = True
                         managed_ci_handoff = dataclasses_replace(
                             managed_ci_handoff,
                             approved_plan_hash=recovered_scope.plan_hash,
+                            retired_plan_hashes=(
+                                frozenset()
+                                if recovered_scope.plan_hash in ordinary_retired
+                                else ordinary_retired
+                            ),
                         )
                     managed_ci_handoff = revalidate_issue_created_handoff(
                         runner,
@@ -15193,6 +17587,7 @@ def run_pr_loop(
             handoff_disposition = None
             stable_stage_id = None
             normalized = None
+            planning_child_binding = None
             if issue_handoff is not None and issue_handoff.pr_number != pr_number:
                 plan_bound_handoff = (
                     issue_handoff.flow == "approved-plan-implementation"
@@ -15497,12 +17892,18 @@ def run_pr_loop(
                                             "issue; repair the child plan round or the issue-to-PR "
                                             "provenance."
                                         )
-                                    validate_separately_planned_child_matrix(
-                                        parent_plan_context.risk_test_matrix_payload
-                                        if parent_plan_context.matrix_available else None,
-                                        child_plan_context.risk_test_matrix_payload
-                                        if child_plan_context.matrix_available else None,
-                                        execution_owner=stable_stage_id,
+                                    planning_child_binding = _PlanningChildBinding(
+                                        child_issue=issue_context.number,
+                                        parent_issue=parent_issue_context.number,
+                                        stage_id=stable_stage_id,
+                                        parent_plan_context=parent_plan_context,
+                                    )
+                                    _require_admissible_pr_child_plan(
+                                        issue_context.comments,
+                                        config=config,
+                                        binding=planning_child_binding,
+                                        child_plan_context=child_plan_context,
+                                        pr_number=pr_number,
                                     )
                                     approved_plan_context = child_plan_context
                                 if phase_handoff is None:
@@ -15533,12 +17934,18 @@ def run_pr_loop(
                                             "implementation handoff and no recoverable approved "
                                             "child plan; repair the child issue-to-PR provenance."
                                         )
-                                    validate_separately_planned_child_matrix(
-                                        parent_plan_context.risk_test_matrix_payload
-                                        if parent_plan_context.matrix_available else None,
-                                        child_plan_context.risk_test_matrix_payload
-                                        if child_plan_context.matrix_available else None,
-                                        execution_owner=stable_stage_id,
+                                    planning_child_binding = _PlanningChildBinding(
+                                        child_issue=issue_context.number,
+                                        parent_issue=parent_issue_context.number,
+                                        stage_id=stable_stage_id,
+                                        parent_plan_context=parent_plan_context,
+                                    )
+                                    _require_admissible_pr_child_plan(
+                                        issue_context.comments,
+                                        config=config,
+                                        binding=planning_child_binding,
+                                        child_plan_context=child_plan_context,
+                                        pr_number=pr_number,
                                     )
                                     # The child has its own approved plan, so
                                     # its matrix owners are authoritative for
@@ -15879,13 +18286,41 @@ def run_pr_loop(
             # no-reviewer diagnostic path as an in-round decode failure.
             stop_pre_panel(undecodable_history_message(exc), round_number=None)
             raise
+        # Signed reviewer-board amendments (#943) live on the PR itself, in
+        # the same comment list as the PR scheduler records, for issue-mode
+        # and standalone runs alike.  A PR amendment on the owning issue is
+        # never ordered against PR comments; it fails closed.
+        if issue_context is not None:
+            reject_misplaced_pr_amendments(
+                issue_context.comments, issue_number=issue_context.number
+            )
+        pr_amendment_diagnostics: list[str] = []
+        pr_board_amendments = collect_reviewer_board_amendments(
+            initial_pr_context.comments,
+            flow="pr",
+            pr_number=pr_number,
+            ignored_sink=pr_amendment_diagnostics,
+        )
+        for diagnostic in pr_amendment_diagnostics:
+            log(config, f"PR #{pr_number}: {diagnostic}")
+        pr_contract_lineage: ContractLineage = resolve_contract_lineage(
+            startup_records,
+            pr_board_amendments,
+            scheduler_contract,
+            contract_from_metadata=_scheduler_contract_from_metadata,
+            drift_error=lambda persisted, detail: _pr_contract_drift_error(
+                persisted,
+                detail,
+                pr_number=pr_number,
+                configured=scheduler_contract,
+                start_round_number=lambda: _pr_amendment_start_round(
+                    initial_pr_context, configured_reviewers, scheduler_capabilities
+                ),
+            ),
+        )
+        pr_amendment_digest = pr_contract_lineage.active_digest
+        pr_amendment_checkpoint_pending = bool(pr_contract_lineage.pending_amendments)
         for record in startup_records:
-            persisted_contract = _scheduler_contract_from_metadata(record.metadata)
-            if persisted_contract is not None and persisted_contract != scheduler_contract:
-                raise AgentLoopError(
-                    "PR review scheduler contract changed during resume; required reviewers, "
-                    "policy, and broad-path rules must remain immutable."
-                )
             if record.metadata.scheduler_force_full:
                 if record.metadata.scheduler_force_full_source == "operator":
                     scheduler_operator_force_full = True
@@ -15939,9 +18374,87 @@ def run_pr_loop(
                 else "aggregate"
             ),
         )
+        pr_amendment_start_round = (
+            resumed_round.round_number if resumed_round is not None else 1
+        )
+        require_amendment_activation(
+            pr_contract_lineage,
+            start_round_number=pr_amendment_start_round,
+            template=lambda amendment, round_number: _board_amendment_template(
+                flow="pr",
+                issue_number=None,
+                pr_number=pr_number,
+                persisted=pr_contract_lineage.contracts[
+                    pr_contract_lineage.amendments.index(amendment)
+                ],
+                removed=amendment.removed_reviewers,
+                start_round_number=round_number,
+            ),
+        )
+        pr_amendment_note: str | None = None
+        if pr_contract_lineage.active_amendment is not None:
+            pr_amended_contract = pr_contract_lineage.contracts[-1]
+            _pr_view, pr_amendment_reassignments = apply_board_amendment_to_ledger(
+                (
+                    (*resumed_round.prior_items, *resumed_round.current_round_new_items)
+                    if resumed_round is not None
+                    else ()
+                ),
+                removed_reviewers=pr_contract_lineage.removed_reviewers,
+                remaining_reviewers=pr_amended_contract.required_reviewers,
+                primary_reviewer=pr_amended_contract.primary_reviewer,
+            )
+            pr_amendment_note = amendment_summary_line(
+                pr_contract_lineage, pr_amendment_reassignments
+            )
+            log(config, f"PR #{pr_number}: {pr_amendment_note}")
+            if not amendment_audit_already_posted(
+                initial_pr_context.comments, pr_contract_lineage.active_amendment.digest
+            ):
+                post_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=render_amendment_audit_comment(
+                        pr_contract_lineage,
+                        start_round_number=pr_amendment_start_round,
+                        reassignments=pr_amendment_reassignments,
+                    ),
+                )
+
+        def announce_reduced_board_completion() -> str:
+            """Durable reduced-board completion note (#943); returns stdout suffix."""
+            if pr_amendment_note is None or pr_contract_lineage.active_amendment is None:
+                return ""
+            _post_reduced_board_completion_note(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                digest=pr_contract_lineage.active_amendment.digest,
+                note=pr_amendment_note,
+            )
+            return f" {pr_amendment_note}"
+
+        def pr_ledger_view(
+            items: Sequence[UnresolvedReviewItem],
+        ) -> tuple[UnresolvedReviewItem, ...]:
+            """Derived ledger with removed reviewers' ownership reassigned (#943)."""
+            if pr_contract_lineage.active_amendment is None:
+                return tuple(items)
+            amended = pr_contract_lineage.contracts[-1]
+            view, _reassignments = apply_board_amendment_to_ledger(
+                items,
+                removed_reviewers=pr_contract_lineage.removed_reviewers,
+                remaining_reviewers=amended.required_reviewers,
+                primary_reviewer=amended.primary_reviewer,
+            )
+            return view
+
         if resumed_round is not None:
             unresolved_items = list(resumed_round.prior_items)
-            pr_compact_prior_summaries = list(resumed_round.compact_prior_summaries)
+            pr_compact_prior_summaries = list(
+                bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
+            )
             latest_coder_output = resumed_round.coder_output
             latest_coder_metadata = resumed_round.coder_metadata
             qualification_checkpoint = resumed_round.qualification_checkpoint
@@ -16585,7 +19098,7 @@ def run_pr_loop(
                         None,
                     )
                 obligations = _scheduler_obligations(
-                    prior_unresolved_items,
+                    pr_ledger_view(prior_unresolved_items),
                     required_reviewers=tuple(
                         agent_display_name(reviewer) for reviewer in configured_reviewers
                     ),
@@ -16844,15 +19357,29 @@ def run_pr_loop(
                     f"panel_evidence={bool(panel_evidence is not None and panel_evidence.opened)}; "
                     f"checkpoint_phase={scheduler_checkpoint_phase or 'none'}; head={current_pr_subject}; "
                     f"primary={scheduler_contract.primary_reviewer or 'none'}; active_owners="
-                    f"{', '.join(scheduler_decision.active_owners) or 'none'}",
+                    f"{', '.join(scheduler_decision.active_owners) or 'none'}"
+                    + (f"; {pr_amendment_note}" if pr_amendment_note else ""),
                 )
-                if scheduler_decision.selected_reviewers and not skip_reviewers_for_recovery and not conflict_pending:
+                # The amendment's activation round always persists a fresh
+                # digest-bound scheduler decision (#943), even when every
+                # remaining reviewer's review is reused and nobody is invoked.
+                amendment_checkpoint_due = bool(
+                    pr_amendment_checkpoint_pending
+                    and pr_contract_lineage.active_amendment is not None
+                    and round_number == pr_contract_lineage.active_amendment.effective_from_round
+                )
+                if (
+                    (scheduler_decision.selected_reviewers or amendment_checkpoint_due)
+                    and not skip_reviewers_for_recovery
+                    and not conflict_pending
+                ):
+                    pr_amendment_checkpoint_pending = False
                     post_pr_comment(
                         runner,
                         config=config,
                         pr_number=pr_number,
                         body=_attach_round_metadata(
-                            f"PR review scheduling audit: selected {', '.join(scheduler_decision.selected_reviewers)}; "
+                            f"PR review scheduling audit: selected {', '.join(scheduler_decision.selected_reviewers) or 'none'}; "
                             f"paused {', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}; "
                             f"reason: {scheduler_decision.reason}; phase: {scheduler_decision.phase}; "
                             f"head: {current_pr_subject}; primary: "
@@ -16861,12 +19388,14 @@ def run_pr_loop(
                             f"force-full: {scheduler_recorded_force_full} "
                             f"(source: {scheduler_recorded_force_full_source or 'none'}); "
                             "scheduler-policy calls avoided cumulatively: "
-                            f"{scheduler_calls_avoided}.{superseded_audit_text}",
+                            f"{scheduler_calls_avoided}.{superseded_audit_text}"
+                            + (f" {pr_amendment_note}" if pr_amendment_note else ""),
                             PostedRoundMetadata(
                                 flow="pr", role="summary", agent="Orchestrator",
                                 round_number=round_number, subject=current_pr_subject,
                                 prior_items=prior_unresolved_items, phase="scheduler-prelaunch",
                                 scheduler_contract=scheduler_contract.as_dict(),
+                                reviewer_board_amendment_digest=pr_amendment_digest,
                                 scheduler_previous_sha=scheduler_previous_sha,
                                 scheduler_current_sha=current_pr_subject,
                                 scheduler_obligation_digest=hashlib.sha256(
@@ -16958,6 +19487,7 @@ def run_pr_loop(
                             phase=phase,
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
                             scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                            reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
                             scheduler_previous_sha=(scheduler_previous_sha if selective_policy else None),
                             scheduler_current_sha=(current_pr_subject if selective_policy else None),
                             scheduler_obligation_digest=(
@@ -17702,6 +20232,7 @@ def run_pr_loop(
                                 disposition for values in prior_dispositions.values() for disposition in values
                             ), new_items=tuple(round_new_unresolved_items), phase="reconciliation",
                             scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                            reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
                             scheduler_previous_sha=(scheduler_previous_sha if selective_policy else None),
                             scheduler_current_sha=(current_pr_subject if selective_policy else None),
                             scheduler_obligation_digest=(
@@ -17752,7 +20283,7 @@ def run_pr_loop(
 
             if use_compact_pr_context:
                 unresolved_items, future_from_prior_items = _apply_unresolved_item_dispositions(
-                    prior_unresolved_items,
+                    pr_ledger_view(prior_unresolved_items),
                     prior_dispositions,
                     retain_future=False,
                     reconciliation_mode=(
@@ -17761,16 +20292,21 @@ def run_pr_loop(
                         else "aggregate"
                     ),
                 )
-                pr_compact_prior_summaries.extend(
-                    _collect_prior_compact_summaries(
-                        prior_unresolved_items,
-                        unresolved_items,
-                        prior_dispositions,
+                pr_compact_prior_summaries = list(
+                    bound_compact_prior_summaries(
+                        [
+                            *pr_compact_prior_summaries,
+                            *_collect_prior_compact_summaries(
+                                prior_unresolved_items,
+                                unresolved_items,
+                                prior_dispositions,
+                            ),
+                        ]
                     )
                 )
             else:
                 unresolved_items, _future_items = _apply_unresolved_item_dispositions(
-                    prior_unresolved_items,
+                    pr_ledger_view(prior_unresolved_items),
                     prior_dispositions,
                     reconciliation_mode=(
                         "owner-scoped"
@@ -17779,7 +20315,9 @@ def run_pr_loop(
                     ),
                 )
                 future_from_prior_items = []
-            unresolved_items = [*unresolved_items, *round_new_unresolved_items]
+            unresolved_items = list(
+                pr_ledger_view([*unresolved_items, *round_new_unresolved_items])
+            )
             # Human-requirement acknowledgement is a structured reviewer/coder
             # contract, not a reviewer-item ownership decision. Once every
             # required reviewer has emitted the explicit acknowledgement on
@@ -18051,6 +20589,9 @@ def run_pr_loop(
                         approved_plan_context=approved_plan_context,
                         scheduler_contract=scheduler_contract if selective_policy else None,
                         allow_plan_handoff_change=True,
+                        planning_child_binding=planning_child_binding,
+                        managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                        managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                     )
                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                         log(
@@ -18260,6 +20801,7 @@ def run_pr_loop(
                             f"PR #{pr_number} was released to ordinary CI, but recovery provenance "
                             "could not be correlated; no merge attempted."
                         )
+                    recheck_pending_child_plan_supersession()
                     merged = _finalize_ordinary_recovery_checked(
                         runner,
                         config=config,
@@ -18410,6 +20952,9 @@ def run_pr_loop(
                                 approved_plan_context=approved_plan_context,
                                 scheduler_contract=scheduler_contract if selective_policy else None,
                                 allow_plan_handoff_change=True,
+                                planning_child_binding=planning_child_binding,
+                                managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                                managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                             )
                             if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                 unresolved_items = _advance_machine_obligations_for_head(
@@ -18481,6 +21026,7 @@ def run_pr_loop(
                         unresolved_items = _clear_machine_obligations(
                             unresolved_items, kind="github-pr-checks"
                         )
+                        recheck_pending_child_plan_supersession()
                         _ensure_finalization_ready(
                             pr_number=pr_number,
                             round_number=round_number,
@@ -18502,9 +21048,15 @@ def run_pr_loop(
                                     source="full-board",
                                 ),
                             )
-                            print(f"PR #{pr_number} merged after CI watch completed.")
+                            print(
+                                f"PR #{pr_number} merged after CI watch completed."
+                                + announce_reduced_board_completion()
+                            )
                         else:
-                            print(f"PR #{pr_number} is merge-ready after CI watch completed.")
+                            print(
+                                f"PR #{pr_number} is merge-ready after CI watch completed."
+                                + announce_reduced_board_completion()
+                            )
                         return 0
                     if watch_outcome.status == "not_started":
                         command = render_managed_ci_resume_command(
@@ -18784,6 +21336,9 @@ def run_pr_loop(
                             approved_plan_context=approved_plan_context,
                             scheduler_contract=scheduler_contract if selective_policy else None,
                             allow_plan_handoff_change=True,
+                            planning_child_binding=planning_child_binding,
+                            managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                            managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             prefetched_pr_context = fresh_context
@@ -18808,6 +21363,9 @@ def run_pr_loop(
                             approved_plan_context=approved_plan_context,
                             scheduler_contract=scheduler_contract if selective_policy else None,
                             allow_plan_handoff_change=True,
+                            planning_child_binding=planning_child_binding,
+                            managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                            managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             log(
@@ -18977,6 +21535,7 @@ def run_pr_loop(
                                         f"PR #{pr_number} managed resume could not be correlated to ordinary "
                                         "recovery CI; no merge attempted."
                                     )
+                                recheck_pending_child_plan_supersession()
                                 merged = _finalize_ordinary_recovery_checked(
                                     runner,
                                     config=config,
@@ -19048,6 +21607,9 @@ def run_pr_loop(
                                         approved_plan_context=approved_plan_context,
                                         scheduler_contract=scheduler_contract if selective_policy else None,
                                         allow_plan_handoff_change=True,
+                                        planning_child_binding=planning_child_binding,
+                                        managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
+                                        managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                                     )
                                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                         prefetched_pr_context = fresh_context
@@ -19065,6 +21627,7 @@ def run_pr_loop(
                                 unresolved_items = _clear_machine_obligations(
                                     unresolved_items, kind="managed-exact-head-ci"
                                 )
+                                recheck_pending_child_plan_supersession()
                                 _ensure_finalization_ready(
                                     pr_number=pr_number,
                                     round_number=round_number,
@@ -19092,6 +21655,7 @@ def run_pr_loop(
                                     print(
                                         f"PR #{pr_number} approved by "
                                         f"{format_agent_list(configured_reviewers)}."
+                                        + announce_reduced_board_completion()
                                     )
                                 else:
                                     qualified_head = publish_manual_v2_qualification(
@@ -19116,6 +21680,7 @@ def run_pr_loop(
                                         f"PR #{pr_number} approved and qualified; manual merge required. "
                                         f"Qualified head: {qualified_head}. Run `{merge_command}` after "
                                         f"confirming the live head.{risk}"
+                                        + announce_reduced_board_completion()
                                     )
                                 return 0
                             if managed_outcome.status == "head_changed":
@@ -19252,6 +21817,7 @@ def run_pr_loop(
                                     f"PR #{pr_number} ordinary recovery provenance is unavailable; "
                                     "no merge attempted."
                                 )
+                            recheck_pending_child_plan_supersession()
                             merged = _finalize_ordinary_recovery_checked(
                                 runner,
                                 config=config,
@@ -19280,13 +21846,17 @@ def run_pr_loop(
                             )["coder_blockers"]
                         )
                     if not must_fix_items:
+                        recheck_pending_child_plan_supersession()
                         _ensure_finalization_ready(
                             pr_number=pr_number,
                             round_number=round_number,
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
                         )
-                        print(f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}.")
+                        print(
+                            f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}."
+                            + announce_reduced_board_completion()
+                        )
                         return 0
             if round_number == allowed_rounds:
                 raise AgentLoopError(
@@ -19691,6 +22261,19 @@ def run_pr_loop(
                     else None
                 ),
             )
+            # The coder metadata record posted below is numbered one past the
+            # loop round; the matrix-evidence anchor must use that number.
+            coder_record_round = round_number + 1
+            matrix_evidence_render_decision = None
+            if (
+                isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                and coder_response.marker_value.risk_test_matrix_evidence is not None
+            ):
+                matrix_evidence_render_decision = resolve_matrix_evidence_render(
+                    coder_response.marker_value.risk_test_matrix_evidence,
+                    latest_coder_metadata,
+                    coder_record_round,
+                )
             if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                 public_comment = render_public_agent_comment(
                     kind="coder_followup",
@@ -19701,6 +22284,7 @@ def run_pr_loop(
                     model_used=coder_response.model_used,
                     local_test_evidence=local_test_evidence,
                     current_test_turn_id=coder_response.acquisition_test_turn_id,
+                    matrix_evidence_render_decision=matrix_evidence_render_decision,
                 )
 
             qualification_checkpoint = _machine_obligation_checkpoint(
@@ -19726,7 +22310,7 @@ def run_pr_loop(
                 flow="pr",
                 role="coder",
                 agent=coder_name,
-                round_number=round_number + 1,
+                round_number=coder_record_round,
                 subject=str(updated_pr_context.metadata.head_sha or "unknown"),
                 prior_items=tuple(unresolved_items),
                 raw_structured_coder_response=raw_structured_coder_response,
@@ -19735,6 +22319,11 @@ def run_pr_loop(
                     coder_response.marker_value.risk_test_matrix_evidence.to_payload()
                     if isinstance(coder_response.marker_value, StructuredCoderFollowup)
                     and coder_response.marker_value.risk_test_matrix_evidence is not None
+                    else None
+                ),
+                risk_test_matrix_evidence_full_round=(
+                    matrix_evidence_render_decision.anchor_round
+                    if matrix_evidence_render_decision is not None
                     else None
                 ),
                 risk_test_matrix_diagnostics=(
@@ -19750,6 +22339,7 @@ def run_pr_loop(
                 acquisition_outcome=coder_response.acquisition_outcome,
                 acquisition_returncode=coder_response.acquisition_returncode,
                 scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
                 scheduler_previous_sha=(pr_metadata.head_sha if selective_policy else None),
                 scheduler_current_sha=(
                     str(updated_pr_context.metadata.head_sha or "unknown")
@@ -19837,6 +22427,29 @@ def run_pr_loop(
                         issue_created_handoff=managed_ci_handoff,
                         override_nonce=managed_ci_handoff.override_nonce,
                     )
+            previous_head = pr_metadata.head_sha
+            unchanged_head_coder_turns = unchanged_head_tracker.observe(
+                previous_head, updated_pr_context.metadata.head_sha
+            )
+            if unchanged_head_coder_turns >= MAX_UNCHANGED_HEAD_CODER_TURNS:
+                # Re-reviewing an identical diff reaches the same verdict every
+                # round; a finding a PR-mode coder turn cannot satisfy (such as
+                # a required re-plan) must stop with a route, not consume the
+                # round budget (#985).
+                route = (
+                    " If the blocking finding requires re-planning the child plan, post the "
+                    "signed child-plan supersession record on child issue "
+                    f"#{planning_child_binding.child_issue} and rerun "
+                    f"`{_child_resume_hint(planning_child_binding.child_issue, EXECUTION_DISPOSITION_PLANNING)}`."
+                    if planning_child_binding is not None
+                    else ""
+                )
+                raise AgentLoopError(
+                    f"PR #{pr_number}: {coder_name} left head {previous_head} unchanged in "
+                    f"{unchanged_head_coder_turns} consecutive follow-up rounds, so another "
+                    "review of the same diff cannot change the verdict. Stopping before round "
+                    f"{round_number + 1}; human review required.{route}"
+                )
             log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")
             pre_review_test_pending = True
             if external_recovery_full_board:
@@ -19922,11 +22535,13 @@ def _is_bot_authored_discuss_comment(body: str) -> bool:
     match = ROUND_RESUME_MARKER_RE.search(body)
     if match is None:
         return False
+    # Read only ``flow``, which never spills: a full decode would reject a
+    # round comment whose growth fields are unhydrated spill references.
     try:
-        metadata = _decode_round_metadata(match.group("payload"))
+        payload = decode_mapping(match.group("payload"))
     except AgentLoopError:
         return False
-    return metadata.flow == "discuss"
+    return payload.get("flow") == "discuss"
 
 
 def _discuss_subject(issue_context: IssueContext) -> str:

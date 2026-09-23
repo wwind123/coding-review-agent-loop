@@ -1145,7 +1145,10 @@ def test_gemini_pre_marker_429_malformed_public_response_fails_deterministically
             run_pr_loop(runner, pr_number=77, config=config)
 
     message = str(exc_info.value)
-    assert "Failure category: deterministic" in message
+    # The internal category stays deterministic (no transient auto-retry), but
+    # the operator label reflects a stochastic schema miss (#957).
+    assert getattr(exc_info.value, "failure_category", "deterministic") == "deterministic"
+    assert "Failure category: schema-validation" in message
     assert "Failure category: transient" not in message
 
 
@@ -6551,6 +6554,37 @@ def test_format_invalid_agent_response_error_includes_suggestion_deterministic()
     assert "inspect" in msg.lower()
 
 
+def test_format_invalid_agent_response_error_schema_rejection_is_retryable_957():
+    msg = _format_invalid_agent_response_error(
+        agent_name="Codex",
+        marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+        reason="plan_review.blocking_plan_issues at index 0 must be a string.",
+        result=None,
+        log_paths=[],
+        category="deterministic",
+        classification_text="structured plan_review response failed trusted validation",
+    )
+    assert "Failure category: schema-validation" in msg
+    assert "may require a code fix" not in msg
+    assert "re-run the same command" in msg
+    # The actual reason leads; the marker requirement follows it.
+    assert msg.index("Reason: plan_review.blocking_plan_issues") < msg.index("Required marker:")
+
+
+def test_format_invalid_agent_response_error_unstructured_deterministic_unchanged_957():
+    msg = _format_invalid_agent_response_error(
+        agent_name="Codex",
+        marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+        reason="missing marker",
+        result=None,
+        log_paths=[],
+        category="deterministic",
+        classification_text="some other diagnostic",
+    )
+    assert "Failure category: deterministic (may require a code fix)." in msg
+    assert "schema-validation" not in msg
+
+
 def test_format_invalid_agent_response_error_no_suggestion_empty_response():
     msg = _format_invalid_agent_response_error(
         agent_name="Codex",
@@ -6561,3 +6595,41 @@ def test_format_invalid_agent_response_error_no_suggestion_empty_response():
         category="empty-response",
     )
     assert "Suggestion:" not in msg
+
+
+def test_m953_discuss_round_comment_with_spilled_prior_items_is_bot_authored():
+    import coding_review_agent_loop.round_transport as transport
+    from coding_review_agent_loop.orchestrator import _discuss_subject, _is_bot_authored_discuss_comment
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from coding_review_agent_loop.github import IssueContext
+
+    body = _attach_round_metadata(
+        "discuss vote",
+        PostedRoundMetadata(
+            flow="discuss", role="reviewer", agent="codex", round_number=1, subject="s",
+        ),
+    )
+    match = transport.ROUND_RESUME_MARKER_RE.search(body)
+    payload = transport.decode_mapping(match.group("payload"))
+    payload["prior_items"] = {
+        "$round_transport_spill": "abc", "field": "prior_items", "parts": 1,
+        "sha256": "0" * 64, "spill": "0" * 64, "encoding": "json",
+    }
+    spilled = (
+        body[: match.start("payload")]
+        + transport.encode_mapping(payload)
+        + body[match.end("payload"):]
+    )
+
+    assert _is_bot_authored_discuss_comment(spilled) is True
+    assert _is_bot_authored_discuss_comment("<!-- AGENT_LOOP_META: not-valid -->") is False
+
+    def context(*comments):
+        return IssueContext(
+            number=1, repo="OWNER/REPO", title="Issue", body="Body", url=None,
+            comments=tuple(
+                IssueComment(author="bot", created_at=None, body=text) for text in comments
+            ),
+        )
+
+    assert _discuss_subject(context(spilled)) == _discuss_subject(context())

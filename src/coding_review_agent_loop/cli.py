@@ -1245,6 +1245,345 @@ def add_containment_options(parser: argparse.ArgumentParser) -> None:
                 default=None,
                 help=f"Override {label} for the {role} role.",
             )
+    add_test_worker_options(parser)
+
+
+def _positive_worker_count(value: str) -> int:
+    from .test_workers import WorkerBudgetError, parse_worker_count
+
+    try:
+        return parse_worker_count(value)
+    except WorkerBudgetError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _worker_memory_value(value: str) -> str:
+    from .test_workers import WorkerBudgetError, parse_worker_memory
+
+    try:
+        parse_worker_memory(value)
+    except WorkerBudgetError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
+def add_test_worker_options(parser: argparse.ArgumentParser) -> None:
+    """Parallel test-worker budget options (issue #848)."""
+    parser.add_argument(
+        "--test-workers",
+        type=_positive_worker_count,
+        default=None,
+        metavar="N",
+        help=(
+            "Parallel test-worker budget. In loop flows and standalone run-tests it replaces "
+            "the containment-derived value; an inherited run-tests may only lower it "
+            "(default: derived after containment admission)."
+        ),
+    )
+    parser.add_argument(
+        "--test-worker-memory",
+        type=_worker_memory_value,
+        default=None,
+        metavar="SIZE",
+        help="Per-worker memory estimate used to derive the budget (default: 1G).",
+    )
+    parser.add_argument(
+        "--test-worker-enforcement",
+        choices=("clamp", "refuse", "off"),
+        default=None,
+        help=(
+            "How run-tests treats over-budget pytest-xdist requests: clamp lowers them "
+            "(default), refuse rejects them before any test runs, off only advertises "
+            "the budget. An inherited run-tests may only tighten the mode."
+        ),
+    )
+
+
+def _resolve_run_tests_worker_budget(args: argparse.Namespace, *, broker_present: bool, handle=None):
+    """Resolve the run-tests worker budget per the precedence rules."""
+    from .test_workers import (
+        MANAGED_BACKEND,
+        derive_worker_budget,
+        parse_worker_memory,
+        resolve_worker_budget,
+    )
+
+    memory = parse_worker_memory(args.test_worker_memory) if args.test_worker_memory else None
+    managed = handle is not None and getattr(handle, "managed", False)
+    derived = derive_worker_budget(
+        backend=(MANAGED_BACKEND if managed else "process-group"),
+        child_limits=(handle.child_limits if managed else None),
+        aggregate_limits=(handle.aggregate_limits if managed else None),
+        os_headroom_percent=args.containment_os_headroom_percent,
+        per_worker_bytes=memory,
+    )
+    return resolve_worker_budget(
+        derived,
+        operator_workers=args.test_workers,
+        operator_enforcement=args.test_worker_enforcement,
+        env=os.environ,
+        has_parent=broker_present or None,
+    )
+
+
+def _render_worker_budget_preflight(args: argparse.Namespace, policy, manifest) -> str:
+    from .test_workers import MANAGED_BACKEND, derive_worker_budget, parse_worker_memory, resolve_worker_budget
+
+    memory = parse_worker_memory(args.test_worker_memory) if args.test_worker_memory else None
+    managed = manifest.backend == MANAGED_BACKEND and manifest.memory_ceiling_claimed
+    derived = derive_worker_budget(
+        backend=(MANAGED_BACKEND if managed else "process-group"),
+        child_limits=(policy.role_limits("coder").restrict(policy.aggregate) if managed else None),
+        aggregate_limits=(policy.aggregate if managed else None),
+        os_headroom_percent=policy.os_headroom_percent,
+        per_worker_bytes=memory,
+    )
+    budget = resolve_worker_budget(
+        derived,
+        operator_workers=args.test_workers,
+        operator_enforcement=args.test_worker_enforcement,
+        env={},
+        has_parent=False,
+    ).budget
+    return "\n".join(
+        [
+            "Parallel test-worker budget (preliminary; no lease taken)",
+            f"  workers: {budget.workers}",
+            f"  source: {'operator-supplied' if budget.source == 'operator' else budget.source}",
+            f"  limiting factor: {budget.limiting_factor}",
+            f"  enforcement: {budget.enforcement}",
+            f"  backend: {manifest.backend}",
+            "  memory ceiling: "
+            + ("enforced" if budget.enforced_ceiling else "no agent-loop memory ceiling enforced"),
+        ]
+    )
+
+
+def _record_run_tests_result(
+    args: argparse.Namespace,
+    *,
+    raw_inner: Sequence[str],
+    outcome: str,
+    elapsed_seconds: float,
+    chosen,
+    policy: int,
+    returncode: int | None,
+    containment,
+    lane: str | None,
+    workers: str | None,
+    executed_argv: Sequence[str] | None,
+    worker_enforcement: str | None,
+    caveats: Sequence[str],
+) -> None:
+    record_test_observation(
+        args.memory_dir,
+        argv=raw_inner,
+        cwd=Path.cwd(),
+        outcome=outcome,
+        elapsed_seconds=elapsed_seconds,
+        attempted_timeout_seconds=chosen,
+        policy_ceiling_seconds=policy,
+        returncode=returncode,
+        containment=containment,
+        lane=lane,
+        workers=workers,
+        executed_argv=executed_argv,
+        worker_enforcement=worker_enforcement,
+        caveats=caveats,
+    )
+
+
+_NO_RECORD_OUTCOMES = frozenset({"overlap-rejected", "worker-budget-busy", "worker-budget-refused"})
+
+
+def _run_tests_command(args: argparse.Namespace) -> int:
+    from .test_workers import (
+        WORKER_BUDGET_REFUSED_EXIT_CODE,
+        WorkerBudgetError,
+        client_refusal,
+    )
+
+    if args.preflight:
+        print("agent-loop preflight: verified")
+        return 0
+    raw_inner = list(args.inner_argv)
+    if raw_inner[:1] == ["--"]:
+        raw_inner = raw_inner[1:]
+    try:
+        if not raw_inner:
+            raise TestRuntimeConfigurationError(
+                "run-tests requires `--` followed by a non-empty command."
+            )
+        policy = inherited_timeout_ceiling()
+        chosen = resolve_timeout_seconds(args.timeout_seconds, policy_ceiling=policy)
+        broker = broker_client_from_environment()
+        try:
+            worker_resolution = _resolve_run_tests_worker_budget(args, broker_present=broker is not None)
+        except WorkerBudgetError as exc:
+            raise TestRuntimeConfigurationError(str(exc)) from exc
+        for diagnostic in worker_resolution.diagnostics:
+            print(diagnostic, file=sys.stderr, flush=True)
+        worker_budget = worker_resolution.budget
+        # The client's only local refusal is a plugin-disabling argv token in
+        # refuse mode; worker counts are judged by the plugin in pytest.
+        refusal = client_refusal(raw_inner, worker_budget)
+        if refusal is not None:
+            print(refusal, file=sys.stderr, flush=True)
+            return WORKER_BUDGET_REFUSED_EXIT_CODE
+        if broker is not None:
+            try:
+                # Neither the command lane nor the worker-budget lock is taken
+                # here: only the process that spawns the target holds them.
+                broker_result = broker.run(
+                    raw_inner,
+                    timeout_seconds=chosen,
+                    cwd=Path.cwd(),
+                    environment_overrides=worker_budget.environment(),
+                )
+            except (AgentLoopError, OSError, ValueError) as exc:
+                print(
+                    f"agent-loop: broker telemetry unavailable ({exc}); running locally with unverified telemetry",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                # The receipt is the only durable citation handle exposed to
+                # the coder. The execution_ref is only an invocation-local
+                # semantic selector; the parent owns the journal and later
+                # converts a selected observation into the receipt citation.
+                if broker_result.execution_ref:
+                    print(
+                        f"agent-loop test execution_ref: {broker_result.execution_ref}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                print(
+                    f"agent-loop test observation receipt: {broker_result.receipt_id}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if broker_result.outcome in _NO_RECORD_OUTCOMES:
+                    # Coordination and pre-execution refusals are not evidence
+                    # about the executable. They must not affect timing or health.
+                    pass
+                elif broker_result.inner_exec == "failed":
+                    record_launcher_health(
+                        args.memory_dir,
+                        cwd=Path.cwd(),
+                        candidate=raw_inner,
+                        state="failed",
+                        provenance="broker-parent",
+                        environment=os.environ,
+                        diagnostic=broker_result.diagnostic or broker_result.output_tail,
+                    )
+                elif broker_result.suite_start == "verified":
+                    record_launcher_health(
+                        args.memory_dir,
+                        cwd=Path.cwd(),
+                        candidate=raw_inner,
+                        state="verified",
+                        provenance="broker-parent",
+                        environment=os.environ,
+                        diagnostic=broker_result.diagnostic,
+                    )
+                if broker_result.suite_start != "not-started" and broker_result.outcome not in _NO_RECORD_OUTCOMES:
+                    _record_run_tests_result(
+                        args,
+                        raw_inner=raw_inner,
+                        outcome=broker_result.outcome,
+                        elapsed_seconds=broker_result.elapsed_seconds,
+                        chosen=chosen,
+                        policy=policy,
+                        returncode=broker_result.returncode,
+                        containment=None,
+                        lane="broker",
+                        workers=broker_result.workers_cohort,
+                        executed_argv=broker_result.executed_argv or None,
+                        worker_enforcement=broker_result.worker_enforcement,
+                        caveats=broker_result.worker_caveats,
+                    )
+                return int(broker_result.returncode if broker_result.returncode is not None else 1)
+        else:
+            print(
+                "agent-loop: test broker unavailable; running locally with telemetry-unverified evidence",
+                file=sys.stderr,
+                flush=True,
+            )
+        containment_policy = policy_from_values(vars(args))
+        fallback_environment = dict(os.environ)
+        for name in (
+            "AGENT_LOOP_TEST_BROKER_ENDPOINT",
+            "AGENT_LOOP_TEST_BROKER_CAPABILITY",
+            "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+        ):
+            fallback_environment.pop(name, None)
+
+        def resize(handle):
+            # Only a genuinely standalone managed run sizes from the admitted
+            # test-gate limits; an inherited scope keeps the parent budget.
+            return _resolve_run_tests_worker_budget(args, broker_present=False, handle=handle).budget
+
+        result = run_foreground_test(
+            raw_inner,
+            cwd=Path.cwd(),
+            timeout_seconds=chosen,
+            dry_run=False,
+            containment_policy=containment_policy,
+            containment_role="test-gate",
+            env=fallback_environment,
+            environment_is_complete=True,
+            wrapper_bootstrap="verified",
+            worker_budget=worker_budget,
+            worker_budget_resizer=(None if worker_resolution.inherited else resize),
+        )
+        if result.overlap_rejected or result.outcome in _NO_RECORD_OUTCOMES:
+            # Overlap, worker-budget-busy and direct refusals are coordination
+            # or configuration, not launcher health or suite timing evidence.
+            pass
+        elif result.inner_exec == "failed":
+            record_launcher_health(
+                args.memory_dir,
+                cwd=Path.cwd(),
+                candidate=raw_inner,
+                state="failed",
+                provenance="parent-runner",
+                diagnostic=result.diagnostic or result.output_tail,
+                environment=fallback_environment,
+            )
+        elif result.suite_start == "verified":
+            record_launcher_health(
+                args.memory_dir,
+                cwd=Path.cwd(),
+                candidate=raw_inner,
+                state="verified",
+                provenance="parent-runner",
+                diagnostic=result.diagnostic,
+                environment=fallback_environment,
+            )
+        if (
+            result.suite_start != "not-started"
+            and not result.overlap_rejected
+            and result.outcome not in _NO_RECORD_OUTCOMES
+        ):
+            _record_run_tests_result(
+                args,
+                raw_inner=raw_inner,
+                outcome=result.outcome,
+                elapsed_seconds=result.elapsed_seconds,
+                chosen=chosen,
+                policy=policy,
+                returncode=result.returncode,
+                containment=(result.containment.to_dict() if result.containment is not None else None),
+                lane=(result.containment.backend if result.containment is not None else None),
+                workers=result.workers_cohort,
+                executed_argv=result.args,
+                worker_enforcement=result.worker_enforcement,
+                caveats=result.worker_caveats,
+            )
+        return int(result.returncode if result.returncode is not None else 1)
+    except (AgentLoopError, OSError, ValueError) as exc:
+        print(f"agent-loop: {exc}", file=sys.stderr)
+        return 1
 
 
 def _resolve_task_text(args: argparse.Namespace) -> str:
@@ -1284,154 +1623,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             policy = policy_from_values(vars(args))
             manifest = preflight_containment(policy)
             print(render_preflight(policy, manifest))
+            print(_render_worker_budget_preflight(args, policy, manifest))
             return 0 if manifest.ready or policy.mode != "required" else 2
         except (AgentLoopError, OSError, ValueError) as exc:
             print(f"agent-loop: {exc}", file=sys.stderr)
             return 2
     if args.command == "run-tests":
-        if args.preflight:
-            print("agent-loop preflight: verified")
-            return 0
-        raw_inner = list(args.inner_argv)
-        if raw_inner[:1] == ["--"]:
-            raw_inner = raw_inner[1:]
-        try:
-            if not raw_inner:
-                raise TestRuntimeConfigurationError(
-                    "run-tests requires `--` followed by a non-empty command."
-                )
-            policy = inherited_timeout_ceiling()
-            chosen = resolve_timeout_seconds(args.timeout_seconds, policy_ceiling=policy)
-            broker = broker_client_from_environment()
-            if broker is not None:
-                try:
-                    broker_result = broker.run(raw_inner, timeout_seconds=chosen, cwd=Path.cwd())
-                except (AgentLoopError, OSError, ValueError) as exc:
-                    print(
-                        f"agent-loop: broker telemetry unavailable ({exc}); running locally with unverified telemetry",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                else:
-                    # The receipt is the only durable citation handle exposed to
-                    # the coder. The execution_ref is only an invocation-local
-                    # semantic selector; the parent owns the journal and later
-                    # converts a selected observation into the receipt citation.
-                    if broker_result.execution_ref:
-                        print(
-                            f"agent-loop test execution_ref: {broker_result.execution_ref}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    print(
-                        f"agent-loop test observation receipt: {broker_result.receipt_id}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    if broker_result.outcome == "overlap-rejected":
-                        # Overlap is coordination, not evidence about the
-                        # executable. It must not affect timing or health.
-                        pass
-                    elif broker_result.inner_exec == "failed":
-                        record_launcher_health(
-                            args.memory_dir,
-                            cwd=Path.cwd(),
-                            candidate=raw_inner,
-                            state="failed",
-                            provenance="broker-parent",
-                            environment=os.environ,
-                            diagnostic=broker_result.diagnostic or broker_result.output_tail,
-                        )
-                    elif broker_result.suite_start == "verified":
-                        record_launcher_health(
-                            args.memory_dir,
-                            cwd=Path.cwd(),
-                            candidate=raw_inner,
-                            state="verified",
-                            provenance="broker-parent",
-                            environment=os.environ,
-                            diagnostic=broker_result.diagnostic,
-                        )
-                    if broker_result.suite_start != "not-started" and broker_result.outcome != "overlap-rejected":
-                        record_test_observation(
-                            args.memory_dir,
-                            argv=raw_inner,
-                            cwd=Path.cwd(),
-                            outcome=broker_result.outcome,
-                            elapsed_seconds=broker_result.elapsed_seconds,
-                            attempted_timeout_seconds=chosen,
-                            policy_ceiling_seconds=policy,
-                            returncode=broker_result.returncode,
-                            containment=None,
-                            lane="broker",
-                        )
-                    return int(broker_result.returncode if broker_result.returncode is not None else 1)
-            else:
-                print(
-                    "agent-loop: test broker unavailable; running locally with telemetry-unverified evidence",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            containment_policy = policy_from_values(vars(args))
-            fallback_environment = dict(os.environ)
-            for name in (
-                "AGENT_LOOP_TEST_BROKER_ENDPOINT",
-                "AGENT_LOOP_TEST_BROKER_CAPABILITY",
-                "AGENT_LOOP_TEST_BROKER_PROTOCOL",
-            ):
-                fallback_environment.pop(name, None)
-            result = run_foreground_test(
-                raw_inner,
-                cwd=Path.cwd(),
-                timeout_seconds=chosen,
-                dry_run=False,
-                containment_policy=containment_policy,
-                containment_role="test-gate",
-                env=fallback_environment,
-                environment_is_complete=True,
-                wrapper_bootstrap="verified",
-            )
-            if result.overlap_rejected or result.outcome == "overlap-rejected":
-                # Overlap is coordination, not launcher health or suite
-                # timing evidence.
-                pass
-            elif result.inner_exec == "failed":
-                record_launcher_health(
-                    args.memory_dir,
-                    cwd=Path.cwd(),
-                    candidate=raw_inner,
-                    state="failed",
-                    provenance="parent-runner",
-                    diagnostic=result.diagnostic or result.output_tail,
-                    environment=fallback_environment,
-                )
-            elif result.suite_start == "verified":
-                record_launcher_health(
-                    args.memory_dir,
-                    cwd=Path.cwd(),
-                    candidate=raw_inner,
-                    state="verified",
-                    provenance="parent-runner",
-                    diagnostic=result.diagnostic,
-                    environment=fallback_environment,
-                )
-            if result.suite_start != "not-started" and not result.overlap_rejected:
-                record_test_observation(
-                    args.memory_dir,
-                    argv=raw_inner,
-                    cwd=Path.cwd(),
-                    outcome=result.outcome,
-                    elapsed_seconds=result.elapsed_seconds,
-                    attempted_timeout_seconds=chosen,
-                    policy_ceiling_seconds=policy,
-                    returncode=result.returncode,
-                    containment=(result.containment.to_dict() if result.containment is not None else None),
-                    lane=(result.containment.backend if result.containment is not None else None),
-                )
-            return int(result.returncode if result.returncode is not None else 1)
-        except (AgentLoopError, OSError, ValueError) as exc:
-            print(f"agent-loop: {exc}", file=sys.stderr)
-            return 1
+        return _run_tests_command(args)
     if args.command == "managed-ci" and args.managed_ci_command == "preflight":
         try:
             context = ManagedCiProbeContext(args.repo, args.gh_cmd, Path.cwd())

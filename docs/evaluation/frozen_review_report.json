@@ -160,6 +160,168 @@
           }
         }
       },
+      "review_contracts": {
+        "exhaustive": {
+          "policies": {
+            "all-reviewers": {
+              "coder_followup_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 0
+            },
+            "primary-then-panel": {
+              "coder_followup_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 0
+            }
+          }
+        },
+        "first-finding-permitted": {
+          "policies": {
+            "all-reviewers": {
+              "coder_followup_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 1
+            },
+            "primary-then-panel": {
+              "coder_followup_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-plan-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 1
+            }
+          }
+        }
+      },
       "run_count": 2,
       "title": "Frozen plan review policy evaluation"
     },
@@ -388,6 +550,244 @@
           "valid_unique_findings": {
             "status": "verified",
             "value": 2
+          }
+        }
+      },
+      "review_contracts": {
+        "exhaustive": {
+          "policies": {
+            "all-reviewers": {
+              "coder_followup_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 0
+            },
+            "primary-then-panel": {
+              "coder_followup_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 0
+            },
+            "selective-intermediate": {
+              "coder_followup_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "no frozen runs for this review contract and policy",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 0
+            }
+          }
+        },
+        "first-finding-permitted": {
+          "policies": {
+            "all-reviewers": {
+              "coder_followup_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-all-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 1
+            },
+            "primary-then-panel": {
+              "coder_followup_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-primary-panel-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 1
+            },
+            "selective-intermediate": {
+              "coder_followup_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "escaped_defects_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "review_rounds_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "reviewer_calls_per_run": {
+                "reason": "review contract label absent or without verified provenance for runs: historical-selective-001",
+                "status": "unavailable",
+                "value": null
+              },
+              "run_count": 1
+            }
           }
         }
       },

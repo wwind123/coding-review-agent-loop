@@ -627,6 +627,273 @@ def test_recognized_inner_probe_uses_only_safe_version_argv(tmp_path, monkeypatc
     assert calls[0][1]["timeout_seconds"] == 5.0
 
 
+_SYSTEM_ENV = runtime._trusted_env_executable("/usr/bin/env", environment=os.environ)
+_SYSTEM_ENV_AVAILABLE = _SYSTEM_ENV is not None
+requires_system_env = pytest.mark.skipif(
+    not _SYSTEM_ENV_AVAILABLE, reason="root-owned /usr/bin/env is unavailable"
+)
+
+
+@pytest.fixture
+def no_ambient_invocation(monkeypatch):
+    # An ambient invocation id (e.g. running under agent-loop) would share the
+    # per-invocation probe cache and candidate budget across tests.
+    monkeypatch.delenv("AGENT_LOOP_INVOCATION_ID", raising=False)
+
+
+@requires_system_env
+def test_env_assignment_prefix_is_normalized_for_inner_probe(tmp_path, monkeypatch, no_ambient_invocation):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    src = str(tmp_path / "src")
+    for prefix in (["env"], ["/usr/bin/env"], ["env", "--"]):
+        calls.clear()
+        runtime._INNER_PREFLIGHT_CACHE.clear()
+        result = runtime.probe_inner_launcher(
+            [*prefix, f"PYTHONPATH={src}", "AGENT_FLAG=1", sys.executable, "-m", "pytest", "tests", "-q"],
+            cwd=tmp_path,
+        )
+        assert result.state == "verified", prefix
+        # The probe runs the real interpreter, not ``env``...
+        assert calls[0][0] == (sys.executable, "-m", "pytest", "--version")
+        # ...under the assignments the target will actually see.
+        probe_env = calls[0][1]["env"]
+        assert probe_env["PYTHONPATH"] == src
+        assert probe_env["AGENT_FLAG"] == "1"
+
+
+@requires_system_env
+def test_env_prefix_without_assignments_is_normalized(tmp_path):
+    assert runtime.recognized_inner_probe(
+        ["env", sys.executable, "-m", "pytest", "tests"], cwd=tmp_path
+    ) == (sys.executable, "-m", "pytest", "--version")
+
+
+@requires_system_env
+def test_env_prefix_assignments_distinguish_inner_probe_cache(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(kwargs["env"].get("PYTHONPATH"))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    environment = {**runtime.os.environ, "AGENT_LOOP_INVOCATION_ID": "inv-964"}
+    for value in ("a", "b", "a"):
+        result = runtime.probe_inner_launcher(
+            ["env", f"PYTHONPATH={value}", sys.executable, "-m", "pytest", "tests"],
+            cwd=tmp_path,
+            environment=environment,
+            environment_is_complete=True,
+        )
+        assert result.state == "verified"
+    assert calls == ["a", "b"]
+
+
+@pytest.mark.parametrize(
+    "argv_prefix",
+    [
+        ["env", "-i"],
+        ["env", "--ignore-environment"],
+        ["env", "-"],
+        ["env", "-u", "PATH"],
+        ["env", "-S"],
+        ["env", "--chdir=/tmp"],
+        ["env", "PYTHONPATH=x", "-i"],
+        ["env", "1BAD=x"],
+        ["env", "=x"],
+        ["env", "env"],
+        ["./env"],
+        ["tools/env"],
+    ],
+)
+def test_env_prefix_with_unreproducible_semantics_stays_unrecognized(tmp_path, monkeypatch, argv_prefix, no_ambient_invocation):
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    result = runtime.probe_inner_launcher(
+        [*argv_prefix, sys.executable, "-m", "pytest", "tests"], cwd=tmp_path
+    )
+
+    assert result.state == "unknown"
+    assert "unrecognized" in result.diagnostic
+    assert calls == []
+
+
+def test_env_prefix_without_command_or_with_unrecognized_target_is_unknown(tmp_path, monkeypatch, no_ambient_invocation):
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    for argv in (["env"], ["env", "PYTHONPATH=x"], ["env", "PYTHONPATH=x", "make", "test"]):
+        result = runtime.probe_inner_launcher(argv, cwd=tmp_path)
+        assert result.state == "unknown", argv
+    assert calls == []
+
+
+def test_lookalike_env_executable_is_not_stripped_from_probe(tmp_path, monkeypatch, no_ambient_invocation):
+    # A program named ``env`` that ignores its argv and exits 0 must not let
+    # the probe verify the real interpreter on its behalf.
+    calls = []
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_env = fake_bin / "env"
+    fake_env.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_env.chmod(0o755)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    shadowed = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
+    for argv_prefix, environment in (
+        (["env"], shadowed),
+        ([str(fake_env)], None),
+    ):
+        argv = [*argv_prefix, "PYTHONPATH=x", sys.executable, "-m", "pytest", "tests"]
+        assert runtime.recognized_inner_probe(argv, cwd=tmp_path, environment=environment) is None
+        result = runtime.probe_inner_launcher(argv, cwd=tmp_path, environment=environment)
+        assert result.state == "unknown", argv_prefix
+        assert "unrecognized" in result.diagnostic
+    assert calls == []
+
+
+@requires_system_env
+def test_symlinked_env_is_bound_to_canonical_system_env(tmp_path, monkeypatch, no_ambient_invocation):
+    # A mutable alias (an absolute symlink, or a bare ``env`` found through a
+    # user-writable PATH symlink) may be recognized, but the verified result
+    # binds the launch to the canonical root-protected ``env`` so swapping
+    # the alias after the probe cannot change what actually runs.
+    monkeypatch.setattr(
+        runtime,
+        "_run_bounded_probe",
+        lambda argv, **kwargs: type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})(),
+    )
+    alias_dir = tmp_path / "alias-bin"
+    alias_dir.mkdir()
+    alias = alias_dir / "env"
+    alias.symlink_to(_SYSTEM_ENV)
+    shadowed = {**os.environ, "PATH": f"{alias_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
+    for token, environment in ((str(alias), None), ("env", shadowed)):
+        runtime._INNER_PREFLIGHT_CACHE.clear()
+        argv = [token, "PYTHONPATH=x", sys.executable, "-m", "pytest", "tests"]
+        result = runtime.probe_inner_launcher(argv, cwd=tmp_path, environment=environment)
+        assert result.state == "verified", token
+        assert result.candidate == tuple(argv)
+        assert result.launch_argv == (_SYSTEM_ENV, *argv[1:])
+
+
+def test_unprotected_env_install_is_not_trusted(tmp_path, monkeypatch):
+    fake_env = tmp_path / "usr" / "bin" / "env"
+    fake_env.parent.mkdir(parents=True)
+    fake_env.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_env.chmod(0o755)
+    monkeypatch.setattr(runtime, "_TRUSTED_ENV_PATHS", (fake_env,))
+    # Same file as the "trusted" path, but its chain is user-owned.
+    assert runtime._trusted_env_executable(str(fake_env), environment=os.environ) is None
+
+
+def test_unprefixed_launcher_has_no_launch_rebinding(tmp_path, monkeypatch, no_ambient_invocation):
+    monkeypatch.setattr(
+        runtime,
+        "_run_bounded_probe",
+        lambda argv, **kwargs: type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})(),
+    )
+    result = runtime.probe_inner_launcher([sys.executable, "-m", "pytest", "tests"], cwd=tmp_path)
+    assert result.state == "verified"
+    assert result.launch_argv == ()
+
+
+@requires_system_env
+def test_cached_env_probe_binds_launch_to_current_command(tmp_path, monkeypatch):
+    # The per-invocation cache is keyed by launcher identity, not by pytest's
+    # selectors; a cache hit must launch and report the current command.
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    environment = {**os.environ, "AGENT_LOOP_INVOCATION_ID": "inv-964-selectors"}
+    first = ["env", "X=1", sys.executable, "-m", "pytest", "tests/a"]
+    second = ["env", "X=1", sys.executable, "-m", "pytest", "tests/b"]
+    first_result = runtime.probe_inner_launcher(
+        first, cwd=tmp_path, environment=environment, environment_is_complete=True
+    )
+    second_result = runtime.probe_inner_launcher(
+        second, cwd=tmp_path, environment=environment, environment_is_complete=True
+    )
+    assert len(calls) == 1  # the second probe is a cache hit
+    assert first_result.launch_argv == (_SYSTEM_ENV, *first[1:])
+    assert second_result.state == "verified"
+    assert second_result.candidate == tuple(second)
+    assert second_result.launch_argv == (_SYSTEM_ENV, *second[1:])
+    assert all(entry.launch_argv == () for entry in runtime._INNER_PREFLIGHT_CACHE.values())
+
+
+@requires_system_env
+def test_foreground_runs_under_shared_invocation_spawn_their_own_selectors(tmp_path, monkeypatch):
+    from coding_review_agent_loop import runner as runner_module
+
+    for name in ("a", "b"):
+        (tmp_path / f"test_{name}.py").write_text(
+            f"def test_{name}():\n    print('RAN-{name.upper()}')\n", encoding="utf-8"
+        )
+    spawned = []
+    real_popen = runner_module.subprocess.Popen
+
+    def recording_popen(argv, *args, **kwargs):
+        spawned.append(list(argv))
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inv-964-foreground")
+    results = []
+    for name in ("a", "b"):
+        cmd = [
+            "env", "X=1", sys.executable, "-m", "pytest", f"test_{name}.py",
+            "-q", "-s", "-p", "no:cacheprovider",
+        ]
+        results.append(
+            runner_module.run_foreground_test(cmd, cwd=tmp_path, timeout_seconds=60, echo_output=False)
+        )
+
+    assert [result.suite_start for result in results] == ["verified", "verified"]
+    # Ignore the bounded ``--version`` probes; keep only the real targets.
+    targets = [argv for argv in spawned if argv[0] == _SYSTEM_ENV]
+    assert [argv[5] for argv in targets] == ["test_a.py", "test_b.py"]
+    assert "RAN-B" in results[1].output_tail
+    assert "RAN-A" not in results[1].output_tail
+
+
+@requires_system_env
+def test_foreground_run_spawns_authenticated_env_after_alias_swap(tmp_path, monkeypatch, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    alias_dir = tmp_path / "alias-bin"
+    alias_dir.mkdir()
+    alias = alias_dir / "env"
+    alias.symlink_to(_SYSTEM_ENV)
+    original_probe = runner_module.probe_inner_launcher
+
+    def probe_then_swap(*args, **kwargs):
+        result = original_probe(*args, **kwargs)
+        # Replace the authenticated alias with a no-op lookalike.
+        alias.unlink()
+        alias.write_text("#!/bin/sh\necho FAKE-ENV\nexit 0\n", encoding="utf-8")
+        alias.chmod(0o755)
+        return result
+
+    monkeypatch.setattr(runner_module, "probe_inner_launcher", probe_then_swap)
+    cmd = [str(alias), "AGENT_LOOP_964_MARK=1", sys.executable, "-m", "pytest", "--version"]
+    result = runner_module.run_foreground_test(cmd, cwd=tmp_path, timeout_seconds=60, echo_output=False)
+
+    assert result.suite_start == "verified"
+    assert result.args == cmd
+    assert result.passed
+    assert "FAKE-ENV" not in result.output_tail
+    assert "pytest" in result.output_tail
+
+
 def test_non_python_m_pytest_command_is_not_spawned_by_preflight(tmp_path, monkeypatch):
     calls = []
     non_python = tmp_path / "repo-script"
@@ -1378,3 +1645,303 @@ def test_report_side_consumers_pass_the_launcher_opt_in_explicitly():
 
     signature = inspect.signature(runtime.parse_managed_test_invocation)
     assert signature.parameters["allow_command_name_launcher"].default is False
+
+
+# ---------------------------------------------------------------------------
+# Parallel test-worker budget (issue #848)
+# ---------------------------------------------------------------------------
+
+try:  # pragma: no cover - depends on the dev extra
+    import xdist as _xdist  # noqa: F401
+
+    _HAS_XDIST = True
+except ImportError:  # pragma: no cover
+    _HAS_XDIST = False
+
+needs_xdist = pytest.mark.skipif(not _HAS_XDIST, reason="pytest-xdist is not installed")
+
+_WORKER_TESTS = "def test_one():\n    pass\n\ndef test_two():\n    pass\n\ndef test_three():\n    pass\n"
+
+
+def _worker_project(tmp_path: Path, files: dict[str, str] | None = None) -> Path:
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "test_cases.py").write_text(_WORKER_TESTS, encoding="utf-8")
+    for name, text in (files or {}).items():
+        (project / name).write_text(text, encoding="utf-8")
+    return project
+
+
+@pytest.fixture
+def worker_cli(tmp_path, monkeypatch):
+    for name in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_XDIST_AUTO_NUM_WORKERS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", f"worker-cli-{os.getpid()}-{time.monotonic_ns()}")
+    project = _worker_project(tmp_path)
+    monkeypatch.chdir(project)
+    return project
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--test-workers", "2", "--test-worker-memory", "2G", "--test-worker-enforcement=refuse"],
+        ["--test-workers=2", "--test-worker-memory=2G", "--test-worker-enforcement", "refuse"],
+    ],
+)
+def test_managed_invocation_accepts_worker_flags(tmp_path, flags):
+    from coding_review_agent_loop.test_workers import parse_worker_memory
+
+    argv = [
+        "/usr/local/bin/agent-loop", "run-tests", *flags, "--timeout-seconds", "60", "--",
+        "pytest", "-n", "4",
+    ]
+    parsed = runtime.parse_managed_test_invocation(argv)
+    assert parsed.inner_argv == ("pytest", "-n", "4")
+    assert parsed.test_workers == 2
+    assert parsed.test_worker_memory == parse_worker_memory("2G")
+    assert parsed.test_worker_enforcement == "refuse"
+    assert parsed.timeout_seconds == 60
+    assert runtime.normalize_test_command(argv, cwd=tmp_path) == runtime.normalize_test_command(
+        ["pytest", "-n", "4"], cwd=tmp_path
+    )
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--test-workers", "2", "--test-workers", "3"],
+        ["--test-workers", "0"],
+        ["--test-worker-memory", "max"],
+        ["--test-worker-enforcement", "sometimes"],
+    ],
+)
+def test_managed_invocation_rejects_bad_worker_flags(flags):
+    with pytest.raises(runtime.TestRuntimeConfigurationError):
+        runtime.parse_managed_test_invocation(["/usr/bin/agent-loop", "run-tests", *flags, "--", "pytest"])
+
+
+def test_cli_parser_validates_worker_flags():
+    parser = build_parser()
+    args = parser.parse_args(["run-tests", "--test-workers", "3", "--test-worker-enforcement", "off", "--", "pytest"])
+    assert args.test_workers == 3 and args.test_worker_enforcement == "off"
+    for bad in (["--test-workers", "0"], ["--test-workers", "x"], ["--test-worker-memory", "max"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["run-tests", *bad, "--", "pytest"])
+
+
+def test_loop_flow_worker_override_reaches_config_and_runner(tmp_path):
+    from coding_review_agent_loop.config import config_from_args
+    from coding_review_agent_loop.runner import Runner
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "issue", "1", "--repo", "o/r", "--test-workers", "8", "--test-worker-enforcement", "refuse",
+    ])
+    assert args.test_workers == 8
+    runner = Runner(dry_run=True)
+    config = config_from_args(args, runner, invocation_argv=("agent-loop",))
+    runner.configure_from_config(config)
+    assert runner.test_workers == 8 and runner.test_worker_enforcement == "refuse"
+    assert runner.derive_worker_budget(None).workers == 8
+    assert runner.derive_worker_budget(None).source == "operator"
+
+
+def test_cli_same_command_contends_for_one_lane_across_modes(tmp_path, monkeypatch):
+    from coding_review_agent_loop.test_workers import worker_lane_identity
+
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "lane-mode-test")
+    held_command = [sys.executable, "-m", "pytest", "-n", "8", "tests/"]
+    lock = runtime.acquire_command_lane(
+        held_command, cwd=tmp_path, env=os.environ,
+        identity=worker_lane_identity(held_command, cwd=tmp_path),
+    )
+    assert lock is not None
+    try:
+        for mode in ("off", "clamp", "refuse"):
+            for spelling in (["-n", "12"], ["--numprocesses=12"], ["-n", "auto"], []):
+                assert main([
+                    "run-tests", "--test-worker-enforcement", mode, "--memory-dir", str(memory), "--",
+                    sys.executable, "-m", "pytest", *spelling, "tests/",
+                ]) == runtime.OVERLAP_REJECTED_EXIT_CODE
+    finally:
+        lock.close()
+    assert runtime.load_runtime_memory(memory) == []
+
+
+def test_cli_worker_budget_busy_records_nothing(tmp_path, monkeypatch):
+    from coding_review_agent_loop.test_workers import WorkerBudgetLock
+
+    memory = tmp_path / "memory"
+    marker = tmp_path / "spawned"
+    monkeypatch.chdir(tmp_path)
+    invocation = f"busy-{os.getpid()}-{time.monotonic_ns()}"
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", invocation)
+    held, _ = WorkerBudgetLock.acquire(invocation_id=invocation, cwd=tmp_path)
+    assert held is not None
+    try:
+        for command in (
+            [sys.executable, "-c", f"open({str(marker)!r}, 'w')"],
+            ["sh", "-c", f"touch {marker}"],
+        ):
+            assert main(["run-tests", "--memory-dir", str(memory), "--", *command]) == 125
+        # Off mode takes no worker-budget lock.
+        assert main([
+            "run-tests", "--test-worker-enforcement", "off", "--memory-dir", str(memory), "--",
+            sys.executable, "-c", "pass",
+        ]) == 0
+    finally:
+        held.close()
+    assert not marker.exists()
+    rows = runtime.load_runtime_memory(memory)
+    assert len(rows) == 1 and rows[0]["worker_enforcement"] == "off"
+    assert main(["run-tests", "--memory-dir", str(memory), "--", sys.executable, "-c", "pass"]) == 0
+
+
+def test_cli_inherited_budget_is_only_lowered(tmp_path, monkeypatch, capsys):
+    from coding_review_agent_loop import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKERS", "4")
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_ENFORCEMENT", "clamp")
+    args = build_parser().parse_args(["run-tests", "--test-workers", "8", "--test-worker-enforcement", "off", "--", "x"])
+    resolved = cli_module._resolve_run_tests_worker_budget(args, broker_present=False)
+    assert resolved.budget.workers <= 4 and resolved.budget.enforcement == "clamp"
+    args = build_parser().parse_args(["run-tests", "--test-workers", "2", "--test-worker-enforcement", "refuse", "--", "x"])
+    resolved = cli_module._resolve_run_tests_worker_budget(args, broker_present=False)
+    assert resolved.budget.workers == 2 and resolved.budget.enforcement == "refuse"
+    monkeypatch.delenv("AGENT_LOOP_TEST_WORKERS")
+    monkeypatch.delenv("AGENT_LOOP_TEST_WORKER_ENFORCEMENT")
+    args = build_parser().parse_args(["run-tests", "--test-workers", "64", "--", "x"])
+    standalone = cli_module._resolve_run_tests_worker_budget(args, broker_present=False)
+    assert standalone.budget.workers == 64 and standalone.budget.source == "operator"
+
+
+def test_cli_other_command_records_not_observed(tmp_path, monkeypatch):
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+    assert main(["run-tests", "--memory-dir", str(memory), "--", sys.executable, "-c", "pass"]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "unknown"
+    assert row["worker_enforcement"] == "not-observed"
+    assert "worker-budget-not-observed" in row["caveats"]
+    assert row["executed_argv"] == [sys.executable, "-c", "pass"]
+
+
+def test_legacy_and_unknown_rows_never_feed_serial_or_count_recommendations(tmp_path):
+    memory = tmp_path / "memory"
+    for argv in (["pytest", "-n", "0"], ["pytest", "-n", "4"], ["pytest", "-n", "8", "--maxprocesses=2"], ["pytest"]):
+        _record(memory, tmp_path, argv, outcome="passed", elapsed=400)
+    rows = runtime.load_runtime_memory(memory)
+    assert {row["workers"] for row in rows} == {"unknown"}
+    for argv, label in ((["pytest", "-n", "4"], "4"), (["pytest", "-n", "0"], "serial")):
+        recommendation = runtime.recommend_timeout(
+            memory, argv=argv, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now(), workers=label,
+        )
+        assert recommendation.successful_samples == 0
+    # Serial and parallel samples of one command never blend.
+    command = ["pytest", "tests/"]
+    for elapsed, label in ((100, "serial"), (110, "serial"), (30, "2")):
+        assert runtime.record_test_observation(
+            memory, argv=command, cwd=tmp_path, outcome="passed", elapsed_seconds=elapsed,
+            attempted_timeout_seconds=1800, policy_ceiling_seconds=1800, commit="abc",
+            timestamp=_now(), workers=label,
+        )
+    serial = runtime.recommend_timeout(memory, argv=command, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now(), workers="serial")
+    parallel = runtime.recommend_timeout(memory, argv=command, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now(), workers="2")
+    assert serial.successful_samples == 2 and parallel.successful_samples == 1
+    assert parallel.median_seconds == 30
+
+
+@needs_xdist
+def test_cli_local_clamp_records_report_cohort(worker_cli, tmp_path, capsys):
+    memory = tmp_path / "memory"
+    command = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "--numprocesses=12"]
+    assert main(["run-tests", "--test-workers", "2", "--memory-dir", str(memory), "--", *command]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "2"
+    assert row["worker_enforcement"] == "clamped"
+    assert "_agent_loop_worker_cap" in row["executed_argv"]
+    assert "_agent_loop_worker_cap" not in row["normalized_command"]
+    assert row["normalized_command"] == runtime.normalize_test_command(command, cwd=worker_cli)
+    captured = capsys.readouterr()
+    assert "clamped worker request 12" in captured.err
+    assert "top-level runner" in captured.err
+
+
+@needs_xdist
+def test_cli_local_direct_refusal_records_nothing(worker_cli, tmp_path):
+    memory = tmp_path / "memory"
+    assert main([
+        "run-tests", "--test-workers", "2", "--test-worker-enforcement", "refuse", "--memory-dir", str(memory),
+        "--", sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", "8",
+    ]) == 2
+    assert runtime.load_runtime_memory(memory) == []
+    assert runtime.load_launcher_health(memory) == []
+    assert main([
+        "run-tests", "--test-workers", "2", "--test-worker-enforcement", "refuse", "--memory-dir", str(memory),
+        "--", sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", "8", "--maxprocesses=2",
+    ]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "2" and row["worker_enforcement"] == "unchanged"
+
+
+@needs_xdist
+def test_cli_local_unverified_when_repository_unregisters_plugin(tmp_path, monkeypatch):
+    for name in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_XDIST_AUTO_NUM_WORKERS"):
+        monkeypatch.delenv(name, raising=False)
+    project = _worker_project(tmp_path, {
+        "conftest.py": (
+            "def pytest_configure(config):\n"
+            "    plugin = config.pluginmanager.get_plugin('_agent_loop_worker_cap')\n"
+            "    config.pluginmanager.unregister(plugin)\n"
+        ),
+    })
+    monkeypatch.chdir(project)
+    memory = tmp_path / "memory"
+    assert main([
+        "run-tests", "--test-workers", "2", "--memory-dir", str(memory),
+        "--", sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", "2",
+    ]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "unknown"
+    assert row["worker_enforcement"] == "unverified"
+    assert "worker-budget-unverified" in row["caveats"]
+
+
+@needs_xdist
+def test_cli_other_script_refused_session_keeps_status_and_evidence(worker_cli, tmp_path):
+    memory = tmp_path / "memory"
+    script = tmp_path / "run.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"{sys.executable} -m pytest -p no:cacheprovider -q -n 1\n"
+        f"{sys.executable} -m pytest -p no:cacheprovider -q -n 8\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    assert main([
+        "run-tests", "--test-workers", "2", "--test-worker-enforcement", "refuse",
+        "--memory-dir", str(memory), "--", str(script),
+    ]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "unknown"
+    assert row["worker_enforcement"] == "refused-in-command"
+    assert "worker-budget-refused-session" in row["caveats"]
+
+
+@needs_xdist
+def test_cli_off_mode_labels_only_proven_serial(worker_cli, tmp_path):
+    memory = tmp_path / "memory"
+    base = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q"]
+    assert main(["run-tests", "--test-worker-enforcement", "off", "--memory-dir", str(memory), "--", *base, "-n", "2"]) == 0
+    assert main(["run-tests", "--test-worker-enforcement", "off", "--memory-dir", str(memory), "--", *base, "-p", "no:xdist"]) == 0
+    labels = {
+        row["normalized_command"].rsplit(" ", 2)[-2:][0] + " " + row["normalized_command"].rsplit(" ", 1)[-1]: row["workers"]
+        for row in runtime.load_runtime_memory(memory)
+    }
+    assert labels == {"-n 2": "unknown", "-p no:xdist": "serial"}
+    assert {row["worker_enforcement"] for row in runtime.load_runtime_memory(memory)} == {"off"}

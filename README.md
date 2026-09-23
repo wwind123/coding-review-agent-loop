@@ -103,8 +103,9 @@ replace provider subscriptions.
 ### Managed CI in this repository
 
 This repository's `.github/workflows/ci.yml` installs the managed-CI v2
-contract with the literal `AGENT_LOOP_MANAGED_CI_V2` and
-`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` declarations. Pull requests use
+contract with the literal `AGENT_LOOP_MANAGED_CI_V2`,
+`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1`, and
+`AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1` declarations. Pull requests use
 exactly four activities: `opened`, `synchronize`, `reopened`, and `unlabeled`.
 Only a trusted, same-repository draft on the reserved
 `agent-loop/managed-*` branch can suppress intermediate CI: opening is
@@ -458,9 +459,162 @@ readiness fields and approved-parent provenance; it does not infer readiness
 from issue size or file count. A direct child uses the parent stage contract
 without duplicate planning. A planning-required child records its route first,
 then must run with `--plan-first` and complete its own reviewed plan before
-implementation. Recorded routes survive reruns and cannot be switched with CLI
+implementation. That child plan may refine or strengthen the risk-matrix rows it
+inherits from the parent but may not weaken them; weakening is caught and
+replanned during child planning rather than after implementation. Recorded
+routes survive reruns and cannot be switched with CLI
 flags. See the detailed
 [child execution disposition contract](docs/local_agent_loop.md#child-execution-dispositions).
+
+### Re-planning an approved child plan
+
+An approved child plan can stop satisfying the inherited-matrix contract, most
+often because the contract tightened after the plan was approved. The failure
+always names a supported route, and which route depends on how far the child
+got:
+
+1. **No implementation handoff yet.** Rerun the same `--plan-first` command.
+   The loop posts one audit comment, sends the approved plan back to the
+   planner with the field-level diagnostic, mechanically rechecks the revision
+   before it is posted, and has the complete reviewer board review it. No
+   signed record is needed, because nothing is bound to the plan yet.
+2. **A handoff and an open PR already exist.** The plan can only be re-planned
+   under a signed human authorization. Without it the run stops before any
+   agent turn and prints this record pre-filled for the child. Post it as a
+   comment on the **child** issue, then rerun
+   `agent-loop issue <child> --plan-first --plan-execution-mode auto`:
+
+````markdown
+Child plan supersession:
+
+```json
+{
+  "child_issue": 925,
+  "kind": "child-plan-supersession",
+  "parent_issue": 924,
+  "rationale": "Approved before the inherited-matrix contract tightened.",
+  "schema_version": 1,
+  "stage_id": "stage-1",
+  "superseded_plan_hash": "<16-hex plan hash printed by the diagnostic>"
+}
+```
+-- Human Reviewer
+````
+
+   The child is re-planned, and once the revision is approved the **same PR**
+   is rebound to the new plan hash by one issue comment. No second PR is
+   opened, no implementation turn runs, nothing is written on the PR, and
+   reviewer approvals recorded before the rebind do not count under the new
+   plan. `agent-loop pr <n>` never re-plans or rebinds; on an inadmissible
+   binding it fails closed and prints the same route.
+
+**Deliberate re-plan of an admissible plan.** The same signed record also
+authorizes replacing a bound child plan that is still admissible, for example
+a human-approved scope reduction. The record is consulted for every bound plan,
+not only an inadmissible one: post it naming the bound plan hash (printed in the
+`plan_hash=` log line) with the reason as `rationale`, then rerun
+`agent-loop issue <child> --plan-first --plan-execution-mode auto`. The planner
+receives the rationale, reviewer approval of the superseded plan never approves
+it again, and the revision is rebound to the same PR as above. While such a
+record is pending, `agent-loop pr <n>` stops before any reviewer runs and prints
+the issue-mode rerun command instead of reviewing the PR against a scope no
+plan approved. The check is repeated on the freshly fetched child issue before
+every approval or merge, so a record posted during review also stops the run.
+A PR follow-up coder turn that leaves the head unchanged twice in a row stops the
+run with a human-review error instead of re-reviewing an identical diff.
+
+Rules: keep exactly one signed record per superseded plan hash (two distinct
+records for one hash always stop for a human decision; records are never
+chosen by comment order), and leave the record in place afterwards because the
+rebound PR re-verifies it on every run. Re-planning continues the child's
+existing round numbering, so raise `--max-rounds` if the budget is exhausted.
+Abandoning or replacing the existing PR, re-planning direct-implementation or
+non-child issues, revising the parent plan, and any unsigned or flag-only
+bypass are not supported.
+
+**Migration note.** When the inherited-matrix contract tightens, children
+approved under the looser contract are reported as inadmissible the next time
+the loop touches them. That is expected: follow the route above rather than
+hand-editing issue records. See
+[the detailed contract](docs/local_agent_loop.md#re-planning-an-approved-child-plan).
+
+### Removing an unavailable reviewer from an in-flight run
+
+A persisted scheduler contract (the required reviewer board, the policy, and
+the primary) is immutable for the run. If one reviewer's backend becomes
+unavailable, for example because its quota is exhausted, rerunning without that
+reviewer stops with the contract-drift error. That error now also prints a
+filled-in **signed reviewer-board amendment** record. A human operator posts it
+to record a deliberate, audited reduction of the board:
+
+````markdown
+Reviewer board amendment:
+
+```json
+{
+  "effective_from_round": 3,
+  "flow": "plan",
+  "issue": 942,
+  "kind": "reviewer-board-amendment",
+  "original_required_reviewers": [
+    "Codex",
+    "Claude",
+    "Antigravity"
+  ],
+  "policy": "primary-then-panel",
+  "pr_number": null,
+  "primary_reviewer": "Codex",
+  "rationale": "Antigravity weekly quota exhausted.",
+  "reason": "backend-unavailable",
+  "removed_reviewers": [
+    "Antigravity"
+  ],
+  "schema_version": 1
+}
+```
+-- Human Reviewer
+````
+
+- **Where to post it.** Post a `plan` record (`issue` set, `pr_number` null)
+  on the issue being planned. Post a `pr` record (`pr_number` set, `issue`
+  null) on the PR itself, including standalone `agent-loop pr` runs. A record
+  on the wrong surface, a record naming another issue or PR, and a `pr` record
+  on the owning issue all stop for a human decision.
+- **Choosing `effective_from_round`.** Use the round number the drift error
+  prints. That is the round the resume re-enters, whether the round is only
+  partly recorded or already reconciled, and it is not always the latest
+  visible round number. Any other value stops before any agent turn or comment
+  and prints the corrected template.
+- **Retroactive use.** The record rescues runs whose contract was persisted
+  before this feature existed. Earlier rounds are never rewritten. Inside the
+  re-entered round, reviews already posted by the remaining reviewers are
+  reused, and the removed reviewer is never invoked again.
+- **What stays immutable.** `policy` and `primary_reviewer` must match the
+  persisted contract. The primary cannot be removed, and a `primary-then-panel`
+  board must keep at least one secondary. Re-adding a removed reviewer is
+  contract drift. Every scheduler record posted after the amendment carries the
+  amended board and the record's digest; any other contract fails closed, and
+  at PR qualification it refuses the merge. Amendments can chain, with each
+  record's `original_required_reviewers` equal to the previous amended board.
+  Two different records that amend the same board always stop for a human
+  decision.
+- **Findings and approvals.** An active finding whose only pending owner was
+  removed is reassigned to the primary, or to every remaining reviewer when
+  there is no primary. It stays blocking until a new owner clears it; nothing
+  is auto-cleared. Approvals the removed reviewer already gave remain in the
+  history but are no longer required. The run posts one audit comment naming
+  the record, the activation round, and every reassignment. Scheduler audits,
+  completion messages, and (for PR runs, on every completion path including
+  managed CI) one plain completion comment on the PR note that the run
+  finished on a reduced board. The activation round always posts a fresh
+  scheduler checkpoint carrying the amended board and digest, even when every
+  remaining reviewer's review is reused.
+- Unsigned or malformed records are ignored with a logged diagnostic. A comment
+  that contains only the record is not treated as a signed human requirement.
+  All-reviewers PR runs and the non-staged plan path persist no contract, so
+  there you change the reviewer flags directly and must not post a record.
+
+See [the detailed contract](docs/local_agent_loop.md#removing-an-unavailable-reviewer-from-an-in-flight-run).
 
 ### Approved follow-up dedupe
 
@@ -689,6 +843,18 @@ opt-in and does not change the default or the CI/merge gates. Use
 independent severity-weighted coverage before any proposal to change the
 default; measurements without verified provenance are reported as unavailable.
 
+PR and plan reviewers are prompted to review exhaustively: every independently
+substantiated defect on the reviewed head or plan is reported in one response,
+defects in the same function or path are enumerated together, and a defect that
+genuinely masks what lies behind it is disclosed in the finding text and
+summary. `review-evaluation` measures that contract with an optional per-run
+`review_contract` label (`first-finding-permitted` or `exhaustive`) plus
+`review_contract_provenance`, and reports rounds, reviewer calls, and escaped
+defects per run side by side within each flow and scheduling policy, never
+pooled across policies. Real runs are frozen only into
+`docs/evaluation/review_contract_runs.json`; see
+[review contract comparison](docs/local_agent_loop.md#review-contract-comparison).
+
 ### Staged issue plan review
 
 The same staged idea is available for issue plan review, selected independently
@@ -709,8 +875,10 @@ approve the exact final plan. Because each phase advance costs a planning round,
 raise `--max-rounds` when enabling it. `--plan-review-force-full` authorizes the
 complete plan board and recovers the two ownership-ambiguity diagnostics; it
 cannot recover an unreadable planning history. Omitting the flags keeps today's
-full-board planning behavior unchanged, and discussion-mode and child-planning
-cycles always stay full-board. `review-evaluation` reports planning runs in
+full-board planning behavior unchanged, and discussion-mode cycles always stay
+full-board. A child-planning cycle inherits `--plan-review-policy` and
+`--primary-plan-reviewer` but never the parent's `--plan-review-force-full`
+override or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board
 planning can be compared on calls, tokens, latency, overlap, severity-weighted
 marginal findings, and escaped plan defects before any proposal to change the
@@ -772,6 +940,18 @@ runs produce advisory median/p95 recommendations with headroom; timeouts remain
 lower-bound evidence and are never treated as successful durations. Data is
 best-effort, retained to 20 samples per command/fingerprint cohort and 200
 cohorts, and becomes stale after 30 days or when relevant inputs change.
+Cohorts also key on the worker count, so serial and parallel durations never
+blend.
+
+`run-tests`, `containment-preflight` and the loop flows accept
+`--test-workers N`, `--test-worker-memory SIZE` and
+`--test-worker-enforcement {clamp,refuse,off}`. Coder and repair agents receive
+a containment-derived budget in `AGENT_LOOP_TEST_WORKERS`; in the default
+`clamp` mode an injected pytest plugin lowers over-budget pytest-xdist requests
+(`-n auto`, `-n 16`, config or `PYTEST_ADDOPTS`) to that budget, `refuse` rejects
+them before any test runs, and `off` only advertises the budget. See
+[Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
+
 Remembered commands are suggestions only: agents must inspect the checkout and
 select focused tests. Framework per-test limits, the wrapper whole-command
 watchdog, and the backend whole-turn timeout are separate. The backend turn

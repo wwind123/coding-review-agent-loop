@@ -12649,3 +12649,607 @@ def test_pr_fresh_authorization_without_parent_context_still_fails_closed(tmp_pa
         match="could not recover the canonical approved plan for the explicit issue scope",
     ):
         run_pr_loop(_managed_resume_runner(), pr_number=77, config=config)
+
+
+# --- #959: delta-rendered coder matrix evidence ----------------------------
+
+from coding_review_agent_loop.round_transport import (  # noqa: E402
+    decode_mapping,
+    encode_mapping,
+)
+
+_EVIDENCE_HEADING_959 = "### Risk-based mode and transition test matrix evidence"
+
+
+def _coder_records_959(runner):
+    records = []
+    for item in runner.pr_payload.get("comments", []):
+        body = item.get("body") if isinstance(item, dict) else None
+        if not isinstance(body, str) or "AGENT_LOOP_META: " not in body:
+            continue
+        metadata = orchestrator._decode_round_metadata(
+            body.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+        )
+        if metadata.role == "coder":
+            records.append((body, metadata))
+    return records
+
+
+def _blocking_reviews_959(count):
+    reviews = [
+        structured_pr_review(state="blocking", blocking_items=["Exercise the follow-up row."])
+    ]
+    for _ in range(count - 1):
+        reviews.append(structured_pr_review(
+            state="blocking",
+            prior_item_dispositions=[{
+                "item_id": "item-1", "disposition": "blocking", "note": "Still open.",
+            }],
+        ))
+    reviews.append(structured_pr_review(
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    ))
+    return reviews
+
+
+def test_959_in_process_coder_rounds_render_full_then_deltas_with_stable_anchor(tmp_path):
+    plan_context = _followup_matrix_context()
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"], summary=f"Round {n}.")
+            for n in (1, 2, 3)
+        ],
+        codex_outputs=_blocking_reviews_959(3),
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=4)
+    spy_calls = []
+    real_resolve = orchestrator.resolve_matrix_evidence_render
+
+    def spy(current, previous, current_round):
+        decision = real_resolve(current, previous, current_round)
+        spy_calls.append((previous, current_round, decision))
+        return decision
+
+    with patch.object(orchestrator, "resolve_matrix_evidence_render", spy):
+        assert run_pr_loop(
+            runner, pr_number=77, config=config, approved_plan_context=plan_context
+        ) == 0
+
+    records = _coder_records_959(runner)
+    assert len(records) == 3
+    (first_body, first), (second_body, second), (third_body, third) = records
+    # The establishing round renders every row and anchors to its own record.
+    assert first.risk_test_matrix_evidence_full_round == first.round_number
+    assert first.risk_test_matrix_evidence_full_round_status == "valid"
+    assert "<summary>Full matrix evidence (1 row)</summary>" in first_body
+    assert "**followup-derived-evidence**" in first_body
+    assert [call[1] for call in spy_calls] == [
+        first.round_number, second.round_number, third.round_number
+    ]
+    # The in-process record reused as previous metadata is valid by construction.
+    assert spy_calls[1][0].risk_test_matrix_evidence_full_round_status == "valid"
+    for body, record, previous in ((second_body, second, first), (third_body, third, second)):
+        assert record.risk_test_matrix_evidence_full_round == first.round_number
+        assert record.risk_test_matrix_evidence is not None
+        assert len(record.risk_test_matrix_evidence["rows"]) == 1
+        assert "**followup-derived-evidence**" not in body
+        assert (
+            f"1 row unchanged since round {previous.round_number}; "
+            f"full matrix in round {first.round_number}."
+        ) in body
+        assert "<details>" in body and body.index(_EVIDENCE_HEADING_959) < body.index("<details>")
+
+
+def _seeded_resume_runner_959(plan_context, *, anchor_mutation=None, full_round=None):
+    carried_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="OpenAI Codex",
+        source_round=1,
+        text="Exercise follow-up evidence derivation.",
+        status="blocking",
+        source_status="blocking",
+    )
+    raw_coder = structured_coder_followup(addressed_items=["item-1"], summary="Seeded.")
+    parsed_coder = validate_structured_coder_followup(raw_coder)
+    evidence = {
+        "matrix_identity": plan_context.risk_test_matrix_identity,
+        "rows": [{
+            "row_id": "followup-derived-evidence",
+            "status": "missing",
+            "test_identifiers": [],
+            "test_locations": [],
+            "workflow_path_claim": "Seeded legacy evidence.",
+            "outcome_assertions": [],
+            "forbidden_effect_assertions": [],
+            "evidence_citations": [],
+            "caveats": [],
+        }],
+    }
+    extra = {}
+    if full_round is not None:
+        extra["risk_test_matrix_evidence_full_round"] = full_round
+    coder_comment = _attach_round_metadata(
+        _render_public_coder_followup_comment(
+            parsed_coder, agent="Claude", prior_items=(carried_item,)
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="abc123",
+            prior_items=(carried_item,),
+            raw_structured_coder_response=raw_coder,
+            risk_test_matrix_evidence=evidence,
+            **extra,
+        ),
+    )
+    if anchor_mutation is not None:
+        encoded = coder_comment.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+        payload = decode_mapping(encoded)
+        payload["risk_test_matrix_evidence_full_round"] = anchor_mutation
+        coder_comment = coder_comment.replace(encoded, encode_mapping(payload))
+    review_comment = _attach_round_metadata(
+        structured_pr_review(
+            state="blocking",
+            prior_item_dispositions=[
+                {"item_id": "item-1", "disposition": "blocking", "note": "Still open."}
+            ],
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="abc123",
+            prior_items=(carried_item,),
+            dispositions=(
+                ReviewItemDisposition("item-1", "OpenAI Codex", "blocking", "Still open."),
+            ),
+            state="blocking",
+        ),
+    )
+    return FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"], summary="Resumed follow-up.")
+        ],
+        # Resume re-reviews first, so every review carries the item-1 disposition.
+        codex_outputs=_blocking_reviews_959(2)[1:],
+        pr_payload={
+            "headRefOid": "abc123",
+            "comments": [
+                {"author": {"login": "bot"}, "createdAt": "2026-06-01T00:00:00Z", "body": coder_comment},
+                {"author": {"login": "bot"}, "createdAt": "2026-06-01T00:01:00Z", "body": review_comment},
+            ],
+        },
+    )
+
+
+def test_959_resume_from_legacy_coder_record_anchors_to_its_round(tmp_path):
+    plan_context = _followup_matrix_context()
+    runner = _seeded_resume_runner_959(plan_context)
+    seeded = _coder_records_959(runner)[0][1]
+    assert seeded.risk_test_matrix_evidence_full_round_status == "absent"
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3),
+        approved_plan_context=plan_context,
+    ) == 0
+
+    records = _coder_records_959(runner)
+    assert len(records) >= 2
+    body, posted = records[-1]
+    assert posted.round_number > seeded.round_number
+    assert posted.risk_test_matrix_evidence_full_round == seeded.round_number
+    assert posted.risk_test_matrix_evidence_full_round_status == "valid"
+    assert f"full matrix in round {seeded.round_number}." in body
+    assert f"unchanged since round {seeded.round_number}" in body
+    assert posted.risk_test_matrix_evidence is not None
+    assert len(posted.risk_test_matrix_evidence["rows"]) == 1
+
+
+@pytest.mark.parametrize(
+    "seed", [{"anchor_mutation": "bogus"}, {"anchor_mutation": 0}, {"full_round": 5}],
+    ids=["invalid-string", "invalid-zero", "future"],
+)
+def test_959_unusable_prior_anchor_posts_full_comment_anchored_to_own_record(tmp_path, seed):
+    plan_context = _followup_matrix_context()
+    runner = _seeded_resume_runner_959(plan_context, **seed)
+    seeded = _coder_records_959(runner)[0][1]
+    if "anchor_mutation" in seed:
+        assert seeded.risk_test_matrix_evidence_full_round_status == "invalid"
+    else:
+        assert seeded.risk_test_matrix_evidence_full_round > seeded.round_number
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3),
+        approved_plan_context=plan_context,
+    ) == 0
+
+    body, posted = _coder_records_959(runner)[-1]
+    assert posted.round_number > seeded.round_number
+    assert posted.risk_test_matrix_evidence_full_round == posted.round_number
+    assert "<summary>Full matrix evidence (1 row)</summary>" in body
+    assert "**followup-derived-evidence**" in body
+    assert "unchanged since round" not in body
+
+
+def test_959_followup_without_evidence_posts_no_section_then_full_on_evidence(tmp_path):
+    plan_context = _followup_matrix_context()
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"], summary=f"Round {n}.")
+            for n in (1, 2)
+        ],
+        codex_outputs=_blocking_reviews_959(2),
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
+    real_derive = orchestrator._derive_authenticated_risk_evidence_for_coder
+    derive_calls = []
+
+    def derive(followup, **kwargs):
+        derive_calls.append(followup)
+        derived, result = real_derive(followup, **kwargs)
+        if len(derive_calls) == 1:
+            # First follow-up: no canonical evidence after derivation.
+            return dataclasses.replace(derived, risk_test_matrix_evidence=None), result
+        return derived, result
+
+    resolve_calls = []
+    real_resolve = orchestrator.resolve_matrix_evidence_render
+
+    def resolve(current, previous, current_round):
+        assert current is not None
+        resolve_calls.append(current_round)
+        return real_resolve(current, previous, current_round)
+
+    with patch.object(orchestrator, "_derive_authenticated_risk_evidence_for_coder", derive), \
+            patch.object(orchestrator, "resolve_matrix_evidence_render", resolve):
+        assert run_pr_loop(
+            runner, pr_number=77, config=config, approved_plan_context=plan_context
+        ) == 0
+
+    records = _coder_records_959(runner)
+    assert len(records) == 2
+    (first_body, first), (second_body, second) = records
+    assert first.risk_test_matrix_evidence is None
+    assert first.risk_test_matrix_evidence_full_round is None
+    assert first.risk_test_matrix_evidence_full_round_status == "absent"
+    assert _EVIDENCE_HEADING_959 not in first_body
+    assert "<details>" not in first_body.split("AGENT_LOOP_META", 1)[0]
+    assert resolve_calls == [second.round_number]
+    assert second.risk_test_matrix_evidence is not None
+    assert second.risk_test_matrix_evidence_full_round == second.round_number
+    assert "<summary>Full matrix evidence (1 row)</summary>" in second_body
+    assert "unchanged since round" not in second_body
+
+
+# --- Signed reviewer-board amendment (#943) -------------------------------
+
+from coding_review_agent_loop.board_amendment import (  # noqa: E402
+    format_reviewer_board_amendment_comment as _m943_amendment_comment,
+)
+
+
+def _m943_partial_pr_round(tmp_path, **payload):
+    """Codex and Gemini review; Antigravity's backend fails before it posts."""
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[],
+        **payload,
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
+    posted = _posted_scheduler_metadata(runner)
+    assert posted and all(
+        tuple(item.scheduler_contract["required_reviewers"]) == ("Codex", "Gemini", "Antigravity")
+        for item in posted
+    )
+    return runner
+
+
+def _m943_amendment_from_error(message):
+    start = message.index("Reviewer board amendment:")
+    template = message[start:]
+    return template.replace(
+        "<why the removed reviewer cannot be reached>", "Antigravity quota exhausted."
+    )
+
+
+def _m943_append(runner, body, login="operator"):
+    comments = runner.pr_payload.setdefault("comments", [])
+    comments.append(
+        {
+            "author": {"login": login},
+            "createdAt": f"2026-05-23T00:00:{len(comments):02d}Z",
+            "body": body,
+        }
+    )
+
+
+@pytest.mark.parametrize("linked_issue", [False, True], ids=["standalone", "issue-mode"])
+def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkeypatch, linked_issue):
+    """Row pr-qualification, standalone (issue_context=None) and with a linked issue."""
+    payload = (
+        {
+            "issue_payload": {"number": 56, "title": "Linked issue", "body": "Scope."},
+            "pr_payload": {"body": "Fixes #56"},
+        }
+        if linked_issue
+        else {}
+    )
+    runner = _m943_partial_pr_round(tmp_path, **payload)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    calls_before = _agent_sequence(runner)
+
+    # No record: the drift error prints a filled PR amendment template.
+    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert _agent_sequence(runner) == calls_before
+    template = _m943_amendment_from_error(str(excinfo.value))
+    assert '"flow": "pr"' in template and '"pr_number": 77' in template
+    assert '"issue": null' in template
+
+    _m943_append(runner, template)
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: None
+    )
+    assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+
+    # The qualification gate re-reads the fresh PR comments, including the
+    # pre-amendment three-reviewer records, and accepts the amended board.
+    amended_contract = orchestrator.make_contract(
+        ("Codex", "Gemini"), "primary-then-panel", None, "Codex"
+    )
+    orchestrator._fresh_pr_qualification_snapshot(
+        runner,
+        config=reduced,
+        pr_number=77,
+        issue_context=None,
+        parent_issue_context=None,
+        scheduler_contract=amended_contract,
+    )
+    # The original board is no longer an acceptable configured contract.
+    with pytest.raises(AgentLoopError, match="no qualification or merge is permitted"):
+        orchestrator._fresh_pr_qualification_snapshot(
+            runner,
+            config=reduced,
+            pr_number=77,
+            issue_context=None,
+            parent_issue_context=None,
+            scheduler_contract=orchestrator.make_contract(
+                ("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex"
+            ),
+        )
+    assert "agy" not in _agent_sequence(runner)[len(calls_before):]
+    assert any("Reviewer board amendment applied." in comment for comment in runner.comments)
+    posted = _posted_scheduler_metadata(runner)
+    # Gemini's round-2 review was reused and Codex's approval carried, yet the
+    # activation round still persists a fresh digest-bound scheduler decision.
+    amended = [item for item in posted if item.reviewer_board_amendment_digest is not None]
+    assert amended
+    assert amended[0].phase == "scheduler-prelaunch"
+    assert amended[0].round_number == 2
+    for item in posted:
+        board = tuple(item.scheduler_contract["required_reviewers"])
+        if item.reviewer_board_amendment_digest is not None:
+            assert board == ("Codex", "Gemini")
+        else:
+            assert board == ("Codex", "Gemini", "Antigravity")
+    completion_notes = [
+        comment for comment in runner.comments
+        if comment.startswith("Review completed on a reduced reviewer board.")
+    ]
+    assert len(completion_notes) == 1
+    assert "required board now Codex, Gemini" in completion_notes[0]
+
+
+def test_pr_board_amendment_qualification_refuses_a_stale_contract(tmp_path, monkeypatch):
+    """Rows pr-qualification and digest-binding: the gate re-reads fresh PR comments."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
+    stale_contract = orchestrator.make_contract(
+        ("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex"
+    )
+    stale = _attach_round_metadata(
+        "A stale-board scheduler record posted while managed CI was running.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=9, subject="abc123",
+            phase="reconciliation", scheduler_contract=stale_contract.as_dict(),
+            scheduler_previous_sha=None, scheduler_current_sha="abc123",
+            scheduler_obligation_digest="0" * 16, scheduler_selected_reviewers=("Codex",),
+            scheduler_reasons=("stale",), scheduler_final_sweep=False,
+            scheduler_force_full=False, scheduler_calls_avoided=0,
+            scheduler_phase="primary", scheduler_primary_reviewer="Codex",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+
+    def wait_and_inject(*args, **kwargs):
+        _m943_append(runner, stale, login="bot")
+        return ManagedCiOutcome(status="passed", head_sha="abc123")
+
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait_and_inject)
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("stale contract must block merge")
+    )
+    with pytest.raises(AgentLoopError, match="no qualification or merge is permitted"):
+        run_pr_loop(runner, pr_number=77, config=reduced)
+
+
+def test_pr_board_amendment_on_the_owning_issue_fails_closed(tmp_path):
+    """Row wrong-surface: a pr amendment belongs on the PR, not the issue."""
+    record = _m943_amendment_comment(
+        flow="pr", issue=None, pr_number=77,
+        original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=1,
+        rationale="Antigravity quota exhausted.",
+    )
+    runner = FakeRunner(
+        issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        issue_comments=[
+            {"author": {"login": "operator"}, "createdAt": "2026-06-01T00:00:00Z", "body": record}
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+    with pytest.raises(AgentLoopError, match="Post this record on PR #77"):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, reviewer=("codex", "gemini")))
+    assert _agent_sequence(runner) == []
+
+
+@pytest.mark.parametrize("auto_merge", [True, False], ids=["auto-merge", "manual-qualification"])
+def test_pr_board_amendment_managed_completion_names_the_reduced_board(
+    tmp_path, monkeypatch, capsys, auto_merge
+):
+    """Managed-CI completion paths repeat the reduced-board note durably."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=auto_merge)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    waits = []
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        lambda *args, **kwargs: waits.append(True) or ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    merges = []
+    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator, "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
+    )
+    monkeypatch.setattr(
+        orchestrator, "publish_manual_v2_qualification", lambda *args, **kwargs: "abc123"
+    )
+    capsys.readouterr()
+    assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+
+    assert waits, "the managed qualification path was not exercised"
+    assert bool(merges) is auto_merge
+    out = capsys.readouterr().out
+    assert "Reviewer board amended from round 2" in out
+    assert "required board now Codex, Gemini" in out
+    notes = [
+        comment for comment in runner.comments
+        if comment.startswith("Review completed on a reduced reviewer board.")
+    ]
+    assert len(notes) == 1
+
+
+def test_pr_board_amendment_qualification_refuses_a_digest_on_a_contract_neutral_record(
+    tmp_path, monkeypatch
+):
+    """Row digest-binding at the gate: a neutral record carrying a digest blocks merge."""
+    from coding_review_agent_loop.board_amendment import collect_reviewer_board_amendments
+
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    template = _m943_amendment_from_error(str(excinfo.value))
+    _m943_append(runner, template)
+    (amendment,) = collect_reviewer_board_amendments(
+        [SimpleNamespace(body=template)], flow="pr", pr_number=77
+    )
+    neutral = _attach_round_metadata(
+        _staged_review(reviewer="OpenAI Codex"),
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=9, subject="abc123",
+            reviewer_board_amendment_digest=amendment.digest,
+        ),
+    )
+    assert orchestrator._extract_round_metadata_records(
+        [SimpleNamespace(body=neutral)], flow="pr"
+    )[0].metadata.scheduler_metadata_status == "absent"
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    injected = []
+
+    def wait_and_inject(*args, **kwargs):
+        _m943_append(runner, neutral, login="bot")
+        injected.append(True)
+        return ManagedCiOutcome(status="passed", head_sha="abc123")
+
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait_and_inject)
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("a neutral digest must block merge")
+    )
+    monkeypatch.setattr(
+        orchestrator, "_merge_with_exact_head_proof",
+        lambda *args, **kwargs: pytest.fail("a neutral digest must block merge"),
+    )
+    with pytest.raises(AgentLoopError, match="(?i)no qualification or merge is permitted") as gate:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert injected
+    assert "contract-neutral" in str(gate.value)
+
+
+def test_m985_pr_loop_stops_after_two_unchanged_head_coder_turns(tmp_path):
+    from coding_review_agent_loop.errors import AgentLoopError
+
+    blocking = structured_pr_review(
+        state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            blocking,
+            structured_pr_review(
+                state="blocking",
+                summary="Still needs a re-plan.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
+                ],
+            ),
+            structured_pr_review(state="approved"),
+        ],
+        claude_outputs=[
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+        ],
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
+    with pytest.raises(Exception) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert isinstance(excinfo.value, AgentLoopError)
+    assert "unchanged in 2 consecutive follow-up rounds" in str(excinfo.value)
+    # The identical head is not reviewed a third time.
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
+
+
+
+def test_m985_unchanged_head_count_resets_after_an_external_head_advance():
+    from coding_review_agent_loop.orchestrator import (
+        MAX_UNCHANGED_HEAD_CODER_TURNS,
+        _UnchangedHeadTracker,
+    )
+
+    tracker = _UnchangedHeadTracker()
+    # The coder leaves A unchanged once; another actor then pushes B.
+    assert tracker.observe("A", "A") == 1
+    # B has had only one no-progress follow-up, so the loop must not stop.
+    assert tracker.observe("B", "B") == 1 < MAX_UNCHANGED_HEAD_CODER_TURNS
+    assert tracker.observe("B", "B") == MAX_UNCHANGED_HEAD_CODER_TURNS
+    # A follow-up that moves the head clears the count.
+    assert tracker.observe("B", "C") == 0
+    assert tracker.observe("C", "C") == 1
+    # An unknown reviewed head never counts.
+    assert tracker.observe(None, None) == 0

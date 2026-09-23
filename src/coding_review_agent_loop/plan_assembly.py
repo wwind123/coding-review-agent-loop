@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from .errors import AgentLoopError
 from .protocol import (
+    RISK_MATRIX_MAX_ROWS,
     ArchitectureImpact,
     DeferredStage,
     ExecutionStrategyRecommendation,
@@ -521,8 +522,12 @@ def _validate_matrix_operations(
         elif operation.op == "matrix_merge":
             transformed_count += 1
     final_count = transformed_count + adds
-    if final_count > 24:
-        raise AgentLoopError("assembled risk_test_matrix exceeds the 24-row bound.")
+    if final_count > RISK_MATRIX_MAX_ROWS:
+        raise AgentLoopError(
+            f"assembled risk_test_matrix has {final_count} rows and exceeds the "
+            f"{RISK_MATRIX_MAX_ROWS}-row bound; consolidate scenarios explicitly with "
+            "matrix_merge or matrix_retire instead of adding rows."
+        )
     for position in add_positions:
         if position >= final_count:
             raise AgentLoopError(

@@ -1148,3 +1148,316 @@ def test_referenced_paths_treat_bare_launcher_like_the_absolute_spelling(tmp_pat
     assert "tests/test_thing.py" in expected
     assert _referenced_paths(root, absolute) == expected
     assert _referenced_paths(root, bare) == expected
+
+
+# ---------------------------------------------------------------------------
+# Parallel test-worker budget through the broker (issue #848)
+# ---------------------------------------------------------------------------
+
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
+
+
+def _src_env():
+    """Child interpreters must import this checkout, not an installed copy."""
+    existing = os.environ.get("PYTHONPATH")
+    return {"PYTHONPATH": _SRC + (os.pathsep + existing if existing else "")}
+
+
+def _git_checkout(path):
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
+    (path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", "initial"], check=True)
+
+
+@pytest.mark.parametrize("parent", ["clamp", "refuse", "off"])
+@pytest.mark.parametrize("client", ["clamp", "refuse", "off", None])
+def test_broker_effective_budget_is_stricter_of_parent_and_client(tmp_path, parent, client):
+    from coding_review_agent_loop.test_workers import WorkerBudget, stricter_mode
+
+    server = BrokerServer(root=tmp_path)
+    server.set_execution_context(
+        containment_handle=None, process_started=None, process_finished=None,
+        worker_budget=WorkerBudget(2, "derived", parent, "cpu", {}, False),
+    )
+    env = {"AGENT_LOOP_TEST_WORKERS": "16"}
+    if client is not None:
+        env["AGENT_LOOP_TEST_WORKER_ENFORCEMENT"] = client
+    effective = server.effective_worker_budget(env)
+    assert effective.workers == 2
+    assert effective.enforcement == (stricter_mode(parent, client) if client else parent)
+    lowered = server.effective_worker_budget({"AGENT_LOOP_TEST_WORKERS": "1"})
+    assert lowered.workers == 1
+    forged = server.effective_worker_budget({"AGENT_LOOP_TEST_WORKERS": "lots", "AGENT_LOOP_TEST_WORKER_ENFORCEMENT": "x"})
+    assert forged.workers == 2 and forged.enforcement == parent
+
+
+def test_broker_without_parent_budget_keeps_legacy_behaviour(tmp_path):
+    server = BrokerServer(root=tmp_path)
+    assert server.effective_worker_budget({"AGENT_LOOP_TEST_WORKERS": "1"}) is None
+
+
+def test_worker_env_names_are_excluded_from_environment_identity():
+    from coding_review_agent_loop.local_test_evidence import ENVIRONMENT_EXCLUSIONS
+
+    assert {
+        "AGENT_LOOP_TEST_WORKERS",
+        "AGENT_LOOP_TEST_WORKER_ENFORCEMENT",
+        "AGENT_LOOP_WORKER_CAP_SPEC",
+        "AGENT_LOOP_WORKER_CAP_NESTED",
+    } <= ENVIRONMENT_EXCLUSIONS
+
+
+def _runner_with_budget(tmp_path, workers, mode):
+    from coding_review_agent_loop.containment import default_policy
+    from coding_review_agent_loop.runner import Runner
+
+    runner = Runner(containment_policy=default_policy(mode="off", cache_dir=tmp_path / ".runtime"))
+    runner.test_workers = workers
+    runner.test_worker_enforcement = mode
+    return runner
+
+
+def test_broker_nested_run_tests_gets_worker_budget_busy(tmp_path):
+    _git_checkout(tmp_path)
+    runner = _runner_with_budget(tmp_path, 2, "clamp")
+    nested = (
+        "import os, sys; from coding_review_agent_loop.cli import main; "
+        "assert 'AGENT_LOOP_TEST_BROKER_ENDPOINT' not in os.environ; "
+        "print('nested=' + str(main(['run-tests','--timeout-seconds','5','--',sys.executable,'-c','pass'])))"
+    )
+    script = (
+        "from coding_review_agent_loop.cli import main; import sys; "
+        f"raise SystemExit(main(['run-tests','--timeout-seconds','30','--',sys.executable,'-c',{nested!r}]))"
+    )
+    result = runner.run_with_log(
+        [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / "coder.log",
+        label="coder", progress_interval_seconds=1, env=_src_env(),
+    )
+    assert result.returncode == 0
+    log = (tmp_path / "coder.log").read_text()
+    assert "nested=125" in log
+    assert "worker budget" in log
+    observations = runner.local_test_observations()
+    assert [item.outcome for item in observations] == ["passed"]
+
+
+def test_broker_refuse_mode_rejects_plugin_disable_before_spawn(tmp_path):
+    _git_checkout(tmp_path)
+    runner = _runner_with_budget(tmp_path, 2, "refuse")
+    marker = tmp_path / "spawned"
+    script = (
+        "import sys; from coding_review_agent_loop.local_test_evidence import broker_client_from_environment; "
+        "client = broker_client_from_environment(); "
+        "result = client.run([sys.executable, '-m', 'pytest', '-p', 'no:_agent_loop_worker_cap', "
+        "'--version'], timeout_seconds=30, environment_overrides={'AGENT_LOOP_TEST_WORKER_ENFORCEMENT': 'off'}); "
+        "print('outcome=' + result.outcome, 'rc=' + str(result.returncode))"
+    )
+    result = runner.run_with_log(
+        [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / "coder.log",
+        label="coder", progress_interval_seconds=1, env=_src_env(),
+    )
+    assert result.returncode == 0
+    log = (tmp_path / "coder.log").read_text()
+    assert "outcome=worker-budget-refused rc=2" in log
+    assert not marker.exists()
+    assert list(runner.local_test_observations()) == []
+
+
+def test_broker_worker_budget_busy_across_broker_requests(tmp_path):
+    from coding_review_agent_loop.test_workers import WorkerBudget
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    server = BrokerServer(root=root, turn_id="turn-busy-" + str(os.getpid())).start()
+    server._worker_lock_root = tmp_path / "locks"
+    server.set_execution_context(
+        containment_handle=None, process_started=None, process_finished=None,
+        worker_budget=WorkerBudget(2, "derived", "clamp", "cpu", {}, False),
+    )
+    try:
+        from coding_review_agent_loop.test_workers import WorkerBudgetLock
+
+        held, _ = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=root, root=tmp_path / "locks")
+        assert held is not None
+        client = BrokerClient({**os.environ, **server.environment, "AGENT_LOOP_INVOCATION_ID": server.turn_id})
+        for xdg in ("/tmp/one", "/tmp/two"):
+            result = client.run(
+                [sys.executable, "-c", "pass"], timeout_seconds=10, cwd=root,
+                environment_overrides={"XDG_RUNTIME_DIR": xdg},
+            )
+            assert result.outcome == "worker-budget-busy"
+            assert result.returncode == 125
+        held.close()
+        ok = client.run([sys.executable, "-c", "pass"], timeout_seconds=10, cwd=root)
+        assert ok.outcome == "passed"
+        assert ok.worker_enforcement == "not-observed"
+        assert ok.workers_cohort == "unknown"
+        assert ok.worker_environment["AGENT_LOOP_TEST_WORKERS"] == "2"
+    finally:
+        server.stop()
+    assert [item.outcome for item in server.journal] == ["passed"]
+
+
+def _gate_target(marker, gate):
+    """A target that announces it started, then blocks until the gate exists."""
+    return [
+        sys.executable, "-c",
+        "import os, sys, time; "
+        f"open({str(marker)!r}, 'w').write('started'); "
+        f"[time.sleep(0.02) for _ in range(3000) if not os.path.exists({str(gate)!r})]",
+    ]
+
+
+def _wait_for(path, seconds=30):
+    import time
+
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"{path} was not created")
+        time.sleep(0.02)
+
+
+def _local_fallback_run_tests(root, invocation, xdg, argv, memory, *, popen=False):
+    """The real run-tests CLI with no broker in its environment (local fallback)."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("AGENT_LOOP_TEST_BROKER_")
+    }
+    env.update(_src_env())
+    env.update({
+        "AGENT_LOOP_INVOCATION_ID": invocation,
+        "AGENT_LOOP_TEST_WORKERS": "2",
+        "AGENT_LOOP_TEST_WORKER_ENFORCEMENT": "clamp",
+        "XDG_RUNTIME_DIR": xdg,
+    })
+    command = [
+        sys.executable, "-c",
+        "import sys; from coding_review_agent_loop.cli import main; raise SystemExit(main(sys.argv[1:]))",
+        "run-tests", "--timeout-seconds", "60", "--memory-dir", str(memory), "--", *argv,
+    ]
+    if popen:
+        return subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=120)
+
+
+@pytest.mark.parametrize("holder", ["broker", "local"])
+def test_broker_and_local_fallback_share_one_worker_budget_lock(tmp_path, holder):
+    """A real broker target and a real local-fallback run-tests contend on one lock.
+
+    The two sides use different XDG_RUNTIME_DIR values and neither overrides
+    the lock root, so the trusted uid-owned namespace is what makes them
+    contend.  Exactly one target starts while the other is held.
+    """
+    import uuid
+
+    from coding_review_agent_loop.test_workers import WorkerBudget
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    _git_checkout(root)
+    memory = tmp_path / "memory"
+    invocation = f"cross-path-{os.getpid()}-{uuid.uuid4().hex}"
+    server = BrokerServer(root=root, turn_id=invocation).start()
+    server.set_execution_context(
+        containment_handle=None, process_started=None, process_finished=None,
+        worker_budget=WorkerBudget(2, "derived", "clamp", "cpu", {}, False),
+    )
+    client = BrokerClient({**os.environ, **server.environment, "AGENT_LOOP_INVOCATION_ID": invocation})
+    gate = tmp_path / "gate"
+    holder_marker = tmp_path / "holder.started"
+    contender_marker = tmp_path / "contender.started"
+    try:
+        if holder == "broker":
+            outcome: dict = {}
+
+            def run_holder():
+                outcome["result"] = client.run(
+                    _gate_target(holder_marker, gate), timeout_seconds=60, cwd=root,
+                    environment_overrides={"XDG_RUNTIME_DIR": str(tmp_path / "xdg-broker")},
+                )
+
+            thread = threading.Thread(target=run_holder)
+            thread.start()
+            _wait_for(holder_marker)
+            local = _local_fallback_run_tests(
+                root, invocation, str(tmp_path / "xdg-local"),
+                [sys.executable, "-c", f"open({str(contender_marker)!r}, 'w').write('x')"], memory,
+            )
+            assert local.returncode == 125, local.stdout + local.stderr
+            assert "worker budget" in local.stderr
+            assert not contender_marker.exists()
+            gate.write_text("open")
+            thread.join(timeout=60)
+            assert outcome["result"].outcome == "passed"
+        else:
+            local = _local_fallback_run_tests(
+                root, invocation, str(tmp_path / "xdg-local"), _gate_target(holder_marker, gate), memory,
+                popen=True,
+            )
+            try:
+                _wait_for(holder_marker)
+                busy = client.run(
+                    [sys.executable, "-c", f"open({str(contender_marker)!r}, 'w').write('x')"],
+                    timeout_seconds=30, cwd=root,
+                    environment_overrides={"XDG_RUNTIME_DIR": str(tmp_path / "xdg-broker")},
+                )
+                assert busy.outcome == "worker-budget-busy" and busy.returncode == 125
+                assert not contender_marker.exists()
+            finally:
+                gate.write_text("open")
+                output, _ = local.communicate(timeout=60)
+            assert local.returncode == 0, output
+        # Once the holder has exited, the other path runs.
+        after = client.run(
+            [sys.executable, "-c", f"open({str(contender_marker)!r}, 'w').write('x')"],
+            timeout_seconds=30, cwd=root,
+        )
+        assert after.outcome == "passed" and contender_marker.exists()
+    finally:
+        gate.write_text("open")
+        server.stop()
+
+
+try:  # pragma: no cover - depends on the dev extra
+    import xdist as _xdist  # noqa: F401
+
+    _HAS_XDIST = True
+except ImportError:  # pragma: no cover
+    _HAS_XDIST = False
+
+
+@pytest.mark.skipif(not _HAS_XDIST, reason="pytest-xdist is not installed")
+def test_broker_clamps_forged_client_request_and_records_report_cohort(tmp_path):
+    _git_checkout(tmp_path)
+    (tmp_path / "test_cases.py").write_text("def test_a():\n    pass\n\ndef test_b():\n    pass\n", encoding="utf-8")
+    runner = _runner_with_budget(tmp_path, 2, "clamp")
+    memory = tmp_path / ".memory"
+    script = (
+        "import os, sys; from coding_review_agent_loop.cli import main; "
+        "os.environ['AGENT_LOOP_TEST_WORKERS'] = '16'; "
+        "os.environ['AGENT_LOOP_TEST_WORKER_ENFORCEMENT'] = 'off'; "
+        "os.environ['AGENT_LOOP_WORKER_CAP_SPEC'] = '{\"budget\": 99, \"mode\": \"clamp\", \"report\": \"/tmp/forged\"}'; "
+        f"raise SystemExit(main(['run-tests','--timeout-seconds','60','--memory-dir',{str(memory)!r},'--',"
+        "sys.executable,'-m','pytest','-p','no:cacheprovider','-q','-n','auto','-p','no:_agent_loop_worker_cap','test_cases.py']))"
+    )
+    result = runner.run_with_log(
+        [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / "coder.log",
+        label="coder", progress_interval_seconds=1, env=_src_env(),
+    )
+    log = (tmp_path / "coder.log").read_text()
+    assert result.returncode == 0, log
+    from coding_review_agent_loop import test_runtime as runtime
+
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["lane"] == "broker"
+    assert row["workers"] == "2"
+    assert row["worker_enforcement"] == "clamped"
+    assert "_agent_loop_worker_cap" in row["executed_argv"]
+    assert "no:_agent_loop_worker_cap" not in row["executed_argv"]
+    (observation,) = runner.local_test_observations()
+    assert observation.command[-1] == "test_cases.py"
+    assert any("worker budget" in caveat for caveat in observation.caveats)

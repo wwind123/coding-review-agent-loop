@@ -23,10 +23,16 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "markdown-it-py>=3"]
+dev = ["pytest>=8", "pytest-xdist>=3", "markdown-it-py>=3"]
 
 [project.scripts]
 agent-loop = "coding_review_agent_loop.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coding_review_agent_loop"]
+# Every file under the package ships, including the worker-budget pytest
+# plugin in pytest_plugin/, which is loaded from its own directory through
+# PYTHONPATH and is intentionally not a subpackage.
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -3498,18 +3498,19 @@ class _EventOrderRunner(FakeRunner):
         self.events = []
         self._events_lock = threading.Lock()
 
-    def _event_name(self, cmd):
+    def _event_name(self, cmd, input_text):
         if cmd[:2] == ["codex", "exec"]:
             return "codex"
         if cmd[:1] == ["gemini"]:
             return "gemini"
         if cmd[:1] == ["claude"]:
-            return "analyzer" if "Summarize debate round" in " ".join(cmd) else "claude"
+            # Claude receives its prompt on stdin, not argv (#870).
+            return "analyzer" if "Summarize debate round" in (input_text or "") else "claude"
         return None
 
     def run_with_log(self, args, *, cwd, **kwargs):
         cmd = [str(arg) for arg in args]
-        name = self._event_name(cmd)
+        name = self._event_name(cmd, kwargs.get("input_text"))
         if name is not None:
             with self._events_lock:
                 self.events.append(f"{name}-start")

@@ -19,6 +19,49 @@ class HumanDecisionRequiredError(AgentLoopError):
     EXIT_CODE = 4
 
 
+class WorkflowTransactionError(AgentLoopError):
+    """A cross-surface workflow transaction is missing, partial, or contradictory (#827).
+
+    The message always names the transaction(s), the expected record set, each
+    offending record, and the one supported recovery action, so an operator can
+    act without reading protocol payloads.
+    """
+
+    def __init__(
+        self,
+        summary: str,
+        *,
+        transaction_ids: tuple[str, ...] = (),
+        successor_kind: str | None = None,
+        expected_record_set: tuple[str, ...] = (),
+        problems: tuple[str, ...] = (),
+        recovery_action: str = "rerun to finish the transaction",
+        code: str | None = None,
+    ) -> None:
+        self.summary = summary
+        self.transaction_ids = tuple(transaction_ids)
+        self.successor_kind = successor_kind
+        self.expected_record_set = tuple(expected_record_set)
+        self.problems = tuple(problems)
+        self.recovery_action = recovery_action
+        self.code = code
+        parts = [summary.rstrip(".") + "."]
+        if code:
+            parts.append(f"Code: {code}.")
+        parts.append(
+            "Transaction(s): " + (", ".join(self.transaction_ids) or "(none)") + "."
+        )
+        if successor_kind:
+            parts.append(f"Successor kind: {successor_kind}.")
+        parts.append(
+            "Expected record set: " + (", ".join(self.expected_record_set) or "(none)") + "."
+        )
+        if self.problems:
+            parts.append("Records: " + "; ".join(self.problems) + ".")
+        parts.append(f"Recovery: {recovery_action}.")
+        super().__init__(" ".join(parts))
+
+
 class FreshContractIntegrityError(AgentLoopError):
     """A fresh plan cannot be format-repaired without recoverable v1 data."""
 
@@ -52,6 +95,31 @@ class UnknownPriorItemDispositionError(AgentLoopError):
             f"{same_round_description}"
         )
         super().__init__(message)
+
+
+class SemanticPatchPayloadRejection(AgentLoopError):
+    """A semantic-patch rejection that names content inside the patch payload.
+
+    Repair preserves a ``plan_revision_patch`` payload exactly and may change
+    only its envelope/footer, so no repair output can satisfy this rejection.
+    It is routed to the planner's bounded replan instead (#979).
+    """
+
+
+class SemanticPatchUnknownPriorItemDispositionError(
+    UnknownPriorItemDispositionError, SemanticPatchPayloadRejection
+):
+    """An unknown prior-item disposition inside a semantic patch payload."""
+
+
+class NonRepairableEvidenceRejection(AgentLoopError):
+    """A semantic evidence rejection that no structured repair can satisfy.
+
+    Selecting an in-catalog broker handle that is not an admissible,
+    authoritatively launched passing observation is an authority decision,
+    not a formatting defect: repair may only reshape the envelope around the
+    coder's own claims, so it is never invoked for this class (#990).
+    """
 
 
 class IssueImplementationConflictError(AgentLoopError):
@@ -119,6 +187,7 @@ class AgentInvocationError(AgentLoopError):
         containment: "ContainmentEvidence | None" = None,
         plan_validation_exhaustion: DeterministicPlanValidationExhaustion | None = None,
         preserved_unsatisfied_response: PreservedUnsatisfiedResponse | None = None,
+        bounded_replan_rejection: DeterministicPlanValidationExhaustion | None = None,
     ) -> None:
         super().__init__(message)
         self.failure_category = failure_category
@@ -130,6 +199,9 @@ class AgentInvocationError(AgentLoopError):
         self.containment = containment
         self.plan_validation_exhaustion = plan_validation_exhaustion
         self.preserved_unsatisfied_response = preserved_unsatisfied_response
+        # A semantic-patch payload rejection that repair could never satisfy
+        # (#979). The planner's bounded replan consumes it as a diagnostic.
+        self.bounded_replan_rejection = bounded_replan_rejection
 
 
 class QuotaResetExceededError(AgentLoopError):

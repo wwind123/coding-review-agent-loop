@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 import zlib
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import asdict, dataclass
 
 from .config import AgentLoopConfig
@@ -21,7 +21,7 @@ from .child_topology import (
 from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .runner import Runner
-from .protocol_markers import TrustedBody, sanitize_historical_text
+from .protocol_markers import TrustedBody, decompress_record_payload, sanitize_historical_text
 from .protocol import (
     ArchitectureImpact,
     ChildStage,
@@ -43,6 +43,7 @@ from .protocol import (
     ArchitectureImpactContract,
     ParseDegradation,
     architecture_impact_contract_for,
+    RiskTestMatrixRow,
     parse_architecture_impact,
     parse_architecture_impact_degradable,
     parse_risk_test_matrix,
@@ -59,7 +60,7 @@ from .issue_body_limits import (
     is_bounded_form,
     shortened_section,
 )
-from .round_transport import MAX_GITHUB_BODY_CHARS
+from .round_transport import MAX_GITHUB_BODY_CHARS, MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS
 
 AUTOMATION_CLASSES = set(EXECUTION_AUTOMATION_CLASSES)
 DECOMPOSITION_MARKER_RE = re.compile(
@@ -474,21 +475,172 @@ def risk_matrix_row_ids_for_owner(
     )
 
 
-def validate_separately_planned_child_matrix(
+INHERITED_APPLICABILITY_RANK = {"not-applicable": 0, "applicable": 1, "required": 2}
+# Scenario coverage fields: downstream evidence construction falls back to
+# them, so a child keeps the parent text verbatim and may only extend it.
+INHERITED_SCENARIO_FIELDS = (
+    "entry_path_or_mode",
+    "initial_state",
+    "event",
+    "expected_outcome",
+)
+INHERITED_REVIEWED_PROPOSAL_FIELDS = ("proposed_test_level", "proposed_test_location")
+INHERITED_MATRIX_ROUTE_FORWARD = (
+    "Route forward: revise the child plan so each inherited row keeps its row ID, "
+    "never lowers applicability (not-applicable < applicable < required), copies every "
+    "parent forbidden side effect exactly (case and whitespace included; additions are "
+    "allowed), and keeps each scenario field (entry_path_or_mode, initial_state, event, "
+    "expected_outcome) containing the parent text verbatim with refinements added after "
+    "it; a parent scenario field already at the size bound admits only the identical value."
+    " An already-approved child plan is revised by rerunning child planning; once it is "
+    "bound to an implementation PR, post a signed child-plan-supersession record on the "
+    "child issue first (see 'Re-planning an approved child plan' in the README)."
+)
+_INHERITED_DIAGNOSTIC_VALUE_CHARS = 96
+# Entries are emitted whole under this budget so the storage sanitizer's
+# bound never cuts one mid-way and the route-forward sentence always fits.
+_INHERITED_DIAGNOSTIC_ENTRY_BUDGET = (
+    MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS - len(INHERITED_MATRIX_ROUTE_FORWARD) - 512
+)
+
+
+@dataclass(frozen=True)
+class InheritedMatrixBinding:
+    """Binds a child plan-first cycle to the parent rows allocated to its stage."""
+
+    parent_issue: int
+    stage_id: str
+    parent_matrix: dict[str, object]
+
+    def inherited_rows(self) -> tuple[RiskTestMatrixRow, ...]:
+        inherited = set(risk_matrix_row_ids_for_owner(self.parent_matrix, self.stage_id))
+        if not inherited:
+            return ()
+        parsed = parse_risk_test_matrix(self.parent_matrix)
+        return tuple(row for row in parsed.rows if row.row_id in inherited)
+
+
+@dataclass(frozen=True)
+class InheritedRowDifference:
+    """One field-level difference between a parent row and the child's copy."""
+
+    row_id: str
+    field: str
+    parent_value: str
+    child_value: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class InheritedRowComparison:
+    """Mechanically rejected weakenings and review-only admissible deltas."""
+
+    weakenings: tuple[InheritedRowDifference, ...] = ()
+    reviewed_deltas: tuple[InheritedRowDifference, ...] = ()
+
+
+def compare_inherited_row(
+    parent_row: RiskTestMatrixRow, child_row: RiskTestMatrixRow
+) -> InheritedRowComparison:
+    """Classify every field of one inherited row as preserved, reviewed, or weakened.
+
+    Comparison uses the exact sanitized strings ``to_payload()`` produces: no
+    case folding and no whitespace collapsing, because identifiers, paths,
+    commands, and values can be case- or whitespace-sensitive.
+    """
+    parent = parent_row.to_payload()
+    child = child_row.to_payload()
+    row_id = str(parent["row_id"])
+    weakenings: list[InheritedRowDifference] = []
+    deltas: list[InheritedRowDifference] = []
+
+    parent_applicability = str(parent["applicability"])
+    child_applicability = str(child["applicability"])
+    parent_rank = INHERITED_APPLICABILITY_RANK.get(parent_applicability)
+    child_rank = INHERITED_APPLICABILITY_RANK.get(child_applicability)
+    if parent_applicability != child_applicability:
+        difference = InheritedRowDifference(
+            row_id=row_id,
+            field="applicability",
+            parent_value=parent_applicability,
+            child_value=child_applicability,
+            reason="applicability raised",
+        )
+        if parent_rank is None or child_rank is None or child_rank < parent_rank:
+            weakenings.append(dataclasses.replace(difference, reason="applicability weakened"))
+        else:
+            deltas.append(difference)
+
+    parent_effects = [str(item) for item in parent["forbidden_side_effects"]]  # type: ignore[union-attr]
+    child_effects = [str(item) for item in child["forbidden_side_effects"]]  # type: ignore[union-attr]
+    for effect in parent_effects:
+        if effect not in child_effects:
+            weakenings.append(
+                InheritedRowDifference(
+                    row_id=row_id,
+                    field="forbidden_side_effects",
+                    parent_value=effect,
+                    child_value="",
+                    reason="forbidden side effect dropped",
+                )
+            )
+    seen_added: set[str] = set()
+    for effect in child_effects:
+        if effect not in parent_effects and effect not in seen_added:
+            seen_added.add(effect)
+            deltas.append(
+                InheritedRowDifference(
+                    row_id=row_id,
+                    field="forbidden_side_effects",
+                    parent_value="",
+                    child_value=effect,
+                    reason="forbidden side effect added",
+                )
+            )
+
+    for field in INHERITED_SCENARIO_FIELDS:
+        parent_text = str(parent[field])
+        child_text = str(child[field])
+        if parent_text == child_text:
+            continue
+        difference = InheritedRowDifference(
+            row_id=row_id,
+            field=field,
+            parent_value=parent_text,
+            child_value=child_text,
+            reason="coverage text extended",
+        )
+        if parent_text in child_text:
+            deltas.append(difference)
+        else:
+            weakenings.append(dataclasses.replace(difference, reason="coverage text replaced"))
+
+    for field in INHERITED_REVIEWED_PROPOSAL_FIELDS:
+        if parent[field] != child[field]:
+            deltas.append(
+                InheritedRowDifference(
+                    row_id=row_id,
+                    field=field,
+                    parent_value=str(parent[field]),
+                    child_value=str(child[field]),
+                    reason="proposed test changed",
+                )
+            )
+    # `label` and `related_scope_item_ids` are free, and `execution_owner` is
+    # excluded: a separately approved child owns its own scope and owner
+    # namespaces.
+    return InheritedRowComparison(tuple(weakenings), tuple(deltas))
+
+
+def _inherited_row_pairs(
     parent_matrix: RiskTestMatrix | dict[str, object] | None,
     child_matrix: RiskTestMatrix | dict[str, object] | None,
     *,
     execution_owner: str,
-) -> tuple[str, ...]:
-    """Bind a separately approved child plan to its inherited parent rows.
-
-    A child plan may add child-local rows, but it cannot omit or weaken rows
-    allocated to this stage. The returned IDs are later used as the
-    provenance-bound discharge scope for the child turn.
-    """
+) -> tuple[tuple[str, ...], tuple[tuple[RiskTestMatrixRow, RiskTestMatrixRow], ...]]:
     inherited = risk_matrix_row_ids_for_owner(parent_matrix, execution_owner)
     if not inherited:
-        return ()
+        return (), ()
     if child_matrix is None:
         raise AgentLoopError(
             "Separately planned child omitted the approved parent risk matrix; "
@@ -504,19 +656,118 @@ def validate_separately_planned_child_matrix(
             "Separately planned child is missing inherited parent matrix row IDs: "
             + ", ".join(missing)
         )
-    weakened: list[str] = []
-    for row_id in inherited:
-        expected = parent_by_id[row_id].to_payload()
-        actual = child_by_id[row_id].to_payload()
-        expected.pop("execution_owner", None)
-        actual.pop("execution_owner", None)
-        if expected != actual:
-            weakened.append(row_id)
-    if weakened:
-        raise AgentLoopError(
-            "Separately planned child changed inherited parent matrix semantics for: "
-            + ", ".join(weakened)
+    return inherited, tuple((parent_by_id[row_id], child_by_id[row_id]) for row_id in inherited)
+
+
+def _inherited_display_value(value: str) -> str:
+    """Bounded, marker-safe, single-line rendering for diagnostics only."""
+    text = sanitize_historical_text(value)
+    text = "".join(character if ord(character) >= 32 else " " for character in text)
+    if len(text) > _INHERITED_DIAGNOSTIC_VALUE_CHARS:
+        text = text[: _INHERITED_DIAGNOSTIC_VALUE_CHARS - 1].rstrip() + "…"
+    return f'"{text}"'
+
+
+def _inherited_weakening_entry(difference: InheritedRowDifference) -> str:
+    row_id = sanitize_historical_text(difference.row_id)
+    if difference.field == "applicability":
+        return (
+            f"{row_id}: applicability weakened (parent={difference.parent_value}, "
+            f"child={difference.child_value})"
         )
+    if difference.field == "forbidden_side_effects":
+        return (
+            f"{row_id}: forbidden_side_effects dropped "
+            f"{_inherited_display_value(difference.parent_value)} "
+            "(no exactly equal child entry)"
+        )
+    return (
+        f"{row_id}: {difference.field} replaced "
+        f"(parent={_inherited_display_value(difference.parent_value)}, "
+        f"child={_inherited_display_value(difference.child_value)}); the parent text must "
+        "be kept verbatim and refinements added after it"
+    )
+
+
+def format_inherited_matrix_weakening_diagnostic(
+    weakenings: Sequence[InheritedRowDifference],
+) -> str:
+    """Render weakenings whole within the plan-validation diagnostic bound."""
+    header = "Separately planned child weakened inherited parent matrix rows:"
+    lines = [header]
+    used = len(header)
+    emitted = 0
+    for difference in weakenings:
+        entry = "- " + _inherited_weakening_entry(difference)
+        if used + 1 + len(entry) > _INHERITED_DIAGNOSTIC_ENTRY_BUDGET:
+            break
+        lines.append(entry)
+        used += 1 + len(entry)
+        emitted += 1
+    remaining = list(weakenings[emitted:])
+    if remaining:
+        rows = len({difference.row_id for difference in remaining})
+        lines.append(f"- and {len(remaining)} more weakened fields in {rows} rows")
+    lines.append(INHERITED_MATRIX_ROUTE_FORWARD)
+    return "\n".join(lines)
+
+
+def inherited_matrix_reviewed_deltas(
+    parent_matrix: RiskTestMatrix | dict[str, object] | None,
+    child_matrix: RiskTestMatrix | dict[str, object] | None,
+    *,
+    execution_owner: str,
+) -> tuple[InheritedRowDifference, ...]:
+    """Admissible inherited-row differences that reviewers must judge.
+
+    Deterministic in the two matrices, so a resumed review round recomputes
+    the same deltas and nothing about them is persisted.
+    """
+    _, pairs = _inherited_row_pairs(
+        parent_matrix, child_matrix, execution_owner=execution_owner
+    )
+    deltas: list[InheritedRowDifference] = []
+    for parent_row, child_row in pairs:
+        deltas.extend(compare_inherited_row(parent_row, child_row).reviewed_deltas)
+    return tuple(deltas)
+
+
+def validate_separately_planned_child_matrix(
+    parent_matrix: RiskTestMatrix | dict[str, object] | None,
+    child_matrix: RiskTestMatrix | dict[str, object] | None,
+    *,
+    execution_owner: str,
+) -> tuple[str, ...]:
+    """Bind a separately approved child plan to its inherited parent rows.
+
+    A child plan may add child-local rows, but it cannot omit or weaken rows
+    allocated to this stage. Weakening is judged per field class, on the exact
+    sanitized strings with no case or whitespace normalization:
+
+    - ``applicability`` is ordered (``not-applicable`` < ``applicable`` <
+      ``required``) and may only stay or rise;
+    - every parent ``forbidden_side_effects`` entry must survive as an exactly
+      equal child entry; reordering and additions are accepted;
+    - ``entry_path_or_mode``, ``initial_state``, ``event``, and
+      ``expected_outcome`` must contain the parent text verbatim and may only
+      extend it;
+    - ``proposed_test_level`` and ``proposed_test_location`` may change but are
+      always surfaced through :func:`inherited_matrix_reviewed_deltas`;
+    - ``label`` and ``related_scope_item_ids`` are free, and
+      ``execution_owner`` is excluded.
+
+    Raises, strengthenings, extensions, and test placement changes are
+    reviewed deltas and never raise here. The returned IDs are later used as
+    the provenance-bound discharge scope for the child turn.
+    """
+    inherited, pairs = _inherited_row_pairs(
+        parent_matrix, child_matrix, execution_owner=execution_owner
+    )
+    weakenings: list[InheritedRowDifference] = []
+    for parent_row, child_row in pairs:
+        weakenings.extend(compare_inherited_row(parent_row, child_row).weakenings)
+    if weakenings:
+        raise AgentLoopError(format_inherited_matrix_weakening_diagnostic(weakenings))
     return inherited
 
 
@@ -1046,22 +1297,9 @@ def _phase_from_payload(
 
 
 def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
-    try:
-        if encoded.startswith("v1_"):
-            raw = zlib.decompress(
-                base64.urlsafe_b64decode(encoded[3:].encode("ascii"))
-            )
-            payload = json.loads(raw.decode("utf-8"))
-        else:
-            # Read the original uncompressed representation for checkpoints
-            # already posted before the compact payload format was introduced.
-            payload = _decode_json_payload(
-                encoded, marker_name="AGENT_PLAN_TOPOLOGY_CHECKPOINT"
-            )
-    except (ValueError, json.JSONDecodeError, zlib.error) as exc:
-        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.") from exc
-    if not isinstance(payload, dict):
-        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+    # Accepts the compact form and the original uncompressed representation of
+    # checkpoints posted before the compact payload format was introduced.
+    payload = _decode_json_payload(encoded, marker_name="AGENT_PLAN_TOPOLOGY_CHECKPOINT")
     phases_payload = payload.get("phases")
     if not isinstance(phases_payload, list) or not phases_payload:
         raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
@@ -1104,7 +1342,11 @@ def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
             raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
         raw_impact = payload.get("architecture_impact")
         architecture_impact = (
-            asdict(parse_architecture_impact(raw_impact, context="checkpoint.architecture_impact"))
+            asdict(parse_architecture_impact(
+                raw_impact,
+                context="checkpoint.architecture_impact",
+                architecture_status_mode="legacy",
+            ))
             if raw_impact is not None else None
         )
         raw_contract = payload.get("architecture_contract_version")
@@ -1219,13 +1461,7 @@ def find_topology_checkpoints_for_parent(
 
 
 def format_topology_checkpoint(checkpoint: TopologyCheckpoint) -> str:
-    raw = json.dumps(
-        _checkpoint_payload(checkpoint),
-        separators=(",", ":"),
-        ensure_ascii=False,
-        sort_keys=True,
-    ).encode("utf-8")
-    encoded = "v1_" + base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii")
+    encoded = _encode_compressed_json_payload(_checkpoint_payload(checkpoint))
     body = "\n".join(
         [
             f"Topology checkpoint recorded for issue #{checkpoint.parent_issue}.",
@@ -1912,15 +2148,47 @@ def create_decomposition_child_issues(
     return tuple(created)
 
 
+# Prefix of a zlib-compressed record payload.  A plain payload is the base64 of
+# a JSON object, so it always starts with `ey` and can never carry this prefix.
+COMPRESSED_PAYLOAD_PREFIX = "v1_"
+
+
 def _encode_json_payload(payload: dict[str, object]) -> str:
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
+def _encode_compressed_json_payload(payload: dict[str, object]) -> str:
+    """Encode a record the way the topology checkpoint does (#909).
+
+    Plan-derived text compresses by orders of magnitude, and `ensure_ascii=False`
+    keeps a non-ASCII character at its UTF-8 size instead of a `\\uXXXX` escape.
+    """
+    raw = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+    return COMPRESSED_PAYLOAD_PREFIX + base64.urlsafe_b64encode(
+        zlib.compress(raw, 9)
+    ).decode("ascii")
+
+
 def _decode_json_payload(encoded: str, *, marker_name: str) -> dict[str, object]:
+    """Decode a record in either the compressed or the original plain form.
+
+    Records published before a producer switched to compression stay plain
+    base64, so the form is detected from the prefix rather than assumed.
+    """
     try:
-        payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
-    except (ValueError, json.JSONDecodeError) as exc:
+        if encoded.startswith(COMPRESSED_PAYLOAD_PREFIX):
+            raw = decompress_record_payload(
+                base64.urlsafe_b64decode(
+                    encoded[len(COMPRESSED_PAYLOAD_PREFIX):].encode("ascii")
+                )
+            )
+        else:
+            raw = base64.urlsafe_b64decode(encoded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError, zlib.error) as exc:
         raise AgentLoopError(f"Invalid {marker_name} payload.") from exc
     if not isinstance(payload, dict):
         raise AgentLoopError(f"Invalid {marker_name} payload.")
@@ -1987,8 +2255,17 @@ def find_existing_execution_decision(
     plan_subject: str,
     strategy: str,
     recommendation_digest: str,
+    retired_plan_hashes: Collection[str] = (),
 ) -> ExecutionDecision | None:
+    """The decision recorded for ``plan_hash``, or ``None``.
+
+    ``retired_plan_hashes`` names approved plans that a verified signed
+    child-plan supersession chain replaced (#988).  A decision bound to one
+    of them is history, not a competing topology, and is skipped.  Any other
+    decision under a different hash still fails closed.
+    """
     found: ExecutionDecision | None = None
+    retired = frozenset(retired_plan_hashes)
     expected_identity = {
         "parent_issue": parent_issue,
         "plan_hash": plan_hash,
@@ -2007,6 +2284,8 @@ def find_existing_execution_decision(
             if decision.parent_issue != parent_issue:
                 continue
             if decision.plan_hash != plan_hash:
+                if decision.plan_hash in retired:
+                    continue
                 # A decision is durable approval-bound state, not a cache keyed
                 # only by the currently visible plan.  If approval changed
                 # after a crash, publishing a second decision would allow the
@@ -2140,7 +2419,9 @@ def _encode_metadata(metadata: DecompositionMetadata) -> str:
             "acceptance_criteria": list(final_integration.acceptance_criteria),
             "covered_scope_item_ids": list(final_integration.covered_scope_item_ids),
         }
-    return _encode_json_payload(payload)
+    # Compressed so an embedded retained-parent excerpt costs a fraction of its
+    # plain size; `_decode_metadata` still reads plain summaries (#909).
+    return _encode_compressed_json_payload(payload)
 
 
 def _decode_metadata(encoded: str) -> DecompositionMetadata:
@@ -2779,10 +3060,10 @@ def format_decomposition_parent_summary(
         )
 
     # A retained character does not cost a fixed number of body characters:
-    # `_encode_json_payload` serializes with `ensure_ascii=True`, so one CJK
-    # character becomes a six-character escape (an emoji, two) before base64
-    # expands it again.  Search for the largest budget whose actually rendered
-    # body fits instead of assuming a ratio that only holds for ASCII (#907).
+    # the record payload is compressed (#909), so its cost depends on how
+    # repetitive the excerpt is, and the visible copy costs one character each.
+    # Search for the largest budget whose actually rendered body fits instead
+    # of assuming a ratio (#907).
     target = MAX_GITHUB_BODY_CHARS - BODY_SAFETY_MARGIN
     shortest = render_budget(0)
     if len(shortest) > target:
@@ -3159,6 +3440,416 @@ def collect_child_disposition_overrides(
         seen.add(record.digest)
         scoped.append(record)
     return tuple(scoped)
+
+
+# ---------------------------------------------------------------------------
+# Signed child-plan supersession and the same-PR rebind audit record (#936)
+# ---------------------------------------------------------------------------
+
+CHILD_PLAN_SUPERSESSION_KIND = "child-plan-supersession"
+CHILD_PLAN_SUPERSESSION_SCHEMA_VERSION = 1
+_SUPERSESSION_RECORD_KEYS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "child_issue",
+        "parent_issue",
+        "stage_id",
+        "superseded_plan_hash",
+        "rationale",
+    }
+)
+CHILD_PLAN_REBIND_MARKER_RE = re.compile(
+    r"<!--\s*AGENT_CHILD_PLAN_REBIND:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I
+)
+_REBIND_RECORD_KEYS = frozenset(
+    {
+        "schema_version",
+        "child_issue",
+        "pr_number",
+        "superseded_plan_hash",
+        "new_plan_hash",
+        "plan_supersession_digest",
+        "first_replan_round",
+        "approved_round",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ChildPlanSupersession:
+    """One signed human authorization to re-plan an approved child plan."""
+
+    child_issue: int
+    parent_issue: int
+    stage_id: str
+    superseded_plan_hash: str
+    rationale: str
+    digest: str
+    comment_locator: str
+    comment_index: int
+
+
+@dataclass(frozen=True)
+class ChildPlanRebindRecord:
+    """Audit record posted in the same comment as a same-PR plan replacement."""
+
+    child_issue: int
+    pr_number: int
+    superseded_plan_hash: str
+    new_plan_hash: str
+    plan_supersession_digest: str
+    first_replan_round: int
+    approved_round: int
+    comment_index: int = -1
+
+
+@dataclass(frozen=True)
+class AuthorizedReplanLineage:
+    """The contiguous digest-bound coder rounds of one authorized re-plan."""
+
+    round_numbers: tuple[int, ...]
+    latest_plan_hash: str
+
+    @property
+    def first_round(self) -> int:
+        return self.round_numbers[0]
+
+    @property
+    def latest_round(self) -> int:
+        return self.round_numbers[-1]
+
+
+def child_plan_supersession_digest(record: dict[str, object]) -> str:
+    """The one digest shared by discovery, round metadata, and rebind verification."""
+    canonical = json.dumps(
+        {key: record[key] for key in sorted(_SUPERSESSION_RECORD_KEYS)},
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def format_child_plan_supersession_comment(
+    *,
+    child_issue: int,
+    parent_issue: int,
+    stage_id: str,
+    superseded_plan_hash: str,
+    rationale: str,
+) -> str:
+    """Render the signed supersession record format documented for human reviewers."""
+    record = {
+        "kind": CHILD_PLAN_SUPERSESSION_KIND,
+        "schema_version": CHILD_PLAN_SUPERSESSION_SCHEMA_VERSION,
+        "child_issue": child_issue,
+        "parent_issue": parent_issue,
+        "stage_id": stage_id,
+        "superseded_plan_hash": superseded_plan_hash,
+        "rationale": rationale,
+    }
+    return (
+        "Child plan supersession:\n\n```json\n"
+        + json.dumps(record, indent=2, sort_keys=True)
+        + "\n```\n-- Human Reviewer"
+    )
+
+
+def _supersession_record_problem(payload: dict[str, object]) -> str | None:
+    keys = set(payload)
+    if keys != _SUPERSESSION_RECORD_KEYS:
+        missing = sorted(_SUPERSESSION_RECORD_KEYS - keys)
+        unknown = sorted(keys - _SUPERSESSION_RECORD_KEYS)
+        return f"missing keys {missing}, unknown keys {unknown}"
+    if (
+        isinstance(payload.get("schema_version"), bool)
+        or payload.get("schema_version") != CHILD_PLAN_SUPERSESSION_SCHEMA_VERSION
+    ):
+        return "schema_version must be 1"
+    for key in ("child_issue", "parent_issue"):
+        value = payload.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            return f"{key} must be a positive integer"
+    for key in ("stage_id", "superseded_plan_hash", "rationale"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return f"{key} must be a non-empty string"
+    return None
+
+
+def parse_child_plan_supersession_records(
+    body: str | None, *, comment_locator: str, comment_index: int = -1
+) -> tuple[tuple[ChildPlanSupersession, ...], tuple[str, ...]]:
+    """Return (signed valid records, ignored-record diagnostics) for one comment.
+
+    Same contract as the disposition override parser: only a body with the
+    standalone human reviewer signature counts, and a malformed record is
+    reported and ignored so it can never reopen planning.
+    """
+    signed = parse_signed_human_requirement_body(body)
+    if signed is None:
+        return (), ()
+    records: list[ChildPlanSupersession] = []
+    ignored: list[str] = []
+    for match in _FENCED_JSON_RE.finditer(signed):
+        try:
+            payload = json.loads(match.group("body"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("kind") != CHILD_PLAN_SUPERSESSION_KIND:
+            continue
+        problem = _supersession_record_problem(payload)
+        if problem is not None:
+            ignored.append(
+                f"{comment_locator}: malformed child-plan supersession record ignored ({problem})"
+            )
+            continue
+        records.append(
+            ChildPlanSupersession(
+                child_issue=int(payload["child_issue"]),
+                parent_issue=int(payload["parent_issue"]),
+                stage_id=str(payload["stage_id"]),
+                superseded_plan_hash=str(payload["superseded_plan_hash"]),
+                rationale=str(payload["rationale"]),
+                digest=child_plan_supersession_digest(payload),
+                comment_locator=comment_locator,
+                comment_index=comment_index,
+            )
+        )
+    return tuple(records), tuple(ignored)
+
+
+def collect_child_plan_supersessions(
+    child_comments: Sequence[object],
+    *,
+    child_issue: int,
+    parent_issue: int,
+    stage_id: str,
+    ignored_sink: list[str] | None = None,
+) -> tuple[ChildPlanSupersession, ...]:
+    """Signed supersession discovery on the child issue only.
+
+    A signed record naming another child, parent, or stage fails closed.
+    Identical duplicates collapse by digest (the earliest comment is kept).
+    Records for different superseded hashes coexist, but two distinct records
+    for one superseded hash always fail closed: the orchestrator never
+    chooses between them by comment order.
+    """
+    by_digest: dict[str, ChildPlanSupersession] = {}
+    for index, comment in enumerate(child_comments):
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        locator = f"child issue #{child_issue} comment {index + 1}"
+        records, ignored = parse_child_plan_supersession_records(
+            body, comment_locator=locator, comment_index=index
+        )
+        if ignored_sink is not None:
+            ignored_sink.extend(ignored)
+        for record in records:
+            if (
+                record.child_issue != child_issue
+                or record.parent_issue != parent_issue
+                or record.stage_id != stage_id
+            ):
+                raise AgentLoopError(
+                    "Human decision required: signed child-plan supersession at "
+                    f"{record.comment_locator} names child #{record.child_issue} / parent "
+                    f"#{record.parent_issue} / stage `{record.stage_id}`, but this issue is child "
+                    f"#{child_issue} / parent #{parent_issue} / stage `{stage_id}`. Remove or "
+                    "correct the record before rerunning."
+                )
+            by_digest.setdefault(record.digest, record)
+    by_hash: dict[str, ChildPlanSupersession] = {}
+    for record in by_digest.values():
+        other = by_hash.get(record.superseded_plan_hash)
+        if other is not None:
+            raise AgentLoopError(
+                "Human decision required: two distinct signed child-plan supersession records "
+                f"name superseded plan {record.superseded_plan_hash} "
+                f"({other.comment_locator} and {record.comment_locator}). Keep exactly one "
+                "record per superseded plan hash before rerunning; records are never chosen "
+                "by comment order."
+            )
+        by_hash[record.superseded_plan_hash] = record
+    return tuple(by_digest.values())
+
+
+def _rebind_record_payload(record: ChildPlanRebindRecord) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "child_issue": record.child_issue,
+        "pr_number": record.pr_number,
+        "superseded_plan_hash": record.superseded_plan_hash,
+        "new_plan_hash": record.new_plan_hash,
+        "plan_supersession_digest": record.plan_supersession_digest,
+        "first_replan_round": record.first_replan_round,
+        "approved_round": record.approved_round,
+    }
+
+
+def format_child_plan_rebind_section(record: ChildPlanRebindRecord) -> str:
+    """Visible audit text plus the rebind audit record for the rebind comment."""
+    encoded = _encode_json_payload(_rebind_record_payload(record))
+    return "\n".join(
+        [
+            f"Child plan rebind: PR #{record.pr_number} is rebound from approved plan "
+            f"{record.superseded_plan_hash} to approved plan {record.new_plan_hash}.",
+            f"Signed supersession digest: {record.plan_supersession_digest}",
+            f"Re-plan rounds: {record.first_replan_round} through {record.approved_round}.",
+            "No PR-side record changed; reviewer approvals recorded before this comment "
+            "do not count under the new plan.",
+            f"<!-- AGENT_CHILD_PLAN_REBIND: {encoded} -->",
+        ]
+    )
+
+
+def find_child_plan_rebind_records(
+    comments: Sequence[object],
+) -> tuple[ChildPlanRebindRecord, ...]:
+    """Every decodable rebind audit record, tagged with its comment index."""
+    found: list[ChildPlanRebindRecord] = []
+    for index, comment in enumerate(comments):
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in CHILD_PLAN_REBIND_MARKER_RE.finditer(body):
+            payload = _decode_json_payload(
+                match.group("payload"), marker_name="AGENT_CHILD_PLAN_REBIND"
+            )
+            if set(payload) != _REBIND_RECORD_KEYS or payload.get("schema_version") != 1:
+                raise AgentLoopError("Invalid AGENT_CHILD_PLAN_REBIND payload: unexpected keys.")
+            for key in ("child_issue", "pr_number", "first_replan_round", "approved_round"):
+                value = payload.get(key)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise AgentLoopError(
+                        f"Invalid AGENT_CHILD_PLAN_REBIND payload: `{key}` must be a positive integer."
+                    )
+            for key in ("superseded_plan_hash", "new_plan_hash", "plan_supersession_digest"):
+                value = payload.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    raise AgentLoopError(
+                        f"Invalid AGENT_CHILD_PLAN_REBIND payload: `{key}` must be a non-empty string."
+                    )
+            found.append(
+                ChildPlanRebindRecord(
+                    child_issue=int(payload["child_issue"]),
+                    pr_number=int(payload["pr_number"]),
+                    superseded_plan_hash=str(payload["superseded_plan_hash"]),
+                    new_plan_hash=str(payload["new_plan_hash"]),
+                    plan_supersession_digest=str(payload["plan_supersession_digest"]),
+                    first_replan_round=int(payload["first_replan_round"]),
+                    approved_round=int(payload["approved_round"]),
+                    comment_index=index,
+                )
+            )
+    return tuple(found)
+
+
+def authorized_replan_lineage(
+    comments: Sequence[object],
+    *,
+    superseded_hash: str,
+    digest: str,
+    supersessions: Sequence[ChildPlanSupersession],
+    through_round: int | None = None,
+) -> AuthorizedReplanLineage | str:
+    """The digest-bound re-plan lineage, or the reason it is not authorized.
+
+    Single authority for resume, rebind eligibility, and rebind verification.
+    ``through_round`` bounds the inspected history to one historical re-plan
+    (a later re-plan of the replacement plan is a different lineage); when it
+    is ``None`` the lineage must reach the latest plan coder round.
+    """
+    from .round_state import _extract_round_metadata_records
+
+    matching = [
+        record
+        for record in supersessions
+        if record.digest == digest and record.superseded_plan_hash == superseded_hash
+    ]
+    if len(matching) != 1:
+        return (
+            f"signed child-plan supersession {digest} for superseded plan {superseded_hash} "
+            "is not discoverable on the child issue (exactly one signed record is required)"
+        )
+    signed = matching[0]
+    coder_rounds: dict[int, object] = {}
+    for record in _extract_round_metadata_records(comments, flow="plan"):
+        if record.metadata.role != "coder":
+            continue
+        if through_round is not None and record.metadata.round_number > through_round:
+            continue
+        # The latest record for a round number is the authoritative plan round.
+        coder_rounds[record.metadata.round_number] = record
+    ordered = [coder_rounds[number] for number in sorted(coder_rounds)]
+    bound = [
+        record
+        for record in ordered
+        if record.metadata.plan_supersession_digest == digest
+        and record.metadata.plan_supersession_superseded_hash == superseded_hash
+    ]
+    if not bound:
+        return (
+            f"no plan round carries signed supersession digest {digest} for superseded plan "
+            f"{superseded_hash}"
+        )
+    first = bound[0]
+    first_round = first.metadata.round_number
+    if first.index <= signed.comment_index:
+        return (
+            f"plan round {first_round} carries the supersession digest but was posted before "
+            f"the signed record at {signed.comment_locator}"
+        )
+    # Reviewer-only phase advances consume round numbers without a coder
+    # round, so contiguity is judged on the coder-round chain: each bound
+    # round must revise exactly the plan subject of the coder round before it.
+    first_position = ordered.index(first)
+    previous = ordered[first_position - 1] if first_position > 0 else None
+    previous_plan = previous.metadata.canonical_plan if previous is not None else None
+    if (
+        previous is None
+        or previous_plan is None
+        or approved_plan_hash(previous_plan) != superseded_hash
+    ):
+        return (
+            f"plan round {first_round} is the first digest-bound round, but the plan round "
+            f"immediately before it is not superseded plan {superseded_hash}"
+        )
+    chain_subject = previous.metadata.subject
+    round_numbers: list[int] = []
+    for record in ordered[first_position:]:
+        number = record.metadata.round_number
+        if record.metadata.prior_plan_subject != chain_subject:
+            return (
+                f"the digest-bound re-plan lineage has a gap before plan round {number}: it "
+                "does not revise the plan of the preceding plan round"
+            )
+        chain_subject = record.metadata.subject
+        round_numbers.append(number)
+        if (
+            record.metadata.plan_supersession_digest != digest
+            or record.metadata.plan_supersession_superseded_hash != superseded_hash
+        ):
+            return (
+                f"plan round {number} follows the authorized re-plan but is "
+                + (
+                    "bound to a different supersession record"
+                    if record.metadata.plan_supersession_digest is not None
+                    else "not bound to the signed supersession digest"
+                )
+            )
+    latest = ordered[-1]
+    if through_round is not None and latest.metadata.round_number != through_round:
+        return f"no digest-bound plan round {through_round} exists"
+    latest_plan = latest.metadata.canonical_plan
+    if latest_plan is None:
+        return f"plan round {latest.metadata.round_number} has no canonical plan record"
+    return AuthorizedReplanLineage(
+        round_numbers=tuple(round_numbers),
+        latest_plan_hash=approved_plan_hash(latest_plan),
+    )
 
 
 def reconcile_handoff_disposition(

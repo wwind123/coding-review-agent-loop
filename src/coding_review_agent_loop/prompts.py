@@ -20,7 +20,12 @@ from .architecture_context import (
     render_architecture_snapshot,
 )
 from .config import AgentLoopConfig, reviewers
-from .decomposition import approved_plan_hash
+from .decomposition import (
+    INHERITED_SCENARIO_FIELDS,
+    InheritedMatrixBinding,
+    InheritedRowDifference,
+    approved_plan_hash,
+)
 from .errors import AgentLoopError
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provenance
@@ -230,7 +235,7 @@ def _memory_block(
         cwd = agent_workdir(config, config.coder)
         commands: list[tuple[str, ...]] = []
         seen: set[tuple[str, ...]] = set()
-        remembered_keys: dict[tuple[str, ...], tuple[str, str]] = {}
+        remembered_keys: dict[tuple[str, ...], tuple[str, str, str]] = {}
         if config.test_command:
             commands.append(tuple(config.test_command))
             seen.add(tuple(config.test_command))
@@ -251,7 +256,9 @@ def _memory_block(
                     # cohort key.  Re-normalizing this display form can hash
                     # redacted environment values twice or resolve an
                     # external executable through a different PATH entry.
-                    remembered_keys[command] = (normalized, fingerprint)
+                    from .test_workers import row_workers_label
+
+                    remembered_keys[command] = (normalized, fingerprint, row_workers_label(observation))
         commands = commands[:6]
         wrapper_results = preflight_wrapper_candidates(
             cwd=cwd,
@@ -295,6 +302,7 @@ def _memory_block(
                     policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
                     normalized_command_override=key[0] if key else None,
                     fingerprint_override=key[1] if key else None,
+                    workers=key[2] if key else _expected_workers(config, command),
                 )
             runtime_text = render_runtime_context(
                 memory.memory_dir,
@@ -366,6 +374,16 @@ def _memory_block(
             "are advisory and cannot alone suppress a command."
         )
     return f"Agent memory context:\n{text}{runtime}\n"
+
+
+def _expected_workers(config: AgentLoopConfig, command: Sequence[str]) -> str | None:
+    try:
+        from .test_workers import expected_workers_label
+
+        budget = preliminary_worker_budget(config)
+        return expected_workers_label(command, budget=budget.workers, mode=budget.enforcement)
+    except Exception:  # pragma: no cover - guidance must never block a prompt
+        return None
 
 
 def _scratch_file_guidance() -> str:
@@ -475,7 +493,46 @@ def _coder_local_test_scope_guidance(
         + ". Reserve agent-unavailable for a genuine environment/tooling "
         "failure, not an ordinary slow test.\n"
         + containment_prompt_guidance(config)
+        + parallel_test_worker_guidance(config)
     )
+
+
+def preliminary_worker_budget(config: AgentLoopConfig):
+    """The pre-admission worker-budget estimate shown in coder/repair prompts.
+
+    The launch-time ``AGENT_LOOP_TEST_WORKERS`` value, derived after
+    containment admission, is authoritative.
+    """
+    from .test_workers import derive_worker_budget, parse_worker_memory, resolve_worker_budget
+
+    memory = parse_worker_memory(config.test_worker_memory) if config.test_worker_memory else None
+    derived = derive_worker_budget(
+        backend="process-group",
+        os_headroom_percent=config.containment_policy.os_headroom_percent,
+        per_worker_bytes=memory,
+        enforcement=config.test_worker_enforcement,
+    )
+    return resolve_worker_budget(
+        derived,
+        operator_workers=config.test_workers,
+        operator_enforcement=config.test_worker_enforcement,
+        env={},
+        has_parent=False,
+    ).budget
+
+
+def parallel_test_worker_guidance(config: AgentLoopConfig | None) -> str:
+    """Coder/repair-only parallel test-worker block (issue #848)."""
+    if config is None:
+        return ""
+    try:
+        from .test_workers import detect_parallel_support, render_worker_guidance
+
+        budget = preliminary_worker_budget(config)
+        supported = detect_parallel_support(agent_workdir(config, config.coder))
+        return render_worker_guidance(budget, parallel_supported=supported)
+    except Exception:  # pragma: no cover - guidance must never block a prompt
+        return ""
 
 
 def containment_prompt_guidance(config: AgentLoopConfig | None) -> str:
@@ -576,6 +633,35 @@ def _reviewer_documentation_check() -> str:
         "If this PR adds or changes a user-facing subcommand, flag, or mode, "
         "verify that README.md and any relevant docs/ files are updated. "
         "Flag missing or stale documentation as a blocking item.\n"
+    )
+
+
+_REVIEWER_EXHAUSTIVENESS_FLOWS = {
+    "pr": ("blocking_items", "same_pr_followups", "reviewed head", "full diff", "code"),
+    "plan": ("blocking_plan_issues", "same_plan_followups", "reviewed plan", "full plan", "plan content"),
+}
+
+
+def _reviewer_exhaustiveness_guidance(flow: str) -> str:
+    """Return the static reviewer-exhaustiveness rule for one review flow.
+
+    The text is parameterised only by ``flow`` (``pr`` or ``plan``), never by
+    round number, head SHA, or reviewer name, so it can sit inside the compact
+    stable prefixes without breaking their byte identity across rounds.
+    """
+    blocking_list, followup_list, subject, full_pass, behind = _REVIEWER_EXHAUSTIVENESS_FLOWS[flow]
+    return (
+        "Review exhaustively: report every defect you can independently substantiate on "
+        f"the {subject}, not only the first. Substantiating one blocking defect does not "
+        f"end the review; finish the pass over the {full_pass} before responding. When you "
+        "find a defect in a function, code path, or plan step, re-read that whole function "
+        "or path and enumerate every other independently evidenced defect there as separate "
+        f"`{blocking_list}` or `{followup_list}` entries in the same response. Each entry "
+        "still needs its own evidence; speculation, or padding the review with items you "
+        "cannot evidence, is forbidden. If a defect genuinely prevents you from evaluating "
+        f"{behind} behind it, say so in that entry's text and in `summary`, naming what "
+        "could not be evaluated, so the coder knows another round is expected. Do not "
+        "claim masking merely to stop early.\n"
     )
 
 
@@ -1770,7 +1856,7 @@ def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
             "Body:",
             body,
             "",
-            "Raw prior issue comments are omitted in compact planning context. Durable reviewer findings must appear in the active unresolved ledger or the append-only compact prior ledger below.",
+            "Raw prior issue comments are omitted in compact planning context. Open reviewer findings appear in the active unresolved ledger; findings that left it are summarized in the bounded compact prior ledger below, where older entries may be reduced to headers or folded into an omission notice.",
             "",
         ]
     )
@@ -1779,9 +1865,9 @@ def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
 def _compact_prior_ledger_block(compact_prior: CompactPriorContext | None) -> str:
     summaries = compact_prior.prior_item_summaries if compact_prior is not None else ()
     if not summaries:
-        return "Append-only compact prior item ledger\n\n(none)\n"
+        return "Compact prior item ledger (bounded)\n\n(none)\n"
     return (
-        "Append-only compact prior item ledger\n\n"
+        "Compact prior item ledger (bounded)\n\n"
         + "\n\n".join(summaries)
         + "\n"
     )
@@ -1807,8 +1893,8 @@ def _canonical_plan_ledger_rules() -> str:
     return """Canonical compact planning ledger rules
 
 - Treat active prior unresolved plan items as approval-critical until explicitly dispositioned.
-- Treat append-only compact prior ledger entries as the canonical history for prior blocking and same-plan concerns that left the active ledger.
-- Do not reinterpret, reorder, or rewrite prior compact ledger entries; append only new resolved or future-follow-up summaries after later review rounds.
+- Treat compact prior ledger entries as the history for prior blocking and same-plan concerns that left the active ledger. The ledger is size-bounded and lossy: the newest entries are verbatim, older entries may be reduced to their header line marked "(details compacted)", and the oldest may be folded into a single "[compacted] N earlier prior item summaries omitted" notice. Those items were already dispositioned; do not reopen them merely because their details are compacted or omitted.
+- Do not reinterpret or reorder compact ledger entries; new resolved or future-follow-up summaries are appended after later review rounds.
 - Future follow-ups are relevant in compact mode only when elevated, referenced, or preserved in the compact prior ledger.
 """
 
@@ -1848,7 +1934,7 @@ provisioning, or other named integration artifact in the plan; an `admin.html`
 view alone is not coverage. If the plan cannot satisfy the request, record a
 visible `blocked` or `not-applicable` reason and approve only if you accept it.
 
-Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
+""" + _reviewer_exhaustiveness_guidance("plan") + """Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
 follow-ups are small current-plan refinements that must be incorporated before
 implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
@@ -2381,6 +2467,149 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
 
 
+# Fail-closed caps: neither block is ever truncated.  The enforceable tier
+# stops child planning before any planner turn when the parent rows exceed
+# it; an over-cap delta set rejects the candidate into the replan loop.
+INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES = 96 * 1024
+INHERITED_COVERAGE_DELTA_MAX_BYTES = 64 * 1024
+_INHERITED_PRESERVATION_RULES = (
+    "Preservation rules for every inherited row: keep the row ID; never lower "
+    "applicability (not-applicable < applicable < required); copy every forbidden side "
+    "effect exactly, case and whitespace included (additions and reordering are "
+    "allowed); keep the text of entry_path_or_mode, initial_state, event, and "
+    "expected_outcome verbatim and add refinements after it; proposed test level and "
+    "location may change with justification and are shown to reviewers; the label, "
+    "scope links, and execution owner are free; child-local rows may be added."
+)
+
+
+def _inherited_literal(value: object) -> str:
+    # A JSON string literal is lossless: decoding it yields exactly the
+    # sanitized text the validator compares, case and whitespace included.
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _inherited_enforceable_tier(binding: InheritedMatrixBinding) -> str:
+    lines: list[str] = []
+    for row in binding.inherited_rows():
+        payload = row.to_payload()
+        lines.append(f"- row_id: {_inherited_literal(payload['row_id'])}")
+        lines.append(f"  applicability: {_inherited_literal(payload['applicability'])}")
+        for field in INHERITED_SCENARIO_FIELDS:
+            lines.append(f"  {field}: {_inherited_literal(payload[field])}")
+        lines.append("  forbidden_side_effects:")
+        for effect in payload["forbidden_side_effects"]:  # type: ignore[union-attr]
+            lines.append(f"    - {_inherited_literal(effect)}")
+    return "\n".join(lines)
+
+
+def inherited_obligations_enforceable_size(binding: InheritedMatrixBinding) -> int:
+    """UTF-8 size of the never-shortened enforceable tier."""
+    return len(_inherited_enforceable_tier(binding).encode("utf-8"))
+
+
+def render_inherited_matrix_obligations(binding: InheritedMatrixBinding | None) -> str:
+    """Shared lossless inherited-obligation block for every plan prompt form."""
+    if binding is None:
+        return ""
+    enforceable = _inherited_enforceable_tier(binding)
+    if not enforceable:
+        return ""
+    measured = len(enforceable.encode("utf-8"))
+    if measured > INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES:
+        raise AgentLoopError(
+            f"Inherited parent matrix obligations for stage `{binding.stage_id}` measure "
+            f"{measured} bytes, above the {INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES}-byte "
+            "lossless prompt cap; they are never truncated. Reduce or split the rows the "
+            f"parent plan on issue #{binding.parent_issue} allocates to this stage."
+        )
+    descriptive_lines = []
+    for row in binding.inherited_rows():
+        payload = row.to_payload()
+        descriptive_lines.append(
+            f"- {_inherited_literal(payload['row_id'])}: label={_inherited_literal(payload['label'])}; "
+            f"proposed_test_level={_inherited_literal(payload['proposed_test_level'])}; "
+            f"proposed_test_location={_inherited_literal(payload['proposed_test_location'])}"
+        )
+    descriptive = "\n".join(descriptive_lines)
+    if measured + len(descriptive.encode("utf-8")) > INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES:
+        descriptive = (
+            "[Descriptive tier (labels and proposed tests) omitted as a whole for prompt "
+            "size; every enforceable value above is complete.]"
+        )
+    return (
+        f"Inherited parent risk-matrix obligations (authenticated approved plan of parent "
+        f"issue #{binding.parent_issue}, stage `{sanitize_historical_text(binding.stage_id)}`; "
+        "not issue prose):\n"
+        f"{_INHERITED_PRESERVATION_RULES}\n"
+        "Each value is a JSON string literal; the decoded text is exactly what the "
+        "deterministic validator compares.\n"
+        "Enforceable tier:\n"
+        f"{enforceable}\n"
+        "Descriptive tier:\n"
+        f"{descriptive}\n"
+    )
+
+
+def _inherited_coverage_delta_entries(deltas: Sequence[InheritedRowDifference]) -> str:
+    return "\n".join(
+        f"- row {_inherited_literal(sanitize_historical_text(delta.row_id))} field `{delta.field}` "
+        f"({delta.reason}):\n"
+        f"  parent: {_inherited_literal(delta.parent_value) if delta.parent_value else '(none)'}\n"
+        f"  child: {_inherited_literal(delta.child_value) if delta.child_value else '(none)'}"
+        for delta in deltas
+    )
+
+
+def inherited_coverage_delta_size(deltas: Sequence[InheritedRowDifference]) -> int:
+    """UTF-8 size of the never-shortened reviewer coverage-delta entries."""
+    return len(_inherited_coverage_delta_entries(deltas).encode("utf-8"))
+
+
+def render_inherited_coverage_delta(
+    binding: InheritedMatrixBinding | None,
+    deltas: Sequence[InheritedRowDifference] | None,
+    *,
+    check_failure: str | None = None,
+) -> str:
+    """Deterministic parent-versus-child coverage delta for plan reviewers."""
+    if binding is None or not binding.inherited_rows():
+        return ""
+    if check_failure:
+        return (
+            "Inherited coverage check FAILED for this candidate (published before the "
+            "planning-time check existed). It cannot be approved: report a blocking plan "
+            "issue naming each row and field below so the revision restores the inherited "
+            "obligations.\n"
+            f"{sanitize_historical_text(check_failure)}\n"
+        )
+    if not deltas:
+        return (
+            "Inherited coverage delta: none; every inherited row is identical to the parent "
+            "in all reviewed fields.\n"
+        )
+    entries = _inherited_coverage_delta_entries(deltas)
+    measured = len(entries.encode("utf-8"))
+    if measured > INHERITED_COVERAGE_DELTA_MAX_BYTES:
+        raise AgentLoopError(
+            f"Inherited coverage delta measures {measured} bytes, above the "
+            f"{INHERITED_COVERAGE_DELTA_MAX_BYTES}-byte lossless prompt cap; it is never "
+            "truncated. Make fewer or smaller departures from the inherited text."
+        )
+    return (
+        "Inherited coverage delta (deterministic parent-versus-child comparison of this "
+        "candidate; these differences passed the mechanical check and are admissible only "
+        "under your review):\n"
+        f"{entries}\n"
+        "For every listed delta, decide whether the child value is equivalent to or stronger "
+        "than the parent value for entry path or mode, initial state, event, expected "
+        "outcome, forbidden side effects, and test reachability. An extension that narrows, "
+        "conditions, or negates the retained parent text, or a test level/location change "
+        "that makes the scenario less reachable, is a blocking plan issue naming the row "
+        "and field.\n"
+    )
+
+
 def build_issue_plan_prompt(
     issue_number: int,
     config: AgentLoopConfig,
@@ -2388,6 +2617,7 @@ def build_issue_plan_prompt(
     issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     plan_validation_diagnostic: object | None = None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -2466,7 +2696,7 @@ prose between the JSON object and footer.
         "Each bullet must explain how the plan covers that item or what remains risky or blocked."
     ),
 )}
-{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 {_issue_context_block(issue_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -2503,6 +2733,9 @@ def build_plan_review_prompt(
     compact_tail: CompactPlanTailContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     superseded_prepanel_review: SupersededPrepanelReview | None = None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
+    inherited_check_failure: str | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2518,6 +2751,9 @@ def build_plan_review_prompt(
             compact_prior=compact_prior,
             compact_tail=compact_tail,
             superseded_prepanel_review=superseded_prepanel_review,
+            inherited_matrix_binding=inherited_matrix_binding,
+            inherited_reviewed_deltas=inherited_reviewed_deltas,
+            inherited_check_failure=inherited_check_failure,
         )
         return compact_prompt
     coder_name = agent_display_name(config.coder)
@@ -2554,7 +2790,7 @@ branch, commit, push, or open a pull request during this planning review.
 Plan from {coder_name}:
 
 {plan}
-{superseded_prepanel_block}
+{render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
 Review the plan for correctness, architecture fit, missing edge cases, test
 strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -2575,7 +2811,7 @@ strategy, and ambiguity. Use this mandatory structured JSON response format:
 <!-- AGENT_PLAN_STATE: approved -->
 -- {reviewer_signature}
 
-Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
+{_reviewer_exhaustiveness_guidance('plan')}Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
 follow-ups are small current-plan refinements that must be incorporated before
 implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
@@ -2636,6 +2872,9 @@ def _build_compact_plan_review_prompt(
     compact_prior: CompactPriorContext | None,
     compact_tail: CompactPlanTailContext | None,
     superseded_prepanel_review: SupersededPrepanelReview | None = None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
+    inherited_check_failure: str | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_name = agent_display_name(reviewer)
@@ -2695,7 +2934,7 @@ Action for this call: {action}
 Current implementation plan from {coder_name}:
 
 {plan}
-{superseded_prepanel_block}
+{render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
 {_agent_unavailable_guidance(reviewer_signature)}
 {_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
@@ -2801,6 +3040,7 @@ def _build_semantic_plan_revision_prompt(
     base_round_number: int,
     base_state_identity: str,
     plan_validation_diagnostic: object | None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> str:
     """Prompt for the revision-only semantic contract.
 
@@ -2829,7 +3069,7 @@ authenticated base and assemble the complete generation-1 plan.
 {human_requirements_context.block}
 {_issue_context_block(issue_context)}
 {_memory_block(memory, config, include_runtime=True)}
-{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 
 Authenticated base binding:
 - base_round_number: {base_round_number}
@@ -2874,6 +3114,28 @@ text; do not use `rationale` or omit `disposition`.
 <!-- AGENT_PLAN_STATE: blocking -->
 -- {coder_signature}
 
+Whole-field `replace` accepts only these fields: `summary`, `plan_steps`,
+`architecture_impact`, `additional_closing_issue_ids`,
+`human_requirement_dispositions`, `execution_recommendation`,
+`external_dependencies`, `deferred_work`, `plan_actions`, `deferred_stages`.
+Never `replace` `risk_test_matrix` and never re-emit the whole matrix; revise it
+with these per-row operations (each object uses exactly the keys shown, and
+every `row`/`target_row`/`target_rows` entry is a complete matrix row):
+- `{{"op": "matrix_add", "row": {{...}}, "final_position": 0, "rationale": "..."}}`
+  adds a new row at a zero-based position in the revised matrix.
+- `{{"op": "matrix_edit", "row_id": "existing-row", "row": {{...}}, "rationale": "..."}}`
+  replaces one existing row, for example to correct its `expected_outcome`.
+- `{{"op": "matrix_retire", "row_id": "existing-row", "rationale": "..."}}`
+  removes one existing row.
+- `{{"op": "matrix_split", "source_row_id": "existing-row", "target_rows": [{{...}}, {{...}}], "rationale": "..."}}`
+  replaces one row with two or more rows.
+- `{{"op": "matrix_merge", "source_row_ids": ["row-a", "row-b"], "target_row": {{...}}, "rationale": "..."}}`
+  consolidates two or more rows into one.
+- `{{"op": "matrix_metadata_replace", "value": {{"applicability": "applicable", "important_exclusions": ["..."]}}, "audit_operation": "change", "rationale": "..."}}`
+  replaces matrix-level metadata; `audit_operation` is `change`, `split`, or
+  `merge`, and `value` may add `not_applicable_rationale`.
+No other operation names exist.
+
 Operations are applied atomically and simultaneously. The patch must contain
 at least one real change, and its binding must match the authenticated values
 above exactly. Repair may fix only response-envelope presentation; it cannot
@@ -2899,6 +3161,7 @@ def build_plan_revision_prompt(
     response_form: str | None = None,
     base_round_number: int | None = None,
     base_state_identity: str | None = None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if response_form == "semantic-patch-v1":
@@ -2916,6 +3179,7 @@ def build_plan_revision_prompt(
             base_round_number=base_round_number,
             base_state_identity=base_state_identity,
             plan_validation_diagnostic=plan_validation_diagnostic,
+            inherited_matrix_binding=inherited_matrix_binding,
         )
     if compact_context:
         return _build_compact_plan_revision_prompt(
@@ -2931,6 +3195,7 @@ def build_plan_revision_prompt(
             compact_tail=compact_tail,
             require_risk_test_matrix_contract=require_risk_test_matrix_contract,
             plan_validation_diagnostic=plan_validation_diagnostic,
+            inherited_matrix_binding=inherited_matrix_binding,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2957,7 +3222,7 @@ branch, commit, push, or open a pull request during this planning stage.
         "Each bullet must explain how the revised plan covers that item or what remains risky or blocked."
     ),
 )}
-{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, previous_plan))}
 {_issue_context_block(issue_context)}
 {unresolved_items_block}{_memory_block(memory, config, include_runtime=True)}
@@ -3061,6 +3326,7 @@ def _build_compact_plan_revision_prompt(
     compact_tail: CompactPlanTailContext | None,
     require_risk_test_matrix_contract: bool,
     plan_validation_diagnostic: object | None,
+    inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3111,7 +3377,7 @@ Reviewers: {reviewer_name}
 {subject_line}
 Action for this call: {action}
 
-{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 
 Previous implementation plan:
 
@@ -3446,8 +3712,10 @@ def _compact_pr_review_issue_context_block(
         [
             "",
             "Raw prior PR-review comments are omitted in compact PR review context. "
-            "Durable reviewer findings must appear in the active unresolved ledger or "
-            "the append-only compact prior ledger below.",
+            "Open reviewer findings appear in the active unresolved ledger; findings "
+            "that left it are summarized in the bounded compact prior ledger below, "
+            "where older entries may be reduced to headers or folded into an "
+            "omission notice.",
             "",
         ]
     )
@@ -3458,8 +3726,8 @@ def _canonical_pr_review_ledger_rules() -> str:
     return """Canonical compact PR review ledger rules
 
 - Treat active prior unresolved review items as approval-critical until explicitly dispositioned.
-- Treat append-only compact prior ledger entries as the canonical history for prior blocking and same-PR concerns that left the active ledger.
-- Do not reinterpret, reorder, or rewrite prior compact ledger entries; append only new resolved or future-follow-up summaries after later review rounds.
+- Treat compact prior ledger entries as the history for prior blocking and same-PR concerns that left the active ledger. The ledger is size-bounded and lossy: the newest entries are verbatim, older entries may be reduced to their header line marked "(details compacted)", and the oldest may be folded into a single "[compacted] N earlier prior item summaries omitted" notice. Those items were already dispositioned; do not reopen them merely because their details are compacted or omitted.
+- Do not reinterpret or reorder compact ledger entries; new resolved or future-follow-up summaries are appended after later review rounds.
 - Future follow-ups are relevant in compact mode only when elevated, referenced, or preserved in the compact prior ledger.
 """
 
@@ -3552,7 +3820,7 @@ the pull request to be considered approved.
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
-Treat the GitHub PR checks block in the volatile tail as authoritative for current CI state.
+{_reviewer_exhaustiveness_guidance('pr')}Treat the GitHub PR checks block in the volatile tail as authoritative for current CI state.
 Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
@@ -4171,7 +4439,7 @@ already available, or produce a blocking review explaining the limitation.
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
-Treat the GitHub PR checks block above as authoritative for current CI state.
+{_reviewer_exhaustiveness_guidance('pr')}Treat the GitHub PR checks block above as authoritative for current CI state.
 Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.

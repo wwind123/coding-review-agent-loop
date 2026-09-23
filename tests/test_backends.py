@@ -807,8 +807,9 @@ def test_claude_backend_prefers_response_file_over_message_text(tmp_path):
 
     result = CLAUDE_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
 
-    assert runner.last_input_text is None
-    assert any("Review this PR." in arg for arg in runner.commands[-1][0])
+    assert runner.last_input_text is not None
+    assert "Review this PR." in runner.last_input_text
+    assert all("Review this PR." not in arg for arg in runner.argv_commands[-1][0])
     assert result.response_file_text == "response file text"
     assert result.response_file_path is not None
     assert result.response_file_path.read_text(encoding="utf-8").strip() == "response file text"
@@ -826,7 +827,38 @@ def test_claude_backend_sends_large_prompt_on_stdin(tmp_path):
 
     assert runner.last_input_text is not None
     assert prompt in runner.last_input_text
-    assert all(prompt not in arg for arg in runner.commands[-1][0])
+    assert all(prompt not in arg for arg in runner.argv_commands[-1][0])
+
+
+def test_claude_backend_sends_small_prompt_on_stdin_with_no_prompt_in_argv(tmp_path):
+    # Regression for #870: even a tiny prompt must never appear in argv, where
+    # it is visible through ps and /proc/<pid>/cmdline.
+    runner = FakeRunner(claude_outputs=[json.dumps({"result": "ok"})])
+    config = make_config(tmp_path)
+    prompt = "Secret issue text 870."
+
+    CLAUDE_BACKEND.run(runner, config, prompt, run_id="run-1")
+
+    assert runner.last_input_text is not None
+    assert prompt in runner.last_input_text
+    args = runner.argv_commands[-1][0]
+    assert all(prompt not in arg for arg in args)
+    assert all("PUBLIC RESPONSE FILE" not in arg for arg in args)
+    assert args[:4] == [config.claude_cmd, "--print", "--output-format", "json"]
+
+
+def test_claude_backend_resume_turn_sends_prompt_on_stdin(tmp_path):
+    runner = FakeRunner(claude_outputs=[json.dumps({"result": "ok", "session_id": "s-2"})])
+    config = make_config(tmp_path)
+    prompt = "Finish the completion-recovery turn."
+
+    CLAUDE_BACKEND.run(runner, config, prompt, session_id="s-1", run_id="run-1")
+
+    args = runner.argv_commands[-1][0]
+    assert args[-2:] == ["--resume", "s-1"]
+    assert runner.last_input_text is not None
+    assert prompt in runner.last_input_text
+    assert all(prompt not in arg for arg in args)
 
 
 def test_gemini_backend_prefers_response_file_over_message_text(tmp_path):
@@ -975,8 +1007,25 @@ def test_codex_backend_sends_large_prompt_on_stdin(tmp_path):
 
     assert runner.last_input_text is not None
     assert prompt in runner.last_input_text
-    assert all(prompt not in arg for arg in runner.commands[-1][0])
+    assert all(prompt not in arg for arg in runner.argv_commands[-1][0])
     assert result.response_file_text == "response file text"
+
+
+def test_codex_backend_sends_small_prompt_on_stdin_with_no_prompt_in_argv(tmp_path):
+    # Regression for #870: `codex exec -` reads the prompt from stdin for
+    # every size, so argv never carries prompt text.
+    runner = FakeRunner(codex_outputs=[{"public_response": "last message text"}])
+    config = make_config(tmp_path)
+    prompt = "Secret issue text 870."
+
+    CODEX_BACKEND.run(runner, config, prompt, run_id="run-1")
+
+    assert runner.last_input_text is not None
+    assert prompt in runner.last_input_text
+    args = runner.argv_commands[-1][0]
+    assert args[-1] == "-"
+    assert all(prompt not in arg for arg in args)
+    assert all("PUBLIC RESPONSE FILE" not in arg for arg in args)
 
 
 def test_codex_backend_prefers_last_message_over_stdout_without_response_file(tmp_path):

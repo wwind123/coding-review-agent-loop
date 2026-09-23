@@ -33,6 +33,7 @@ from coding_review_agent_loop.managed_ci import (
     assess_exact_head_protection,
     _dispatch_v2_qualification,
     _ensure_v2_intent,
+    _intent_body,
     _patch_intent,
     _v2_failed_jobs,
     _v2_correlated_status,
@@ -1754,6 +1755,291 @@ def test_fresh_authorization_supersedes_prior_grant_for_verified_descendant(tmp_
     assert resume is not None
     assert resume[0] == advanced.authorization_comment_id
     assert resume[1]["nonce"] == advanced.override_nonce
+
+
+def _rebound_plan_fresh_setup(tmp_path):
+    """A pre-rebind grant under plan ``a`` and a descendant head (#993)."""
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    first = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+        approved_plan_hash="a" * 64,
+    )
+    runner.rest_pr["head"]["sha"] = "descendant"
+    runner.compare_payload = {
+        "status": "ahead",
+        "base_commit": {"sha": "abc123"},
+        "merge_base_commit": {"sha": "abc123"},
+    }
+    live = replace(
+        metadata(), head_branch="agent-loop/managed-643", head_sha="descendant"
+    )
+    return runner, config, first, live
+
+
+def test_fresh_authorization_treats_verified_retired_plan_grant_as_history(tmp_path):
+    runner, config, first, live = _rebound_plan_fresh_setup(tmp_path)
+
+    rebound = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643, metadata=live,
+        approved_plan_hash="b" * 64,
+        retired_plan_hashes=frozenset({"a" * 64}),
+    )
+
+    assert rebound.authorization_kind == "fresh"
+    assert rebound.approved_plan_hash == "b" * 64
+    assert rebound.retired_plan_hashes == frozenset({"a" * 64})
+    parsed = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert parsed is not None
+    assert parsed.approved_plan_hash == "b" * 64
+    assert parsed.predecessor_comment_id == first.authorization_comment_id
+
+    # A rerun reuses the new grant, and re-validation keeps the retired set.
+    posted = len(runner.intent_comments)
+    revalidated = revalidate_issue_created_handoff(
+        runner, config=config, handoff=rebound, metadata=live
+    )
+    assert revalidated.authorization_comment_id == rebound.authorization_comment_id
+    assert revalidated.retired_plan_hashes == frozenset({"a" * 64})
+    assert len(runner.intent_comments) == posted
+
+
+@pytest.mark.parametrize(
+    "retired",
+    [
+        frozenset(),
+        frozenset({"c" * 64}),
+        # The live plan itself can never be retired.
+        frozenset({"a" * 64, "b" * 64}),
+    ],
+)
+def test_fresh_authorization_still_refuses_unexplained_plan_divergence(tmp_path, retired):
+    runner, config, _first, live = _rebound_plan_fresh_setup(tmp_path)
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="conflicting actor-owned record"):
+        authorize_fresh_issue_created_resume(
+            runner, config=config, pr_number=7, issue_number=643, metadata=live,
+            approved_plan_hash="b" * 64,
+            retired_plan_hashes=retired,
+        )
+
+    assert len(runner.intent_comments) == posted
+
+
+def test_fresh_authorization_retired_plan_does_not_excuse_other_field_mismatch(tmp_path):
+    runner, config, _first, live = _rebound_plan_fresh_setup(tmp_path)
+    # The retired-plan grant also carries an unknown label event: still a conflict.
+    runner.issue_events.clear()
+    runner.issue_events.append(label_event(202))
+
+    with pytest.raises(AgentLoopError, match="conflicting actor-owned record"):
+        authorize_fresh_issue_created_resume(
+            runner, config=config, pr_number=7, issue_number=643, metadata=live,
+            approved_plan_hash="b" * 64,
+            retired_plan_hashes=frozenset({"a" * 64}),
+        )
+
+
+def test_fresh_authorization_after_same_head_rebind_uses_the_retired_grant(tmp_path):
+    # A signed rebind posts only an issue comment; the PR head is unchanged.
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    live = replace(metadata(), head_branch="agent-loop/managed-643")
+    first = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata(),
+        approved_plan_hash="a" * 64,
+    )
+    # GitHub reports an identical head, which never proves a descendant.
+    runner.compare_payload = {"status": "identical"}
+
+    rebound = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643, metadata=live,
+        approved_plan_hash="b" * 64,
+        retired_plan_hashes=frozenset({"a" * 64}),
+    )
+
+    assert rebound.authorization_kind == "fresh"
+    assert rebound.head_sha == "abc123"
+    parsed = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert parsed is not None
+    assert parsed.approved_plan_hash == "b" * 64
+    assert parsed.predecessor_head == "abc123"
+    assert parsed.predecessor_comment_id == first.authorization_comment_id
+
+    audit_kwargs = dict(
+        config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123",
+        expected_protection="voluntary", require_actor_owned_label_event=True,
+    )
+    # Activation resolves the rebound grant; the retired grant is history.
+    resume = _find_resume_audit(runner, expected_handoff=rebound, **audit_kwargs)
+    assert resume is not None
+    assert resume[0] == rebound.authorization_comment_id
+    # Without the verified retired set the old grant still fails closed.
+    assert _find_resume_audit(
+        runner, expected_handoff=replace(rebound, retired_plan_hashes=frozenset()),
+        **audit_kwargs,
+    ) is None
+
+    # A rerun reuses the rebound grant instead of posting another.
+    posted = len(runner.intent_comments)
+    again = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643, metadata=live,
+        approved_plan_hash="b" * 64,
+        retired_plan_hashes=frozenset({"a" * 64}),
+    )
+    assert again.authorization_comment_id == rebound.authorization_comment_id
+    assert len(runner.intent_comments) == posted
+
+
+def _same_head_rebound(tmp_path):
+    """A creation grant under plan ``a``, then a same-head fresh grant under ``b``."""
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    first = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata(),
+        approved_plan_hash="a" * 64,
+    )
+    runner.compare_payload = {"status": "identical"}
+    rebound = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+        approved_plan_hash="b" * 64,
+        retired_plan_hashes=frozenset({"a" * 64}),
+    )
+    return runner, config, first, rebound
+
+
+def _advance_head(runner):
+    runner.intent_comments.extend([
+        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="next-head", round_number=2),
+    ])
+    runner.rest_pr["head"]["sha"] = "next-head"
+
+
+def _inject_authorization(runner, comment_id, record):
+    runner.intent_comments.append({
+        "id": comment_id,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": str(format_issue_created_authorization_comment(record)),
+    })
+
+
+def _retired_plan_record(**overrides):
+    record = ManagedCiIssueAuthorization(
+        kind="fresh", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        nonce="retired-fresh", label_event_id=101, approved_plan_hash="a" * 64,
+    )
+    return replace(record, **overrides)
+
+
+def test_continuity_after_same_head_rebind_chains_to_the_rebound_grant(tmp_path):
+    runner, config, _first, rebound = _same_head_rebound(tmp_path)
+    _advance_head(runner)
+
+    continued = publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=rebound, predecessor_head="abc123",
+        new_head="next-head", round_comment_ids=(88, 89),
+    )
+
+    assert continued.authorization_kind == "continuity"
+    assert continued.retired_plan_hashes == frozenset({"a" * 64})
+    parsed = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert parsed is not None
+    assert parsed.approved_plan_hash == "b" * 64
+    assert parsed.predecessor_comment_id == rebound.authorization_comment_id
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="next-head",
+        expected_handoff=continued, expected_protection="voluntary",
+        require_actor_owned_label_event=True,
+    )
+    assert audit is not None
+    assert audit[0] == continued.authorization_comment_id
+
+
+def test_continuity_after_same_head_rebind_without_retirement_refuses(tmp_path):
+    runner, config, _first, rebound = _same_head_rebound(tmp_path)
+    _advance_head(runner)
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="conflicting prior authorizations"):
+        publish_issue_created_continuity_authorization(
+            runner, config=config,
+            handoff=replace(rebound, retired_plan_hashes=frozenset()),
+            predecessor_head="abc123", new_head="next-head", round_comment_ids=(88, 89),
+        )
+    assert len(runner.intent_comments) == posted
+
+
+def test_continuity_refuses_retired_plan_record_with_inconsistent_fields(tmp_path):
+    runner, config, _first, rebound = _same_head_rebound(tmp_path)
+    _inject_authorization(runner, 60, _retired_plan_record(protection="plan_limited"))
+    _advance_head(runner)
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="conflicting prior authorizations"):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=rebound, predecessor_head="abc123",
+            new_head="next-head", round_comment_ids=(88, 89),
+        )
+    assert len(runner.intent_comments) == posted
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"protection": "plan_limited"}, {"label_event_id": 999}],
+)
+def test_resume_audit_retires_only_the_plan_hash(tmp_path, overrides):
+    runner, config, _first, rebound = _same_head_rebound(tmp_path)
+    audit_kwargs = dict(
+        config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123",
+        expected_handoff=rebound, expected_protection="voluntary",
+        require_actor_owned_label_event=True,
+    )
+    # A consistent retired-plan grant is history.
+    _inject_authorization(runner, 60, _retired_plan_record())
+    audit = _find_resume_audit(runner, **audit_kwargs)
+    assert audit is not None and audit[0] == rebound.authorization_comment_id
+    # One whose non-plan fields disagree still fails closed.
+    _inject_authorization(runner, 61, _retired_plan_record(nonce="other", **overrides))
+    assert _find_resume_audit(runner, **audit_kwargs) is None
+
+
+def test_fresh_authorization_same_head_plan_change_without_retirement_refuses(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata(),
+        approved_plan_hash="a" * 64,
+    )
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="conflicting actor-owned record"):
+        authorize_fresh_issue_created_resume(
+            runner, config=config, pr_number=7, issue_number=643,
+            metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+            approved_plan_hash="b" * 64,
+        )
+    assert len(runner.intent_comments) == posted
 
 
 def test_fresh_authorization_rejects_actor_owned_record_with_unknown_label_event(tmp_path):
@@ -5289,6 +5575,98 @@ def test_v2_activation_and_preflight_require_authenticated_actor(tmp_path):
     assert contract.trusted_actor_login == "agent-loop"
 
 
+
+@pytest.mark.parametrize(
+    ("workflow", "capable"),
+    [
+        (V2_WORKFLOW, False),
+        (V2_WORKFLOW + "# AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1\n", True),
+    ],
+)
+def test_v2_activation_derives_visible_intent_capability_from_base_workflow(
+    tmp_path, workflow, capable
+):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(workflow=workflow, pr_payload={"headRefOid": "abc123"})
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.visible_intent_capable is capable
+
+
+def _visible_intent_pr(expected_head):
+    return {
+        "state": "open", "draft": True, "number": 7,
+        "base": {"ref": "main"}, "head": {
+            "sha": expected_head, "ref": "agent-loop/managed-7",
+            "repo": {"full_name": "OWNER/REPO"},
+        }, "user": {"login": "agent-loop", "id": 7},
+        "labels": [{"name": MANAGED_LABEL}],
+    }
+
+
+def test_v2_intent_body_is_bare_for_workflow_without_visible_capability():
+    revision, expected_head = "a" * 40, "b" * 40
+    contract = v2_contract(
+        workflow_revision=revision, repository="OWNER/REPO", nonce="n" * 32, created_at=1,
+        intent_generation="generation-935",
+        attached_run_id=100, run_attempt=1,
+    )
+
+    body = str(_intent_body(contract, pr_number=7, expected_head_sha=expected_head, state="attached"))
+
+    assert body.startswith("<!-- AGENT_MANAGED_CI_INTENT_V2 ")
+    pages = [[{"user": {"login": "agent-loop", "id": 7}, "body": body}]]
+    # Older pinned consumers, which fullmatch the bare record, keep working.
+    for router in (historical_router, current_router):
+        router.validate(
+            _visible_intent_pr(expected_head), pages, "OWNER/REPO", "7", expected_head,
+            "n" * 32, "agent-loop", revision,
+        )
+    local_router.validate(
+        _visible_intent_pr(expected_head), pages, "OWNER/REPO", "7", expected_head,
+        "n" * 32, "agent-loop", revision, 7,
+    )
+
+
+def test_v2_intent_body_leads_with_fixed_visible_line_for_capable_workflow():
+    revision, expected_head = "a" * 40, "b" * 40
+    contract = v2_contract(
+        workflow_revision=revision, repository="OWNER/REPO", nonce="n" * 32, created_at=1,
+        intent_generation="generation-935",
+        attached_run_id=100, run_attempt=1, visible_intent_capable=True,
+    )
+
+    body = str(_intent_body(contract, pr_number=7, expected_head_sha=expected_head, state="attached"))
+
+    visible, record = body.split("\n\n", 1)
+    assert visible == f"Managed CI authorization for exact head {expected_head}."
+    assert record.startswith("<!-- AGENT_MANAGED_CI_INTENT_V2 ")
+    pages = [[{"user": {"login": "agent-loop", "id": 7}, "body": body}]]
+    validated = local_router.validate(
+        _visible_intent_pr(expected_head), pages, "OWNER/REPO", "7", expected_head,
+        "n" * 32, "agent-loop", revision, 7,
+    )
+    assert validated["expected_head_sha"] == expected_head
+
+
+def test_v2_visible_intent_body_round_trips_through_intent_rediscovery(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner()
+    contract = v2_contract(visible_intent_capable=True)
+
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract)
+    nonce = contract.nonce
+    _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+
+    assert [snapshot["state"] for snapshot in runner.intent_snapshots] == ["prepared", "dispatch-requested"]
+    resumed = v2_contract(visible_intent_capable=True, nonce=None)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=resumed)
+    assert resumed.nonce == nonce
+    assert resumed.intent_state == "dispatch-requested"
+
+
 def test_v2_preflight_accepts_exactly_one_reserved_direct_branch(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     runner = V2ManagedRunner(pr_payload={"headRefOid": "abc123"})
@@ -6450,3 +6828,107 @@ def test_unverified_resume_audit_falls_back_to_ordinary_recovery(tmp_path):
     assert not any(
         command[:4] == ["gh", "pr", "merge", "7"] for command, _cwd in runner.commands
     )
+
+
+# --- #953: a spilled prior_items still carries the merge-conflict obligation ---
+
+
+def _spilled_conflict_round_comments(*, subject, round_number, first_id):
+    """A conflict coder record whose prior_items spilled into sidecar comments."""
+    import base64 as _base64
+    import os as _os
+
+    import coding_review_agent_loop.round_transport as transport
+
+    conflict = UnresolvedReviewItem(
+        item_id="item-merge-conflict",
+        reviewer="agent-loop",
+        source_round=round_number,
+        text="PR has a merge conflict with main. "
+        + _base64.urlsafe_b64encode(_os.urandom(50_000)).decode("ascii"),
+        status="blocking",
+        authority="machine",
+        obligation_kind="merge-conflict",
+        lifecycle="repair_required",
+    )
+    prepared = transport.prepare_round_comment(
+        _attach_round_metadata(
+            "coder round",
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="agent-loop",
+                round_number=round_number, subject=subject,
+                prior_items=(conflict,),
+            ),
+        )
+    )
+    anchor = transport.ROUND_RESUME_MARKER_RE.search(str(prepared[-1]))
+    reference = transport.decode_mapping(anchor.group("payload"))["prior_items"]
+    assert isinstance(reference, dict) and "$round_transport_spill" in reference
+    return [
+        {"id": first_id + index, "user": {"login": "agent-loop", "id": 1}, "body": str(body)}
+        for index, body in enumerate(prepared)
+    ]
+
+
+def _spilled_conflict_continuity():
+    comments = _spilled_conflict_round_comments(
+        subject="merged-head", round_number=13, first_id=58
+    )
+    anchor_id = comments[-1]["id"]
+    authorization = ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="merged-head", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
+        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=50,
+        round_comment_ids=(anchor_id,),
+    )
+    return comments, anchor_id, authorization
+
+
+def test_m953_spilled_conflict_obligation_grants_continuity(tmp_path):
+    comments, anchor_id, authorization = _spilled_conflict_continuity()
+
+    records = managed_ci._continuity_round_records(comments)
+    assert records[len(comments) - 1]["resolves_merge_conflict"] is True
+    assert managed_ci._continuity_round_metadata_is_valid(
+        comments, authorization=authorization
+    ) is True
+
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.extend(comments)
+    selected = managed_ci.find_actor_round_metadata_comment_ids(
+        runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+        actor_id=1, predecessor_head="abc123", new_head="merged-head", round_number=12,
+        after_comment_id=50,
+    )
+    assert selected == (anchor_id,)
+
+
+def test_m953_legacy_reader_declines_spilled_conflict_continuity(tmp_path, monkeypatch):
+    """An older binary cannot see the spilled obligation and so denies, never grants."""
+    import coding_review_agent_loop.round_transport as transport
+
+    comments, _anchor_id, authorization = _spilled_conflict_continuity()
+    monkeypatch.setattr(
+        transport,
+        "_SPILL_FIELDS",
+        tuple(
+            field for field in transport._SPILL_FIELDS
+            if field not in transport._GROWTH_SPILL_FIELDS
+        ),
+    )
+
+    records = managed_ci._continuity_round_records(comments)
+    assert records[len(comments) - 1]["resolves_merge_conflict"] is False
+    assert managed_ci._continuity_round_metadata_is_valid(
+        comments, authorization=authorization
+    ) is False
+
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.extend(comments)
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+            actor_id=1, predecessor_head="abc123", new_head="merged-head",
+            round_number=12, after_comment_id=50,
+        )

@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 from .base import (
     AgentName,
     AgentResult,
-    STDIN_PROMPT_THRESHOLD_BYTES,
     public_response_path,
     read_public_response_file,
     with_public_response_file_instruction,
@@ -218,13 +217,9 @@ class ClaudeBackend:
         if session_id:
             args += ["--resume", session_id]
         prompt_with_response_instruction = with_public_response_file_instruction(prompt, response_path)
-        input_text = None
-        if len(prompt_with_response_instruction.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES:
-            # Linux limits a single exec argument to about 128 KiB. Long compact
-            # contexts can exceed that before the Claude CLI is launched.
-            input_text = prompt_with_response_instruction
-        else:
-            args.append(prompt_with_response_instruction)
+        # Always deliver the prompt on stdin (#870): argv is capped per argument
+        # by exec and is visible to every local user through ps/proc cmdline.
+        input_text = prompt_with_response_instruction
         log_path = agent_log_path(config, "claude", run_id=run_id, label=label, attempt_suffix=attempt_suffix)
         log(config, f"Starting Claude in {config.claude_dir}; log: {log_path}; response: {response_path}")
         # This is deliberately before every Claude invocation, including an

@@ -1416,3 +1416,18 @@ def test_malformed_bare_launcher_options_get_no_exemption(tmp_path, origin, opti
             assigned_workdir=checkout,
             origin=origin,
         )
+
+
+def test_managed_run_tests_with_worker_flags_keeps_wrapper_contract(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    wrapper = [
+        "/home/user/.local/bin/agent-loop", "run-tests",
+        "--test-workers", "2", "--test-worker-memory=2G", "--test-worker-enforcement", "refuse",
+        "--memory-dir=/outside/cache", "--timeout-seconds", "720", "--",
+        sys.executable, "-m", "pytest", "tests/test_protocol.py", "-n", "2",
+    ]
+    validate_test_commands_within_workdir([shlex.join(wrapper)], assigned_workdir=checkout)
+    outside = [*wrapper[:-4], str(tmp_path / "outside.py")]
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir([shlex.join(outside)], assigned_workdir=checkout)

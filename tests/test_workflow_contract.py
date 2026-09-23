@@ -191,6 +191,75 @@ def test_validator_accepts_each_dispatch_lifecycle_state(state):
     assert _validate(_record(state))["state"] == state
 
 
+
+def test_workflow_advertises_visible_intent_capability():
+    assert "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1: enabled" in _workflow_text()
+
+
+def _visible_pages(record, *, prefix, actor="agent-loop", actor_id=7):
+    return [[{
+        "user": {"login": actor, "id": actor_id},
+        "body": prefix + "<!-- AGENT_MANAGED_CI_INTENT_V2 "
+        + json.dumps(record, separators=(",", ":"))
+        + " -->",
+    }]]
+
+
+def test_validator_accepts_fixed_visible_line_bound_to_the_authorized_head():
+    record = _record()
+    prefix = f"Managed CI authorization for exact head {'b' * 40}.\n\n"
+
+    assert _validate(record, pages=_visible_pages(record, prefix=prefix))["nonce"] == "n" * 32
+    # Surrounding whitespace is stripped before the whole-body match.
+    assert _validate(record, pages=_visible_pages(record, prefix="\n" + prefix))["state"] == record["state"]
+
+
+def test_validator_still_accepts_bare_record_during_transition():
+    assert _validate(_record())["state"] == "dispatch-requested"
+
+
+def test_validator_rejects_visible_line_that_disagrees_with_payload_head():
+    record = _record()
+    prefix = f"Managed CI authorization for exact head {'c' * 40}.\n\n"
+
+    with pytest.raises(ValueError, match="visible intent line disagrees"):
+        _validate(record, pages=_visible_pages(record, prefix=prefix))
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "Managed CI authorization for exact head.\n\n",
+        f"Managed CI authorization for exact head {'b' * 40}\n\n",
+        f"Managed CI authorization for exact head {'b' * 40}.\n",
+        f"Managed CI authorization for exact head {'b' * 40}.\n\n\n",
+        f"Managed CI authorization for exact head {'B' * 40}.\n\n",
+        f"managed CI authorization for exact head {'b' * 40}.\n\n",
+        f"Managed CI authorization for exact head {'b' * 40}. Approved!\n\n",
+        f"Hello\nManaged CI authorization for exact head {'b' * 40}.\n\n",
+        f"Managed CI authorization for exact head {'b' * 40}.\n\n"
+        f"Managed CI authorization for exact head {'b' * 40}.\n\n",
+        "Ordinary prose ahead of the record.\n\n",
+    ],
+)
+def test_validator_ignores_any_body_beyond_the_fixed_visible_template(prefix):
+    record = _record()
+
+    # A non-conforming trusted body is not an intent, so the requested nonce
+    # has no authorization at all.
+    with pytest.raises(ValueError, match="exactly one fresh"):
+        _validate(record, pages=_visible_pages(record, prefix=prefix))
+
+
+def test_validator_rejects_trailing_content_after_visible_record():
+    record = _record()
+    pages = _visible_pages(record, prefix=f"Managed CI authorization for exact head {'b' * 40}.\n\n")
+    pages[0][0]["body"] += "\n\nsmuggled"
+
+    with pytest.raises(ValueError, match="exactly one fresh"):
+        _validate(record, pages=pages)
+
+
 def test_validator_rejects_prepared_duplicate_and_foreign_records():
     with pytest.raises(ValueError, match="prepared intent"):
         _validate(_record("prepared"))

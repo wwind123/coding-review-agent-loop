@@ -286,7 +286,10 @@ def test_discuss_answer_needs_human_contract_and_legacy_decoder_are_isolated():
         DiscussUnresolvedItem("blocker", "Verify availability."),
     )
 from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER
-from coding_review_agent_loop.errors import UnknownPriorItemDispositionError
+from coding_review_agent_loop.errors import (
+    NonRepairableEvidenceRejection,
+    UnknownPriorItemDispositionError,
+)
 from coding_review_agent_loop.orchestrator import (
     _detect_discuss_consensus,
     _decode_public_response_json_prefix,
@@ -2095,6 +2098,86 @@ def test_parse_structured_plan_review_normalizes_v1_payload():
     ]
 
 
+def _plan_review_with_blocking(items: list[object]) -> str:
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "plan_review",
+                "state": "blocking",
+                "summary": "Plan has a blocking gap.",
+                "blocking_plan_issues": items,
+                "same_plan_followups": [],
+                "future_followups": [],
+                "prior_plan_item_dispositions": [],
+            }
+        )
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+
+def test_parse_structured_plan_review_flattens_finding_objects_verbatim_957():
+    finding = {
+        "item_id": "start-limit-recovery",
+        "title": "dev-deploy cannot reliably recover the unit",
+        "evidence": "Step 6 uses only `systemctl start`; systemd does not reset the start limit.",
+        "required_change": "Add `systemctl reset-failed` before the deploy start, without weakening boot-time limits.",
+    }
+
+    parsed = parse_structured_plan_review(
+        _plan_review_with_blocking([finding, "Plain string finding."]),
+        reviewer="OpenAI Codex",
+    )
+
+    assert parsed is not None
+    assert [item.text for item in parsed.items.blocking] == [
+        "dev-deploy cannot reliably recover the unit "
+        "Evidence: Step 6 uses only `systemctl start`; systemd does not reset the start limit. "
+        "Required change: Add `systemctl reset-failed` before the deploy start, "
+        "without weakening boot-time limits.",
+        "Plain string finding.",
+    ]
+    assert "start-limit-recovery" not in parsed.items.blocking[0].text
+
+
+def test_parse_structured_plan_review_accepts_text_finding_object_in_every_bucket_957():
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "plan_review",
+            "state": "blocking",
+            "summary": "Plan needs work.",
+            "blocking_plan_issues": [{"text": "Blocking gap."}],
+            "same_plan_followups": [{"text": "Same-plan cleanup."}],
+            "future_followups": [{"title": "Later idea."}],
+            "prior_plan_item_dispositions": [],
+        }
+    ) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+
+    parsed = parse_structured_plan_review(payload, reviewer="OpenAI Codex")
+
+    assert parsed is not None
+    assert [item.text for item in parsed.items.blocking] == ["Blocking gap."]
+    assert [item.text for item in parsed.items.same_plan] == ["Same-plan cleanup."]
+
+
+@pytest.mark.parametrize(
+    ("item", "message"),
+    [
+        ({"title": "x", "severity": "high"}, "unsupported finding key"),
+        ({"item_id": "only-an-id"}, "no text field"),
+        ({"title": 3}, r"at index 0\.title"),
+        ({"title": "  "}, r"at index 0\.title"),
+        ({"item_id": 7, "title": "x"}, r"at index 0\.item_id must be a string"),
+        (["nested"], "must be a string or a finding object"),
+        (5, "must be a string or a finding object"),
+    ],
+)
+def test_parse_structured_plan_review_rejects_malformed_finding_objects_957(item, message):
+    with pytest.raises(AgentLoopError, match=message):
+        parse_structured_plan_review(_plan_review_with_blocking([item]), reviewer="OpenAI Codex")
+
+
 def test_parse_structured_plan_review_tolerates_omitted_empty_collections():
     payload = (
         json.dumps(
@@ -2394,7 +2477,6 @@ def test_semantic_matrix_claim_empty_fact_normalizes_to_default(kind, field, val
         (lambda c: c.pop("execution_refs"), "missing required field"),
         (lambda c: c.update(execution_refs=[]), "at least one selector"),
         (lambda c: c.pop("row_id"), "missing required field"),
-        (lambda c: c.update(row_id="row-unknown"), "not an approved enforceable matrix row"),
         (lambda c: c.update(execution_refs=["turn:observation-1", "turn:observation-1"]), "more than once"),
         (lambda c: c.update(execution_refs=[f"cmd-{i}" for i in range(9)]), "8-item bound"),
         (lambda c: c.update(execution_refs=[3]), "must be a string"),
@@ -2412,8 +2494,48 @@ def test_semantic_matrix_claim_authority_defects_still_reject(kind, mutate, matc
 
 
 @pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_for_unapproved_row_is_dropped_not_rejected(kind):
+    """#920: one claim citing a sibling phase's row must not discard the envelope."""
+    valid = _complete_semantic_claim()
+    sibling = {**_complete_semantic_claim(), "row_id": "legacy-planning-metadata-fallback"}
+    other_valid = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(
+        kind,
+        [valid, sibling, other_valid, dict(sibling)],
+        row_ids=("row-1", "row-2"),
+    )
+
+    assert parsed is not None
+    if kind == "issue_implementation":
+        assert parsed.pr_number == 77
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-1", "row-2"]
+    assert claims.dropped_row_ids == ("legacy-planning-metadata-fallback",)
+    # A dropped claim is not serialized back as coverage.
+    assert [item["row_id"] for item in claims.to_payload()] == ["row-1", "row-2"]
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_empty_approved_set_drops_every_claim(kind):
+    """#920: an explicitly empty scoped set is a restriction, not 'no restriction'."""
+    parsed = _validate_claims_envelope(kind, [_complete_semantic_claim()], row_ids=())
+
+    assert parsed.risk_test_matrix_claims.claims == ()
+    assert parsed.risk_test_matrix_claims.dropped_row_ids == ("row-1",)
+
+
+def test_semantic_matrix_claim_malformed_row_id_still_rejects():
+    """#920 degrades only well-formed unapproved ids; malformed ids still reject."""
+    claim = {**_complete_semantic_claim(), "row_id": 5}
+
+    with pytest.raises(AgentLoopError, match="row_id"):
+        _validate_claims_envelope("coder_followup", [claim], row_ids=("row-1",))
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
 def test_semantic_matrix_claim_inadmissible_selector_still_rejects(kind):
-    with pytest.raises(AgentLoopError, match="not an admissible passing observation"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="not an admissible passing observation"):
         _validate_claims_envelope(
             kind,
             [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
@@ -2560,7 +2682,7 @@ def test_semantic_matrix_claim_launch_integrity_failing_or_unknown_selector_stil
     It is a real broker handle, so selecting it is an authority decision and
     must not be downgraded to a dropped ref.
     """
-    with pytest.raises(AgentLoopError, match="launch-integrity"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="launch-integrity"):
         _validate_claims_envelope(
             kind,
             [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
@@ -2575,7 +2697,7 @@ def test_semantic_matrix_claim_launch_integrity_failing_or_unknown_selector_stil
 
 def test_semantic_matrix_claim_catalog_collision_still_rejects():
     entry = {"execution_ref": "turn:observation-1", "outcome": "passed", "provenance": "parent-observed"}
-    with pytest.raises(AgentLoopError, match="colliding execution_ref"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="colliding execution_ref"):
         _validate_claims_envelope(
             "issue_implementation",
             [{"row_id": "row-1", "execution_refs": [_COMMAND_REF]}],
@@ -2709,7 +2831,7 @@ def test_semantic_matrix_claims_reject_known_launch_integrity_failures_before_au
         if kind == "issue_implementation"
         else validate_structured_coder_followup
     )
-    with pytest.raises(AgentLoopError, match="launch-integrity"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="launch-integrity"):
         validator(
             text,
             delivered_risk_test_matrix_row_ids=["row-1"],
@@ -5011,3 +5133,122 @@ def test_patch_replace_near_miss_is_rejected_with_route_forward_diagnostic():
     message = str(error.value)
     assert "`changed`" in message and "`unchanged`" in message
     assert "`modified` is not accepted in a patch" in message
+
+
+def _changed_architecture_impact(status: str) -> dict[str, object]:
+    return {
+        "status": status,
+        "rationale": "Extends an existing recovery data flow.",
+        "affected_components": ["orchestrator"],
+        "dependencies": [],
+        "execution_data_flows": ["managed-CI recovery"],
+        "persistence": [],
+        "public_contracts": [],
+        "security_boundaries": [],
+        "canonical_document_action": "no-change",
+        "canonical_document_path": None,
+        "canonical_document_rationale": "",
+    }
+
+
+def test_plan_review_keeps_envelope_for_modified_architecture_status_916():
+    from coding_review_agent_loop.protocol import parse_structured_plan_review
+
+    payload = json.dumps({
+        "schema_version": 1,
+        "kind": "plan_review",
+        "state": "approved",
+        "summary": "Plan looks good.",
+        "blocking_plan_issues": [],
+        "same_plan_followups": [],
+        "future_followups": [],
+        "prior_plan_item_dispositions": [],
+        "architecture_impact": _changed_architecture_impact("modified"),
+    }) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+
+    parsed = parse_structured_plan_review(payload, reviewer="OpenAI Codex")
+
+    # A fresh review degrades the uncorroborated near miss (#925) rather than
+    # rejecting the round; the #916 synonym table is now the explicit legacy
+    # decode for stored text, exercised below.
+    assert parsed is not None
+    assert parsed.architecture_impact is not None
+    assert parsed.architecture_impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    (record,) = parsed.architecture_impact_degradations
+    assert record.observed_preview == "modified"
+    assert record.outcome == "degraded-to-undetermined"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("modified", "changed"),
+        ("Changes", "changed"),
+        ("change", "changed"),
+        ("no-change", "unchanged"),
+        ("No_Change", "unchanged"),
+        ("none", "unchanged"),
+        ("same", "unchanged"),
+    ],
+)
+def test_architecture_status_synonyms_normalize_with_audit_note_916(raw, expected):
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    impact = parse_architecture_impact(
+        _changed_architecture_impact(raw), architecture_status_mode="legacy"
+    )
+
+    assert impact.status == expected
+    assert impact.uncertainty[-1].startswith("agent-loop normalized architecture_impact.status")
+
+
+def test_canonical_architecture_status_adds_no_audit_note_916():
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    impact = parse_architecture_impact(_changed_architecture_impact("changed"))
+
+    assert impact.status == "changed"
+    assert impact.uncertainty == ()
+
+
+def test_normalized_architecture_impact_reparses_idempotently_916():
+    from dataclasses import asdict
+
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    first = parse_architecture_impact(
+        _changed_architecture_impact("modified"), architecture_status_mode="legacy"
+    )
+    second = parse_architecture_impact(
+        json.loads(json.dumps(asdict(first))), architecture_status_mode="legacy"
+    )
+
+    assert second == first
+
+
+def test_changed_synonym_without_changed_field_set_still_fails_916():
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact(
+            {"status": "modified", "rationale": "Something moved."},
+            architecture_status_mode="legacy",
+        )
+
+
+@pytest.mark.parametrize("raw", ["partially", "maybe", "extended"])
+def test_unmapped_architecture_status_still_fails_916(raw):
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact(
+            _changed_architecture_impact(raw), architecture_status_mode="legacy"
+        )
+
+
+@pytest.mark.parametrize("raw", ["modified", "change", "none", "same"])
+def test_default_strict_mode_rejects_every_synonym_925(raw):
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact(_changed_architecture_impact(raw))

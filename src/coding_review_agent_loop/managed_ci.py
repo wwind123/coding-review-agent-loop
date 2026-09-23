@@ -8,7 +8,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import datetime
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -64,6 +64,9 @@ V2_FEATURE_MARKERS = (V2_MARKER, "workflow_dispatch", "managed_nonce", FINAL_CON
 V2_ADOPTION_MARKER = "AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION"
 V2_ADOPTION_FEATURE_MARKERS = (V2_ADOPTION_MARKER,)
 RECOVERY_MARKER = "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1"
+# Advertised by a base workflow whose intent validator admits the fixed
+# visible authorization line ahead of the record (#935).
+VISIBLE_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1"
 UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
 ISSUE_AUTHORIZATION_MARKER = "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1"
 _TERMINAL_CI_STATUSES = frozenset({
@@ -155,6 +158,9 @@ class ManagedCiContract:
     # delayed dispatch-time fallback so a suppressed draft is released only
     # when that same workflow advertises an unlabeled CI route.
     ordinary_recovery_capable: bool = False
+    # Derived from the same base workflow. Only a workflow that advertises
+    # the visible-intent envelope may receive the prefixed intent body.
+    visible_intent_capable: bool = False
     # Explicit lifecycle provenance.  These fields are intentionally not
     # inferred from public mode flags after activation.
     origin: Literal["issue-created", "source-managed"] | None = None
@@ -216,6 +222,9 @@ class AuthenticatedIssueCreatedHandoff:
     authorization_kind: Literal["creation", "fresh", "continuity"] = "creation"
     authorization_comment_id: int | None = None
     approved_plan_hash: str | None = None
+    # Approved plans a verified signed child-plan supersession retired (#993).
+    # Carried so a fresh re-validation treats their authorizations as history.
+    retired_plan_hashes: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1732,6 +1741,29 @@ def publish_issue_created_continuity_authorization(
         and record.base_ref == handoff.base_ref
         and record.kind in {"creation", "fresh", "continuity"}
     ]
+    # A signed rebind that kept the head leaves the retired-plan grant next to
+    # the live-plan grant at this head (#993).  It is history, not a second
+    # predecessor, but only when every non-plan field is still consistent.
+    retired_history = [
+        record
+        for _comment_id, record in predecessor_records
+        if _is_retired_plan_history(record, handoff)
+    ]
+    if any(
+        record.actor_login.casefold() != handoff.trusted_actor_login.casefold()
+        or record.actor_id != handoff.trusted_actor_id
+        or record.protection != handoff.protection_mode
+        or record.waiver != "allow-unprotected-managed-ci"
+        for record in retired_history
+    ):
+        raise AgentLoopError(
+            "Managed-CI head continuity found conflicting prior authorizations for the predecessor head; refusing to proceed."
+        )
+    predecessor_records = [
+        (comment_id, record)
+        for comment_id, record in predecessor_records
+        if not _is_retired_plan_history(record, handoff)
+    ]
     if not predecessor_records:
         raise AgentLoopError(
             "Managed-CI head continuity has no unique prior authorization for the predecessor head."
@@ -1983,8 +2015,19 @@ def authorize_fresh_issue_created_resume(
     issue_number: int,
     metadata: PullRequestMetadata,
     approved_plan_hash: str | None = None,
+    retired_plan_hashes: Collection[str] = (),
 ) -> AuthenticatedIssueCreatedHandoff:
-    """Create a new operator grant for a PR whose original checkpoint is absent."""
+    """Create a new operator grant for a PR whose original checkpoint is absent.
+
+    ``retired_plan_hashes`` names approved plans that a verified signed
+    child-plan supersession replaced (#993).  An authorization recorded under
+    such a plan is history, not a competing grant, so its plan hash alone does
+    not make it conflicting.  Every other field is still compared, and a plan
+    divergence with no verified supersession edge still refuses.
+    """
+    retired = frozenset(retired_plan_hashes)
+    if approved_plan_hash is None or approved_plan_hash in retired:
+        retired = frozenset()
     if not config.allow_unprotected_managed_ci:
         raise AgentLoopError(
             "Managed-CI fresh authorization requires --allow-unprotected-managed-ci."
@@ -2155,6 +2198,7 @@ def authorize_fresh_issue_created_resume(
             authorization_kind=record.kind,
             authorization_comment_id=comment_id,
             approved_plan_hash=record.approved_plan_hash,
+            retired_plan_hashes=retired,
         )
     issue_timeline = _api_list(
         runner,
@@ -2201,7 +2245,10 @@ def authorize_fresh_issue_created_resume(
         or record.protection != protection.state
         or record.waiver != "allow-unprotected-managed-ci"
         or record.label_event_id not in valid_label_event_ids
-        or (record.approved_plan_hash or None) != (approved_plan_hash or None)
+        or (
+            (record.approved_plan_hash or None) != (approved_plan_hash or None)
+            and record.approved_plan_hash not in retired
+        )
     ]
     if incompatible_records:
         raise AgentLoopError(
@@ -2209,6 +2256,16 @@ def authorize_fresh_issue_created_resume(
         )
     predecessor: tuple[int, ManagedCiIssueAuthorization] | None = None
     for candidate in sorted(scoped_records, key=lambda item: item[0], reverse=True):
+        # A signed rebind changes only the plan, not the PR head (#993).  A
+        # grant at the live head under a verified retired plan is therefore
+        # the predecessor of this plan transition; any other same-head record
+        # would have been reused above or refused as incompatible.
+        if (
+            candidate[1].head_sha == metadata.head_sha
+            and candidate[1].approved_plan_hash in retired
+        ):
+            predecessor = candidate
+            break
         if _github_proves_descendant(
             runner,
             config=config,
@@ -2281,6 +2338,7 @@ def authorize_fresh_issue_created_resume(
         authorization_kind="fresh",
         authorization_comment_id=comment_id,
         approved_plan_hash=approved_plan_hash,
+        retired_plan_hashes=retired,
     )
 
 
@@ -2302,6 +2360,7 @@ def revalidate_issue_created_handoff(
             issue_number=handoff.issue_number,
             metadata=metadata,
             approved_plan_hash=handoff.approved_plan_hash,
+            retired_plan_hashes=handoff.retired_plan_hashes,
         )
         # A fresh retry may find a continuity terminal for the live head.  It
         # is still a fresh operator invocation, but the terminal's nonce is
@@ -2364,6 +2423,7 @@ def revalidate_issue_created_handoff(
         override_nonce=terminal_override_nonce,
         opening_override_nonce=opening_override_nonce,
         approved_plan_hash=handoff.approved_plan_hash,
+        retired_plan_hashes=handoff.retired_plan_hashes,
     )
 
 
@@ -2559,6 +2619,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--containment-repair-memory-swap-max", "--containment-repair-tasks-max",
     "--containment-test-gate-memory-high", "--containment-test-gate-memory-max",
     "--containment-test-gate-memory-swap-max", "--containment-test-gate-tasks-max",
+    "--test-workers", "--test-worker-memory", "--test-worker-enforcement",
 })
 _RECOVERY_NARGS_VALUE_OPTIONS = frozenset({
     "--antigravity-models", "--antigravity-quota-signatures", "--agent-retry-backoff-seconds",
@@ -3003,6 +3064,149 @@ def _parse_override_audit(body: str) -> dict[str, str] | None:
     return None if record is None else record.field_map()
 
 
+def verify_managed_pr_plan_binding(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    issue_number: int,
+    live_head: str | None,
+    approved_plan_hash: str,
+    retired_plan_hashes: Collection[str] = (),
+) -> None:
+    """Require the PR-side authorization chain to bind this PR to the plan.
+
+    Managed-CI issue-created runs deliberately do not post the issue-side
+    handoff record; their durable binding is the trusted actor's PR-comment
+    authorization chain (#966).  Qualification reads the binding from there
+    with the same substance the issue-side check enforces: the chain must name
+    this repository, issue, PR, and approved plan hash, and its unique terminal
+    must be the live head, linked back to a creation or fresh root.
+    """
+    failure = (
+        "Approved-plan/handoff identity changed or disappeared during PR qualification; "
+        "the managed-CI authorization chain does not bind PR #{pr} to approved plan "
+        "{plan} at the live head ({reason}). Stale approvals cannot be used for this head."
+    )
+
+    def fail(reason: str) -> AgentLoopError:
+        return AgentLoopError(
+            failure.format(pr=pr_number, plan=approved_plan_hash, reason=reason)
+        )
+
+    trusted_actor = (config.managed_ci_trusted_actor or "").strip()
+    if not trusted_actor:
+        raise fail("no trusted managed-CI actor is configured")
+    if not live_head:
+        raise fail("the live head is unknown")
+    retired = frozenset(retired_plan_hashes)
+    if approved_plan_hash in retired:
+        retired = frozenset()
+    comments = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+    )
+    if comments is None:
+        raise fail("the PR authorization comments could not be inspected")
+    records: list[tuple[int, ManagedCiIssueAuthorization]] = []
+    for comment in comments:
+        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        if ISSUE_AUTHORIZATION_MARKER not in body:
+            continue
+        try:
+            authorization = parse_issue_created_authorization_comment(body)
+        except AgentLoopError as exc:
+            raise fail("an authorization record is malformed") from exc
+        if authorization is None:
+            continue
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        comment_id = comment.get("id")
+        login = user.get("login")
+        if (
+            not isinstance(comment_id, int)
+            or not isinstance(login, str)
+            or login.casefold() != trusted_actor.casefold()
+            or authorization.actor_login.casefold() != trusted_actor.casefold()
+            or user.get("id") != authorization.actor_id
+        ):
+            raise fail("an authorization record is not authored by the trusted actor")
+        if (
+            authorization.repository.casefold() != config.repo.casefold()
+            or authorization.pr_number != pr_number
+            or authorization.issue_number != issue_number
+            or (config.base and authorization.base_ref != config.base)
+        ):
+            raise fail("an authorization record names a different repository, issue, PR, or base")
+        records.append((comment_id, authorization))
+    if not records:
+        raise fail("no authorization record exists")
+    by_comment_id = dict(records)
+    children_by_predecessor: dict[ManagedCiIssueAuthorization, set[str]] = {}
+    for _comment_id, authorization in records:
+        if authorization.kind == "continuity" and authorization.predecessor_comment_id is not None:
+            predecessor = by_comment_id.get(authorization.predecessor_comment_id)
+            if predecessor is not None and predecessor.head_sha == authorization.predecessor_head:
+                children_by_predecessor.setdefault(predecessor, set()).add(authorization.head_sha)
+    if any(len(heads) > 1 for heads in children_by_predecessor.values()):
+        raise fail("the authorization chain forks")
+    bound_terminals: set[ManagedCiIssueAuthorization] = set()
+    for _comment_id, terminal in records:
+        if terminal.head_sha != live_head:
+            continue
+        chain: list[ManagedCiIssueAuthorization] = []
+        current: ManagedCiIssueAuthorization | None = terminal
+        while current is not None and current.kind == "continuity":
+            if current in chain or not _continuity_round_metadata_is_valid(
+                comments, authorization=current
+            ):
+                current = None
+                break
+            chain.append(current)
+            predecessor = by_comment_id.get(current.predecessor_comment_id or 0)
+            if predecessor is None or predecessor.head_sha != current.predecessor_head:
+                current = None
+                break
+            current = predecessor
+        if current is None or current.kind not in {"creation", "fresh"}:
+            continue
+        chain.append(current)
+        if all(
+            record.approved_plan_hash != approved_plan_hash
+            and record.approved_plan_hash in retired
+            for record in chain
+        ):
+            # A whole chain under verified retired plans is history left at
+            # the live head by a signed rebind that kept the head (#993).
+            continue
+        if any(record.approved_plan_hash != approved_plan_hash for record in chain):
+            raise fail("the authorization chain names a different approved plan")
+        bound_terminals.add(terminal)
+    if not bound_terminals:
+        raise fail("no authenticated chain reaches the live head")
+    if len(bound_terminals) != 1:
+        # Byte-equivalent retries collapse in the set.  As in resume, a single
+        # fresh grant at the creation head supersedes that creation record;
+        # any other pair of distinct live-head terminals is ambiguous.
+        fresh_roots = {record for record in bound_terminals if record.kind == "fresh"}
+        if not (
+            {record.kind for record in bound_terminals} <= {"creation", "fresh"}
+            and len(fresh_roots) == 1
+        ):
+            raise fail("more than one distinct authorization terminal reaches the live head")
+
+
+def _is_retired_plan_history(
+    authorization: ManagedCiIssueAuthorization,
+    handoff: AuthenticatedIssueCreatedHandoff | None,
+) -> bool:
+    """Whether ``authorization`` was granted under a verified retired plan (#993)."""
+    return (
+        handoff is not None
+        and authorization.approved_plan_hash is not None
+        and authorization.approved_plan_hash != handoff.approved_plan_hash
+        and authorization.approved_plan_hash in handoff.retired_plan_hashes
+    )
+
+
 def _find_resume_audit(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, actor_login: str, actor_id: int,
     base_ref: str, issue_number: int | None = None, live_head: str | None = None,
@@ -3038,6 +3242,8 @@ def _find_resume_audit(
     def authorization_matches(
         authorization: ManagedCiIssueAuthorization,
         comment_id: int,
+        *,
+        history: bool = False,
     ) -> bool:
         if (
             authorization.actor_login.casefold() != actor_login.casefold()
@@ -3082,6 +3288,10 @@ def _find_resume_audit(
                 expected_nonce = expected_handoff.override_nonce
             if expected_nonce is not None and authorization.nonce != expected_nonce:
                 return False
+        if history:
+            # A retired-plan record is never the terminal, so the terminal
+            # identity checks below do not apply to it (#993).
+            return True
         if (
             authorization.kind == "fresh"
             and expected_handoff.authorization_kind == "fresh"
@@ -3148,9 +3358,25 @@ def _find_resume_audit(
                 or authorization.base_ref != base_ref
                 or authorization.pr_number != pr_number
                 or (issue_number is not None and authorization.issue_number != issue_number)
-                or not authorization_matches(authorization, cid)
                 or not isinstance(cid, int)
             ):
+                malformed = True
+                continue
+            if _is_retired_plan_history(authorization, expected_handoff):
+                # History under a plan a verified signed rebind replaced (#993):
+                # neither a competing grant nor part of the live chain.  Only
+                # the plan hash is retired; every other field must still match.
+                if not authorization_matches(
+                    replace(
+                        authorization,
+                        approved_plan_hash=expected_handoff.approved_plan_hash,
+                    ),
+                    cid,
+                    history=True,
+                ):
+                    malformed = True
+                continue
+            if not authorization_matches(authorization, cid):
                 malformed = True
                 continue
             candidates.append(
@@ -3380,6 +3606,7 @@ def _activate_v2_managed_ci(
     ordinary_recovery_capable = (
         RECOVERY_MARKER in workflow_text and "pull_request" in workflow_text and "unlabeled" in workflow_text
     )
+    visible_intent_capable = VISIBLE_INTENT_MARKER in workflow_text
 
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -3958,6 +4185,7 @@ def _activate_v2_managed_ci(
         issue_created_pr=origin == "issue-created",
         invocation_applied_label=label_applied,
         ordinary_recovery_capable=ordinary_recovery_capable,
+        visible_intent_capable=visible_intent_capable,
         origin=origin,
         lifecycle=lifecycle,
         authenticated_resume=managed_resume,
@@ -4158,6 +4386,7 @@ def _activate_v2_existing_pr_adoption(
         trusted_actor_id=actor_id, workflow_revision=revision if isinstance(revision, str) else None,
         adopted_existing_pr=True, guard_head_sha=live_sha, active_label_event_id=existing[0],
         invocation_applied_label=applied,
+        visible_intent_capable=VISIBLE_INTENT_MARKER in source,
         intent_generation=(
             secrets.token_urlsafe(16)
             if config.managed_ci
@@ -4659,16 +4888,21 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
             for run_id, run_attempt in contract.terminal_attempts
         ],
     }
+    record = f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->"
     # The intent record is the one protocol comment parsed by the installed
-    # base workflow, whose envelope is anchored at the start of the body
-    # (`^<!-- AGENT_MANAGED_CI_INTENT_V2 ... -->$` in .github/workflows/ci.yml).
-    # A visible #878 label ahead of the marker makes every dispatch fail with
-    # "expected exactly one fresh intent for requested nonce", so this record
-    # stays marker-only until the workflow contract accepts a prefix (#888).
-    return TrustedBody.canonical(
-        f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->",
-        expected_tokens=(INTENT_MARKER,),
-    )
+    # base workflow, which fullmatches the whole stripped body.  An older
+    # workflow accepts only the bare record (#888), so the fixed visible line
+    # is emitted only when the same base workflow advertises that its
+    # envelope admits it (#935).  The line is a literal template bound to the
+    # payload's head, never free text.
+    if contract.visible_intent_capable:
+        record = visible_intent_line(expected_head_sha) + "\n\n" + record
+    return TrustedBody.canonical(record, expected_tokens=(INTENT_MARKER,))
+
+
+def visible_intent_line(expected_head_sha: str) -> str:
+    """Return the exact visible line a v2 workflow admits ahead of the record."""
+    return f"Managed CI authorization for exact head {expected_head_sha}."
 
 
 def _validate_v2_intent_publication(contract: ManagedCiContract, *, state: str) -> None:

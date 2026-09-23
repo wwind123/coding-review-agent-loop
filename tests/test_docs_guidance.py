@@ -547,7 +547,8 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     assert "never recover class D" in text
     # Carried approvals and the exclusions.
     assert "HUMAN_REQUIREMENTS_RESOLVED" in text
-    assert "Discussion-mode scheduling and the child-planning cycle always invoke the full" in text
+    assert "Discussion-mode scheduling always invokes the full board" in text
+    assert "A child-planning cycle inherits the operator's `--plan-review-policy`" in text
 
 
 def test_docs_document_the_flow_aware_planning_policy_evaluation():
@@ -570,3 +571,46 @@ def test_docs_document_the_flow_aware_planning_policy_evaluation():
     assert "escaped plan defects are reported in\nthe `plan` flow" in text
     assert "`unavailable` with a reason rather than borrowed" in text
     assert "own `plan` flow" in readme
+
+
+def test_docs_document_the_review_contract_dimension_and_freezing_procedure():
+    text = " ".join(LOCAL_AGENT_LOOP_DOC.read_text().split())
+    architecture = " ".join(ARCHITECTURE.read_text().split())
+    readme = " ".join(README.read_text().split())
+
+    # The reviewer rule (#894) and that it changes no schema.
+    assert "Reviews are exhaustive." in text
+    assert "substantiating one blocking defect does not end the review" in text
+    assert "masking must not be claimed merely to stop early" in text
+    assert "The rule changes no response schema" in text
+    # The label, its default, rejection, and label provenance.
+    assert "An absent key defaults to `first-finding-permitted`" in text
+    assert "An explicitly present null, non-string, blank, or unknown value is rejected" in text
+    assert "`flows.<flow>.review_contracts.<contract>.policies.<policy>`" in text
+    assert "verified `review_contract_provenance`" in text
+    assert "no frozen runs for this review contract and policy" in text
+    # Reading rules and the absence of any pooled figure.
+    assert "Read the effect of the contract only within the same flow and the same scheduling policy." in text
+    assert "no pooled contract figure is produced" in text
+    assert "Fewer rounds are an improvement only if they were not bought with missed defects." in text
+    # The two artifact pairs never mix.
+    assert "It is never extended with real runs" in text
+    assert "`docs/evaluation/review_contract_runs.json`" in text
+    assert "`docs/evaluation/review_contract_report.json`" in text
+    # The freezing procedure: label evidence, exclusion, window, regeneration.
+    assert "#### Freezing a real run" in LOCAL_AGENT_LOOP_DOC.read_text()
+    assert "belongs to neither contract and must not be frozen under either label" in text
+    assert "`review_contract_provenance.source`" in text
+    assert "fixed escaped-defect observation window of 14 days after the run's PR merge, identical for both contracts" in text
+    assert "`metric_provenance.escaped_defects` entry" in text
+    assert "may be frozen as `verified: true` only after the window has closed" in text
+    assert (
+        "agent-loop review-evaluation docs/evaluation/review_contract_runs.json \\ "
+        "--output docs/evaluation/review_contract_report.json"
+    ) in text
+    for document in (architecture, readme):
+        assert "`review_contract`" in document
+        assert "`first-finding-permitted`" in document
+        assert "review_contract_runs.json" in document
+    assert "no per-flow or cross-policy contract rollup" in architecture
+    assert "never pooled across policies" in readme

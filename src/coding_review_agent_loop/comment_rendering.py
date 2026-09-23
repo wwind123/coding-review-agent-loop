@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import shlex
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from .decomposition import _decode_json_payload, _encode_json_payload
@@ -13,8 +15,13 @@ from .errors import AgentLoopError
 from .expected_closure import normalize_issue_ids
 from .agents.registry import agent_display_name, agent_signature
 from .protocol import (
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     ANY_HEADING_RE,
     HTML_COMMENT_RE,
+    HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+    HUMAN_REQUIREMENTS_ADDRESSED_RE,
+    HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE,
+    HUMAN_REQUIREMENTS_HEADING_RE,
     PLAN_STATE_RE,
     PRIOR_UNRESOLVED_ITEM_DISPOSITIONS_HEADING_RE,
     PRIOR_UNRESOLVED_PLAN_ITEM_DISPOSITIONS_HEADING_RE,
@@ -43,10 +50,12 @@ from .protocol import (
     RiskTestMatrixEvidence,
     parse_risk_test_matrix,
     parse_risk_test_matrix_changes,
+    parse_risk_test_matrix_evidence,
     risk_test_matrix_identity,
     ExecutionStrategyRecommendation,
     EXECUTION_TOPOLOGY_SOURCE,
     UnresolvedReviewItem,
+    parse_human_requirements_acknowledgement,
     review_freeform_summary_text,
 )
 from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID
@@ -68,6 +77,7 @@ from .local_test_evidence import decode_bounded_evidence, redact_test_command
 if TYPE_CHECKING:
     from .agents.base import AgentName
     from .config import AgentLoopConfig
+    from .round_state import PostedRoundMetadata
 
 ITEM_SUMMARY_LIMIT = 100
 PLAN_EXPECTED_CLOSING_MARKER = "AGENT_PLAN_EXPECTED_CLOSING_ISSUES"
@@ -533,18 +543,156 @@ def decode_risk_test_matrix_marker(
     return payload
 
 
+_MATRIX_EVIDENCE_RENDER_MODES = frozenset({"full", "delta"})
+
+
+def _positive_round(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+@dataclass(frozen=True)
+class MatrixEvidenceRenderDecision:
+    """The single full-or-delta choice for a visible matrix-evidence section.
+
+    Presentation only (#959): canonical evidence in round metadata and the
+    matrix sidecar always keep every row.  ``anchor_round`` is the coder
+    record round that rendered the full row list and is what callers persist.
+    """
+
+    mode: str
+    anchor_round: int
+    previous_evidence: RiskTestMatrixEvidence | None = None
+    previous_round: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in _MATRIX_EVIDENCE_RENDER_MODES:
+            raise ValueError("matrix evidence render mode must be full or delta")
+        if not _positive_round(self.anchor_round):
+            raise ValueError("matrix evidence anchor round must be a positive integer")
+        if self.mode == "full" and (
+            self.previous_evidence is not None or self.previous_round is not None
+        ):
+            raise ValueError("a full matrix evidence decision carries no previous evidence")
+        if self.mode == "delta" and (
+            self.previous_evidence is None or not _positive_round(self.previous_round)
+        ):
+            raise ValueError("a delta matrix evidence decision requires previous evidence")
+
+
+def _matrix_evidence_row_key(row: object) -> str:
+    # The per-turn receipt_id is ignored: a row re-cited with a fresh receipt
+    # but the same claims is not a presentation change.
+    payload = row.to_payload()  # type: ignore[attr-defined]
+    payload["evidence_citations"] = [
+        {"command": item["command"], "claim": item["claim"]}
+        for item in payload["evidence_citations"]
+    ]
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def resolve_matrix_evidence_render(
+    current: RiskTestMatrixEvidence,
+    previous_metadata: "PostedRoundMetadata | None",
+    current_round: int,
+) -> MatrixEvidenceRenderDecision:
+    """Choose full or delta presentation against the previous coder record.
+
+    ``current_round`` is the round number of the coder metadata record being
+    published.  Never raises on unusable prior presentation data: any doubt
+    falls back to a full render anchored at ``current_round``.
+    """
+    full = MatrixEvidenceRenderDecision(mode="full", anchor_round=current_round)
+    if previous_metadata is None:
+        return full
+    raw_previous = getattr(previous_metadata, "risk_test_matrix_evidence", None)
+    if raw_previous is None:
+        return full
+    try:
+        previous = parse_risk_test_matrix_evidence(raw_previous)
+    except Exception:  # noqa: BLE001 - prior presentation data must never abort a round
+        return full
+    if previous.matrix_identity != current.matrix_identity:
+        return full
+    if {row.row_id for row in previous.rows} != {row.row_id for row in current.rows}:
+        return full
+    previous_round = getattr(previous_metadata, "round_number", None)
+    if not _positive_round(previous_round):
+        return full
+    status = getattr(previous_metadata, "risk_test_matrix_evidence_full_round_status", "absent")
+    if status == "valid":
+        anchor = getattr(previous_metadata, "risk_test_matrix_evidence_full_round", None)
+        if not _positive_round(anchor) or anchor > previous_round:
+            return full
+    elif status == "absent":
+        # A pre-#959 record rendered the full row list in its own comment.
+        anchor = previous_round
+    else:
+        return full
+    return MatrixEvidenceRenderDecision(
+        mode="delta",
+        anchor_round=anchor,
+        previous_evidence=previous,
+        previous_round=previous_round,
+    )
+
+
+def _matrix_evidence_display_text(value: object) -> str:
+    # Row text is agent-influenced and sits inside a renderer-owned
+    # <details> wrapper, so it must not be able to emit HTML tags (a raw
+    # </details> would close the wrapper early) or line breaks (which could
+    # start a new Markdown block).  Escape after protocol-record neutralization.
+    text = sanitize_historical_text(str(value))
+    text = " ".join(text.splitlines())
+    return html.escape(text, quote=False)
+
+
 def _render_risk_test_matrix_evidence(
     evidence: RiskTestMatrixEvidence | None,
+    *,
+    render_decision: MatrixEvidenceRenderDecision | None = None,
+    diagnostics: Sequence[object] = (),
 ) -> str | None:
     if evidence is None:
         return None
-    safe = lambda value: sanitize_historical_text(str(value))
+    safe = _matrix_evidence_display_text
     rows = sorted(evidence.rows, key=lambda row: (row.status == "verified", row.row_id))
     lines = [
         "### Risk-based mode and transition test matrix evidence",
         f"- Matrix identity: `{safe(evidence.matrix_identity)}`",
     ]
-    for row in rows:
+    # Outside the collapsed block, so an operator sees that coverage was
+    # dropped rather than silently reduced (#920).
+    lines.extend(
+        f"- Dropped claim: {safe(getattr(diagnostic, 'message', ''))}"
+        for diagnostic in diagnostics
+        if getattr(diagnostic, "code", None) == UNAPPROVED_ROW_CLAIM_DIAGNOSTIC
+    )
+    unchanged_line: str | None = None
+    if render_decision is not None and render_decision.mode == "delta":
+        assert render_decision.previous_evidence is not None
+        previous_keys = {
+            row.row_id: _matrix_evidence_row_key(row)
+            for row in render_decision.previous_evidence.rows
+        }
+        shown = [
+            row for row in rows
+            if previous_keys.get(row.row_id) != _matrix_evidence_row_key(row)
+        ]
+        unchanged = len(rows) - len(shown)
+        summary = (
+            f"{len(shown)} changed {'row' if len(shown) == 1 else 'rows'}; "
+            f"{unchanged} unchanged since round {int(render_decision.previous_round)}"
+        )
+        unchanged_line = (
+            f"{unchanged} {'row' if unchanged == 1 else 'rows'} unchanged since round "
+            f"{int(render_decision.previous_round)}; full matrix in round "
+            f"{int(render_decision.anchor_round)}."
+        )
+    else:
+        shown = rows
+        summary = f"Full matrix evidence ({len(rows)} {'row' if len(rows) == 1 else 'rows'})"
+    lines.extend(["", "<details>", f"<summary>{summary}</summary>", ""])
+    for row in shown:
         lines.append(f"- **{safe(row.row_id)}** — `{safe(row.status)}`")
         lines.append(f"  - Tests: {', '.join(safe(item) for item in row.test_identifiers) or 'none'}")
         lines.append(f"  - Locations: {', '.join(safe(item) for item in row.test_locations) or 'none'}")
@@ -558,6 +706,11 @@ def _render_risk_test_matrix_evidence(
             ))
         if row.caveats:
             lines.append("  - Caveats: " + "; ".join(safe(item) for item in row.caveats))
+    if unchanged_line is not None:
+        if shown:
+            lines.append("")
+        lines.append(unchanged_line)
+    lines.extend(["", "</details>"])
     return "\n".join(lines)
 
 
@@ -1225,6 +1378,7 @@ def _render_public_coder_followup_comment(
     model_used: str | None = None,
     local_test_evidence: str | None = None,
     current_test_turn_id: str | None = None,
+    matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
 
@@ -1302,7 +1456,11 @@ def _render_public_coder_followup_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
-    matrix_evidence = _render_risk_test_matrix_evidence(parsed_followup.risk_test_matrix_evidence)
+    matrix_evidence = _render_risk_test_matrix_evidence(
+        parsed_followup.risk_test_matrix_evidence,
+        render_decision=matrix_evidence_render_decision,
+        diagnostics=parsed_followup.risk_test_matrix_diagnostics,
+    )
     if matrix_evidence:
         sections.append(matrix_evidence)
     if parsed_followup.human_requirement_dispositions:
@@ -1363,7 +1521,10 @@ def _render_public_issue_implementation_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
-    matrix_evidence = _render_risk_test_matrix_evidence(parsed.risk_test_matrix_evidence)
+    matrix_evidence = _render_risk_test_matrix_evidence(
+        parsed.risk_test_matrix_evidence,
+        diagnostics=parsed.risk_test_matrix_diagnostics,
+    )
     if matrix_evidence:
         sections.append(matrix_evidence)
     human_section = render_human_requirement_dispositions(
@@ -1380,12 +1541,15 @@ def _render_public_issue_implementation_comment(
     return "\n\n".join(section for section in sections if section)
 
 
-def _extract_plan_revision_human_requirements_block(text: str) -> str:
+def _extract_plan_human_requirements_block(text: str) -> str:
     stripped = text.lstrip()
     if not stripped.startswith("{"):
         return ""
     decoder = json.JSONDecoder()
-    payload, end = decoder.raw_decode(stripped)
+    try:
+        payload, end = decoder.raw_decode(stripped)
+    except ValueError:
+        return ""
     if not isinstance(payload, dict):
         return ""
     trailing = stripped[end:].lstrip()
@@ -1393,6 +1557,258 @@ def _extract_plan_revision_human_requirements_block(text: str) -> str:
     if state_match is None:
         return ""
     return trailing[: state_match.start()].strip()
+
+
+def _extract_plan_revision_human_requirements_block(text: str) -> str:
+    return _extract_plan_human_requirements_block(text)
+
+
+# Bounded visible digest for structured plan coder comments (#948).  The
+# complete plan always travels in authenticated round metadata; the digest only
+# bounds the human-facing prose.  Each budgeted section owns a fixed share that
+# already includes its heading and omitted-entry line, and unused share is never
+# redistributed, so the budgeted output is bounded by construction for any
+# entry count or string length.
+COMPACT_PLAN_DIGEST_BUDGET_CHARS = 12_000
+COMPACT_PLAN_DIGEST_NOTICE = (
+    "> **Compact plan digest.** The complete plan exceeded the comment budget, so this "
+    "comment shows a bounded summary. The complete canonical plan is preserved in this "
+    "round's authenticated attachments and is what reviewers, resume and approval use."
+)
+_COMPACT_ELLIPSIS = " …"
+_COMPACT_SUMMARY_SHARE = 2_000
+_COMPACT_STEPS_SHARE = 4_800
+_COMPACT_PRIOR_DISPOSITIONS_SHARE = 1_400
+_COMPACT_CLOSING_SHARE = 500
+_COMPACT_DEFERRED_SHARE = 900
+_COMPACT_TYPED_CATEGORY_SHARE = 400
+_COMPACT_ENTRY_CHARS = 300
+_COMPACT_TITLE_CHARS = 120
+_COMPACT_HUMAN_EVIDENCE_CHARS = 300
+_COMPACT_ACK_PROSE_LINES = 20
+_COMPACT_OMITTED_LINE = (
+    "- ... {omitted} more of {total} omitted; complete list in the authenticated attachments"
+)
+_COMPACT_REQUIREMENT_ID_RE = re.compile(
+    r"\b(?:Requirement\s+)?hr-[0-9a-f]{64}\b|\bRequirement\s+\d+\b", re.I
+)
+
+
+def _compact_clip(text: str, limit: int, *, keep_newlines: bool = False) -> str:
+    """Sanitize, flatten and clip ``text`` to at most ``limit`` characters."""
+    safe = sanitize_historical_text(text).strip()
+    if not keep_newlines:
+        safe = re.sub(r"\s+", " ", safe)
+    if len(safe) <= limit:
+        return safe
+    clipped = safe[: max(0, limit - len(_COMPACT_ELLIPSIS))].rstrip() + _COMPACT_ELLIPSIS
+    # Clipping sanitized text cannot normally create a reserved record; a second
+    # pass keeps that a checked property rather than an assumption.
+    return sanitize_historical_text(clipped)[:limit]
+
+
+def _compact_budgeted_section(
+    heading: str, entries: Sequence[str], *, share: int, entry_chars: int
+) -> str:
+    """Render entries in canonical order until the fixed section share is used."""
+    total = len(entries)
+    reserve = len(_COMPACT_OMITTED_LINE.format(omitted=total, total=total)) + 1
+    lines = [heading]
+    used = len(heading)
+    if used + reserve > share:
+        raise AgentLoopError("Compact plan digest section share is too small for its heading.")
+    shown = 0
+    for index, entry in enumerate(entries):
+        line = _compact_clip(entry, entry_chars)
+        cost = len(line) + 1
+        needed = reserve if index + 1 < total else 0
+        if used + cost + needed > share:
+            break
+        lines.append(line)
+        used += cost
+        shown += 1
+    if shown < total:
+        lines.append(_COMPACT_OMITTED_LINE.format(omitted=total - shown, total=total))
+    rendered = "\n".join(lines)
+    if len(rendered) > share:
+        raise AgentLoopError("Compact plan digest section exceeded its share.")
+    return rendered
+
+
+def _compact_human_requirement_dispositions(
+    dispositions: Sequence[HumanRequirementDisposition],
+) -> str | None:
+    """List every requirement ID; only explanatory evidence is clipped."""
+    if not dispositions:
+        return None
+    return "\n".join(
+        ["### Human requirement dispositions"]
+        + [
+            f"- **{item.requirement_id}** — `{item.disposition}`: "
+            f"{_compact_clip(item.evidence, _COMPACT_HUMAN_EVIDENCE_CHARS)}"
+            for item in dispositions
+        ]
+    )
+
+
+def _compact_acknowledgement_line(line: str) -> str:
+    safe = re.sub(r"[ \t]+$", "", sanitize_historical_text(line))
+    if len(safe) <= _COMPACT_HUMAN_EVIDENCE_CHARS:
+        return safe
+    cut = _COMPACT_HUMAN_EVIDENCE_CHARS
+    required = [
+        *_COMPACT_REQUIREMENT_ID_RE.finditer(safe),
+        *HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE.finditer(safe),
+    ]
+    # Never cut inside an ID or the acknowledgement sentence: a partial
+    # "Requirement 12" would otherwise read as a different requirement.
+    for match in required:
+        if match.start() < cut < match.end():
+            cut = match.start()
+    kept = safe[:cut].rstrip() + _COMPACT_ELLIPSIS
+    tail = [match.group(0) for match in required if match.start() >= cut]
+    if tail:
+        kept += " " + "; ".join(tail)
+    return kept
+
+
+def _compact_human_requirements_block(block: str) -> str:
+    """Keep the record, heading, every ID line and the direct-discussion sentence."""
+    if not block:
+        return ""
+    lines: list[str] = []
+    prose_lines = 0
+    dropped = 0
+    for line in block.splitlines():
+        if HUMAN_REQUIREMENTS_ADDRESSED_RE.search(line) and HTML_COMMENT_RE.match(line):
+            lines.append(HUMAN_REQUIREMENTS_ADDRESSED_MARKER)
+            continue
+        essential = (
+            HUMAN_REQUIREMENTS_HEADING_RE.match(line)
+            or _COMPACT_REQUIREMENT_ID_RE.search(line)
+            or HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE.search(line)
+        )
+        if not essential:
+            if not line.strip():
+                if lines and lines[-1]:
+                    lines.append("")
+                continue
+            prose_lines += 1
+            if prose_lines > _COMPACT_ACK_PROSE_LINES:
+                dropped += 1
+                continue
+        lines.append(_compact_acknowledgement_line(line))
+    if dropped:
+        lines.append(f"_{dropped} further explanatory line(s) omitted; no requirement ID was omitted._")
+    compact = "\n".join(lines).strip()
+    original = parse_human_requirements_acknowledgement(block)
+    rendered = parse_human_requirements_acknowledgement(compact)
+    direct = HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK_RE.search
+    if (
+        original.addressed_ids != rendered.addressed_ids
+        or original.marker_present != rendered.marker_present
+        or original.section_present != rendered.section_present
+        or bool(direct(original.section_text)) != bool(direct(rendered.section_text))
+    ):
+        # Fail toward size, never toward a changed acknowledgement: the
+        # transport's attributed overflow then fails closed if this cannot fit.
+        return block
+    return compact
+
+
+def _render_compact_plan_digest(
+    parsed: StructuredPlanState | StructuredPlanRevision,
+    *,
+    title: str,
+    raw_text: str,
+    agent: str,
+    config: AgentLoopConfig | None,
+    model_used: str | None,
+) -> str:
+    budgeted: list[str] = [
+        COMPACT_PLAN_DIGEST_NOTICE,
+        _compact_clip(parsed.summary, _COMPACT_SUMMARY_SHARE, keep_newlines=True),
+    ]
+    prior_dispositions = getattr(parsed, "prior_plan_item_dispositions", ())
+    if prior_dispositions:
+        budgeted.append(
+            _compact_budgeted_section(
+                "### Prior plan item dispositions (digest)",
+                [
+                    f"- [{item.item_id}] {_render_disposition_status(replace(item, note=None))}"
+                    for item in prior_dispositions
+                ],
+                share=_COMPACT_PRIOR_DISPOSITIONS_SHARE,
+                entry_chars=_COMPACT_TITLE_CHARS,
+            )
+        )
+    budgeted.append(
+        _compact_budgeted_section(
+            "### Plan steps (digest)",
+            [f"{index}. {step}" for index, step in enumerate(parsed.plan_steps, start=1)],
+            share=_COMPACT_STEPS_SHARE,
+            entry_chars=_COMPACT_ENTRY_CHARS,
+        )
+    )
+    if parsed.additional_closing_issue_ids is not None:
+        budgeted.append(
+            _compact_budgeted_section(
+                "### Additional issues completed by this implementation PR (digest)",
+                [f"- #{item}" for item in parsed.additional_closing_issue_ids] or ["- none"],
+                share=_COMPACT_CLOSING_SHARE,
+                entry_chars=_COMPACT_TITLE_CHARS,
+            )
+        )
+    if parsed.deferred_stages:
+        budgeted.append(
+            _compact_budgeted_section(
+                "### Deferred stages (not in this plan; digest)",
+                [f"- {stage.title}" for stage in parsed.deferred_stages],
+                share=_COMPACT_DEFERRED_SHARE,
+                entry_chars=_COMPACT_TITLE_CHARS,
+            )
+        )
+    for heading, entries in (
+        ("#### Child stages (digest)", parsed.typed_stages.child_stages),
+        ("#### External dependencies (digest)", parsed.typed_stages.external_dependencies),
+        ("#### Deferred work (digest)", parsed.typed_stages.deferred_work),
+        ("#### Plan actions (digest)", parsed.typed_stages.plan_actions),
+    ):
+        if entries:
+            budgeted.append(
+                _compact_budgeted_section(
+                    heading,
+                    [f"- {entry.title}" for entry in entries],
+                    share=_COMPACT_TYPED_CATEGORY_SHARE,
+                    entry_chars=_COMPACT_TITLE_CHARS,
+                )
+            )
+    budgeted_text = "\n\n".join(section for section in budgeted if section)
+    if len(budgeted_text) > COMPACT_PLAN_DIGEST_BUDGET_CHARS:
+        raise AgentLoopError(
+            "Compact plan digest exceeded its aggregate budget of "
+            f"{COMPACT_PLAN_DIGEST_BUDGET_CHARS} characters."
+        )
+    sections = [title, budgeted_text]
+    # Visible-anchor records: emitted by the unchanged section renderers so the
+    # transport's authenticated reference rewrites keep applying to them.
+    if parsed.risk_test_matrix is not None:
+        sections.append(
+            render_risk_test_matrix_section(parsed.risk_test_matrix, parsed.risk_test_matrix_changes)
+        )
+    human_section = _compact_human_requirement_dispositions(parsed.human_requirement_dispositions)
+    if human_section:
+        sections.append(human_section)
+    if parsed.execution_recommendation is not None:
+        sections.append(render_execution_recommendation_section(parsed.execution_recommendation))
+    acknowledgement = _compact_human_requirements_block(
+        _extract_plan_human_requirements_block(raw_text)
+    )
+    if acknowledgement:
+        sections.append(acknowledgement)
+    sections.append(f"<!-- AGENT_PLAN_STATE: {parsed.state} -->")
+    sections.append(f"-- {_comment_signature(agent, config, model_used)}")
+    return "\n\n".join(section for section in sections if section)
 
 
 def _render_public_plan_revision_comment(
@@ -1403,7 +1819,17 @@ def _render_public_plan_revision_comment(
     agent: str,
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
+    compact: bool = False,
 ) -> str:
+    if compact:
+        return _render_compact_plan_digest(
+            parsed_revision,
+            title="## Revised plan",
+            raw_text=raw_text,
+            agent=agent,
+            config=config,
+            model_used=model_used,
+        )
     sections = ["## Revised plan", render_canonical_plan_revision(parsed_revision, prior_items, config)]
     human_requirements_block = _extract_plan_revision_human_requirements_block(raw_text)
     if human_requirements_block:
@@ -1419,7 +1845,21 @@ def _render_public_plan_state_comment(
     agent: str,
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
+    compact: bool = False,
+    raw_text: str = "",
 ) -> str:
+    # ``raw_text`` is read only by the compact digest: the parsed fresh plan
+    # does not retain the raw acknowledgement block.  The full rendering
+    # ignores it and stays byte-identical.
+    if compact:
+        return _render_compact_plan_digest(
+            parsed_plan,
+            title="## Plan",
+            raw_text=raw_text,
+            agent=agent,
+            config=config,
+            model_used=model_used,
+        )
     sections = [
         "## Plan",
         parsed_plan.summary.strip(),
@@ -1497,6 +1937,8 @@ def render_public_agent_comment(
     round_number: int = 1,
     local_test_evidence: str | None = None,
     current_test_turn_id: str | None = None,
+    compact: bool = False,
+    matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -1539,6 +1981,7 @@ def render_public_agent_comment(
             model_used=model_used,
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
+            matrix_evidence_render_decision=matrix_evidence_render_decision,
         )
     if kind == "issue_implementation":
         if not isinstance(parsed, StructuredIssueImplementation):
@@ -1563,6 +2006,7 @@ def render_public_agent_comment(
             agent=agent,
             config=config,
             model_used=model_used,
+            compact=compact,
         )
     if kind == "plan_state":
         if not isinstance(parsed, StructuredPlanState):
@@ -1572,6 +2016,8 @@ def render_public_agent_comment(
             agent=agent,
             config=config,
             model_used=model_used,
+            compact=compact,
+            raw_text=raw_text,
         )
     if kind == "discuss_review":
         if not isinstance(parsed, ParsedDiscussReview):

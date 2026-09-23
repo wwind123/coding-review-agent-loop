@@ -254,6 +254,25 @@ and then inspects phase 1:
   returned `resume_hint` to run the child with `--plan-first
   --plan-execution-mode auto`; implementation may begin only after that child
   plan is reviewed and approved.
+- If an already-approved child plan is reported as inadmissible under the
+  inherited-matrix contract, follow the route the diagnostic prints: rerun child
+  planning when no implementation PR exists yet, or have a human post the signed
+  `child-plan-supersession` record on the child issue and then rerun the
+  child's `--plan-first` command, which re-plans it and rebinds the same PR.
+  The same signed record authorizes a deliberate re-plan (for example a scope
+  reduction) of a plan that is still admissible; run the child's
+  `--plan-first` command, not `agent-loop pr`, which refuses to review while
+  such a record is pending.
+  Never edit handoff records by hand. See "Re-planning an approved child plan"
+  in `docs/local_agent_loop.md`.
+- If a reviewer backend is unavailable (for example, an exhausted quota) and a
+  rerun without it stops with the scheduler contract-drift error, do not drop
+  the reviewer silently or refile the issue. Report the error to the human; the
+  error prints a filled-in signed `reviewer-board-amendment` record. Only a
+  human may post it (on the issue for planning, on the PR for PR review),
+  keeping the printed `effective_from_round`; then rerun with the reduced
+  reviewer list. Policy and primary stay immutable. See "Removing an
+  unavailable reviewer from an in-flight run" in `docs/local_agent_loop.md`.
 - If phase 1 is `human-action` or `manual-close`, it prints JSON identifying the
   child issue and stops without posting a phase handoff or running the coder.
 - If a matching phase handoff marker already exists, it prints state
