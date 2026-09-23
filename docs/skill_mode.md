@@ -505,7 +505,9 @@ whole-turn limits. The optional `agent-loop run-tests [--timeout-seconds N] --
 COMMAND...` wrapper inherits the ceiling from its environment, defaults to
 1,800 outside agent-loop, rejects malformed or over-ceiling requests before
 spawn, and records measured observations only when skill memory is enabled and
-writable. Long browser/integration matrices remain finite and can be split or
+writable. It also accepts `--test-workers N`, `--test-worker-memory SIZE` and
+`--test-worker-enforcement {clamp,refuse,off}`; see
+[Parallel test-worker budget](local_agent_loop.md#parallel-test-worker-budget). Long browser/integration matrices remain finite and can be split or
 sharded when useful.
 
 ## Known limitations

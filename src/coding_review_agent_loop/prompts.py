@@ -235,7 +235,7 @@ def _memory_block(
         cwd = agent_workdir(config, config.coder)
         commands: list[tuple[str, ...]] = []
         seen: set[tuple[str, ...]] = set()
-        remembered_keys: dict[tuple[str, ...], tuple[str, str]] = {}
+        remembered_keys: dict[tuple[str, ...], tuple[str, str, str]] = {}
         if config.test_command:
             commands.append(tuple(config.test_command))
             seen.add(tuple(config.test_command))
@@ -256,7 +256,9 @@ def _memory_block(
                     # cohort key.  Re-normalizing this display form can hash
                     # redacted environment values twice or resolve an
                     # external executable through a different PATH entry.
-                    remembered_keys[command] = (normalized, fingerprint)
+                    from .test_workers import row_workers_label
+
+                    remembered_keys[command] = (normalized, fingerprint, row_workers_label(observation))
         commands = commands[:6]
         wrapper_results = preflight_wrapper_candidates(
             cwd=cwd,
@@ -300,6 +302,7 @@ def _memory_block(
                     policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
                     normalized_command_override=key[0] if key else None,
                     fingerprint_override=key[1] if key else None,
+                    workers=key[2] if key else _expected_workers(config, command),
                 )
             runtime_text = render_runtime_context(
                 memory.memory_dir,
@@ -371,6 +374,16 @@ def _memory_block(
             "are advisory and cannot alone suppress a command."
         )
     return f"Agent memory context:\n{text}{runtime}\n"
+
+
+def _expected_workers(config: AgentLoopConfig, command: Sequence[str]) -> str | None:
+    try:
+        from .test_workers import expected_workers_label
+
+        budget = preliminary_worker_budget(config)
+        return expected_workers_label(command, budget=budget.workers, mode=budget.enforcement)
+    except Exception:  # pragma: no cover - guidance must never block a prompt
+        return None
 
 
 def _scratch_file_guidance() -> str:
@@ -480,7 +493,46 @@ def _coder_local_test_scope_guidance(
         + ". Reserve agent-unavailable for a genuine environment/tooling "
         "failure, not an ordinary slow test.\n"
         + containment_prompt_guidance(config)
+        + parallel_test_worker_guidance(config)
     )
+
+
+def preliminary_worker_budget(config: AgentLoopConfig):
+    """The pre-admission worker-budget estimate shown in coder/repair prompts.
+
+    The launch-time ``AGENT_LOOP_TEST_WORKERS`` value, derived after
+    containment admission, is authoritative.
+    """
+    from .test_workers import derive_worker_budget, parse_worker_memory, resolve_worker_budget
+
+    memory = parse_worker_memory(config.test_worker_memory) if config.test_worker_memory else None
+    derived = derive_worker_budget(
+        backend="process-group",
+        os_headroom_percent=config.containment_policy.os_headroom_percent,
+        per_worker_bytes=memory,
+        enforcement=config.test_worker_enforcement,
+    )
+    return resolve_worker_budget(
+        derived,
+        operator_workers=config.test_workers,
+        operator_enforcement=config.test_worker_enforcement,
+        env={},
+        has_parent=False,
+    ).budget
+
+
+def parallel_test_worker_guidance(config: AgentLoopConfig | None) -> str:
+    """Coder/repair-only parallel test-worker block (issue #848)."""
+    if config is None:
+        return ""
+    try:
+        from .test_workers import detect_parallel_support, render_worker_guidance
+
+        budget = preliminary_worker_budget(config)
+        supported = detect_parallel_support(agent_workdir(config, config.coder))
+        return render_worker_guidance(budget, parallel_supported=supported)
+    except Exception:  # pragma: no cover - guidance must never block a prompt
+        return ""
 
 
 def containment_prompt_guidance(config: AgentLoopConfig | None) -> str:

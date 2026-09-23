@@ -637,3 +637,177 @@ def test_oversized_plan_followup_update_notes_alone_are_shortened():
     for group in range(len(notes)):
         assert f"Update {group} line 0:" in body
     assert body.count("canonical plan comment") >= len(notes)
+
+def _capturing_runner(posted: list[str]):
+    class _CapturingRunner(FakeRunner):
+        def run(self, args, **kwargs):  # type: ignore[override]
+            if "comment" in args and "--body-file" in args:
+                path = args[args.index("--body-file") + 1]
+                posted.append(open(path, encoding="utf-8").read())
+            return super().run(args, **kwargs)
+
+    return _CapturingRunner()
+
+
+# A valid step may carry multiline Markdown, including headings and HTML
+# comment lines, so the summary must not guess where the steps end (#941).
+_MULTILINE_STEPS = [
+    "Rework the renderer so " + "the long detail " * 40,
+    "Add regression tests.\n### Heading inside a step\n<!-- comment inside a step -->\n"
+    "Continuation detail that only the planner comment carries.",
+    "Document the change.",
+]
+
+
+def _approved_plan_with_planner_comment(*, steps, comment_payload):
+    from agent_loop_helpers import structured_plan_state
+    from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.github import _parse_issue_comments
+    from coding_review_agent_loop.plan_assembly import make_assembled_plan_sidecar
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+    )
+
+    parsed = validate_structured_plan_state(
+        structured_plan_state(summary="Approved plan summary.", plan_steps=steps)
+    )
+    approved_plan = render_canonical_plan_state(parsed)
+    sidecar = make_assembled_plan_sidecar(
+        parsed,
+        round_number=1,
+        response_form="fresh-plan-state",
+        rendered_plan=approved_plan,
+    )
+    planner_body = _attach_round_metadata(
+        "## Plan\n\n" + approved_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="subject-941",
+            canonical_plan=approved_plan,
+            response_form="fresh-plan-state",
+            aggregate_plan_identity=sidecar.aggregate_identity,
+            assembled_plan_sidecar=sidecar.to_payload(),
+        ),
+    )
+    # The ordinary ``gh issue view --comments`` projection: GraphQL node ids
+    # and permalinks, no numeric REST identities.
+    comments = _parse_issue_comments(
+        [
+            {
+                "id": "IC_unrelated",
+                "author": {"login": "bot"},
+                "createdAt": "2026-09-22T05:00:00Z",
+                "body": "unrelated",
+                "url": "https://github.com/o/r/issues/941#issuecomment-11",
+            },
+            {**comment_payload, "body": planner_body},
+        ]
+    )
+    return approved_plan, approved_plan_hash(approved_plan), comments
+
+
+def _publish_announcement(tmp_path, approved_plan, plan_hash, comments, **config_overrides):
+    from coding_review_agent_loop.followups import _publish_plan_approved_followups
+
+    posted: list[str] = []
+    config = make_config(tmp_path, approved_followups="summarize", **config_overrides)
+    assert _publish_plan_approved_followups(
+        _capturing_runner(posted),
+        config=config,
+        issue_number=941,
+        approved_plan=approved_plan,
+        plan_hash=plan_hash,
+        plan_subject="subject-941",
+        issue_comments=comments,
+        sources=[],
+        source_context=_source(parent=941),
+        allow_issue_filing=False,
+    )
+    return posted[-1], config
+
+
+def test_approved_plan_announcement_summarizes_steps_and_links_planner_comment(tmp_path):
+    """#941: the announcement must not repeat the planner's steps verbatim."""
+    config = make_config(tmp_path)
+    permalink = f"https://github.com/{config.repo}/issues/941#issuecomment-5755997542"
+    approved_plan, plan_hash, comments = _approved_plan_with_planner_comment(
+        steps=_MULTILINE_STEPS,
+        comment_payload={
+            "id": "IC_planner",
+            "author": {"login": "bot"},
+            "createdAt": "2026-09-22T05:52:14Z",
+            "url": permalink,
+        },
+    )
+    assert all(comment.comment_id is None for comment in comments)
+    assert "### Heading inside a step" in approved_plan
+
+    body, _ = _publish_announcement(tmp_path, approved_plan, plan_hash, comments)
+
+    assert body.startswith("Planning complete for issue #941.")
+    assert "Approved plan summary." in body
+    assert "### Plan steps (summary)" in body
+    assert "\n### Plan steps\n" not in body
+    assert _MULTILINE_STEPS[0] not in body
+    assert "### Heading inside a step" not in body
+    assert "comment inside a step" not in body
+    assert "Continuation detail" not in body
+    assert f"3 steps; the full text of each is in [the planner's plan comment]({permalink})." in body
+    assert "\n2. Add regression tests.\n3. Document the change." in body
+    assert "AGENT_PLAN_APPROVED_FOLLOWUPS" in body
+
+
+def test_approved_plan_announcement_links_by_rest_id_when_url_is_absent(tmp_path):
+    config = make_config(tmp_path)
+    approved_plan, plan_hash, comments = _approved_plan_with_planner_comment(
+        steps=["Only step."],
+        comment_payload={
+            "id": 5755997542,
+            "user": {"login": "bot", "id": 7},
+            "created_at": "2026-09-22T05:52:14Z",
+        },
+    )
+
+    body, _ = _publish_announcement(tmp_path, approved_plan, plan_hash, comments)
+
+    assert (
+        f"1 step; the full text of each is in [the planner's plan comment]"
+        f"(https://github.com/{config.repo}/issues/941#issuecomment-5755997542)."
+    ) in body
+
+
+def test_approved_plan_announcement_keeps_plan_without_structured_steps(tmp_path):
+    """No planner record (or no sidecar) means no safe boundary: keep the text."""
+    approved_plan = "Summary.\n\n### Plan steps\n1. Only step.\n### Not a boundary\n2. Tail."
+
+    body, _ = _publish_announcement(tmp_path, approved_plan, "abc123def456", [])
+
+    assert approved_plan in body
+
+
+def test_approved_plan_step_summary_requires_one_exact_canonical_block():
+    from coding_review_agent_loop.followups import _summarize_approved_plan_steps
+
+    plan = "Summary.\n\n### Plan steps\n\n1. Only step.\n\n### Risk-based mode and transition test matrix\nrow"
+    assert _summarize_approved_plan_steps(plan, plan_steps=["Only step."], plan_comment_url=None) == (
+        "Summary.\n\n### Plan steps (summary)\n\n"
+        "1 step; the full text of each is in the planner's plan comment on this issue.\n\n"
+        "1. Only step.\n\n### Risk-based mode and transition test matrix\nrow"
+    )
+    # Steps that do not match the rendered text exactly are left alone.
+    assert _summarize_approved_plan_steps(plan, plan_steps=["Other."], plan_comment_url=None) == plan
+    # An ambiguous duplicate of the block is left alone too.
+    duplicated = plan + "\n\n### Plan steps\n1. Only step."
+    assert (
+        _summarize_approved_plan_steps(duplicated, plan_steps=["Only step."], plan_comment_url=None)
+        == duplicated
+    )
+    # A prefix match against a longer final step is not the canonical block.
+    prefix = "### Plan steps\n1. Only step. And more."
+    assert _summarize_approved_plan_steps(prefix, plan_steps=["Only step."], plan_comment_url=None) == prefix

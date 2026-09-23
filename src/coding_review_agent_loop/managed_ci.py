@@ -64,6 +64,9 @@ V2_FEATURE_MARKERS = (V2_MARKER, "workflow_dispatch", "managed_nonce", FINAL_CON
 V2_ADOPTION_MARKER = "AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION"
 V2_ADOPTION_FEATURE_MARKERS = (V2_ADOPTION_MARKER,)
 RECOVERY_MARKER = "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1"
+# Advertised by a base workflow whose intent validator admits the fixed
+# visible authorization line ahead of the record (#935).
+VISIBLE_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1"
 UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
 ISSUE_AUTHORIZATION_MARKER = "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1"
 _TERMINAL_CI_STATUSES = frozenset({
@@ -155,6 +158,9 @@ class ManagedCiContract:
     # delayed dispatch-time fallback so a suppressed draft is released only
     # when that same workflow advertises an unlabeled CI route.
     ordinary_recovery_capable: bool = False
+    # Derived from the same base workflow. Only a workflow that advertises
+    # the visible-intent envelope may receive the prefixed intent body.
+    visible_intent_capable: bool = False
     # Explicit lifecycle provenance.  These fields are intentionally not
     # inferred from public mode flags after activation.
     origin: Literal["issue-created", "source-managed"] | None = None
@@ -2714,6 +2720,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--containment-repair-memory-swap-max", "--containment-repair-tasks-max",
     "--containment-test-gate-memory-high", "--containment-test-gate-memory-max",
     "--containment-test-gate-memory-swap-max", "--containment-test-gate-tasks-max",
+    "--test-workers", "--test-worker-memory", "--test-worker-enforcement",
 })
 _RECOVERY_NARGS_VALUE_OPTIONS = frozenset({
     "--antigravity-models", "--antigravity-quota-signatures", "--agent-retry-backoff-seconds",
@@ -3230,6 +3237,135 @@ def _committed_bound_resume_audit(
     )
 
 
+def verify_managed_pr_plan_binding(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    issue_number: int,
+    live_head: str | None,
+    approved_plan_hash: str,
+) -> None:
+    """Require the PR-side authorization chain to bind this PR to the plan.
+
+    Managed-CI issue-created runs deliberately do not post the issue-side
+    handoff record; their durable binding is the trusted actor's PR-comment
+    authorization chain (#966).  Qualification reads the binding from there
+    with the same substance the issue-side check enforces: the chain must name
+    this repository, issue, PR, and approved plan hash, and its unique terminal
+    must be the live head, linked back to a creation or fresh root.
+    """
+    failure = (
+        "Approved-plan/handoff identity changed or disappeared during PR qualification; "
+        "the managed-CI authorization chain does not bind PR #{pr} to approved plan "
+        "{plan} at the live head ({reason}). Stale approvals cannot be used for this head."
+    )
+
+    def fail(reason: str) -> AgentLoopError:
+        return AgentLoopError(
+            failure.format(pr=pr_number, plan=approved_plan_hash, reason=reason)
+        )
+
+    trusted_actor = (config.managed_ci_trusted_actor or "").strip()
+    if not trusted_actor:
+        raise fail("no trusted managed-CI actor is configured")
+    if not live_head:
+        raise fail("the live head is unknown")
+    comments = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+    )
+    if comments is None:
+        raise fail("the PR authorization comments could not be inspected")
+    # The scan itself goes through the single accessor (#827), which also
+    # returns no unbound record for a transaction-era PR.
+    actor_users = {
+        (user.get("login"), user.get("id"))
+        for comment in comments
+        if isinstance(user := comment.get("user"), dict)
+        and isinstance(user.get("login"), str)
+        and user["login"].casefold() == trusted_actor.casefold()
+        and isinstance(user.get("id"), int)
+    }
+    if len({actor_id for _login, actor_id in actor_users}) > 1:
+        raise fail("an authorization record is not authored by the trusted actor")
+    actor_login, actor_id = next(iter(actor_users), (trusted_actor, 0))
+    try:
+        scan = read_managed_ci_authorizations(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            actor_login=actor_login,
+            actor_id=actor_id,
+            comments=comments,
+        )
+    except AgentLoopError as exc:
+        if exc.__cause__ is not None:
+            raise fail("an authorization record is malformed") from exc
+        raise fail("an authorization record is not authored by the trusted actor") from exc
+    records: list[tuple[int, ManagedCiIssueAuthorization]] = []
+    for comment_id, authorization in scan.records:
+        if (
+            authorization.actor_login.casefold() != trusted_actor.casefold()
+            or authorization.actor_id != actor_id
+        ):
+            raise fail("an authorization record is not authored by the trusted actor")
+        if (
+            authorization.repository.casefold() != config.repo.casefold()
+            or authorization.pr_number != pr_number
+            or authorization.issue_number != issue_number
+            or (config.base and authorization.base_ref != config.base)
+        ):
+            raise fail("an authorization record names a different repository, issue, PR, or base")
+        records.append((comment_id, authorization))
+    if not records:
+        raise fail("no authorization record exists")
+    by_comment_id = dict(records)
+    children_by_predecessor: dict[ManagedCiIssueAuthorization, set[str]] = {}
+    for _comment_id, authorization in records:
+        if authorization.kind == "continuity" and authorization.predecessor_comment_id is not None:
+            predecessor = by_comment_id.get(authorization.predecessor_comment_id)
+            if predecessor is not None and predecessor.head_sha == authorization.predecessor_head:
+                children_by_predecessor.setdefault(predecessor, set()).add(authorization.head_sha)
+    if any(len(heads) > 1 for heads in children_by_predecessor.values()):
+        raise fail("the authorization chain forks")
+    bound_terminals: set[ManagedCiIssueAuthorization] = set()
+    for _comment_id, terminal in records:
+        if terminal.head_sha != live_head:
+            continue
+        chain: list[ManagedCiIssueAuthorization] = []
+        current: ManagedCiIssueAuthorization | None = terminal
+        while current is not None and current.kind == "continuity":
+            if current in chain or not _continuity_round_metadata_is_valid(
+                comments, authorization=current
+            ):
+                current = None
+                break
+            chain.append(current)
+            predecessor = by_comment_id.get(current.predecessor_comment_id or 0)
+            if predecessor is None or predecessor.head_sha != current.predecessor_head:
+                current = None
+                break
+            current = predecessor
+        if current is None or current.kind not in {"creation", "fresh"}:
+            continue
+        chain.append(current)
+        if any(record.approved_plan_hash != approved_plan_hash for record in chain):
+            raise fail("the authorization chain names a different approved plan")
+        bound_terminals.add(terminal)
+    if not bound_terminals:
+        raise fail("no authenticated chain reaches the live head")
+    if len(bound_terminals) != 1:
+        # Byte-equivalent retries collapse in the set.  As in resume, a single
+        # fresh grant at the creation head supersedes that creation record;
+        # any other pair of distinct live-head terminals is ambiguous.
+        fresh_roots = {record for record in bound_terminals if record.kind == "fresh"}
+        if not (
+            {record.kind for record in bound_terminals} <= {"creation", "fresh"}
+            and len(fresh_roots) == 1
+        ):
+            raise fail("more than one distinct authorization terminal reaches the live head")
+
+
 def _find_resume_audit(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, actor_login: str, actor_id: int,
     base_ref: str, issue_number: int | None = None, live_head: str | None = None,
@@ -3643,6 +3779,7 @@ def _activate_v2_managed_ci(
     ordinary_recovery_capable = (
         RECOVERY_MARKER in workflow_text and "pull_request" in workflow_text and "unlabeled" in workflow_text
     )
+    visible_intent_capable = VISIBLE_INTENT_MARKER in workflow_text
 
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -4221,6 +4358,7 @@ def _activate_v2_managed_ci(
         issue_created_pr=origin == "issue-created",
         invocation_applied_label=label_applied,
         ordinary_recovery_capable=ordinary_recovery_capable,
+        visible_intent_capable=visible_intent_capable,
         origin=origin,
         lifecycle=lifecycle,
         authenticated_resume=managed_resume,
@@ -4421,6 +4559,7 @@ def _activate_v2_existing_pr_adoption(
         trusted_actor_id=actor_id, workflow_revision=revision if isinstance(revision, str) else None,
         adopted_existing_pr=True, guard_head_sha=live_sha, active_label_event_id=existing[0],
         invocation_applied_label=applied,
+        visible_intent_capable=VISIBLE_INTENT_MARKER in source,
         intent_generation=(
             secrets.token_urlsafe(16)
             if config.managed_ci
@@ -4923,16 +5062,21 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
             for run_id, run_attempt in contract.terminal_attempts
         ],
     }
+    record = f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->"
     # The intent record is the one protocol comment parsed by the installed
-    # base workflow, whose envelope is anchored at the start of the body
-    # (`^<!-- AGENT_MANAGED_CI_INTENT_V2 ... -->$` in .github/workflows/ci.yml).
-    # A visible #878 label ahead of the marker makes every dispatch fail with
-    # "expected exactly one fresh intent for requested nonce", so this record
-    # stays marker-only until the workflow contract accepts a prefix (#888).
-    return TrustedBody.canonical(
-        f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->",
-        expected_tokens=(INTENT_MARKER,),
-    )
+    # base workflow, which fullmatches the whole stripped body.  An older
+    # workflow accepts only the bare record (#888), so the fixed visible line
+    # is emitted only when the same base workflow advertises that its
+    # envelope admits it (#935).  The line is a literal template bound to the
+    # payload's head, never free text.
+    if contract.visible_intent_capable:
+        record = visible_intent_line(expected_head_sha) + "\n\n" + record
+    return TrustedBody.canonical(record, expected_tokens=(INTENT_MARKER,))
+
+
+def visible_intent_line(expected_head_sha: str) -> str:
+    """Return the exact visible line a v2 workflow admits ahead of the record."""
+    return f"Managed CI authorization for exact head {expected_head_sha}."
 
 
 def _validate_v2_intent_publication(contract: ManagedCiContract, *, state: str) -> None:

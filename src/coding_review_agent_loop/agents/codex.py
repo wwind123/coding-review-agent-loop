@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 from .base import (
     AgentName,
     AgentResult,
-    STDIN_PROMPT_THRESHOLD_BYTES,
     public_response_path,
     read_public_response_file,
     with_public_response_file_instruction,
@@ -315,11 +314,10 @@ class CodexBackend:
         log_path = agent_log_path(config, "codex", run_id=run_id, label=label, attempt_suffix=attempt_suffix)
         response_path = public_response_path(config, "codex")
         prompt_with_response_file = with_public_response_file_instruction(prompt, response_path)
-        input_text = None
-        if len(prompt_with_response_file.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES:
-            # Linux limits a single exec argument to about 128 KiB. Long compact
-            # contexts can exceed that before the Codex CLI is launched.
-            input_text = prompt_with_response_file
+        # Always deliver the prompt on stdin via `codex exec -` (#870): argv is
+        # capped per argument by exec and is visible to every local user
+        # through ps/proc cmdline.
+        input_text = prompt_with_response_file
         log(
             config,
             f"Starting Codex in {config.codex_dir}; log: {log_path}; response: {response_path}",
@@ -333,7 +331,7 @@ class CodexBackend:
                     str(config.codex_dir),
                     *_codex_model_args(config, role=role),
                     *config.codex_args,
-                    *([] if input_text is not None else [prompt]),
+                    "-",
                 ],
                 cwd=config.codex_dir,
                 input_text=input_text,
@@ -377,7 +375,7 @@ class CodexBackend:
                     output_path,
                     *_codex_model_args(config, role=role),
                     *config.codex_args,
-                    *([] if input_text is not None else [prompt_with_response_file]),
+                    "-",
                 ],
                 cwd=config.codex_dir,
                 log_path=log_path,

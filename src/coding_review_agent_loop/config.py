@@ -355,6 +355,11 @@ class AgentLoopConfig:
     containment_test_gate_memory_max: object | None = None
     containment_test_gate_memory_swap_max: object | None = None
     containment_test_gate_tasks_max: object | None = None
+    # Containment-aware parallel test-worker budget (issue #848).  None means
+    # derive the budget after containment admission.
+    test_workers: int | None = None
+    test_worker_memory: object | None = None
+    test_worker_enforcement: str = "clamp"
     # Architecture context is advisory and contributes no prompt text unless a
     # frozen, successfully acquired snapshot is attached by orchestration.
     architecture_context_enabled: bool = True
@@ -559,6 +564,12 @@ class AgentLoopConfig:
         from .containment import policy_from_values
 
         policy_from_values(self.__dict__)
+        from .test_workers import WorkerBudgetError, budget_from_values
+
+        try:
+            budget_from_values(self.__dict__)
+        except WorkerBudgetError as exc:
+            raise AgentLoopError(str(exc)) from exc
 
     @property
     def containment_policy(self):
@@ -1544,4 +1555,7 @@ def config_from_args(
         containment_test_gate_memory_max=getattr(args, "containment_test_gate_memory_max", None),
         containment_test_gate_memory_swap_max=getattr(args, "containment_test_gate_memory_swap_max", None),
         containment_test_gate_tasks_max=getattr(args, "containment_test_gate_tasks_max", None),
+        test_workers=getattr(args, "test_workers", None),
+        test_worker_memory=getattr(args, "test_worker_memory", None),
+        test_worker_enforcement=getattr(args, "test_worker_enforcement", None) or "clamp",
     )

@@ -21,7 +21,7 @@ from .child_topology import (
 from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .runner import Runner
-from .protocol_markers import TrustedBody, sanitize_historical_text
+from .protocol_markers import TrustedBody, decompress_record_payload, sanitize_historical_text
 from .protocol import (
     ArchitectureImpact,
     ChildStage,
@@ -1280,22 +1280,9 @@ def _phase_from_payload(
 
 
 def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
-    try:
-        if encoded.startswith("v1_"):
-            raw = zlib.decompress(
-                base64.urlsafe_b64decode(encoded[3:].encode("ascii"))
-            )
-            payload = json.loads(raw.decode("utf-8"))
-        else:
-            # Read the original uncompressed representation for checkpoints
-            # already posted before the compact payload format was introduced.
-            payload = _decode_json_payload(
-                encoded, marker_name="AGENT_PLAN_TOPOLOGY_CHECKPOINT"
-            )
-    except (ValueError, json.JSONDecodeError, zlib.error) as exc:
-        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.") from exc
-    if not isinstance(payload, dict):
-        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+    # Accepts the compact form and the original uncompressed representation of
+    # checkpoints posted before the compact payload format was introduced.
+    payload = _decode_json_payload(encoded, marker_name="AGENT_PLAN_TOPOLOGY_CHECKPOINT")
     phases_payload = payload.get("phases")
     if not isinstance(phases_payload, list) or not phases_payload:
         raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
@@ -1453,13 +1440,7 @@ def find_topology_checkpoints_for_parent(
 
 
 def format_topology_checkpoint(checkpoint: TopologyCheckpoint) -> str:
-    raw = json.dumps(
-        _checkpoint_payload(checkpoint),
-        separators=(",", ":"),
-        ensure_ascii=False,
-        sort_keys=True,
-    ).encode("utf-8")
-    encoded = "v1_" + base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii")
+    encoded = _encode_compressed_json_payload(_checkpoint_payload(checkpoint))
     body = "\n".join(
         [
             f"Topology checkpoint recorded for issue #{checkpoint.parent_issue}.",
@@ -2135,15 +2116,47 @@ def create_decomposition_child_issues(
     return tuple(created)
 
 
+# Prefix of a zlib-compressed record payload.  A plain payload is the base64 of
+# a JSON object, so it always starts with `ey` and can never carry this prefix.
+COMPRESSED_PAYLOAD_PREFIX = "v1_"
+
+
 def _encode_json_payload(payload: dict[str, object]) -> str:
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
+def _encode_compressed_json_payload(payload: dict[str, object]) -> str:
+    """Encode a record the way the topology checkpoint does (#909).
+
+    Plan-derived text compresses by orders of magnitude, and `ensure_ascii=False`
+    keeps a non-ASCII character at its UTF-8 size instead of a `\\uXXXX` escape.
+    """
+    raw = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+    return COMPRESSED_PAYLOAD_PREFIX + base64.urlsafe_b64encode(
+        zlib.compress(raw, 9)
+    ).decode("ascii")
+
+
 def _decode_json_payload(encoded: str, *, marker_name: str) -> dict[str, object]:
+    """Decode a record in either the compressed or the original plain form.
+
+    Records published before a producer switched to compression stay plain
+    base64, so the form is detected from the prefix rather than assumed.
+    """
     try:
-        payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
-    except (ValueError, json.JSONDecodeError) as exc:
+        if encoded.startswith(COMPRESSED_PAYLOAD_PREFIX):
+            raw = decompress_record_payload(
+                base64.urlsafe_b64decode(
+                    encoded[len(COMPRESSED_PAYLOAD_PREFIX):].encode("ascii")
+                )
+            )
+        else:
+            raw = base64.urlsafe_b64decode(encoded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError, zlib.error) as exc:
         raise AgentLoopError(f"Invalid {marker_name} payload.") from exc
     if not isinstance(payload, dict):
         raise AgentLoopError(f"Invalid {marker_name} payload.")
@@ -2363,7 +2376,9 @@ def _encode_metadata(metadata: DecompositionMetadata) -> str:
             "acceptance_criteria": list(final_integration.acceptance_criteria),
             "covered_scope_item_ids": list(final_integration.covered_scope_item_ids),
         }
-    return _encode_json_payload(payload)
+    # Compressed so an embedded retained-parent excerpt costs a fraction of its
+    # plain size; `_decode_metadata` still reads plain summaries (#909).
+    return _encode_compressed_json_payload(payload)
 
 
 def _decode_metadata(encoded: str) -> DecompositionMetadata:
@@ -3002,10 +3017,10 @@ def format_decomposition_parent_summary(
         )
 
     # A retained character does not cost a fixed number of body characters:
-    # `_encode_json_payload` serializes with `ensure_ascii=True`, so one CJK
-    # character becomes a six-character escape (an emoji, two) before base64
-    # expands it again.  Search for the largest budget whose actually rendered
-    # body fits instead of assuming a ratio that only holds for ASCII (#907).
+    # the record payload is compressed (#909), so its cost depends on how
+    # repetitive the excerpt is, and the visible copy costs one character each.
+    # Search for the largest budget whose actually rendered body fits instead
+    # of assuming a ratio (#907).
     target = MAX_GITHUB_BODY_CHARS - BODY_SAFETY_MARGIN
     shortest = render_budget(0)
     if len(shortest) > target:

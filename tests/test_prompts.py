@@ -4801,3 +4801,49 @@ def test_non_reviewer_prompts_do_not_carry_the_exhaustiveness_rule(tmp_path):
     for name, prompt in prompts.items():
         assert "Review exhaustively" not in prompt, name
         assert "Do not claim masking merely to stop early." not in " ".join(prompt.split()), name
+
+
+# ---------------------------------------------------------------------------
+# Parallel test-worker budget guidance (issue #848)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fixture, supported",
+    [
+        ({"pyproject.toml": '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n'}, True),
+        ({"README.md": "```\npytest -n 6\n```\n"}, True),
+        ({"README.md": "Someday we may use pytest-xdist with pytest -n 6.\n"}, False),
+        ({}, False),
+    ],
+)
+@pytest.mark.parametrize(
+    "mode, sentence",
+    [
+        ("clamp", "Over-budget worker requests are lowered to the budget."),
+        ("refuse", "Over-budget worker requests are refused and the run does not execute."),
+        ("off", "The budget is advisory; nothing enforces it."),
+    ],
+)
+def test_coder_prompt_parallel_worker_guidance(tmp_path, fixture, supported, mode, sentence):
+    config = make_config(tmp_path, test_workers=3, test_worker_enforcement=mode)
+    for name, text in fixture.items():
+        (config.claude_dir / name).write_text(text, encoding="utf-8")
+    prompt = " ".join(build_issue_prompt(56, config).split())
+    assert "Parallel test workers: `$AGENT_LOOP_TEST_WORKERS`" in prompt
+    assert "3 worker(s) (operator-supplied" in prompt
+    assert sentence in prompt
+    if mode != "clamp":
+        assert "lowered to the budget" not in prompt
+    if supported:
+        assert "keep focused single-file runs serial" in prompt
+    else:
+        assert "do not add parallel worker flags" in prompt
+
+
+def test_reviewer_prompt_has_no_parallel_worker_guidance(tmp_path):
+    config = make_config(tmp_path)
+    (config.claude_dir / "pyproject.toml").write_text('dev = ["pytest-xdist"]\n', encoding="utf-8")
+    prompt = build_review_prompt(77, 1, config, reviewer="codex")
+    assert "Parallel test workers" not in prompt
+    assert "AGENT_LOOP_TEST_WORKERS" not in prompt

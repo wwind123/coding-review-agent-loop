@@ -2,6 +2,7 @@ import base64
 import dataclasses
 import json
 import re
+import zlib
 
 import pytest
 
@@ -23,7 +24,9 @@ from coding_review_agent_loop.decomposition import (
     TopologyCheckpoint,
     PhaseImplementationHandoffMetadata,
     _decode_phase_implementation_handoff_metadata,
+    _decode_json_payload,
     _decode_metadata,
+    _encode_json_payload,
     _encode_phase_implementation_handoff_metadata,
     _encode_metadata,
     _fresh_phase_payload,
@@ -904,8 +907,8 @@ def test_child_disposition_persistence_is_optional_and_legacy_stable():
     assert _decode_metadata(_encode_metadata(decomposition_metadata)) == decomposition_metadata
     legacy_metadata = dataclasses.replace(decomposition_metadata, dispositions=())
     encoded_legacy_metadata = _encode_metadata(legacy_metadata)
-    assert "dispositions" not in json.loads(
-        base64.urlsafe_b64decode(encoded_legacy_metadata).decode("utf-8")
+    assert "dispositions" not in _decode_json_payload(
+        encoded_legacy_metadata, marker_name="AGENT_PLAN_DECOMPOSITION"
     )
     assert _decode_metadata(encoded_legacy_metadata) == legacy_metadata
 
@@ -2092,6 +2095,134 @@ def test_non_ascii_retained_excerpt_is_shortened_in_the_parent_summary(unit):
     assert len(metadata.retained_parent_scope.excerpt) < len(huge_excerpt)
 
 
+def _retained_decomposition_metadata(excerpt: str) -> DecompositionMetadata:
+    return DecompositionMetadata(
+        parent_issue=909,
+        plan_hash="a" * 16,
+        mode="implement-by-phase",
+        phase_count=1,
+        phase_titles=("Stage one",),
+        automation=("agent-pr",),
+        children=(("Stage one", "https://example/issues/910", 910),),
+        topology_source="approved-plan-v1",
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="b" * 64, plan_hash="a" * 16, excerpt=excerpt,
+        ),
+        final_integration_work=ExecutionAllocation("none", (), (), ()),
+        strategy="staged",
+        execution_strategy_contract_version=1,
+        recommendation_digest="r" * 64,
+        plan_subject="b" * 64,
+        stage_ids=("stage-one",),
+        phase_identities=("identity-one",),
+    )
+
+
+def _plain_decomposition_payload(encoded: str) -> str:
+    """Re-encode a record the way summaries were published before #909."""
+    return _encode_json_payload(
+        _decode_json_payload(encoded, marker_name="AGENT_PLAN_DECOMPOSITION")
+    )
+
+
+@pytest.mark.parametrize(
+    "excerpt",
+    [
+        pytest.param("Retained scope line: keep the adapter contract.\n" * 400, id="ascii"),
+        pytest.param("保留された親スコープの詳細な説明文です。\n" * 400, id="cjk"),
+    ],
+)
+def test_decomposition_record_is_compressed_and_round_trips(excerpt):
+    """#909: the summary record is compressed and decodes to the same metadata."""
+    metadata = _retained_decomposition_metadata(excerpt)
+    encoded = _encode_metadata(metadata)
+    plain = _plain_decomposition_payload(encoded)
+
+    assert encoded.startswith("v1_")
+    assert plain.startswith("ey")
+    assert _decode_metadata(encoded) == metadata
+    # Repetitive plan text costs a small fraction of the plain base64 form,
+    # including a non-ASCII excerpt that the plain form escapes per character.
+    assert len(encoded) * 20 < len(plain)
+
+
+def test_decomposition_record_still_decodes_plain_published_summaries():
+    """#909: summaries published before compression stay recoverable."""
+    metadata = _retained_decomposition_metadata("Keep the adapter contract.")
+    compressed_body = format_decomposition_parent_summary(
+        parent_issue=metadata.parent_issue,
+        mode=metadata.mode,
+        plan_hash=metadata.plan_hash,
+        created=(
+            CreatedPhaseIssue(
+                phase=PlanPhase(
+                    title="Stage one",
+                    scope="Implement the reviewed stage contract.",
+                    non_goals="No rollout.",
+                    dependency_notes="No dependencies.",
+                    rollout_risk="low.",
+                    validation="Run the focused tests.",
+                    parent_context="Approved parent plan.",
+                    automation="agent-pr",
+                    depends_on=(),
+                ),
+                issue_url="https://example/issues/910",
+                issue_number=910,
+            ),
+        ),
+        retained_parent_scope=metadata.retained_parent_scope,
+    )
+    marker = re.search(r"<!-- AGENT_PLAN_DECOMPOSITION: (\S+) -->", compressed_body)
+    assert marker is not None and marker.group(1).startswith("v1_")
+    plain_body = compressed_body.replace(
+        marker.group(1), _plain_decomposition_payload(marker.group(1))
+    )
+
+    recovered_plain = find_existing_decomposition(
+        [IssueComment(author=None, created_at=None, body=plain_body)], parent_issue=909, plan_hash="a" * 16
+    )
+    recovered_compressed = find_existing_decomposition(
+        [IssueComment(author=None, created_at=None, body=compressed_body)], parent_issue=909, plan_hash="a" * 16
+    )
+    assert recovered_plain is not None
+    assert recovered_plain == recovered_compressed
+    # A plain summary and a re-posted compressed one of the same metadata are
+    # one decomposition, not a divergent pair.
+    assert find_existing_decomposition(
+        [IssueComment(author=None, created_at=None, body=plain_body), IssueComment(author=None, created_at=None, body=compressed_body)],
+        parent_issue=909,
+        plan_hash="a" * 16,
+    ) == recovered_plain
+
+
+@pytest.mark.parametrize(
+    "packed",
+    [
+        pytest.param(zlib.compress(b" " * 16_000_001, 9), id="oversized"),
+        pytest.param(zlib.compress(b'{"a":1}', 9)[:-4], id="truncated"),
+        pytest.param(b"not zlib data", id="garbage"),
+        pytest.param(zlib.compress(b'{"a":1}', 9) + b"junk", id="trailing-junk"),
+        pytest.param(
+            zlib.compress(b'{"a":1}', 9) + zlib.compress(b'{"b":2}', 9),
+            id="concatenated-stream",
+        ),
+    ],
+)
+def test_compressed_record_payload_rejects_malformed_or_oversized_data(packed):
+    encoded = "v1_" + base64.urlsafe_b64encode(packed).decode("ascii")
+    with pytest.raises(AgentLoopError, match="Invalid AGENT_PLAN_DECOMPOSITION payload"):
+        _decode_metadata(encoded)
+    # Recovery reads summaries straight from comments, so the decoder itself
+    # must reject the record rather than rely on writer canonicalization.
+    body = f"<!-- AGENT_PLAN_DECOMPOSITION: {encoded} -->"
+    with pytest.raises(AgentLoopError, match="Invalid AGENT_PLAN_DECOMPOSITION payload"):
+        find_existing_decomposition(
+            [IssueComment(author=None, created_at=None, body=body)],
+            parent_issue=909,
+            plan_hash=None,
+        )
+
+
 def test_parent_summary_overflow_names_the_surface_when_nothing_can_be_cut():
     """A summary whose fixed sections overflow raises a precise diagnostic."""
     from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
@@ -2109,7 +2240,9 @@ def test_parent_summary_overflow_names_the_surface_when_nothing_can_be_cut():
     )
     created = tuple(
         CreatedPhaseIssue(phase=phase, issue_url=f"https://example/issues/{n}", issue_number=n)
-        for n in range(1, 120)
+        # Enough rows that the visible table alone overflows: the compressed
+        # record no longer doubles the cost of each title (#909).
+        for n in range(1, 200)
     )
 
     with pytest.raises(AgentLoopError) as excinfo:

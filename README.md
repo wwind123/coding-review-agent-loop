@@ -103,8 +103,9 @@ replace provider subscriptions.
 ### Managed CI in this repository
 
 This repository's `.github/workflows/ci.yml` installs the managed-CI v2
-contract with the literal `AGENT_LOOP_MANAGED_CI_V2` and
-`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` declarations. Pull requests use
+contract with the literal `AGENT_LOOP_MANAGED_CI_V2`,
+`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1`, and
+`AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1` declarations. Pull requests use
 exactly four activities: `opened`, `synchronize`, `reopened`, and `unlabeled`.
 Only a trusted, same-repository draft on the reserved
 `agent-loop/managed-*` branch can suppress intermediate CI: opening is
@@ -522,6 +523,84 @@ the loop touches them. That is expected: follow the route above rather than
 hand-editing issue records. See
 [the detailed contract](docs/local_agent_loop.md#re-planning-an-approved-child-plan).
 
+### Removing an unavailable reviewer from an in-flight run
+
+A persisted scheduler contract (the required reviewer board, the policy, and
+the primary) is immutable for the run. If one reviewer's backend becomes
+unavailable, for example because its quota is exhausted, rerunning without that
+reviewer stops with the contract-drift error. That error now also prints a
+filled-in **signed reviewer-board amendment** record. A human operator posts it
+to record a deliberate, audited reduction of the board:
+
+````markdown
+Reviewer board amendment:
+
+```json
+{
+  "effective_from_round": 3,
+  "flow": "plan",
+  "issue": 942,
+  "kind": "reviewer-board-amendment",
+  "original_required_reviewers": [
+    "Codex",
+    "Claude",
+    "Antigravity"
+  ],
+  "policy": "primary-then-panel",
+  "pr_number": null,
+  "primary_reviewer": "Codex",
+  "rationale": "Antigravity weekly quota exhausted.",
+  "reason": "backend-unavailable",
+  "removed_reviewers": [
+    "Antigravity"
+  ],
+  "schema_version": 1
+}
+```
+-- Human Reviewer
+````
+
+- **Where to post it.** Post a `plan` record (`issue` set, `pr_number` null)
+  on the issue being planned. Post a `pr` record (`pr_number` set, `issue`
+  null) on the PR itself, including standalone `agent-loop pr` runs. A record
+  on the wrong surface, a record naming another issue or PR, and a `pr` record
+  on the owning issue all stop for a human decision.
+- **Choosing `effective_from_round`.** Use the round number the drift error
+  prints. That is the round the resume re-enters, whether the round is only
+  partly recorded or already reconciled, and it is not always the latest
+  visible round number. Any other value stops before any agent turn or comment
+  and prints the corrected template.
+- **Retroactive use.** The record rescues runs whose contract was persisted
+  before this feature existed. Earlier rounds are never rewritten. Inside the
+  re-entered round, reviews already posted by the remaining reviewers are
+  reused, and the removed reviewer is never invoked again.
+- **What stays immutable.** `policy` and `primary_reviewer` must match the
+  persisted contract. The primary cannot be removed, and a `primary-then-panel`
+  board must keep at least one secondary. Re-adding a removed reviewer is
+  contract drift. Every scheduler record posted after the amendment carries the
+  amended board and the record's digest; any other contract fails closed, and
+  at PR qualification it refuses the merge. Amendments can chain, with each
+  record's `original_required_reviewers` equal to the previous amended board.
+  Two different records that amend the same board always stop for a human
+  decision.
+- **Findings and approvals.** An active finding whose only pending owner was
+  removed is reassigned to the primary, or to every remaining reviewer when
+  there is no primary. It stays blocking until a new owner clears it; nothing
+  is auto-cleared. Approvals the removed reviewer already gave remain in the
+  history but are no longer required. The run posts one audit comment naming
+  the record, the activation round, and every reassignment. Scheduler audits,
+  completion messages, and (for PR runs, on every completion path including
+  managed CI) one plain completion comment on the PR note that the run
+  finished on a reduced board. The activation round always posts a fresh
+  scheduler checkpoint carrying the amended board and digest, even when every
+  remaining reviewer's review is reused.
+- Unsigned or malformed records are ignored with a logged diagnostic. A comment
+  that contains only the record is not treated as a signed human requirement.
+  All-reviewers PR runs and the non-staged plan path persist no contract, so
+  there you change the reviewer flags directly and must not post a record.
+
+See [the detailed contract](docs/local_agent_loop.md#removing-an-unavailable-reviewer-from-an-in-flight-run).
+
 ### Approved follow-up dedupe
 
 When approved future follow-ups are summarized or filed, semantic reuse is
@@ -844,6 +923,18 @@ runs produce advisory median/p95 recommendations with headroom; timeouts remain
 lower-bound evidence and are never treated as successful durations. Data is
 best-effort, retained to 20 samples per command/fingerprint cohort and 200
 cohorts, and becomes stale after 30 days or when relevant inputs change.
+Cohorts also key on the worker count, so serial and parallel durations never
+blend.
+
+`run-tests`, `containment-preflight` and the loop flows accept
+`--test-workers N`, `--test-worker-memory SIZE` and
+`--test-worker-enforcement {clamp,refuse,off}`. Coder and repair agents receive
+a containment-derived budget in `AGENT_LOOP_TEST_WORKERS`; in the default
+`clamp` mode an injected pytest plugin lowers over-budget pytest-xdist requests
+(`-n auto`, `-n 16`, config or `PYTEST_ADDOPTS`) to that budget, `refuse` rejects
+them before any test runs, and `off` only advertises the budget. See
+[Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
+
 Remembered commands are suggestions only: agents must inspect the checkout and
 select focused tests. Framework per-test limits, the wrapper whole-command
 watchdog, and the backend whole-turn timeout are separate. The backend turn

@@ -233,10 +233,31 @@ class PostedRoundMetadata:
     # on every historical record and omitted from the encoding when absent.
     plan_supersession_digest: str | None = None
     plan_supersession_superseded_hash: str | None = None
+    # Signed reviewer-board amendment binding (#943).  Written only on
+    # contract-bearing scheduler records posted under an amended contract;
+    # absent on every historical record and omitted from the encoding.
+    reviewer_board_amendment_digest: str | None = None
+    # Coder record round that last rendered the full visible matrix-evidence
+    # row list (#959).  Writers set it iff they persist matrix evidence; it is
+    # omitted from the encoding when None so legacy records stay byte-stable.
+    risk_test_matrix_evidence_full_round: int | None = None
+    # In-memory decode-quality signal for the anchor, never serialized:
+    # ``absent`` is a legacy (pre-#959) record, ``invalid`` a present but
+    # malformed value.  Constructing with an anchor promotes it to ``valid``.
+    risk_test_matrix_evidence_full_round_status: str = "absent"
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
+        if self.risk_test_matrix_evidence_full_round_status not in {"absent", "valid", "invalid"}:
+            raise ValueError("invalid matrix evidence full-round status")
+        if self.risk_test_matrix_evidence_full_round is not None:
+            if self.risk_test_matrix_evidence_full_round_status == "invalid":
+                raise ValueError("a matrix evidence full-round anchor cannot be invalid")
+            if self.risk_test_matrix_evidence_full_round_status == "absent":
+                object.__setattr__(
+                    self, "risk_test_matrix_evidence_full_round_status", "valid"
+                )
         if (self.plan_supersession_digest is None) != (
             self.plan_supersession_superseded_hash is None
         ):
@@ -248,6 +269,11 @@ class PostedRoundMetadata:
             or not self.plan_supersession_superseded_hash.strip()
         ):
             raise ValueError("invalid plan supersession binding")
+        if self.reviewer_board_amendment_digest is not None and (
+            not isinstance(self.reviewer_board_amendment_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.reviewer_board_amendment_digest)
+        ):
+            raise ValueError("invalid reviewer board amendment digest")
         if self.scheduler_force_full_source is not None and (
             self.scheduler_force_full_source not in FORCE_FULL_SOURCES
             or self.scheduler_force_full is not True
@@ -1924,10 +1950,16 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["plan_supersession_superseded_hash"] = (
             metadata.plan_supersession_superseded_hash
         )
+    if metadata.reviewer_board_amendment_digest is not None:
+        payload["reviewer_board_amendment_digest"] = metadata.reviewer_board_amendment_digest
     if metadata.plan_candidate_key is not None:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
     if metadata.workflow_transaction_id is not None:
         payload["workflow_transaction_id"] = metadata.workflow_transaction_id
+    if metadata.risk_test_matrix_evidence_full_round is not None:
+        payload["risk_test_matrix_evidence_full_round"] = (
+            metadata.risk_test_matrix_evidence_full_round
+        )
     matrix_present =_risk_test_matrix_metadata_present(metadata)
     matrix_values = {
         "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,
@@ -1968,6 +2000,20 @@ def _decode_workflow_transaction_id(payload: Mapping[str, object]) -> str | None
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
         raise ValueError("workflow_transaction_id must be a transaction ID")
     return value
+
+
+def _decode_matrix_evidence_full_round(payload: Mapping[str, object]) -> dict[str, object]:
+    # Missing is legacy absence; a present malformed value never raises and
+    # stays distinguishable from absence so it cannot claim the legacy rule.
+    if "risk_test_matrix_evidence_full_round" not in payload:
+        return {"risk_test_matrix_evidence_full_round_status": "absent"}
+    value = payload["risk_test_matrix_evidence_full_round"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return {"risk_test_matrix_evidence_full_round_status": "invalid"}
+    return {
+        "risk_test_matrix_evidence_full_round": value,
+        "risk_test_matrix_evidence_full_round_status": "valid",
+    }
 
 
 def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
@@ -2212,6 +2258,10 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             plan_supersession_superseded_hash=_decode_plan_supersession_field(
                 payload, "plan_supersession_superseded_hash"
             ),
+            reviewer_board_amendment_digest=_decode_plan_supersession_field(
+                payload, "reviewer_board_amendment_digest"
+            ),
+            **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
@@ -3160,6 +3210,72 @@ def _legacy_freeform_plan_candidates(record: PostedRoundRecord) -> tuple[str, ..
         if spaced:
             spaced_candidates.append(spaced)
     return tuple(dict.fromkeys(spaced_candidates))
+
+
+@dataclass(frozen=True)
+class ApprovedPlanComment:
+    """The planner comment that carries an approved plan, for presentation."""
+
+    comment: object
+    # Structured steps from the authenticated plan sidecar, or ``None`` when
+    # the record has no sidecar bound to the approved rendered plan.
+    plan_steps: tuple[str, ...] | None
+
+
+def _sidecar_plan_steps(metadata: PostedRoundMetadata, rendered_plan: str) -> tuple[str, ...] | None:
+    if metadata.assembled_plan_sidecar is None:
+        return None
+    try:
+        sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+    except AgentLoopError:
+        return None
+    if (
+        sidecar.rendered_plan_identity is not None
+        and sidecar.rendered_plan_identity != rendered_plan_identity(rendered_plan)
+    ):
+        return None
+    steps = sidecar.canonical_json.get("plan_steps")
+    if not isinstance(steps, list) or not steps or not all(isinstance(step, str) for step in steps):
+        return None
+    return tuple(steps)
+
+
+def find_approved_plan_comment(
+    comments: Sequence[object],
+    *,
+    expected_hash: str,
+) -> ApprovedPlanComment | None:
+    """Return the latest planner comment carrying the approved plan.
+
+    Presentation only (#941): the approval announcement links here and uses
+    the structured steps to summarize them instead of repeating them.  Any
+    lookup failure yields ``None`` so the announcement degrades to the full
+    plan text rather than failing.
+    """
+    try:
+        records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError:
+        return None
+    for record in reversed(records):
+        if record.metadata.role != "coder":
+            continue
+        raw = record.metadata.canonical_plan or record.metadata.raw_structured_coder_response
+        candidates = (raw,) if raw is not None else _legacy_freeform_plan_candidates(record)
+        matched = next(
+            (
+                candidate.strip()
+                for candidate in candidates
+                if candidate and _approved_plan_hash(candidate) == expected_hash
+            ),
+            None,
+        )
+        if matched is None:
+            continue
+        return ApprovedPlanComment(
+            comment=comments[record.index],
+            plan_steps=_sidecar_plan_steps(record.metadata, matched),
+        )
+    return None
 
 
 def recover_approved_plan_context(

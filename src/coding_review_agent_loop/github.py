@@ -10,7 +10,7 @@ import os
 import re
 import tempfile
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
@@ -81,6 +81,9 @@ class IssueComment:
     body: str | None
     comment_id: int | None = None
     author_id: int | None = None
+    # Presentation-only permalink (GraphQL ``url`` / REST ``html_url``).  It
+    # is excluded from equality so it never participates in record identity.
+    url: str | None = field(default=None, compare=False)
 
     @property
     def id(self) -> int | None:
@@ -1337,6 +1340,8 @@ def _parse_issue_comments(raw_comments: object) -> tuple[IssueComment, ...]:
                 body=_optional_str(raw_comment.get("body")),
                 comment_id=comment_id,
                 author_id=_author_id(author),
+                url=_optional_str(raw_comment.get("url"))
+                or _optional_str(raw_comment.get("html_url")),
             )
         )
     return tuple(sorted(comments, key=_comment_sort_key))
@@ -1646,13 +1651,21 @@ def get_pr_checks(
     )
 
 
+def _is_board_amendment_record(signed_body: str) -> bool:
+    # A signed reviewer-board amendment is an orchestration record (#943),
+    # not a requirement on the reviewed artifact.
+    from .board_amendment import is_reviewer_board_amendment_only
+
+    return is_reviewer_board_amendment_only(signed_body)
+
+
 def _parse_pr_human_requirements(data: dict[str, object]) -> tuple[HumanReviewRequirement, ...]:
     requirements: list[HumanReviewRequirement] = []
     for raw_comment in data.get("comments") or []:
         if not isinstance(raw_comment, dict):
             continue
         body = parse_signed_human_requirement_body(raw_comment.get("body"))
-        if body is None:
+        if body is None or _is_board_amendment_record(body):
             continue
         requirements.append(
             HumanReviewRequirement(
@@ -1994,7 +2007,7 @@ def _parse_issue_human_requirements(data: dict[str, object]) -> tuple[HumanRevie
         if not isinstance(raw_comment, dict):
             continue
         body = parse_signed_human_requirement_body(_optional_str(raw_comment.get("body")))
-        if body is None:
+        if body is None or _is_board_amendment_record(body):
             continue
         requirements.append(
             HumanReviewRequirement(

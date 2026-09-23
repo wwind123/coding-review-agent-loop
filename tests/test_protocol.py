@@ -2095,6 +2095,86 @@ def test_parse_structured_plan_review_normalizes_v1_payload():
     ]
 
 
+def _plan_review_with_blocking(items: list[object]) -> str:
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "plan_review",
+                "state": "blocking",
+                "summary": "Plan has a blocking gap.",
+                "blocking_plan_issues": items,
+                "same_plan_followups": [],
+                "future_followups": [],
+                "prior_plan_item_dispositions": [],
+            }
+        )
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+
+def test_parse_structured_plan_review_flattens_finding_objects_verbatim_957():
+    finding = {
+        "item_id": "start-limit-recovery",
+        "title": "dev-deploy cannot reliably recover the unit",
+        "evidence": "Step 6 uses only `systemctl start`; systemd does not reset the start limit.",
+        "required_change": "Add `systemctl reset-failed` before the deploy start, without weakening boot-time limits.",
+    }
+
+    parsed = parse_structured_plan_review(
+        _plan_review_with_blocking([finding, "Plain string finding."]),
+        reviewer="OpenAI Codex",
+    )
+
+    assert parsed is not None
+    assert [item.text for item in parsed.items.blocking] == [
+        "dev-deploy cannot reliably recover the unit "
+        "Evidence: Step 6 uses only `systemctl start`; systemd does not reset the start limit. "
+        "Required change: Add `systemctl reset-failed` before the deploy start, "
+        "without weakening boot-time limits.",
+        "Plain string finding.",
+    ]
+    assert "start-limit-recovery" not in parsed.items.blocking[0].text
+
+
+def test_parse_structured_plan_review_accepts_text_finding_object_in_every_bucket_957():
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "plan_review",
+            "state": "blocking",
+            "summary": "Plan needs work.",
+            "blocking_plan_issues": [{"text": "Blocking gap."}],
+            "same_plan_followups": [{"text": "Same-plan cleanup."}],
+            "future_followups": [{"title": "Later idea."}],
+            "prior_plan_item_dispositions": [],
+        }
+    ) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+
+    parsed = parse_structured_plan_review(payload, reviewer="OpenAI Codex")
+
+    assert parsed is not None
+    assert [item.text for item in parsed.items.blocking] == ["Blocking gap."]
+    assert [item.text for item in parsed.items.same_plan] == ["Same-plan cleanup."]
+
+
+@pytest.mark.parametrize(
+    ("item", "message"),
+    [
+        ({"title": "x", "severity": "high"}, "unsupported finding key"),
+        ({"item_id": "only-an-id"}, "no text field"),
+        ({"title": 3}, r"at index 0\.title"),
+        ({"title": "  "}, r"at index 0\.title"),
+        ({"item_id": 7, "title": "x"}, r"at index 0\.item_id must be a string"),
+        (["nested"], "must be a string or a finding object"),
+        (5, "must be a string or a finding object"),
+    ],
+)
+def test_parse_structured_plan_review_rejects_malformed_finding_objects_957(item, message):
+    with pytest.raises(AgentLoopError, match=message):
+        parse_structured_plan_review(_plan_review_with_blocking([item]), reviewer="OpenAI Codex")
+
+
 def test_parse_structured_plan_review_tolerates_omitted_empty_collections():
     payload = (
         json.dumps(
@@ -4759,3 +4839,101 @@ def test_semantic_risk_claim_schema_text_states_the_fact_list_bound():
 
     assert f"most {RISK_MATRIX_MAX_LIST_ITEMS} items" in text
     assert "split broader coverage across additional" in text
+
+
+def _changed_architecture_impact(status: str) -> dict[str, object]:
+    return {
+        "status": status,
+        "rationale": "Extends an existing recovery data flow.",
+        "affected_components": ["orchestrator"],
+        "dependencies": [],
+        "execution_data_flows": ["managed-CI recovery"],
+        "persistence": [],
+        "public_contracts": [],
+        "security_boundaries": [],
+        "canonical_document_action": "no-change",
+        "canonical_document_path": None,
+        "canonical_document_rationale": "",
+    }
+
+
+def test_plan_review_normalizes_modified_architecture_status_916():
+    from coding_review_agent_loop.protocol import parse_structured_plan_review
+
+    payload = json.dumps({
+        "schema_version": 1,
+        "kind": "plan_review",
+        "state": "approved",
+        "summary": "Plan looks good.",
+        "blocking_plan_issues": [],
+        "same_plan_followups": [],
+        "future_followups": [],
+        "prior_plan_item_dispositions": [],
+        "architecture_impact": _changed_architecture_impact("modified"),
+    }) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+
+    parsed = parse_structured_plan_review(payload, reviewer="OpenAI Codex")
+
+    assert parsed is not None
+    assert parsed.architecture_impact is not None
+    assert parsed.architecture_impact.status == "changed"
+    assert any(
+        "from `modified` to `changed`" in note
+        for note in parsed.architecture_impact.uncertainty
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("modified", "changed"),
+        ("Changes", "changed"),
+        ("change", "changed"),
+        ("no-change", "unchanged"),
+        ("No_Change", "unchanged"),
+        ("none", "unchanged"),
+        ("same", "unchanged"),
+    ],
+)
+def test_architecture_status_synonyms_normalize_with_audit_note_916(raw, expected):
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    impact = parse_architecture_impact(_changed_architecture_impact(raw))
+
+    assert impact.status == expected
+    assert impact.uncertainty[-1].startswith("agent-loop normalized architecture_impact.status")
+
+
+def test_canonical_architecture_status_adds_no_audit_note_916():
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    impact = parse_architecture_impact(_changed_architecture_impact("changed"))
+
+    assert impact.status == "changed"
+    assert impact.uncertainty == ()
+
+
+def test_normalized_architecture_impact_reparses_idempotently_916():
+    from dataclasses import asdict
+
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    first = parse_architecture_impact(_changed_architecture_impact("modified"))
+    second = parse_architecture_impact(json.loads(json.dumps(asdict(first))))
+
+    assert second == first
+
+
+def test_changed_synonym_without_changed_field_set_still_fails_916():
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact({"status": "modified", "rationale": "Something moved."})
+
+
+@pytest.mark.parametrize("raw", ["partially", "maybe", "extended"])
+def test_unmapped_architecture_status_still_fails_916(raw):
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact(_changed_architecture_impact(raw))
