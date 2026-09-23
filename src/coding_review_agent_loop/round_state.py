@@ -2441,6 +2441,10 @@ def _is_legacy_promoted_plan_item(item: UnresolvedReviewItem) -> bool:
         and item.obligation_identity == f"unknown:{item.item_id}"
         and item.lifecycle == "repair_required"
         and item.candidate_head_sha is None
+        # The legacy promotion always clears ownership; a machine record that
+        # still names owners is not identifiable as that promotion.
+        and not item.resolution_owners
+        and not item.owner_states
         and item.status in {"blocking", "same-pr"}
         and not any(note.startswith("Invalid persisted machine") for note in item.notes)
     )

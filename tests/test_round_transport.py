@@ -1365,6 +1365,9 @@ def test_plan_flow_demotes_persisted_machine_obligation_to_reviewer_finding() ->
         # A machine record that is not the legacy promotion shape.
         {"reviewer": "Codex"},
         {"obligation_identity": "unknown:item-99"},
+        # The legacy promotion clears ownership; contradictory ownership is
+        # not identifiable as that promotion.
+        {"resolution_owners": ("Codex",), "owner_states": (("Codex", "pending"),)},
     ],
 )
 def test_plan_flow_keeps_unrecognized_machine_record_fail_closed(overrides) -> None:
