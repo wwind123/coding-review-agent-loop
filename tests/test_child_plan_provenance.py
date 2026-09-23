@@ -3336,3 +3336,231 @@ def test_m985_record_posted_during_default_policy_review_blocks_approval(tmp_pat
     assert "agent-loop issue 56 --plan-first --plan-execution-mode auto" in message
     assert len(world.agent_calls("codex")) == 1
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in world.runner.commands)
+
+
+# ---------------------------------------------------------------------------
+# A signed re-plan retires the execution decision of the superseded plan (#988)
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    EXECUTION_DECISION_MARKER_RE,
+    ExecutionDecision,
+    find_existing_execution_decision,
+    format_execution_decision,
+)
+
+
+def _m988_decision(plan_hash, *, digest="d" * 64):
+    return ExecutionDecision(
+        parent_issue=56,
+        plan_hash=plan_hash,
+        plan_subject="Child plan.",
+        execution_strategy_contract_version=1,
+        strategy="one-shot",
+        topology_source="execution_recommendation",
+        recommendation_digest=digest,
+        requested_policy="auto",
+        current_action="implement-one-shot",
+    )
+
+
+def _m988_decisions(comments):
+    return [
+        match
+        for item in comments
+        for match in EXECUTION_DECISION_MARKER_RE.finditer(str(getattr(item, "body", "")))
+    ]
+
+
+def _m988_rebound_world(tmp_path, monkeypatch):
+    """#946 shape: a decision recorded under the old plan, then a signed rebind."""
+    world = _M936World(tmp_path, monkeypatch)
+    world.comments.insert(
+        len(world.comments) - 2, comment(format_execution_decision(_m988_decision(world.old_hash)))
+    )
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    world.settle()
+    return world
+
+
+def test_m988_decision_finder_skips_only_retired_plan_hashes():
+    comments = [comment(format_execution_decision(_m988_decision("a" * 16)))]
+    kwargs = dict(
+        parent_issue=56, plan_hash="b" * 16, plan_subject="Child plan.",
+        strategy="one-shot", recommendation_digest="d" * 64,
+    )
+    with pytest.raises(AgentLoopError, match="Conflicting execution decision"):
+        find_existing_execution_decision(comments, **kwargs)
+    with pytest.raises(AgentLoopError, match="Conflicting execution decision"):
+        find_existing_execution_decision(comments, retired_plan_hashes={"c" * 16}, **kwargs)
+    assert find_existing_execution_decision(
+        comments, retired_plan_hashes={"a" * 16}, **kwargs
+    ) is None
+
+
+def test_m988_run_after_a_rebind_proceeds_past_the_superseded_decision(tmp_path, monkeypatch):
+    world = _m988_rebound_world(tmp_path, monkeypatch)
+    new_hash = find_latest_issue_pr_handoff(
+        world.comments, issue_number=56, repo="OWNER/REPO"
+    ).plan_hash
+    assert new_hash != world.old_hash
+    retired = orchestrator.verified_retired_child_plan_hashes(
+        world.comments, repo="OWNER/REPO",
+        parent_plan_context=orchestrator.make_approved_plan_context(
+            _m936_parent_plan(), source_locator="parent"
+        ),
+        child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
+    )
+    assert retired == frozenset({world.old_hash})
+    # The stranded #946 state: the next run resumes the PR instead of failing.
+    assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
+    assert world.agent_calls("claude") == []
+    assert len(world.agent_calls("codex")) == 1
+    # Any decision it records is bound to the rebound plan, never a second
+    # decision under the superseded hash.
+    for body in world.posted():
+        for match in EXECUTION_DECISION_MARKER_RE.finditer(body):
+            decoded = find_existing_execution_decision(
+                [comment(body)], parent_issue=56, plan_hash=new_hash,
+                plan_subject=_m988_plan_subject(match), strategy="one-shot",
+                recommendation_digest=_m988_digest(match),
+            )
+            assert decoded is not None and decoded.plan_hash == new_hash
+    old_bound = [
+        m for m in _m988_decisions(world.all_comments())
+        if _m988_payload(m)["plan_hash"] == world.old_hash
+    ]
+    assert len(old_bound) == 1
+
+
+def test_m988_unexplained_decision_divergence_still_fails_closed(tmp_path, monkeypatch):
+    world = _m988_rebound_world(tmp_path, monkeypatch)
+    # A decision under a hash no verified signed rebind replaced is a
+    # competing topology, even on an issue that also has a verified rebind.
+    world.comments.append(comment(format_execution_decision(_m988_decision("f" * 16))))
+    with pytest.raises(AgentLoopError, match="Conflicting execution decision exists"):
+        world.run_issue(codex_outputs=[PR_APPROVAL])
+    assert world.agent_calls("codex") == [] and world.posted() == []
+
+
+def test_m988_decision_without_a_rebind_still_fails_closed(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
+    world.comments.append(comment(format_execution_decision(_m988_decision("f" * 16))))
+    with pytest.raises(AgentLoopError, match="Conflicting execution decision exists"):
+        world.run_issue(codex_outputs=[PR_APPROVAL])
+    assert world.agent_calls("codex") == []
+
+
+def _m988_payload(match):
+    from coding_review_agent_loop.decomposition import _decode_execution_decision
+
+    return _decode_execution_decision(match.group("payload")).to_payload()
+
+
+def _m988_plan_subject(match):
+    return str(_m988_payload(match)["plan_subject"])
+
+
+def _m988_digest(match):
+    return str(_m988_payload(match)["recommendation_digest"])
+
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    AuthorizedReplanLineage,
+    ChildPlanRebindRecord,
+    format_child_plan_rebind_section,
+)
+
+_M988_EARLIER = "e" * 16
+
+
+def _m988_earlier_rebind_section(world):
+    return format_child_plan_rebind_section(ChildPlanRebindRecord(
+        child_issue=56, pr_number=77, superseded_plan_hash=_M988_EARLIER,
+        new_plan_hash=world.old_hash, plan_supersession_digest="a" * 64,
+        first_replan_round=1, approved_round=1,
+    ))
+
+
+def _m988_accept_earlier_lineage(monkeypatch, world):
+    """Treat the earlier edge's re-plan lineage as verified, isolating the handoff check."""
+    original = orchestrator.authorized_replan_lineage
+
+    def lineage(comments, *, superseded_hash, **kwargs):
+        if superseded_hash == _M988_EARLIER:
+            return AuthorizedReplanLineage(round_numbers=(1,), latest_plan_hash=world.old_hash)
+        return original(comments, superseded_hash=superseded_hash, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "authorized_replan_lineage", lineage)
+
+
+def _m988_retired(world):
+    return orchestrator.verified_retired_child_plan_hashes(
+        world.comments, repo="OWNER/REPO",
+        parent_plan_context=orchestrator.make_approved_plan_context(
+            _m936_parent_plan(), source_locator="parent"
+        ),
+        child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
+    )
+
+
+def _m988_old_handoff_index(world):
+    return next(
+        index for index, item in enumerate(world.comments)
+        if AGENT_ISSUE_PR_HANDOFF_RE.search(item.body)
+    )
+
+
+def test_m988_standalone_earlier_audit_record_retires_nothing(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+    index = _m988_old_handoff_index(world)
+    # An earlier audit record with no handoff transition behind it, and a
+    # decision under the plan it claims to have replaced.
+    world.comments.insert(index, comment(_m988_earlier_rebind_section(world)))
+    world.comments.insert(index, comment(format_execution_decision(_m988_decision(_M988_EARLIER))))
+    _m988_accept_earlier_lineage(monkeypatch, world)
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    world.settle()
+    assert _m988_retired(world) == frozenset({world.old_hash})
+    with pytest.raises(AgentLoopError, match="Conflicting execution decision exists"):
+        world.run_issue(codex_outputs=[PR_APPROVAL])
+    assert world.agent_calls("codex") == [] and world.posted() == []
+
+
+def test_m988_earlier_edge_with_its_handoff_transition_is_retired(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+    index = _m988_old_handoff_index(world)
+    handoff = dict(
+        issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123", flow="approved-plan-implementation",
+    )
+    earlier = format_issue_pr_handoff_comment(plan_hash=_M988_EARLIER, **handoff)
+    earlier_meta = find_latest_issue_pr_handoff(
+        [comment(earlier)], issue_number=56, repo="OWNER/REPO"
+    )
+    # The earlier plan was bound first, then rebound to the old plan in one
+    # comment carrying both the handoff transition and its audit record.
+    world.comments[index:index + 1] = [
+        comment(format_execution_decision(_m988_decision(_M988_EARLIER))),
+        comment(earlier),
+        comment(
+            _m988_earlier_rebind_section(world) + "\n" + format_issue_pr_handoff_comment(
+                plan_hash=world.old_hash, supersedes_hash=earlier_meta.contract_hash, **handoff
+            )
+        ),
+    ]
+    _m988_accept_earlier_lineage(monkeypatch, world)
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    world.settle()
+    assert _m988_retired(world) == frozenset({world.old_hash, _M988_EARLIER})
+    assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
+    assert len(world.agent_calls("codex")) == 1

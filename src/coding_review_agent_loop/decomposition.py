@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 import zlib
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import asdict, dataclass
 
 from .config import AgentLoopConfig
@@ -2223,8 +2223,17 @@ def find_existing_execution_decision(
     plan_subject: str,
     strategy: str,
     recommendation_digest: str,
+    retired_plan_hashes: Collection[str] = (),
 ) -> ExecutionDecision | None:
+    """The decision recorded for ``plan_hash``, or ``None``.
+
+    ``retired_plan_hashes`` names approved plans that a verified signed
+    child-plan supersession chain replaced (#988).  A decision bound to one
+    of them is history, not a competing topology, and is skipped.  Any other
+    decision under a different hash still fails closed.
+    """
     found: ExecutionDecision | None = None
+    retired = frozenset(retired_plan_hashes)
     expected_identity = {
         "parent_issue": parent_issue,
         "plan_hash": plan_hash,
@@ -2243,6 +2252,8 @@ def find_existing_execution_decision(
             if decision.parent_issue != parent_issue:
                 continue
             if decision.plan_hash != plan_hash:
+                if decision.plan_hash in retired:
+                    continue
                 # A decision is durable approval-bound state, not a cache keyed
                 # only by the currently visible plan.  If approval changed
                 # after a crash, publishing a second decision would allow the
