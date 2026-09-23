@@ -218,7 +218,9 @@ With exactly one matching record and an open canonical PR, planning reopens:
 That includes an admissible bound plan with a pending matching signed record:
 PR mode stops before any reviewer runs rather than reviewing the PR against a
 scope no approved plan contains, since a PR-mode coder turn cannot produce the
-replacement plan.
+replacement plan. The same check runs again on the freshly fetched child issue
+at qualification, so a record posted while reviewers were running stops the
+run before any final sweep, merge, or managed-CI gate.
 Keep the signed record on the child issue after the rebind. Re-planning
 continues the child's round numbering, so a higher `--max-rounds` may be needed.
 Not supported: abandoning or replacing the PR, re-planning direct-implementation

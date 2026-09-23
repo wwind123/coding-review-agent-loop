@@ -9422,6 +9422,28 @@ def _require_admissible_pr_child_plan(
                 superseded_plan_hash=child_plan_context.plan_hash or "",
             )
         )
+    _reject_pending_child_plan_supersession(
+        child_comments,
+        binding=binding,
+        plan_hash=child_plan_context.plan_hash,
+        pr_number=pr_number,
+        stopped="no reviewer ran",
+    )
+
+
+def _reject_pending_child_plan_supersession(
+    child_comments: Sequence[object],
+    *,
+    binding: _PlanningChildBinding,
+    plan_hash: str | None,
+    pr_number: int,
+    stopped: str,
+) -> None:
+    """Fail closed while a signed record authorizes replacing the bound plan (#985).
+
+    Checked at PR entry and again on the freshly fetched child issue at
+    qualification, so a record posted while reviewers ran cannot be bypassed.
+    """
     pending = [
         record
         for record in collect_child_plan_supersessions(
@@ -9430,13 +9452,13 @@ def _require_admissible_pr_child_plan(
             parent_issue=binding.parent_issue,
             stage_id=binding.stage_id,
         )
-        if record.superseded_plan_hash == child_plan_context.plan_hash
+        if record.superseded_plan_hash == plan_hash
     ]
     if pending:
         raise AgentLoopError(
-            f"PR #{pr_number} is bound to approved child plan {child_plan_context.plan_hash}, "
+            f"PR #{pr_number} is bound to approved child plan {plan_hash}, "
             f"which the signed child-plan supersession at {pending[0].comment_locator} "
-            "authorizes replacing; no reviewer ran. The authorization permits a re-plan but is "
+            f"authorizes replacing; {stopped}. The authorization permits a re-plan but is "
             "not itself an approved plan, and `agent-loop pr` never re-plans or rebinds. Rerun "
             f"`{_child_resume_hint(binding.child_issue, EXECUTION_DISPOSITION_PLANNING)}`: the "
             "child is re-planned, and after approval this PR is rebound to the revised plan."
@@ -16160,6 +16182,16 @@ def _fresh_pr_qualification_snapshot(
             raise AgentLoopError(
                 "Approved plan identity changed or disappeared during PR qualification; "
                 "stale approvals cannot be used for this head."
+            )
+        if planning_child_binding is not None:
+            # A signed supersession posted while reviewers ran must not be
+            # bypassed by qualifying the plan it authorizes replacing (#985).
+            _reject_pending_child_plan_supersession(
+                fresh_issue.comments,
+                binding=planning_child_binding,
+                plan_hash=fresh_approved_plan_context.plan_hash,
+                pr_number=pr_number,
+                stopped="no final sweep, merge, or managed-CI gate ran",
             )
     if (
         staged_owner

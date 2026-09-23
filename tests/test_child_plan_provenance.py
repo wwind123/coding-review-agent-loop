@@ -3291,3 +3291,25 @@ def test_m985_pr_mode_refuses_to_review_under_a_pending_signed_replan(tmp_path, 
     ) == 0
     assert world.run_pr(codex_outputs=[PR_APPROVAL]) == 0
     assert len(world.agent_calls("codex")) == 1
+
+
+def test_m985_qualification_rechecks_a_signed_record_posted_during_review(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
+    old_context = orchestrator.recover_approved_plan_context(
+        world.comments, expected_hash=world.old_hash
+    )
+    # Without a record the unchanged binding qualifies.
+    _context, _ids, adopted, _config = _m936_snapshot(
+        world, binding=_m936_binding(world), approved_plan_context=old_context
+    )
+    assert adopted.plan_hash == world.old_hash
+    # A human authorizes the re-plan while reviewers are running.
+    world.comments.append(comment(world.signed_record(rationale="Reduce scope.")))
+    with pytest.raises(AgentLoopError) as excinfo:
+        _m936_snapshot(world, binding=_m936_binding(world), approved_plan_context=old_context)
+    message = str(excinfo.value)
+    assert "authorizes replacing" in message and "no final sweep, merge" in message
+    assert "agent-loop issue 56 --plan-first --plan-execution-mode auto" in message
+    # A record for another plan hash does not block qualification.
+    world.comments[-1] = comment(world.signed_record(superseded_plan_hash="0" * 16))
+    _m936_snapshot(world, binding=_m936_binding(world), approved_plan_context=old_context)
