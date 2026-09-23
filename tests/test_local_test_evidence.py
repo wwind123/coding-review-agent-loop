@@ -1301,6 +1301,127 @@ def test_broker_worker_budget_busy_across_broker_requests(tmp_path):
     assert [item.outcome for item in server.journal] == ["passed"]
 
 
+def _gate_target(marker, gate):
+    """A target that announces it started, then blocks until the gate exists."""
+    return [
+        sys.executable, "-c",
+        "import os, sys, time; "
+        f"open({str(marker)!r}, 'w').write('started'); "
+        f"[time.sleep(0.02) for _ in range(3000) if not os.path.exists({str(gate)!r})]",
+    ]
+
+
+def _wait_for(path, seconds=30):
+    import time
+
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"{path} was not created")
+        time.sleep(0.02)
+
+
+def _local_fallback_run_tests(root, invocation, xdg, argv, memory, *, popen=False):
+    """The real run-tests CLI with no broker in its environment (local fallback)."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("AGENT_LOOP_TEST_BROKER_")
+    }
+    env.update(_src_env())
+    env.update({
+        "AGENT_LOOP_INVOCATION_ID": invocation,
+        "AGENT_LOOP_TEST_WORKERS": "2",
+        "AGENT_LOOP_TEST_WORKER_ENFORCEMENT": "clamp",
+        "XDG_RUNTIME_DIR": xdg,
+    })
+    command = [
+        sys.executable, "-c",
+        "import sys; from coding_review_agent_loop.cli import main; raise SystemExit(main(sys.argv[1:]))",
+        "run-tests", "--timeout-seconds", "60", "--memory-dir", str(memory), "--", *argv,
+    ]
+    if popen:
+        return subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=120)
+
+
+@pytest.mark.parametrize("holder", ["broker", "local"])
+def test_broker_and_local_fallback_share_one_worker_budget_lock(tmp_path, holder):
+    """A real broker target and a real local-fallback run-tests contend on one lock.
+
+    The two sides use different XDG_RUNTIME_DIR values and neither overrides
+    the lock root, so the trusted uid-owned namespace is what makes them
+    contend.  Exactly one target starts while the other is held.
+    """
+    import uuid
+
+    from coding_review_agent_loop.test_workers import WorkerBudget
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    _git_checkout(root)
+    memory = tmp_path / "memory"
+    invocation = f"cross-path-{os.getpid()}-{uuid.uuid4().hex}"
+    server = BrokerServer(root=root, turn_id=invocation).start()
+    server.set_execution_context(
+        containment_handle=None, process_started=None, process_finished=None,
+        worker_budget=WorkerBudget(2, "derived", "clamp", "cpu", {}, False),
+    )
+    client = BrokerClient({**os.environ, **server.environment, "AGENT_LOOP_INVOCATION_ID": invocation})
+    gate = tmp_path / "gate"
+    holder_marker = tmp_path / "holder.started"
+    contender_marker = tmp_path / "contender.started"
+    try:
+        if holder == "broker":
+            outcome: dict = {}
+
+            def run_holder():
+                outcome["result"] = client.run(
+                    _gate_target(holder_marker, gate), timeout_seconds=60, cwd=root,
+                    environment_overrides={"XDG_RUNTIME_DIR": str(tmp_path / "xdg-broker")},
+                )
+
+            thread = threading.Thread(target=run_holder)
+            thread.start()
+            _wait_for(holder_marker)
+            local = _local_fallback_run_tests(
+                root, invocation, str(tmp_path / "xdg-local"),
+                [sys.executable, "-c", f"open({str(contender_marker)!r}, 'w').write('x')"], memory,
+            )
+            assert local.returncode == 125, local.stdout + local.stderr
+            assert "worker budget" in local.stderr
+            assert not contender_marker.exists()
+            gate.write_text("open")
+            thread.join(timeout=60)
+            assert outcome["result"].outcome == "passed"
+        else:
+            local = _local_fallback_run_tests(
+                root, invocation, str(tmp_path / "xdg-local"), _gate_target(holder_marker, gate), memory,
+                popen=True,
+            )
+            try:
+                _wait_for(holder_marker)
+                busy = client.run(
+                    [sys.executable, "-c", f"open({str(contender_marker)!r}, 'w').write('x')"],
+                    timeout_seconds=30, cwd=root,
+                    environment_overrides={"XDG_RUNTIME_DIR": str(tmp_path / "xdg-broker")},
+                )
+                assert busy.outcome == "worker-budget-busy" and busy.returncode == 125
+                assert not contender_marker.exists()
+            finally:
+                gate.write_text("open")
+                output, _ = local.communicate(timeout=60)
+            assert local.returncode == 0, output
+        # Once the holder has exited, the other path runs.
+        after = client.run(
+            [sys.executable, "-c", f"open({str(contender_marker)!r}, 'w').write('x')"],
+            timeout_seconds=30, cwd=root,
+        )
+        assert after.outcome == "passed" and contender_marker.exists()
+    finally:
+        gate.write_text("open")
+        server.stop()
+
+
 try:  # pragma: no cover - depends on the dev extra
     import xdist as _xdist  # noqa: F401
 

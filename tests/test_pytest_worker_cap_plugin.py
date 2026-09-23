@@ -448,3 +448,198 @@ def test_script_wrapper_other_command_is_capped_through_env(tmp_path):
     assert _confirmed(rows)["effective"] == 2
     analysis = analyze_worker_report(project.parent / "report.jsonl", command_class="other", mode="clamp")
     assert analysis.workers_cohort == "unknown" and analysis.enforcement == "clamped"
+
+
+# ---------------------------------------------------------------------------
+# Gateway creation instrumentation, worker restarts and socket gateways
+# ---------------------------------------------------------------------------
+
+
+_GATEWAY_PROBE = """
+import json, os, time
+
+
+def pytest_xdist_newgateway(gateway):
+    # Records, at the moment xdist creates each gateway, whether the cap's
+    # pre-creation decision line is already on disk.
+    report = os.environ["PROBE_REPORT"]
+    decided = False
+    if os.path.exists(report):
+        with open(report) as stream:
+            decided = any(json.loads(line).get("kind") == "decision" for line in stream if line.strip())
+    with open(os.environ["PROBE_LOG"], "a") as stream:
+        spec = gateway.spec
+        kind = "popen" if getattr(spec, "popen", None) else ("socket" if getattr(spec, "socket", None) else "other")
+        stream.write(json.dumps({"kind": kind, "decided": decided, "ns": time.monotonic_ns()}) + "\\n")
+"""
+
+
+def _probe_env(project: Path) -> dict[str, str]:
+    return {
+        "PROBE_REPORT": str(project.parent / "report.jsonl"),
+        "PROBE_LOG": str(project.parent / "gateways.jsonl"),
+    }
+
+
+def _gateway_log(project: Path) -> list[dict]:
+    path = project.parent / "gateways.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+@pytest.mark.parametrize(
+    "args, budget, expected",
+    [
+        (["-n", "4"], 2, 2),
+        (["--dist=load", "--tx", "5*popen"], 2, 2),
+        (["-n", "2"], 3, 2),
+    ],
+)
+def test_decision_line_precedes_every_gateway_creation(tmp_path, args, budget, expected):
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    proc, rows, ran = _run(project, args, budget=budget, env=_probe_env(project))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    gateways = _gateway_log(project)
+    assert len(gateways) == expected
+    # Every gateway, including the first, was created after the decision
+    # line had been written: the decision is a pre-creation record.
+    assert all(entry["decided"] for entry in gateways)
+    assert _confirmed(rows)["effective"] == expected == len(gateways)
+    assert len(ran) == 4
+
+
+def test_worker_restarts_are_not_counted(tmp_path):
+    crash = """
+    import os
+
+    def test_crash_once():
+        flag = os.path.join(os.environ["CRASH_DIR"], "crashed")
+        if not os.path.exists(flag):
+            open(flag, "w").close()
+            os._exit(1)
+    """
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE, "test_crash.py": crash})
+    env = {**_probe_env(project), "CRASH_DIR": str(tmp_path)}
+    proc, rows, _ran = _run(project, ["-n", "4", "--max-worker-restart=2"], budget=2, env=env)
+    # The crashed test is reported as a failure; the run itself completes.
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert (tmp_path / "crashed").exists()
+    gateways = _gateway_log(project)
+    # A replacement gateway was created after the crash ...
+    assert len(gateways) >= 3, gateways
+    # ... but the confirmation counts only the setup-phase gateways.
+    confirmed = _confirmed(rows)
+    assert confirmed["effective"] == 2 and confirmed["action"] == "clamped"
+    analysis = analyze_worker_report(project.parent / "report.jsonl", command_class="direct-pytest", mode="clamp")
+    assert analysis.workers_cohort == "2"
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture
+def socket_servers(tmp_path):
+    """Local execnet socket servers (one per socket gateway; never ssh)."""
+    import execnet
+
+    script = Path(execnet.__file__).parent / "script" / "socketserver.py"
+    started: list[subprocess.Popen] = []
+
+    def start(count: int, project: Path) -> list[str]:
+        import socket
+        import time
+
+        env = {key: value for key, value in os.environ.items() if key not in _SCRUB}
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(plugin_directory()), str(Path(__file__).resolve().parents[1] / "src")]
+        )
+        env["RAN_MARKER"] = str(project.parent / "ran.txt")
+        addresses = []
+        for _ in range(count):
+            port = _free_port()
+            started.append(
+                subprocess.Popen(
+                    [sys.executable, "-u", str(script), f"127.0.0.1:{port}"], cwd=project, env=env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            )
+            deadline = time.monotonic() + 20
+            while True:
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("socket server did not start")
+                    time.sleep(0.05)
+            addresses.append(f"socket=127.0.0.1:{port}//chdir={project}")
+        return addresses
+
+    # A readiness probe connection consumes one accept; the server's loop
+    # mode accepts the next connection afterwards.
+    yield start
+    for proc in started:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def _tx(specs: list[str]) -> list[str]:
+    args = ["--dist=load"]
+    for spec in specs:
+        args += ["--tx", spec]
+    return args
+
+
+@pytest.mark.parametrize(
+    "budget, popen, sockets, kept_popen, kept_remote",
+    [
+        (1, 1, 1, 1, 0),
+        (2, 0, 3, 0, 2),
+        (3, 2, 2, 2, 1),
+    ],
+)
+def test_socket_gateways_count_against_the_budget(
+    tmp_path, socket_servers, budget, popen, sockets, kept_popen, kept_remote
+):
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    specs = ["popen"] * popen + socket_servers(sockets, project)
+    proc, rows, ran = _run(project, _tx(specs), budget=budget, env=_probe_env(project), timeout=180)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    decision = _only(rows, "decision")[0]
+    assert decision["planned"] == budget and decision["remote"] == kept_remote
+    gateways = _gateway_log(project)
+    # Clamp keeps the first `budget` specs in order.
+    assert [entry["kind"] for entry in gateways] == (
+        ["popen"] * kept_popen + ["socket"] * kept_remote
+    )
+    assert all(entry["decided"] for entry in gateways)
+    confirmed = _confirmed(rows)
+    assert confirmed["effective"] == budget and confirmed["remote"] == kept_remote
+    assert confirmed["action"] == "clamped"
+    assert sorted(ran) == ["four", "one", "three", "two"]
+    analysis = analyze_worker_report(project.parent / "report.jsonl", command_class="direct-pytest", mode="clamp")
+    if kept_remote:
+        assert analysis.workers_cohort == "unknown"
+        assert "worker-budget-remote-gateways" in analysis.caveats
+    else:
+        assert analysis.workers_cohort == str(budget)
+
+
+def test_socket_gateways_refused_before_any_gateway(tmp_path, socket_servers):
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    specs = ["popen", "popen"] + socket_servers(2, project)
+    proc, rows, ran = _run(project, _tx(specs), budget=3, mode="refuse", env=_probe_env(project))
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    refused = _only(rows, "refused")
+    assert len(refused) == 1
+    assert refused[0]["stage"] == "setupnodes"
+    assert refused[0]["total"] == 4 and refused[0]["remote"] == 2
+    assert _gateway_log(project) == [] and ran == []
+    analysis = analyze_worker_report(project.parent / "report.jsonl", command_class="direct-pytest", mode="refuse")
+    assert analysis.direct_refusal

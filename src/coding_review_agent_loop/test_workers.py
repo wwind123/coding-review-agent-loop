@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import stat
@@ -58,6 +59,7 @@ WORKER_BUDGET_REFUSED_EXIT_CODE = 2
 
 WORKER_BUDGET_LOCK_DIR = "worker-budget"
 DESCENDANT_TERMINATION_GRACE_SECONDS = 2.0
+DESCENDANT_KILL_CONFIRM_SECONDS = 10.0
 
 CAVEAT_UNVERIFIED = "worker-budget-unverified"
 CAVEAT_NOT_OBSERVED = "worker-budget-not-observed"
@@ -705,9 +707,16 @@ def apply_worker_budget(
     child_env["PYTHONPATH"] = pythonpath(child_env.get("PYTHONPATH"))
     child_env["PYTEST_PLUGINS"] = plugins(child_env.get("PYTEST_PLUGINS"))
     child_env.update(controlled)
+    if shape.command_class != "direct-pytest":
+        # ``other`` commands keep their argv byte-for-byte; a runner whose env
+        # segments drop the control environment is simply not observed.
+        return WorkerDecision(
+            tuple(tokens), child_env, shape.command_class, effective_mode, budget.workers,
+            report_path=report_path, report_dir=report_dir, notices=tuple(notices),
+        )
 
-    # Rewrite inline env segments so they cannot disable the plugin or raise
-    # the budget.
+    # Rewrite inline env segments of a direct pytest so they cannot disable
+    # the plugin or raise the budget.
     shape = classify_command(tokens)
     segments, assignments = _env_segments(tokens, shape.head_index)
     rewritten = list(tokens)
@@ -995,14 +1004,14 @@ def worker_budget_busy_message(budget: WorkerBudget, reason: str | None = None) 
     return text
 
 
-def process_group_members(pgid: int) -> list[int]:
-    """Best-effort list of live processes in ``pgid`` (Linux /proc only)."""
+def process_group_members(pgid: int) -> list[int] | None:
+    """Live (non-zombie) processes in ``pgid``, or None when /proc is unavailable."""
     members: list[int] = []
     proc = Path("/proc")
     try:
         entries = list(proc.iterdir())
     except OSError:
-        return members
+        return None
     for entry in entries:
         if not entry.name.isdigit():
             continue
@@ -1025,30 +1034,76 @@ def process_group_members(pgid: int) -> list[int]:
     return members
 
 
-def terminate_process_group_descendants(
-    pgid: int, *, grace_seconds: float = DESCENDANT_TERMINATION_GRACE_SECONDS
-) -> int:
-    """Terminate whatever is left in the target's process group; return the count."""
+def process_group_alive(pgid: int) -> bool:
+    """Whether any live process remains in ``pgid``.
+
+    Uses /proc when it can be enumerated (zombies do not count); otherwise
+    falls back to a signal-0 probe of the group, which works on every POSIX
+    host.  A permission error means the group still exists.
+    """
     members = process_group_members(pgid)
+    if members is not None:
+        return bool(members)
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _wait_group_gone(pgid: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if not process_group_alive(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+@dataclass(frozen=True)
+class DescendantTermination:
+    count: int
+    confirmed: bool
+
+
+def terminate_process_group_descendants(
+    pgid: int,
+    *,
+    grace_seconds: float = DESCENDANT_TERMINATION_GRACE_SECONDS,
+    kill_wait_seconds: float = DESCENDANT_KILL_CONFIRM_SECONDS,
+) -> DescendantTermination:
+    """Terminate whatever is left in the target's process group.
+
+    The group is signalled whether or not /proc can enumerate it.  After
+    SIGTERM and a grace period the group is SIGKILLed, and the call waits
+    (bounded) until no live member remains, so the caller releases the
+    worker-budget lock only once the old workers are gone.  ``confirmed`` is
+    False when a member was still alive at the end of the bounded wait.
+    """
+    if not process_group_alive(pgid):
+        return DescendantTermination(0, True)
+    members = process_group_members(pgid)
+    count = max(len(members), 1) if members is not None else 1
     try:
         os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return len(members)
+    except ProcessLookupError:
+        return DescendantTermination(count, True)
     except OSError:
-        return len(members)
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not process_group_members(pgid):
-            break
-        time.sleep(0.05)
-    else:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except OSError:
-            pass
-    # Some platforms cannot enumerate the group; report at least one signalled
-    # process when the group still existed.
-    return max(len(members), 1)
+        pass
+    if _wait_group_gone(pgid, grace_seconds):
+        return DescendantTermination(count, True)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return DescendantTermination(count, True)
+    except OSError:
+        pass
+    return DescendantTermination(count, _wait_group_gone(pgid, kill_wait_seconds))
 
 
 # ---------------------------------------------------------------------------
@@ -1337,9 +1392,30 @@ def _read_capped(path: Path) -> str | None:
 def _pytest_parallel_invocation(text: str) -> bool:
     import re
 
+    # Any value counts, including a shell variable such as
+    # ``$AGENT_LOOP_TEST_WORKERS``; only an option-looking token does not.
     return bool(
-        re.search(r"\bpytest\b[^\n`]*?(?:\s-n\s*(?:\d+|auto|logical)\b|\s--numprocesses(?:=|\s+)\S+)", text)
+        re.search(r"\bpytest\b[^\n`]*?\s(?:-n|--numprocesses)(?:=|\s*)(?!-)[^\s`]+", text)
     )
+
+
+def _strip_machine_comments(path: Path, text: str) -> str:
+    """Drop comment text so a commented-out requirement is not a requirement."""
+    if path.suffix == ".lock" and path.name == "Pipfile.lock":
+        return text  # JSON: no comments
+    ini_like = path.suffix in {".cfg", ".ini"}
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if ini_like and stripped.startswith(";"):
+            continue
+        if stripped.startswith("#"):
+            continue
+        # Trailing ``# comment`` (``#`` after whitespace; URL fragments such as
+        # ``#egg=`` have no preceding whitespace and are kept).
+        cut = re.search(r"\s#", line)
+        lines.append(line[: cut.start()] if cut else line)
+    return "\n".join(lines)
 
 
 def _code_fragments(text: str) -> Iterable[str]:
@@ -1380,6 +1456,7 @@ def detect_parallel_support(root: Path) -> bool:
         if text is None:
             continue
         checked += 1
+        text = _strip_machine_comments(path, text)
         if re.search(r"(?<![A-Za-z0-9_.-])pytest[-_]xdist(?![A-Za-z0-9_-])", text):
             return True
     workflows = root / ".github" / "workflows"

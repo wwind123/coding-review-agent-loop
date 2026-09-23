@@ -46,7 +46,7 @@ from .test_workers import (
     WorkerDecision,
     analyze_worker_report,
     apply_worker_budget,
-    process_group_members,
+    process_group_alive,
     terminate_process_group_descendants,
     worker_budget_busy_message,
     worker_lane_identity,
@@ -784,6 +784,7 @@ def run_foreground_test(
             diagnostics=("test wrapper inherited the active agent invocation scope",),
         )
     descendants_terminated = 0
+    descendants_unconfirmed = False
     worker_caveats: tuple[str, ...] = ()
     analysis = None
     try:
@@ -791,8 +792,12 @@ def run_foreground_test(
             # Descendants count against the worker ceiling until they are gone:
             # terminate the target's process group before releasing the lock.
             # Processes that escaped into a new session are outside it.
-            if process_group_members(proc.pid):
-                descendants_terminated = terminate_process_group_descendants(proc.pid)
+            # The group is signalled even where /proc cannot enumerate it,
+            # and the lock is released only after termination is confirmed.
+            if process_group_alive(proc.pid):
+                termination = terminate_process_group_descendants(proc.pid)
+                descendants_terminated = termination.count
+                descendants_unconfirmed = not termination.confirmed
         if decision is not None:
             analysis = analyze_worker_report(
                 decision.report_path,
@@ -831,6 +836,12 @@ def run_foreground_test(
             *worker_notices,
             f"agent-loop worker budget: terminated {descendants_terminated} lingering process(es) "
             "left in the test command's process group",
+        )
+    if descendants_unconfirmed:
+        worker_notices = (
+            *worker_notices,
+            "agent-loop worker budget: WARNING a process in the test command's process group "
+            "was still alive after SIGKILL; the worker ceiling may be exceeded until it exits",
         )
     for notice in worker_notices:
         notify(notice)

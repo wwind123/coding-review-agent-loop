@@ -489,12 +489,13 @@ through `PYTHONPATH` and `PYTEST_PLUGINS`, plus a wrapper-private
 `-p _agent_loop_worker_cap` after its entry point; that later argv token
 re-enables the plugin even if config or `PYTEST_ADDOPTS` disables it. Every
 other command (make, scripts, tox, nox, npm, go, cargo, ...) keeps its argv
-unchanged and receives the same inert environment; it is enforced whenever that
-environment reaches a pytest process and is recorded `not-observed` otherwise
-(for example tox without `passenv` for both variables). `off` injects nothing.
-Inline `env` segments cannot remove or forge the controlled variables: `-i`,
-`-u` and assignments are rewritten so the plugin, spec and (in clamp) the auto
-cap survive. The plugin requires pytest >= 8 (new-style pluggy wrappers); on
+unchanged, including any `env -i`/`-u` prefix, and receives the same inert
+environment; it is enforced whenever that environment reaches a pytest process
+and is recorded `not-observed` otherwise (for example tox without `passenv` for
+both variables, or an `env -i make test` prefix). `off` injects nothing. For a
+direct pytest, inline `env` segments cannot remove or forge the controlled
+variables: `-i`, `-u` and assignments are rewritten so the plugin, spec and (in
+clamp) the auto cap survive. The plugin requires pytest >= 8 (new-style pluggy wrappers); on
 older pluggy it defines no hooks and the run is reported unverified.
 
 The plugin acts on pytest's own final resolved options, whatever supplied them
@@ -576,8 +577,11 @@ uid-owned directory (`/run/user/<uid>/agent-loop/worker-budget`, else
 can choose; an unsafe directory fails closed. The command lane is keyed on the
 requested command with worker-selection tokens removed and no budget or mode,
 so every worker spelling of one command shares a lane in every mode. After the
-target exits, its process group is terminated before the lock is released;
-processes that escape into a new session (`setsid`, double fork) are outside
+target exits, its process group is terminated before the lock is released:
+the group is signalled (SIGTERM, then SIGKILL after a short grace) even where
+`/proc` cannot enumerate it, and the lock is released only after no live member
+remains (a bounded wait; a survivor is reported with a warning notice). Processes
+that escape into a new session (`setsid`, double fork) are outside
 the ceiling and bounded only by cgroup limits. Off mode takes no worker-budget
 lock and terminates nothing. Test suites that exercise `run-tests` itself must
 give the inner call its own environment (clear `AGENT_LOOP_INVOCATION_ID` and

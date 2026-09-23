@@ -371,6 +371,28 @@ def test_other_commands_keep_argv_and_get_identical_env(tmp_path, argv):
         decision.cleanup()
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["env", "-i", "PATH=/usr/bin", "make", "test"],
+        ["env", "-u", "PYTHONPATH", "-u", "PYTEST_PLUGINS", "./script.sh"],
+        ["env", f"{ENV_WORKER_CAP_SPEC}=forged", f"{ENV_XDIST_AUTO}=99", "tox", "-e", "py"],
+        ["timeout", "60", "env", "-i", "npm", "test"],
+    ],
+)
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+def test_prefixed_other_commands_keep_argv_unchanged(tmp_path, argv, mode):
+    """Env-filtering prefixes on `other` commands are left alone (not observed)."""
+    decision = apply_worker_budget(argv, {"PATH": "/usr/bin"}, tmp_path, _budget(2, mode))
+    try:
+        assert decision.command_class == "other"
+        assert decision.argv == tuple(argv)
+        assert decision.refused is None
+        assert decision.env["PYTEST_PLUGINS"] == PLUGIN_MODULE
+    finally:
+        decision.cleanup()
+
+
 def test_off_mode_injects_nothing(tmp_path):
     env = {"PYTEST_ADDOPTS": "-n 8", ENV_XDIST_AUTO: "6"}
     decision = apply_worker_budget(["pytest", "-n", "8"], env, tmp_path, _budget(2, "off"))
@@ -668,6 +690,42 @@ def test_parallel_detection_is_bounded_and_text_only(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "snippet",
+    [
+        "`pytest -n $AGENT_LOOP_TEST_WORKERS tests/`",
+        "```bash\npytest -n \"${AGENT_LOOP_TEST_WORKERS}\"\n```",
+        "`python -m pytest --numprocesses=$AGENT_LOOP_TEST_WORKERS`",
+        "`pytest -n4`",
+    ],
+)
+def test_parallel_detection_accepts_variable_valued_documented_commands(tmp_path, snippet):
+    (tmp_path / "README.md").write_text(f"Run it:\n\n{snippet}\n")
+    assert detect_parallel_support(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "name, content",
+    [
+        ("pyproject.toml", '[project]\ndependencies = ["pytest"]\n# "pytest-xdist" disabled for now\n'),
+        ("pyproject.toml", '[project]\ndependencies = ["pytest"]  # maybe pytest-xdist later\n'),
+        ("requirements.txt", "pytest\n# pytest-xdist\n"),
+        ("setup.cfg", "[options]\n; pytest-xdist\ninstall_requires = pytest\n"),
+        ("tox.ini", "[testenv]\ndeps = pytest  # pytest-xdist\n"),
+    ],
+)
+def test_parallel_detection_ignores_commented_requirements(tmp_path, name, content):
+    (tmp_path / name).write_text(content)
+    assert not detect_parallel_support(tmp_path)
+
+
+def test_parallel_detection_ignores_option_like_value(tmp_path):
+    (tmp_path / "README.md").write_text("`pytest -n --help`\n")
+    assert not detect_parallel_support(tmp_path)
+    (tmp_path / "requirements.txt").write_text("pytest-xdist==3.6  # parallel runs\n")
+    assert detect_parallel_support(tmp_path)
+
+
+@pytest.mark.parametrize(
     "mode, sentence",
     [("clamp", "lowered to the budget"), ("refuse", "refused and the run does not execute"), ("off", "advisory")],
 )
@@ -941,6 +999,90 @@ def test_lingering_descendants_terminated_before_release(tmp_path):
         time.sleep(0.05)
     else:  # pragma: no cover - failure path
         pytest.fail("background descendant survived the worker-budget release")
+
+
+def _pid_gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat") as stream:
+            return stream.read().split(")")[-1].split()[0] == "Z"
+    except OSError:
+        return True
+
+
+def _stubborn_descendant_script(pid_file, ready_file):
+    child = (
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"open({str(ready_file)!r}, 'w').write('ok'); time.sleep(60)"
+    )
+    return (
+        "import subprocess, sys, time, os; "
+        f"p = subprocess.Popen([sys.executable, '-c', {child!r}]); "
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid)); "
+        f"[time.sleep(0.02) for _ in range(500) if not os.path.exists({str(ready_file)!r})]"
+    )
+
+
+def test_stubborn_descendant_is_dead_before_the_lock_is_handed_off(tmp_path):
+    """A SIGTERM-ignoring descendant is SIGKILLed and confirmed gone before release."""
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    pid_file, ready = tmp_path / "child.pid", tmp_path / "child.ready"
+    root = tmp_path / "locks"
+    env = {**os.environ, "AGENT_LOOP_INVOCATION_ID": "handoff"}
+    result = run_foreground_test(
+        [sys.executable, "-c", _stubborn_descendant_script(pid_file, ready)], cwd=tmp_path,
+        timeout_seconds=60, env=env, environment_is_complete=True, echo_output=False,
+        worker_budget=_enforced(), worker_lock_root=root,
+    )
+    assert result.returncode == 0 and ready.exists()
+    # The next command of the invocation can take the lock now, and the old
+    # worker is already gone at that moment: no overlap is possible.
+    handoff, _ = WorkerBudgetLock.acquire(invocation_id="handoff", cwd=tmp_path, root=root)
+    try:
+        assert handoff is not None
+        assert _pid_gone(int(pid_file.read_text()))
+    finally:
+        handoff.close()
+    assert "worker-budget-descendants-terminated" in result.worker_caveats
+    assert not any("still alive after SIGKILL" in notice for notice in result.worker_notices)
+
+
+def test_descendants_are_signalled_without_proc(tmp_path, monkeypatch):
+    """Hosts without an enumerable /proc still signal and confirm the group."""
+    from coding_review_agent_loop import runner as runner_module
+    from coding_review_agent_loop import test_workers
+
+    monkeypatch.setattr(test_workers, "process_group_members", lambda pgid: None)
+    pid_file, ready = tmp_path / "child.pid", tmp_path / "child.ready"
+    result = runner_module.run_foreground_test(
+        [sys.executable, "-c", _stubborn_descendant_script(pid_file, ready)], cwd=tmp_path,
+        timeout_seconds=60, env=dict(os.environ), environment_is_complete=True, echo_output=False,
+        worker_budget=_enforced(), worker_lock_root=tmp_path / "locks",
+    )
+    assert result.returncode == 0
+    assert result.descendants_terminated >= 1
+    child = int(pid_file.read_text())
+    # killpg(0) sees zombies, so allow the reaper a moment; the helper itself
+    # waited for the group to disappear before returning.
+    assert _pid_gone(child)
+
+
+def test_terminate_reports_unconfirmed_when_group_survives(monkeypatch):
+    from coding_review_agent_loop import test_workers
+
+    signals: list[int] = []
+    monkeypatch.setattr(test_workers, "process_group_alive", lambda pgid: True)
+    monkeypatch.setattr(test_workers, "process_group_members", lambda pgid: None)
+    monkeypatch.setattr(test_workers.os, "killpg", lambda pgid, sig: signals.append(sig))
+    outcome = test_workers.terminate_process_group_descendants(
+        12345, grace_seconds=0.05, kill_wait_seconds=0.05
+    )
+    assert signals == [test_workers.signal.SIGTERM, test_workers.signal.SIGKILL]
+    assert outcome.confirmed is False and outcome.count == 1
 
 
 def test_setsid_descendant_is_documented_exclusion_and_off_mode_terminates_nothing(tmp_path):
