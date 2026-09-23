@@ -363,6 +363,7 @@ from .repair import (
     require_recoverable_review_substance,
 )
 from .repair_preservation import (
+    recover_payload,
     require_recoverable_semantic_patch,
     validate_repair_preservation,
 )
@@ -2991,25 +2992,34 @@ def _semantic_patch_payload_rejection(
     *,
     text: str,
     normalized: str | None,
-    validate: Callable[[str], object],
+    payload_validator: Callable[[dict], object] | None,
 ) -> tuple[str, str] | None:
     """Return ``(candidate, diagnostic)`` when no envelope repair can succeed.
 
     Repair preservation pins a ``plan_revision_patch`` payload byte-for-byte,
-    so the defects repair may fix are exactly the envelope/footer ones.  A
-    rejection naming the payload itself -- on the raw text, or on the
-    envelope-normalized text once the envelope is fixed -- is unsatisfiable
-    by repair and must go to the bounded replan instead (#979).
+    so the defects repair may fix are exactly the envelope/footer ones.  The
+    recovered payload is therefore checked on its own, independent of which
+    error the full validator reported first: an envelope defect can mask a
+    payload defect that no repair could clear.  Any payload rejection -- a
+    strict patch-schema failure or a ledger/disposition check -- is
+    unsatisfiable by repair and goes to the bounded replan instead (#979).
+    A payload that cannot be recovered at all stays on the existing
+    semantic-patch integrity path.
     """
     if isinstance(exc, SemanticPatchPayloadRejection):
         return text, str(exc)
-    if normalized is None:
+    if payload_validator is None:
         return None
-    try:
-        validate(normalized)
-    except SemanticPatchPayloadRejection as normalized_exc:
-        return normalized, str(normalized_exc)
-    except AgentLoopError:
+    for candidate in (text, normalized):
+        if candidate is None:
+            continue
+        payload = recover_payload(candidate)
+        if not isinstance(payload, dict) or payload.get("kind") != "plan_revision_patch":
+            continue
+        try:
+            payload_validator(payload)
+        except AgentLoopError as payload_exc:
+            return candidate, str(payload_exc)
         return None
     return None
 
@@ -3073,6 +3083,7 @@ def _run_validated_agent(
     plan_validation_failure_handler: Callable[
         [DeterministicPlanValidationExhaustion, AgentInvocationError], None
     ] | None = None,
+    semantic_patch_payload_validator: Callable[[dict], object] | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -4005,7 +4016,10 @@ def _run_validated_agent(
                             )
                 payload_rejection = (
                     _semantic_patch_payload_rejection(
-                        exc, text=text, normalized=normalized, validate=validate
+                        exc,
+                        text=text,
+                        normalized=normalized,
+                        payload_validator=semantic_patch_payload_validator,
                     )
                     if (
                         repair_expected_kind == "plan_revision_patch"
@@ -5260,6 +5274,62 @@ def _validate_plan_revision_patch_response(
     parsed = validate_structured_plan_revision_patch(text)
     if parsed is None:
         raise AgentLoopError("Semantic plan revision did not use the required structured patch format.")
+    _check_plan_revision_patch_ledger(parsed, unresolved_items=unresolved_items)
+    requirements_context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+    )
+    validate_human_requirements_acknowledgement(
+        text,
+        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+        requires_direct_discussion_ack=requirements_context.requires_direct_discussion_ack,
+    )
+    _check_plan_revision_patch_human_requirement_dispositions(
+        parsed,
+        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+        inherited_human_requirement_dispositions=inherited_human_requirement_dispositions,
+    )
+    return parsed
+
+
+def _validate_plan_revision_patch_payload(
+    payload: dict,
+    *,
+    unresolved_items: Sequence[UnresolvedReviewItem] = (),
+    human_requirements=(),
+    inherited_human_requirement_dispositions: Sequence[object] | None = None,
+) -> object:
+    """Run every semantic-patch check that depends only on the JSON payload.
+
+    Repair preservation pins this payload exactly, so any failure here is
+    unsatisfiable by an envelope-only repair, whatever envelope error the full
+    validator happened to report first (#979).  Every failure is raised as a
+    ``SemanticPatchPayloadRejection``.
+    """
+    try:
+        parsed = parse_plan_revision_patch(payload)
+    except AgentLoopError as exc:
+        raise SemanticPatchPayloadRejection(str(exc)) from exc
+    _check_plan_revision_patch_ledger(parsed, unresolved_items=unresolved_items)
+    requirements_context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+    )
+    _check_plan_revision_patch_human_requirement_dispositions(
+        parsed,
+        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+        inherited_human_requirement_dispositions=inherited_human_requirement_dispositions,
+    )
+    return parsed
+
+
+def _check_plan_revision_patch_ledger(
+    parsed: PlanRevisionPatch,
+    *,
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> None:
     allowed_ids = {item.item_id for item in unresolved_items}
     unknown = {item.item_id for item in parsed.prior_plan_item_dispositions} - allowed_ids
     if unknown:
@@ -5273,16 +5343,14 @@ def _validate_plan_revision_patch_response(
                 "as prior carried items."
             ),
         )
-    requirements_context = render_coder_human_requirements_prompt_context(
-        human_requirements,
-        requirement_scope="planning requirements",
-        full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
-    )
-    validate_human_requirements_acknowledgement(
-        text,
-        surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
-        requires_direct_discussion_ack=requirements_context.requires_direct_discussion_ack,
-    )
+
+
+def _check_plan_revision_patch_human_requirement_dispositions(
+    parsed: PlanRevisionPatch,
+    *,
+    surfaced_requirement_ids: Sequence[str],
+    inherited_human_requirement_dispositions: Sequence[object] | None,
+) -> None:
     dispositions = _effective_plan_revision_patch_dispositions(
         parsed,
         inherited_human_requirement_dispositions,
@@ -5292,14 +5360,13 @@ def _validate_plan_revision_patch_response(
     try:
         validate_human_requirement_dispositions(
             dispositions,
-            surfaced_requirement_ids=requirements_context.surfaced_requirement_ids,
+            surfaced_requirement_ids=surfaced_requirement_ids,
             context="plan_revision_patch.human_requirement_dispositions",
         )
     except SemanticPatchPayloadRejection:
         raise
     except AgentLoopError as exc:
         raise SemanticPatchPayloadRejection(str(exc)) from exc
-    return parsed
 
 
 def _drop_repeated_carried_future_followups(
@@ -12157,6 +12224,19 @@ def _run_plan_first_loop(
                     same_status="same-plan",
                 ),
                 operation_description="plan revision",
+                semantic_patch_payload_validator=(
+                    (lambda payload, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_payload(
+                        payload,
+                        unresolved_items=items,
+                        human_requirements=human_requirements,
+                        inherited_human_requirement_dispositions=(
+                            semantic_base.plan.human_requirement_dispositions
+                            if semantic_base is not None else None
+                        ),
+                    ))
+                    if semantic_revision
+                    else None
+                ),
                 plan_validation_failure_handler=(
                     None if semantic_revision else lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
                         runner,

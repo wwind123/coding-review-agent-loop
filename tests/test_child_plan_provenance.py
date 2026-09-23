@@ -21,7 +21,7 @@ from coding_review_agent_loop.decomposition import (
     _decode_phase_implementation_handoff_metadata,
 )
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.github import IssueComment, IssueContext
+from coding_review_agent_loop.github import HumanReviewRequirement, IssueComment, IssueContext
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
 from coding_review_agent_loop.protocol import parse_risk_test_matrix
@@ -1908,6 +1908,21 @@ def _m979_patch_with_unknown_disposition(base_plan_text, *, summary):
     return json.dumps(patch) + PLAN_FOOTER
 
 
+def _m979_carried_item():
+    return orchestrator.UnresolvedReviewItem(
+        item_id="item-1", reviewer="OpenAI Codex", source_round=1,
+        text="Add coverage.", status="blocking", source_status="blocking",
+    )
+
+
+def _m979_patch_with(base_plan_text, *, operations=None, extra_operations=(), summary="Patch."):
+    patch = json.loads(_m976_patch(base_plan_text, summary=summary).split("\n<!--", 1)[0])
+    if operations is not None:
+        patch["operations"] = operations
+    patch["operations"].extend(extra_operations)
+    return json.dumps(patch) + PLAN_FOOTER
+
+
 def _m979_forbid_repair(*args, **kwargs):
     raise AssertionError("a semantic patch payload rejection must never reach the repair model")
 
@@ -2005,23 +2020,23 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     fresh = _m976_full_plan_state()
     good = _m976_patch(fresh, summary="Good.")
     unknown = _m979_patch_with_unknown_disposition(fresh, summary="Bad.")
+    carried = (_m979_carried_item(),)
 
     def validate(text):
         return orchestrator._validate_plan_revision_patch_response(
-            text,
-            unresolved_items=(
-                orchestrator.UnresolvedReviewItem(
-                    item_id="item-1", reviewer="OpenAI Codex", source_round=1,
-                    text="Add coverage.", status="blocking", source_status="blocking",
-                ),
-            ),
+            text, unresolved_items=carried
         )
 
     def classify(text, normalized=None):
         with pytest.raises(AgentLoopError) as error:
             validate(text)
         return orchestrator._semantic_patch_payload_rejection(
-            error.value, text=text, normalized=normalized, validate=validate
+            error.value,
+            text=text,
+            normalized=normalized,
+            payload_validator=lambda payload: orchestrator._validate_plan_revision_patch_payload(
+                payload, unresolved_items=carried
+            ),
         )
 
     # Payload-level: the unknown disposition sits inside the pinned payload.
@@ -2045,6 +2060,77 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     stripped = _m976_patch(fresh, summary="Bad.")
     with pytest.raises(AgentLoopError, match="must be preserved exactly"):
         validate_repair_preservation(unknown, stripped)
+    # A strict patch-schema failure is payload-level too, even though the
+    # full validator reports it as a plain parse error.
+    empty_operations = _m979_patch_with(fresh, operations=[])
+    candidate, diagnostic = classify(empty_operations)
+    assert candidate == empty_operations and "operations" in diagnostic
+    # ...and so is one hidden behind a missing footer.
+    candidate, diagnostic = classify(empty_operations.split("\n<!--", 1)[0])
+    assert "operations" in diagnostic
+
+
+def test_m979_envelope_error_does_not_mask_a_payload_disposition_defect():
+    """A missing acknowledgement must not send an invalid pinned disposition to repair."""
+    requirement = HumanReviewRequirement(
+        source_type="Issue body", author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Preserve backward compatibility.",
+    )
+    fresh = _m976_full_plan_state()
+    # No acknowledgement section (an envelope defect repair could add) and a
+    # disposition naming an unknown requirement (a pinned payload defect).
+    combined = _m979_patch_with(fresh, extra_operations=[{
+        "op": "replace", "field": "human_requirement_dispositions",
+        "value": [{
+            "requirement_id": "hr-" + "0" * 64, "disposition": "addressed",
+            "evidence": "Not a surfaced requirement.",
+        }],
+    }])
+    carried = (_m979_carried_item(),)
+    with pytest.raises(AgentLoopError) as error:
+        orchestrator._validate_plan_revision_patch_response(
+            combined, unresolved_items=carried, human_requirements=(requirement,),
+        )
+    assert not isinstance(error.value, orchestrator.SemanticPatchPayloadRejection)
+    rejection = orchestrator._semantic_patch_payload_rejection(
+        error.value,
+        text=combined,
+        normalized=None,
+        payload_validator=lambda payload: orchestrator._validate_plan_revision_patch_payload(
+            payload, unresolved_items=carried, human_requirements=(requirement,),
+        ),
+    )
+    assert rejection is not None
+    assert "human_requirement_dispositions" in rejection[1]
+
+
+def test_m979_strict_patch_schema_failure_is_replanned_without_repair(tmp_path, monkeypatch):
+    """#979 item: a parse-level payload error uses the bounded replan, not repair."""
+    monkeypatch.setattr(orchestrator, "_run_structured_repair", _m979_forbid_repair)
+    fresh = _m976_full_plan_state()
+    rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
+    corrected = _m976_patch(fresh, summary="Corrected revision.")
+    runner = _ChildPlanningRunner(
+        claude_outputs=[fresh, rejected, corrected],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    assert orchestrator.run_issue_loop(
+        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+    ) == 0
+    planner_prompts = _agent_prompts(runner, "claude")
+    assert len(planner_prompts) == 3
+    assert "Trusted orchestration correction record" in planner_prompts[2]
+    assert "operations" in planner_prompts[2].split("Trusted orchestration correction record", 1)[1]
+    assert "Corrected revision." in _published(runner)
+    assert runner.diagnostic_posts == []
 
 
 def test_m931_replan_exhaustion_persists_one_record_and_resume_feeds_the_next_turn(
