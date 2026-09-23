@@ -6522,7 +6522,7 @@ def test_issue_loop_rejects_outside_workdir_tests_before_posting_pr_comment(tmp_
     runner = FakeRunner(
         codex_outputs=[
             "Fixed issue.\n"
-            "Tests: cd ~/llm-dialectic && python -m pytest\n"
+            "Tests: python -m pytest https://live.example\n"
             "<!-- AGENT_PR: 77 -->\n"
             "<!-- AGENT_STATE: blocking -->\n"
             "-- OpenAI Codex",
@@ -6533,7 +6533,7 @@ def test_issue_loop_rejects_outside_workdir_tests_before_posting_pr_comment(tmp_
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
 
-    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+    with pytest.raises(AgentLoopError, match="live remote target"):
         run_issue_loop(runner, issue_number=56, config=config)
 
     assert runner.comments == []
@@ -6543,7 +6543,7 @@ def test_issue_loop_outside_workdir_after_reported_pr_mentions_confirmed_resume(
     runner = FakeRunner(
         codex_outputs=[
             "Fixed issue.\n"
-            "Tests: cd /outside && python -m pytest\n"
+            "Tests: python -m pytest https://live.example\n"
             "<!-- AGENT_PR: 77 -->\n"
             "<!-- AGENT_STATE: blocking -->\n"
             "-- OpenAI Codex",
@@ -6558,7 +6558,7 @@ def test_issue_loop_outside_workdir_after_reported_pr_mentions_confirmed_resume(
         run_issue_loop(runner, issue_number=56, config=config)
 
     message = str(exc_info.value)
-    assert "outside the assigned checkout" in message
+    assert "live remote target" in message
     assert "PR #77 was confirmed open" in message
     assert "handoff/reviewer comments were not posted" in message
     assert "agent-loop pr 77" in message
@@ -6949,7 +6949,7 @@ def test_managed_issue_resume_reviews_same_head_after_post_pr_report_rejection(
     runner = _IssueRecoveryWorkflowRunner(
         labeled=True,
         codex_outputs=[
-            "Fixed issue.\nTests: cd /outside && python -m pytest\n"
+            "Fixed issue.\nTests: python -m pytest https://live.example\n"
             "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n"
             "-- OpenAI Codex"
         ],
@@ -7010,7 +7010,7 @@ def test_invalid_post_pr_report_then_issue_resume_runs_real_activation_without_r
     runner = _IssueRecoveryWorkflowRunner(
         labeled=True,
         codex_outputs=[
-            "Fixed issue.\nTests: cd /outside && python -m pytest\n"
+            "Fixed issue.\nTests: python -m pytest https://live.example\n"
             "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n"
             "-- OpenAI Codex"
         ],
@@ -7509,6 +7509,73 @@ def test_issue_loop_accepts_absolute_interpreter_test_command_through_response_p
 
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
     assert len(runner.comments) >= 1
+
+def test_issue_loop_records_out_of_checkout_baseline_as_context(tmp_path):
+    """Issue #991: an honestly reported clean-base baseline must not reject the hand-off."""
+    baseline = (
+        "PYTHONPATH=/tmp/scratch-main-1176 timeout 900 /usr/bin/python3 -m pytest "
+        "/tmp/scratch-main-1176/tests/ -q"
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_issue_implementation(
+                pr_number=77,
+                tests_run=["python3 -m pytest tests/test_api.py -q", baseline],
+                reviewer="OpenAI Codex",
+            )
+        ],
+        claude_outputs=[
+            "Looks good.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude",
+        ],
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    # The same baseline also ran (and failed) through the managed broker.
+    from coding_review_agent_loop.local_test_evidence import LocalTestObservation
+
+    runner._local_test_observations.append(LocalTestObservation(
+        command=("python3", "-m", "pytest", "/tmp/scratch-main-1176/tests/", "-q"),
+        outcome="failed",
+        provenance="parent-observed",
+        receipt_id="baseline-broker-failure",
+        turn_id="turn-baseline",
+        timestamp="2026-09-23T10:00:00+00:00",
+        cwd=str(tmp_path),
+    ))
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    handoff = next(
+        comment for comment in runner.comments if comment.startswith("## Issue implementation")
+    )
+    tests_section, _, context_section = handoff.partition(
+        "### Out-of-checkout context runs (not evidence)"
+    )
+    assert "python3 -m pytest tests/test_api.py -q" in tests_section
+    assert "/tmp/scratch-main-1176" not in tests_section
+    assert f"- {baseline}" in context_section
+    baseline_line = next(
+        line for line in handoff.splitlines() if "baseline-broker-failure" in line
+    )
+    assert "out-of-checkout context (not evidence) `failed`" in baseline_line
+    assert "authoritative" not in baseline_line
+
+
+def test_degrade_out_of_checkout_tests_keeps_baseline_out_of_evidence(tmp_path):
+    """Issue #991: the baseline never reaches the tests_run evidence source."""
+    baseline = "cd /tmp/scratch-main && python3 -m pytest tests/ -q"
+    parsed = validate_structured_issue_implementation(
+        structured_issue_implementation(
+            tests_run=["python3 -m pytest tests/test_api.py -q", baseline]
+        )
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    degraded = orchestrator_module._degrade_out_of_checkout_tests(parsed, config=config)
+
+    assert degraded.tests_run == ("python3 -m pytest tests/test_api.py -q",)
+    assert degraded.out_of_checkout_tests_run == (baseline,)
+    assert orchestrator_module._degrade_out_of_checkout_tests(degraded, config=config) is degraded
+
 
 def test_issue_loop_live_target_after_reported_pr_mentions_confirmed_resume(tmp_path):
     # Same post-PR guidance wrapper as the outside-workdir case above, but

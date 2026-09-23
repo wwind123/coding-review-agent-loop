@@ -2920,3 +2920,30 @@ def test_959_issue_implementation_renders_full_collapsed_rows():
     assert "<summary>Full matrix evidence (2 rows)</summary>" in rendered
     assert "**row-0**" in rendered and "**row-1**" in rendered
     assert "unchanged since round" not in rendered
+
+
+def test_out_of_checkout_broker_failure_renders_as_context_not_authoritative():
+    """Issue #991: a failed outside baseline is labeled context in the public comment."""
+    from coding_review_agent_loop.local_test_evidence import (
+        OUT_OF_CHECKOUT_CONTEXT_CAVEAT,
+        bounded_evidence_for_round,
+    )
+
+    parsed = validate_structured_coder_followup(structured_coder_followup())
+    evidence = bounded_evidence_for_round({
+        "observations": [
+            {"command": ["python", "-m", "pytest", "/tmp/scratch-main/tests/", "-q"], "outcome": "failed", "provenance": "parent-observed", "receipt_id": "baseline", "turn_id": "current-turn", "environment": "unknown", "caveats": [OUT_OF_CHECKOUT_CONTEXT_CAVEAT]},
+            {"command": ["python", "-m", "pytest", "tests/test_runner.py", "-q"], "outcome": "failed", "provenance": "parent-observed", "receipt_id": "real", "turn_id": "current-turn", "environment": "unknown"},
+        ]
+    })
+
+    rendered = _render_public_coder_followup_comment(
+        parsed, agent="Claude", prior_items=(), local_test_evidence=evidence,
+        current_test_turn_id="current-turn",
+    )
+
+    baseline_line = next(line for line in rendered.splitlines() if "`baseline`" in line)
+    real_line = next(line for line in rendered.splitlines() if "`real`" in line)
+    assert "out-of-checkout context (not evidence) `failed`" in baseline_line
+    assert "authoritative" not in baseline_line
+    assert "uncited authoritative `failed`" in real_line

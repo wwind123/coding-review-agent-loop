@@ -85,11 +85,12 @@ def _derived_observation(
     receipt_id: str,
     outcome: str = "passed",
     turn_id: str = "turn-current",
+    command: tuple[str, ...] = ("python3", "-m", "pytest", "tests/test_protocol.py", "-q"),
 ) -> SimpleNamespace:
     return SimpleNamespace(
         execution_ref=execution_ref,
         receipt_id=receipt_id,
-        command=("python3", "-m", "pytest", "tests/test_protocol.py", "-q"),
+        command=command,
         normalized_command="python3 -m pytest tests/test_protocol.py -q",
         outcome=outcome,
         provenance="parent-observed",
@@ -405,6 +406,177 @@ def test_orchestrator_derivation_ignores_prior_turn_failure(monkeypatch, tmp_pat
     assert not any(
         diagnostic.code == "unsuperseded-journal-failure"
         for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.parametrize("outside_first", [True, False])
+def test_orchestrator_derivation_excludes_out_of_checkout_broker_runs(
+    monkeypatch, tmp_path, outside_first
+) -> None:
+    """Issue #991: a passing broker run of an outside test path is never evidence."""
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    plan_context = make_approved_plan_context(
+        None,
+        expected_hash="a" * 16,
+        expected_subject="b" * 64,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    baseline = _derived_observation(
+        execution_ref="current-turn:observation-1",
+        receipt_id="receipt-baseline",
+        command=("python3", "-m", "pytest", "/tmp/scratch-main-991/tests/", "-q"),
+    )
+    failing_baseline = _derived_observation(
+        execution_ref="current-turn:observation-2",
+        receipt_id="receipt-baseline-failure",
+        outcome="failed",
+        command=("python3", "-m", "pytest", "/tmp/scratch-main-991/tests/", "-q"),
+    )
+    in_checkout = _derived_observation(
+        execution_ref="current-turn:observation-3",
+        receipt_id="receipt-in-checkout",
+    )
+    parsed = validate_structured_coder_followup(structured_coder_followup())
+    parsed = dataclasses.replace(parsed, risk_test_matrix_claims=SemanticRiskCoverageClaims((
+        SemanticRiskCoverageClaim(
+            row_id="row-ordinary",
+            execution_refs=(
+                "current-turn:observation-1" if outside_first else "current-turn:observation-3",
+            ),
+            test_identifiers=("test_ordinary",),
+            test_locations=("tests/test_risk_test_matrix.py::test_ordinary",),
+            workflow_path_claim="The current coder turn ran the workflow.",
+            outcome_assertions=("The selected test passed.",),
+            forbidden_effect_assertions=("No stale head was merged.",),
+        ),
+    )))
+    monkeypatch.setattr(
+        orchestrator_module,
+        "stable_tracked_tree_snapshot",
+        lambda _cwd: SimpleNamespace(
+            head="head-current", tracked_digest="tree-current", complete=True,
+            stable=True, status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "reconcile_test_observations",
+        lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
+    )
+    catalog = (baseline, failing_baseline, in_checkout)
+    runner = SimpleNamespace(local_test_observations=lambda: catalog)
+
+    derived, result = orchestrator_module._derive_authenticated_risk_evidence_for_coder(
+        parsed,
+        approved_plan_context=plan_context,
+        runner=runner,
+        assigned_workdir=tmp_path,
+        head_sha="head-current",
+        invocation_id="turn-current",
+        _closed_execution_catalog=catalog,
+    )
+
+    assert result is not None
+    row = derived.risk_test_matrix_evidence.rows[0]
+    if outside_first:
+        assert row.status != "verified"
+        assert not any(
+            "receipt-baseline" in str(citation) for citation in row.evidence_citations
+        )
+    else:
+        # The failing outside baseline is context, so it neither blocks the
+        # in-checkout run nor surfaces as an unsuperseded journal failure.
+        assert row.status == "verified"
+        assert not any(
+            diagnostic.code == "unsuperseded-journal-failure"
+            for diagnostic in result.diagnostics
+        )
+
+
+@pytest.mark.parametrize("failure_command", [
+    ("pytest", "tests/", "https://live.example"),
+    ("python3", "-m", "pytest", "tests/test_protocol.py", "/tmp/scratch-main-991/tests/"),
+    ("python3", "-m", "pytest", "tests", "/tmp/scratch-main-991/tests"),
+    ("pytest", "--rootdir=/tmp/scratch-main-991", "tests/test_protocol.py"),
+    ("python3", "-m", "pytest", "-q", "--junit-xml", "/tmp/scratch-main-991/r.xml"),
+])
+def test_orchestrator_derivation_keeps_unvalidatable_failures_in_journal(
+    monkeypatch, tmp_path, failure_command
+) -> None:
+    """Issue #991: only pure out-of-checkout runs leave the failure journal.
+
+    Unvalidatable runs and mixed runs that also name in-checkout tests keep
+    degrading rows, though neither is ever a selectable execution ref.
+    """
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    plan_context = make_approved_plan_context(
+        None,
+        expected_hash="a" * 16,
+        expected_subject="b" * 64,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    unvalidatable_failure = _derived_observation(
+        execution_ref="current-turn:observation-1",
+        receipt_id="receipt-url-failure",
+        outcome="failed",
+        command=failure_command,
+    )
+    in_checkout_pass = _derived_observation(
+        execution_ref="current-turn:observation-2",
+        receipt_id="receipt-in-checkout",
+    )
+    parsed = validate_structured_coder_followup(structured_coder_followup())
+    parsed = dataclasses.replace(parsed, risk_test_matrix_claims=SemanticRiskCoverageClaims((
+        SemanticRiskCoverageClaim(
+            row_id="row-ordinary",
+            execution_refs=("current-turn:observation-2",),
+            test_identifiers=("test_ordinary",),
+            test_locations=("tests/test_risk_test_matrix.py::test_ordinary",),
+            workflow_path_claim="The current coder turn ran the workflow.",
+            outcome_assertions=("The selected test passed.",),
+            forbidden_effect_assertions=("No stale head was merged.",),
+        ),
+    )))
+    monkeypatch.setattr(
+        orchestrator_module,
+        "stable_tracked_tree_snapshot",
+        lambda _cwd: SimpleNamespace(
+            head="head-current", tracked_digest="tree-current", complete=True,
+            stable=True, status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "reconcile_test_observations",
+        lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
+    )
+    catalog = (unvalidatable_failure, in_checkout_pass)
+    runner = SimpleNamespace(local_test_observations=lambda: catalog)
+
+    derived, result = orchestrator_module._derive_authenticated_risk_evidence_for_coder(
+        parsed,
+        approved_plan_context=plan_context,
+        runner=runner,
+        assigned_workdir=tmp_path,
+        head_sha="head-current",
+        invocation_id="turn-current",
+        _closed_execution_catalog=catalog,
+    )
+
+    assert result is not None
+    assert derived.risk_test_matrix_evidence.rows[0].status == "incomplete"
+    assert any(
+        diagnostic.code == "unsuperseded-journal-failure" for diagnostic in result.diagnostics
     )
 
 

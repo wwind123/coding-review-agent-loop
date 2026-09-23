@@ -1461,3 +1461,185 @@ def test_broker_clamps_forged_client_request_and_records_report_cohort(tmp_path)
     (observation,) = runner.local_test_observations()
     assert observation.command[-1] == "test_cases.py"
     assert any("worker budget" in caveat for caveat in observation.caveats)
+
+
+def _outside_baseline(*, outcome: str, receipt_id: str, registry, timestamp: str):
+    from dataclasses import replace as _replace
+
+    row = _observation(
+        outcome=outcome, timestamp=timestamp, receipt_id=receipt_id, registry=registry
+    )
+    return _replace(
+        row, command=(sys.executable, "-m", "pytest", "/tmp/scratch-main-991/tests/", "-q")
+    )
+
+
+def test_runner_labels_out_of_checkout_broker_failure_as_context(tmp_path):
+    """Issue #991: a failed outside baseline is not an authoritative failure."""
+    from coding_review_agent_loop.local_test_evidence import OUT_OF_CHECKOUT_CONTEXT_CAVEAT
+    from coding_review_agent_loop.runner import Runner
+
+    registry = EnvironmentIdentityRegistry()
+    baseline = _outside_baseline(
+        outcome="failed", receipt_id="baseline-failure", registry=registry,
+        timestamp="2026-09-23T10:00:00+00:00",
+    )
+    in_checkout = _observation(
+        outcome="failed", timestamp="2026-09-23T10:01:00+00:00",
+        receipt_id="real-failure", registry=registry,
+    )
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.extend([baseline, in_checkout])
+
+    rendered = runner.render_local_test_evidence(cwd=tmp_path)
+    decoded = decode_bounded_evidence(rendered)
+
+    assert decoded is not None
+    assert decoded.authoritative_failures == ("real-failure",)
+    by_receipt = {row.receipt_id: row for row in decoded.observations}
+    assert by_receipt["baseline-failure"].is_out_of_checkout_context
+    assert by_receipt["baseline-failure"].caveats[0] == OUT_OF_CHECKOUT_CONTEXT_CAVEAT
+    assert not by_receipt["real-failure"].is_out_of_checkout_context
+
+    # The persisted label survives a later round without raw argv.
+    carried = decode_bounded_evidence(
+        Runner().render_local_test_evidence(cwd=tmp_path, prior_local_test_evidence=rendered)
+    )
+    assert carried is not None
+    assert carried.authoritative_failures == ("real-failure",)
+
+
+def test_out_of_checkout_pass_cannot_supersede_in_checkout_failure(tmp_path):
+    from coding_review_agent_loop.local_test_evidence import mark_out_of_checkout_context
+
+    registry = EnvironmentIdentityRegistry()
+    failure = _observation(
+        outcome="failed", timestamp="2026-09-23T10:00:00+00:00",
+        receipt_id="real-failure", registry=registry,
+    )
+    outside_pass = _outside_baseline(
+        outcome="passed", receipt_id="baseline-pass", registry=registry,
+        timestamp="2026-09-23T10:01:00+00:00",
+    )
+    rows = mark_out_of_checkout_context([failure, outside_pass], assigned_workdir=tmp_path)
+
+    evidence = reconcile_test_observations(rows, registry=registry)
+
+    assert evidence.authoritative_failures == ("real-failure",)
+    assert evidence.observations[0].superseded_by is None
+
+
+def test_unvalidatable_failure_is_not_relabeled_as_context(tmp_path):
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.local_test_evidence import mark_out_of_checkout_context
+
+    registry = EnvironmentIdentityRegistry()
+    row = _replace(
+        _observation(
+            outcome="failed", timestamp="2026-09-23T10:00:00+00:00",
+            receipt_id="url-failure", registry=registry,
+        ),
+        command=("pytest", "tests/", "https://live.example"),
+    )
+
+    (marked,) = mark_out_of_checkout_context([row], assigned_workdir=tmp_path)
+
+    assert not marked.is_out_of_checkout_context
+
+
+def test_bounded_journal_keeps_in_checkout_failure_over_context_rows():
+    """Issue #991: context rows yield to a real failure under the count cap."""
+    from coding_review_agent_loop.local_test_evidence import (
+        MAX_ROUND_OBSERVATIONS,
+        OUT_OF_CHECKOUT_CONTEXT_CAVEAT,
+    )
+
+    rows = [{
+        "command": ["python", "-m", "pytest", "tests/test_runner.py", "-q"],
+        "outcome": "failed", "provenance": "parent-observed", "receipt_id": "real-failure",
+        "turn_id": "turn", "timestamp": "2026-09-23T10:00:00+00:00", "environment": "unknown",
+    }]
+    rows.extend({
+        "command": ["python", "-m", "pytest", f"/tmp/scratch-main/tests/test_{index}.py"],
+        "outcome": "failed", "provenance": "parent-observed", "receipt_id": f"baseline-{index}",
+        "turn_id": "turn", "timestamp": f"2026-09-23T11:{index:02d}:00+00:00",
+        "environment": "unknown", "caveats": [OUT_OF_CHECKOUT_CONTEXT_CAVEAT],
+    } for index in range(MAX_ROUND_OBSERVATIONS))
+
+    decoded = decode_bounded_evidence(bounded_evidence_for_round({
+        "observations": rows, "authoritative_failures": ["real-failure"],
+    }))
+
+    assert decoded is not None
+    receipts = [row.receipt_id for row in decoded.observations]
+    assert "real-failure" in receipts
+    assert len(receipts) <= MAX_ROUND_OBSERVATIONS
+    assert decoded.capture_incomplete
+
+
+def test_mixed_operand_broker_failure_stays_authoritative(tmp_path):
+    """Issue #991: a run naming in-checkout tests is not relabeled as context."""
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.runner import Runner
+
+    registry = EnvironmentIdentityRegistry()
+    mixed = _replace(
+        _observation(
+            outcome="failed", timestamp="2026-09-23T10:00:00+00:00",
+            receipt_id="mixed-failure", registry=registry,
+        ),
+        command=(
+            sys.executable, "-m", "pytest", "tests/test_foo.py",
+            "/tmp/scratch-main-991/tests/test_foo.py",
+        ),
+    )
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.append(mixed)
+
+    decoded = decode_bounded_evidence(runner.render_local_test_evidence(cwd=tmp_path))
+
+    assert decoded is not None
+    assert decoded.authoritative_failures == ("mixed-failure",)
+    assert not decoded.observations[0].is_out_of_checkout_context
+
+
+@pytest.mark.parametrize("command", [
+    ("pytest", "--rootdir=/tmp/scratch-main-991", "tests/test_foo.py"),
+    ("python3", "-m", "pytest", "tests", "/tmp/scratch-main-991/tests"),
+    ("python3", "-m", "pytest", "-q", "--junit-xml", "/tmp/scratch-main-991/r.xml"),
+])
+def test_in_checkout_broker_failure_with_outside_path_stays_authoritative(tmp_path, command):
+    """Issue #991: only positive evidence of an outside-only run makes context.
+
+    Covers the journal and the public receipt label.
+    """
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+    from coding_review_agent_loop.runner import Runner
+
+    registry = EnvironmentIdentityRegistry()
+    failing = _replace(
+        _observation(
+            outcome="failed", timestamp="2026-09-23T10:00:00+00:00",
+            receipt_id="in-checkout-failure", registry=registry,
+        ),
+        command=command,
+    )
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.append(failing)
+
+    rendered = runner.render_local_test_evidence(cwd=tmp_path)
+    decoded = decode_bounded_evidence(rendered)
+
+    assert decoded is not None
+    assert decoded.authoritative_failures == ("in-checkout-failure",)
+    assert not decoded.observations[0].is_out_of_checkout_context
+    public = _render_test_observation_citations((), local_test_evidence=rendered)
+    assert "uncited authoritative `failed`" in public
+    assert "out-of-checkout context" not in public

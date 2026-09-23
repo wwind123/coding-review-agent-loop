@@ -529,3 +529,25 @@ def test_initial_implementation_summary_and_test_caveats_are_preserved():
     assert "Initial implementation, not a follow-up." in context
     assert "pytest -q (subset only)" in context
     assert "addressed_item_notes" not in context
+
+
+@pytest.mark.parametrize("kind", ["followup", "implementation"])
+def test_coder_context_keeps_out_of_checkout_baseline_as_non_evidence(tmp_path, kind):
+    """Issue #991: the reviewer handoff reapplies the public classification."""
+    baseline = "cd /tmp/scratch-main-991 && python3 -m pytest tests/ -q"
+    tests_run = ["python3 -m pytest tests/test_api.py -q", baseline]
+    if kind == "followup":
+        output = structured_coder_followup(tests_run=tests_run)
+    else:
+        output = structured_issue_implementation(tests_run=tests_run)
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123"
+    )
+
+    context = _coder_followup_review_context(
+        output, metadata, head_sha="abc123", assigned_workdir=tmp_path
+    )
+
+    payload = json.loads(context[context.index("{"):])
+    assert payload["tests_run"] == ["python3 -m pytest tests/test_api.py -q"]
+    assert payload["out_of_checkout_context_runs_not_evidence"] == [baseline]

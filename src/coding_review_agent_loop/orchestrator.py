@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 from .agents.base import AgentName, AgentResult
 from .agents.antigravity import AntigravityAttemptState
@@ -416,7 +416,9 @@ from .workdir_guard import (
     validate_assigned_head_advanced,
     validate_checkout_inspected_evidence,
     validate_response_tests_within_workdir,
-    validate_test_commands_within_workdir,
+    command_is_admissible_evidence,
+    command_targets_outside_workdir,
+    partition_reported_tests_by_workdir,
     validate_test_observation_citations_within_workdir,
 )
 from .checks import (
@@ -4569,6 +4571,48 @@ def _current_test_turn_observations(runner: Runner) -> tuple[object, ...]:
     )
 
 
+def _admissible_evidence_observations(
+    observations: Sequence[object],
+    *,
+    assigned_workdir: Path,
+    selectable: bool = True,
+) -> tuple[object, ...]:
+    """Drop broker runs that targeted paths outside the assigned checkout.
+
+    The broker confines ``cwd`` but not test operands, so a run of a clean
+    base-branch baseline can carry a valid selector. It stays visible as
+    context, but can never back a risk-matrix citation (#991).
+
+    ``selectable=True`` filters the execution catalog: anything the guard
+    cannot prove in-checkout is dropped.  ``selectable=False`` filters the
+    failure journal: only runs proven to target another location are dropped,
+    so an unvalidatable failure still degrades the rows it would affect.
+    """
+
+    def keep(command: str | tuple[str, ...]) -> bool:
+        if selectable:
+            return command_is_admissible_evidence(command, assigned_workdir=assigned_workdir)
+        return not command_targets_outside_workdir(command, assigned_workdir=assigned_workdir)
+
+    def argv(observation: object) -> object:
+        if isinstance(observation, Mapping):
+            return observation.get("argv", observation.get("command", ()))
+        return getattr(observation, "command", ())
+
+    kept: list[object] = []
+    for observation in observations:
+        command = argv(observation)
+        if isinstance(command, str):
+            admissible = keep(command)
+        elif isinstance(command, Sequence):
+            admissible = keep(tuple(str(item) for item in command))
+        else:
+            admissible = not selectable
+        if admissible:
+            kept.append(observation)
+    return tuple(kept)
+
+
 def _safe_execution_handle_catalog(observations: Sequence[object]) -> tuple[dict[str, object], ...]:
     """Project correction context without exposing receipt authority."""
     catalog: list[dict[str, object]] = []
@@ -4706,6 +4750,12 @@ def _derive_authenticated_risk_evidence_for_coder(
                 else getattr(observation, "turn_id", None)
             ) == bound_invocation_id
         )
+    )
+    closed_catalog = _admissible_evidence_observations(
+        closed_catalog, assigned_workdir=assigned_workdir
+    )
+    journal_observations = _admissible_evidence_observations(
+        journal_observations, assigned_workdir=assigned_workdir, selectable=False
     )
     try:
         snapshot = stable_tracked_tree_snapshot(assigned_workdir)
@@ -7827,24 +7877,55 @@ def _validate_response_tests_with_post_pr_context(
     )
 
 
+_StructuredTestReport = TypeVar(
+    "_StructuredTestReport", StructuredIssueImplementation, StructuredCoderFollowup
+)
+
+
+def _degrade_out_of_checkout_tests(
+    parsed: _StructuredTestReport, *, config: AgentLoopConfig
+) -> _StructuredTestReport:
+    """Move reported out-of-checkout runs to non-evidence context (#991).
+
+    A baseline run on a clean base-branch copy is honest context, not a reason
+    to reject the whole hand-off. It is removed from ``tests_run`` so it never
+    becomes a self-reported evidence row, and rendered separately. Live remote
+    targets and other unvalidatable reports still raise.
+    """
+    partition = partition_reported_tests_by_workdir(
+        parsed.tests_run, assigned_workdir=active_workdir(config)
+    )
+    if not partition.out_of_checkout:
+        return parsed
+    log(
+        config,
+        f"Recorded {len(partition.out_of_checkout)} reported test run(s) outside the "
+        "assigned checkout as non-evidence context",
+    )
+    return dataclasses_replace(
+        parsed,
+        tests_run=partition.in_checkout,
+        out_of_checkout_tests_run=partition.out_of_checkout,
+    )
+
+
 def _validate_structured_response_tests_with_post_pr_context(
-    tests_run: Sequence[str] | None,
+    parsed: _StructuredTestReport,
     *,
     runner: Runner,
     config: AgentLoopConfig,
     pr_number: int,
-) -> None:
+) -> _StructuredTestReport:
     """Validate structured test commands with the same confirmed-PR diagnostic."""
+    result: list[_StructuredTestReport] = []
     _validate_tests_with_post_pr_context(
-        lambda: validate_test_commands_within_workdir(
-            tests_run,
-            assigned_workdir=active_workdir(config),
-        ),
+        lambda: result.append(_degrade_out_of_checkout_tests(parsed, config=config)),
         runner=runner,
         config=config,
         pr_number=pr_number,
         report_description="structured test report",
     )
+    return result[0]
 
 
 def _validate_structured_response_observations_with_post_pr_context(
@@ -8364,9 +8445,10 @@ def _implement_approved_issue(
     coder_output = coder_response.text
     implementation_result = coder_response.marker_value
     if isinstance(implementation_result, _TerminalIssueImplementationConflict):
-        validate_test_commands_within_workdir(
-            implementation_result.parsed.tests_run,
-            assigned_workdir=active_workdir(implementation_config),
+        implementation_result = _TerminalIssueImplementationConflict(
+            _degrade_out_of_checkout_tests(
+                implementation_result.parsed, config=implementation_config
+            )
         )
         _post_structured_issue_implementation_terminal_comment(
             runner,
@@ -8381,9 +8463,8 @@ def _implement_approved_issue(
         )
     if isinstance(implementation_result, StructuredIssueImplementation):
         if implementation_result.pr_number is None:
-            validate_test_commands_within_workdir(
-                implementation_result.tests_run,
-                assigned_workdir=active_workdir(implementation_config),
+            implementation_result = _degrade_out_of_checkout_tests(
+                implementation_result, config=implementation_config
             )
             _post_structured_issue_implementation_terminal_comment(
                 runner,
@@ -8448,8 +8529,8 @@ def _implement_approved_issue(
             surface=f"pull-request #{pr_number} body",
         )
     if isinstance(implementation_result, StructuredIssueImplementation):
-        _validate_structured_response_tests_with_post_pr_context(
-            implementation_result.tests_run,
+        implementation_result = _validate_structured_response_tests_with_post_pr_context(
+            implementation_result,
             runner=runner,
             config=implementation_config,
             pr_number=pr_number,
@@ -13551,9 +13632,8 @@ def run_issue_loop(
         coder_session_id = coder_response.session_id
         implementation_result = coder_response.marker_value
         if isinstance(implementation_result, _TerminalIssueImplementationConflict):
-            validate_test_commands_within_workdir(
-                implementation_result.parsed.tests_run,
-                assigned_workdir=active_workdir(config),
+            implementation_result = _TerminalIssueImplementationConflict(
+                _degrade_out_of_checkout_tests(implementation_result.parsed, config=config)
             )
             validate_test_observation_citations_within_workdir(
                 implementation_result.parsed.test_observations,
@@ -13572,9 +13652,8 @@ def run_issue_loop(
             )
         if isinstance(implementation_result, StructuredIssueImplementation):
             if implementation_result.pr_number is None:
-                validate_test_commands_within_workdir(
-                    implementation_result.tests_run,
-                    assigned_workdir=active_workdir(config),
+                implementation_result = _degrade_out_of_checkout_tests(
+                    implementation_result, config=config
                 )
                 validate_test_observation_citations_within_workdir(
                     implementation_result.test_observations,
@@ -13642,8 +13721,8 @@ def run_issue_loop(
                 surface=f"pull-request #{pr_number} body",
             )
         if isinstance(implementation_result, StructuredIssueImplementation):
-            _validate_structured_response_tests_with_post_pr_context(
-                implementation_result.tests_run,
+            implementation_result = _validate_structured_response_tests_with_post_pr_context(
+                implementation_result,
                 runner=runner,
                 config=config,
                 pr_number=pr_number,
@@ -13971,6 +14050,7 @@ def _coder_followup_review_context(
     metadata: PostedRoundMetadata | None,
     *,
     head_sha: str | None,
+    assigned_workdir: Path | None = None,
 ) -> str:
     if not text or metadata is None:
         return ""
@@ -13981,6 +14061,19 @@ def _coder_followup_review_context(
         )
     summary = _extract_structured_coder_summary(text)
     tests = _extract_structured_coder_tests_run(text)
+    out_of_checkout_tests: tuple[str, ...] = ()
+    if tests and assigned_workdir is not None:
+        # The persisted response keeps the coder's raw list; reapply the same
+        # classification the public comment used so the reviewer never sees
+        # an out-of-checkout baseline as an ordinary test run (#991).
+        try:
+            partition = partition_reported_tests_by_workdir(
+                tests, assigned_workdir=assigned_workdir
+            )
+        except AgentLoopError:
+            tests, out_of_checkout_tests = (), tuple(tests)
+        else:
+            tests, out_of_checkout_tests = partition.in_checkout, partition.out_of_checkout
     try:
         parsed = parse_historical_structured_coder_followup(text)
     except AgentLoopError:
@@ -13990,6 +14083,8 @@ def _coder_followup_review_context(
         "tests_run": tests,
         "local_test_evidence": metadata.local_test_evidence,
     }
+    if out_of_checkout_tests:
+        payload["out_of_checkout_context_runs_not_evidence"] = out_of_checkout_tests
     # Reviewers receive the orchestrator-derived authority carried by the
     # same round metadata as the public comment. Do not reconstruct it from
     # the coder's fresh response or from the cumulative local journal.
@@ -18315,7 +18410,10 @@ def run_pr_loop(
                 and not round_ledger_incomplete
             )
             coder_followup_context = _coder_followup_review_context(
-                latest_coder_output, latest_coder_metadata, head_sha=pr_metadata.head_sha,
+                latest_coder_output,
+                latest_coder_metadata,
+                head_sha=pr_metadata.head_sha,
+                assigned_workdir=active_workdir(config),
             )
             # Persist the same digest identities surfaced in reviewer prompts.
             # An edited signed comment must not inherit the old approval.
@@ -21731,9 +21829,11 @@ def run_pr_loop(
             public_comment = coder_output
             raw_structured_coder_response: str | None = None
             if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                validate_test_commands_within_workdir(
-                    coder_response.marker_value.tests_run,
-                    assigned_workdir=active_workdir(config),
+                coder_response = dataclasses_replace(
+                    coder_response,
+                    marker_value=_degrade_out_of_checkout_tests(
+                        coder_response.marker_value, config=config
+                    ),
                 )
                 validate_test_observation_citations_within_workdir(
                     coder_response.marker_value.test_observations,

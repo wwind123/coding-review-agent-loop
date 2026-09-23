@@ -9757,7 +9757,12 @@ def test_pr_loop_posts_followup_with_env_prefixed_managed_tests(tmp_path):
     )
 
 
-def test_pr_loop_rejects_structured_followup_outside_workdir_tests_before_posting(tmp_path):
+def test_pr_loop_records_structured_followup_out_of_checkout_tests_as_context(tmp_path):
+    """Issue #991: a clean-base baseline is context, not a rejected hand-off."""
+    baseline = (
+        "PYTHONPATH=/tmp/scratch-main /usr/bin/python3 -m pytest "
+        "/tmp/scratch-main/tests/ -q"
+    )
     runner = FakeRunner(
         claude_outputs=[
             structured_pr_review(
@@ -9766,25 +9771,49 @@ def test_pr_loop_rejects_structured_followup_outside_workdir_tests_before_postin
                 blocking_items=["Add a regression test."],
                 reviewer="Anthropic Claude",
             ),
-            "Looks good.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude",
+            structured_pr_review(
+                state="approved",
+                summary="The regression test resolves the finding.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                reviewer="Anthropic Claude",
+            ),
         ],
         codex_outputs=[
             structured_coder_followup(
                 summary="Added the test.",
                 addressed_items=["item-1"],
-                tests_run=["cd ~/llm-dialectic && python -m pytest"],
+                tests_run=["python -m pytest tests/test_foo.py -q", baseline],
                 reviewer="OpenAI Codex",
             ),
         ],
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
+    # The same baseline also ran (and failed) through the managed broker.
+    runner._local_test_observations.append(LocalTestObservation(
+        command=("python3", "-m", "pytest", "/tmp/scratch-main/tests/", "-q"),
+        outcome="failed",
+        provenance="parent-observed",
+        receipt_id="baseline-broker-failure",
+        turn_id="turn-baseline",
+        timestamp="2026-09-23T10:00:00+00:00",
+        cwd=str(tmp_path),
+    ))
 
-    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert len(runner.comments) == 1
-    assert runner.comments[0].startswith("**Review verdict:** Blocking")
-    assert not any("Added the test." in comment for comment in runner.comments)
+    followup = next(comment for comment in runner.comments if "Added the test." in comment)
+    tests_section, _, context_section = followup.partition(
+        "### Out-of-checkout context runs (not evidence)"
+    )
+    assert "python -m pytest tests/test_foo.py -q" in tests_section
+    assert "/tmp/scratch-main" not in tests_section
+    assert f"- {baseline}" in context_section
+    baseline_line = next(
+        line for line in followup.splitlines() if "baseline-broker-failure" in line
+    )
+    assert "out-of-checkout context (not evidence) `failed`" in baseline_line
+    assert "authoritative" not in baseline_line
+
 
 def test_pr_loop_rejects_structured_followup_live_target_tests_before_posting(tmp_path):
     # Regression for #584: a structured `tests_run` entry (origin='structured',

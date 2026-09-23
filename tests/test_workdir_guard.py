@@ -1431,3 +1431,115 @@ def test_managed_run_tests_with_worker_flags_keeps_wrapper_contract(tmp_path):
     outside = [*wrapper[:-4], str(tmp_path / "outside.py")]
     with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
         validate_test_commands_within_workdir([shlex.join(outside)], assigned_workdir=checkout)
+
+
+# Issue #991: a reported run outside the assigned checkout (for example a
+# baseline on a clean copy of the base branch) is context, not evidence.
+_BASELINE_991 = (
+    "PYTHONPATH=/tmp/scratch-main-1176 timeout 900 /usr/bin/python3 -m pytest "
+    "/tmp/scratch-main-1176/tests/ -q -n 4"
+)
+
+
+def test_partition_moves_out_of_checkout_baseline_to_context(tmp_path):
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        ["python3 -m pytest tests/test_api.py -q", _BASELINE_991],
+        assigned_workdir=tmp_path,
+    )
+
+    assert partition.in_checkout == ("python3 -m pytest tests/test_api.py -q",)
+    assert partition.out_of_checkout == (_BASELINE_991,)
+    # The strict validator used for evidence citations still fails closed.
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir([_BASELINE_991], assigned_workdir=tmp_path)
+
+
+def test_partition_moves_managed_wrapper_outside_target_to_context(tmp_path):
+    command = (
+        "/home/user/.local/bin/agent-loop run-tests --memory-dir /cache -- "
+        "python3 -m pytest /tmp/scratch-main/tests/ -q"
+    )
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        [command], assigned_workdir=tmp_path
+    )
+
+    assert partition.in_checkout == ()
+    assert partition.out_of_checkout == (command,)
+
+
+@pytest.mark.parametrize("command", [
+    "cd /tmp/scratch-main && pytest tests/ https://live.example",
+    "pytest /tmp/scratch-main/tests/ --base-url https://live.example",
+    r"pytest C:\outside\tests",
+])
+def test_partition_still_rejects_non_path_violations(tmp_path, command):
+    with pytest.raises(AgentLoopError):
+        workdir_guard.partition_reported_tests_by_workdir(
+            [command], assigned_workdir=tmp_path
+        )
+
+
+@pytest.mark.parametrize("tests_run", [None, ()])
+def test_partition_preserves_empty_reports(tmp_path, tests_run):
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        tests_run, assigned_workdir=tmp_path
+    )
+
+    assert partition.in_checkout == tests_run
+    assert partition.out_of_checkout == ()
+
+
+@pytest.mark.parametrize(("argv", "admissible"), [
+    (("python3", "-m", "pytest", "tests/test_api.py", "-q"), True),
+    (("/usr/bin/python3", "-m", "pytest", "tests/"), True),
+    (("python3", "-m", "pytest", "/tmp/scratch-main-991/tests/"), False),
+    (("pytest", "--rootdir=/tmp/scratch-main-991"), False),
+    (("pytest", "tests/", "https://live.example"), False),
+    ((), False),
+])
+def test_command_is_admissible_evidence(tmp_path, argv, admissible):
+    assert workdir_guard.command_is_admissible_evidence(
+        argv, assigned_workdir=tmp_path
+    ) is admissible
+
+
+@pytest.mark.parametrize(("command", "outside_only"), [
+    ("python3 -m pytest /tmp/scratch-main-991/tests/ -q", True),
+    ("python3 -m pytest -q /tmp/scratch-main-991/tests/", True),
+    ("bash -c 'cd /tmp/scratch-main-991 && pytest tests/'", True),
+    ("bash -c 'cd /tmp/scratch-main-991 && pytest'", True),
+    (
+        "PYTHONPATH=/tmp/scratch-main-991 timeout 900 /usr/bin/python3 -m pytest "
+        "/tmp/scratch-main-991/tests/ -q -n 4 -p no:cacheprovider",
+        True,
+    ),
+    ("make -C /tmp/scratch-main-991 test", True),
+    # --rootdir selects configuration; operands still resolve in the checkout.
+    ("pytest --rootdir=/tmp/scratch-main-991 tests/", False),
+    ("pytest --rootdir /tmp/scratch-main-991 tests/test_foo.py", False),
+    # Bare directories, node IDs and the implicit cwd are in-checkout targets.
+    ("python3 -m pytest tests /tmp/scratch-main-991/tests", False),
+    ("python3 -m pytest test_a.py::t /tmp/scratch-main-991/tests", False),
+    ("python3 -m pytest -q --junit-xml /tmp/scratch-main-991/r.xml", False),
+    ("python3 -m pytest -q --html /tmp/scratch-main-991/r.html", False),
+    ("python3 -m pytest -q --unknown-report /tmp/scratch-main-991/r.html", False),
+    # Mixed runs and outside option values still test the checkout (#991).
+    ("python3 -m pytest tests/test_foo.py /tmp/scratch-main-991/tests/test_foo.py", False),
+    ("python3 -m pytest -c /tmp/scratch-main-991/pytest.ini tests/", False),
+    ("pytest -c /tmp/scratch-main-991/pytest.ini", False),
+    ("bash -c 'cd /tmp/scratch-main-991 && pytest; cd {checkout} && pytest tests/'", False),
+    ("python3 -m pytest tests/ -q", False),
+    ("pytest tests/ https://live.example", False),
+])
+def test_command_targets_outside_workdir_only_for_pure_outside_runs(
+    tmp_path, command, outside_only
+):
+    command = command.format(checkout=tmp_path)
+    assert workdir_guard.command_targets_outside_workdir(
+        command, assigned_workdir=tmp_path
+    ) is outside_only
+    if not outside_only and "/tmp/scratch-main-991" in command:
+        # Runs naming any outside path remain unselectable as evidence.
+        assert not workdir_guard.command_is_admissible_evidence(
+            command, assigned_workdir=tmp_path
+        )

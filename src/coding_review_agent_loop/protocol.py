@@ -703,6 +703,9 @@ class StructuredCoderFollowup:
     risk_test_matrix_claims: SemanticRiskCoverageClaims | None = None
     risk_test_matrix_evidence: "RiskTestMatrixEvidence | None" = None
     risk_test_matrix_diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
+    # Orchestrator-derived, never parsed: reported runs outside the assigned
+    # checkout (e.g. a clean-base baseline). Visible context, never evidence.
+    out_of_checkout_tests_run: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -722,6 +725,8 @@ class StructuredIssueImplementation:
     risk_test_matrix_claims: SemanticRiskCoverageClaims | None = None
     risk_test_matrix_evidence: "RiskTestMatrixEvidence | None" = None
     risk_test_matrix_diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
+    # Orchestrator-derived, never parsed: see StructuredCoderFollowup.
+    out_of_checkout_tests_run: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

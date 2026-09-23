@@ -2963,9 +2963,38 @@ the loop's own classifier -- for example a backslash inside the URL, which
 WHATWG URL parsers treat as a path separator and could resolve to a different
 host than a strict URL parse reports -- is never treated as loopback, even if
 it superficially contains `localhost` or a loopback IP; it is rejected as an
-unverifiable live target instead. If an explicit
-test location is outside the assigned checkout, or a live remote target is
-detected, the loop fails with an `AgentLoopError` naming the offending
+unverifiable live target instead. A structured `tests_run` entry whose only
+problem is a test location outside the assigned checkout -- for example an
+honestly reported baseline run on a clean copy of the base branch -- does not
+reject the hand-off (#991). The orchestrator moves it out of `tests_run`, so it
+never becomes a self-reported evidence row, and renders it in a separate
+"Out-of-checkout context runs (not evidence)" section; the next reviewer's
+handoff context applies the same classification. A managed-broker run whose
+test operands point outside the assigned checkout is likewise excluded from
+the selectable execution catalog and the journal used for risk-matrix
+evidence, so it can never back a verified row. On the failure side the
+classification is fail-safe: only a run with positive evidence that every test
+target lies outside the checkout counts as context. Any other positional
+operand, such as a relative path, a bare directory like `tests`, or a node ID,
+is an in-checkout target, and so is the current directory of a test command
+with no operand. Relative operands resolve through `cd`/`pushd` and real
+working-directory options such as `-C`, but not through pytest's `--rootdir`.
+An absolute path after a value-taking or unknown option (a config, report, or
+ignore path) is never a target. A mixed run, or one whose only outside path is
+an option value, therefore keeps its failures authoritative. In
+the public local test journal a pure outside run carries an out-of-checkout
+context caveat that survives
+round metadata; it never counts as an authoritative failure, cannot supersede
+or be superseded by an in-checkout run, and renders as "out-of-checkout
+context (not evidence)" instead of "uncited authoritative". When the journal
+is trimmed for transport, context rows yield to every in-checkout row. A broker
+run the guard cannot validate is never a selectable execution ref, but its
+failure still counts against risk-matrix rows. Test-observation receipt
+citations remain strict, and so do freeform `Tests:` reports that are not
+converted to a structured result: if an explicit
+test location is outside the assigned checkout there, or a live remote target
+is detected anywhere (including in a structured `tests_run` entry), the loop
+fails with an `AgentLoopError` naming the offending
 command/URL and assigned checkout. When that failure happens after a PR was
 already created or detected, the error also confirms the PR state and tells
 the user to continue with `agent-loop pr <number>` instead of rerunning
