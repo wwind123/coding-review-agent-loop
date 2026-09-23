@@ -2424,6 +2424,58 @@ def _promote_legacy_machine_items(records: Sequence[PostedRoundRecord]) -> tuple
     return tuple(promoted)
 
 
+PLAN_DEMOTED_MACHINE_ITEM_NOTE = (
+    "Planning has no machine-obligation clearance path; this orchestrator-authored "
+    "plan item was restored to an ordinary reviewer-dispositionable finding (#1005)."
+)
+
+
+def _demote_plan_machine_item(item: UnresolvedReviewItem) -> UnresolvedReviewItem:
+    """Return a plan-flow machine record to the ordinary finding representation.
+
+    The planning loop never mints machine obligations and has no path that
+    clears one: reviewer dispositions are evidence only for machine records,
+    and the human-requirements/merge-conflict/CI clearance paths are PR-only.
+    A machine-authority item in a plan ledger (historically the legacy
+    promotion of the orchestrator's human-requirements re-injection item)
+    would therefore stay blocking forever and force a revision after every
+    unanimous approval (#1005).  Restoring the legacy representation lets the
+    reviewers disposition it like every other plan finding; the
+    human-requirements gate still re-checks acknowledgements each round and
+    re-injects a fresh item if they remain missing.
+    """
+    if not item.is_machine_obligation:
+        return item
+    notes = item.notes
+    if PLAN_DEMOTED_MACHINE_ITEM_NOTE not in notes:
+        notes = (*notes, PLAN_DEMOTED_MACHINE_ITEM_NOTE)
+    return replace(
+        item,
+        authority=None,
+        obligation_kind=None,
+        lifecycle=None,
+        failed_head_sha=None,
+        candidate_head_sha=None,
+        obligation_identity=None,
+        notes=notes,
+        resolution_owners=(),
+        owner_states=(),
+    )
+
+
+def _demote_plan_machine_items(records: Sequence[PostedRoundRecord]) -> tuple[PostedRoundRecord, ...]:
+    demoted: list[PostedRoundRecord] = []
+    for record in records:
+        metadata = record.metadata
+        prior = tuple(_demote_plan_machine_item(item) for item in metadata.prior_items)
+        new_items = tuple(_demote_plan_machine_item(item) for item in metadata.new_items)
+        if prior != metadata.prior_items or new_items != metadata.new_items:
+            metadata = replace(metadata, prior_items=prior, new_items=new_items)
+            record = replace(record, metadata=metadata)
+        demoted.append(record)
+    return tuple(demoted)
+
+
 def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) -> tuple[PostedRoundRecord, ...]:
     records: list[PostedRoundRecord] = []
     bodies = tuple(body for comment in comments if isinstance((body := getattr(comment, "body", None)), str))
@@ -2463,6 +2515,10 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
                 body=_strip_round_metadata(body),
             )
         )
+    if flow == "plan":
+        # Legacy machine promotion exists for PR ledgers, whose machine gates
+        # have clearance paths.  A plan ledger has none (#1005).
+        return _demote_plan_machine_items(tuple(records))
     return _promote_legacy_machine_items(tuple(records))
 
 
