@@ -2434,6 +2434,25 @@ PLAN_DEMOTED_MACHINE_ITEM_NOTE = (
 )
 
 
+_REVIEWER_DISPOSITION_NOTE_RE = re.compile(r"[A-Za-z][A-Za-z0-9 ._-]*: \S")
+
+
+def _has_legacy_promotion_note_tail(notes: Sequence[str]) -> bool:
+    """True when the promotion's diagnostic note is followed only by reviewer notes.
+
+    ``_apply_unresolved_item_dispositions`` appends ``"<reviewer>: <note>"``
+    evidence to a machine record each round it is dispositioned, so a promoted
+    item carried through approval rounds holds those notes after the diagnostic.
+    """
+    diagnostics = {_LEGACY_UNTRUSTED_LINEAGE_NOTE, _LEGACY_UNBOUND_HEAD_NOTE}
+    positions = [index for index, note in enumerate(notes) if note in diagnostics]
+    if len(positions) != 1:
+        return False
+    return all(
+        _REVIEWER_DISPOSITION_NOTE_RE.match(note) for note in notes[positions[0] + 1:]
+    )
+
+
 def _is_legacy_promoted_plan_item(item: UnresolvedReviewItem) -> bool:
     """Recognize exactly what ``_legacy_machine_promotion`` made of a plan item."""
     return (
@@ -2453,8 +2472,7 @@ def _is_legacy_promoted_plan_item(item: UnresolvedReviewItem) -> bool:
             or (
                 item.authority == UNKNOWN_MACHINE_AUTHORITY
                 and not item.failed_head_sha
-                and bool(item.notes)
-                and item.notes[-1] in {_LEGACY_UNTRUSTED_LINEAGE_NOTE, _LEGACY_UNBOUND_HEAD_NOTE}
+                and _has_legacy_promotion_note_tail(item.notes)
             )
         )
         # The legacy promotion always clears ownership; a machine record that

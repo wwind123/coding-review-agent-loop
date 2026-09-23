@@ -4906,7 +4906,9 @@ def test_issue_loop_plan_first_resumes_with_only_missing_reviewer_for_current_pl
     assert agent_commands == ["gemini"]
     assert runner.comments[-1].startswith("Planning complete for issue #56.")
 
-@pytest.mark.parametrize("persisted_as_machine", [False, True])
+@pytest.mark.parametrize(
+    "persisted_as_machine", ["legacy", "promoted", "promoted-with-reviewer-notes"]
+)
 def test_issue_loop_plan_first_resume_clears_orchestrator_item_on_unanimous_approval(
     tmp_path, persisted_as_machine
 ):
@@ -4927,14 +4929,18 @@ def test_issue_loop_plan_first_resume_clears_orchestrator_item_on_unanimous_appr
         status="blocking",
         source_status="blocking",
     )
-    if persisted_as_machine:
+    if persisted_as_machine != "legacy":
+        notes = ("Synthetic machine record lacked trusted orchestrator lineage.",)
+        if persisted_as_machine == "promoted-with-reviewer-notes":
+            # Evidence appended by earlier approval rounds that could not clear it.
+            notes = (*notes, "Codex: Acknowledged in the revised plan.")
         orchestrator_item = replace(
             orchestrator_item,
             authority="unknown",
             obligation_kind="unknown",
             lifecycle="repair_required",
             obligation_identity="unknown:item-1",
-            notes=("Synthetic machine record lacked trusted orchestrator lineage.",),
+            notes=notes,
         )
     summary_comment = _attach_round_metadata(
         "Orchestrator plan review.",

@@ -1373,6 +1373,19 @@ def test_plan_flow_demotes_persisted_machine_obligation_to_reviewer_finding() ->
         {"failed_head_sha": "plan-subject"},
         {"notes": ()},
         {"authority": MACHINE_AUTHORITY},
+        # The diagnostic must be followed only by reviewer disposition notes.
+        {
+            "notes": (
+                "Known machine item could not be bound to a failed head.",
+                "free-form tampering",
+            )
+        },
+        {
+            "notes": (
+                "Known machine item could not be bound to a failed head.",
+                "Synthetic machine record lacked trusted orchestrator lineage.",
+            )
+        },
     ],
 )
 def test_plan_flow_keeps_unrecognized_machine_record_fail_closed(overrides) -> None:
@@ -1421,6 +1434,52 @@ def test_plan_flow_keeps_unrecognized_machine_record_fail_closed(overrides) -> N
         same_status="same-plan",
     )
     assert [entry.item_id for entry in remaining] == ["item-7"]
+
+
+def test_plan_flow_demotes_promotion_carrying_later_reviewer_notes() -> None:
+    """Disposition evidence appended after the promotion must not block recovery."""
+    promoted = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic blocker.",
+        status="blocking",
+        source_status="blocking",
+        notes=(
+            "Synthetic machine record lacked trusted orchestrator lineage.",
+            "Codex: Acknowledged in the revised plan.",
+            "Antigravity: Covered by step 2.",
+        ),
+        authority=UNKNOWN_MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="unknown:item-7",
+    )
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=5,
+            subject="plan-subject", prior_items=(promoted,),
+        ),
+    )
+
+    demoted = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert not demoted.is_machine_obligation
+    remaining, _future = _apply_unresolved_item_dispositions(
+        [demoted],
+        {
+            "item-7": [
+                ReviewItemDisposition(
+                    reviewer="Codex", item_id="item-7", disposition="resolved", note="Done."
+                )
+            ]
+        },
+        same_status="same-plan",
+    )
+    assert remaining == []
 
 
 def test_plan_flow_demotes_trusted_machine_authority_promotion() -> None:
