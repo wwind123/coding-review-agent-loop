@@ -215,6 +215,100 @@ any unsigned or flag-only bypass once a handoff exists.
 approved under the looser contract inadmissible the next time the loop touches
 them. Both routes above are the intended migration path.
 
+### Removing an unavailable reviewer from an in-flight run
+
+A persisted scheduler contract (the required reviewer board, the policy, and
+the primary) is immutable for the run. If one reviewer's backend becomes
+unavailable, for example because its quota is exhausted, rerunning without that
+reviewer stops with the contract-drift error. That error now also prints a
+filled-in **signed reviewer-board amendment** record. A human operator posts it
+to record a deliberate, audited reduction of the board:
+
+````markdown
+Reviewer board amendment:
+
+```json
+{
+  "effective_from_round": 3,
+  "flow": "plan",
+  "issue": 942,
+  "kind": "reviewer-board-amendment",
+  "original_required_reviewers": [
+    "Codex",
+    "Claude",
+    "Antigravity"
+  ],
+  "policy": "primary-then-panel",
+  "pr_number": null,
+  "primary_reviewer": "Codex",
+  "rationale": "Antigravity weekly quota exhausted.",
+  "reason": "backend-unavailable",
+  "removed_reviewers": [
+    "Antigravity"
+  ],
+  "schema_version": 1
+}
+```
+-- Human Reviewer
+````
+
+- **Where to post it.** Post a `plan` record (`issue` set, `pr_number` null)
+  on the issue being planned. Post a `pr` record (`pr_number` set, `issue`
+  null) on the PR itself, including standalone `agent-loop pr` runs. A record
+  on the wrong surface, a record naming another issue or PR, and a `pr` record
+  on the owning issue all stop for a human decision.
+- **Choosing `effective_from_round`.** Use the round number the drift error
+  prints. That is the round the resume re-enters, whether the round is only
+  partly recorded or already reconciled, and it is not always the latest
+  visible round number. Any other value stops before any agent turn or comment
+  and prints the corrected template.
+- **Retroactive use.** The record rescues runs whose contract was persisted
+  before this feature existed. Earlier rounds are never rewritten. Inside the
+  re-entered round, reviews already posted by the remaining reviewers are
+  reused, and the removed reviewer is never invoked again.
+- **What stays immutable.** `policy` and `primary_reviewer` must match the
+  persisted contract. The primary cannot be removed, and a `primary-then-panel`
+  board must keep at least one secondary. Re-adding a removed reviewer is
+  contract drift. Every scheduler record posted after the amendment carries the
+  amended board and the record's digest; any other contract fails closed, and
+  at PR qualification it refuses the merge. Amendments can chain, with each
+  record's `original_required_reviewers` equal to the previous amended board.
+  Two different records that amend the same board always stop for a human
+  decision.
+- **Findings and approvals.** An active finding whose only pending owner was
+  removed is reassigned to the primary, or to every remaining reviewer when
+  there is no primary. It stays blocking until a new owner clears it; nothing
+  is auto-cleared. Approvals the removed reviewer already gave remain in the
+  history but are no longer required. The run posts one audit comment naming
+  the record, the activation round, and every reassignment. Scheduler audits,
+  completion messages, and (for PR runs, on every completion path including
+  managed CI) one plain completion comment on the PR note that the run
+  finished on a reduced board. The activation round always posts a fresh
+  scheduler checkpoint carrying the amended board and digest, even when every
+  remaining reviewer's review is reused.
+- Unsigned or malformed records are ignored with a logged diagnostic. A comment
+  that contains only the record is not treated as a signed human requirement.
+  All-reviewers PR runs and the non-staged plan path persist no contract, so
+  there you change the reviewer flags directly and must not post a record.
+
+**Lineage rules.** Only scheduler records that carry a contract are compared:
+the plan `scheduler-prelaunch` checkpoint and PR scheduler records written under
+a selective policy. Coder, reviewer, and phase-advance records are never
+compared and never carry the digest. The base contract is the one on the
+earliest contract-bearing record. Each record is judged by exactly one link of
+the amendment chain: the latest amendment whose comment precedes the record and
+whose `effective_from_round` is at or before the record's round. The record must
+carry that link's board and digest exactly. A record that precedes every
+amendment carries the original board and no digest. Plan resume, PR startup, and
+the PR qualification gate all use this one resolver, and the gate re-reads the
+amendments from the same fresh PR comment fetch as the scheduler records.
+
+**Ledger view.** Persisted `prior_items` inside a round are never rewritten.
+The reassignment is a derived view that the scheduler, disposition
+reconciliation, and completion check recompute from the record on every run.
+The ledger handed to the next round is built from that view, so from then on
+the persisted items carry explicit owners that exclude the removed reviewer.
+
 ### Risk-based mode and transition matrices
 
 For planning work involving multiple modes, lifecycle transitions,

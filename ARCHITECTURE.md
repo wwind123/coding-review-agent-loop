@@ -397,7 +397,23 @@ availability failure; it is never repaired into a verdict.
 The default policy invokes all reviewers. Opt-in selective intermediate review
 can pause already-approved reviewers for bounded fixes, but their old approvals
 remain head-bound. Changed scope, incomplete state, and final qualification can
-require a full review. The scheduler contract is immutable across a resume.
+require a full review. The scheduler contract is immutable across a resume,
+with one audited exception (#943). A signed human `reviewer-board-amendment`
+record may remove unavailable non-primary reviewers. It is read from the same
+comment surface as the round records it amends: the issue for planning, the PR
+for PR review. `board_amendment.resolve_contract_lineage` is the single
+resolver used at plan resume, PR startup, and the PR qualification gate. Only
+contract-bearing scheduler records take part. The base contract comes from the
+earliest persisted record, and each record is judged by exactly one
+amendment-chain link. Every post-amendment scheduler record must carry the
+amended contract and the record's digest in the optional
+`reviewer_board_amendment_digest` round-metadata field, which is omitted when
+absent. Any other contract refuses resume, qualification, and merge.
+Activation is pinned to the round the resume re-enters. Findings owned only by
+a removed reviewer are reassigned in a derived ledger view that never rewrites
+persisted in-round `prior_items`, and approvals banked by the removed reviewer
+remain history only. A comment carrying only such a record is excluded from
+signed human requirements.
 The opt-in `primary-then-panel` policy adds a phase-aware contract with one
 primary reviewer and a non-empty secondary panel. It keeps the primary as the
 only normal reviewer until exact-head approval, then dispatches an independent

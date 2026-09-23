@@ -229,6 +229,10 @@ class PostedRoundMetadata:
     # on every historical record and omitted from the encoding when absent.
     plan_supersession_digest: str | None = None
     plan_supersession_superseded_hash: str | None = None
+    # Signed reviewer-board amendment binding (#943).  Written only on
+    # contract-bearing scheduler records posted under an amended contract;
+    # absent on every historical record and omitted from the encoding.
+    reviewer_board_amendment_digest: str | None = None
     # Coder record round that last rendered the full visible matrix-evidence
     # row list (#959).  Writers set it iff they persist matrix evidence; it is
     # omitted from the encoding when None so legacy records stay byte-stable.
@@ -261,6 +265,11 @@ class PostedRoundMetadata:
             or not self.plan_supersession_superseded_hash.strip()
         ):
             raise ValueError("invalid plan supersession binding")
+        if self.reviewer_board_amendment_digest is not None and (
+            not isinstance(self.reviewer_board_amendment_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.reviewer_board_amendment_digest)
+        ):
+            raise ValueError("invalid reviewer board amendment digest")
         if self.scheduler_force_full_source is not None and (
             self.scheduler_force_full_source not in FORCE_FULL_SOURCES
             or self.scheduler_force_full is not True
@@ -1937,6 +1946,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["plan_supersession_superseded_hash"] = (
             metadata.plan_supersession_superseded_hash
         )
+    if metadata.reviewer_board_amendment_digest is not None:
+        payload["reviewer_board_amendment_digest"] = metadata.reviewer_board_amendment_digest
     if metadata.plan_candidate_key is not None:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
     if metadata.risk_test_matrix_evidence_full_round is not None:
@@ -2229,6 +2240,9 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             ),
             plan_supersession_superseded_hash=_decode_plan_supersession_field(
                 payload, "plan_supersession_superseded_hash"
+            ),
+            reviewer_board_amendment_digest=_decode_plan_supersession_field(
+                payload, "reviewer_board_amendment_digest"
             ),
             **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),
