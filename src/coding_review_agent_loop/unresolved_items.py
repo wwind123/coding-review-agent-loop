@@ -1014,6 +1014,83 @@ def _collect_prior_compact_summaries(
     return tuple(summaries)
 
 
+# The compact prior ledger rides in every round comment's metadata, so its
+# size must not scale with round count (#1003).  The budget is measured in raw
+# characters; JSON/base64 encoding in the round metadata roughly adds a third,
+# which keeps the encoded field well inside the 60,000-character comment limit.
+COMPACT_PRIOR_SUMMARIES_MAX_CHARS = 16_000
+COMPACT_PRIOR_DETAILS_OMITTED_SUFFIX = " (details compacted)"
+COMPACT_PRIOR_OMITTED_NOTICE_RE = re.compile(
+    r"^\[compacted\] (?P<count>\d+) earlier prior item summar(?:y|ies) omitted"
+)
+
+
+def _compact_prior_summaries_size(summaries: Sequence[str]) -> int:
+    # Matches the "\n\n" join used to render the prompt ledger block.
+    return sum(len(summary) for summary in summaries) + 2 * max(len(summaries) - 1, 0)
+
+
+def _compact_prior_omitted_notice(count: int) -> str:
+    noun = "summary" if count == 1 else "summaries"
+    return (
+        f"[compacted] {count} earlier prior item {noun} omitted to bound "
+        "round metadata; those items were already dispositioned in earlier rounds."
+    )
+
+
+def bound_compact_prior_summaries(
+    summaries: Sequence[str],
+    *,
+    max_chars: int = COMPACT_PRIOR_SUMMARIES_MAX_CHARS,
+) -> tuple[str, ...]:
+    """Bound the append-only compact prior ledger independent of round count.
+
+    Oldest entries degrade first: their bodies collapse to the header line
+    (item id, disposition label, reviewer, source round), then whole headers
+    fold into a single omission notice.  The newest entries stay verbatim.
+    The result is idempotent, so re-bounding a persisted ledger is stable.
+    """
+    entries = list(summaries)
+    omitted = 0
+    if entries:
+        match = COMPACT_PRIOR_OMITTED_NOTICE_RE.match(entries[0])
+        if match:
+            omitted = int(match.group("count"))
+            entries = entries[1:]
+
+    rendered = [_compact_prior_omitted_notice(omitted), *entries] if omitted else entries
+    if _compact_prior_summaries_size(rendered) <= max_chars:
+        return tuple(rendered)
+    # Fill the budget newest-first.  Once one entry must degrade to its header,
+    # every older entry degrades too; once a header no longer fits, every older
+    # entry folds into the omission notice.
+    notice_reserve = len(_compact_prior_omitted_notice(omitted + len(entries))) + 2
+    budget = max_chars - notice_reserve
+    kept: list[str] = []
+    used = 0
+    headers_only = False
+    for position in range(len(entries) - 1, -1, -1):
+        entry = entries[position]
+        separator = 2 if kept else 0
+        if not headers_only and used + separator + len(entry) <= budget:
+            kept.append(entry)
+            used += separator + len(entry)
+            continue
+        headers_only = True
+        header = entry.split("\n", 1)[0]
+        if not header.endswith(COMPACT_PRIOR_DETAILS_OMITTED_SUFFIX):
+            header += COMPACT_PRIOR_DETAILS_OMITTED_SUFFIX
+        if used + separator + len(header) > budget:
+            omitted += position + 1
+            break
+        kept.append(header)
+        used += separator + len(header)
+    kept.reverse()
+    if omitted:
+        kept.insert(0, _compact_prior_omitted_notice(omitted))
+    return tuple(kept)
+
+
 def _validate_plan_review_response(
     text: str,
     *,
