@@ -1651,13 +1651,21 @@ def get_pr_checks(
     )
 
 
+def _is_board_amendment_record(signed_body: str) -> bool:
+    # A signed reviewer-board amendment is an orchestration record (#943),
+    # not a requirement on the reviewed artifact.
+    from .board_amendment import is_reviewer_board_amendment_only
+
+    return is_reviewer_board_amendment_only(signed_body)
+
+
 def _parse_pr_human_requirements(data: dict[str, object]) -> tuple[HumanReviewRequirement, ...]:
     requirements: list[HumanReviewRequirement] = []
     for raw_comment in data.get("comments") or []:
         if not isinstance(raw_comment, dict):
             continue
         body = parse_signed_human_requirement_body(raw_comment.get("body"))
-        if body is None:
+        if body is None or _is_board_amendment_record(body):
             continue
         requirements.append(
             HumanReviewRequirement(
@@ -1995,7 +2003,7 @@ def _parse_issue_human_requirements(data: dict[str, object]) -> tuple[HumanRevie
         if not isinstance(raw_comment, dict):
             continue
         body = parse_signed_human_requirement_body(_optional_str(raw_comment.get("body")))
-        if body is None:
+        if body is None or _is_board_amendment_record(body):
             continue
         requirements.append(
             HumanReviewRequirement(

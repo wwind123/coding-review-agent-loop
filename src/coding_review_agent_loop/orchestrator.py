@@ -34,6 +34,19 @@ from .config import (
     sync_coder_pr_before_validation,
     sync_reviewer_pr_before_review,
 )
+from .board_amendment import (
+    ContractLineage,
+    amendment_audit_already_posted,
+    amendment_summary_line,
+    apply_board_amendment_to_ledger,
+    collect_reviewer_board_amendments,
+    format_reviewer_board_amendment_comment,
+    missing_from_config,
+    reject_misplaced_pr_amendments,
+    render_amendment_audit_comment,
+    require_amendment_activation,
+    resolve_contract_lineage,
+)
 from .decomposition import (
     _decode_json_payload,
     CreatedPhaseIssue,
@@ -538,6 +551,7 @@ from .plan_review_scheduling import (
     PlanRevisionDescriptor,
     PlanReviewSchedulingContract,
     PlanSchedulerSnapshot,
+    PlanSchedulingDecision,
     classify_plan_history,
     classify_plan_transition,
     make_plan_contract,
@@ -10006,25 +10020,60 @@ def _run_plan_first_loop(
         except AgentLoopError:
             return ()
 
-    for record in planning_contract_drift_records():
-        metadata = record.metadata
-        try:
-            persisted_contract = _plan_scheduler_contract_from_metadata(metadata)
-        except AgentLoopError:
-            persisted_contract = None
-        if persisted_contract is not None and persisted_contract != plan_scheduler_contract:
-            raise AgentLoopError(
-                "Plan review scheduler contract changed during resume; the required "
-                "reviewer board, the planning policy, and the primary plan reviewer "
-                "must remain immutable for the run. This run is configured with "
-                f"--plan-review-policy {config.plan_review_policy} and primary "
-                f"{plan_primary_name or '(none)'}, but issue #{issue_number} already "
-                "carries a planning scheduler contract for policy "
-                f"{persisted_contract.policy} with primary "
-                f"{persisted_contract.primary_reviewer or '(none)'} and reviewer board "
-                f"{', '.join(persisted_contract.required_reviewers)}. Rerun with the "
-                "persisted planning policy, primary, and reviewer board."
+    def plan_contract_drift_error(
+        persisted_contract: PlanReviewSchedulingContract, detail: str
+    ) -> AgentLoopError:
+        def template_round() -> int | None:
+            resumed = _resume_plan_round(
+                issue_context.comments, configured_reviewers=configured_reviewers
             )
+            return resumed[1].round_number if resumed is not None else 1
+
+        return AgentLoopError(
+            "Plan review scheduler contract changed during resume; the required "
+            "reviewer board, the planning policy, and the primary plan reviewer "
+            "must remain immutable for the run. This run is configured with "
+            f"--plan-review-policy {config.plan_review_policy} and primary "
+            f"{plan_primary_name or '(none)'}, but issue #{issue_number} already "
+            "carries a planning scheduler contract for policy "
+            f"{persisted_contract.policy} with primary "
+            f"{persisted_contract.primary_reviewer or '(none)'} and reviewer board "
+            f"{', '.join(persisted_contract.required_reviewers)} ({detail}). Rerun with the "
+            "persisted planning policy, primary, and reviewer board."
+            + _board_amendment_route_clause(
+                flow="plan",
+                issue_number=issue_number,
+                pr_number=None,
+                persisted=persisted_contract,
+                configured=plan_scheduler_contract,
+                start_round_number=template_round,
+            )
+        )
+
+    # Signed reviewer-board amendments (#943) are read from the same issue
+    # comment list the plan round records live in, so comment order is
+    # always comparable.  Without an amendment this is exactly the historical
+    # immutability rule.
+    plan_amendment_diagnostics: list[str] = []
+    plan_board_amendments = collect_reviewer_board_amendments(
+        issue_context.comments,
+        flow="plan",
+        issue_number=issue_number,
+        ignored_sink=plan_amendment_diagnostics,
+    )
+    for diagnostic in plan_amendment_diagnostics:
+        log(config, f"Planning issue #{issue_number}: {diagnostic}")
+    plan_drift_records = planning_contract_drift_records()
+    plan_contract_lineage: ContractLineage = resolve_contract_lineage(
+        plan_drift_records,
+        plan_board_amendments,
+        plan_scheduler_contract,
+        contract_from_metadata=_plan_contract_or_none,
+        drift_error=plan_contract_drift_error,
+    )
+    plan_amendment_digest = plan_contract_lineage.active_digest
+    for record in plan_drift_records:
+        metadata = record.metadata
         if not staged_planning:
             continue
         if (
@@ -10062,6 +10111,76 @@ def _run_plan_first_loop(
     # run does for every item the resumed round carried.
     plan_accounted_item_ids: set[str] = set()
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
+    # Amendment activation (#943) runs right after resume reconstruction and
+    # before any agent invocation or comment post: an amendment no
+    # digest-bound record has used must start at the round this resume
+    # re-enters.
+    plan_amendment_start_round = resume_state[1].round_number if resume_state is not None else 1
+    require_amendment_activation(
+        plan_contract_lineage,
+        start_round_number=plan_amendment_start_round,
+        template=lambda amendment, round_number: _board_amendment_template(
+            flow="plan",
+            issue_number=issue_number,
+            pr_number=None,
+            persisted=plan_contract_lineage.contracts[
+                plan_contract_lineage.amendments.index(amendment)
+            ],
+            removed=amendment.removed_reviewers,
+            start_round_number=round_number,
+        ),
+    )
+    plan_amendment_reassignments = ()
+    plan_amendment_note: str | None = None
+    if plan_contract_lineage.active_amendment is not None:
+        plan_amended_contract = plan_contract_lineage.contracts[-1]
+        _view, plan_amendment_reassignments = apply_board_amendment_to_ledger(
+            (
+                (*resume_state[1].prior_items, *resume_state[1].current_round_new_items)
+                if resume_state is not None
+                else ()
+            ),
+            removed_reviewers=plan_contract_lineage.removed_reviewers,
+            remaining_reviewers=plan_amended_contract.required_reviewers,
+            primary_reviewer=plan_amended_contract.primary_reviewer,
+        )
+        plan_amendment_note = amendment_summary_line(
+            plan_contract_lineage, plan_amendment_reassignments
+        )
+        log(config, f"Planning issue #{issue_number}: {plan_amendment_note}")
+        if not amendment_audit_already_posted(
+            issue_context.comments, plan_contract_lineage.active_amendment.digest
+        ):
+            post_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=render_amendment_audit_comment(
+                    plan_contract_lineage,
+                    start_round_number=plan_amendment_start_round,
+                    reassignments=plan_amendment_reassignments,
+                ),
+            )
+
+    def plan_ledger_view(
+        items: Sequence[UnresolvedReviewItem],
+    ) -> tuple[UnresolvedReviewItem, ...]:
+        """Derived ledger with removed reviewers' ownership reassigned (#943).
+
+        Persisted ``prior_items`` inside a round are never rewritten; this
+        view feeds scheduler obligations, dispositions, and completion.
+        """
+        if plan_contract_lineage.active_amendment is None:
+            return tuple(items)
+        amended = plan_contract_lineage.contracts[-1]
+        view, _reassignments = apply_board_amendment_to_ledger(
+            items,
+            removed_reviewers=plan_contract_lineage.removed_reviewers,
+            remaining_reviewers=amended.required_reviewers,
+            primary_reviewer=amended.primary_reviewer,
+        )
+        return view
+
     if plan_supersession is not None:
         # Classify the latest reconstructable plan round before any agent
         # turn (#936): only the superseded plan itself, or a plan produced by
@@ -10494,7 +10613,7 @@ def _run_plan_first_loop(
                 previous_key=plan_previous_key,
                 current_key=current_plan_key,
                 obligations=_scheduler_obligations(
-                    prior_unresolved_items,
+                    plan_ledger_view(prior_unresolved_items),
                     required_reviewers=plan_reviewer_names,
                     active_statuses=frozenset({"blocking", "same-plan"}),
                 ),
@@ -10523,6 +10642,15 @@ def _run_plan_first_loop(
             except PlanPrePanelSafetyError as exc:
                 stop_plan_pre_panel(str(exc), round_number=round_number)
                 raise
+            plan_scheduler_decision = _keep_reused_amendment_round_reviews(
+                plan_scheduler_decision,
+                lineage=plan_contract_lineage,
+                round_number=round_number,
+                current_resume=current_resume,
+                eligible=lambda name: (
+                    name == plan_primary_name or plan_panel_evidence.opened
+                ),
+            )
             if plan_scheduler_decision.latches_force_full:
                 plan_automatic_force_full = True
             plan_scheduler_calls_avoided += plan_scheduler_decision.calls_avoided
@@ -10551,14 +10679,15 @@ def _run_plan_first_loop(
                 f"force_full={plan_recorded_force_full} "
                 f"(source: {plan_recorded_force_full_source or 'none'}); "
                 f"degraded_history={plan_history_class}; "
-                f"calls_avoided_cumulative={plan_scheduler_calls_avoided}",
+                f"calls_avoided_cumulative={plan_scheduler_calls_avoided}"
+                + (f"; {plan_amendment_note}" if plan_amendment_note else ""),
             )
             post_issue_comment(
                 runner,
                 config=config,
                 issue_number=issue_number,
                 body=_attach_round_metadata(
-                    render_plan_scheduling_audit(
+                    _append_board_amendment_note(render_plan_scheduling_audit(
                         phase=plan_scheduler_decision.phase,
                         reason=plan_scheduler_decision.reason,
                         selected=plan_scheduler_decision.selected_reviewers,
@@ -10576,7 +10705,7 @@ def _run_plan_first_loop(
                             () if plan_panel_evidence.opened
                             else plan_panel_evidence.unqualified_artifacts
                         ),
-                    ),
+                    ), plan_amendment_note),
                     PostedRoundMetadata(
                         flow="plan",
                         role="summary",
@@ -10586,6 +10715,7 @@ def _run_plan_first_loop(
                         prior_items=prior_unresolved_items,
                         phase="scheduler-prelaunch",
                         scheduler_contract=plan_scheduler_contract.as_dict(),
+                        reviewer_board_amendment_digest=plan_amendment_digest,
                         scheduler_obligation_digest=hashlib.sha256(
                             repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                         ).hexdigest()[:16],
@@ -11148,19 +11278,24 @@ def _run_plan_first_loop(
             raise plan_fatal_errors[0][1]
 
         unresolved_items, _ = _apply_unresolved_item_dispositions(
-            prior_unresolved_items,
+            plan_ledger_view(prior_unresolved_items),
             prior_dispositions,
             same_status="same-plan",
             retain_future=True,
         )
         compact_prior_summaries.extend(
             _collect_prior_compact_summaries(
-                prior_unresolved_items,
+                plan_ledger_view(prior_unresolved_items),
                 unresolved_items,
                 prior_dispositions,
             )
         )
-        unresolved_items = [*unresolved_items, *round_new_unresolved_items]
+        # The ledger handed to the next round is built from the amended view,
+        # so from the next round on persisted ``prior_items`` carry explicit
+        # ownership that excludes removed reviewers (#943).
+        unresolved_items = list(
+            plan_ledger_view([*unresolved_items, *round_new_unresolved_items])
+        )
         # Items minted and cleared inside one round never reappear as prior
         # items, so record them here too.
         plan_accounted_item_ids.update(item.item_id for item in unresolved_items)
@@ -11465,6 +11600,12 @@ def _run_plan_first_loop(
                 )
             inherited_guard_revision = inherited_review_failure
         elif all_approved and not must_fix_items and not plan_missing_approvals:
+            if plan_amendment_note:
+                log(
+                    config,
+                    f"Planning issue #{issue_number}: plan approved on a reduced board. "
+                    f"{plan_amendment_note}",
+                )
             # Re-read both sides at the approval-to-implementation boundary so
             # a human instruction posted during planning cannot be hidden by
             # the original snapshot. New signed IDs require a fresh planning
@@ -11728,6 +11869,7 @@ def _run_plan_first_loop(
             if mode == "plan-only":
                 print(
                     f"Issue #{issue_number} plan approved by {format_agent_list(configured_reviewers)}."
+                    + (f" {plan_amendment_note}" if plan_amendment_note else "")
                 )
                 return 0
 
@@ -14628,6 +14770,134 @@ def _outstanding_plan_phase(
         return "secondary-audit"
 
 
+def _board_amendment_template(
+    *,
+    flow: str,
+    issue_number: int | None,
+    pr_number: int | None,
+    persisted: object,
+    removed: Sequence[str],
+    start_round_number: int | str,
+) -> str:
+    """Filled-in signed amendment template printed by fail-closed errors (#943)."""
+    return format_reviewer_board_amendment_comment(
+        flow=flow,
+        issue=issue_number if flow == "plan" else None,
+        pr_number=pr_number if flow == "pr" else None,
+        original_required_reviewers=tuple(getattr(persisted, "required_reviewers")),
+        policy=str(getattr(persisted, "policy")),
+        primary_reviewer=getattr(persisted, "primary_reviewer"),
+        removed_reviewers=tuple(removed),
+        effective_from_round=start_round_number,  # type: ignore[arg-type]
+    )
+
+
+def _board_amendment_route_clause(
+    *,
+    flow: str,
+    issue_number: int | None,
+    pr_number: int | None,
+    persisted: object,
+    configured: object | None,
+    start_round_number: Callable[[], int | None],
+) -> str:
+    """The amendment-route clause appended to a contract-drift error (#943)."""
+    removed = missing_from_config(persisted, configured)
+    if removed is None:
+        return ""
+    try:
+        round_number: int | str | None = start_round_number()
+    except Exception:  # noqa: BLE001 - the template is advisory text only
+        round_number = None
+    if round_number is None:
+        round_number = "<N: the round this resume re-enters>"
+    surface = f"issue #{issue_number}" if flow == "plan" else f"PR #{pr_number}"
+    template = _board_amendment_template(
+        flow=flow,
+        issue_number=issue_number,
+        pr_number=pr_number,
+        persisted=persisted,
+        removed=removed,
+        start_round_number=round_number,
+    )
+    return (
+        " If a reviewer backend is unavailable, a human operator may instead remove it "
+        f"with a signed reviewer-board amendment posted on {surface}; replace the "
+        "rationale placeholder and keep the effective round printed here:\n\n"
+        + template
+    )
+
+
+def _append_board_amendment_note(body: str, note: str | None) -> str:
+    """Insert the reduced-board note before a comment's trailing signature."""
+    if not note:
+        return body
+    lines = body.splitlines()
+    index = len(lines)
+    while index > 0 and (
+        not lines[index - 1].strip()
+        or lines[index - 1].startswith("-- ")
+        or lines[index - 1].lstrip().startswith("<!--")
+    ):
+        index -= 1
+    return "\n".join([*lines[:index], f"- {note}", *lines[index:]])
+
+
+def _keep_reused_amendment_round_reviews(
+    decision: PlanSchedulingDecision,
+    *,
+    lineage: ContractLineage,
+    round_number: int,
+    current_resume: ResumedReviewRound | None,
+    eligible: Callable[[str], bool],
+) -> PlanSchedulingDecision:
+    """Keep remaining reviewers' round-N reviews in the amended selection (#943).
+
+    Re-entering the amendment's activation round reruns scheduler selection
+    under the amended contract.  A remaining reviewer that already posted a
+    usable review in that round stays selected so its review (and its item
+    dispositions) is reused rather than dropped as a carried approval; it is
+    never re-invoked.
+    """
+    active = lineage.active_amendment
+    if (
+        active is None
+        or current_resume is None
+        or round_number != active.effective_from_round
+    ):
+        return decision
+    required = getattr(lineage.contracts[-1], "required_reviewers")
+    posted = {record.metadata.agent for record in current_resume.completed_reviews}
+    keep = [
+        name
+        for name in required
+        if name in posted and name not in decision.selected_reviewers and eligible(name)
+    ]
+    if not keep:
+        return decision
+    selected = tuple(
+        name for name in required if name in decision.selected_reviewers or name in keep
+    )
+    return dataclasses_replace(
+        decision,
+        selected_reviewers=selected,
+        paused_reviewers=tuple(
+            (name, why) for name, why in decision.paused_reviewers if name not in keep
+        ),
+        reason=(
+            f"{decision.reason}; reviewer board amendment re-entry reuses the round "
+            f"{round_number} review(s) already posted by {', '.join(keep)}"
+        ),
+    )
+
+
+def _plan_contract_or_none(metadata: PostedRoundMetadata) -> PlanReviewSchedulingContract | None:
+    try:
+        return _plan_scheduler_contract_from_metadata(metadata)
+    except AgentLoopError:
+        return None
+
+
 def _plan_scheduler_contract_from_metadata(
     metadata: PostedRoundMetadata,
 ) -> PlanReviewSchedulingContract | None:
@@ -15372,6 +15642,57 @@ def _scheduler_contract_from_metadata(
     return _Contract.from_mapping(metadata.scheduler_contract)
 
 
+def _pr_contract_drift_error(
+    persisted: ReviewSchedulingContract,
+    detail: str,
+    *,
+    pr_number: int,
+    configured: ReviewSchedulingContract | None,
+    start_round_number: Callable[[], int | None],
+    during: str = "resume",
+) -> AgentLoopError:
+    """The fail-closed PR contract-drift error, with the amendment route (#943)."""
+    return AgentLoopError(
+        f"PR review scheduler contract changed during {during}; "
+        + ("no qualification or merge is permitted; " if during == "qualification" else "")
+        + "required reviewers, policy, and broad-path rules must remain immutable. PR "
+        f"#{pr_number} carries a scheduler contract for policy {persisted.policy} with "
+        f"primary {persisted.primary_reviewer or '(none)'} and reviewer board "
+        f"{', '.join(persisted.required_reviewers)} ({detail})."
+        + (
+            ""
+            if during == "qualification"
+            else _board_amendment_route_clause(
+                flow="pr",
+                issue_number=None,
+                pr_number=pr_number,
+                persisted=persisted,
+                configured=configured,
+                start_round_number=start_round_number,
+            )
+        )
+    )
+
+
+def _pr_amendment_start_round(
+    pr_context: PullRequestReviewContext,
+    configured_reviewers: Sequence[AgentName],
+    scheduler_capabilities: object,
+) -> int:
+    """The round a PR resume would re-enter; only used to fill an error template."""
+    resumed = _resume_pr_round(
+        pr_context.comments,
+        head_sha=pr_context.metadata.head_sha,
+        configured_reviewers=configured_reviewers,
+        reconciliation_mode=(
+            "owner-scoped"
+            if getattr(scheduler_capabilities, "owner_scoped_reconciliation", False)
+            else "aggregate"
+        ),
+    )
+    return resumed.round_number if resumed is not None else 1
+
+
 def _is_completed_full_board_scheduler_record(
     record: PostedRoundRecord,
     *,
@@ -15542,27 +15863,62 @@ def _fresh_pr_qualification_snapshot(
             if status != "valid":
                 continue
             try:
-                fresh_contract = _scheduler_contract_from_metadata(record.metadata)
+                _scheduler_contract_from_metadata(record.metadata)
             except AgentLoopError as exc:
                 raise AgentLoopError(
                     "Malformed PR review scheduler contract was observed during qualification; "
                     "no qualification or merge is permitted."
                 ) from exc
-            if fresh_contract != scheduler_contract:
-                raise AgentLoopError(
-                    "PR review scheduler contract changed during qualification; "
-                    "no qualification or merge is permitted."
-                )
             if record.metadata.scheduler_current_sha != record.metadata.subject:
                 raise AgentLoopError(
                     "Contradictory PR review scheduler head metadata was observed during "
                     "qualification; no qualification or merge is permitted."
                 )
+        # Amendments are re-read from this same fresh PR comment fetch (#943),
+        # so the gate never relies on a stale or separately refreshed source.
+        # Pre-amendment contracts are accepted only by the lineage rules, and
+        # a post-amendment record only with the exact amendment digest.
+        try:
+            resolve_contract_lineage(
+                tuple(
+                    record
+                    for record in fresh_scheduler_records
+                    if record.metadata.scheduler_metadata_status == "valid"
+                ),
+                collect_reviewer_board_amendments(
+                    context.comments, flow="pr", pr_number=pr_number
+                ),
+                scheduler_contract,
+                contract_from_metadata=_scheduler_contract_from_metadata,
+                drift_error=lambda persisted, detail: _pr_contract_drift_error(
+                    persisted,
+                    detail,
+                    pr_number=pr_number,
+                    configured=scheduler_contract,
+                    start_round_number=lambda: None,
+                    during="qualification",
+                ),
+            )
+        except AgentLoopError as exc:
+            if "no qualification or merge is permitted" in str(exc):
+                raise
+            raise AgentLoopError(
+                f"{exc} No qualification or merge is permitted."
+            ) from exc
     fresh_issue = issue_context
     fresh_parent = parent_issue_context
     fresh_approved_plan_context = approved_plan_context
     if issue_context is not None:
         fresh_issue = get_issue_context(runner, config=config, issue_number=issue_context.number)
+        if scheduler_contract is not None:
+            try:
+                reject_misplaced_pr_amendments(
+                    fresh_issue.comments, issue_number=fresh_issue.number
+                )
+            except AgentLoopError as exc:
+                raise AgentLoopError(
+                    f"{exc} No qualification or merge is permitted."
+                ) from exc
     if parent_issue_context is not None:
         fresh_parent = get_issue_context(
             runner, config=config, issue_number=parent_issue_context.number
@@ -17100,13 +17456,40 @@ def run_pr_loop(
             # no-reviewer diagnostic path as an in-round decode failure.
             stop_pre_panel(undecodable_history_message(exc), round_number=None)
             raise
+        # Signed reviewer-board amendments (#943) live on the PR itself, in
+        # the same comment list as the PR scheduler records, for issue-mode
+        # and standalone runs alike.  A PR amendment on the owning issue is
+        # never ordered against PR comments; it fails closed.
+        if issue_context is not None:
+            reject_misplaced_pr_amendments(
+                issue_context.comments, issue_number=issue_context.number
+            )
+        pr_amendment_diagnostics: list[str] = []
+        pr_board_amendments = collect_reviewer_board_amendments(
+            initial_pr_context.comments,
+            flow="pr",
+            pr_number=pr_number,
+            ignored_sink=pr_amendment_diagnostics,
+        )
+        for diagnostic in pr_amendment_diagnostics:
+            log(config, f"PR #{pr_number}: {diagnostic}")
+        pr_contract_lineage: ContractLineage = resolve_contract_lineage(
+            startup_records,
+            pr_board_amendments,
+            scheduler_contract,
+            contract_from_metadata=_scheduler_contract_from_metadata,
+            drift_error=lambda persisted, detail: _pr_contract_drift_error(
+                persisted,
+                detail,
+                pr_number=pr_number,
+                configured=scheduler_contract,
+                start_round_number=lambda: _pr_amendment_start_round(
+                    initial_pr_context, configured_reviewers, scheduler_capabilities
+                ),
+            ),
+        )
+        pr_amendment_digest = pr_contract_lineage.active_digest
         for record in startup_records:
-            persisted_contract = _scheduler_contract_from_metadata(record.metadata)
-            if persisted_contract is not None and persisted_contract != scheduler_contract:
-                raise AgentLoopError(
-                    "PR review scheduler contract changed during resume; required reviewers, "
-                    "policy, and broad-path rules must remain immutable."
-                )
             if record.metadata.scheduler_force_full:
                 if record.metadata.scheduler_force_full_source == "operator":
                     scheduler_operator_force_full = True
@@ -17160,6 +17543,69 @@ def run_pr_loop(
                 else "aggregate"
             ),
         )
+        pr_amendment_start_round = (
+            resumed_round.round_number if resumed_round is not None else 1
+        )
+        require_amendment_activation(
+            pr_contract_lineage,
+            start_round_number=pr_amendment_start_round,
+            template=lambda amendment, round_number: _board_amendment_template(
+                flow="pr",
+                issue_number=None,
+                pr_number=pr_number,
+                persisted=pr_contract_lineage.contracts[
+                    pr_contract_lineage.amendments.index(amendment)
+                ],
+                removed=amendment.removed_reviewers,
+                start_round_number=round_number,
+            ),
+        )
+        pr_amendment_note: str | None = None
+        if pr_contract_lineage.active_amendment is not None:
+            pr_amended_contract = pr_contract_lineage.contracts[-1]
+            _pr_view, pr_amendment_reassignments = apply_board_amendment_to_ledger(
+                (
+                    (*resumed_round.prior_items, *resumed_round.current_round_new_items)
+                    if resumed_round is not None
+                    else ()
+                ),
+                removed_reviewers=pr_contract_lineage.removed_reviewers,
+                remaining_reviewers=pr_amended_contract.required_reviewers,
+                primary_reviewer=pr_amended_contract.primary_reviewer,
+            )
+            pr_amendment_note = amendment_summary_line(
+                pr_contract_lineage, pr_amendment_reassignments
+            )
+            log(config, f"PR #{pr_number}: {pr_amendment_note}")
+            if not amendment_audit_already_posted(
+                initial_pr_context.comments, pr_contract_lineage.active_amendment.digest
+            ):
+                post_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=render_amendment_audit_comment(
+                        pr_contract_lineage,
+                        start_round_number=pr_amendment_start_round,
+                        reassignments=pr_amendment_reassignments,
+                    ),
+                )
+
+        def pr_ledger_view(
+            items: Sequence[UnresolvedReviewItem],
+        ) -> tuple[UnresolvedReviewItem, ...]:
+            """Derived ledger with removed reviewers' ownership reassigned (#943)."""
+            if pr_contract_lineage.active_amendment is None:
+                return tuple(items)
+            amended = pr_contract_lineage.contracts[-1]
+            view, _reassignments = apply_board_amendment_to_ledger(
+                items,
+                removed_reviewers=pr_contract_lineage.removed_reviewers,
+                remaining_reviewers=amended.required_reviewers,
+                primary_reviewer=amended.primary_reviewer,
+            )
+            return view
+
         if resumed_round is not None:
             unresolved_items = list(resumed_round.prior_items)
             pr_compact_prior_summaries = list(resumed_round.compact_prior_summaries)
@@ -17806,7 +18252,7 @@ def run_pr_loop(
                         None,
                     )
                 obligations = _scheduler_obligations(
-                    prior_unresolved_items,
+                    pr_ledger_view(prior_unresolved_items),
                     required_reviewers=tuple(
                         agent_display_name(reviewer) for reviewer in configured_reviewers
                     ),
@@ -18065,7 +18511,8 @@ def run_pr_loop(
                     f"panel_evidence={bool(panel_evidence is not None and panel_evidence.opened)}; "
                     f"checkpoint_phase={scheduler_checkpoint_phase or 'none'}; head={current_pr_subject}; "
                     f"primary={scheduler_contract.primary_reviewer or 'none'}; active_owners="
-                    f"{', '.join(scheduler_decision.active_owners) or 'none'}",
+                    f"{', '.join(scheduler_decision.active_owners) or 'none'}"
+                    + (f"; {pr_amendment_note}" if pr_amendment_note else ""),
                 )
                 if scheduler_decision.selected_reviewers and not skip_reviewers_for_recovery and not conflict_pending:
                     post_pr_comment(
@@ -18082,12 +18529,14 @@ def run_pr_loop(
                             f"force-full: {scheduler_recorded_force_full} "
                             f"(source: {scheduler_recorded_force_full_source or 'none'}); "
                             "scheduler-policy calls avoided cumulatively: "
-                            f"{scheduler_calls_avoided}.{superseded_audit_text}",
+                            f"{scheduler_calls_avoided}.{superseded_audit_text}"
+                            + (f" {pr_amendment_note}" if pr_amendment_note else ""),
                             PostedRoundMetadata(
                                 flow="pr", role="summary", agent="Orchestrator",
                                 round_number=round_number, subject=current_pr_subject,
                                 prior_items=prior_unresolved_items, phase="scheduler-prelaunch",
                                 scheduler_contract=scheduler_contract.as_dict(),
+                                reviewer_board_amendment_digest=pr_amendment_digest,
                                 scheduler_previous_sha=scheduler_previous_sha,
                                 scheduler_current_sha=current_pr_subject,
                                 scheduler_obligation_digest=hashlib.sha256(
@@ -18179,6 +18628,7 @@ def run_pr_loop(
                             phase=phase,
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
                             scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                            reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
                             scheduler_previous_sha=(scheduler_previous_sha if selective_policy else None),
                             scheduler_current_sha=(current_pr_subject if selective_policy else None),
                             scheduler_obligation_digest=(
@@ -18923,6 +19373,7 @@ def run_pr_loop(
                                 disposition for values in prior_dispositions.values() for disposition in values
                             ), new_items=tuple(round_new_unresolved_items), phase="reconciliation",
                             scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                            reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
                             scheduler_previous_sha=(scheduler_previous_sha if selective_policy else None),
                             scheduler_current_sha=(current_pr_subject if selective_policy else None),
                             scheduler_obligation_digest=(
@@ -18973,7 +19424,7 @@ def run_pr_loop(
 
             if use_compact_pr_context:
                 unresolved_items, future_from_prior_items = _apply_unresolved_item_dispositions(
-                    prior_unresolved_items,
+                    pr_ledger_view(prior_unresolved_items),
                     prior_dispositions,
                     retain_future=False,
                     reconciliation_mode=(
@@ -18991,7 +19442,7 @@ def run_pr_loop(
                 )
             else:
                 unresolved_items, _future_items = _apply_unresolved_item_dispositions(
-                    prior_unresolved_items,
+                    pr_ledger_view(prior_unresolved_items),
                     prior_dispositions,
                     reconciliation_mode=(
                         "owner-scoped"
@@ -19000,7 +19451,9 @@ def run_pr_loop(
                     ),
                 )
                 future_from_prior_items = []
-            unresolved_items = [*unresolved_items, *round_new_unresolved_items]
+            unresolved_items = list(
+                pr_ledger_view([*unresolved_items, *round_new_unresolved_items])
+            )
             # Human-requirement acknowledgement is a structured reviewer/coder
             # contract, not a reviewer-item ownership decision. Once every
             # required reviewer has emitted the explicit acknowledgement on
@@ -20517,7 +20970,10 @@ def run_pr_loop(
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
                         )
-                        print(f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}.")
+                        print(
+                            f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}."
+                            + (f" {pr_amendment_note}" if pr_amendment_note else "")
+                        )
                         return 0
             if round_number == allowed_rounds:
                 raise AgentLoopError(
@@ -20999,6 +21455,7 @@ def run_pr_loop(
                 acquisition_outcome=coder_response.acquisition_outcome,
                 acquisition_returncode=coder_response.acquisition_returncode,
                 scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
                 scheduler_previous_sha=(pr_metadata.head_sha if selective_policy else None),
                 scheduler_current_sha=(
                     str(updated_pr_context.metadata.head_sha or "unknown")

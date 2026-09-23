@@ -12921,3 +12921,174 @@ def test_959_followup_without_evidence_posts_no_section_then_full_on_evidence(tm
     assert second.risk_test_matrix_evidence_full_round == second.round_number
     assert "<summary>Full matrix evidence (1 row)</summary>" in second_body
     assert "unchanged since round" not in second_body
+
+
+# --- Signed reviewer-board amendment (#943) -------------------------------
+
+from coding_review_agent_loop.board_amendment import (  # noqa: E402
+    format_reviewer_board_amendment_comment as _m943_amendment_comment,
+)
+
+
+def _m943_partial_pr_round(tmp_path, **payload):
+    """Codex and Gemini review; Antigravity's backend fails before it posts."""
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[],
+        **payload,
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
+    posted = _posted_scheduler_metadata(runner)
+    assert posted and all(
+        tuple(item.scheduler_contract["required_reviewers"]) == ("Codex", "Gemini", "Antigravity")
+        for item in posted
+    )
+    return runner
+
+
+def _m943_amendment_from_error(message):
+    start = message.index("Reviewer board amendment:")
+    template = message[start:]
+    return template.replace(
+        "<why the removed reviewer cannot be reached>", "Antigravity quota exhausted."
+    )
+
+
+def _m943_append(runner, body, login="operator"):
+    comments = runner.pr_payload.setdefault("comments", [])
+    comments.append(
+        {
+            "author": {"login": login},
+            "createdAt": f"2026-05-23T00:00:{len(comments):02d}Z",
+            "body": body,
+        }
+    )
+
+
+@pytest.mark.parametrize("linked_issue", [False, True], ids=["standalone", "issue-mode"])
+def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkeypatch, linked_issue):
+    """Row pr-qualification, standalone (issue_context=None) and with a linked issue."""
+    payload = (
+        {
+            "issue_payload": {"number": 56, "title": "Linked issue", "body": "Scope."},
+            "pr_payload": {"body": "Fixes #56"},
+        }
+        if linked_issue
+        else {}
+    )
+    runner = _m943_partial_pr_round(tmp_path, **payload)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    calls_before = _agent_sequence(runner)
+
+    # No record: the drift error prints a filled PR amendment template.
+    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert _agent_sequence(runner) == calls_before
+    template = _m943_amendment_from_error(str(excinfo.value))
+    assert '"flow": "pr"' in template and '"pr_number": 77' in template
+    assert '"issue": null' in template
+
+    _m943_append(runner, template)
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: None
+    )
+    assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+
+    # The qualification gate re-reads the fresh PR comments, including the
+    # pre-amendment three-reviewer records, and accepts the amended board.
+    amended_contract = orchestrator.make_contract(
+        ("Codex", "Gemini"), "primary-then-panel", None, "Codex"
+    )
+    orchestrator._fresh_pr_qualification_snapshot(
+        runner,
+        config=reduced,
+        pr_number=77,
+        issue_context=None,
+        parent_issue_context=None,
+        scheduler_contract=amended_contract,
+    )
+    # The original board is no longer an acceptable configured contract.
+    with pytest.raises(AgentLoopError, match="no qualification or merge is permitted"):
+        orchestrator._fresh_pr_qualification_snapshot(
+            runner,
+            config=reduced,
+            pr_number=77,
+            issue_context=None,
+            parent_issue_context=None,
+            scheduler_contract=orchestrator.make_contract(
+                ("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex"
+            ),
+        )
+    assert "agy" not in _agent_sequence(runner)[len(calls_before):]
+    assert any("Reviewer board amendment applied." in comment for comment in runner.comments)
+    posted = _posted_scheduler_metadata(runner)
+    # Gemini's round-2 review was reused and Codex's approval carried, so no
+    # new scheduler record was needed; any that exists is digest-bound.
+    for item in posted:
+        board = tuple(item.scheduler_contract["required_reviewers"])
+        if item.reviewer_board_amendment_digest is not None:
+            assert board == ("Codex", "Gemini")
+        else:
+            assert board == ("Codex", "Gemini", "Antigravity")
+
+
+def test_pr_board_amendment_qualification_refuses_a_stale_contract(tmp_path, monkeypatch):
+    """Rows pr-qualification and digest-binding: the gate re-reads fresh PR comments."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
+    stale_contract = orchestrator.make_contract(
+        ("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex"
+    )
+    stale = _attach_round_metadata(
+        "A stale-board scheduler record posted while managed CI was running.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=9, subject="abc123",
+            phase="reconciliation", scheduler_contract=stale_contract.as_dict(),
+            scheduler_previous_sha=None, scheduler_current_sha="abc123",
+            scheduler_obligation_digest="0" * 16, scheduler_selected_reviewers=("Codex",),
+            scheduler_reasons=("stale",), scheduler_final_sweep=False,
+            scheduler_force_full=False, scheduler_calls_avoided=0,
+            scheduler_phase="primary", scheduler_primary_reviewer="Codex",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+
+    def wait_and_inject(*args, **kwargs):
+        _m943_append(runner, stale, login="bot")
+        return ManagedCiOutcome(status="passed", head_sha="abc123")
+
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait_and_inject)
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("stale contract must block merge")
+    )
+    with pytest.raises(AgentLoopError, match="no qualification or merge is permitted"):
+        run_pr_loop(runner, pr_number=77, config=reduced)
+
+
+def test_pr_board_amendment_on_the_owning_issue_fails_closed(tmp_path):
+    """Row wrong-surface: a pr amendment belongs on the PR, not the issue."""
+    record = _m943_amendment_comment(
+        flow="pr", issue=None, pr_number=77,
+        original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=1,
+        rationale="Antigravity quota exhausted.",
+    )
+    runner = FakeRunner(
+        issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        issue_comments=[
+            {"author": {"login": "operator"}, "createdAt": "2026-06-01T00:00:00Z", "body": record}
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+    with pytest.raises(AgentLoopError, match="Post this record on PR #77"):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, reviewer=("codex", "gemini")))
+    assert _agent_sequence(runner) == []
