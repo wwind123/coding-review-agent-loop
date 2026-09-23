@@ -2430,6 +2430,22 @@ PLAN_DEMOTED_MACHINE_ITEM_NOTE = (
 )
 
 
+def _is_legacy_promoted_plan_item(item: UnresolvedReviewItem) -> bool:
+    """Recognize exactly what ``_legacy_machine_promotion`` made of a plan item."""
+    return (
+        item.is_machine_obligation
+        and item.reviewer == "Orchestrator"
+        and item.item_id not in {"item-merge-conflict", "item-human-requirements-acknowledgement"}
+        and item.authority in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY}
+        and item.obligation_kind == "unknown"
+        and item.obligation_identity == f"unknown:{item.item_id}"
+        and item.lifecycle == "repair_required"
+        and item.candidate_head_sha is None
+        and item.status in {"blocking", "same-pr"}
+        and not any(note.startswith("Invalid persisted machine") for note in item.notes)
+    )
+
+
 def _demote_plan_machine_item(item: UnresolvedReviewItem) -> UnresolvedReviewItem:
     """Return a plan-flow machine record to the ordinary finding representation.
 
@@ -2443,8 +2459,14 @@ def _demote_plan_machine_item(item: UnresolvedReviewItem) -> UnresolvedReviewIte
     reviewers disposition it like every other plan finding; the
     human-requirements gate still re-checks acknowledgements each round and
     re-injects a fresh item if they remain missing.
+
+    Only the exact legacy-promotion shape is restored.  A malformed or
+    otherwise unrecognized machine record (for example the ``unknown`` blocker
+    the decoder mints for an invalid persisted field) stays a machine
+    obligation, so the planning loop stops on it with a diagnostic instead of
+    letting a reviewer approval clear corrupted state.
     """
-    if not item.is_machine_obligation:
+    if not _is_legacy_promoted_plan_item(item):
         return item
     notes = item.notes
     if PLAN_DEMOTED_MACHINE_ITEM_NOTE not in notes:

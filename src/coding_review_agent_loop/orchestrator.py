@@ -11826,7 +11826,8 @@ def _run_plan_first_loop(
         # A machine obligation has no planning clearance path: reviewer
         # dispositions are evidence only, so after a unanimous approval it
         # would drive another revision every round forever (#1005).  Recovery
-        # demotes such records, so reaching this is a defect; stop with a
+        # demotes only the recognized legacy promotion; a malformed or
+        # unrecognized machine record stays fail-closed here, stopping with a
         # diagnostic naming the items instead of revising again.
         unclearable_plan_items = [item for item in must_fix_items if item.is_machine_obligation]
         if all_approved and unclearable_plan_items:

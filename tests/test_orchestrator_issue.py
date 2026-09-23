@@ -4977,13 +4977,13 @@ def test_issue_loop_plan_first_resume_clears_orchestrator_item_on_unanimous_appr
     assert runner.comments[-1].startswith("Planning complete for issue #56.")
 
 
-def test_issue_loop_plan_first_stops_when_only_unclearable_items_block_approval(
-    tmp_path, monkeypatch
-):
-    """Defense in depth (#1005): never revise an approved plan for an item no one can clear."""
-    import coding_review_agent_loop.round_state as round_state_module
+def test_issue_loop_plan_first_stops_when_only_unclearable_items_block_approval(tmp_path):
+    """A malformed plan machine record fails closed instead of revising forever (#1005).
 
-    monkeypatch.setattr(round_state_module, "_demote_plan_machine_items", tuple)
+    Recovery restores only the recognized legacy promotion; any other machine
+    record (here the decoder's invalid-record blocker) must neither be cleared
+    by a reviewer approval nor drive another revision.
+    """
     current_plan = "Revised plan.\n- Add state reconstruction.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     subject = _plan_subject(current_plan)
     machine_item = UnresolvedReviewItem(
@@ -4996,7 +4996,8 @@ def test_issue_loop_plan_first_stops_when_only_unclearable_items_block_approval(
         authority="unknown",
         obligation_kind="unknown",
         lifecycle="repair_required",
-        obligation_identity="unknown:item-1",
+        obligation_identity="invalid-machine-record",
+        notes=("Invalid persisted machine record: corrupted.",),
     )
     coder_comment = _attach_round_metadata(
         current_plan,

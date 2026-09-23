@@ -1354,6 +1354,95 @@ def test_plan_flow_demotes_persisted_machine_obligation_to_reviewer_finding() ->
     assert any("#1005" in note for note in demoted.notes)
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # The decoder's blocker for an invalid persisted machine field/record.
+        {
+            "obligation_identity": "invalid-machine-record",
+            "notes": ("Invalid persisted machine field: authority",),
+        },
+        # A machine record that is not the legacy promotion shape.
+        {"reviewer": "Codex"},
+        {"obligation_identity": "unknown:item-99"},
+    ],
+)
+def test_plan_flow_keeps_unrecognized_machine_record_fail_closed(overrides) -> None:
+    item = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic blocker.",
+        status="blocking",
+        source_status="blocking",
+        authority=UNKNOWN_MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="unknown:item-7",
+    )
+    from dataclasses import replace as _replace
+
+    item = _replace(item, **overrides)
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=4,
+            subject="plan-subject",
+            prior_items=(item,),
+        ),
+    )
+
+    kept = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert kept.is_machine_obligation
+    remaining, _future = _apply_unresolved_item_dispositions(
+        [kept],
+        {
+            "item-7": [
+                ReviewItemDisposition(
+                    reviewer="Codex", item_id="item-7", disposition="resolved", note="Looks fine."
+                )
+            ]
+        },
+        same_status="same-plan",
+    )
+    assert [entry.item_id for entry in remaining] == ["item-7"]
+
+
+def test_plan_flow_keeps_invalid_persisted_authority_fail_closed() -> None:
+    payload = {
+        "flow": "plan",
+        "role": "coder",
+        "agent": "Claude",
+        "round_number": 4,
+        "subject": "plan-subject",
+        "prior_items": [
+            {
+                "item_id": "item-7",
+                "reviewer": "Orchestrator",
+                "source_round": 3,
+                "text": "Synthetic blocker.",
+                "status": "blocking",
+                "source_status": "blocking",
+                "authority": 17,
+                "obligation_kind": "unknown",
+            }
+        ],
+    }
+
+    kept = _extract_round_metadata_records(
+        [SimpleNamespace(body=_comment(payload))], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert kept.is_machine_obligation
+    assert kept.obligation_identity == "invalid-machine-record"
+
+
 def test_pr_flow_still_promotes_orchestrator_item_to_unknown_machine_obligation() -> None:
     legacy = UnresolvedReviewItem(
         item_id="item-7",
