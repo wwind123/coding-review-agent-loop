@@ -13228,3 +13228,23 @@ def test_m985_pr_loop_stops_after_two_unchanged_head_coder_turns(tmp_path):
     assert "unchanged in 2 consecutive follow-up rounds" in str(excinfo.value)
     # The identical head is not reviewed a third time.
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
+
+
+
+def test_m985_unchanged_head_count_resets_after_an_external_head_advance():
+    from coding_review_agent_loop.orchestrator import (
+        MAX_UNCHANGED_HEAD_CODER_TURNS,
+        _UnchangedHeadTracker,
+    )
+
+    tracker = _UnchangedHeadTracker()
+    # The coder leaves A unchanged once; another actor then pushes B.
+    assert tracker.observe("A", "A") == 1
+    # B has had only one no-progress follow-up, so the loop must not stop.
+    assert tracker.observe("B", "B") == 1 < MAX_UNCHANGED_HEAD_CODER_TURNS
+    assert tracker.observe("B", "B") == MAX_UNCHANGED_HEAD_CODER_TURNS
+    # A follow-up that moves the head clears the count.
+    assert tracker.observe("B", "C") == 0
+    assert tracker.observe("C", "C") == 1
+    # An unknown reviewed head never counts.
+    assert tracker.observe(None, None) == 0

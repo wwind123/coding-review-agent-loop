@@ -8964,6 +8964,28 @@ class _PlanSupersessionBinding:
 MAX_UNCHANGED_HEAD_CODER_TURNS = 2
 
 
+class _UnchangedHeadTracker:
+    """Count consecutive coder follow-ups that left one PR head unchanged (#985).
+
+    The count belongs to a single head: a follow-up on any other head,
+    including one advanced externally between rounds, starts a fresh count,
+    and a follow-up that moves the head clears it.
+    """
+
+    def __init__(self) -> None:
+        self.head_sha: str | None = None
+        self.count = 0
+
+    def observe(self, reviewed_head: str | None, head_after_followup: str | None) -> int:
+        if not reviewed_head or head_after_followup != reviewed_head:
+            self.head_sha, self.count = None, 0
+        elif reviewed_head == self.head_sha:
+            self.count += 1
+        else:
+            self.head_sha, self.count = reviewed_head, 1
+        return self.count
+
+
 def _child_plan_admissibility_failure(
     parent_plan_context: ApprovedPlanContext,
     child_plan_context: ApprovedPlanContext,
@@ -16336,8 +16358,7 @@ def run_pr_loop(
             stopped="no approval or merge was attempted",
         )
 
-    # Consecutive coder follow-ups that left the PR head unchanged (#985).
-    unchanged_head_coder_turns = 0
+    unchanged_head_tracker = _UnchangedHeadTracker()
     try:
         bootstrap_cwd = github_bootstrap_cwd(config)
         initial_pr_context = get_pr_review_context(
@@ -21754,10 +21775,9 @@ def run_pr_loop(
                         override_nonce=managed_ci_handoff.override_nonce,
                     )
             previous_head = pr_metadata.head_sha
-            if previous_head and updated_pr_context.metadata.head_sha == previous_head:
-                unchanged_head_coder_turns += 1
-            else:
-                unchanged_head_coder_turns = 0
+            unchanged_head_coder_turns = unchanged_head_tracker.observe(
+                previous_head, updated_pr_context.metadata.head_sha
+            )
             if unchanged_head_coder_turns >= MAX_UNCHANGED_HEAD_CODER_TURNS:
                 # Re-reviewing an identical diff reaches the same verdict every
                 # round; a finding a PR-mode coder turn cannot satisfy (such as

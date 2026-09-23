@@ -3740,7 +3740,9 @@ A PR follow-up coder turn that leaves the PR head
 unchanged is counted. After two consecutive such turns the loop stops with a
 human-review error instead of starting another review of the same diff, which
 could only repeat the same verdict until `--max-rounds` ran out. A turn that
-moves the head resets the count. For a planning child, the error also names the
+moves the head resets the count, and the count belongs to one head: a round
+that starts on a different head, for example after an external push, starts
+from zero. For a planning child, the error also names the
 signed child-plan supersession route and the issue-mode rerun command, because
 a finding that requires re-planning can never be satisfied by a PR-mode coder
 turn.
