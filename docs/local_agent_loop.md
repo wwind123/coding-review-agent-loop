@@ -419,7 +419,203 @@ descendants remain part of the host session and receive prompt guidance plus
 the managed wrapper when used. The aggregate is per user manager, not a
 cross-user host isolation boundary.
 
+Parallel test workers are budgeted against these limits; see
+[Parallel test-worker budget](#parallel-test-worker-budget).
+
+### Parallel test-worker budget
+
+Parallel test workers multiply memory, so every loop derives an explicit
+test-worker budget from the containment that actually applies, exports it to
+coder and repair agents as `AGENT_LOOP_TEST_WORKERS` (with the enforcement mode
+in `AGENT_LOOP_TEST_WORKER_ENFORCEMENT`), and enforces it for pytest-xdist in
+`agent-loop run-tests`.
+
+**Derivation.** `workers = min(cpu_term, mem_term)`, never below 1.
+
+- The CPU term uses `os.sched_getaffinity` where it exists and returns a
+  non-empty set, then `os.cpu_count()`, then 1, so derivation never raises on
+  macOS or other hosts without affinity support. It is further capped by
+  `ceil(quota / period)` of every `cpu.max` quota in the process's own cgroup
+  ancestry. `CPUWeight` is proportional sharing, not a cap, and is not used.
+- The memory ceiling is the minimum of a candidate set: usable host memory
+  (physical memory minus `--containment-os-headroom-percent`, always a
+  candidate when readable), the admitted child and aggregate `MemoryHigh`
+  (else `MemoryMax`) when the backend is the managed `systemd-cgroup-v2`
+  scope, and every `memory.high`/`memory.max` in the orchestrator's own cgroup
+  ancestry (for example an operator's outer
+  `systemd-run --user --scope -p MemoryHigh=9G`). A limit above physical
+  memory therefore never raises the ceiling.
+  `mem_term = floor((ceiling - 1 GiB reserve) / per-worker estimate)`, with a
+  1 GiB default per-worker estimate (`--test-worker-memory SIZE`).
+- With containment `off`, a process-group fallback, macOS, or non-systemd
+  hosts, the finite default policy values are advisory and ignored. If no
+  memory candidate is readable, the budget is `max(1, cpu_term // 2)` with
+  limiting factor `memory-unknown`. Preflight and prompts say
+  `no agent-loop memory ceiling enforced` unless a managed or ancestry limit
+  exists.
+- Only `/proc/self/cgroup`, host memory, and `cpu.max`, `memory.high` and
+  `memory.max` in the process's own cgroup ancestry are read; missing or racing
+  files are skipped.
+
+**Per-path sizing and timing.** Coder and repair budgets are derived *after*
+containment admission from the admitted handle, including a stricter live
+aggregate lease held by another agent-loop process, and the same value is
+exported to the agent and handed to its test broker. Broker tests attach to
+the requesting coder/repair scope, so they use that budget. A broker-unavailable
+`run-tests` inside a coder/repair scope inherits the exported value and may only
+lower it (child flags, ancestry limits). Only a genuinely standalone managed
+`run-tests` (no invocation ID) sizes from the admitted `test-gate` limits: it
+admits the scope first and binds the launcher to the effective command under
+the same lease. The prompt shows a preliminary pre-admission estimate; the
+launch-time environment value is authoritative. `containment-preflight` prints
+a preliminary budget with its source, limiting factor, backend and whether a
+ceiling is enforced.
+
+**Precedence.** In loop flows (`issue`, `pr`, ...) and standalone `run-tests`,
+`--test-workers N` replaces the derivation (raising or lowering it) and
+`--test-worker-enforcement {clamp,refuse,off}` sets the mode (default `clamp`).
+A `run-tests` with a parent (an inherited `AGENT_LOOP_TEST_WORKERS` or a broker)
+may only lower the budget and only tighten the mode (`off < clamp < refuse`);
+unparseable inherited values fail closed to 1 worker. The three flags are also
+accepted by the managed-command parser in both `--flag value` and
+`--flag=value` forms, so flagged wrappers keep workdir validation, evidence
+extraction and normalization.
+
+**Enforcement.** In `clamp` and `refuse` the wrapper injects a stdlib-only,
+in-process pytest plugin (`_agent_loop_worker_cap`, shipped as package data)
+through `PYTHONPATH` and `PYTEST_PLUGINS`, plus a wrapper-private
+`AGENT_LOOP_WORKER_CAP_SPEC`. A direct pytest command (after `env`, `timeout`,
+`nice`, `stdbuf`, `nohup`, `time` or `command` prefixes) also gets
+`-p _agent_loop_worker_cap` after its entry point; that later argv token
+re-enables the plugin even if config or `PYTEST_ADDOPTS` disables it. Every
+other command (make, scripts, tox, nox, npm, go, cargo, ...) keeps its argv
+unchanged, including any `env -i`/`-u` prefix, and receives the same inert
+environment; it is enforced whenever that environment reaches a pytest process
+and is recorded `not-observed` otherwise (for example tox without `passenv` for
+both variables, or an `env -i make test` prefix). `off` injects nothing. For a
+direct pytest, inline `env` segments cannot remove or forge the controlled
+variables: `-i`, `-u` and assignments are rewritten so the plugin, spec and (in
+clamp) the auto cap survive. The plugin requires pytest >= 8 (new-style pluggy wrappers); on
+older pluggy it defines no hooks and the run is reported unverified.
+
+The plugin acts on pytest's own final resolved options, whatever supplied them
+(any config file chosen by pytest's rootdir rules, `-c`, TOML or INI,
+`-o addopts`, `PYTEST_ADDOPTS`, argv, or a repository
+`pytest_xdist_auto_num_workers` hook):
+
+1. A pre-yield `pytest_cmdline_main` wrapper runs before xdist resolves
+   `-n`. Clamp lowers an over-budget integer (budget 1 becomes serial) and caps
+   `--maxprocesses` for `auto`/`logical`. Refuse judges
+   `min(value, maxprocesses)`, so `pytest -n 8 --maxprocesses=2` under budget 2
+   runs.
+2. A `pytest_xdist_auto_num_workers` wrapper takes the winning result
+   (xdist's or the repository's) and returns `min(result, budget)` in clamp; a
+   lower result is kept exactly. In clamp the wrapper also lowers the caller's
+   `PYTEST_XDIST_AUTO_NUM_WORKERS`; refuse leaves it untouched so the plugin can
+   refuse the real request.
+3. A tryfirst `pytest_xdist_setupnodes` wrapper trims the expanded spec list
+   (and `--tx`) to the budget, or refuses, after session-start and inner
+   setupnodes changes. Every gateway type counts (`popen`, `socket`, `ssh`,
+   ...); clamp keeps the first specs in order. An explicit `--tx` list needs
+   `--dist`/`-d` to distribute at all. It then writes the pre-creation
+   **decision** record: the enforced plan, not an observed count.
+4. `pytest_xdist_newgateway` counts the gateways NodeManager actually creates.
+5. A `pytest_runtestloop` wrapper writes the **confirmation** record before any
+   test runs, with the observed gateway count (`effective`), remote gateways,
+   and action `clamped`, `unchanged` or `exceeded`. Worker-restart gateways are
+   not counted. A first-test **executed** marker is informational only.
+
+Every refusal writes its refused record first and then raises a usage error,
+so pytest exits 4 before any gateway or test exists. Report writes are best
+effort: a write failure prints one stderr line and never changes pytest's exit
+status. xdist worker processes never enforce or write. Each top-level
+`pytest.main` in a process claims the spec for its own Config and reports under
+its own session; configs nested inside an active claim (pytester,
+`pytest.main` in a test) and child processes that inherit the environment are
+never enforced and write only a best-effort nested marker.
+
+The enforcement contract is deliberately narrow. A repository tryfirst
+`pytest_xdist_setupnodes` wrapper registered after the plugin can add gateways
+after the trim; the plugin cannot prevent that, reports `exceeded` with a
+warning, and never labels such a run enforced. A repository can also unregister
+the plugin. The plugin is a safety net against prompt slips, **not a sandbox**:
+cgroup memory limits remain the hard boundary.
+
+**Verification and evidence.** After a clamp/refuse run the wrapper reads the
+report. Evidence is suppressed only when it proves no test ran: a direct pytest
+whose single session wrote only a refused record (and no nested marker) exits
+with the wrapper configuration status 2, records no runtime observation or
+launcher-health row, and the broker returns `worker-budget-refused`. The only
+pre-spawn refusal is an argv `-p no:_agent_loop_worker_cap` in refuse mode (in
+clamp it is stripped with a notice). Every other report containing a refused
+record, for example a script running several pytest sessions, keeps the
+command's own exit status and evidence with caveat
+`worker-budget-refused-session`, because a missing report line never proves that
+no test ran. A direct pytest with no valid report is recorded with
+`worker-budget-unverified` whatever its exit status, including 4. Other caveats
+are `worker-budget-not-observed`, `-mixed`, `-partial-observation`, `-nested-session`,
+`-remote-gateways`, `-exceeded` and `-descendants-terminated`.
+
+**Broker boundary.** The parent-owned budget passed to the broker is
+authoritative. The broker takes the stricter of the parent and the client's
+requested values, overwrites the spec, control variables, plugin environment
+and (in clamp) the auto cap in the spawned environment, and applies its own
+effective mode to a plugin-disabling argv token. Results carry the executed
+argv, the report-derived cohort and the enforcement status; the journal keeps
+the requested argv plus a worker-budget caveat. The local fallback trusts the
+inherited environment and is advisory by comparison.
+
+**One command at a time.** In clamp and refuse the budget is a simultaneous
+ceiling for the whole invocation. Only the process that spawns the target (the
+broker handler or the local fallback) takes the command lane and a
+non-blocking per-invocation worker-budget lock, never the `run-tests` client.
+A second concurrent test command in the same invocation, including a nested
+`run-tests` launched from inside a running test command, gets
+`worker-budget-busy` (exit 125, nothing recorded). The lock lives in a
+uid-owned directory (`/run/user/<uid>/agent-loop/worker-budget`, else
+`/tmp/coding-review-agent-loop-<uid>/worker-budget`) that no caller environment
+can choose; an unsafe directory fails closed. The command lane is keyed on the
+requested command with worker-selection tokens removed and no budget or mode,
+so every worker spelling of one command shares a lane in every mode. After the
+target exits, its process group is terminated before the lock is released:
+the group is always signalled with `killpg` (SIGTERM, then SIGKILL after a
+short grace), independently of `/proc`, and the lock is released only once no
+live member remains. If a member survives the bounded wait after SIGKILL, a
+warning is printed and a small detached watcher inherits the lock and holds it
+until the group is gone, so the next command of the invocation keeps getting
+`worker-budget-busy` until then. Processes that escape into a new session (`setsid`, double fork) are outside
+the ceiling and bounded only by cgroup limits. Off mode takes no worker-budget
+lock and terminates nothing. Test suites that exercise `run-tests` itself must
+give the inner call its own environment (clear `AGENT_LOOP_INVOCATION_ID` and
+run from its own cwd), as this repository's `tests/conftest.py` does.
+
+**Runtime cohorts.** `test-runtime.json` cohorts are keyed on
+`(normalized command, environment fingerprint, workers)`. The normalized
+command never includes the injected plugin token. In clamp and refuse the
+`workers` label comes only from the plugin report: `serial` or a count needs a
+direct pytest with exactly one confirmed session with no remote gateways, action
+`clamped` or `unchanged`, and no nested marker. It describes the top-level
+runner only: a child pytest that a test launches with a filtered environment is
+unobservable test-body workload. Everything else, including every `other`
+command, is `unknown`. Off-mode runs and legacy rows are `serial` only when the
+direct-pytest argv ends xdist loading with `-p no:xdist`, and `unknown`
+otherwise (including `-n 0`, `-n N` and `--tx`), because `--maxprocesses` from
+any source or a repository `pytest_configure` can change the gateway count.
+Unknown rows are retained but never feed serial or explicit-count
+recommendations, so after upgrade most legacy commands restart timeout
+learning. Use clamp or refuse with direct pytest for learned parallel timings.
+
+**Concurrent loops and containment tiers.** Different invocations (for example
+two loops on different repositories in separate capped user scopes) never
+contend for the worker-budget lock; each sizes from its own scope's limits and
+memory governs. Coder and repair budgets come from their own admitted child
+profiles, reviewer turns get no budget, and the `test-gate` profile only sizes a
+standalone managed `run-tests`.
+
 ### Local test evidence
+
+Test commands are also subject to the
+[parallel test-worker budget](#parallel-test-worker-budget).
 
 Coder and repair turns start an invocation-local test broker when the managed
 wrapper is available. The broker uses a fresh mode-0700 runtime directory and

@@ -142,10 +142,13 @@ class CommandLaneLock:
         *,
         cwd: Path,
         env: Mapping[str, str] | None = None,
+        identity: str | None = None,
     ) -> "CommandLaneLock | None":
         values = env if env is not None else os.environ
         invocation_id = values.get("AGENT_LOOP_INVOCATION_ID", "standalone")
-        normalized = normalize_test_command(argv, cwd=cwd)
+        # ``identity`` replaces only the normalized-argv component; cwd and
+        # the invocation stay in the key exactly as before.
+        normalized = identity if identity is not None else normalize_test_command(argv, cwd=cwd)
         key = f"{cwd.resolve()}\0{normalized}\0{invocation_id}"
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         root = Path(values.get("XDG_RUNTIME_DIR", "")) / "agent-loop" / COMMAND_LANE_LOCK_DIR
@@ -201,9 +204,13 @@ class CommandLaneLock:
 
 
 def acquire_command_lane(
-    argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None = None,
+    identity: str | None = None,
 ) -> CommandLaneLock | None:
-    return CommandLaneLock.acquire(argv, cwd=cwd, env=env)
+    return CommandLaneLock.acquire(argv, cwd=cwd, env=env, identity=identity)
 
 
 @dataclass(frozen=True)
@@ -214,6 +221,20 @@ class ManagedTestInvocation:
     timeout_seconds: float | None = None
     memory_dir: Path | None = None
     prefix_argv: tuple[str, ...] = ()
+    test_workers: int | None = None
+    test_worker_memory: int | None = None
+    test_worker_enforcement: str | None = None
+
+
+_MANAGED_RUN_TESTS_OPTIONS = frozenset(
+    {
+        "--timeout-seconds",
+        "--memory-dir",
+        "--test-workers",
+        "--test-worker-memory",
+        "--test-worker-enforcement",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -361,6 +382,9 @@ def parse_managed_test_invocation(
 
     timeout: float | None = None
     memory_dir: Path | None = None
+    test_workers: int | None = None
+    test_worker_memory: int | None = None
+    test_worker_enforcement: str | None = None
     seen: set[str] = set()
     index = prefix_len
     delimiter = False
@@ -375,7 +399,7 @@ def parse_managed_test_invocation(
                 "managed run-tests options must end with `--` before the inner command."
             )
         name, equals, value = token.partition("=")
-        if name not in {"--timeout-seconds", "--memory-dir"} or name in seen:
+        if name not in _MANAGED_RUN_TESTS_OPTIONS or name in seen:
             raise TestRuntimeConfigurationError(f"unknown or duplicate run-tests option: {token}")
         seen.add(name)
         if not equals:
@@ -385,6 +409,23 @@ def parse_managed_test_invocation(
             index += 1
         if name == "--timeout-seconds":
             timeout = _finite_positive(value, name="--timeout-seconds")
+        elif name in {"--test-workers", "--test-worker-memory", "--test-worker-enforcement"}:
+            from .test_workers import (
+                WorkerBudgetError,
+                parse_enforcement,
+                parse_worker_count,
+                parse_worker_memory,
+            )
+
+            try:
+                if name == "--test-workers":
+                    test_workers = parse_worker_count(value)
+                elif name == "--test-worker-memory":
+                    test_worker_memory = parse_worker_memory(value)
+                else:
+                    test_worker_enforcement = parse_enforcement(value)
+            except WorkerBudgetError as exc:
+                raise TestRuntimeConfigurationError(str(exc)) from exc
         else:
             if not value or value.startswith("-"):
                 raise TestRuntimeConfigurationError("--memory-dir requires a path value.")
@@ -394,7 +435,10 @@ def parse_managed_test_invocation(
         raise TestRuntimeConfigurationError(
             "managed run-tests requires `--` followed by a non-empty inner command."
         )
-    return ManagedTestInvocation(tokens[index:], timeout, memory_dir, tokens[:prefix_len])
+    return ManagedTestInvocation(
+        tokens[index:], timeout, memory_dir, tokens[:prefix_len],
+        test_workers, test_worker_memory, test_worker_enforcement,
+    )
 
 
 _MANAGED_EXECUTION_PREFIX_VALUE_OPTIONS = {
@@ -1357,8 +1401,17 @@ def record_test_observation(
     timestamp: datetime | None = None,
     containment: Mapping[str, object] | None = None,
     lane: str | None = None,
+    workers: str | None = None,
+    executed_argv: Sequence[str] | None = None,
+    worker_enforcement: str | None = None,
+    caveats: Sequence[str] = (),
 ) -> bool:
-    """Append a bounded observation; persistence failure never affects execution."""
+    """Append a bounded observation; persistence failure never affects execution.
+
+    ``workers`` is the cohort label (``serial``, a count or ``unknown``).  When
+    omitted it is derived from ``argv`` with the proven-serial rule, so an
+    unconfirmed run never gains a numeric cohort.
+    """
     if memory_dir is None:
         return False
     try:
@@ -1386,15 +1439,28 @@ def record_test_observation(
             }
             if lane is not None:
                 observation["lane"] = lane
+            from .test_workers import argv_only_workers_label, row_workers_label
+
+            observation["workers"] = workers or argv_only_workers_label(argv)
+            if executed_argv is not None:
+                observation["executed_argv"] = [str(item) for item in executed_argv]
+            if worker_enforcement is not None:
+                observation["worker_enforcement"] = worker_enforcement
+            if caveats:
+                observation["caveats"] = [str(item) for item in caveats]
             if containment is not None:
                 # Evidence is already bounded by the runner.  Keep only JSON
                 # values and expose unsupported telemetry explicitly.
                 observation["containment"] = dict(containment)
             rows = payload["observations"]
             rows.append(observation)
-            by_cohort: dict[tuple[str, str], list[dict]] = defaultdict(list)
+            by_cohort: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
             for row in rows:
-                key = (str(row.get("normalized_command", "")), str(row.get("environment_fingerprint", "")))
+                key = (
+                    str(row.get("normalized_command", "")),
+                    str(row.get("environment_fingerprint", "")),
+                    row_workers_label(row),
+                )
                 by_cohort[key].append(row)
             cohorts = sorted(
                 by_cohort.items(),
@@ -2397,8 +2463,17 @@ def recommend_timeout(
     now: datetime | None = None,
     normalized_command_override: str | None = None,
     fingerprint_override: str | None = None,
+    workers: str | None = None,
 ) -> RuntimeRecommendation:
+    """Recommend a watchdog from the (command, fingerprint, workers) cohort.
+
+    ``workers`` defaults to the proven-serial argv label.  Unknown rows only
+    feed an unknown-cohort lookup, never serial or explicit-count ones.
+    """
+    from .test_workers import argv_only_workers_label, row_workers_label
+
     ceiling = validate_timeout_ceiling(policy_ceiling_seconds, name="policy ceiling")
+    cohort = workers or argv_only_workers_label(argv)
     normalized = (
         normalized_command_override
         if normalized_command_override is not None
@@ -2415,6 +2490,8 @@ def recommend_timeout(
     matching: list[dict] = []
     for row in rows:
         if row.get("normalized_command") != normalized or row.get("environment_fingerprint") != fingerprint:
+            continue
+        if row_workers_label(row) != cohort:
             continue
         stamp = _timestamp(row.get("timestamp"))
         if stamp is None or stamp < cutoff:

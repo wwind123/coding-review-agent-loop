@@ -1645,3 +1645,303 @@ def test_report_side_consumers_pass_the_launcher_opt_in_explicitly():
 
     signature = inspect.signature(runtime.parse_managed_test_invocation)
     assert signature.parameters["allow_command_name_launcher"].default is False
+
+
+# ---------------------------------------------------------------------------
+# Parallel test-worker budget (issue #848)
+# ---------------------------------------------------------------------------
+
+try:  # pragma: no cover - depends on the dev extra
+    import xdist as _xdist  # noqa: F401
+
+    _HAS_XDIST = True
+except ImportError:  # pragma: no cover
+    _HAS_XDIST = False
+
+needs_xdist = pytest.mark.skipif(not _HAS_XDIST, reason="pytest-xdist is not installed")
+
+_WORKER_TESTS = "def test_one():\n    pass\n\ndef test_two():\n    pass\n\ndef test_three():\n    pass\n"
+
+
+def _worker_project(tmp_path: Path, files: dict[str, str] | None = None) -> Path:
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "test_cases.py").write_text(_WORKER_TESTS, encoding="utf-8")
+    for name, text in (files or {}).items():
+        (project / name).write_text(text, encoding="utf-8")
+    return project
+
+
+@pytest.fixture
+def worker_cli(tmp_path, monkeypatch):
+    for name in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_XDIST_AUTO_NUM_WORKERS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", f"worker-cli-{os.getpid()}-{time.monotonic_ns()}")
+    project = _worker_project(tmp_path)
+    monkeypatch.chdir(project)
+    return project
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--test-workers", "2", "--test-worker-memory", "2G", "--test-worker-enforcement=refuse"],
+        ["--test-workers=2", "--test-worker-memory=2G", "--test-worker-enforcement", "refuse"],
+    ],
+)
+def test_managed_invocation_accepts_worker_flags(tmp_path, flags):
+    from coding_review_agent_loop.test_workers import parse_worker_memory
+
+    argv = [
+        "/usr/local/bin/agent-loop", "run-tests", *flags, "--timeout-seconds", "60", "--",
+        "pytest", "-n", "4",
+    ]
+    parsed = runtime.parse_managed_test_invocation(argv)
+    assert parsed.inner_argv == ("pytest", "-n", "4")
+    assert parsed.test_workers == 2
+    assert parsed.test_worker_memory == parse_worker_memory("2G")
+    assert parsed.test_worker_enforcement == "refuse"
+    assert parsed.timeout_seconds == 60
+    assert runtime.normalize_test_command(argv, cwd=tmp_path) == runtime.normalize_test_command(
+        ["pytest", "-n", "4"], cwd=tmp_path
+    )
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--test-workers", "2", "--test-workers", "3"],
+        ["--test-workers", "0"],
+        ["--test-worker-memory", "max"],
+        ["--test-worker-enforcement", "sometimes"],
+    ],
+)
+def test_managed_invocation_rejects_bad_worker_flags(flags):
+    with pytest.raises(runtime.TestRuntimeConfigurationError):
+        runtime.parse_managed_test_invocation(["/usr/bin/agent-loop", "run-tests", *flags, "--", "pytest"])
+
+
+def test_cli_parser_validates_worker_flags():
+    parser = build_parser()
+    args = parser.parse_args(["run-tests", "--test-workers", "3", "--test-worker-enforcement", "off", "--", "pytest"])
+    assert args.test_workers == 3 and args.test_worker_enforcement == "off"
+    for bad in (["--test-workers", "0"], ["--test-workers", "x"], ["--test-worker-memory", "max"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["run-tests", *bad, "--", "pytest"])
+
+
+def test_loop_flow_worker_override_reaches_config_and_runner(tmp_path):
+    from coding_review_agent_loop.config import config_from_args
+    from coding_review_agent_loop.runner import Runner
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "issue", "1", "--repo", "o/r", "--test-workers", "8", "--test-worker-enforcement", "refuse",
+    ])
+    assert args.test_workers == 8
+    runner = Runner(dry_run=True)
+    config = config_from_args(args, runner, invocation_argv=("agent-loop",))
+    runner.configure_from_config(config)
+    assert runner.test_workers == 8 and runner.test_worker_enforcement == "refuse"
+    assert runner.derive_worker_budget(None).workers == 8
+    assert runner.derive_worker_budget(None).source == "operator"
+
+
+def test_cli_same_command_contends_for_one_lane_across_modes(tmp_path, monkeypatch):
+    from coding_review_agent_loop.test_workers import worker_lane_identity
+
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "lane-mode-test")
+    held_command = [sys.executable, "-m", "pytest", "-n", "8", "tests/"]
+    lock = runtime.acquire_command_lane(
+        held_command, cwd=tmp_path, env=os.environ,
+        identity=worker_lane_identity(held_command, cwd=tmp_path),
+    )
+    assert lock is not None
+    try:
+        for mode in ("off", "clamp", "refuse"):
+            for spelling in (["-n", "12"], ["--numprocesses=12"], ["-n", "auto"], []):
+                assert main([
+                    "run-tests", "--test-worker-enforcement", mode, "--memory-dir", str(memory), "--",
+                    sys.executable, "-m", "pytest", *spelling, "tests/",
+                ]) == runtime.OVERLAP_REJECTED_EXIT_CODE
+    finally:
+        lock.close()
+    assert runtime.load_runtime_memory(memory) == []
+
+
+def test_cli_worker_budget_busy_records_nothing(tmp_path, monkeypatch):
+    from coding_review_agent_loop.test_workers import WorkerBudgetLock
+
+    memory = tmp_path / "memory"
+    marker = tmp_path / "spawned"
+    monkeypatch.chdir(tmp_path)
+    invocation = f"busy-{os.getpid()}-{time.monotonic_ns()}"
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", invocation)
+    held, _ = WorkerBudgetLock.acquire(invocation_id=invocation, cwd=tmp_path)
+    assert held is not None
+    try:
+        for command in (
+            [sys.executable, "-c", f"open({str(marker)!r}, 'w')"],
+            ["sh", "-c", f"touch {marker}"],
+        ):
+            assert main(["run-tests", "--memory-dir", str(memory), "--", *command]) == 125
+        # Off mode takes no worker-budget lock.
+        assert main([
+            "run-tests", "--test-worker-enforcement", "off", "--memory-dir", str(memory), "--",
+            sys.executable, "-c", "pass",
+        ]) == 0
+    finally:
+        held.close()
+    assert not marker.exists()
+    rows = runtime.load_runtime_memory(memory)
+    assert len(rows) == 1 and rows[0]["worker_enforcement"] == "off"
+    assert main(["run-tests", "--memory-dir", str(memory), "--", sys.executable, "-c", "pass"]) == 0
+
+
+def test_cli_inherited_budget_is_only_lowered(tmp_path, monkeypatch, capsys):
+    from coding_review_agent_loop import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKERS", "4")
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_ENFORCEMENT", "clamp")
+    args = build_parser().parse_args(["run-tests", "--test-workers", "8", "--test-worker-enforcement", "off", "--", "x"])
+    resolved = cli_module._resolve_run_tests_worker_budget(args, broker_present=False)
+    assert resolved.budget.workers <= 4 and resolved.budget.enforcement == "clamp"
+    args = build_parser().parse_args(["run-tests", "--test-workers", "2", "--test-worker-enforcement", "refuse", "--", "x"])
+    resolved = cli_module._resolve_run_tests_worker_budget(args, broker_present=False)
+    assert resolved.budget.workers == 2 and resolved.budget.enforcement == "refuse"
+    monkeypatch.delenv("AGENT_LOOP_TEST_WORKERS")
+    monkeypatch.delenv("AGENT_LOOP_TEST_WORKER_ENFORCEMENT")
+    args = build_parser().parse_args(["run-tests", "--test-workers", "64", "--", "x"])
+    standalone = cli_module._resolve_run_tests_worker_budget(args, broker_present=False)
+    assert standalone.budget.workers == 64 and standalone.budget.source == "operator"
+
+
+def test_cli_other_command_records_not_observed(tmp_path, monkeypatch):
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+    assert main(["run-tests", "--memory-dir", str(memory), "--", sys.executable, "-c", "pass"]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "unknown"
+    assert row["worker_enforcement"] == "not-observed"
+    assert "worker-budget-not-observed" in row["caveats"]
+    assert row["executed_argv"] == [sys.executable, "-c", "pass"]
+
+
+def test_legacy_and_unknown_rows_never_feed_serial_or_count_recommendations(tmp_path):
+    memory = tmp_path / "memory"
+    for argv in (["pytest", "-n", "0"], ["pytest", "-n", "4"], ["pytest", "-n", "8", "--maxprocesses=2"], ["pytest"]):
+        _record(memory, tmp_path, argv, outcome="passed", elapsed=400)
+    rows = runtime.load_runtime_memory(memory)
+    assert {row["workers"] for row in rows} == {"unknown"}
+    for argv, label in ((["pytest", "-n", "4"], "4"), (["pytest", "-n", "0"], "serial")):
+        recommendation = runtime.recommend_timeout(
+            memory, argv=argv, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now(), workers=label,
+        )
+        assert recommendation.successful_samples == 0
+    # Serial and parallel samples of one command never blend.
+    command = ["pytest", "tests/"]
+    for elapsed, label in ((100, "serial"), (110, "serial"), (30, "2")):
+        assert runtime.record_test_observation(
+            memory, argv=command, cwd=tmp_path, outcome="passed", elapsed_seconds=elapsed,
+            attempted_timeout_seconds=1800, policy_ceiling_seconds=1800, commit="abc",
+            timestamp=_now(), workers=label,
+        )
+    serial = runtime.recommend_timeout(memory, argv=command, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now(), workers="serial")
+    parallel = runtime.recommend_timeout(memory, argv=command, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now(), workers="2")
+    assert serial.successful_samples == 2 and parallel.successful_samples == 1
+    assert parallel.median_seconds == 30
+
+
+@needs_xdist
+def test_cli_local_clamp_records_report_cohort(worker_cli, tmp_path, capsys):
+    memory = tmp_path / "memory"
+    command = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "--numprocesses=12"]
+    assert main(["run-tests", "--test-workers", "2", "--memory-dir", str(memory), "--", *command]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "2"
+    assert row["worker_enforcement"] == "clamped"
+    assert "_agent_loop_worker_cap" in row["executed_argv"]
+    assert "_agent_loop_worker_cap" not in row["normalized_command"]
+    assert row["normalized_command"] == runtime.normalize_test_command(command, cwd=worker_cli)
+    captured = capsys.readouterr()
+    assert "clamped worker request 12" in captured.err
+    assert "top-level runner" in captured.err
+
+
+@needs_xdist
+def test_cli_local_direct_refusal_records_nothing(worker_cli, tmp_path):
+    memory = tmp_path / "memory"
+    assert main([
+        "run-tests", "--test-workers", "2", "--test-worker-enforcement", "refuse", "--memory-dir", str(memory),
+        "--", sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", "8",
+    ]) == 2
+    assert runtime.load_runtime_memory(memory) == []
+    assert runtime.load_launcher_health(memory) == []
+    assert main([
+        "run-tests", "--test-workers", "2", "--test-worker-enforcement", "refuse", "--memory-dir", str(memory),
+        "--", sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", "8", "--maxprocesses=2",
+    ]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "2" and row["worker_enforcement"] == "unchanged"
+
+
+@needs_xdist
+def test_cli_local_unverified_when_repository_unregisters_plugin(tmp_path, monkeypatch):
+    for name in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_XDIST_AUTO_NUM_WORKERS"):
+        monkeypatch.delenv(name, raising=False)
+    project = _worker_project(tmp_path, {
+        "conftest.py": (
+            "def pytest_configure(config):\n"
+            "    plugin = config.pluginmanager.get_plugin('_agent_loop_worker_cap')\n"
+            "    config.pluginmanager.unregister(plugin)\n"
+        ),
+    })
+    monkeypatch.chdir(project)
+    memory = tmp_path / "memory"
+    assert main([
+        "run-tests", "--test-workers", "2", "--memory-dir", str(memory),
+        "--", sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", "2",
+    ]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "unknown"
+    assert row["worker_enforcement"] == "unverified"
+    assert "worker-budget-unverified" in row["caveats"]
+
+
+@needs_xdist
+def test_cli_other_script_refused_session_keeps_status_and_evidence(worker_cli, tmp_path):
+    memory = tmp_path / "memory"
+    script = tmp_path / "run.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"{sys.executable} -m pytest -p no:cacheprovider -q -n 1\n"
+        f"{sys.executable} -m pytest -p no:cacheprovider -q -n 8\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    assert main([
+        "run-tests", "--test-workers", "2", "--test-worker-enforcement", "refuse",
+        "--memory-dir", str(memory), "--", str(script),
+    ]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["workers"] == "unknown"
+    assert row["worker_enforcement"] == "refused-in-command"
+    assert "worker-budget-refused-session" in row["caveats"]
+
+
+@needs_xdist
+def test_cli_off_mode_labels_only_proven_serial(worker_cli, tmp_path):
+    memory = tmp_path / "memory"
+    base = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q"]
+    assert main(["run-tests", "--test-worker-enforcement", "off", "--memory-dir", str(memory), "--", *base, "-n", "2"]) == 0
+    assert main(["run-tests", "--test-worker-enforcement", "off", "--memory-dir", str(memory), "--", *base, "-p", "no:xdist"]) == 0
+    labels = {
+        row["normalized_command"].rsplit(" ", 2)[-2:][0] + " " + row["normalized_command"].rsplit(" ", 1)[-1]: row["workers"]
+        for row in runtime.load_runtime_memory(memory)
+    }
+    assert labels == {"-n 2": "unknown", "-p no:xdist": "serial"}
+    assert {row["worker_enforcement"] for row in runtime.load_runtime_memory(memory)} == {"off"}

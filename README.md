@@ -845,6 +845,18 @@ runs produce advisory median/p95 recommendations with headroom; timeouts remain
 lower-bound evidence and are never treated as successful durations. Data is
 best-effort, retained to 20 samples per command/fingerprint cohort and 200
 cohorts, and becomes stale after 30 days or when relevant inputs change.
+Cohorts also key on the worker count, so serial and parallel durations never
+blend.
+
+`run-tests`, `containment-preflight` and the loop flows accept
+`--test-workers N`, `--test-worker-memory SIZE` and
+`--test-worker-enforcement {clamp,refuse,off}`. Coder and repair agents receive
+a containment-derived budget in `AGENT_LOOP_TEST_WORKERS`; in the default
+`clamp` mode an injected pytest plugin lowers over-budget pytest-xdist requests
+(`-n auto`, `-n 16`, config or `PYTEST_ADDOPTS`) to that budget, `refuse` rejects
+them before any test runs, and `off` only advertises the budget. See
+[Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
+
 Remembered commands are suggestions only: agents must inspect the checkout and
 select focused tests. Framework per-test limits, the wrapper whole-command
 watchdog, and the backend whole-turn timeout are separate. The backend turn

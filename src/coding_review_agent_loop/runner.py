@@ -37,6 +37,19 @@ from .test_runtime import (
     acquire_command_lane,
     probe_inner_launcher,
 )
+from .test_workers import (
+    CAVEAT_DESCENDANTS,
+    WORKER_BUDGET_BUSY_EXIT_CODE,
+    WORKER_BUDGET_REFUSED_EXIT_CODE,
+    WorkerBudget,
+    WorkerBudgetLock,
+    WorkerDecision,
+    analyze_worker_report,
+    apply_worker_budget,
+    terminate_process_group_descendants,
+    worker_budget_busy_message,
+    worker_lane_identity,
+)
 from .local_test_evidence import (
     EvidenceScope,
     ExecutionReferenceRegistry,
@@ -205,6 +218,14 @@ class ForegroundTestResult:
     suite_start: str = "not-started"
     diagnostic: str = ""
     health_provenance: str = "parent-runner"
+    # Worker-budget evidence (issue #848).  ``args`` is the executed argv;
+    # ``workers_cohort`` and ``worker_enforcement`` describe the top-level
+    # runner only.
+    workers_cohort: str | None = None
+    worker_enforcement: str | None = None
+    worker_caveats: tuple[str, ...] = ()
+    worker_notices: tuple[str, ...] = ()
+    descendants_terminated: int = 0
 
     def __post_init__(self) -> None:
         if self.wrapper_bootstrap not in WRAPPER_BOOTSTRAP_STATES:
@@ -272,6 +293,31 @@ def _close_held_fds(held_fds: tuple[int, int, int, int] | None) -> None:
             pass
 
 
+class _HeldTestLocks:
+    """The command lane plus the optional worker-budget lock for one command."""
+
+    def __init__(self, lane, worker_lock: WorkerBudgetLock | None, decision: WorkerDecision | None):
+        self._lane = lane
+        self._worker_lock = worker_lock
+        self._decision = decision
+
+    def retain_worker_lock_until_group_exits(self, pgid: int) -> None:
+        if self._worker_lock is not None:
+            self._worker_lock.hold_until_group_exits(pgid)
+            self._worker_lock = None
+
+    def close(self) -> None:
+        try:
+            if self._worker_lock is not None:
+                self._worker_lock.close()
+        finally:
+            try:
+                self._lane.close()
+            finally:
+                if self._decision is not None:
+                    self._decision.cleanup()
+
+
 def run_foreground_test(
     args: Sequence[str],
     *,
@@ -290,9 +336,20 @@ def run_foreground_test(
     process_finished: Callable[[subprocess.Popen], None] | None = None,
     wrapper_bootstrap: str = "unknown",
     health_provenance: str = "parent-runner",
+    worker_budget: WorkerBudget | None = None,
+    worker_budget_resizer: Callable[[InvocationHandle], WorkerBudget] | None = None,
+    worker_lock_root: Path | None = None,
 ) -> ForegroundTestResult:
-    """Run a command in the foreground, teeing output and bounding its process group."""
-    cmd = [str(value) for value in args]
+    """Run a command in the foreground, teeing output and bounding its process group.
+
+    ``worker_budget`` enables the test-worker budget.  It is never read from
+    ``env``: ``None`` means no injection, no plugin report and no worker-budget
+    lock.  With a budget, the effective argv/env are resolved before the
+    command lane and launcher probe; in clamp and refuse the per-invocation
+    worker-budget lock is held until the target's process group is gone.
+    """
+    requested_cmd = [str(value) for value in args]
+    cmd = list(requested_cmd)
     started = time.monotonic()
     if dry_run:
         print(f"[dry-run] ({cwd}) {' '.join(cmd)}")
@@ -303,8 +360,79 @@ def run_foreground_test(
         )
     if not cmd:
         raise AgentLoopError("Test command is empty.")
-    lane_lock = acquire_command_lane(cmd, cwd=cwd, env=env)
+
+    def notify(text: str) -> None:
+        if output_callback is not None:
+            output_callback(text + "\n")
+        if echo_output or output_callback is None:
+            print(text, file=sys.stderr, flush=True)
+
+    invocation_values = env if env is not None else os.environ
+    handle: InvocationHandle | None = None
+    decision: WorkerDecision | None = None
+    worker_lock: WorkerBudgetLock | None = None
+    spawn_environment = (
+        dict(env)
+        if env is not None and environment_is_complete
+        else ({**os.environ, **env} if env is not None else None)
+    )
+    standalone_managed = (
+        parent_cgroup_path is None
+        and containment_policy is not None
+        and containment_policy.mode != "off"
+        and not invocation_values.get("AGENT_LOOP_INVOCATION_ID")
+    )
+    if worker_budget is not None:
+        if standalone_managed:
+            # Admit first so a standalone managed run is sized from the
+            # admitted test-gate limits; the launcher binds to the effective
+            # argv later under the same lease.
+            handle = InvocationHandle.admit(
+                containment_policy, role=containment_role, env=env
+            )
+            if worker_budget_resizer is not None:
+                try:
+                    worker_budget = worker_budget_resizer(handle)
+                except BaseException:
+                    handle.close()
+                    raise
+        try:
+            decision = apply_worker_budget(
+                cmd,
+                spawn_environment if spawn_environment is not None else dict(os.environ),
+                cwd,
+                worker_budget,
+            )
+        except BaseException:
+            if handle is not None:
+                handle.close()
+            raise
+        if decision.refused:
+            if handle is not None:
+                handle.close()
+            decision.cleanup()
+            notify(decision.refused)
+            return ForegroundTestResult(
+                cmd, cwd, "worker-budget-refused", WORKER_BUDGET_REFUSED_EXIT_CODE,
+                0.0, timeout_seconds, decision.refused, None, False,
+                wrapper_bootstrap, "not-attempted", "not-started", decision.refused,
+                health_provenance, worker_enforcement="refused",
+            )
+        for notice in decision.notices:
+            notify(notice)
+        cmd = list(decision.argv)
+        spawn_environment = decision.env
+    lane_lock = acquire_command_lane(
+        requested_cmd,
+        cwd=cwd,
+        env=env,
+        identity=(worker_lane_identity(requested_cmd, cwd=cwd) if worker_budget is not None else None),
+    )
     if lane_lock is None:
+        if handle is not None:
+            handle.close()
+        if decision is not None:
+            decision.cleanup()
         print(OVERLAP_REJECTED_MESSAGE, file=sys.stderr, flush=True)
         return ForegroundTestResult(
             cmd, cwd, "overlap-rejected", OVERLAP_REJECTED_EXIT_CODE,
@@ -312,8 +440,30 @@ def run_foreground_test(
             wrapper_bootstrap, "not-attempted", "not-started", OVERLAP_REJECTED_MESSAGE,
             health_provenance,
         )
+    if worker_budget is not None and worker_budget.enforcing:
+        worker_lock, lock_problem = WorkerBudgetLock.acquire(
+            invocation_id=invocation_values.get("AGENT_LOOP_INVOCATION_ID"),
+            cwd=cwd,
+            root=worker_lock_root,
+        )
+        if worker_lock is None:
+            lane_lock.close()
+            if handle is not None:
+                handle.close()
+            if decision is not None:
+                decision.cleanup()
+            message = worker_budget_busy_message(worker_budget, lock_problem)
+            notify(message)
+            return ForegroundTestResult(
+                cmd, cwd, "worker-budget-busy", WORKER_BUDGET_BUSY_EXIT_CODE,
+                0.0, timeout_seconds, message, None, True,
+                wrapper_bootstrap, "not-attempted", "not-started", message,
+                health_provenance,
+            )
+    # Command lane first, worker-budget lock second; every later release
+    # path closes both in reverse order.
+    lane_lock = _HeldTestLocks(lane_lock, worker_lock, decision)
     selector = None
-    handle: InvocationHandle | None = None
     inherited_scope = False
     inherited_cgroup: Path | None = None
     before_cgroup: dict[str, object] = {}
@@ -323,11 +473,6 @@ def run_foreground_test(
     inner_probe_state = "unknown"
     held_fds: tuple[int, int, int, int] | None = None
     try:
-        spawn_environment = (
-            dict(env)
-            if env is not None and environment_is_complete
-            else ({**os.environ, **env} if env is not None else None)
-        )
         # Probe before allocating containment leases or broker handshake pipes.
         # The probe receives exactly the environment that the real target will
         # receive, including the ambient environment for partial overlays.
@@ -339,6 +484,8 @@ def run_foreground_test(
         )
         inner_probe_state = inner_probe.state
         if inner_probe.state == "failed":
+            if handle is not None:
+                handle.close()
             lane_lock.close()
             return ForegroundTestResult(
                 cmd, cwd, "launch-failed", None, time.monotonic() - started,
@@ -377,7 +524,6 @@ def run_foreground_test(
             # An explicit caller environment takes precedence; when it is
             # omitted, the wrapper's actual ambient environment determines
             # whether this is already inside an orchestrated invocation.
-            invocation_values = env if env is not None else os.environ
             if invocation_values.get("AGENT_LOOP_INVOCATION_ID"):
                 # A test wrapper launched from an already-contained agent is a
                 # descendant of that scope.  Keep it in the inherited cgroup
@@ -388,10 +534,15 @@ def run_foreground_test(
                 spawn_cmd = launch_cmd
             else:
                 try:
-                    handle = InvocationHandle.prepare(
-                        containment_policy, role=containment_role, target_argv=launch_cmd, env=env
-                    )
+                    if handle is None:
+                        handle = InvocationHandle.prepare(
+                            containment_policy, role=containment_role, target_argv=launch_cmd, env=env
+                        )
+                    else:
+                        handle.bind_target(launch_cmd)
                 except BaseException:
+                    if handle is not None:
+                        handle.close()
                     lane_lock.close()
                     raise
                 spawn_cmd = list(handle.launcher_argv)
@@ -454,9 +605,15 @@ def run_foreground_test(
             handle.refresh_report()
             before_cgroup = sample_cgroup(handle.cgroup_path, handle.capabilities)
             last_cgroup = dict(before_cgroup)
-    except (OSError, AgentLoopError) as exc:
+    except BaseException as exc:
         if handle is not None:
             handle.close()
+        if not isinstance(exc, (OSError, AgentLoopError)):
+            _close_held_fds(held_fds)
+            if proc is not None and process_finished is not None:
+                process_finished(proc)
+            lane_lock.close()
+            raise
         if held_fds is not None:
             for fd in held_fds:
                 try:
@@ -630,7 +787,33 @@ def run_foreground_test(
             cleanup_confirmed=True,
             diagnostics=("test wrapper inherited the active agent invocation scope",),
         )
-    lane_lock.close()
+    descendants_terminated = 0
+    descendants_unconfirmed = False
+    worker_caveats: tuple[str, ...] = ()
+    analysis = None
+    try:
+        if worker_budget is not None and worker_budget.enforcing:
+            # Descendants count against the worker ceiling until they are gone:
+            # terminate the target's process group before releasing the lock.
+            # Processes that escaped into a new session are outside it.
+            # The group is signalled even where /proc cannot enumerate it,
+            # and the lock is released only after termination is confirmed.
+            termination = terminate_process_group_descendants(proc.pid)
+            descendants_terminated = termination.count
+            descendants_unconfirmed = not termination.confirmed
+            if descendants_unconfirmed:
+                # A survivor still counts against the ceiling: the lock stays
+                # held (by a watcher) until the group is really gone.
+                lane_lock.retain_worker_lock_until_group_exits(proc.pid)
+        if decision is not None:
+            analysis = analyze_worker_report(
+                decision.report_path,
+                command_class=decision.command_class,
+                mode=decision.mode,
+                argv=requested_cmd,
+            )
+    finally:
+        lane_lock.close()
     outcome = "interrupted" if interrupted else ("timed_out" if timed_out else ("passed" if returncode == 0 else "failed"))
     inner_exec = "started"
     suite_start = "verified" if inner_probe_state == "verified" else "unknown"
@@ -639,12 +822,44 @@ def run_foreground_test(
         outcome = "launch-failed"
         inner_exec = "failed"
         suite_start = "not-started"
+    final_returncode = 124 if timed_out else 130 if interrupted else returncode
+    workers_cohort = None
+    worker_enforcement = None
+    worker_notices: tuple[str, ...] = ()
+    if analysis is not None:
+        workers_cohort = analysis.workers_cohort
+        worker_enforcement = analysis.enforcement
+        worker_caveats = analysis.caveats
+        worker_notices = analysis.notices
+        if analysis.direct_refusal and not timed_out and not interrupted and not target_exec_error:
+            # A single direct-pytest session that refused before any test ran:
+            # the configuration status, and nothing is recorded.
+            outcome = "worker-budget-refused"
+            final_returncode = WORKER_BUDGET_REFUSED_EXIT_CODE
+            suite_start = "not-started"
+    if descendants_terminated:
+        worker_caveats = (*worker_caveats, CAVEAT_DESCENDANTS)
+        worker_notices = (
+            *worker_notices,
+            f"agent-loop worker budget: terminated {descendants_terminated} lingering process(es) "
+            "left in the test command's process group",
+        )
+    if descendants_unconfirmed:
+        worker_notices = (
+            *worker_notices,
+            "agent-loop worker budget: WARNING a process in the test command's process group "
+            "was still alive after SIGKILL; the worker budget stays held until it exits",
+        )
+    for notice in worker_notices:
+        notify(notice)
     return ForegroundTestResult(
-        cmd, cwd, outcome, (124 if timed_out else 130 if interrupted else returncode),
+        cmd, cwd, outcome, final_returncode,
         elapsed, timeout_seconds, "\n".join(tail), evidence, False,
         wrapper_bootstrap, inner_exec, suite_start,
         "\n".join(handle.diagnostics) if handle is not None else "",
         health_provenance,
+        workers_cohort, worker_enforcement, worker_caveats, worker_notices,
+        descendants_terminated,
     )
 
 
@@ -787,6 +1002,11 @@ class Runner:
         self._latest_test_turn_id: str | None = None
         self._environment_registry = EnvironmentIdentityRegistry()
         self._containment_role = "coder"
+        # Operator worker-budget options (issue #848); None means derive.
+        self.test_workers: int | None = None
+        self.test_worker_memory: int | None = None
+        self.test_worker_enforcement: str = "clamp"
+        self.latest_worker_budget: WorkerBudget | None = None
 
     def set_containment_role(self, role: str | None) -> None:
         if role in {"coder", "reviewer", "repair", "test-gate"}:
@@ -798,6 +1018,12 @@ class Runner:
 
         values = dict(getattr(config, "__dict__", {}))
         self.containment_policy = policy_from_values(values)
+        from .test_workers import budget_from_values
+
+        workers, memory, mode = budget_from_values(values)
+        self.test_workers = workers
+        self.test_worker_memory = memory
+        self.test_worker_enforcement = mode or "clamp"
         self._containment_manifest = None
 
     def preflight_containment(self):
@@ -830,6 +1056,46 @@ class Runner:
                 raise AgentLoopError("Runner is shutting down after an interrupt; refusing to start new commands.")
             self._active_handles[handle.invocation_id] = handle
         return handle
+
+    def derive_worker_budget(self, handle: InvocationHandle | None) -> WorkerBudget:
+        """Derive the post-admission budget for a coder/repair turn.
+
+        Managed handle limits (already restricted by the live aggregate
+        lease) count only for the managed systemd backend; otherwise the
+        process-group rules size from host memory and cgroup ancestry.
+        """
+        from .test_workers import derive_worker_budget, resolve_worker_budget
+
+        from .test_workers import MANAGED_BACKEND
+
+        policy = self.containment_policy
+        managed = handle is not None and bool(getattr(handle, "managed", False))
+        derived = derive_worker_budget(
+            backend=(getattr(handle, "backend", MANAGED_BACKEND) if managed else "process-group"),
+            child_limits=(getattr(handle, "child_limits", None) if managed else None),
+            aggregate_limits=(getattr(handle, "aggregate_limits", None) if managed else None),
+            os_headroom_percent=(policy.os_headroom_percent if policy is not None else None),
+            per_worker_bytes=self.test_worker_memory,
+            enforcement=self.test_worker_enforcement,
+        )
+        return resolve_worker_budget(
+            derived,
+            operator_workers=self.test_workers,
+            operator_enforcement=self.test_worker_enforcement,
+            env={},
+            has_parent=False,
+        ).budget
+
+    def _apply_worker_budget_env(
+        self, role: str, handle: InvocationHandle | None, launch_env: dict[str, str]
+    ) -> WorkerBudget | None:
+        if role not in {"coder", "repair"}:
+            return None
+        budget = self.derive_worker_budget(handle)
+        # launch_env is consumed only at Popen, after admission.
+        launch_env.update(budget.environment())
+        self.latest_worker_budget = budget
+        return budget
 
     def _close_containment(self, handle: InvocationHandle | None) -> None:
         if handle is None:
@@ -1382,11 +1648,13 @@ class Runner:
                     launch_env.update(broker.environment)
                 handle = self._prepare_containment(cmd, role=inferred_role, env=launch_env)
                 launch_cmd = list(handle.launcher_argv) if handle is not None and handle.managed else cmd
+                worker_budget = self._apply_worker_budget_env(inferred_role, handle, launch_env)
                 if broker is not None:
                     broker.set_execution_context(
                         containment_handle=handle,
                         process_started=self._register_active_process,
                         process_finished=self._unregister_active_process,
+                        worker_budget=worker_budget,
                     )
 
                 def spawn() -> subprocess.Popen[str]:
@@ -1615,16 +1883,19 @@ class Runner:
                     allocated_fds = None
                     raise
 
+            pty_role = containment_role or self._containment_role or self._role_from_label(label)
             handle = self._prepare_containment(
                 cmd,
-                role=containment_role or self._containment_role or self._role_from_label(label),
+                role=pty_role,
                 env=launch_env,
             )
+            worker_budget = self._apply_worker_budget_env(pty_role, handle, launch_env)
             if broker is not None:
                 broker.set_execution_context(
                     containment_handle=handle,
                     process_started=self._register_active_process,
                     process_finished=self._unregister_active_process,
+                    worker_budget=worker_budget,
                 )
             if handle is not None and handle.managed:
                 # The closure reads this merged environment when the launcher
