@@ -158,7 +158,8 @@ its first planner turn. The same loop also absorbs deterministic plan-assembly
 failures on every plan-first run and semantic-patch payload rejections: repair
 may change only a semantic patch's envelope, so the recovered patch payload is
 validated on its own before repair is considered. Any payload rejection (a
-strict patch-schema failure, an unknown prior-item disposition, or an invalid
+strict patch-schema failure including a missing or wrong kind, an unknown
+prior-item disposition, or an invalid
 human-requirement disposition), including one masked by an envelope error,
 skips the repair model and becomes a replan diagnostic instead. Every plan prompt form carries the inherited obligations
 through one shared lossless renderer that shows exactly the compared form. Both

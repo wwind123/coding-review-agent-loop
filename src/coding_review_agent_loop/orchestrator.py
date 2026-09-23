@@ -3003,8 +3003,10 @@ def _semantic_patch_payload_rejection(
     payload defect that no repair could clear.  Any payload rejection -- a
     strict patch-schema failure or a ledger/disposition check -- is
     unsatisfiable by repair and goes to the bounded replan instead (#979).
-    A payload that cannot be recovered at all stays on the existing
-    semantic-patch integrity path.
+    That includes a recovered JSON object with a missing or wrong ``kind``,
+    which the repair integrity gate would refuse anyway.  Only text with no
+    recoverable JSON object stays on the existing semantic-patch integrity
+    path.
     """
     if isinstance(exc, SemanticPatchPayloadRejection):
         return text, str(exc)
@@ -3014,7 +3016,7 @@ def _semantic_patch_payload_rejection(
         if candidate is None:
             continue
         payload = recover_payload(candidate)
-        if not isinstance(payload, dict) or payload.get("kind") != "plan_revision_patch":
+        if not isinstance(payload, dict):
             continue
         try:
             payload_validator(payload)
@@ -5307,6 +5309,12 @@ def _validate_plan_revision_patch_payload(
     validator happened to report first (#979).  Every failure is raised as a
     ``SemanticPatchPayloadRejection``.
     """
+    if payload.get("kind") != "plan_revision_patch":
+        # Repair never runs on a non-patch payload (the integrity gate refuses
+        # it), so a missing or wrong kind is a replan diagnostic too.
+        raise SemanticPatchPayloadRejection(
+            "Structured response kind mismatch: expected `plan_revision_patch`."
+        )
     try:
         parsed = parse_plan_revision_patch(payload)
     except AgentLoopError as exc:

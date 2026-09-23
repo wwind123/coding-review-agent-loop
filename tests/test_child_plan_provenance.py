@@ -2106,11 +2106,31 @@ def test_m979_envelope_error_does_not_mask_a_payload_disposition_defect():
     assert "human_requirement_dispositions" in rejection[1]
 
 
-def test_m979_strict_patch_schema_failure_is_replanned_without_repair(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("defect", "expected"),
+    [
+        ("empty-operations", "operations"),
+        ("missing-kind", "kind mismatch"),
+        ("misspelled-kind", "kind mismatch"),
+    ],
+)
+def test_m979_strict_patch_schema_failure_is_replanned_without_repair(
+    tmp_path, monkeypatch, defect, expected
+):
     """#979 item: a parse-level payload error uses the bounded replan, not repair."""
     monkeypatch.setattr(orchestrator, "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
-    rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
+    if defect == "empty-operations":
+        rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
+    else:
+        payload = json.loads(
+            _m976_patch(fresh, summary=WEAK_SUMMARY).split("\n<!--", 1)[0]
+        )
+        if defect == "missing-kind":
+            del payload["kind"]
+        else:
+            payload["kind"] = "plan_revison_patch"
+        rejected = json.dumps(payload) + PLAN_FOOTER
     corrected = _m976_patch(fresh, summary="Corrected revision.")
     runner = _ChildPlanningRunner(
         claude_outputs=[fresh, rejected, corrected],
@@ -2128,7 +2148,8 @@ def test_m979_strict_patch_schema_failure_is_replanned_without_repair(tmp_path, 
     planner_prompts = _agent_prompts(runner, "claude")
     assert len(planner_prompts) == 3
     assert "Trusted orchestration correction record" in planner_prompts[2]
-    assert "operations" in planner_prompts[2].split("Trusted orchestration correction record", 1)[1]
+    assert expected in planner_prompts[2].split("Trusted orchestration correction record", 1)[1]
+    assert WEAK_SUMMARY not in _published(runner)
     assert "Corrected revision." in _published(runner)
     assert runner.diagnostic_posts == []
 
