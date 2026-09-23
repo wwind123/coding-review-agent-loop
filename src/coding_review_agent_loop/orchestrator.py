@@ -593,6 +593,7 @@ from .unresolved_items import (
     _apply_dispute_evidence,
     _apply_unresolved_item_dispositions,
     _collect_prior_compact_summaries,
+    bound_compact_prior_summaries,
     _clear_human_requirements_ack_item,
     _clear_merge_conflict_item,
     _format_same_pr_unresolved_items,
@@ -10765,7 +10766,9 @@ def _run_plan_first_loop(
         current_plan, resumed_round = resume_state
         current_coder_output = resumed_round.coder_output
         unresolved_items = list(resumed_round.prior_items)
-        compact_prior_summaries = list(resumed_round.compact_prior_summaries)
+        compact_prior_summaries = list(
+            bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
+        )
         next_unresolved_item_number = resumed_round.next_unresolved_item_number
         start_round_number = resumed_round.round_number
         if resumed_round.coder_metadata is not None and resumed_round.coder_metadata.assembled_plan_sidecar is not None:
@@ -11588,11 +11591,16 @@ def _run_plan_first_loop(
             same_status="same-plan",
             retain_future=True,
         )
-        compact_prior_summaries.extend(
-            _collect_prior_compact_summaries(
-                plan_ledger_view(prior_unresolved_items),
-                unresolved_items,
-                prior_dispositions,
+        compact_prior_summaries = list(
+            bound_compact_prior_summaries(
+                [
+                    *compact_prior_summaries,
+                    *_collect_prior_compact_summaries(
+                        plan_ledger_view(prior_unresolved_items),
+                        unresolved_items,
+                        prior_dispositions,
+                    ),
+                ]
             )
         )
         # The ledger handed to the next round is built from the amended view,
@@ -18105,7 +18113,9 @@ def run_pr_loop(
 
         if resumed_round is not None:
             unresolved_items = list(resumed_round.prior_items)
-            pr_compact_prior_summaries = list(resumed_round.compact_prior_summaries)
+            pr_compact_prior_summaries = list(
+                bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
+            )
             latest_coder_output = resumed_round.coder_output
             latest_coder_metadata = resumed_round.coder_metadata
             qualification_checkpoint = resumed_round.qualification_checkpoint
@@ -19943,11 +19953,16 @@ def run_pr_loop(
                         else "aggregate"
                     ),
                 )
-                pr_compact_prior_summaries.extend(
-                    _collect_prior_compact_summaries(
-                        prior_unresolved_items,
-                        unresolved_items,
-                        prior_dispositions,
+                pr_compact_prior_summaries = list(
+                    bound_compact_prior_summaries(
+                        [
+                            *pr_compact_prior_summaries,
+                            *_collect_prior_compact_summaries(
+                                prior_unresolved_items,
+                                unresolved_items,
+                                prior_dispositions,
+                            ),
+                        ]
                     )
                 )
             else:

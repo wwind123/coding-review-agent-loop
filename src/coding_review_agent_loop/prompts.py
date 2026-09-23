@@ -1856,7 +1856,7 @@ def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
             "Body:",
             body,
             "",
-            "Raw prior issue comments are omitted in compact planning context. Durable reviewer findings must appear in the active unresolved ledger or the append-only compact prior ledger below.",
+            "Raw prior issue comments are omitted in compact planning context. Open reviewer findings appear in the active unresolved ledger; findings that left it are summarized in the bounded compact prior ledger below, where older entries may be reduced to headers or folded into an omission notice.",
             "",
         ]
     )
@@ -1865,9 +1865,9 @@ def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
 def _compact_prior_ledger_block(compact_prior: CompactPriorContext | None) -> str:
     summaries = compact_prior.prior_item_summaries if compact_prior is not None else ()
     if not summaries:
-        return "Append-only compact prior item ledger\n\n(none)\n"
+        return "Compact prior item ledger (bounded)\n\n(none)\n"
     return (
-        "Append-only compact prior item ledger\n\n"
+        "Compact prior item ledger (bounded)\n\n"
         + "\n\n".join(summaries)
         + "\n"
     )
@@ -1893,8 +1893,8 @@ def _canonical_plan_ledger_rules() -> str:
     return """Canonical compact planning ledger rules
 
 - Treat active prior unresolved plan items as approval-critical until explicitly dispositioned.
-- Treat append-only compact prior ledger entries as the canonical history for prior blocking and same-plan concerns that left the active ledger.
-- Do not reinterpret, reorder, or rewrite prior compact ledger entries; append only new resolved or future-follow-up summaries after later review rounds.
+- Treat compact prior ledger entries as the history for prior blocking and same-plan concerns that left the active ledger. The ledger is size-bounded and lossy: the newest entries are verbatim, older entries may be reduced to their header line marked "(details compacted)", and the oldest may be folded into a single "[compacted] N earlier prior item summaries omitted" notice. Those items were already dispositioned; do not reopen them merely because their details are compacted or omitted.
+- Do not reinterpret or reorder compact ledger entries; new resolved or future-follow-up summaries are appended after later review rounds.
 - Future follow-ups are relevant in compact mode only when elevated, referenced, or preserved in the compact prior ledger.
 """
 
@@ -3712,8 +3712,10 @@ def _compact_pr_review_issue_context_block(
         [
             "",
             "Raw prior PR-review comments are omitted in compact PR review context. "
-            "Durable reviewer findings must appear in the active unresolved ledger or "
-            "the append-only compact prior ledger below.",
+            "Open reviewer findings appear in the active unresolved ledger; findings "
+            "that left it are summarized in the bounded compact prior ledger below, "
+            "where older entries may be reduced to headers or folded into an "
+            "omission notice.",
             "",
         ]
     )
@@ -3724,8 +3726,8 @@ def _canonical_pr_review_ledger_rules() -> str:
     return """Canonical compact PR review ledger rules
 
 - Treat active prior unresolved review items as approval-critical until explicitly dispositioned.
-- Treat append-only compact prior ledger entries as the canonical history for prior blocking and same-PR concerns that left the active ledger.
-- Do not reinterpret, reorder, or rewrite prior compact ledger entries; append only new resolved or future-follow-up summaries after later review rounds.
+- Treat compact prior ledger entries as the history for prior blocking and same-PR concerns that left the active ledger. The ledger is size-bounded and lossy: the newest entries are verbatim, older entries may be reduced to their header line marked "(details compacted)", and the oldest may be folded into a single "[compacted] N earlier prior item summaries omitted" notice. Those items were already dispositioned; do not reopen them merely because their details are compacted or omitted.
+- Do not reinterpret or reorder compact ledger entries; new resolved or future-follow-up summaries are appended after later review rounds.
 - Future follow-ups are relevant in compact mode only when elevated, referenced, or preserved in the compact prior ledger.
 """
 

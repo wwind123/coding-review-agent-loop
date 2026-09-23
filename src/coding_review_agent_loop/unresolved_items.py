@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import replace
@@ -1012,6 +1013,96 @@ def _collect_prior_compact_summaries(
             lines.extend(f"- {note}" for note in notes)
         summaries.append("\n".join(lines))
     return tuple(summaries)
+
+
+# The compact prior ledger rides in every round comment's metadata, so its
+# size must not scale with round count (#1003).  The budget is measured as the
+# UTF-8 byte length of each JSON-serialized entry, which is exactly what the
+# round transport compresses and base64-encodes.  Base64 adds a third and zlib
+# cannot expand incompressible input by more than a few bytes, so even a
+# worst-case (non-ASCII, high-entropy) ledger encodes to roughly 21,500
+# characters, well inside the 60,000-character comment limit.
+COMPACT_PRIOR_SUMMARIES_MAX_BYTES = 16_000
+COMPACT_PRIOR_DETAILS_OMITTED_SUFFIX = " (details compacted)"
+COMPACT_PRIOR_OMITTED_NOTICE_RE = re.compile(
+    r"^\[compacted\] (?P<count>\d+) earlier prior item summar(?:y|ies) omitted"
+)
+
+
+def _compact_prior_entry_size(entry: str) -> int:
+    return len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+
+
+def _compact_prior_summaries_size(summaries: Sequence[str]) -> int:
+    # Serialized UTF-8 bytes plus one JSON list separator between entries.
+    return sum(_compact_prior_entry_size(summary) for summary in summaries) + max(
+        len(summaries) - 1, 0
+    )
+
+
+def _compact_prior_omitted_notice(count: int) -> str:
+    noun = "summary" if count == 1 else "summaries"
+    return (
+        f"[compacted] {count} earlier prior item {noun} omitted to bound "
+        "round metadata; those items were already dispositioned in earlier rounds."
+    )
+
+
+def bound_compact_prior_summaries(
+    summaries: Sequence[str],
+    *,
+    max_bytes: int = COMPACT_PRIOR_SUMMARIES_MAX_BYTES,
+) -> tuple[str, ...]:
+    """Bound the append-only compact prior ledger independent of round count.
+
+    Oldest entries degrade first: their bodies collapse to the header line
+    (item id, disposition label, reviewer, source round), then whole headers
+    fold into a single omission notice.  The newest entries stay verbatim.
+    The result is idempotent, so re-bounding a persisted ledger is stable.
+    """
+    entries = list(summaries)
+    omitted = 0
+    if entries:
+        match = COMPACT_PRIOR_OMITTED_NOTICE_RE.match(entries[0])
+        if match:
+            omitted = int(match.group("count"))
+            entries = entries[1:]
+
+    rendered = [_compact_prior_omitted_notice(omitted), *entries] if omitted else entries
+    if _compact_prior_summaries_size(rendered) <= max_bytes:
+        return tuple(rendered)
+    # Fill the budget newest-first.  Once one entry must degrade to its header,
+    # every older entry degrades too; once a header no longer fits, every older
+    # entry folds into the omission notice.
+    notice_reserve = _compact_prior_entry_size(
+        _compact_prior_omitted_notice(omitted + len(entries))
+    ) + 1
+    budget = max_bytes - notice_reserve
+    kept: list[str] = []
+    used = 0
+    headers_only = False
+    for position in range(len(entries) - 1, -1, -1):
+        entry = entries[position]
+        separator = 1 if kept else 0
+        entry_size = _compact_prior_entry_size(entry)
+        if not headers_only and used + separator + entry_size <= budget:
+            kept.append(entry)
+            used += separator + entry_size
+            continue
+        headers_only = True
+        header = entry.split("\n", 1)[0]
+        if not header.endswith(COMPACT_PRIOR_DETAILS_OMITTED_SUFFIX):
+            header += COMPACT_PRIOR_DETAILS_OMITTED_SUFFIX
+        header_size = _compact_prior_entry_size(header)
+        if used + separator + header_size > budget:
+            omitted += position + 1
+            break
+        kept.append(header)
+        used += separator + header_size
+    kept.reverse()
+    if omitted:
+        kept.insert(0, _compact_prior_omitted_notice(omitted))
+    return tuple(kept)
 
 
 def _validate_plan_review_response(

@@ -1304,6 +1304,10 @@ def test_compact_plan_review_prompt_preserves_canonical_context_and_omits_raw_pr
     assert "Current plan payload." in tail
     assert "Planning round: 2" in tail
     assert "subject-a" in tail
+    assert "append-only" not in prompt.lower()
+    assert "bounded compact prior ledger below" in prefix
+    assert "Compact prior item ledger (bounded)" in prefix
+    assert "(details compacted)" in prefix
 
 def test_compact_plan_revision_prompt_preserves_context_and_omits_raw_prose(tmp_path):
     config = make_config(tmp_path)
@@ -1339,6 +1343,10 @@ def test_compact_plan_revision_prompt_preserves_context_and_omits_raw_prose(tmp_
     assert "Blocking review payload." in tail
     assert "Planning round: 2" in tail
     assert "subject-b" in tail
+    assert "append-only" not in prompt.lower()
+    assert "bounded compact prior ledger below" in prefix
+    assert "Compact prior item ledger (bounded)" in prefix
+    assert "(details compacted)" in prefix
     assert "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->" in prompt
     assert "### Human requirements" in prompt
     assert "after the JSON object and before the `AGENT_PLAN_STATE` footer" in prompt
@@ -1475,6 +1483,10 @@ def test_compact_pr_review_prompt_preserves_context_and_omits_raw_history(tmp_pa
     assert "Unrelated future-only item should not stay active" not in prefix
     assert "UNRELATED RAW PRIOR PR REVIEW HISTORY" not in prompt
     assert "[item-4] resolved: old resolved item" in prefix
+    assert "append-only" not in prompt.lower()
+    assert "bounded compact prior ledger below" in prefix
+    assert "Compact prior item ledger (bounded)" in prefix
+    assert "(details compacted)" in prefix
     assert "Coder says the compact mode wiring is complete." in tail
     assert "python -m pytest tests/test_agent_loop.py -k compact_pr" in tail
     assert "Use Future follow-ups only for independent later work" in prefix
