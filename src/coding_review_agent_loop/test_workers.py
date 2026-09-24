@@ -23,6 +23,7 @@ import signal
 import stat
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -63,6 +64,9 @@ WORKER_BUDGET_LOCK_DIR = "worker-budget"
 HOST_CAPACITY_MUTEX = "host-capacity.mutex"
 HOST_RESERVATION_SUFFIX = ".reservation"
 ENV_HOST_SHARING = "AGENT_LOOP_TEST_WORKER_HOST_SHARING"
+# Carried by every test command holding a host reservation, so the
+# reservation stays live while any process launched with it survives.
+ENV_WORKER_RESERVATION = "AGENT_LOOP_WORKER_RESERVATION"
 DESCENDANT_TERMINATION_GRACE_SECONDS = 2.0
 DESCENDANT_KILL_CONFIRM_SECONDS = 10.0
 
@@ -939,6 +943,8 @@ class WorkerBudgetLock:
         self.path = path
         self.key = key
         self.reservation: Path | None = None
+        self.reservation_token: str | None = None
+        self._reservation_data: dict | None = None
 
     @classmethod
     def acquire(
@@ -980,44 +986,72 @@ class WorkerBudgetLock:
         os.set_inheritable(handle.fileno(), False)
         return cls(handle, path, key), None
 
-    def reserve_host_workers(self, requested: int, pool: int) -> int:
+    def reserve_host_workers(self, requested: int, capacity: "HostCapacity") -> int:
         """Reserve workers against the host-wide capacity record.
 
         Returns the number of workers granted, 0 when no capacity is left.
         With no other live reservation the full request is granted, so a
-        single-loop host behaves exactly as before.  Otherwise the grant is
-        capped at ``pool`` minus the workers other live holders reserved.  A
-        reservation counts as live only while its holder's per-invocation
-        lock is held (by the command or by its group watcher), so a killed
-        loop's entry is reclaimed and a reservation is never released while a
-        member of the holder's process group survives.
+        single-loop host behaves exactly as before.  Otherwise the grant must
+        fit both the shared CPU pool and the shared memory pool.  Every
+        reservation persists its own capacity view and per-worker memory
+        cost; the strictest recorded capacity applies and the memory already
+        reserved is summed at each holder's own per-worker size, so loops
+        configured with different headroom or per-worker memory cannot
+        overcommit the host together.  See ``_live_reservation`` for when a
+        reservation stops counting.
         """
         requested = max(1, int(requested))
-        pool = max(1, int(pool))
         directory = self.path.parent
-        reserved_by_others = 0
         with _host_capacity_mutex(directory):
             own = self.path.with_suffix(HOST_RESERVATION_SUFFIX)
-            for record in sorted(directory.glob("*" + HOST_RESERVATION_SUFFIX)):
-                if record == own:
-                    continue
-                workers = _live_reservation_workers(record)
-                if workers is not None:
-                    reserved_by_others += workers
-            if reserved_by_others == 0:
+            others = [
+                data
+                for record in sorted(directory.glob("*" + HOST_RESERVATION_SUFFIX))
+                if record != own and (data := _live_reservation(record)) is not None
+            ]
+            if not others:
                 granted = requested
             else:
-                granted = max(0, min(requested, pool - reserved_by_others))
+                cpu_cap = min([capacity.cpus, *(data["cpus"] for data in others)])
+                granted = min(requested, cpu_cap - sum(data["workers"] for data in others))
+                memory_caps = [
+                    value
+                    for value in (capacity.memory_bytes, *(data["memory_bytes"] for data in others))
+                    if value is not None
+                ]
+                if memory_caps:
+                    used = sum(data["workers"] * data["per_worker_bytes"] for data in others)
+                    granted = min(granted, (min(memory_caps) - used) // capacity.per_worker_bytes)
+                granted = max(0, granted)
             if granted == 0:
                 return 0
-            payload = json.dumps({"version": 1, "workers": granted, "lock": self.path.name}, sort_keys=True)
-            temporary = own.with_name(own.name + ".tmp")
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(payload)
-            os.replace(temporary, own)
+            self.reservation_token = uuid.uuid4().hex
             self.reservation = own
+            self._reservation_data = {
+                "version": 2,
+                "workers": granted,
+                "per_worker_bytes": capacity.per_worker_bytes,
+                "cpus": capacity.cpus,
+                "memory_bytes": capacity.memory_bytes,
+                "lock": self.path.name,
+                "token": self.reservation_token,
+                "pgid": None,
+            }
+            _write_reservation(own, self._reservation_data)
         return granted
+
+    def record_process_group(self, pgid: int) -> None:
+        """Record the target's process group so the reservation outlives this
+        process: if the wrapper is killed, the reservation keeps counting
+        while any member of the group is alive."""
+        if self.reservation is None or self._reservation_data is None:
+            return
+        self._reservation_data = {**self._reservation_data, "pgid": int(pgid)}
+        try:
+            with _host_capacity_mutex(self.reservation.parent):
+                _write_reservation(self.reservation, self._reservation_data)
+        except OSError:
+            pass  # the reservation token still keeps it live
 
     def _release_reservation(self) -> None:
         record, self.reservation = self.reservation, None
@@ -1112,59 +1146,158 @@ class _host_capacity_mutex:
             handle.close()
 
 
-def _live_reservation_workers(record: Path) -> int | None:
-    """Workers held by a live reservation; reclaims and returns None when stale.
+def _write_reservation(path: Path, data: Mapping[str, object]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(data, sort_keys=True))
+    os.replace(temporary, path)
 
-    Must be called with the host capacity mutex held.
-    """
-    try:
-        data = json.loads(record.read_text(encoding="utf-8"))
-        workers = int(data["workers"])
-        lock_name = str(data["lock"])
-    except (OSError, ValueError, KeyError, TypeError):
-        data = None
-    if data is None or "/" in lock_name or workers < 1:
-        record.unlink(missing_ok=True)
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         return None
-    lock_path = record.parent / lock_name
+    return value
+
+
+def _parse_reservation(record: Path) -> dict | None:
+    try:
+        raw = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    workers = _positive_int(raw.get("workers"))
+    per_worker = _positive_int(raw.get("per_worker_bytes"))
+    cpus = _positive_int(raw.get("cpus"))
+    lock_name = raw.get("lock")
+    memory = raw.get("memory_bytes")
+    if memory is not None and (isinstance(memory, bool) or not isinstance(memory, int)):
+        return None
+    if None in (workers, per_worker, cpus) or not isinstance(lock_name, str) or "/" in lock_name:
+        return None
+    token = raw.get("token")
+    return {
+        "workers": workers,
+        "per_worker_bytes": per_worker,
+        "cpus": cpus,
+        "memory_bytes": memory,
+        "lock": lock_name,
+        "token": token if isinstance(token, str) and token.isalnum() else None,
+        "pgid": _positive_int(raw.get("pgid")),
+    }
+
+
+def _lock_is_held(lock_path: Path) -> bool | None:
+    """True/False for held/free, None when the lock file is gone."""
     try:
         handle = lock_path.open("r")
     except FileNotFoundError:
-        record.unlink(missing_ok=True)
         return None
     except OSError:
-        return workers  # cannot prove the holder dead
+        return True  # cannot prove the holder gone
     with handle:
         if os.name == "nt":  # pragma: no cover - not supported by the runner
-            return workers
+            return True
         import fcntl
 
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError:
-            return workers  # the holder (or its group watcher) still holds it
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+
+
+def _token_carried_by_live_process(token: str) -> bool:
+    """Whether any readable live process was launched with ``token``.
+
+    Unreadable processes, or a missing /proc, give no evidence either way
+    and are skipped so they cannot pin a stale reservation forever; the
+    lock and the recorded process group remain the primary liveness checks.
+    """
+    needle = f"{ENV_WORKER_RESERVATION}={token}".encode("ascii")
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for name in entries:
+        if not name.isdigit():
+            continue
         try:
-            record.unlink(missing_ok=True)
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            with open(f"/proc/{name}/environ", "rb") as stream:
+                environ = stream.read()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            continue  # another user's or a non-dumpable process
+        if needle in environ.split(b"\0"):
+            return True
+    return False
+
+
+def _live_reservation(record: Path) -> dict | None:
+    """A live reservation's data; reclaims the record and returns None when stale.
+
+    A reservation stays live while its holder's per-invocation lock is held
+    (by the command or by its group watcher), while any member of the
+    recorded target process group is alive, or while any process launched
+    with its reservation token survives.  The last two keep a reservation
+    counting when the wrapper itself was killed after spawning its target,
+    including the window before the process group was recorded.  Must be
+    called with the host capacity mutex held.
+    """
+    data = _parse_reservation(record)
+    if data is None:
+        record.unlink(missing_ok=True)
+        return None
+    held = _lock_is_held(record.parent / data["lock"])
+    if held:
+        return data
+    if data["pgid"] is not None and process_group_alive(data["pgid"]):
+        return data
+    if data["token"] is not None and _token_carried_by_live_process(data["token"]):
+        return data
+    record.unlink(missing_ok=True)
     return None
 
 
-def host_worker_pool(budget: WorkerBudget) -> int:
-    """Total workers the host can run across all loops.
+@dataclass(frozen=True)
+class HostCapacity:
+    """One loop's view of the host capacity shared by all loops."""
 
-    Computed from host facts only (usable CPUs and usable host memory) so
-    every loop on the host agrees on the pool regardless of its own cgroup
-    caps or ``--test-workers`` value.  Falls back to probing the host when
-    the budget's derivation inputs are unavailable.
+    cpus: int
+    memory_bytes: int | None  # usable host memory minus the reserve
+    per_worker_bytes: int
+
+    @property
+    def workers(self) -> int:
+        if self.memory_bytes is None:
+            return self.cpus
+        return max(1, min(self.cpus, self.memory_bytes // self.per_worker_bytes))
+
+    def describe(self) -> str:
+        memory = (
+            f", {self.memory_bytes / GIB:.1f} GiB usable memory"
+            if self.memory_bytes is not None
+            else ""
+        )
+        return f"{self.cpus} CPU(s){memory}"
+
+
+def host_capacity(budget: WorkerBudget) -> HostCapacity:
+    """This loop's view of the host capacity shared across loops.
+
+    Computed from host facts only (usable CPUs and usable host memory, not
+    this loop's cgroup caps or ``--test-workers``).  Falls back to probing
+    the host when the budget's derivation inputs are unavailable.
     """
     inputs = budget.inputs or {}
-    cpus = inputs.get("cpu_available")
-    if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1:
-        cpus, _source = probe_cpu_count()
-    pool = max(1, int(cpus))
+    cpus = _positive_int(inputs.get("cpu_available"))
+    if cpus is None:
+        cpus = max(1, int(probe_cpu_count()[0]))
     usable = inputs.get("host_usable_bytes")
-    if not isinstance(usable, int) or isinstance(usable, bool):
+    if isinstance(usable, bool) or not isinstance(usable, int):
         usable = None
         try:
             from .containment import DEFAULT_OS_HEADROOM_PERCENT, probe_host_memory_bytes
@@ -1174,13 +1307,16 @@ def host_worker_pool(budget: WorkerBudget) -> int:
                 usable = int(math.floor(total * (100 - DEFAULT_OS_HEADROOM_PERCENT) / 100))
         except Exception:  # pragma: no cover - defensive
             usable = None
-    if usable:
-        per_worker = inputs.get("per_worker_bytes")
-        per_worker = per_worker if isinstance(per_worker, int) and per_worker > 0 else DEFAULT_PER_WORKER_BYTES
-        reserve = inputs.get("reserve_bytes")
-        reserve = reserve if isinstance(reserve, int) and reserve >= 0 else DEFAULT_RESERVE_BYTES
-        pool = min(pool, max(1, (usable - reserve) // per_worker))
-    return max(1, pool)
+    per_worker = _positive_int(inputs.get("per_worker_bytes")) or DEFAULT_PER_WORKER_BYTES
+    reserve = inputs.get("reserve_bytes")
+    reserve = reserve if isinstance(reserve, int) and not isinstance(reserve, bool) and reserve >= 0 else DEFAULT_RESERVE_BYTES
+    memory = max(0, usable - reserve) if usable else None
+    return HostCapacity(cpus, memory, per_worker)
+
+
+def host_worker_pool(budget: WorkerBudget) -> int:
+    """Workers the host could run for this loop alone."""
+    return host_capacity(budget).workers
 
 
 def host_sharing_enabled(env: Mapping[str, str]) -> bool:
@@ -1188,11 +1324,11 @@ def host_sharing_enabled(env: Mapping[str, str]) -> bool:
     return str(env.get(ENV_HOST_SHARING, "")).strip().lower() not in {"off", "0", "false", "no"}
 
 
-def host_capacity_busy_message(budget: WorkerBudget, pool: int) -> str:
+def host_capacity_busy_message(budget: WorkerBudget, capacity: HostCapacity) -> str:
     return (
         f"agent-loop: worker budget ({budget.workers} worker(s), {budget.enforcement}) is busy: "
-        f"other agent-loop runs on this host hold all {pool} shared test worker(s); "
-        "wait for them to finish before starting another."
+        f"other agent-loop runs on this host hold all of the shared test-worker capacity "
+        f"({capacity.describe()}); wait for them to finish before starting another."
     )
 
 
