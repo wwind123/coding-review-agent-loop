@@ -243,8 +243,10 @@ python -m pip install -e .
 
 The package includes a second command, `agent-loop-gh`, in the same `bin/`
 directory as `agent-loop`. Keep the virtual environment activated (or invoke
-`.venv/bin/agent-loop` explicitly) in every later step and shell, since the
-`export PATH` in step 3 only adds the shim directory, not `.venv/bin`.
+`.venv/bin/agent-loop` explicitly) in every later step and shell to find
+`agent-loop`, and separately keep the step-3 `export PATH` in every shell
+regardless: it is what puts the `gh` shim ahead of the real `gh` on `PATH`,
+and `agent-loop` itself never adds it.
 
 **3. Put the shim ahead of the real `gh`.** `agent-loop-gh` is a
 `gh`-compatible shim that answers exactly the porcelain forms agent-loop, its
@@ -312,12 +314,14 @@ host where that is acceptable.
 the `agy` CLI.
 
 **These settings do not persist.** The venv activation and `export PATH` lines
-last only for the current shell; either add them to your shell profile or the
-host's setup script, or invoke `.venv/bin/agent-loop` explicitly in each new
-shell. The symlink points into the virtual environment, so rerun
-`shim-install` after recreating `.venv`. On ephemeral hosts such as cloud
-containers, repeat every step, including the Codex sign-in, in each new
-session.
+last only for the current shell. Add both to your shell profile or the host's
+setup script, or repeat both in each new shell; invoking `.venv/bin/agent-loop`
+explicitly only substitutes for venv activation, not for the step-3 `export
+PATH`, which is what keeps the `gh` shim ahead of the real `gh` and must be
+re-run (or re-sourced) in every new shell regardless. The symlink points into
+the virtual environment, so rerun `shim-install` after recreating `.venv`. On
+ephemeral hosts such as cloud containers, repeat every step, including the
+Codex sign-in, in each new session.
 
 **Transport selection.** `AGENT_LOOP_GH_TRANSPORT` chooses how the shim talks
 to GitHub: `auto` (default) probes GraphQL once and uses REST only when the
