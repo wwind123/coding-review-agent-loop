@@ -786,6 +786,25 @@ lock and terminates nothing. Test suites that exercise `run-tests` itself must
 give the inner call its own environment (clear `AGENT_LOOP_INVOCATION_ID` and
 run from its own cwd), as this repository's `tests/conftest.py` does.
 
+**Shared host capacity.** The lock above is per invocation, so without more
+accounting two loops on one host would each size themselves against the same
+CPUs and memory. In clamp and refuse, after taking its per-invocation lock a
+command reserves its workers in a host-wide capacity record: one reservation
+file per invocation lock, in the same uid-owned lock directory, written and
+counted under a short accounting mutex that never blocks for the length of a
+test command. The host pool is computed from host facts only (usable CPUs and
+usable host memory at the configured per-worker size), so every loop agrees on
+it regardless of its own cgroup caps or `--test-workers`. When no other live
+reservation exists the full budget is granted, so a single-loop host behaves as
+before. Otherwise the command is lowered to the unreserved remainder (the
+injected plugin then enforces the lower number), or gets `worker-budget-busy`
+(exit 125) when nothing is left. A reservation counts only while its holder's
+per-invocation lock is held, including by the survivor watcher, so it is never
+released while a process-group member lives, and a loop killed without cleanup
+has its entry reclaimed by the next command that does the accounting. Set
+`AGENT_LOOP_TEST_WORKER_HOST_SHARING=off` in the wrapper's environment to opt
+out and keep the per-invocation-only behavior.
+
 **Runtime cohorts.** `test-runtime.json` cohorts are keyed on
 `(normalized command, environment fingerprint, workers)`. The normalized
 command never includes the injected plugin token. In clamp and refuse the

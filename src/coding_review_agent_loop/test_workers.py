@@ -58,6 +58,11 @@ WORKER_BUDGET_BUSY_EXIT_CODE = 125
 WORKER_BUDGET_REFUSED_EXIT_CODE = 2
 
 WORKER_BUDGET_LOCK_DIR = "worker-budget"
+# Host-wide capacity record (issue #987): reservation files sit beside the
+# per-invocation locks and a short-lived mutex serializes only the accounting.
+HOST_CAPACITY_MUTEX = "host-capacity.mutex"
+HOST_RESERVATION_SUFFIX = ".reservation"
+ENV_HOST_SHARING = "AGENT_LOOP_TEST_WORKER_HOST_SHARING"
 DESCENDANT_TERMINATION_GRACE_SECONDS = 2.0
 DESCENDANT_KILL_CONFIRM_SECONDS = 10.0
 
@@ -933,6 +938,7 @@ class WorkerBudgetLock:
         self.handle = handle
         self.path = path
         self.key = key
+        self.reservation: Path | None = None
 
     @classmethod
     def acquire(
@@ -974,9 +980,61 @@ class WorkerBudgetLock:
         os.set_inheritable(handle.fileno(), False)
         return cls(handle, path, key), None
 
+    def reserve_host_workers(self, requested: int, pool: int) -> int:
+        """Reserve workers against the host-wide capacity record.
+
+        Returns the number of workers granted, 0 when no capacity is left.
+        With no other live reservation the full request is granted, so a
+        single-loop host behaves exactly as before.  Otherwise the grant is
+        capped at ``pool`` minus the workers other live holders reserved.  A
+        reservation counts as live only while its holder's per-invocation
+        lock is held (by the command or by its group watcher), so a killed
+        loop's entry is reclaimed and a reservation is never released while a
+        member of the holder's process group survives.
+        """
+        requested = max(1, int(requested))
+        pool = max(1, int(pool))
+        directory = self.path.parent
+        reserved_by_others = 0
+        with _host_capacity_mutex(directory):
+            own = self.path.with_suffix(HOST_RESERVATION_SUFFIX)
+            for record in sorted(directory.glob("*" + HOST_RESERVATION_SUFFIX)):
+                if record == own:
+                    continue
+                workers = _live_reservation_workers(record)
+                if workers is not None:
+                    reserved_by_others += workers
+            if reserved_by_others == 0:
+                granted = requested
+            else:
+                granted = max(0, min(requested, pool - reserved_by_others))
+            if granted == 0:
+                return 0
+            payload = json.dumps({"version": 1, "workers": granted, "lock": self.path.name}, sort_keys=True)
+            temporary = own.with_name(own.name + ".tmp")
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+            os.replace(temporary, own)
+            self.reservation = own
+        return granted
+
+    def _release_reservation(self) -> None:
+        record, self.reservation = self.reservation, None
+        if record is None:
+            return
+        try:
+            with _host_capacity_mutex(record.parent):
+                record.unlink(missing_ok=True)
+        except OSError:
+            pass  # a leftover entry is reclaimed once this lock is free
+
     def close(self) -> None:
         if self.handle.closed:
             return
+        # Drop the reservation while the lock is still held; close() is only
+        # reached once the target's process group is gone.
+        self._release_reservation()
         try:
             if os.name != "nt":
                 import fcntl
@@ -1024,6 +1082,118 @@ class WorkerBudgetLock:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+class _host_capacity_mutex:
+    """Blocking exclusive flock held only for the capacity accounting."""
+
+    def __init__(self, directory: Path):
+        self._path = directory / HOST_CAPACITY_MUTEX
+        self._handle = None
+
+    def __enter__(self) -> "_host_capacity_mutex":
+        self._handle = self._path.open("a+")
+        if os.name != "nt":
+            import fcntl
+
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            if os.name != "nt":
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _live_reservation_workers(record: Path) -> int | None:
+    """Workers held by a live reservation; reclaims and returns None when stale.
+
+    Must be called with the host capacity mutex held.
+    """
+    try:
+        data = json.loads(record.read_text(encoding="utf-8"))
+        workers = int(data["workers"])
+        lock_name = str(data["lock"])
+    except (OSError, ValueError, KeyError, TypeError):
+        data = None
+    if data is None or "/" in lock_name or workers < 1:
+        record.unlink(missing_ok=True)
+        return None
+    lock_path = record.parent / lock_name
+    try:
+        handle = lock_path.open("r")
+    except FileNotFoundError:
+        record.unlink(missing_ok=True)
+        return None
+    except OSError:
+        return workers  # cannot prove the holder dead
+    with handle:
+        if os.name == "nt":  # pragma: no cover - not supported by the runner
+            return workers
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return workers  # the holder (or its group watcher) still holds it
+        try:
+            record.unlink(missing_ok=True)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return None
+
+
+def host_worker_pool(budget: WorkerBudget) -> int:
+    """Total workers the host can run across all loops.
+
+    Computed from host facts only (usable CPUs and usable host memory) so
+    every loop on the host agrees on the pool regardless of its own cgroup
+    caps or ``--test-workers`` value.  Falls back to probing the host when
+    the budget's derivation inputs are unavailable.
+    """
+    inputs = budget.inputs or {}
+    cpus = inputs.get("cpu_available")
+    if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1:
+        cpus, _source = probe_cpu_count()
+    pool = max(1, int(cpus))
+    usable = inputs.get("host_usable_bytes")
+    if not isinstance(usable, int) or isinstance(usable, bool):
+        usable = None
+        try:
+            from .containment import DEFAULT_OS_HEADROOM_PERCENT, probe_host_memory_bytes
+
+            total = probe_host_memory_bytes()
+            if total:
+                usable = int(math.floor(total * (100 - DEFAULT_OS_HEADROOM_PERCENT) / 100))
+        except Exception:  # pragma: no cover - defensive
+            usable = None
+    if usable:
+        per_worker = inputs.get("per_worker_bytes")
+        per_worker = per_worker if isinstance(per_worker, int) and per_worker > 0 else DEFAULT_PER_WORKER_BYTES
+        reserve = inputs.get("reserve_bytes")
+        reserve = reserve if isinstance(reserve, int) and reserve >= 0 else DEFAULT_RESERVE_BYTES
+        pool = min(pool, max(1, (usable - reserve) // per_worker))
+    return max(1, pool)
+
+
+def host_sharing_enabled(env: Mapping[str, str]) -> bool:
+    """Host-wide sharing is on unless explicitly opted out."""
+    return str(env.get(ENV_HOST_SHARING, "")).strip().lower() not in {"off", "0", "false", "no"}
+
+
+def host_capacity_busy_message(budget: WorkerBudget, pool: int) -> str:
+    return (
+        f"agent-loop: worker budget ({budget.workers} worker(s), {budget.enforcement}) is busy: "
+        f"other agent-loop runs on this host hold all {pool} shared test worker(s); "
+        "wait for them to finish before starting another."
+    )
 
 
 def worker_budget_busy_message(budget: WorkerBudget, reason: str | None = None) -> str:
