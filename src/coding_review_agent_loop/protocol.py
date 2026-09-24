@@ -3759,8 +3759,9 @@ def _optional_semantic_fact_string(value: object, *, context: str) -> tuple[str,
         return "", None
     if not isinstance(value, str):
         return "", CLAIM_FACT_MISTYPED_RULE
+    # Raw length, before trimming: padding never hides unbounded input.
+    _hard_capped_claim_string(value, context=context)  # shape-check: fatal:payload-bound
     normalized = value.strip()
-    _hard_capped_claim_string(normalized, context=context)  # shape-check: fatal:payload-bound
     if not normalized:
         return "", None
     if len(normalized.encode("utf-8")) > RISK_MATRIX_MAX_FIELD_BYTES:
@@ -3796,7 +3797,7 @@ def _optional_semantic_fact_list(
         return (), CLAIM_FACT_MISTYPED_RULE
     for index, item in enumerate(value):
         if isinstance(item, str):
-            _hard_capped_claim_string(item.strip(), context=f"{context}[{index}]")  # shape-check: fatal:payload-bound
+            _hard_capped_claim_string(item, context=f"{context}[{index}]")  # shape-check: fatal:payload-bound
     if not all(isinstance(item, str) and item.strip() for item in value):
         return (), CLAIM_FACT_MISTYPED_RULE
     # Validate the complete list before truncating, so a malformed or
@@ -3837,12 +3838,14 @@ def _semantic_execution_ref_list(value: object, *, context: str) -> tuple[tuple[
     rendered: list[str] = []
     rule: str | None = None
     for index, item in enumerate(value):
+        if isinstance(item, str):
+            # The hard cap applies to the raw value, before trimming, so
+            # whitespace padding can never smuggle unbounded input past it.
+            _hard_capped_claim_string(item, context=f"{context}[{index}]")  # shape-check: fatal:payload-bound
         if not isinstance(item, str) or not item.strip():
             rule = CLAIM_EXECUTION_REFS_MISTYPED_RULE
             continue
-        normalized = item.strip()
-        _hard_capped_claim_string(normalized, context=f"{context}[{index}]")  # shape-check: fatal:payload-bound
-        rendered.append(normalized)
+        rendered.append(item.strip())
     if rule is None and not rendered:
         rule = CLAIM_EXECUTION_REFS_EMPTY_RULE
     return tuple(rendered), rule

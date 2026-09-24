@@ -2799,3 +2799,30 @@ def test_canonical_evidence_citations_stay_strict_927():
         parse_risk_test_matrix_evidence(evidence([valid, {"command": "x"}]), matrix=matrix)
     with pytest.raises(AgentLoopError, match="must be a JSON array"):
         parse_risk_test_matrix_evidence(evidence(valid), matrix=matrix)
+
+
+@pytest.mark.parametrize("catalog", [_CATALOG_927, None], ids=["catalog", "no-catalog"])
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: c.update(execution_refs=["invocation:observation-1" + " " * 20_000]),
+        lambda c: c.update(execution_refs=["invocation:observation-1", " " * 20_000]),
+        lambda c: c.update(workflow_path_claim="The workflow path ran." + " " * 20_000),
+        lambda c: c.update(test_identifiers=[" " * 20_000 + "tests/test_x.py::test_row-a"]),
+        lambda c: c.update(caveats=["caveat" + "\n" * 20_000]),
+        lambda c: c.update(row_id="row-a" + " " * 20_000),
+    ],
+    ids=["padded-ref", "blank-ref", "padded-workflow", "padded-fact", "padded-caveat", "padded-row-id"],
+)
+def test_whitespace_padding_never_bypasses_the_hard_cap_927(mutate, catalog):
+    """The 16,384-byte cap is measured on the raw value, before trimming."""
+    claim = _claim_927("row-a")
+    mutate(claim)
+    with pytest.raises(AgentLoopError, match="16384-byte bound"):
+        _parse_927([claim], catalog=catalog)
+
+
+def test_padding_within_the_hard_cap_still_normalizes_927():
+    claim = _claim_927("row-a", refs=("invocation:observation-1" + " " * 100,))
+    [parsed] = _parse_927([claim]).claims
+    assert parsed.execution_refs == ("invocation:observation-1",)
