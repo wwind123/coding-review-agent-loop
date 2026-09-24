@@ -3763,6 +3763,9 @@ def _parse_semantic_risk_coverage_claims(
     derivation reports it as a ``degraded-row-claim`` diagnostic while the
     approved row reads ``missing``.  The one reserved fatal row-ID case is a
     string beyond the 16,384-byte dropped-value hard cap: unbounded input.
+    A row-ID defect only decides whether the claim is kept: the non-row-ID
+    rules below still run on a degraded claim first, so a claim that would
+    have been rejected for its selectors or facts is still rejected.
 
     Still fatal, because they forge or corrupt authority, are unbounded input,
     or are owned elsewhere (the stage-3 audit decides the non-row-ID checks):
@@ -3829,19 +3832,18 @@ def _parse_semantic_risk_coverage_claims(
             optional=set(SEMANTIC_RISK_CLAIM_FACT_KEYS + SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS) | {"row_id"},
         )
         row_id_context = f"{claim_context}.row_id"
-        row_id, degradation = _claim_row_id_or_degradation(payload, context=row_id_context)
-        if degradation is not None:
-            degradations.append(degradation)
-            continue
-        assert row_id is not None
-        if allowed_rows is not None and row_id not in allowed_rows:
+        row_id, drop_record = _claim_row_id_or_degradation(payload, context=row_id_context)
+        unapproved_row_id: str | None = None
+        if drop_record is not None:
+            pass
+        elif allowed_rows is not None and row_id not in allowed_rows:
             # A claim for a row outside this turn's approved enforceable set
             # (for example a sibling phase's row) asserts nothing this turn
             # can own.  Drop just that claim (#920): the row is simply not
             # claimed, which is stricter than losing every other valid claim.
-            if row_id not in dropped_row_ids:
-                dropped_row_ids.append(row_id)
-            record = ParseDegradation.build(
+            assert row_id is not None
+            unapproved_row_id = row_id
+            drop_record = ParseDegradation.build(
                 element_path=row_id_context,
                 rule=CLAIM_ROW_ID_UNAPPROVED_RULE,
                 # The row-ID pattern is case-sensitive, so a valid unapproved
@@ -3849,17 +3851,17 @@ def _parse_semantic_risk_coverage_claims(
                 observed=_neutralize_identifier_like(row_id),
                 outcome=CLAIM_DROPPED_OUTCOME,
             )
-            degradations.append(record)
-            unapproved_claim_row_ids.append((record, row_id))
-            continue
-        if row_counts.get(row_id, 0) > 1:
-            degradations.append(ParseDegradation.build(
+        elif row_counts.get(row_id, 0) > 1:
+            drop_record = ParseDegradation.build(
                 element_path=row_id_context,
                 rule=CLAIM_ROW_ID_DUPLICATE_RULE,
                 observed=row_id,
                 outcome=CLAIM_DROPPED_OUTCOME,
-            ))
-            continue
+            )
+        # A row-ID defect decides only whether the claim is kept.  Every
+        # non-row-ID rule below still runs first and keeps its current
+        # consequence, so a degraded claim can never carry a selector or fact
+        # defect past this parser that would have rejected it before (#926).
         if execution_catalog is None:
             raw_refs = _risk_bounded_string_list(
                 payload["execution_refs"],
@@ -3953,15 +3955,24 @@ def _parse_semantic_risk_coverage_claims(
             # (#913).  The row's own caveats keep the remaining slots.
             keep = max(SEMANTIC_RISK_CLAIMS_MAX_CAVEATS - len(bookkeeping), 0)
             caveats = (*caveats[:keep], *bookkeeping)
+        workflow_path_claim = _optional_semantic_fact_string(
+            payload.get("workflow_path_claim"),
+            context=f"{claim_context}.workflow_path_claim",
+        )
+        if drop_record is not None:
+            degradations.append(drop_record)
+            if unapproved_row_id is not None:
+                if unapproved_row_id not in dropped_row_ids:
+                    dropped_row_ids.append(unapproved_row_id)
+                unapproved_claim_row_ids.append((drop_record, unapproved_row_id))
+            continue
+        assert row_id is not None
         claim = SemanticRiskCoverageClaim(
             row_id=row_id,
             execution_refs=tuple(admissible_refs),
             test_identifiers=test_identifiers,
             test_locations=test_locations,
-            workflow_path_claim=_optional_semantic_fact_string(
-                payload.get("workflow_path_claim"),
-                context=f"{claim_context}.workflow_path_claim",
-            ),
+            workflow_path_claim=workflow_path_claim,
             outcome_assertions=outcome_assertions,
             forbidden_effect_assertions=forbidden_effect_assertions,
             caveats=caveats,

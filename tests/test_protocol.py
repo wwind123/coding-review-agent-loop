@@ -2748,6 +2748,109 @@ def test_semantic_matrix_claim_launch_integrity_failing_or_unknown_selector_stil
         )
 
 
+_FAILING_LAUNCH_CATALOG_926 = [
+    *_ADMISSIBLE_CATALOG,
+    {
+        "execution_ref": "turn:observation-2",
+        "outcome": "passed",
+        "provenance": "parent-observed",
+        "wrapper_bootstrap": "failed",
+        "inner_exec": "started",
+        "suite_start": "verified",
+    },
+]
+
+
+def _claim_for_row_926(row_id: object, refs: list[str]) -> dict[str, object]:
+    claim = _complete_semantic_claim()
+    claim["row_id"] = row_id
+    claim["execution_refs"] = refs
+    return claim
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    "degraded_row_id",
+    [
+        "row-1",  # duplicated approved row (the other copy is valid)
+        "row-unknown",  # well-formed but unapproved
+        "finding-3",  # malformed
+        7,  # mistyped
+    ],
+)
+def test_semantic_matrix_claim_row_id_degradation_keeps_selector_authority_fatal_926(
+    kind, degraded_row_id
+):
+    """A row-ID defect must not skip the unchanged non-row-ID authority checks.
+
+    Before #926 each of these follow-ups was rejected; a degraded row ID now
+    only decides whether the claim is kept, after the selector rules ran.
+    """
+    claims = [
+        _claim_for_row_926(degraded_row_id, ["turn:observation-2"]),
+        _claim_for_row_926("row-1", ["turn:observation-1"]),
+    ]
+    with pytest.raises(NonRepairableEvidenceRejection, match="launch-integrity"):
+        _validate_claims_envelope(
+            kind, claims, row_ids=("row-1", "row-2"), catalog=_FAILING_LAUNCH_CATALOG_926
+        )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    ("refs", "message"),
+    [
+        ([], "at least one selector"),
+        (["turn:observation-1", "turn:observation-1"], "more than once"),
+    ],
+)
+@pytest.mark.parametrize("degraded_row_id", ["row-1", "row-unknown", "finding-3"])
+def test_semantic_matrix_claim_row_id_degradation_keeps_selector_shape_fatal_926(
+    kind, refs, message, degraded_row_id
+):
+    claims = [
+        _claim_for_row_926(degraded_row_id, refs),
+        _claim_for_row_926("row-1", ["turn:observation-1"]),
+    ]
+    with pytest.raises(AgentLoopError, match=message):
+        _validate_claims_envelope(
+            kind, claims, row_ids=("row-1", "row-2"), catalog=_ADMISSIBLE_CATALOG
+        )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_duplicate_keeps_fact_typing_fatal_926(kind):
+    duplicate = _claim_for_row_926("row-1", ["turn:observation-1"])
+    duplicate["test_identifiers"] = [7]
+    claims = [duplicate, _claim_for_row_926("row-1", ["turn:observation-1"])]
+    with pytest.raises(AgentLoopError):
+        _validate_claims_envelope(
+            kind, claims, row_ids=("row-1", "row-2"), catalog=_ADMISSIBLE_CATALOG
+        )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_valid_duplicates_still_degrade_926(kind):
+    catalog = [
+        *_ADMISSIBLE_CATALOG,
+        {"execution_ref": "turn:observation-2", "outcome": "passed", "provenance": "parent-observed"},
+    ]
+    parsed = _validate_claims_envelope(
+        kind,
+        [
+            _claim_for_row_926("row-1", ["turn:observation-1"]),
+            _claim_for_row_926("row-2", ["turn:observation-2"]),
+            _claim_for_row_926("row-1", ["turn:observation-2"]),
+        ],
+        row_ids=("row-1", "row-2"),
+        catalog=catalog,
+    )
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-2"]
+    assert len(claims.degradations) == 2
+    assert all("more than once" in record.rule for record in claims.degradations)
+
+
 def test_semantic_matrix_claim_catalog_collision_still_rejects():
     entry = {"execution_ref": "turn:observation-1", "outcome": "passed", "provenance": "parent-observed"}
     with pytest.raises(NonRepairableEvidenceRejection, match="colliding execution_ref"):
