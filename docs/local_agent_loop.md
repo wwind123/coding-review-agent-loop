@@ -944,23 +944,43 @@ command string may appear in several rows.
 One admissible selector may also appear in several rows (#865): a single
 wrapper run commonly executes the tests for more than one row, and each row is
 still verified only on its own semantic facts and the shared passing receipt.
-Within one row a selector may be listed at most once.
+Within one claim a selector may be listed at most once.
 
-These cases still reject the envelope, because they forge or corrupt execution
-authority, are unbounded input, or are owned elsewhere:
+Other claim-scope defects drop only the offending claim before authentication
+(#926, #927). Each dropped claim keeps one bounded parse-degradation record,
+and after authentication it yields a `degraded-row-claim` diagnostic while the
+row reads `missing`. The dropped defects are:
 
-- unknown keys, and ill-typed or oversize facts;
-- a missing, invalid, unapproved, or duplicate `row_id`;
-- a missing `execution_refs` key or an empty list (#855);
-- more than eight refs, non-string or blank refs, or a ref over the
-  16,384-byte hard cap;
-- an admissible selector listed twice within one row, or a colliding catalog;
+- a missing, malformed, mistyped, unapproved, or duplicated `row_id`;
+- a claim that is not a JSON object, or a `risk_test_matrix_claims` value that
+  is not an array, which keeps no claim;
+- a missing, empty, or ill-typed `execution_refs` (#855), or an admissible
+  selector listed twice within one claim;
+- an unknown key, or an ill-typed, duplicated, or over-bound fact;
+- without an execution catalog, a selector over the 1,024-byte field bound.
+
+When one claim has several defects, exactly one record is kept, and the
+row-ID rules win.
+
+These cases still reject the envelope, because they forge or decide execution
+authority or are unbounded input:
+
+- a claim key that names orchestrator-owned verification authority: `status`,
+  `evidence_citations`, `receipt_id`, `command`, or `claim`;
+- more than 24 claims, eight refs, or 16 caveats, any value over the
+  16,384-byte hard cap, or a dropped value whose compact JSON exceeds that
+  bound;
+- a colliding catalog;
 - an in-catalog selector that is not a passing parent-observed observation, or
   whose supplied launch-integrity state is failing or unknown (wrapper
   bootstrap, inner exec, and suite start must all be authoritative). It is a
   real broker handle, so selecting it is an authority decision, not a format
   defect;
 - legacy canonical evidence fields in a fresh response.
+
+A malformed `test_observations` citation in a follow-up or implementation
+result is dropped with its own record, and the round summary lists every
+dropped citation. More than eight malformed citations reject the response.
 
 Catalog collisions and non-passing or non-authoritative in-catalog selectors
 are not repairable by reformatting, so they skip the structured repair pass

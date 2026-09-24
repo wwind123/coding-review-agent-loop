@@ -12,7 +12,7 @@ from typing import Literal
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
-from .errors import AgentLoopError
+from .errors import AgentLoopError, IssueImplementationConflictError
 from .round_transport import (
     MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS,
     PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE,
@@ -27,6 +27,7 @@ from .comment_rendering import (
     RISK_TEST_MATRIX_MARKER_RE,
     decode_risk_test_matrix_marker,
     render_parse_degradations_section,
+    render_test_observation_degradations_section,
 )
 from .local_test_evidence import canonicalize_bounded_evidence
 from .protocol_markers import (
@@ -70,6 +71,10 @@ from .protocol import (
     risk_test_matrix_identity,
     sanitize_risk_test_matrix,
     parse_plan_revision_patch,
+    StructuredCoderFollowup,
+    StructuredIssueImplementation,
+    parse_historical_structured_coder_followup,
+    parse_historical_structured_issue_implementation,
 )
 from .plan_assembly import decode_assembled_plan_sidecar, rendered_plan_identity
 from .review_scheduling import FORCE_FULL_SOURCES, ReviewSchedulingContract, SCHEDULER_PHASES
@@ -207,6 +212,9 @@ class PostedRoundMetadata:
     # Parser-derived degradation records for this round's assessment (#924).
     # Only the orchestrator writes metadata, so agents cannot author these.
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
+    # Records of malformed follow-up citations dropped by the degradable
+    # citation parser (#927); restored onto the coder carrier on resume.
+    test_observation_degradations: tuple[ParseDegradation, ...] = ()
     architecture_contract_version: int | None = None
     # Planning generation discriminator.  Absent is intentionally legacy
     # undecided; generation 1 is required to resume a fresh recommendation.
@@ -634,6 +642,37 @@ class PostedRoundRecord:
 class ResumedRoundSelection:
     anchor_record: PostedRoundRecord
     current_round_records: tuple[PostedRoundRecord, ...]
+
+
+def rebuild_resumed_coder_carrier(
+    text: str | None, metadata: "PostedRoundMetadata | None"
+) -> StructuredCoderFollowup | StructuredIssueImplementation | None:
+    """Rebuild a resumed round's coder carrier from its durable raw response.
+
+    Dropped-citation records are restored from the round metadata written
+    when the response was accepted (#927), so a restart never loses them.
+    The degradable citation parser is deterministic, so re-parsing the
+    stored ``raw_structured_coder_response`` yields the same records.
+    """
+    if not text:
+        return None
+    carrier: StructuredCoderFollowup | StructuredIssueImplementation | None
+    try:
+        carrier = parse_historical_structured_issue_implementation(text)
+    except IssueImplementationConflictError as exc:
+        carrier = exc.payload if isinstance(exc.payload, StructuredIssueImplementation) else None
+    except AgentLoopError:
+        carrier = None
+    if carrier is None:
+        try:
+            carrier = parse_historical_structured_coder_followup(text)
+        except AgentLoopError:
+            return None
+    if carrier is None or metadata is None:
+        return carrier
+    return replace(
+        carrier, test_observation_degradations=tuple(metadata.test_observation_degradations)
+    )
 
 
 @dataclass(frozen=True)
@@ -1978,6 +2017,12 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["architecture_impact_degradations"] = [
             record.to_payload() for record in metadata.architecture_impact_degradations
         ]
+    if metadata.test_observation_degradations:
+        # Optional, like the field above, so rounds without citation records
+        # keep their exact historical encoding.
+        payload["test_observation_degradations"] = [
+            record.to_payload() for record in metadata.test_observation_degradations
+        ]
     if metadata.qualification_checkpoint is not None:
         payload["qualification_checkpoint"] = (
             metadata.qualification_checkpoint.as_dict()
@@ -1987,7 +2032,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
     return encode_mapping(payload)
 
 
-def _decode_architecture_impact_degradations(value: object) -> tuple[ParseDegradation, ...]:
+def _decode_parse_degradations(value: object) -> tuple[ParseDegradation, ...]:
     """Rehydrate records strictly; historical or malformed entries yield none."""
     if not isinstance(value, list):
         return ()
@@ -2127,8 +2172,11 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 payload.get("architecture_impact")
                 if isinstance(payload.get("architecture_impact"), dict) else None
             ),
-            architecture_impact_degradations=_decode_architecture_impact_degradations(
+            architecture_impact_degradations=_decode_parse_degradations(
                 payload.get("architecture_impact_degradations")
+            ),
+            test_observation_degradations=_decode_parse_degradations(
+                payload.get("test_observation_degradations")
             ),
             architecture_contract_version=(
                 int(payload["architecture_contract_version"])
@@ -2289,6 +2337,11 @@ def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
         # Surface degraded elements in the round summary so a degraded round
         # never reads as fully assessed.
         body = _insert_before_trailing_markers(str(body), degradations)
+    citation_degradations = render_test_observation_degradations_section(
+        metadata.test_observation_degradations
+    )
+    if citation_degradations is not None and citation_degradations not in str(body):
+        body = _insert_before_trailing_markers(str(body), citation_degradations)
     lines = body.splitlines()
     index = len(lines)
     while index > 0 and not lines[index - 1].strip():

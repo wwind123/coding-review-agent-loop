@@ -529,3 +529,38 @@ def test_initial_implementation_summary_and_test_caveats_are_preserved():
     assert "Initial implementation, not a follow-up." in context
     assert "pytest -q (subset only)" in context
     assert "addressed_item_notes" not in context
+
+
+def test_reviewer_context_shows_dropped_citations_restored_from_metadata_927():
+    """#927: a resumed round's dropped-citation records reach the reviewer context."""
+    payload, end = json.JSONDecoder().raw_decode(structured_coder_followup(summary="Checked receipts."))
+    payload["test_observations"] = [
+        {"command": "python -m pytest -q", "receipt_id": "known", "claim": "current-result"},
+        {"command": "python -m pytest -q", "receipt_id": "r-1", "claim": "bogus"},
+    ]
+    text = json.dumps(payload) + structured_coder_followup(summary="Checked receipts.")[end:]
+    parsed = orchestrator.validate_structured_coder_followup(text)
+    [record] = parsed.test_observation_degradations
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123",
+        test_observation_degradations=(record,),
+    )
+    context = _coder_followup_review_context(text, metadata, head_sha="abc123")
+    assert '"test_observation_degradations"' in context
+    assert "coder_followup.test_observations[1]" in context
+    without = _coder_followup_review_context(
+        text, dataclasses.replace(metadata, test_observation_degradations=()), head_sha="abc123"
+    )
+    assert "test_observation_degradations" not in without
+
+
+def test_metadata_writer_persists_citation_records_only_for_coder_results_927():
+    payload, end = json.JSONDecoder().raw_decode(structured_coder_followup(summary="Checked."))
+    payload["test_observations"] = [7]
+    text = json.dumps(payload) + structured_coder_followup(summary="Checked.")[end:]
+    parsed = orchestrator.validate_structured_coder_followup(text)
+    fields = orchestrator._test_observation_degradation_fields(parsed)
+    assert fields == {"test_observation_degradations": parsed.test_observation_degradations}
+    assert len(fields["test_observation_degradations"]) == 1
+    assert orchestrator._test_observation_degradation_fields(None) == {}
+    assert orchestrator._test_observation_degradation_fields("clarify") == {}

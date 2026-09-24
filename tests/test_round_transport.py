@@ -2808,3 +2808,115 @@ def test_959_matrix_full_round_construction_status_rules():
 
 def test_959_matrix_full_round_does_not_change_growth_spill_fields():
     assert transport._GROWTH_SPILL_FIELDS == ("prior_items", "risk_test_matrix_evidence")
+
+
+# --- #927: dropped-citation records in round metadata and on resume ----------
+
+def _citation_response_927(kind):
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "state": "blocking",
+        "summary": "Checked receipts.",
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "test_observations": [
+            {"command": "python -m pytest -q", "receipt_id": "known", "claim": "current-result"},
+            *[{"command": "python -m pytest -q", "receipt_id": f"r-{index}", "claim": "bogus"} for index in range(8)],
+        ],
+    }
+    if kind == "issue_implementation":
+        payload["pr_number"] = 77
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _parse_927(kind, text):
+    from coding_review_agent_loop.protocol import (
+        validate_structured_coder_followup,
+        validate_structured_issue_implementation,
+    )
+
+    if kind == "issue_implementation":
+        return validate_structured_issue_implementation(text)
+    return validate_structured_coder_followup(text)
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_citation_records_round_trip_through_round_metadata_927(kind):
+    text = _citation_response_927(kind)
+    records = _parse_927(kind, text).test_observation_degradations
+    assert len(records) == 8
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+        raw_structured_coder_response=text,
+        test_observation_degradations=records,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.test_observation_degradations == records
+
+
+def test_historical_and_malformed_citation_metadata_decode_to_no_records_927():
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Claude", round_number=1, subject="head")
+    encoded = _encode_round_metadata(metadata)
+    payload = transport.decode_mapping(encoded)
+    # A round without citation records keeps its exact historical encoding.
+    assert "test_observation_degradations" not in payload
+    assert _encode_round_metadata(
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+            test_observation_degradations=(),
+        )
+    ) == encoded
+    assert _decode_round_metadata_mapping(payload).test_observation_degradations == ()
+    payload["test_observation_degradations"] = [{"element_path": "x"}, "not a mapping"]
+    assert _decode_round_metadata_mapping(payload).test_observation_degradations == ()
+    payload["test_observation_degradations"] = "not a list"
+    assert _decode_round_metadata_mapping(payload).test_observation_degradations == ()
+
+
+def test_round_summary_renders_every_citation_record_once_beside_architecture_records_927():
+    text = _citation_response_927("coder_followup")
+    records = _parse_927("coder_followup", text).test_observation_degradations
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+        architecture_impact_degradations=(_deg_record(),),
+        test_observation_degradations=records,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.architecture_impact_degradations == (_deg_record(),)
+    assert decoded.test_observation_degradations == records
+    body = _attach_round_metadata("Coder follow-up.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude", metadata)
+    assert body.count("### Test observation parse degradations") == 1
+    assert body.count("### Parse degradations") == 1
+    for record in records:
+        assert f"`{record.element_path}`" in body
+    assert "omitted" not in body
+    # A follow-up comment that already carries the section is not duplicated.
+    again = _attach_round_metadata(body.split("<!-- AGENT_LOOP_META")[0], metadata)
+    assert again.count("### Test observation parse degradations") == 1
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_resumed_round_restores_citation_records_equal_to_a_reparse_927(kind):
+    from coding_review_agent_loop.round_state import _resume_pr_round, rebuild_resumed_coder_carrier
+
+    text = _citation_response_927(kind)
+    records = _parse_927(kind, text).test_observation_degradations
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+        raw_structured_coder_response=text,
+        test_observation_degradations=records,
+    )
+    comment = IssueComment(
+        author="bot", created_at="2026-09-23T00:00:00Z",
+        body=_attach_round_metadata("Coder follow-up.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude", metadata),
+    )
+    resumed = _resume_pr_round([comment], head_sha="head", configured_reviewers=("codex",))
+    assert resumed is not None
+    assert resumed.coder_metadata.test_observation_degradations == records
+    carrier = rebuild_resumed_coder_carrier(resumed.coder_output, resumed.coder_metadata)
+    assert carrier.kind == kind
+    assert carrier.test_observation_degradations == records
+    assert _parse_927(kind, resumed.coder_output).test_observation_degradations == records
