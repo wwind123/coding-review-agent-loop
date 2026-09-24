@@ -93,6 +93,14 @@ from .review_evaluation import (
 )
 
 
+_ALLOW_UNREADABLE_PROTECTION_HELP = (
+    "Per-invocation waiver for managed CI when classic branch protection is not readable "
+    "by this token (HTTP 403) and the readable effective rules show no strict "
+    "final-ci/exact-head enforcement. The exact-head gate is then treated as voluntary. "
+    "Requires --allow-unprotected-managed-ci."
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a local coder -> reviewer PR review loop."
@@ -888,6 +896,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     issue.add_argument(
+        "--allow-unreadable-protection", action="store_true",
+        help=_ALLOW_UNREADABLE_PROTECTION_HELP,
+    )
+    issue.add_argument(
         "--managed-ci-fresh",
         "--managed-ci-fresh-authorization",
         dest="managed_ci_fresh_authorization",
@@ -932,6 +944,10 @@ def build_parser() -> argparse.ArgumentParser:
             "request and "
             "--managed-ci-trusted-actor; never authorizes arbitrary PR adoption."
         ),
+    )
+    pr.add_argument(
+        "--allow-unreadable-protection", action="store_true",
+        help=_ALLOW_UNREADABLE_PROTECTION_HELP,
     )
     pr.add_argument(
         "--managed-ci-fresh",
@@ -1003,6 +1019,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Per-invocation waiver when GitHub cannot independently enforce final-ci/exact-head. "
             "Requires --managed-ci or --auto-merge and --managed-ci-trusted-actor."
         ),
+    )
+    managed_pr.add_argument(
+        "--allow-unreadable-protection", action="store_true",
+        help=_ALLOW_UNREADABLE_PROTECTION_HELP,
     )
     add_review_parallel(managed_pr)
 
@@ -1718,6 +1738,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError("--allow-unprotected-managed-ci requires --managed-ci-trusted-actor.")
             if getattr(args, "managed_ci_adopt_existing_pr", False):
                 raise AgentLoopError("--allow-unprotected-managed-ci cannot be used with --managed-ci-adopt-existing-pr.")
+        if getattr(args, "allow_unreadable_protection", False) and not getattr(
+            args, "allow_unprotected_managed_ci", False
+        ):
+            raise AgentLoopError(
+                "--allow-unreadable-protection requires --allow-unprotected-managed-ci; "
+                "unreadable branch protection is waived only together with the unprotected waiver."
+            )
         if getattr(args, "managed_ci_fresh_authorization", False):
             if args.command not in {"issue", "pr"}:
                 raise AgentLoopError(

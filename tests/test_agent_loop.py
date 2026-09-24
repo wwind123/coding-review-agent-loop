@@ -1594,6 +1594,65 @@ def test_managed_ci_fresh_cli_rejects_incomplete_authorization(argv, message, ca
     assert message in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["issue", "56", "--repo", "OWNER/REPO", "--managed-ci",
+         "--managed-ci-trusted-actor", "agent-loop", "--allow-unreadable-protection"],
+        ["pr", "77", "--repo", "OWNER/REPO", "--managed-ci",
+         "--managed-ci-trusted-actor", "agent-loop", "--allow-unreadable-protection"],
+        ["pr", "77", "--repo", "OWNER/REPO", "--auto-merge",
+         "--managed-ci-trusted-actor", "agent-loop", "--managed-ci-adopt-existing-pr",
+         "--allow-unreadable-protection"],
+        ["managed-pr", "--repo", "OWNER/REPO", "--head", "fix/direct-change",
+         "--title", "Direct change", "--managed-ci",
+         "--managed-ci-trusted-actor", "agent-loop", "--allow-unreadable-protection"],
+    ],
+)
+def test_allow_unreadable_protection_requires_the_unprotected_waiver(
+    argv, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: make_config(tmp_path))
+    # The validation error precedes every GitHub call, including base resolution.
+    monkeypatch.setattr(
+        cli_module, "resolve_base_branch",
+        lambda *_a, **_k: pytest.fail("GitHub was read before flag validation"),
+    )
+    assert main(argv) == 1
+    assert (
+        "--allow-unreadable-protection requires --allow-unprotected-managed-ci"
+        in capsys.readouterr().err
+    )
+
+
+def test_allow_unreadable_protection_with_adoption_keeps_adoption_refusal(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: make_config(tmp_path))
+    assert main([
+        "pr", "77", "--repo", "OWNER/REPO", "--auto-merge",
+        "--managed-ci-trusted-actor", "agent-loop", "--managed-ci-adopt-existing-pr",
+        "--allow-unprotected-managed-ci", "--allow-unreadable-protection",
+    ]) == 1
+    assert (
+        "--allow-unprotected-managed-ci cannot be used with --managed-ci-adopt-existing-pr"
+        in capsys.readouterr().err
+    )
+
+
+def test_config_records_unreadable_protection_waiver():
+    args = build_parser().parse_args([
+        "issue", "1040", "--repo", "OWNER/REPO", "--managed-ci",
+        "--managed-ci-trusted-actor", "agent-loop", "--allow-unprotected-managed-ci",
+        "--allow-unreadable-protection",
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.allow_unprotected_managed_ci is True
+    assert config.allow_unreadable_protection is True
+
+
 def test_config_records_explicit_existing_pr_managed_ci_adoption(tmp_path):
     parser = build_parser()
     args = parser.parse_args([

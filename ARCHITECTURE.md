@@ -644,6 +644,49 @@ for GitHub enforcement. Historical audit markers cannot grant fresh authority;
 the live actor, repository, PR lifecycle, and provenance must be revalidated.
 See [managed CI](docs/local_agent_loop.md#managed-exact-head-ci).
 
+Two preflight reads can be refused where the rest of managed CI works, for
+example in Claude Code cloud sessions (#1040). Each fallback is keyed to a
+strict HTTP 403, taken only from gh's own trailing stderr status line; response
+bodies are never searched for status digits.
+
+- A refused `AGENT_LOOP_MANAGED_ACTOR` read lets `--managed-ci-trusted-actor`
+  stand in as an *asserted* actor at every identity site. The authenticated
+  login must still equal it. The boundary is the workflow: it enforces the real
+  variable server-side, so a wrong assertion leaves ordinary CI unsuppressed
+  and fails managed dispatch validation rather than failing open. A readable
+  variable that differs, a 404, or any other error keeps failing closed.
+- A refused classic-protection read (`required_status_checks`, or
+  `enforce_admins` behind a required context) makes protection indeterminate,
+  not absent. It becomes the distinct `unreadable` state only when the
+  effective rules were fully inspected: a list, or gh's strict 404/422
+  no-rules response. It also requires that no ruleset proves strict
+  enforcement. After such a 403, a ruleset proves strict only when it requires
+  exactly `final-ci/exact-head` and its `bypass_actors` are visible and empty.
+  Malformed rule or ruleset data, and any other rules failure, stay
+  `indeterminate`, which nothing can waive. On readable classic paths only
+  the context matching changed: it is now an exact
+  `required_status_checks` match, which can only remove a false `strict`.
+
+Readiness maps `voluntary`, `plan_limited` and `unreadable` to
+override-eligible without consulting invocation flags. Only the authorization
+gates consult `waivable_protection_states(config)`: creation, fresh
+authorization, resume, activation, recovery, and fresh-command advice.
+`--allow-unprotected-managed-ci` waives `voluntary` and `plan_limited`, and
+`unreadable` additionally requires `--allow-unreadable-protection`. The
+legacy non-suppressing workflow exception stays a separate clause.
+Authorization records derive their persisted waiver from protection through
+one mapping (`allow-unreadable-protection` for `unreadable`), and the parser
+rejects crossed pairings. The override audit trailer keeps its field set and
+simply carries `protection=unreadable`. Issue-created recovery restores the
+persisted state read-only. A selection pass validates every actor-authored
+authorization record with protection and plan-scope comparisons deferred, and
+the creation records supply the state. A confirmation pass then requires every
+record, and the live assessment, to agree. A base that has since become
+`strict` also refuses, because activation's strict path does not run the
+resume-audit plan-scope gate that recovery deferred to. Plan-scope checks are enforced by
+the activation-time resume-audit gate, after the canonical plan is bound and
+before any mutation.
+
 Issue-created managed-CI authorization is a durable orchestration protocol,
 not coder evidence. Once a structurally accepted implementation response
 exposes a PR number, the orchestrator authenticates the live repository, issue,

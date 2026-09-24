@@ -280,6 +280,10 @@ class AgentLoopConfig:
     # A consciously per-invocation waiver for issue-created v2 only. It is
     # never read from the environment or durable PR state.
     allow_unprotected_managed_ci: bool = False
+    # A separate explicit waiver for "unreadable" protection: classic branch
+    # protection refused this token with HTTP 403 and the readable effective
+    # rules show no strict enforcement (#1040).  Requires the waiver above.
+    allow_unreadable_protection: bool = False
     # Runtime-only correlation value minted by the issue-created preflight.
     # It is intentionally not a CLI option: a later invocation must perform a
     # new preflight rather than accepting a PR-body token it did not create.
@@ -1459,6 +1463,7 @@ def config_from_args(
         managed_ci=getattr(args, "managed_ci", False),
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
         allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),
+        allow_unreadable_protection=getattr(args, "allow_unreadable_protection", False),
         managed_ci_fresh_authorization=getattr(args, "managed_ci_fresh_authorization", False),
         managed_ci_issue_number=getattr(args, "managed_ci_issue", None),
         managed_ci_pr_mode=getattr(args, "command", None) == "pr",

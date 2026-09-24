@@ -7387,6 +7387,189 @@ def test_strict_pre_pr_number_rejection_directs_ordinary_discovery_without_reimp
     ) == coder_calls
 
 
+@pytest.mark.parametrize(
+    ("protection_mode", "unreadable_waiver", "fresh_offered"),
+    [
+        ("unreadable", True, True),
+        ("unreadable", False, False),
+        ("voluntary", False, True),
+        ("plan_limited", False, True),
+    ],
+)
+def test_pre_pr_number_rejection_guidance_follows_the_state_specific_waiver(
+    tmp_path, monkeypatch, protection_mode, unreadable_waiver, fresh_offered,
+):
+    valid = structured_issue_implementation(
+        pr_number=77,
+        tests_run=["python3 -m pytest tests/test_managed_ci.py -q"],
+    )
+    payload, end = json.JSONDecoder().raw_decode(valid)
+    payload.pop("architecture_impact")
+    rejected = json.dumps(payload) + valid[end:]
+    runner = _IssueRecoveryWorkflowRunner(labeled=True, codex_outputs=[rejected])
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="claude",
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        allow_unreadable_protection=unreadable_waiver,
+        agent_max_retries=0,
+    )
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="agent-loop",
+        protection_mode=protection_mode,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *_a, **_k: (None, None, ()),
+    )
+
+    with pytest.raises(AgentLoopError, match="rejected before a PR number was accepted") as exc_info:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(exc_info.value)
+    assert "do not rerun implementation" in message
+    if fresh_offered:
+        assert "--managed-ci-fresh" in message
+        if protection_mode == "unreadable":
+            assert "--allow-unprotected-managed-ci --allow-unreadable-protection" in message
+        else:
+            assert "(including the unprotected waiver);" in message
+    else:
+        assert "--managed-ci-fresh" not in message
+        assert "Fresh authorization is unavailable" in message
+        assert "--allow-unreadable-protection" in message
+
+
+class _CloudSessionIssueRunner(_IssueRecoveryWorkflowRunner):
+    """Refuse the Actions variable and classic protection reads with gh 403s (#1040)."""
+
+    _REFUSED = {
+        "/actions/variables/AGENT_LOOP_MANAGED_ACTOR": (
+            "gh: Access to this GitHub Actions path is not permitted through this proxy (HTTP 403)\n"
+        ),
+        "/branches/main/protection/required_status_checks": (
+            "gh: Resource not accessible by integration (HTTP 403)\n"
+        ),
+    }
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next((part for part in args if part.startswith("repos/")), "")
+        for suffix, stderr in self._REFUSED.items():
+            if endpoint.endswith(suffix) and "--method" not in args:
+                recorded, cwd_path = self._record_command(args, cwd)
+                return CommandResult(recorded, cwd_path, "", stderr, 1)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+class _CloudSessionCreatingCoderRunner(_CloudSessionIssueRunner):
+    """The fake coder creates the reserved managed PR its prompt describes."""
+
+    def __init__(self, **kwargs):
+        super().__init__(labeled=False, **kwargs)
+        # No PR exists until the coder creates one.
+        self.pr_payload["body"] = "Fixes #56"
+        self.rest_pr["body"] = "Fixes #56"
+        self.created_pr_body = None
+
+    def _run_with_log_locked(self, args, *, cwd, log_path, check, input_text=None):
+        self._create_reserved_pr(args, input_text)
+        return super()._run_with_log_locked(
+            args, cwd=cwd, log_path=log_path, check=check, input_text=input_text,
+        )
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        self._create_reserved_pr(args, input_text)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    def _create_reserved_pr(self, args, input_text):
+        if [str(part) for part in args[:2]] == ["codex", "exec"] and self.created_pr_body is None:
+            prompt = " ".join(str(part) for part in args) + (input_text or "")
+            branch = re.search(r"reserved branch `([^`]+)`", prompt)
+            nonce = re.search(r"nonce=([A-Za-z0-9_-]+)", prompt)
+            assert branch is not None and branch.group(1) == "agent-loop/managed-56"
+            assert "gh pr create --draft --label agent-loop-managed" in prompt
+            assert nonce is not None
+            # Mirrors `gh pr create --draft --label agent-loop-managed --body-file`.
+            body = f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce.group(1)}"
+            self.created_pr_body = body
+            self.pr_payload["body"] = body
+            self.rest_pr["body"] = body
+            self.rest_pr["draft"] = True
+            self.rest_pr["labels"] = [{"name": "agent-loop-managed"}]
+
+
+@pytest.mark.parametrize("unreadable_waiver", [True, False])
+def test_cloud_session_issue_run_creates_reserved_managed_pr_only_with_both_waivers(
+    tmp_path, monkeypatch, capsys, unreadable_waiver,
+):
+    # The coder creates the reserved PR and reports it. Its legacy report is
+    # rejected only after the orchestrator has accepted the PR number,
+    # authenticated the opening tuple, and persisted the creation authorization.
+    runner = _CloudSessionCreatingCoderRunner(
+        codex_outputs=[
+            "Fixed issue.\nTests: cd /outside && python -m pytest\n"
+            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n"
+            "-- OpenAI Codex"
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="claude",
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        allow_unreadable_protection=unreadable_waiver,
+    )
+
+    with pytest.raises(AgentLoopError) as exc_info:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(exc_info.value)
+    commands = [command for command, _cwd in runner.commands]
+    coder_calls = [command for command in commands if command[:2] == ["codex", "exec"]]
+    # The orchestrator itself never applies a label or dispatches: the coder
+    # creates the PR born draft and labeled.
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    records = [
+        parsed
+        for comment in runner.authorization_comments
+        if (parsed := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    if not unreadable_waiver:
+        assert "--allow-unreadable-protection" in message
+        assert "no PR was created" in message
+        assert coder_calls == []
+        assert runner.created_pr_body is None
+        assert records == []
+        assert runner.rest_pr["labels"] == []
+        assert not any("--method" in command for command in commands)
+        return
+
+    assert runner.created_pr_body is not None, message
+    assert re.search("authorization checkpoint.*persisted", message), (message, runner.created_pr_body)
+    assert len(coder_calls) == 1
+    assert runner.rest_pr["labels"] == [{"name": "agent-loop-managed"}]
+    body_nonce = runner.created_pr_body.rsplit("nonce=", 1)[1]
+    assert len(records) == 1
+    record = records[0]
+    assert (record.kind, record.pr_number, record.issue_number) == ("creation", 77, 56)
+    assert (record.protection, record.waiver) == ("unreadable", "allow-unreadable-protection")
+    assert record.nonce == body_nonce
+    assert record.actor_login == "agent-loop"
+    assert "--allow-unreadable-protection is also active" in capsys.readouterr().out
+
+
 def test_managed_issue_legacy_recovery_rejects_unexpected_closing_reference(
     tmp_path,
 ):
