@@ -191,6 +191,14 @@ With exactly one matching record and an open canonical PR, planning reopens:
   (the rerun performs the rebind only) or the new one (the rerun resumes the
   PR). The write is skipped when it already exists. A plan-only invocation
   stops after approval; the next rerun performs only the rebind.
+- Right after that rebind comment, the superseded and replacement plans are
+  compared on their structural contract: plan steps, risk/test matrix rows, and
+  the execution recommendation's strategy. When the replacement adds steps or
+  matrix rows, or changes the strategy, a log line and one bounded, plain issue
+  comment name what grew and note that the PR's implementation predates it, so
+  the operator can decide whether to decompose. The notice is informational
+  only: it never stops the run, a failure to compare or post is only logged, an
+  equivalent plan posts nothing, and it is not repeated on later runs.
 - The PR-side closing contract keeps authenticating against the closing-contract
   lineage base: the most recent issue-side handoff record that is not a same-PR
   equal-ID plan replacement. The plan hash comes from the latest record. The

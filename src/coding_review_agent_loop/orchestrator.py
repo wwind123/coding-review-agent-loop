@@ -10182,6 +10182,167 @@ def _require_authorized_replan_state(
     )
 
 
+@dataclass(frozen=True)
+class _PlanContractShape:
+    """The structural contract a plan asks a PR to satisfy (#1013)."""
+
+    steps: tuple[str, ...]
+    matrix_row_ids: tuple[str, ...]
+    strategy: str | None
+
+
+# Bounds on the rebind expansion notice so a large re-plan cannot flood it.
+_REBIND_EXPANSION_LIST_LIMIT = 5
+_REBIND_EXPANSION_ITEM_CHARS = 160
+
+
+def _plan_contract_shape(comments: Sequence[object], plan_hash: str) -> _PlanContractShape | None:
+    """Recover a plan's steps, matrix rows, and strategy from its plan round.
+
+    Reads the authenticated assembled-state sidecar of the latest plan coder
+    round whose canonical plan has ``plan_hash``.  ``None`` when no such round
+    carries one; the caller treats that as "not comparable", never as a gap.
+    """
+    for record in reversed(_extract_round_metadata_records(comments, flow="plan")):
+        metadata = record.metadata
+        if (
+            metadata.role != "coder"
+            or metadata.canonical_plan is None
+            or metadata.assembled_plan_sidecar is None
+            or approved_plan_hash(metadata.canonical_plan) != plan_hash
+        ):
+            continue
+        payload = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar).canonical_json
+        steps = payload.get("plan_steps")
+        matrix = payload.get("risk_test_matrix")
+        rows = matrix.get("rows") if isinstance(matrix, Mapping) else None
+        recommendation = payload.get("execution_recommendation")
+        strategy = (
+            recommendation.get("strategy") if isinstance(recommendation, Mapping) else None
+        )
+        return _PlanContractShape(
+            steps=tuple(str(step) for step in steps) if isinstance(steps, list) else (),
+            matrix_row_ids=tuple(
+                str(row["row_id"])
+                for row in (rows if isinstance(rows, list) else ())
+                if isinstance(row, Mapping) and "row_id" in row
+            ),
+            strategy=strategy if isinstance(strategy, str) else None,
+        )
+    return None
+
+
+def _clip_contract_item(text: str) -> str:
+    line = next((part.strip() for part in text.splitlines() if part.strip()), "")
+    if len(line) > _REBIND_EXPANSION_ITEM_CHARS:
+        line = line[: _REBIND_EXPANSION_ITEM_CHARS - 1].rstrip() + "…"
+    return line
+
+
+def _bounded_contract_list(items: Sequence[str]) -> list[str]:
+    lines = [f"  - {_clip_contract_item(item)}" for item in items[:_REBIND_EXPANSION_LIST_LIMIT]]
+    if len(items) > _REBIND_EXPANSION_LIST_LIMIT:
+        lines.append(f"  - …and {len(items) - _REBIND_EXPANSION_LIST_LIMIT} more")
+    return lines
+
+
+def _plan_contract_expansion(
+    superseded: _PlanContractShape, replacement: _PlanContractShape
+) -> list[str]:
+    """Describe how the replacement plan materially expands the contract.
+
+    Structural, not numeric on review findings: new plan steps, new matrix
+    rows, or a changed execution strategy.  An empty list means equivalent
+    (or narrower) — reworded steps at the same count are not an expansion.
+    """
+    expansion: list[str] = []
+    known_steps = {_clip_contract_item(step) for step in superseded.steps}
+    new_steps = [step for step in replacement.steps if _clip_contract_item(step) not in known_steps]
+    if len(replacement.steps) > len(superseded.steps) and new_steps:
+        expansion.append(
+            f"- Plan steps grew from {len(superseded.steps)} to {len(replacement.steps)}; "
+            "steps not in the superseded plan:"
+        )
+        expansion.extend(_bounded_contract_list(new_steps))
+    new_rows = [
+        row_id for row_id in replacement.matrix_row_ids
+        if row_id not in set(superseded.matrix_row_ids)
+    ]
+    if new_rows:
+        expansion.append(f"- {len(new_rows)} new risk/test matrix row(s):")
+        expansion.extend(_bounded_contract_list([f"`{row_id}`" for row_id in new_rows]))
+    if superseded.strategy != replacement.strategy:
+        expansion.append(
+            f"- The execution recommendation changed from "
+            f"`{superseded.strategy or 'none'}` to `{replacement.strategy or 'none'}`."
+        )
+    return expansion
+
+
+def _notify_rebind_contract_expansion(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    comments: Sequence[object],
+    pr_number: int,
+    superseded_hash: str,
+    plan_hash: str,
+) -> None:
+    """Informational notice when a rebind materially expands the PR's contract (#1013).
+
+    The PR's code was written against the superseded plan, so a larger
+    replacement plan is a divergence reviewers would otherwise discover one
+    finding at a time.  This never blocks: any failure to compare or post is
+    logged and the run continues.  Whether to decompose is left to the
+    operator or the next planning cycle.
+    """
+    try:
+        superseded = _plan_contract_shape(comments, superseded_hash)
+        replacement = _plan_contract_shape(comments, plan_hash)
+        if superseded is None or replacement is None:
+            log(
+                config,
+                f"Issue #{issue_number}: rebind contract comparison skipped; the structured "
+                f"state of plan {superseded_hash if superseded is None else plan_hash} is not "
+                "recoverable from its plan round",
+            )
+            return
+        expansion = _plan_contract_expansion(superseded, replacement)
+        if not expansion:
+            return
+        log(
+            config,
+            f"Issue #{issue_number}: replacement plan {plan_hash} materially expands the "
+            f"contract PR #{pr_number} must satisfy relative to superseded plan "
+            f"{superseded_hash}: "
+            + "; ".join(line.strip("- ").strip() for line in expansion if line.startswith("- ")),
+        )
+        body = "\n".join(
+            [
+                "### Rebound PR contract expanded",
+                "",
+                f"PR #{pr_number} was rebound from approved plan `{superseded_hash}` to "
+                f"replacement plan `{plan_hash}`. The replacement materially expands the "
+                "contract the PR must satisfy, and the PR's implementation predates it:",
+                "",
+                *expansion,
+                "",
+                "Review will now judge the existing diff against the replacement plan. If the "
+                "remaining work no longer suits a single PR, consider decomposing it before "
+                "continuing. This notice is informational and does not stop the run.",
+                "",
+                "-- coding-review-agent-loop",
+            ]
+        )
+        post_issue_comment(runner, config=config, issue_number=issue_number, body=body)
+    except Exception as exc:  # noqa: BLE001 - the notice must never block the run
+        log(
+            config,
+            f"Issue #{issue_number}: rebind contract-expansion notice was not posted: {exc}",
+        )
+
+
 def _rebind_superseded_child_plan(
     runner: Runner,
     *,
@@ -10298,6 +10459,15 @@ def _rebind_superseded_child_plan(
         config,
         f"Issue #{issue_number}: rebound PR #{current.pr_number} from approved plan "
         f"{plan_supersession.superseded_hash} to {plan_hash} with one issue comment",
+    )
+    _notify_rebind_contract_expansion(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        comments=issue_context.comments,
+        pr_number=current.pr_number,
+        superseded_hash=plan_supersession.superseded_hash,
+        plan_hash=plan_hash,
     )
 
 

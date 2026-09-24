@@ -2706,6 +2706,88 @@ def test_m936_signed_replan_rebinds_the_same_pr_and_reviews_under_the_new_plan(
     assert "Inherited rows restored." in reviewer_prompts[1]
 
 
+def _m1013_expanding_patch(world, *, extra_steps):
+    base_steps = json.loads(world.old_state.split("\n", 1)[0])["plan_steps"]
+    patch = json.loads(world.good_patch().split("\n", 1)[0])
+    patch["operations"].append(
+        {"op": "replace", "field": "plan_steps", "value": [*base_steps, *extra_steps]}
+    )
+    return json.dumps(patch) + PLAN_FOOTER
+
+
+def _m1013_notices(world):
+    return [body for body in world.posted() if "### Rebound PR contract expanded" in body]
+
+
+def test_m1013_rebind_to_a_plan_with_new_steps_posts_one_expansion_notice(
+    tmp_path, monkeypatch
+):
+    world = _M936World(tmp_path, monkeypatch)
+    extra = [f"Add parser mode {index}." for index in range(1, 8)]
+    assert world.run_issue(
+        claude_outputs=[_m1013_expanding_patch(world, extra_steps=extra)],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    notices = _m1013_notices(world)
+    assert len(notices) == 1
+    notice = notices[0]
+    assert "PR #77" in notice and world.old_hash in notice
+    assert "predates it" in notice and "decompos" in notice
+    assert "Add parser mode 1." in notice and "Add parser mode 5." in notice
+    # Bounded: at most five named steps, then a remainder count.
+    assert "Add parser mode 6." not in notice and "…and 2 more" in notice
+    # Informational only: the PR is still reviewed under the rebound plan.
+    assert len(world.agent_calls("codex")) == 2
+    rebind_index = next(
+        index for index, body in enumerate(world.posted())
+        if CHILD_PLAN_REBIND_MARKER_RE.search(body)
+    )
+    assert world.posted().index(notice) > rebind_index
+    # A later resume after the rebind posts no second notice.
+    assert world.run_issue(codex_outputs=[PR_APPROVAL]) == 0
+    assert _m1013_notices(world) == []
+
+
+def test_m1013_rebind_to_an_equivalent_plan_posts_no_notice(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+    assert world.run_issue(
+        claude_outputs=[world.good_patch()],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    assert sum(1 for body in world.posted() if CHILD_PLAN_REBIND_MARKER_RE.search(body)) == 1
+    assert _m1013_notices(world) == []
+
+
+def test_m1013_expansion_notice_failure_never_blocks_the_run(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch)
+
+    def broken_shape(*args, **kwargs):
+        raise AgentLoopError("sidecar unreadable")
+
+    monkeypatch.setattr(orchestrator, "_plan_contract_shape", broken_shape)
+    assert world.run_issue(
+        claude_outputs=[_m1013_expanding_patch(world, extra_steps=["Add parser mode."])],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    assert sum(1 for body in world.posted() if CHILD_PLAN_REBIND_MARKER_RE.search(body)) == 1
+    assert _m1013_notices(world) == []
+    assert len(world.agent_calls("codex")) == 2
+
+
+def test_m1013_contract_expansion_names_new_rows_and_a_changed_strategy():
+    shape = orchestrator._PlanContractShape
+    old = shape(steps=("Do A.",), matrix_row_ids=("row-a",), strategy="one-shot")
+    assert orchestrator._plan_contract_expansion(old, old) == []
+    # Reworded steps at the same count, or fewer rows, are not an expansion.
+    narrower = shape(steps=("Do A differently.",), matrix_row_ids=(), strategy="one-shot")
+    assert orchestrator._plan_contract_expansion(old, narrower) == []
+    grown = shape(steps=("Do A.",), matrix_row_ids=("row-a", "row-b"), strategy="staged")
+    expansion = "\n".join(orchestrator._plan_contract_expansion(old, grown))
+    assert "1 new risk/test matrix row(s)" in expansion and "`row-b`" in expansion
+    assert "`row-a`" not in expansion
+    assert "from `one-shot` to `staged`" in expansion
+
+
 def test_m936_each_restart_point_continues_from_durable_state(tmp_path, monkeypatch):
     world = _M936World(tmp_path, monkeypatch)
     # Interrupted after the digest-bound revised round: the reviewer never ran.

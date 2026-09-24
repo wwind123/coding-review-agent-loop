@@ -506,7 +506,10 @@ Child plan supersession:
    opened, no implementation turn runs, nothing is written on the PR, and
    reviewer approvals recorded before the rebind do not count under the new
    plan. `agent-loop pr <n>` never re-plans or rebinds; on an inadmissible
-   binding it fails closed and prints the same route.
+   binding it fails closed and prints the same route. If the replacement plan
+   adds steps or matrix rows, or changes the execution strategy, the rebind
+   also posts one informational issue comment naming what grew; it never
+   stops the run.
 
 **Deliberate re-plan of an admissible plan.** The same signed record also
 authorizes replacing a bound child plan that is still admissible, for example
