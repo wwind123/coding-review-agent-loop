@@ -12,6 +12,12 @@ that run pytest) are never enforced.  Each top-level ``pytest.main`` claims
 the armed spec for its own Config and reports under its own session id;
 Configs nested inside an active claim and child processes that inherit the
 plugin environment only write a best-effort ``nested`` marker.
+
+The wrapper's ``PYTEST_PLUGINS`` entry is withdrawn from ``os.environ`` for
+the whole of every claimed session, so a test that launches a
+nested pytest with a replaced ``PYTHONPATH`` never inherits an entry it cannot
+import (issue #1008).  It is restored when a claim ends so a later sequential
+``pytest.main`` in the same launcher process still loads the plugin.
 """
 
 from __future__ import annotations
@@ -26,6 +32,8 @@ import pytest
 _SPEC_ENV = "AGENT_LOOP_WORKER_CAP_SPEC"
 _NESTED_ENV = "AGENT_LOOP_WORKER_CAP_NESTED"
 _MODES = ("clamp", "refuse")
+_PLUGINS_ENV = "PYTEST_PLUGINS"
+_SELF = "_agent_loop_worker_cap"
 
 
 def _load_spec():
@@ -51,6 +59,29 @@ def _load_spec():
     ):
         return None
     return {"budget": budget, "mode": mode, "report": report}
+
+
+def _plugin_entries(raw):
+    return [entry.strip() for entry in (raw or "").split(",") if entry.strip()]
+
+
+def _withdraw_env_entry() -> bool:
+    """Drop this plugin from ``PYTEST_PLUGINS`` so child processes never inherit it."""
+    entries = _plugin_entries(os.environ.get(_PLUGINS_ENV))
+    if _SELF not in entries:
+        return False
+    kept = [entry for entry in entries if entry != _SELF]
+    if kept:
+        os.environ[_PLUGINS_ENV] = ",".join(kept)
+    else:
+        os.environ.pop(_PLUGINS_ENV, None)
+    return True
+
+
+def _restore_env_entry() -> None:
+    entries = _plugin_entries(os.environ.get(_PLUGINS_ENV))
+    if _SELF not in entries:
+        os.environ[_PLUGINS_ENV] = ",".join([*entries, _SELF])
 
 
 _ARMED = _load_spec()
@@ -117,6 +148,7 @@ def count_specs(specs):
 
 class _Session:
     def __init__(self, spec, config):
+        self.env_entry = False  # whether this claim withdrew the PYTEST_PLUGINS entry
         self.budget = spec["budget"]
         self.mode = spec["mode"]
         self.report = spec["report"]
@@ -201,6 +233,7 @@ if _pluggy_supports_wrappers():
             if _CLAIM is None:
                 state = _Session(_ARMED, config)
                 _CLAIM = state
+                state.env_entry = _withdraw_env_entry()
             else:
                 _emit(
                     _ARMED["report"],
@@ -216,6 +249,8 @@ if _pluggy_supports_wrappers():
         finally:
             if _CLAIM is state:
                 _CLAIM = None
+                if state.env_entry:
+                    _restore_env_entry()
 
     def _option_gate(state, config):
         option = config.option
