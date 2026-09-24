@@ -2289,6 +2289,31 @@ def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mappi
     return recognized[0] if recognized is not None else None
 
 
+def _direct_launcher_executable(token: str, *, cwd: Path, environment: Mapping[str, str]) -> str:
+    executable = token
+    if not Path(executable).is_absolute() and (token.startswith((".", "~")) or Path(token).parent != Path(".")):
+        executable = str((cwd / Path(token)).resolve(strict=False))
+    elif not Path(executable).is_absolute():
+        executable = shutil.which(executable, path=environment.get("PATH")) or executable
+    return executable
+
+
+def _is_node_test_runner(arguments: Sequence[str]) -> bool:
+    """Return whether ``node`` options select the built-in test runner.
+
+    Only Node's own leading options are inspected: ``--test`` after the first
+    positional argument belongs to the script, not to Node.
+    """
+    for argument in arguments:
+        if argument == "--":
+            return False
+        if not argument.startswith("-"):
+            return False
+        if argument == "--test":
+            return True
+    return False
+
+
 def _recognized_inner_probe_tokens(
     tokens: tuple[str, ...], *, cwd: Path, environment: Mapping[str, str]
 ) -> tuple[str, ...] | None:
@@ -2297,12 +2322,12 @@ def _recognized_inner_probe_tokens(
     values = environment
     first = Path(tokens[0]).name
     if first in {"pytest", "py.test"}:
-        executable = tokens[0]
-        if not Path(executable).is_absolute() and (tokens[0].startswith((".", "~")) or Path(tokens[0]).parent != Path(".")):
-            executable = str((cwd / Path(tokens[0])).resolve(strict=False))
-        elif not Path(executable).is_absolute():
-            executable = shutil.which(executable, path=values.get("PATH")) or executable
-        return (executable, "--version")
+        return (_direct_launcher_executable(tokens[0], cwd=cwd, environment=values), "--version")
+    if first in {"node", "nodejs"} and _is_node_test_runner(tokens[1:]):
+        # Node's built-in test runner has the same safe bootstrap shape as
+        # pytest: ``node --version`` proves the runtime starts without running
+        # any test file.
+        return (_direct_launcher_executable(tokens[0], cwd=cwd, environment=values), "--version")
     if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
         interpreter = _python_interpreter_path(tokens[0], cwd=cwd, environment=values)
         if interpreter is not None:

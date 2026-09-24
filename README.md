@@ -967,7 +967,9 @@ environment, including ambient values merged with a partial overlay. The probe
 never runs remembered test arguments,
 installs dependencies, contacts a database, or executes an arbitrary shell.
 Recognized inner launchers receive the same bounded `--version` probe: direct
-`pytest`/`py.test` and exactly `<python> -m pytest`; other commands remain
+`pytest`/`py.test`, exactly `<python> -m pytest`, and Node's built-in runner
+(`node --test ...`, with `--test` among Node's own leading options, probed as
+`node --version`); other commands remain
 unknown rather than being judged from text or exit codes. The runtime result
 keeps independent `wrapper_bootstrap`, `inner_exec`, and `suite_start` states,
 so a missing executable or import is launcher health rather than a suite

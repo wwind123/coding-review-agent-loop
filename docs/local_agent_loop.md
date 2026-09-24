@@ -4773,8 +4773,10 @@ shebang, interpreter,
 package-origin, virtualenv, and invocation identity so repair or replacement
 causes a fresh probe.
 
-For the recognized inner forms direct `pytest`/`py.test` and exactly
-`<python> -m pytest`, agent-loop performs a fixed `--version` bootstrap probe
+For the recognized inner forms direct `pytest`/`py.test`, exactly
+`<python> -m pytest`, and Node's built-in test runner (`node`/`nodejs` with
+`--test` among Node's own leading options, before any script path), agent-loop
+performs a fixed `--version` bootstrap probe
 under the same five-second bound. Other launchers are never classified from
 stderr or an exit code. Results carry independent `wrapper_bootstrap`,
 `inner_exec`, and `suite_start` states plus the existing suite outcome. Direct
