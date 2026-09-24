@@ -188,6 +188,9 @@ In skill mode, the test-gate policy is selected with
 
 Clone the repository and install it into a virtual environment:
 
+If `python3 --version` reports an interpreter older than 3.12, name a newer
+one explicitly in the `venv` step, for example `python3.12 -m venv .venv`.
+
 ```bash
 gh repo clone wwind123/coding-review-agent-loop
 cd coding-review-agent-loop
