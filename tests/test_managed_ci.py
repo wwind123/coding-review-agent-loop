@@ -2166,6 +2166,102 @@ def test_continuity_revalidation_never_uses_terminal_nonce_for_opening_body(
     assert validated.opening_override_nonce == "nonce-643"
 
 
+def _released_label_revalidation(tmp_path, issue_events, *, labels=()):
+    runner = AuthorizationCommentRunner(
+        issue_events=issue_events,
+        rest_pr={"labels": [{"name": name} for name in labels]},
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = replace(
+        _authorization_handoff(),
+        lifecycle="draft-unlabeled-reentry",
+        authorization_kind="creation",
+        opening_override_nonce=None,
+        active_label_event_id=101,
+        authorization_comment_id=42,
+    )
+    return revalidate_issue_created_handoff(
+        runner,
+        config=config,
+        handoff=handoff,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+    )
+
+
+def test_released_label_after_failed_activation_revalidates_for_reentry(tmp_path):
+    # #997: a failed activation removes the label, so the recorded event is
+    # historical rather than active.  That is the documented unlabeled
+    # re-entry state, not a provenance change.
+    validated = _released_label_revalidation(
+        tmp_path, [label_event(101), label_event(102, event="unlabeled")]
+    )
+
+    assert validated.lifecycle == "draft-unlabeled-reentry"
+    assert validated.active_label_event_id == 101
+
+
+@pytest.mark.parametrize(
+    ("applied_id", "login", "actor_id"),
+    [
+        # The recorded event does not exist in the timeline at all.
+        (103, "agent-loop", 1),
+        # The recorded event id was applied by a different actor.
+        (101, "intruder", 9),
+    ],
+)
+def test_released_label_reentry_still_rejects_foreign_label_event(
+    tmp_path, applied_id, login, actor_id
+):
+    issue_events = [
+        label_event(applied_id, login=login, actor_id=actor_id),
+        label_event(applied_id + 1, event="unlabeled"),
+    ]
+    with pytest.raises(AgentLoopError, match="label provenance changed"):
+        _released_label_revalidation(tmp_path, issue_events)
+
+
+def test_released_label_reentry_rejects_relabeled_pr(tmp_path):
+    with pytest.raises(AgentLoopError, match="opening tuple"):
+        _released_label_revalidation(
+            tmp_path, [label_event(101)], labels=(MANAGED_LABEL,)
+        )
+
+
+def test_labeled_revalidation_still_requires_the_active_label_event(tmp_path):
+    runner = AuthorizationCommentRunner(
+        issue_events=[label_event(101), label_event(102, event="unlabeled"), label_event(103)]
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = replace(
+        _authorization_handoff(),
+        lifecycle="draft-labeled",
+        authorization_kind="creation",
+        opening_override_nonce=None,
+        active_label_event_id=101,
+        authorization_comment_id=42,
+    )
+
+    with pytest.raises(AgentLoopError, match="label provenance changed"):
+        revalidate_issue_created_handoff(
+            runner,
+            config=config,
+            handoff=handoff,
+            metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+        )
+
+
 def test_public_pr_missing_authorization_reaches_parser_valid_fresh_remedy(tmp_path):
     recovered_metadata = replace(
         metadata(),
