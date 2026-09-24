@@ -193,8 +193,10 @@ With exactly one matching record and an open canonical PR, planning reopens:
   stops after approval; the next rerun performs only the rebind.
 - Before that rebind comment is written, the superseded and replacement plans
   are compared on their structural contract: plan steps (full text), risk/test
-  matrix rows, the execution recommendation's scope items, acceptance
-  criteria, deliverables, and stages, and its strategy. When the replacement
+  matrix rows, the execution recommendation's scope items, coupling
+  constraints, acceptance criteria, deliverables, coverage, and stages
+  (including stage execution disposition, dependencies, and automation), and
+  its strategy. When the replacement
   adds any of these or changes the strategy, a log line records it and a
   bounded notice section in the same rebind comment names what grew and notes
   that the PR's implementation predates it, so the operator can decide whether

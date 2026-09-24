@@ -10191,8 +10191,9 @@ class _PlanContractShape:
     steps: tuple[str, ...]
     matrix_row_ids: tuple[str, ...]
     strategy: str | None
-    # Labelled scope, delivery, and stage commitments of the execution
-    # recommendation: work the PR must satisfy even when steps and rows hold.
+    # Labelled scope, coupling, delivery, and stage commitments (including
+    # stage execution fields) of the execution recommendation: work or
+    # topology the PR must satisfy even when steps and rows hold.
     commitments: tuple[str, ...] = ()
 
 
@@ -10219,6 +10220,11 @@ def _recommendation_commitments(recommendation: Mapping[str, object]) -> tuple[s
             f"acceptance for scope item `{scope_id}`: {criterion}"
             for criterion in strings(item.get("acceptance_criteria"))
         )
+    for constraint in mappings(recommendation.get("coupling_constraints")):
+        scope_ids = ", ".join(f"`{item}`" for item in sorted(strings(constraint.get("scope_item_ids"))))
+        commitments.append(
+            f"coupling constraint `{constraint.get('constraint_id', '')}` couples {scope_ids}"
+        )
     allocations = (
         ("one-shot delivery", recommendation.get("one_shot_delivery")),
         ("retained parent work", recommendation.get("retained_parent_work")),
@@ -10227,12 +10233,18 @@ def _recommendation_commitments(recommendation: Mapping[str, object]) -> tuple[s
     for label, allocation in allocations:
         if not isinstance(allocation, Mapping):
             continue
+        if isinstance(allocation.get("status"), str) and allocation["status"] != "none":
+            commitments.append(f"{label} status: {allocation['status']}")
         commitments.extend(
             f"{label} deliverable: {item}" for item in strings(allocation.get("deliverables"))
         )
         commitments.extend(
             f"{label} acceptance: {item}"
             for item in strings(allocation.get("acceptance_criteria"))
+        )
+        commitments.extend(
+            f"{label} covers scope item `{item}`"
+            for item in strings(allocation.get("covered_scope_item_ids"))
         )
     for stage in mappings(recommendation.get("child_stages")):
         stage_id = str(stage.get("stage_id", ""))
@@ -10245,6 +10257,31 @@ def _recommendation_commitments(recommendation: Mapping[str, object]) -> tuple[s
             f"stage `{stage_id}` acceptance: {item}"
             for item in strings(stage.get("acceptance_criteria"))
         )
+        # Execution fields: a changed value is a new label, so moving a stage
+        # to child planning or adding a dependency is reported as growth.
+        commitments.extend(
+            f"stage `{stage_id}` covers scope item `{item}`"
+            for item in strings(stage.get("covered_scope_item_ids"))
+        )
+        commitments.extend(
+            f"stage `{stage_id}` depends on stage `{item}`"
+            for item in strings(stage.get("depends_on_stage_ids"))
+        )
+        commitments.extend(
+            f"stage `{stage_id}` compatibility constraint: {item}"
+            for item in strings(stage.get("compatibility_constraints"))
+        )
+        if isinstance(stage.get("automation"), str):
+            commitments.append(f"stage `{stage_id}` automation: {stage['automation']}")
+        disposition = stage.get("execution_disposition")
+        if isinstance(disposition, Mapping):
+            commitments.append(
+                f"stage `{stage_id}` execution disposition: {disposition.get('disposition', '')}"
+            )
+            commitments.extend(
+                f"stage `{stage_id}` unresolved design decision: {item}"
+                for item in strings(disposition.get("unresolved_design_decisions"))
+            )
     return tuple(commitments)
 
 
@@ -10343,7 +10380,8 @@ def _plan_contract_expansion(
         expansion.append(
             (
                 f"{len(new_commitments)} new execution-recommendation commitment(s) "
-                "(scope items, acceptance criteria, deliverables, or stages):",
+                "(scope items, coupling constraints, acceptance criteria, deliverables, "
+                "coverage, or stage execution fields):",
                 new_commitments,
             )
         )

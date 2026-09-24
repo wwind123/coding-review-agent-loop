@@ -2823,6 +2823,72 @@ def test_m1013_new_recommendation_commitments_are_an_expansion():
     assert "one-shot delivery acceptance: B works end to end." in items
 
 
+def _m1013_expansion_for(base, changed):
+    shape = orchestrator._PlanContractShape
+    old = shape(
+        steps=("Do it.",), matrix_row_ids=("row-a",), strategy=base["strategy"],
+        commitments=orchestrator._recommendation_commitments(base),
+    )
+    new = dataclasses.replace(
+        old, commitments=orchestrator._recommendation_commitments(changed)
+    )
+    return orchestrator._plan_contract_expansion(old, new)
+
+
+def test_m1013_new_coupling_constraint_alone_is_an_expansion():
+    base = {
+        "strategy": "one-shot",
+        "scope_items": [
+            {"scope_item_id": f"scope-{key}", "requirement": f"Do {key}.",
+             "acceptance_criteria": [f"{key} works."]}
+            for key in ("a", "b")
+        ],
+        "coupling_constraints": [],
+        "one_shot_delivery": {
+            "deliverables": ["A and B."], "acceptance_criteria": ["Both work."],
+            "covered_scope_item_ids": ["scope-a", "scope-b"],
+        },
+    }
+    assert _m1013_expansion_for(base, base) == []
+    changed = json.loads(json.dumps(base))
+    changed["coupling_constraints"].append(
+        {"constraint_id": "couple-ab", "scope_item_ids": ["scope-b", "scope-a"],
+         "rationale": "Shared seam."}
+    )
+    (summary, items), = _m1013_expansion_for(base, changed)
+    assert summary.startswith("1 new execution-recommendation commitment(s)")
+    assert items == ["coupling constraint `couple-ab` couples `scope-a`, `scope-b`"]
+
+
+def test_m1013_stage_moved_to_child_planning_alone_is_an_expansion():
+    stage = {
+        "stage_id": "stage-one", "position": 1, "title": "Stage one", "summary": "S.",
+        "deliverables": ["D."], "non_goals": [], "acceptance_criteria": ["A."],
+        "depends_on_stage_ids": [], "dependency_notes": "", "automation": "automatic",
+        "rollout_risk": "low", "compatibility_constraints": [],
+        "covered_scope_item_ids": ["scope-a"],
+        "execution_disposition": {
+            "disposition": "direct-implementation", "rationale": "Clear.",
+            "unresolved_design_decisions": [],
+        },
+    }
+    base = {"strategy": "staged", "scope_items": [], "child_stages": [stage]}
+    assert _m1013_expansion_for(base, base) == []
+    changed = json.loads(json.dumps(base))
+    changed["child_stages"][0]["execution_disposition"] = {
+        "disposition": "requires-child-planning", "rationale": "Open design.",
+        "unresolved_design_decisions": ["Pick the transport."],
+    }
+    (summary, items), = _m1013_expansion_for(base, changed)
+    assert "stage `stage-one` execution disposition: requires-child-planning" in items
+    assert "stage `stage-one` unresolved design decision: Pick the transport." in items
+    # A new dependency between existing stages is growth too.
+    depends = json.loads(json.dumps(base))
+    depends["child_stages"][0]["depends_on_stage_ids"] = ["stage-zero"]
+    (_summary, items), = _m1013_expansion_for(base, depends)
+    assert items == ["stage `stage-one` depends on stage `stage-zero`"]
+
+
 def test_m1013_notice_escapes_quoted_record_text(tmp_path, monkeypatch):
     shape = orchestrator._PlanContractShape
     shapes = {
