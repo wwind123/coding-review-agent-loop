@@ -744,6 +744,10 @@ def no_ambient_invocation(monkeypatch):
     # An ambient invocation id (e.g. running under agent-loop) would share the
     # per-invocation probe cache and candidate budget across tests.
     monkeypatch.delenv("AGENT_LOOP_INVOCATION_ID", raising=False)
+    # A host-exported NODE_OPTIONS makes the probe refuse node --test by
+    # design, which would fail positive node tests and let negative ones pass
+    # for the wrong reason. Tests that exercise it set it explicitly.
+    monkeypatch.delenv("NODE_OPTIONS", raising=False)
 
 
 @requires_system_env
