@@ -202,7 +202,10 @@ With exactly one matching record and an open canonical PR, planning reopens:
   in the recommendation, or changes the strategy, a log line records it and a
   bounded notice section in the same rebind comment names what grew and notes
   that the PR's implementation predates it, so the operator can decide whether
-  to decompose. Because it shares the rebind comment, an interruption cannot
+  to decompose. Each named item is bounded but shows its changed part: lines
+  of a multi-line item are joined, and a long prefix shared with the
+  superseded item is elided. Because it shares the rebind comment, an
+  interruption cannot
   leave a rebind without its notice. The notice is informational only: it
   never stops the run, a failure to compare is only logged, quoted plan text is
   escaped, an equivalent plan adds nothing, and it is not repeated later.

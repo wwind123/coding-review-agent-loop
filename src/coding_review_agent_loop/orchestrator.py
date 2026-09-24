@@ -10299,10 +10299,50 @@ def _plan_contract_shape(comments: Sequence[object], plan_hash: str) -> _PlanCon
     return None
 
 
-def _clip_contract_item(text: str) -> str:
-    line = next((part.strip() for part in text.splitlines() if part.strip()), "")
-    if len(line) > _REBIND_EXPANSION_ITEM_CHARS:
-        line = line[: _REBIND_EXPANSION_ITEM_CHARS - 1].rstrip() + "…"
+# Leading characters kept before an elision when the change sits deep in a
+# long item, and characters of shared text kept just before the divergence.
+_REBIND_EXPANSION_HEAD_CHARS = 60
+_REBIND_EXPANSION_LEAD_CHARS = 30
+
+
+def _flatten_contract_text(text: str) -> str:
+    """Join non-empty lines so later lines of a multi-line item stay visible."""
+    return " ⏎ ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
+def _common_prefix_length(left: str, right: str) -> int:
+    length = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        length += 1
+    return length
+
+
+def _clip_contract_item(text: str, prior: Sequence[str] = ()) -> str:
+    """Render one changed item within the bound, keeping the change visible.
+
+    ``prior`` holds the superseded plan's items.  When the item shares a long
+    prefix with its closest superseded counterpart, so that plain clipping
+    would show only unchanged text, the rendering keeps a short head, elides
+    the shared middle, and shows the text from just before the divergence.
+    """
+    line = _flatten_contract_text(text)
+    limit = _REBIND_EXPANSION_ITEM_CHARS
+    if len(line) > limit:
+        divergence = max(
+            (_common_prefix_length(line, _flatten_contract_text(item)) for item in prior),
+            default=0,
+        )
+        head = _REBIND_EXPANSION_HEAD_CHARS
+        if divergence >= limit - 1 - _REBIND_EXPANSION_LEAD_CHARS:
+            tail = line[max(head, divergence - _REBIND_EXPANSION_LEAD_CHARS):]
+            budget = limit - head - 3
+            if len(tail) > budget:
+                tail = tail[: budget - 1].rstrip() + "…"
+            line = line[:head].rstrip() + " … " + tail
+        else:
+            line = line[: limit - 1].rstrip() + "…"
     # Plan text is quoted, never interpreted: an HTML comment opener would
     # otherwise let a quoted step pose as a record in the rebind comment.
     return line.replace("<!--", "&lt;!--")
@@ -10394,6 +10434,7 @@ def _render_contract_expansion_notice(
     superseded_hash: str,
     plan_hash: str,
     include_items: bool,
+    prior: Sequence[str] = (),
 ) -> str:
     lines = [
         _REBIND_EXPANSION_HEADING,
@@ -10408,7 +10449,8 @@ def _render_contract_expansion_notice(
         if not include_items:
             continue
         lines.extend(
-            f"  - {_clip_contract_item(item)}" for item in items[:_REBIND_EXPANSION_LIST_LIMIT]
+            f"  - {_clip_contract_item(item, prior)}"
+            for item in items[:_REBIND_EXPANSION_LIST_LIMIT]
         )
         if len(items) > _REBIND_EXPANSION_LIST_LIMIT:
             lines.append(f"  - …and {len(items) - _REBIND_EXPANSION_LIST_LIMIT} more")
@@ -10468,6 +10510,11 @@ def _rebind_contract_expansion_notice(
             pr_number=pr_number,
             superseded_hash=superseded_hash,
             plan_hash=plan_hash,
+            prior=(
+                *superseded.steps,
+                *superseded.commitments,
+                *(label for _row_id, values in superseded.matrix_row_values for label in values),
+            ),
         )
         notice = render(include_items=True)
         if scan_reserved_markers(notice):

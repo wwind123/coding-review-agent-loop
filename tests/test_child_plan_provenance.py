@@ -2964,6 +2964,38 @@ def test_m1013_any_single_stage_field_change_is_an_expansion(field, value, label
     assert items == [label]
 
 
+def test_m1013_notice_shows_the_changed_part_of_multiline_and_long_prefix_items(
+    tmp_path, monkeypatch
+):
+    shape = orchestrator._PlanContractShape
+    shared = "Validate every parser mode against the single acceptance boundary " * 4
+    old_outcome = shared + "for fresh responses."
+    new_outcome = shared + "for fresh responses and for retried repair responses."
+    label = "`risk_test_matrix[row-a].expected_outcome`: "
+    shapes = {
+        "old": shape(
+            steps=("Build parser\nSupport A",), matrix_row_ids=("row-a",), strategy="one-shot",
+            matrix_row_values=(("row-a", (label + old_outcome,)),),
+        ),
+        "new": shape(
+            steps=("Build parser\nSupport A and B",), matrix_row_ids=("row-a",),
+            strategy="one-shot",
+            matrix_row_values=(("row-a", (label + new_outcome,)),),
+        ),
+    }
+    monkeypatch.setattr(orchestrator, "_plan_contract_shape", lambda _comments, key: shapes[key])
+    notice = orchestrator._rebind_contract_expansion_notice(
+        config=make_config(tmp_path), issue_number=56, comments=(), pr_number=77,
+        superseded_hash="old", plan_hash="new",
+    )
+    # A multi-line step keeps its later, changed line.
+    assert "Build parser ⏎ Support A and B" in notice
+    # A long shared prefix is elided so the divergent tail is named.
+    row_line = next(line for line in notice.splitlines() if "expected_outcome" in line)
+    assert " … " in row_line and "and for retried repair responses." in row_line
+    assert len(row_line) <= orchestrator._REBIND_EXPANSION_ITEM_CHARS + len("  - ")
+
+
 def test_m1013_notice_escapes_quoted_record_text(tmp_path, monkeypatch):
     shape = orchestrator._PlanContractShape
     shapes = {
