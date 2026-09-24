@@ -2001,11 +2001,24 @@ CLAIM_ROW_ID_MISTYPED_RULE = "row_id is not a string"
 CLAIM_DROPPED_OUTCOME = "claim-dropped"
 
 
+# Identifier shapes a malformed row ID may imitate: reviewer finding IDs and
+# signed-requirement IDs, the same namespaces ``_RISK_ROW_ID_RE`` refuses.
+_RESERVED_IDENTIFIER_LIKE_RE = re.compile(r"(item|finding|review|blocker)[-_.]?(?=\d)|hr-", re.I)
+
+
+def _neutralize_identifier_like(text: str) -> str:
+    """Break finding- and requirement-like tokens so a preview cannot read as one (#926)."""
+    return _RESERVED_IDENTIFIER_LIKE_RE.sub(
+        lambda match: re.sub(r"[-_.]$", "", match.group(0)) + "\u00b7", text
+    )
+
+
 def _degraded_row_claim_message(record: ParseDegradation) -> str:
+    observed = _neutralize_identifier_like(_dropped_ref_preview(record.observed_preview))
     return (
         f"The semantic coverage claim at `{_dropped_ref_preview(record.element_path)}` was dropped "
         f"before authentication: {_dropped_ref_preview(record.rule)} "
-        f"(observed `{_dropped_ref_preview(record.observed_preview)}`). "
+        f"(observed `{observed}`). "
         "The claim asserted no coverage."
     )
 
@@ -2028,7 +2041,8 @@ def _unapproved_row_claim_message(
     else:
         origin = f"The row belongs to execution owner `{_dropped_ref_preview(row_owner)}`."
     return (
-        f"A semantic coverage claim for row `{_dropped_ref_preview(row_id)}` was dropped "
+        f"A semantic coverage claim for row "
+        f"`{_neutralize_identifier_like(_dropped_ref_preview(row_id))}` was dropped "
         f"because the row is not in the approved enforceable matrix set for {scope}. "
         f"{origin} The claim asserted no coverage."
         + (
@@ -3830,7 +3844,9 @@ def _parse_semantic_risk_coverage_claims(
             record = ParseDegradation.build(
                 element_path=row_id_context,
                 rule=CLAIM_ROW_ID_UNAPPROVED_RULE,
-                observed=row_id,
+                # The row-ID pattern is case-sensitive, so a valid unapproved
+                # ID such as ``Item9`` can still imitate a finding ID.
+                observed=_neutralize_identifier_like(row_id),
                 outcome=CLAIM_DROPPED_OUTCOME,
             )
             degradations.append(record)
@@ -3995,7 +4011,7 @@ def _claim_row_id_or_degradation(
         return None, ParseDegradation.build(
             element_path=context,
             rule=CLAIM_ROW_ID_MALFORMED_RULE,
-            observed=_dropped_ref_preview(value) or "blank",
+            observed=_neutralize_identifier_like(_dropped_ref_preview(value)) or "blank",
             outcome=CLAIM_DROPPED_OUTCOME,
         )
 

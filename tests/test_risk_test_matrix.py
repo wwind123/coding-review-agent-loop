@@ -2485,3 +2485,46 @@ def test_correction_keeps_distinct_drops_at_the_same_index_926() -> None:
     lines = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
     assert len(lines) == 2
     assert "correction." in lines[1] and "correction." not in lines[0]
+
+
+@pytest.mark.parametrize(
+    "bad_row_id",
+    ["finding-3", "hr-2", "item-1", "blocker_5", "review.2", "HR-0abc", "x-finding-7", "Item9"],
+)
+def test_malformed_identifier_like_row_id_is_neutralized_in_public_output_926(bad_row_id) -> None:
+    """A malformed row ID cannot surface as an intact finding- or requirement-style token."""
+    import re
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    reserved = re.compile(r"(item|finding|review|blocker)[-_.]?\d|hr-", re.I)
+    parsed, result = _parse_and_derive_926(
+        [_claim_926(bad_row_id, "turn:observation-2"), _claim_926("row-first")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    [record] = parsed.risk_test_matrix_claims.degradations
+    assert not reserved.search(record.observed_preview)
+    assert "·" in record.observed_preview
+    # Case-variant IDs such as ``Item9`` are valid but unapproved, so they
+    # take the unapproved-row path; both paths must neutralize the preview.
+    [dropped] = [
+        item for item in result.diagnostics
+        if item.code in {"degraded-row-claim", "unapproved-row-claim"}
+    ]
+    assert not reserved.search(dropped.message)
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert not any(reserved.search(item["message"]) for item in decoded.risk_test_matrix_diagnostics)
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    [line] = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert "·" in line
+    assert not reserved.search(rendered)
