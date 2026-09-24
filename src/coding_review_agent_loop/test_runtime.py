@@ -1389,55 +1389,34 @@ def _unlock_file(handle) -> None:
 LAUNCH_INTEGRITY_STATES = frozenset({"verified", "unverified"})
 
 
-def launch_integrity_state(result: object) -> str:
+def launch_integrity_state(result: object, *, wrapper_boundary: bool = True) -> str:
     """Classify a runner/broker result's launch boundary for runtime history.
 
     Mirrors the evidence gate: only a verified wrapper bootstrap, a started
     inner exec and a verified suite start are authoritative.  Anything else
     (for example an unrecognized shell-script wrapper whose suite start is
     ``unknown``) is refused as evidence and must not become a recommendation.
+
+    ``wrapper_boundary=False`` is for the parent-owned configured test gate,
+    which has no ``run-tests`` wrapper to bootstrap; its suite start must
+    still be verified.
     """
     authoritative = (
-        getattr(result, "wrapper_bootstrap", "unknown") == "verified"
+        (not wrapper_boundary or getattr(result, "wrapper_bootstrap", "unknown") == "verified")
         and getattr(result, "inner_exec", "not-attempted") == "started"
         and getattr(result, "suite_start", "not-started") == "verified"
     )
     return "verified" if authoritative else "unverified"
 
 
-def _row_is_non_evidence(row: Mapping[str, object]) -> bool:
-    return row.get("launch_integrity") == "unverified"
+def runtime_row_is_evidence(row: Mapping[str, object]) -> bool:
+    """Whether a remembered row carries an authenticated launch.
 
-
-def _lexically_recognized_suite_launcher(tokens: Sequence[str]) -> bool:
-    """Text-only form of the inner-probe recognizer, for legacy rows.
-
-    Rows written before ``launch_integrity`` existed carry no launch state.
-    Only ``pytest``/``py.test`` and ``<python> -m pytest`` (optionally behind a
-    plain ``env NAME=VALUE`` prefix) can ever reach a verified suite start, so
-    any other legacy command is treated as unverified.  No path is resolved.
+    Fail closed: rows written before ``launch_integrity`` existed carry no
+    launch state, and their argv alone cannot prove the suite start was
+    verified, so they are non-evidence just like an ``unverified`` row.
     """
-    items = [str(item) for item in tokens]
-    if items and Path(items[0]).name == "env":
-        index = 1
-        if index < len(items) and items[index] == "--":
-            index += 1
-        while index < len(items) and "=" in items[index] and not items[index].startswith("-"):
-            index += 1
-        items = items[index:]
-    if not items:
-        return False
-    if Path(items[0]).name in {"pytest", "py.test"}:
-        return True
-    return len(items) >= 3 and items[1] == "-m" and items[2] == "pytest"
-
-
-def runtime_row_recommendable(row: Mapping[str, object], command: Sequence[str]) -> bool:
-    """Whether a remembered row may be surfaced to coders as a command."""
-    state = row.get("launch_integrity")
-    if state is not None:
-        return state == "verified"
-    return _lexically_recognized_suite_launcher(command)
+    return row.get("launch_integrity") == "verified"
 
 
 def record_test_observation(
@@ -2563,8 +2542,9 @@ def recommend_timeout(
             continue
         if row.get("input_manifest") != current_manifest:
             continue
-        if _row_is_non_evidence(row):
-            # A run refused as evidence is not trustworthy timing either.
+        if not runtime_row_is_evidence(row):
+            # A run refused as evidence (or a legacy row with no launch
+            # state) is not trustworthy timing either (#989).
             continue
         matching.append(row)
     timestamped: list[tuple[datetime, int, dict]] = []

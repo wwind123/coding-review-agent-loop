@@ -4838,14 +4838,16 @@ timeouts are lower-bound evidence, never successes. Samples are retained up to
 relevant lockfile, configuration, target, or fixture changes. Persistence is
 best-effort and uses an advisory lock plus atomic replacement.
 
-Wrapper rows carry `launch_integrity` (`verified` only when `wrapper_bootstrap`
-is `verified`, `inner_exec` is `started`, and `suite_start` is `verified`). An
-`unverified` row is the same launch the evidence gate refuses as an
-`execution_refs` selector, so it is kept only as non-evidence: `recommend_timeout`
-skips it and prompt rendering never lists it as a remembered command. Legacy
-rows without the field are listed only when their command is a recognized
-`pytest`/`<python> -m pytest` launcher, so unauthenticated wrappers already in
-history stop being recommended.
+Rows carry `launch_integrity`. A `run-tests` wrapper row is `verified` only
+when `wrapper_bootstrap` is `verified`, `inner_exec` is `started`, and
+`suite_start` is `verified`; a configured local/pre-review gate row (which has
+no wrapper to bootstrap) is `verified` only when `inner_exec` is `started` and
+`suite_start` is `verified`. An `unverified` row is the same launch the
+evidence gate refuses as an `execution_refs` selector, so it is kept only as
+non-evidence: `recommend_timeout` skips it and prompt rendering never lists it
+as a remembered command. Legacy rows without the field fail closed the same
+way, because argv alone cannot prove the suite start was authenticated, so
+unauthenticated wrappers already in history stop being recommended.
 
 ### Semantic revision assembly
 

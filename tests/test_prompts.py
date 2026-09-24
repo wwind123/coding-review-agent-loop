@@ -2572,7 +2572,9 @@ def test_coder_prompt_never_recommends_runs_refused_as_evidence(tmp_path):
     assert "run_suite.sh" not in prompt
     assert "legacy_wrapper.sh" not in prompt
     assert "tests/test_verified.py" in prompt
-    assert "tests/test_legacy.py" in prompt
+    # A legacy row carries no launch state; its argv cannot prove the suite
+    # start was authenticated, so it is not recommended either.
+    assert "tests/test_legacy.py" not in prompt
 
 
 def test_coder_prompt_reuses_stored_runtime_keys_for_redacted_and_external_commands(tmp_path):
