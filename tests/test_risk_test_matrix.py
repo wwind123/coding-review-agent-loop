@@ -2427,3 +2427,61 @@ def test_unapproved_row_ids_sharing_a_preview_keep_exact_attribution_926() -> No
     rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
     lines = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
     assert len(lines) == 2
+
+
+def test_correction_keeps_distinct_drops_at_the_same_index_926() -> None:
+    """A correction drop that looks like the original's keeps its own ID and position."""
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    first_id = "a" * 120 + "x"
+    second_id = "a" * 120 + "y"
+    catalog = [_derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")]
+    original = validate_structured_coder_followup(
+        _followup_with_claims_920([_claim_926(first_id)]),
+        delivered_risk_test_matrix_row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+    corrected = orchestrator_module._parse_fresh_correction_claims(
+        _followup_with_claims_920([_claim_926(second_id)]),
+        original,
+        row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+    claims = corrected.risk_test_matrix_claims
+    assert len(claims.degradations) == 2
+
+    matrix = parse_risk_test_matrix(_matrix())
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=tuple(catalog),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+    dropped = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert [item.row_id for item in dropped] == [first_id, second_id]
+    assert "`coder_followup.risk_test_matrix_claims[0].row_id`" in dropped[0].message
+    assert "correction.coder_followup.risk_test_matrix_claims[0].row_id" in dropped[1].message
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    restored = [item for item in decoded.risk_test_matrix_diagnostics if item["code"] == "unapproved-row-claim"]
+    assert [(item["row_id"], item["message"]) for item in restored] == [
+        (item.row_id, item.message) for item in dropped
+    ]
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    lines = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert len(lines) == 2
+    assert "correction." in lines[1] and "correction." not in lines[0]

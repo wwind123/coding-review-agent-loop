@@ -5455,13 +5455,29 @@ def _parse_fresh_correction_claims(
     )
     if original_dropped or original_degradations:
         claims = claims or SemanticRiskCoverageClaims()
+        # Each drop is its own audit record, so records are concatenated, not
+        # deduplicated; the correction's records are relabeled so a drop at
+        # the same index in both responses keeps a distinct position.
+        relabeled = {
+            record: dataclasses_replace(
+                record, element_path=f"correction.{record.element_path}"
+            )
+            for record in claims.degradations
+        }
         claims = dataclasses_replace(
             claims,
             dropped_row_ids=tuple(dict.fromkeys((*original_dropped, *claims.dropped_row_ids))),
-            degradations=tuple(dict.fromkeys((*original_degradations, *claims.degradations))),
-            unapproved_claim_row_ids=tuple(dict.fromkeys(
-                (*original_exact_ids, *claims.unapproved_claim_row_ids)
-            )),
+            degradations=(
+                *original_degradations,
+                *(relabeled[record] for record in claims.degradations),
+            ),
+            unapproved_claim_row_ids=(
+                *original_exact_ids,
+                *(
+                    (relabeled.get(record, record), row_id)
+                    for record, row_id in claims.unapproved_claim_row_ids
+                ),
+            ),
         )
     return dataclasses_replace(
         original,

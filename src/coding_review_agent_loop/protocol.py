@@ -2149,26 +2149,14 @@ def derive_risk_test_matrix_evidence(
     ]
     if isinstance(claims, SemanticRiskCoverageClaims):
         owner_by_row = {row.row_id: row.execution_owner for row in parsed_matrix.rows}
-        # The recorded preview is bounded, so each unapproved record's exact
-        # row ID comes from the parser's record-keyed map.
-        exact_row_id_by_record = dict(claims.unapproved_claim_row_ids)
+        # One diagnostic per dropped claim (#926).  Each unapproved record is
+        # paired with its exact row ID at parse time, because the record's
+        # preview is bounded and two records can compare equal; iterating the
+        # pairs keeps every drop, even equal-looking ones, attributed.
         covered_dropped: set[str] = set()
-        for record in claims.degradations:
-            if record.rule != CLAIM_ROW_ID_UNAPPROVED_RULE:
-                continue
-            # One diagnostic per dropped claim (#926), so a row ID claimed
-            # twice outside the approved set is reported twice, each with its
-            # position; the historical code and row-ID keying are kept (#920).
-            dropped_row_id = exact_row_id_by_record.get(record)
-            if dropped_row_id is None:
-                # A record with no exact ID cannot be attributed to a row, so
-                # it is keyed by its element path like other drops.
-                diagnostics.append(PostAuthClaimDiagnostic(
-                    record.element_path,
-                    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
-                    _degraded_row_claim_message(record),
-                ))
-                continue
+        paired_records: dict[ParseDegradation, int] = {}
+        for record, dropped_row_id in claims.unapproved_claim_row_ids:
+            paired_records[record] = paired_records.get(record, 0) + 1
             covered_dropped.add(dropped_row_id)
             diagnostics.append(PostAuthClaimDiagnostic(
                 dropped_row_id,
@@ -2179,6 +2167,19 @@ def derive_risk_test_matrix_evidence(
                     execution_owner=execution_owner,
                     record=record,
                 ),
+            ))
+        for record in claims.degradations:
+            if record.rule != CLAIM_ROW_ID_UNAPPROVED_RULE:
+                continue
+            if paired_records.get(record, 0):
+                paired_records[record] -= 1
+                continue
+            # A record with no exact ID cannot be attributed to a row, so it
+            # is keyed by its element path like other drops.
+            diagnostics.append(PostAuthClaimDiagnostic(
+                record.element_path,
+                UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+                _degraded_row_claim_message(record),
             ))
         for dropped_row_id in claims.dropped_row_ids:
             if dropped_row_id in covered_dropped:
