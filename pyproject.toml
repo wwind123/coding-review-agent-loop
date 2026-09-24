@@ -26,6 +26,7 @@ dev = ["pytest>=8", "pytest-xdist>=3", "markdown-it-py>=3"]
 
 [project.scripts]
 agent-loop = "coding_review_agent_loop.cli:main"
+agent-loop-gh = "coding_review_agent_loop.gh_rest_shim:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/coding_review_agent_loop"]

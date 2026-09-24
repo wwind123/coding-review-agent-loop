@@ -210,6 +210,40 @@ codex --version
 
 Substitute `agy --version` or `gemini --version` when using those backends.
 
+### Running where GitHub GraphQL is refused
+
+Some hosts, notably Claude Code cloud sessions, block every GitHub GraphQL
+request at an egress proxy while allowing repository-scoped REST
+(`repos/{owner}/{repo}/...`). Much of `gh`'s porcelain (`gh issue view --json`,
+`gh pr view --json`, `gh pr create`, `gh repo clone`, …) is GraphQL-backed, so
+agent-loop and its coder agents fail there on their first GitHub read.
+
+The package ships `agent-loop-gh`, a `gh`-compatible shim that answers exactly
+the porcelain forms agent-loop, its skill helpers, and its coder prompts use
+over REST, printing the same `--json` shape `gh` would. Every other command,
+including every `gh api` call, passes through to the real `gh` unchanged.
+Install it as `gh` ahead of the real one so the orchestrator and the agents it
+launches both use it:
+
+```bash
+agent-loop-gh shim-install ~/.local/agent-loop-gh/bin
+export PATH="$HOME/.local/agent-loop-gh/bin:$PATH"
+```
+
+`AGENT_LOOP_GH_TRANSPORT` selects the transport: `auto` (default) probes
+GraphQL once and uses REST only when the proxy's refusal is identified
+(cached for 15 minutes), `rest` always emulates, and `graphql` always passes
+through. On a host where GraphQL works, `auto` passes through, so the shim can
+stay installed. Set `AGENT_LOOP_REAL_GH` if the real `gh` is not on `PATH`.
+
+In REST mode an unsupported flag or `--json` field fails with a pointer to
+`gh api repos/...` rather than being ignored, issue search is evaluated locally
+because `search/issues` is not repository-scoped, and PR commit provenance
+fails closed above GitHub REST's 250-commit listing limit. Other notes for such
+hosts: sign Codex in with `codex login --device-auth` to use a ChatGPT plan,
+and pass `--repair-backend codex --repair-model MODEL` (or `claude`) when the
+default `antigravity` repair backend is not installed.
+
 ## Quick Start
 
 ### Review an existing PR
