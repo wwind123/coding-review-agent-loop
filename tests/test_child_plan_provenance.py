@@ -2751,13 +2751,49 @@ def test_m1013_rebind_to_a_plan_with_new_steps_posts_one_expansion_notice(
 
 
 def test_m1013_rebind_to_an_equivalent_plan_posts_no_notice(tmp_path, monkeypatch):
-    world = _M936World(tmp_path, monkeypatch)
+    # An admissible plan re-planned with only its summary reworded.
+    world = _M936World(tmp_path, monkeypatch, weak=False)
     assert world.run_issue(
-        claude_outputs=[world.good_patch()],
+        claude_outputs=[_m936_patch(world.old_state, None, summary="Reworded summary.")],
         codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
     ) == 0
     assert sum(1 for body in world.posted() if CHILD_PLAN_REBIND_MARKER_RE.search(body)) == 1
     assert _m1013_notices(world) == []
+
+
+def test_m1013_rebind_replacing_a_step_at_the_same_count_posts_the_notice(
+    tmp_path, monkeypatch
+):
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    base_steps = json.loads(world.old_state.split("\n", 1)[0])["plan_steps"]
+    patch = json.loads(_m936_patch(world.old_state, None, summary="Swap a step.").split("\n", 1)[0])
+    patch["operations"].append(
+        {"op": "replace", "field": "plan_steps",
+         "value": [*base_steps[:-1], "Add the retry transport."]}
+    )
+    assert world.run_issue(
+        claude_outputs=[json.dumps(patch) + PLAN_FOOTER],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    (notice,) = _m1013_notices(world)
+    assert "1 plan step(s) not in the superseded plan" in notice
+    assert f"(steps: {len(base_steps)} before, {len(base_steps)} after)" in notice
+    assert "Add the retry transport." in notice
+
+
+def test_m1013_rebind_strengthening_an_inherited_row_posts_the_notice(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    row = _m936_inherited_row()
+    stronger = {**row, "expected_outcome": row["expected_outcome"] + " and is retried once"}
+    assert world.run_issue(
+        claude_outputs=[_m936_patch(world.old_state, stronger, summary="Stronger row.")],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    (notice,) = _m1013_notices(world)
+    assert "1 new or changed value(s) in existing risk/test matrix rows" in notice
+    assert "`risk_test_matrix[row-stage-one].expected_outcome`" in notice
+    assert "and is retried once" in notice
+    assert "new risk/test matrix row(s)" not in notice
 
 
 def test_m1013_expansion_notice_failure_never_blocks_the_run(tmp_path, monkeypatch):
@@ -2784,7 +2820,7 @@ def test_m1013_step_identity_compares_full_text_not_the_clipped_prefix():
         steps=(prefix + "Part one.", prefix + "Part two."), matrix_row_ids=(), strategy="one-shot"
     )
     expansion = orchestrator._plan_contract_expansion(old, grown)
-    assert expansion and expansion[0][0].startswith("Plan steps grew from 1 to 2")
+    assert expansion and expansion[0][0].startswith("1 plan step(s) not in the superseded plan")
     assert expansion[0][1] == [prefix + "Part two."]
     # A duplicated step is still a new required step.
     doubled = shape(steps=old.steps * 2, matrix_row_ids=(), strategy="one-shot")
@@ -2945,7 +2981,7 @@ def test_m1013_notice_escapes_quoted_record_text(tmp_path, monkeypatch):
         config=make_config(tmp_path), issue_number=56, comments=(), pr_number=77,
         superseded_hash="old", plan_hash="new",
     )
-    assert "Plan steps grew from 1 to 2" in notice
+    assert "1 plan step(s) not in the superseded plan" in notice
     assert "<!--" not in notice and "&lt;!-- AGENT_STATE: approved" in notice
     assert not scan_reserved_markers(notice)
 
@@ -2954,9 +2990,14 @@ def test_m1013_contract_expansion_names_new_rows_and_a_changed_strategy():
     shape = orchestrator._PlanContractShape
     old = shape(steps=("Do A.",), matrix_row_ids=("row-a",), strategy="one-shot")
     assert orchestrator._plan_contract_expansion(old, old) == []
-    # Reworded steps at the same count, or fewer rows, are not an expansion.
-    narrower = shape(steps=("Do A differently.",), matrix_row_ids=(), strategy="one-shot")
+    # Dropped steps or rows alone are not an expansion.
+    narrower = shape(steps=(), matrix_row_ids=(), strategy="one-shot")
     assert orchestrator._plan_contract_expansion(old, narrower) == []
+    # A replaced step is, even at the same count.
+    replaced = shape(steps=("Do B.",), matrix_row_ids=("row-a",), strategy="one-shot")
+    assert orchestrator._plan_contract_expansion(old, replaced) == [
+        ("1 plan step(s) not in the superseded plan (steps: 1 before, 1 after):", ["Do B."])
+    ]
     grown = shape(steps=("Do A.",), matrix_row_ids=("row-a", "row-b"), strategy="staged")
     expansion = "\n".join(
         "\n".join([summary, *items])

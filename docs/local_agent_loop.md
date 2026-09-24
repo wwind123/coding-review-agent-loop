@@ -192,12 +192,14 @@ With exactly one matching record and an open canonical PR, planning reopens:
   PR). The write is skipped when it already exists. A plan-only invocation
   stops after approval; the next rerun performs only the rebind.
 - Before that rebind comment is written, the superseded and replacement plans
-  are compared on their structural contract: plan steps (full text), risk/test
-  matrix rows, every field value of the execution recommendation (scope
-  items, coupling constraints, allocations, and every stage field including
-  summary, order, dependencies, notes, risk, and execution disposition), and
-  its strategy. When the replacement adds steps or rows, adds or changes any
-  recommendation value, or changes the strategy, a log line records it and a
+  are compared on their structural contract: plan steps (full text), every
+  field value of each risk/test matrix row (keyed by row ID), every field
+  value of the execution recommendation (scope items, coupling constraints,
+  allocations, and every stage field including summary, order, dependencies,
+  notes, risk, and execution disposition), and its strategy. When the
+  replacement has a step whose text is not in the superseded plan (even at the
+  same step count), adds a row, adds or changes a value in an existing row or
+  in the recommendation, or changes the strategy, a log line records it and a
   bounded notice section in the same rebind comment names what grew and notes
   that the PR's implementation predates it, so the operator can decide whether
   to decompose. Because it shares the rebind comment, an interruption cannot

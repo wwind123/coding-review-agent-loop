@@ -10194,6 +10194,9 @@ class _PlanContractShape:
     # Every execution-recommendation field value, path-labelled: work or
     # topology the PR must satisfy even when steps and rows hold.
     commitments: tuple[str, ...] = ()
+    # Each matrix row's path-labelled field values, keyed by row ID, so a
+    # row strengthened under an unchanged ID is still visible.
+    matrix_row_values: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 # Bounds on the rebind expansion notice so a large re-plan cannot flood it.
@@ -10202,9 +10205,40 @@ _REBIND_EXPANSION_ITEM_CHARS = 160
 _REBIND_EXPANSION_HEADING = "### Rebound PR contract expanded"
 
 
-# Keys that name an element of a recommendation list; they become part of
-# the element's path instead of a separate value.
-_RECOMMENDATION_ELEMENT_ID_KEYS = ("scope_item_id", "constraint_id", "stage_id")
+# Keys that name an element of a contract list; they become part of the
+# element's path instead of a separate value.
+_CONTRACT_ELEMENT_ID_KEYS = ("scope_item_id", "constraint_id", "stage_id", "row_id")
+
+
+def _flatten_contract_values(value: object, path: str, *, skip: frozenset[str] = frozenset()) -> tuple[str, ...]:
+    """Flatten a contract payload into path-labelled leaf values.
+
+    Elements of object lists are addressed by their ID, so an added or
+    changed value is a new label.  ``skip`` names top-level keys left out.
+    """
+    labels: list[str] = []
+
+    def walk(node: object, node_path: str, top: bool) -> None:
+        if isinstance(node, Mapping):
+            for key in sorted(node):
+                if key in _CONTRACT_ELEMENT_ID_KEYS or (top and key in skip):
+                    continue
+                walk(node[key], f"{node_path}.{key}" if node_path else str(key), False)
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                if isinstance(item, Mapping):
+                    element = next(
+                        (str(item[key]) for key in _CONTRACT_ELEMENT_ID_KEYS if key in item),
+                        str(index),
+                    )
+                    walk(item, f"{node_path}[{element}]", False)
+                else:
+                    walk(item, node_path, False)
+        else:
+            labels.append(f"`{node_path}`: {node}")
+
+    walk(value, path, True)
+    return tuple(labels)
 
 
 def _recommendation_commitments(recommendation: Mapping[str, object]) -> tuple[str, ...]:
@@ -10214,33 +10248,21 @@ def _recommendation_commitments(recommendation: Mapping[str, object]) -> tuple[s
     is singled out: scope, coupling, allocations, and every stage field
     (summary, order, dependencies, notes, risk, disposition and its
     rationale, ...) each become a label such as
-    ``child_stages[stage-one].summary: ...``.  Elements of object lists are
-    addressed by their ID, so an added or changed value is a new label.  The
-    strategy is reported on its own and is left out here.
+    ``child_stages[stage-one].summary: ...``.  The strategy is reported on
+    its own and is left out here.
     """
-    labels: list[str] = []
+    return _flatten_contract_values(recommendation, "", skip=frozenset({"strategy"}))
 
-    def walk(value: object, path: str) -> None:
-        if isinstance(value, Mapping):
-            for key in sorted(value):
-                if key in _RECOMMENDATION_ELEMENT_ID_KEYS or (not path and key == "strategy"):
-                    continue
-                walk(value[key], f"{path}.{key}" if path else str(key))
-        elif isinstance(value, list):
-            for index, item in enumerate(value):
-                if isinstance(item, Mapping):
-                    element = next(
-                        (str(item[key]) for key in _RECOMMENDATION_ELEMENT_ID_KEYS if key in item),
-                        str(index),
-                    )
-                    walk(item, f"{path}[{element}]")
-                else:
-                    walk(item, path)
-        else:
-            labels.append(f"`{path}`: {value}")
 
-    walk(recommendation, "")
-    return tuple(labels)
+def _matrix_row_values(rows: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return tuple(
+        (
+            str(row["row_id"]),
+            _flatten_contract_values(row, f"risk_test_matrix[{row['row_id']}]"),
+        )
+        for row in (rows if isinstance(rows, list) else ())
+        if isinstance(row, Mapping) and "row_id" in row
+    )
 
 
 def _plan_contract_shape(comments: Sequence[object], plan_hash: str) -> _PlanContractShape | None:
@@ -10262,20 +10284,17 @@ def _plan_contract_shape(comments: Sequence[object], plan_hash: str) -> _PlanCon
         payload = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar).canonical_json
         steps = payload.get("plan_steps")
         matrix = payload.get("risk_test_matrix")
-        rows = matrix.get("rows") if isinstance(matrix, Mapping) else None
+        row_values = _matrix_row_values(matrix.get("rows") if isinstance(matrix, Mapping) else None)
         recommendation = payload.get("execution_recommendation")
         if not isinstance(recommendation, Mapping):
             recommendation = {}
         strategy = recommendation.get("strategy")
         return _PlanContractShape(
             steps=tuple(str(step) for step in steps) if isinstance(steps, list) else (),
-            matrix_row_ids=tuple(
-                str(row["row_id"])
-                for row in (rows if isinstance(rows, list) else ())
-                if isinstance(row, Mapping) and "row_id" in row
-            ),
+            matrix_row_ids=tuple(row_id for row_id, _values in row_values),
             strategy=strategy if isinstance(strategy, str) else None,
             commitments=_recommendation_commitments(recommendation),
+            matrix_row_values=row_values,
         )
     return None
 
@@ -10307,20 +10326,21 @@ def _plan_contract_expansion(
 ) -> list[tuple[str, list[str]]]:
     """Describe how the replacement plan materially expands the contract.
 
-    Structural, not numeric on review findings: new plan steps, new matrix
-    rows, new or changed execution-recommendation values, or a changed strategy.
-    Each entry is a summary line and the (unclipped) items it names.  An
-    empty list means equivalent or narrower; reworded steps at the same
-    count are not an expansion.  Detection compares full text; clipping is
-    only for rendering.
+    Structural, not numeric on review findings: plan steps whose text is not
+    in the superseded plan (even when another step was removed), new matrix
+    rows, new or changed values in rows that keep their ID, new or changed
+    execution-recommendation values, or a changed strategy.  Each entry is a
+    summary line and the (unclipped) items it names.  An empty list means
+    equivalent or narrower.  Detection compares full text; clipping is only
+    for rendering.
     """
     expansion: list[tuple[str, list[str]]] = []
     new_steps = _added_contract_items(superseded.steps, replacement.steps)
-    if len(replacement.steps) > len(superseded.steps) and new_steps:
+    if new_steps:
         expansion.append(
             (
-                f"Plan steps grew from {len(superseded.steps)} to {len(replacement.steps)}; "
-                "steps not in the superseded plan:",
+                f"{len(new_steps)} plan step(s) not in the superseded plan "
+                f"(steps: {len(superseded.steps)} before, {len(replacement.steps)} after):",
                 new_steps,
             )
         )
@@ -10331,6 +10351,21 @@ def _plan_contract_expansion(
             (
                 f"{len(new_rows)} new risk/test matrix row(s):",
                 [f"`{row_id}`" for row_id in new_rows],
+            )
+        )
+    superseded_row_values = dict(superseded.matrix_row_values)
+    changed_row_values = [
+        label
+        for row_id, values in replacement.matrix_row_values
+        if row_id in superseded_row_values
+        for label in _added_contract_items(superseded_row_values[row_id], values)
+    ]
+    if changed_row_values:
+        expansion.append(
+            (
+                f"{len(changed_row_values)} new or changed value(s) in existing risk/test "
+                "matrix rows:",
+                changed_row_values,
             )
         )
     new_commitments = _added_contract_items(superseded.commitments, replacement.commitments)
