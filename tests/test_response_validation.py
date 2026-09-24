@@ -910,3 +910,46 @@ def test_is_disputed_item_detects_dispute_note():
 
     assert _is_disputed_item(disputed_item)
     assert not _is_disputed_item(non_disputed_item)
+
+
+def _degradable_followup_payload(kind="coder_followup"):
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "state": "blocking",
+        "summary": "Implemented the change.",
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        # Every one of these defects degrades in a parseable envelope (#927).
+        "risk_test_matrix_claims": [{"row_id": "finding-3", "execution_refs": []}, 7],
+        "test_observations": [5, {"command": "x"}],
+    }
+    if kind == "issue_implementation":
+        payload["pr_number"] = 77
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+    return payload
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_unparseable_envelope_with_degradable_claims_still_rejects_whole(kind):
+    """#927: degradation never turns an unparseable payload into a partial object."""
+    from coding_review_agent_loop.protocol import validate_structured_issue_implementation
+
+    validator = (
+        validate_structured_issue_implementation
+        if kind == "issue_implementation"
+        else validate_structured_coder_followup
+    )
+    footer = "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    text = json.dumps(_degradable_followup_payload(kind))
+    # The same payload parses and degrades when it is readable...
+    parsed = validator(text + footer)
+    assert parsed.risk_test_matrix_claims.claims == ()
+    assert len(parsed.risk_test_matrix_claims.degradations) == 2
+    assert len(parsed.test_observation_degradations) == 2
+    # ...but a truncated body whose readable prefix carries those claims, or
+    # prose after the object, still rejects the whole envelope.
+    for broken in (text[: len(text) // 2] + footer, text + " trailing prose" + footer):
+        with pytest.raises(AgentLoopError, match="Structured"):
+            validator(broken)

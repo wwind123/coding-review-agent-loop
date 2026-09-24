@@ -379,11 +379,12 @@ def test_cli_help_documents_ci_queued_grace_seconds():
 
 
 def test_architecture_states_cross_row_selector_reuse_policy():
-    # #865: only repetition within one row is fatal; cross-row reuse is valid.
+    # #865: cross-row reuse is valid; #927: repetition within one claim drops
+    # that claim instead of rejecting the response.
     text = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
     assert "duplicate admissible selectors" not in text
     assert "One admissible selector may be cited by several rows" in text
-    assert "an admissible selector repeated within one row" in text
+    assert "an admissible selector repeated within one claim" in text
 
 
 def test_docs_list_tool_owned_machine_readable_record_types():

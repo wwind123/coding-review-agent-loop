@@ -256,11 +256,22 @@ diagnostic keyed by the claim's element path, never by agent text; it emits no
 canonical row for a dropped claim, and the affected approved row reads
 `missing`. The one
 reserved fatal row-ID case is a value beyond the 16,384-byte hard cap, which is
-unbounded input. Authority violations stay fatal:
-unknown keys, empty selector lists, an admissible selector
-repeated within one row, catalog collisions, in-catalog selectors that are non-passing or
-whose launch integrity is failing or unknown (real broker handles, so
-selecting one is an authority decision), and legacy canonical fields. The
+unbounded input. The remaining claim-scope defects are claim drops too
+(#927), each with one record: a claim that is not an object, an absent, empty
+or ill-typed `execution_refs`, an admissible selector repeated within one
+claim, an unknown key, an ill-typed fact or one over the field bound, a
+selector over the field bound when no catalog is supplied, and a
+`risk_test_matrix_claims` value that is not an array, which keeps no claim and
+records one field-scope drop. A claim with several defects keeps exactly one
+record, and the row-ID rules win. Authority violations and hard bounds stay
+fatal and are checked before any degradation, so a degradable defect never
+masks them: keys that name orchestrator-owned verification authority
+(`status`, `evidence_citations`, `receipt_id`, `command`, `claim`), the row,
+ref, caveat and 16,384-byte caps, a dropped value whose compact JSON exceeds
+the same byte bound, catalog collisions, in-catalog selectors that are
+non-passing or whose launch integrity is failing or unknown (real broker
+handles, so selecting one is an authority decision), and legacy canonical
+fields. The
 catalog-authority rejections (collisions and non-passing or non-authoritative
 selectors) never route to structured repair, since reformatting cannot change
 them: the run stops once, naming the rejection as a
@@ -898,6 +909,32 @@ parsed result and in an optional round-metadata field, from which resumed
 review carriers are rebuilt, and they appear in the round summary. A
 decomposition surfaces its records in a plain parent-issue comment, whether it
 was accepted or refused.
+
+Model-authored `test_observations` citations in coder follow-ups and issue
+implementations also degrade per element. A malformed citation is dropped with
+its own `citation-dropped` record, and valid citations survive. More than
+eight drops, the same limit the degradation renderer shows in full, reject the
+response, so every kept record is stored and rendered. The records travel in
+an optional `test_observation_degradations` round-metadata field, appear in
+the follow-up comment and the round summary, and are restored onto the coder
+carrier on resume. Canonical `risk_test_matrix_evidence` citations stay
+strict: a verified row must never stand on fewer citations than it declared.
+
+Every function, method and nested def in `protocol.py` that can still reach
+an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as
+`fatal`, `mixed` or `delegated`. Each raise site and raise-reaching call site
+carries an inline annotation. A propagating site names one clause from a
+closed set: unparseable envelope, kind or version mismatch, authentication or
+forgery, payload bound, authority decision, orchestrator-authored, or no
+conservative reading. A site inside a `try` whose handlers cover every class
+it can raise without re-raising is annotated as handled. Sites inside generic
+helpers are annotated as delegated to their callers. Imported raisers, such
+as the marker-neutralization check in `sanitize_historical_text`, are listed
+with the classes they raise. `tests/test_shape_check_audit.py` recomputes the
+transitive inventory from source, following bare names, same-module
+`Class.method`, `cls`, `self` and `super()` calls, constructors, and untyped
+receivers. It fails on an unclassified unit, a stale entry, a missing or
+mismatched clause, or a degrading parser that can raise or builds records.
 
 ## Semantic planning foundation
 

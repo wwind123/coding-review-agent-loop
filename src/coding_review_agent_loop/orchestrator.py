@@ -514,6 +514,7 @@ from .round_state import (
     ApprovedPlanContext,
     QualificationCheckpoint,
     PostedRoundMetadata,
+    rebuild_resumed_coder_carrier,
     PostedRoundRecord,
     ROUND_RESUME_MARKER_RE,
     ResumedRoundSelection,
@@ -769,6 +770,18 @@ def _architecture_metadata_fields(
         # unavailable.
         "architecture_contract_version": 1,
     }
+
+
+def _test_observation_degradation_fields(result: object | None) -> dict[str, object]:
+    """Persist dropped-citation records beside the coder's raw response (#927).
+
+    Only coder follow-ups and issue implementations carry them; every other
+    result contributes nothing, so its metadata encoding is unchanged.
+    """
+    result = _unwrap_architecture_result(result)
+    if isinstance(result, (StructuredCoderFollowup, StructuredIssueImplementation)):
+        return {"test_observation_degradations": tuple(result.test_observation_degradations)}
+    return {}
 
 
 def _latest_pr_approval_architecture_identity(
@@ -9458,6 +9471,7 @@ def _implement_approved_issue(
             ),
             model_used=coder_response.model_used,
             **_metadata_identity_fields(coder_response),
+            **_test_observation_degradation_fields(implementation_result),
             **_architecture_metadata_fields(
                 implementation_config,
                 result=implementation_result,
@@ -15057,6 +15071,7 @@ def run_issue_loop(
                 **_metadata_identity_fields(coder_response),
                 acquisition_outcome=coder_response.acquisition_outcome,
                 acquisition_returncode=coder_response.acquisition_returncode,
+                **_test_observation_degradation_fields(implementation_result),
                 **_architecture_metadata_fields(config, result=implementation_result),
             ),
         )
@@ -15275,10 +15290,8 @@ def _coder_followup_review_context(
         )
     summary = _extract_structured_coder_summary(text)
     tests = _extract_structured_coder_tests_run(text)
-    try:
-        parsed = parse_historical_structured_coder_followup(text)
-    except AgentLoopError:
-        parsed = None
+    # Dropped-citation records are restored from the round metadata (#927).
+    parsed = rebuild_resumed_coder_carrier(text, metadata)
     payload: dict[str, object] = {
         "summary": summary,
         "tests_run": tests,
@@ -15310,7 +15323,15 @@ def _coder_followup_review_context(
                 for item in parsed.test_observations
             ],
         )
-    elif summary is None and tests is None:
+    if (
+        isinstance(parsed, (StructuredCoderFollowup, StructuredIssueImplementation))
+        and parsed.test_observation_degradations
+    ):
+        # A dropped citation supports nothing; reviewers see that it was dropped.
+        payload["test_observation_degradations"] = [
+            record.to_payload() for record in parsed.test_observation_degradations
+        ]
+    if not isinstance(parsed, StructuredCoderFollowup) and summary is None and tests is None:
         return "Latest coder explanation: no valid structured resolution details are available.\n"
     return (
         "Latest coder explanation (claims to verify, not reviewer verdicts):\n"
@@ -23268,6 +23289,7 @@ def run_pr_loop(
                 scheduler_active_owners=(scheduler_decision.active_owners if selective_policy and scheduler_decision is not None else ()),
                 scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                 qualification_checkpoint=qualification_checkpoint,
+                **_test_observation_degradation_fields(coder_response.marker_value),
                 **_architecture_metadata_fields(
                     config, result=coder_response.marker_value
                 ),

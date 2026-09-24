@@ -16,6 +16,7 @@ from .expected_closure import normalize_issue_ids
 from .agents.registry import agent_display_name, agent_signature
 from .protocol import (
     DEGRADED_ROW_CLAIM_DIAGNOSTIC,
+    PARSE_DEGRADATION_RENDER_LIMIT,
     UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     ANY_HEADING_RE,
     HTML_COMMENT_RE,
@@ -768,7 +769,16 @@ def render_human_requirement_dispositions(
     )
 
 
-PARSE_DEGRADATION_RENDER_LIMIT = 8
+# ``PARSE_DEGRADATION_RENDER_LIMIT`` is defined in protocol.py, beside the
+# citation drop bound that must never exceed it, and re-exported here (#927).
+TEST_OBSERVATION_DEGRADATIONS_HEADING = "### Test observation parse degradations"
+
+
+def render_test_observation_degradations_section(records: Sequence[object]) -> str | None:
+    """Render dropped follow-up citation records in full (#927)."""
+    return render_parse_degradations_section(
+        records, heading=TEST_OBSERVATION_DEGRADATIONS_HEADING
+    )
 
 
 def _degradation_cell(text: object) -> str:
@@ -1481,6 +1491,11 @@ def _render_public_coder_followup_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
+    citation_degradations = render_test_observation_degradations_section(
+        parsed_followup.test_observation_degradations
+    )
+    if citation_degradations:
+        sections.append(citation_degradations)
     matrix_evidence = _render_risk_test_matrix_evidence(
         parsed_followup.risk_test_matrix_evidence,
         render_decision=matrix_evidence_render_decision,
@@ -1546,6 +1561,11 @@ def _render_public_issue_implementation_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
+    citation_degradations = render_test_observation_degradations_section(
+        parsed.test_observation_degradations
+    )
+    if citation_degradations:
+        sections.append(citation_degradations)
     matrix_evidence = _render_risk_test_matrix_evidence(
         parsed.risk_test_matrix_evidence,
         diagnostics=parsed.risk_test_matrix_diagnostics,

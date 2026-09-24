@@ -122,13 +122,64 @@ def test_replace_on_matrix_names_dedicated_operations_instead_of_non_writable() 
         in message
     )
     assert set(PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS["risk_test_matrix"]) <= PLAN_REVISION_PATCH_OPERATION_KEYS
+    # The rejected patch assembles nothing: the replace is neither applied to
+    # the matrix nor silently dropped from the revision.
+    with pytest.raises(AgentLoopError, match="cannot be revised with `replace`"):
+        assemble_authenticated_plan_revision(state, payload)
 
 
-def test_replace_on_genuinely_derived_field_keeps_non_writable_wording() -> None:
+def test_retry_with_a_named_matrix_operation_is_accepted_922() -> None:
+    """#922/#927: the route forward named by the diagnostic actually works."""
     state = _state(_base([_row("row-a")]))
-    payload = _patch(state, [{"op": "replace", "field": "risk_test_matrix_changes", "value": []}])
-    with pytest.raises(AgentLoopError, match="`risk_test_matrix_changes` is derived or not writable"):
+    rejected = _patch(
+        state,
+        [{"op": "replace", "field": "risk_test_matrix", "value": {"applicability": "applicable"}}],
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        parse_plan_revision_patch(rejected)
+    named = PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS["risk_test_matrix"]
+    assert "matrix_edit" in named and "matrix_metadata_replace" in named
+    for op in named:
+        assert op in str(excinfo.value)
+    edit_retry = _patch(
+        state,
+        [{
+            "op": "matrix_edit",
+            "row_id": "row-a",
+            "row": _row("row-a", outcome="The retried edit applied."),
+            "rationale": "Use the operation the diagnostic named.",
+        }],
+    )
+    parse_plan_revision_patch(edit_retry)
+    edited, _sidecar = assemble_authenticated_plan_revision(state, edit_retry)
+    assert edited.risk_test_matrix.rows[0].expected_outcome == "The retried edit applied."
+    metadata_retry = _patch(
+        state,
+        [{
+            "op": "matrix_metadata_replace",
+            "value": {
+                "applicability": "applicable",
+                "important_exclusions": ["A revised exclusion."],
+            },
+            "audit_operation": "change",
+            "rationale": "Replace the matrix metadata through its dedicated operation.",
+        }],
+    )
+    parse_plan_revision_patch(metadata_retry)
+    replaced, _sidecar = assemble_authenticated_plan_revision(state, metadata_retry)
+    assert replaced.risk_test_matrix.important_exclusions == ("A revised exclusion.",)
+
+
+@pytest.mark.parametrize("field", ["risk_test_matrix_changes", "plan_identity", "not_a_plan_field"])
+def test_replace_on_genuinely_derived_field_keeps_non_writable_wording(field: str) -> None:
+    """A field no operation can write gets a truthful rejection with no invented route."""
+    state = _state(_base([_row("row-a")]))
+    payload = _patch(state, [{"op": "replace", "field": field, "value": []}])
+    with pytest.raises(AgentLoopError, match=f"`{field}` is derived or not writable") as excinfo:
         parse_plan_revision_patch(payload)
+    message = str(excinfo.value)
+    for op in PLAN_REVISION_PATCH_OPERATION_KEYS - {"replace"}:
+        assert op not in message, op
 
 
 def test_unknown_operation_names_every_valid_operation() -> None:
