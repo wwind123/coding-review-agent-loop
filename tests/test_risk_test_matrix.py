@@ -2392,3 +2392,38 @@ def test_repeated_unapproved_row_claims_each_keep_a_durable_diagnostic_926() -> 
     assert len(lines) == 2
     assert "risk_test_matrix_claims[0].row_id" in lines[0]
     assert "risk_test_matrix_claims[2].row_id" in lines[1]
+
+
+def test_unapproved_row_ids_sharing_a_preview_keep_exact_attribution_926() -> None:
+    """Two distinct unapproved IDs with one bounded preview stay distinct."""
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    first_id = "a" * 120 + "x"
+    second_id = "a" * 120 + "y"
+    parsed, result = _parse_and_derive_926(
+        [_claim_926(first_id), _claim_926(second_id, "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    records = parsed.risk_test_matrix_claims.degradations
+    assert records[0].observed_preview == records[1].observed_preview
+    dropped = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert [item.row_id for item in dropped] == [first_id, second_id]
+    assert "coder_followup.risk_test_matrix_claims[0].row_id" in dropped[0].message
+    assert "coder_followup.risk_test_matrix_claims[1].row_id" in dropped[1].message
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    restored = [item for item in decoded.risk_test_matrix_diagnostics if item["code"] == "unapproved-row-claim"]
+    assert [item["row_id"] for item in restored] == [first_id, second_id]
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    lines = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert len(lines) == 2

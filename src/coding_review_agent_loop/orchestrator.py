@@ -5450,12 +5450,18 @@ def _parse_fresh_correction_claims(
     original_claims = original.risk_test_matrix_claims
     original_dropped = original_claims.dropped_row_ids if original_claims is not None else ()
     original_degradations = original_claims.degradations if original_claims is not None else ()
+    original_exact_ids = (
+        original_claims.unapproved_claim_row_ids if original_claims is not None else ()
+    )
     if original_dropped or original_degradations:
         claims = claims or SemanticRiskCoverageClaims()
         claims = dataclasses_replace(
             claims,
             dropped_row_ids=tuple(dict.fromkeys((*original_dropped, *claims.dropped_row_ids))),
             degradations=tuple(dict.fromkeys((*original_degradations, *claims.degradations))),
+            unapproved_claim_row_ids=tuple(dict.fromkeys(
+                (*original_exact_ids, *claims.unapproved_claim_row_ids)
+            )),
         )
     return dataclasses_replace(
         original,

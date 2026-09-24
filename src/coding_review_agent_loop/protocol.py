@@ -933,6 +933,9 @@ class SemanticRiskCoverageClaims:
     claims: tuple[SemanticRiskCoverageClaim, ...] = ()
     dropped_row_ids: tuple[str, ...] = ()
     degradations: tuple[ParseDegradation, ...] = ()
+    # Exact row ID of each unapproved-claim record, paired with the record
+    # itself, because the record's observed preview is bounded.
+    unapproved_claim_row_ids: tuple[tuple[ParseDegradation, str], ...] = ()
 
     @property
     def rows(self) -> tuple[SemanticRiskCoverageClaim, ...]:
@@ -2146,14 +2149,9 @@ def derive_risk_test_matrix_evidence(
     ]
     if isinstance(claims, SemanticRiskCoverageClaims):
         owner_by_row = {row.row_id: row.execution_owner for row in parsed_matrix.rows}
-        # The recorded preview is bounded, so recover each unapproved record's
-        # full row ID from ``dropped_row_ids`` by preview.
-        dropped_by_preview: dict[str, str] = {}
-        for dropped_row_id in claims.dropped_row_ids:
-            dropped_by_preview.setdefault(
-                _bounded_single_line(dropped_row_id, PARSE_DEGRADATION_PREVIEW_CHARS),
-                dropped_row_id,
-            )
+        # The recorded preview is bounded, so each unapproved record's exact
+        # row ID comes from the parser's record-keyed map.
+        exact_row_id_by_record = dict(claims.unapproved_claim_row_ids)
         covered_dropped: set[str] = set()
         for record in claims.degradations:
             if record.rule != CLAIM_ROW_ID_UNAPPROVED_RULE:
@@ -2161,7 +2159,16 @@ def derive_risk_test_matrix_evidence(
             # One diagnostic per dropped claim (#926), so a row ID claimed
             # twice outside the approved set is reported twice, each with its
             # position; the historical code and row-ID keying are kept (#920).
-            dropped_row_id = dropped_by_preview.get(record.observed_preview, record.observed_preview)
+            dropped_row_id = exact_row_id_by_record.get(record)
+            if dropped_row_id is None:
+                # A record with no exact ID cannot be attributed to a row, so
+                # it is keyed by its element path like other drops.
+                diagnostics.append(PostAuthClaimDiagnostic(
+                    record.element_path,
+                    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+                    _degraded_row_claim_message(record),
+                ))
+                continue
             covered_dropped.add(dropped_row_id)
             diagnostics.append(PostAuthClaimDiagnostic(
                 dropped_row_id,
@@ -3782,6 +3789,7 @@ def _parse_semantic_risk_coverage_claims(
     result: list[SemanticRiskCoverageClaim] = []
     dropped_row_ids: list[str] = []
     degradations: list[ParseDegradation] = []
+    unapproved_claim_row_ids: list[tuple[ParseDegradation, str]] = []
     # Count admissible row IDs first, so a duplicated row drops every copy
     # rather than keeping whichever happened to come first (#926).
     row_counts: dict[str, int] = {}
@@ -3818,12 +3826,14 @@ def _parse_semantic_risk_coverage_claims(
             # claimed, which is stricter than losing every other valid claim.
             if row_id not in dropped_row_ids:
                 dropped_row_ids.append(row_id)
-            degradations.append(ParseDegradation.build(
+            record = ParseDegradation.build(
                 element_path=row_id_context,
                 rule=CLAIM_ROW_ID_UNAPPROVED_RULE,
                 observed=row_id,
                 outcome=CLAIM_DROPPED_OUTCOME,
-            ))
+            )
+            degradations.append(record)
+            unapproved_claim_row_ids.append((record, row_id))
             continue
         if row_counts.get(row_id, 0) > 1:
             degradations.append(ParseDegradation.build(
@@ -3946,6 +3956,7 @@ def _parse_semantic_risk_coverage_claims(
         tuple(result),
         dropped_row_ids=tuple(dropped_row_ids),
         degradations=tuple(degradations),
+        unapproved_claim_row_ids=tuple(unapproved_claim_row_ids),
     )
 
 
