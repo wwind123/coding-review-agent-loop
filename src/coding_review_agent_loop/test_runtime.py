@@ -2334,15 +2334,15 @@ _NODE_TEST_RUNNER_VALUE_OPTIONS = frozenset({
     "--test-coverage-lines",
     "--test-coverage-branches",
     "--test-coverage-functions",
-    "--test-global-setup",
-    "--import",
-    "--require",
-    "--loader",
-    "--experimental-loader",
     "--conditions",
-    "--env-file",
     "--max-old-space-size",
 })
+# Only Node's built-in reporters: a custom reporter is a module loaded into the
+# runner process.  Startup-code options (``--import``, ``--require``,
+# ``--loader``, ``--test-global-setup``, ``--env-file`` which can set
+# ``NODE_OPTIONS``) are deliberately absent: a preload can exit 0 before any
+# test file runs, and the ``node --version`` probe cannot see that.
+_NODE_BUILTIN_TEST_REPORTERS = frozenset({"spec", "tap", "dot", "junit", "lcov"})
 
 
 def _is_node_test_runner(arguments: Sequence[str]) -> bool:
@@ -2370,6 +2370,8 @@ def _is_node_test_runner(arguments: Sequence[str]) -> bool:
         if has_value:
             if name not in _NODE_TEST_RUNNER_VALUE_OPTIONS or not value:
                 return False
+            if name == "--test-reporter" and value not in _NODE_BUILTIN_TEST_REPORTERS:
+                return False
         elif argument not in _NODE_TEST_RUNNER_FLAGS:
             return False
     return selected
@@ -2384,7 +2386,12 @@ def _recognized_inner_probe_tokens(
     first = Path(tokens[0]).name
     if first in {"pytest", "py.test"}:
         return (_direct_launcher_executable(tokens[0], cwd=cwd, environment=values), "--version")
-    if first in {"node", "nodejs"} and _is_node_test_runner(tokens[1:]):
+    if (
+        first in {"node", "nodejs"}
+        and _is_node_test_runner(tokens[1:])
+        # ``NODE_OPTIONS`` can inject the same preloads the allow-list refuses.
+        and not values.get("NODE_OPTIONS", "").strip()
+    ):
         # Node's built-in test runner has the same safe bootstrap shape as
         # pytest: ``node --version`` proves the runtime starts without running
         # any test file.

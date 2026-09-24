@@ -779,6 +779,13 @@ def test_node_test_runner_is_a_recognized_inner_launcher(tmp_path, argv):
         ["node", "--test", "tests/a.mjs", "--version"],
         ["node", "--test-reporter", "spec", "--test", "tests/a.mjs"],
         ["node", "--test", "--test-reporter="],
+        ["node", "--test", "--import=data:text/javascript,process.exit(0)", "tests/a.mjs"],
+        ["node", "--test", "--require=./exit.cjs", "tests/a.mjs"],
+        ["node", "--test", "--loader=./loader.mjs", "tests/a.mjs"],
+        ["node", "--test", "--experimental-loader=./loader.mjs", "tests/a.mjs"],
+        ["node", "--test", "--test-global-setup=./setup.mjs", "tests/a.mjs"],
+        ["node", "--test", "--env-file=.env", "tests/a.mjs"],
+        ["node", "--test", "--test-reporter=./reporter.mjs", "tests/a.mjs"],
     ],
 )
 def test_node_without_builtin_test_runner_stays_unrecognized(tmp_path, monkeypatch, argv, no_ambient_invocation):
@@ -823,6 +830,39 @@ def test_foreground_node_print_only_option_is_not_verified_evidence(tmp_path, pr
     assert result.suite_start != "verified"
 
 
+def test_node_options_preload_keeps_node_test_runner_unrecognized(tmp_path, monkeypatch, no_ambient_invocation):
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    environment = {**os.environ, "NODE_OPTIONS": "--import=./exit.mjs"}
+    argv = ["node", "--test", "tests/a.mjs"]
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path, environment=environment) is None
+    assert runtime.probe_inner_launcher(argv, cwd=tmp_path, environment=environment).state == "unknown"
+    assert runtime.recognized_inner_probe(
+        ["env", "NODE_OPTIONS=--require=./exit.cjs", *argv], cwd=tmp_path, environment={**os.environ, "NODE_OPTIONS": ""}
+    ) is None
+    assert calls == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is unavailable")
+def test_foreground_node_early_exit_preload_is_not_verified_evidence(tmp_path, monkeypatch, no_ambient_invocation):
+    # Review item on #1012: a preload that exits 0 before any test file runs
+    # must never yield a verified, passing observation.
+    from coding_review_agent_loop import runner as runner_module
+
+    test_file = tmp_path / "failing.test.mjs"
+    test_file.write_text(
+        "import test from 'node:test';\ntest('fails', () => { throw new Error('ran'); });\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("NODE_OPTIONS", raising=False)
+    result = runner_module.run_foreground_test(
+        ["node", "--test", "--import=data:text/javascript,process.exit(0)", str(test_file)],
+        cwd=tmp_path, timeout_seconds=60, echo_output=False,
+    )
+
+    assert result.suite_start != "verified"
+
+
 @requires_system_env
 def test_env_prefixed_node_test_runner_is_normalized(tmp_path, no_ambient_invocation):
     fake_bin = tmp_path / "bin"
@@ -831,6 +871,7 @@ def test_env_prefixed_node_test_runner_is_normalized(tmp_path, no_ambient_invoca
     node.write_text("#!/bin/sh\n", encoding="utf-8")
     node.chmod(0o755)
     environment = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
+    environment.pop("NODE_OPTIONS", None)
     assert runtime.recognized_inner_probe(
         ["env", "NODE_ENV=test", "node", "--test", "tests/a.mjs"], cwd=tmp_path, environment=environment
     ) == (str(node), "--version")
@@ -846,6 +887,7 @@ def test_foreground_node_test_run_reports_verified_suite_start(tmp_path, monkeyp
         "test('adds', () => assert.strictEqual(1 + 1, 2));\n",
         encoding="utf-8",
     )
+    monkeypatch.delenv("NODE_OPTIONS", raising=False)
     result = runner_module.run_foreground_test(
         ["node", "--test", str(test_file)], cwd=tmp_path, timeout_seconds=60, echo_output=False
     )
