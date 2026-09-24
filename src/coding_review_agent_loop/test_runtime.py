@@ -2289,6 +2289,94 @@ def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mappi
     return recognized[0] if recognized is not None else None
 
 
+def _direct_launcher_executable(token: str, *, cwd: Path, environment: Mapping[str, str]) -> str:
+    executable = token
+    if not Path(executable).is_absolute() and (token.startswith((".", "~")) or Path(token).parent != Path(".")):
+        executable = str((cwd / Path(token)).resolve(strict=False))
+    elif not Path(executable).is_absolute():
+        executable = shutil.which(executable, path=environment.get("PATH")) or executable
+    return executable
+
+
+# Node options accepted alongside ``--test``.  This is an allow-list because
+# Node has print-and-exit options (``--version``, ``--help``, ``--v8-options``,
+# ``--check``, ``--eval``, ``--run``, ``--experimental-sea-config``, ...) that
+# exit 0 without running a single test.  Options that take a value are only
+# accepted in ``--name=value`` form so a detached value can never hide one.
+_NODE_TEST_RUNNER_FLAGS = frozenset({
+    "--test",
+    "--test-only",
+    "--test-force-exit",
+    "--test-update-snapshots",
+    "--experimental-test-coverage",
+    "--experimental-test-module-mocks",
+    "--experimental-test-snapshots",
+    "--experimental-vm-modules",
+    "--experimental-strip-types",
+    "--experimental-transform-types",
+    "--enable-source-maps",
+    "--trace-warnings",
+    "--trace-uncaught",
+    "--no-warnings",
+    "--no-deprecation",
+})
+_NODE_TEST_RUNNER_VALUE_OPTIONS = frozenset({
+    "--test-reporter",
+    "--test-reporter-destination",
+    "--test-name-pattern",
+    "--test-skip-pattern",
+    "--test-concurrency",
+    "--test-timeout",
+    "--test-shard",
+    "--test-isolation",
+    "--test-coverage-include",
+    "--test-coverage-exclude",
+    "--test-coverage-lines",
+    "--test-coverage-branches",
+    "--test-coverage-functions",
+    "--conditions",
+    "--max-old-space-size",
+})
+# Only Node's built-in reporters: a custom reporter is a module loaded into the
+# runner process.  Startup-code options (``--import``, ``--require``,
+# ``--loader``, ``--test-global-setup``, ``--env-file`` which can set
+# ``NODE_OPTIONS``) are deliberately absent: a preload can exit 0 before any
+# test file runs, and the ``node --version`` probe cannot see that.
+_NODE_BUILTIN_TEST_REPORTERS = frozenset({"spec", "tap", "dot", "junit", "lcov"})
+
+
+def _is_node_test_runner(arguments: Sequence[str]) -> bool:
+    """Return whether ``node`` argv provably runs the built-in test runner.
+
+    ``--test`` must precede the first positional argument (after it, the flag
+    would belong to a script), and every option anywhere in argv must be on
+    the allow-list so no print-and-exit option can turn a zero exit into
+    citable evidence that ran no tests.
+    """
+    selected = False
+    positional_seen = False
+    for argument in arguments:
+        if argument == "--":
+            return False
+        if not argument.startswith("-"):
+            positional_seen = True
+            continue
+        if argument == "--test":
+            if positional_seen:
+                return False
+            selected = True
+            continue
+        name, has_value, value = argument.partition("=")
+        if has_value:
+            if name not in _NODE_TEST_RUNNER_VALUE_OPTIONS or not value:
+                return False
+            if name == "--test-reporter" and value not in _NODE_BUILTIN_TEST_REPORTERS:
+                return False
+        elif argument not in _NODE_TEST_RUNNER_FLAGS:
+            return False
+    return selected
+
+
 def _recognized_inner_probe_tokens(
     tokens: tuple[str, ...], *, cwd: Path, environment: Mapping[str, str]
 ) -> tuple[str, ...] | None:
@@ -2297,12 +2385,17 @@ def _recognized_inner_probe_tokens(
     values = environment
     first = Path(tokens[0]).name
     if first in {"pytest", "py.test"}:
-        executable = tokens[0]
-        if not Path(executable).is_absolute() and (tokens[0].startswith((".", "~")) or Path(tokens[0]).parent != Path(".")):
-            executable = str((cwd / Path(tokens[0])).resolve(strict=False))
-        elif not Path(executable).is_absolute():
-            executable = shutil.which(executable, path=values.get("PATH")) or executable
-        return (executable, "--version")
+        return (_direct_launcher_executable(tokens[0], cwd=cwd, environment=values), "--version")
+    if (
+        first in {"node", "nodejs"}
+        and _is_node_test_runner(tokens[1:])
+        # ``NODE_OPTIONS`` can inject the same preloads the allow-list refuses.
+        and not values.get("NODE_OPTIONS", "").strip()
+    ):
+        # Node's built-in test runner has the same safe bootstrap shape as
+        # pytest: ``node --version`` proves the runtime starts without running
+        # any test file.
+        return (_direct_launcher_executable(tokens[0], cwd=cwd, environment=values), "--version")
     if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
         interpreter = _python_interpreter_path(tokens[0], cwd=cwd, environment=values)
         if interpreter is not None:

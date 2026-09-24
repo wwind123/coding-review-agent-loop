@@ -733,6 +733,169 @@ def test_env_prefix_without_command_or_with_unrecognized_target_is_unknown(tmp_p
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["node", "--test", "tests/test_history.mjs"],
+        ["node", "--test"],
+        ["nodejs", "--test", "tests"],
+        ["node", "--experimental-vm-modules", "--test", "tests/a.mjs"],
+        ["node", "--test-reporter=spec", "--test", "tests/a.mjs"],
+    ],
+)
+def test_node_test_runner_is_a_recognized_inner_launcher(tmp_path, argv):
+    # Issue #1009: ``node --test`` must be probeable so its runs can be cited.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    environment = {"PATH": str(fake_bin)}
+    for name in ("node", "nodejs"):
+        launcher = fake_bin / name
+        launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+        launcher.chmod(0o755)
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path, environment=environment) == (
+        str(fake_bin / argv[0]),
+        "--version",
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["node", "scripts/build.mjs", "--test"],
+        ["node", "scripts/build.mjs"],
+        ["node", "--", "--test"],
+        ["node"],
+        ["npx", "--test"],
+        ["node", "--test", "--version"],
+        ["node", "--test", "-v"],
+        ["node", "--test", "--help"],
+        ["node", "--test", "-h"],
+        ["node", "--test", "--v8-options"],
+        ["node", "--test", "--check", "tests/a.mjs"],
+        ["node", "--test", "--eval=process.exit(0)"],
+        ["node", "--test", "-e", "process.exit(0)"],
+        ["node", "--test", "--run", "noop"],
+        ["node", "--test", "--experimental-sea-config=sea.json"],
+        ["node", "--test", "tests/a.mjs", "--version"],
+        ["node", "--test-reporter", "spec", "--test", "tests/a.mjs"],
+        ["node", "--test", "--test-reporter="],
+        ["node", "--test", "--import=data:text/javascript,process.exit(0)", "tests/a.mjs"],
+        ["node", "--test", "--require=./exit.cjs", "tests/a.mjs"],
+        ["node", "--test", "--loader=./loader.mjs", "tests/a.mjs"],
+        ["node", "--test", "--experimental-loader=./loader.mjs", "tests/a.mjs"],
+        ["node", "--test", "--test-global-setup=./setup.mjs", "tests/a.mjs"],
+        ["node", "--test", "--env-file=.env", "tests/a.mjs"],
+        ["node", "--test", "--test-reporter=./reporter.mjs", "tests/a.mjs"],
+    ],
+)
+def test_node_without_builtin_test_runner_stays_unrecognized(tmp_path, monkeypatch, argv, no_ambient_invocation):
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path) is None
+    result = runtime.probe_inner_launcher(argv, cwd=tmp_path)
+    assert result.state == "unknown"
+    assert calls == []
+
+
+def test_node_test_runner_probe_uses_only_version_argv(tmp_path, monkeypatch, no_ambient_invocation):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "v22.0.0", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    node = tmp_path / "node"
+    node.write_text("#!/bin/sh\n", encoding="utf-8")
+    node.chmod(0o755)
+    result = runtime.probe_inner_launcher(
+        [str(node), "--test", "tests/test_history.mjs"], cwd=tmp_path
+    )
+    assert result.state == "verified"
+    assert calls[0][0] == (str(node), "--version")
+    assert calls[0][1]["timeout_seconds"] == 5.0
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is unavailable")
+@pytest.mark.parametrize("print_only", ["--version", "--help"])
+def test_foreground_node_print_only_option_is_not_verified_evidence(tmp_path, print_only, no_ambient_invocation):
+    # Review item on #1012: ``node --test --version`` exits 0 without running
+    # any test, so it must never produce a verified, passing observation.
+    from coding_review_agent_loop import runner as runner_module
+
+    result = runner_module.run_foreground_test(
+        ["node", "--test", print_only], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+
+    assert result.suite_start != "verified"
+
+
+def test_node_options_preload_keeps_node_test_runner_unrecognized(tmp_path, monkeypatch, no_ambient_invocation):
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    environment = {**os.environ, "NODE_OPTIONS": "--import=./exit.mjs"}
+    argv = ["node", "--test", "tests/a.mjs"]
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path, environment=environment) is None
+    assert runtime.probe_inner_launcher(argv, cwd=tmp_path, environment=environment).state == "unknown"
+    assert runtime.recognized_inner_probe(
+        ["env", "NODE_OPTIONS=--require=./exit.cjs", *argv], cwd=tmp_path, environment={**os.environ, "NODE_OPTIONS": ""}
+    ) is None
+    assert calls == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is unavailable")
+def test_foreground_node_early_exit_preload_is_not_verified_evidence(tmp_path, monkeypatch, no_ambient_invocation):
+    # Review item on #1012: a preload that exits 0 before any test file runs
+    # must never yield a verified, passing observation.
+    from coding_review_agent_loop import runner as runner_module
+
+    test_file = tmp_path / "failing.test.mjs"
+    test_file.write_text(
+        "import test from 'node:test';\ntest('fails', () => { throw new Error('ran'); });\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("NODE_OPTIONS", raising=False)
+    result = runner_module.run_foreground_test(
+        ["node", "--test", "--import=data:text/javascript,process.exit(0)", str(test_file)],
+        cwd=tmp_path, timeout_seconds=60, echo_output=False,
+    )
+
+    assert result.suite_start != "verified"
+
+
+@requires_system_env
+def test_env_prefixed_node_test_runner_is_normalized(tmp_path, no_ambient_invocation):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    node = fake_bin / "node"
+    node.write_text("#!/bin/sh\n", encoding="utf-8")
+    node.chmod(0o755)
+    environment = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
+    environment.pop("NODE_OPTIONS", None)
+    assert runtime.recognized_inner_probe(
+        ["env", "NODE_ENV=test", "node", "--test", "tests/a.mjs"], cwd=tmp_path, environment=environment
+    ) == (str(node), "--version")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is unavailable")
+def test_foreground_node_test_run_reports_verified_suite_start(tmp_path, monkeypatch, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    test_file = tmp_path / "sample.test.mjs"
+    test_file.write_text(
+        "import test from 'node:test';\nimport assert from 'node:assert';\n"
+        "test('adds', () => assert.strictEqual(1 + 1, 2));\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("NODE_OPTIONS", raising=False)
+    result = runner_module.run_foreground_test(
+        ["node", "--test", str(test_file)], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+
+    assert result.suite_start == "verified"
+    assert result.passed
+
+
 def test_lookalike_env_executable_is_not_stripped_from_probe(tmp_path, monkeypatch, no_ambient_invocation):
     # A program named ``env`` that ignores its argv and exits 0 must not let
     # the probe verify the real interpreter on its behalf.
