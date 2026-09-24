@@ -7,7 +7,7 @@ name = "coding-review-agent-loop"
 version = "0.1.0"
 description = "Local Claude/Codex/Gemini coding PR review loop orchestrator"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Wild Wind" }]
 keywords = ["agents", "codex", "claude", "gemini", "github", "code-review"]
@@ -16,7 +16,6 @@ classifiers = [
   "Environment :: Console",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
 ]
 

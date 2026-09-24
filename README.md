@@ -87,7 +87,7 @@ audit read them back. Older marker-only copies, which GitHub renders as
 
 ## Requirements
 
-- Python 3.11 or newer.
+- Python 3.12 or newer.
 - Git and [GitHub CLI](https://cli.github.com/) with `gh auth status` succeeding.
 - Repository access sufficient for the requested issue, branch, PR, and comment
   operations.
