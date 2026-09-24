@@ -229,7 +229,17 @@ If this prints your login, GraphQL works and you can skip this section. If it
 fails with `GitHub GraphQL is not available`, continue. A supplied personal
 token does not help: such proxies replace the `Authorization` header.
 
-**2. Install agent-loop with Python 3.12 or newer** (see [Install](#install)).
+**2. Install agent-loop with Python 3.12 or newer.** The [Install](#install)
+steps start with `gh repo clone`, which is itself GraphQL-backed and fails
+before the shim exists, so clone over plain HTTPS instead:
+
+```bash
+git clone https://github.com/wwind123/coding-review-agent-loop.git
+cd coding-review-agent-loop
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -e .
+```
+
 The package includes a second command, `agent-loop-gh`, in the same `bin/`
 directory as `agent-loop`.
 
@@ -260,16 +270,18 @@ gh issue view 1 --repo OWNER/REPO --json title  # answered over REST
 another device; `CODEX_API_KEY` instead bills the API account, and takes
 precedence over the sign-in while it is set.
 
-**6. Give the agents write access without disabling their sandboxes.** Each
-agent writes its answer to a per-invocation file under
+**6. Give the agents the access their role needs.** Each agent writes its
+answer to a per-invocation file under
 `${TMPDIR:-/tmp}/coding-review-agent-loop/responses`, outside its checkout.
-`--dangerous-agent-permissions` turns the sandboxes off entirely; where that is
-unwanted or refused, grant only that directory:
+`--dangerous-agent-permissions` turns the agents' sandboxes off entirely.
+
+*Planning and review turns* can keep their sandboxes and be granted only that
+directory plus network access, as in this plan-only run:
 
 ```bash
 RESP="${TMPDIR:-/tmp}/coding-review-agent-loop/responses"
 mkdir -p "$RESP"
-agent-loop pr 123 --repo OWNER/REPO \
+agent-loop issue 123 --repo OWNER/REPO --plan-first \
   --coder codex --reviewer codex --reviewer claude \
   --repair-backend codex --repair-model MODEL \
   --codex-arg=--sandbox --codex-arg=workspace-write \
@@ -279,13 +291,22 @@ agent-loop pr 123 --repo OWNER/REPO \
   --claude-arg=--add-dir --claude-arg="$RESP"
 ```
 
-Codex's `workspace-write` sandbox blocks network access by default; the coder
-needs it to push, hence `network_access=true`. Planning and review turns do
-not push, so a plan-only run can omit that `-c` pair. `acceptEdits` lets
-Claude write files but not run arbitrary shell commands, which suits
-reviewing; a Claude coder that must commit and push needs broader
-permissions. `--repair-backend` is needed only because its default,
-`antigravity`, requires the `agy` CLI.
+Keep `network_access=true` even though these turns do not push: Codex's
+`workspace-write` sandbox otherwise blocks all network access, including the
+GitHub reads a planning prompt can require (for example fetching the issue
+discussion when detailed requirements are omitted from the prompt).
+`acceptEdits` lets Claude write files but not run arbitrary shell commands,
+which suits reviewing.
+
+*Coder turns that commit and push* cannot use these narrow grants. Codex's
+`workspace-write` sandbox keeps the repository's `.git` read-only even when it
+is passed with `--add-dir`, so `git commit` fails, and `acceptEdits` does not
+let Claude run `git`. Implementation and PR-fix runs therefore need
+`--dangerous-agent-permissions` (or an equivalent coder permission grant) on a
+host where that is acceptable.
+
+`--repair-backend` is needed only because its default, `antigravity`, requires
+the `agy` CLI.
 
 **These settings do not persist.** The `export PATH` line lasts for the current
 shell, so add it to your shell profile or to the host's setup script. The
