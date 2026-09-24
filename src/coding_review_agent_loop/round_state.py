@@ -255,6 +255,10 @@ class PostedRoundMetadata:
     # ``absent`` is a legacy (pre-#959) record, ``invalid`` a present but
     # malformed value.  Constructing with an anchor promotes it to ``valid``.
     risk_test_matrix_evidence_full_round_status: str = "absent"
+    # PR head a coder follow-up was dispatched against (#1034).  Written only
+    # on PR coder follow-up records and omitted from the encoding when None,
+    # so historical records decode unchanged and re-encode byte-identically.
+    followup_dispatch_head: str | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -284,6 +288,10 @@ class PostedRoundMetadata:
             or not re.fullmatch(r"[0-9a-f]{64}", self.reviewer_board_amendment_digest)
         ):
             raise ValueError("invalid reviewer board amendment digest")
+        if self.followup_dispatch_head is not None and not _is_followup_dispatch_head(
+            self.followup_dispatch_head
+        ):
+            raise ValueError("invalid followup_dispatch_head: expected a hex Git commit SHA")
         if self.scheduler_force_full_source is not None and (
             self.scheduler_force_full_source not in FORCE_FULL_SOURCES
             or self.scheduler_force_full is not True
@@ -1995,6 +2003,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["reviewer_board_amendment_digest"] = metadata.reviewer_board_amendment_digest
     if metadata.plan_candidate_key is not None:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
+    if metadata.followup_dispatch_head is not None:
+        payload["followup_dispatch_head"] = metadata.followup_dispatch_head
     if metadata.risk_test_matrix_evidence_full_round is not None:
         payload["risk_test_matrix_evidence_full_round"] = (
             metadata.risk_test_matrix_evidence_full_round
@@ -2043,6 +2053,26 @@ def _decode_parse_degradations(value: object) -> tuple[ParseDegradation, ...]:
         except AgentLoopError:
             continue
     return tuple(records)
+
+
+# A Git commit SHA (SHA-1 or SHA-256, abbreviated or full) in lowercase hex;
+# placeholders such as ``unknown`` never qualify as a dispatch head (#1034).
+_FOLLOWUP_DISPATCH_HEAD_RE = re.compile(r"[0-9a-f]{4,64}")
+
+
+def _is_followup_dispatch_head(value: object) -> bool:
+    return isinstance(value, str) and _FOLLOWUP_DISPATCH_HEAD_RE.fullmatch(value) is not None
+
+
+def _decode_followup_dispatch_head(payload: Mapping[str, object]) -> str | None:
+    # Absent is historical; a present malformed value is rejected rather than
+    # decoded as absence, so it can never silently drop the head signal.
+    if "followup_dispatch_head" not in payload:
+        return None
+    value = payload["followup_dispatch_head"]
+    if not _is_followup_dispatch_head(value):
+        raise ValueError("followup_dispatch_head must be a hex Git commit SHA")
+    return str(value)
 
 
 def _decode_plan_supersession_field(payload: Mapping[str, object], key: str) -> str | None:
@@ -2319,6 +2349,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             reviewer_board_amendment_digest=_decode_plan_supersession_field(
                 payload, "reviewer_board_amendment_digest"
             ),
+            followup_dispatch_head=_decode_followup_dispatch_head(payload),
             **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),
         )
@@ -2328,6 +2359,22 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
 
 def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:
     return _decode_round_metadata_mapping(decode_mapping(encoded))
+
+
+def followup_head_unchanged_sha(metadata: PostedRoundMetadata | None) -> str | None:
+    """Return the PR head a coder follow-up left unchanged, else ``None`` (#1034).
+
+    The signal is purely SHA-based: a coder record whose persisted dispatch
+    head equals its recorded subject.  Historical records without the
+    dispatch head never qualify, so their rendering and context stay as-is.
+    """
+    if metadata is None or metadata.role != "coder":
+        return None
+    dispatch_head = metadata.followup_dispatch_head
+    subject = metadata.subject
+    if not dispatch_head or not subject or subject == "unknown":
+        return None
+    return subject if subject == dispatch_head else None
 
 
 def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:

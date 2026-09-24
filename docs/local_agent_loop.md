@@ -4042,6 +4042,15 @@ If the PR head advanced without a current-head coder metadata comment, resume
 uses metadata-backed active `blocking` and `same-pr` items from the latest
 recorded head and sends them to the coder for a structured follow-up before
 reviewers run again.
+So when a later run finds the PR head advanced by a commit without coder
+metadata, such as a manual push, and active prior review items can be
+recovered, it routes those items through a coder recovery round before the
+full-board review; the coder is told the external head may or may not satisfy
+each item and must check them one by one. If that round leaves the PR head
+unchanged, the follow-up comment and the next reviewer context record the items
+as claimed already present at that head rather than as fixes made by the turn.
+A head change observed while the run is still watching checks restarts review
+instead of starting a recovery round.
 
 Reviewer responses should use structured JSON first. A PR review starts with:
 

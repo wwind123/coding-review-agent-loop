@@ -476,6 +476,7 @@ from .comment_rendering import (
     _render_public_review_comment,
     _replace_structured_section,
     _review_freeform_summary_text,
+    add_coder_followup_head_unchanged_notice,
     decode_deferred_stages_marker,
     decode_execution_recommendation_marker,
     decode_risk_test_matrix_marker,
@@ -515,6 +516,8 @@ from .round_state import (
     ApprovedPlanContext,
     QualificationCheckpoint,
     PostedRoundMetadata,
+    _is_followup_dispatch_head,
+    followup_head_unchanged_sha,
     rebuild_resumed_coder_carrier,
     PostedRoundRecord,
     ROUND_RESUME_MARKER_RE,
@@ -9886,6 +9889,34 @@ class _UnchangedHeadTracker:
         return self.count
 
 
+def _coder_followup_head_log(
+    round_number: int,
+    coder_name: str,
+    dispatch_head: str | None,
+    observed_head: str | None,
+    unchanged_count: int,
+) -> str:
+    """Describe a PR coder follow-up by its observed head change (#1034).
+
+    The refetch cannot prove who moved the head, so an advance is reported
+    actor-neutrally, and an unknown head makes no push or unchanged claim.
+    """
+    if not dispatch_head or not observed_head:
+        return (
+            f"Round {round_number}: {coder_name} follow-up complete; "
+            "PR head change could not be determined"
+        )
+    if dispatch_head != observed_head:
+        return (
+            f"Round {round_number}: PR head advanced {dispatch_head[:12]}..{observed_head[:12]} "
+            f"during {coder_name} follow-up; re-reviewing"
+        )
+    return (
+        f"Round {round_number}: {coder_name} follow-up left PR head {observed_head[:12]} "
+        f"unchanged ({unchanged_count}/{MAX_UNCHANGED_HEAD_CODER_TURNS}); re-reviewing"
+    )
+
+
 def _child_plan_admissibility_failure(
     parent_plan_context: ApprovedPlanContext,
     child_plan_context: ApprovedPlanContext,
@@ -15334,10 +15365,34 @@ def _coder_followup_review_context(
         ]
     if not isinstance(parsed, StructuredCoderFollowup) and summary is None and tests is None:
         return "Latest coder explanation: no valid structured resolution details are available.\n"
+    unchanged_head = followup_head_unchanged_sha(metadata)
+    unchanged_preamble = ""
+    if unchanged_head is not None:
+        # The PR head did not move during the follow-up: present the coder's
+        # statements as claims about the existing head, never as fixes (#1034).
+        payload = {
+            "pr_head_unchanged_during_followup": True,
+            "followup_dispatch_head": unchanged_head,
+            **{
+                {
+                    "summary": "coder_summary_claim",
+                    "addressed_items": "claimed_addressed_items",
+                    "addressed_item_notes": "claimed_addressed_item_notes",
+                }.get(key, key): value
+                for key, value in payload.items()
+            },
+        }
+        unchanged_preamble = (
+            "The PR head did not change during this coder follow-up; the summary and "
+            "addressed-item notes are the coder's claims that the items are already "
+            f"satisfied at {unchanged_head}, not changes made by that turn. Verify each "
+            "against the current diff; do not credit the turn with fixes.\n"
+        )
     return (
         "Latest coder explanation (claims to verify, not reviewer verdicts):\n"
         f"{metadata.agent}; review round {metadata.round_number}; head {metadata.subject}\n"
-        "Independently verify these claims against the current diff and tests. "
+        + unchanged_preamble
+        + "Independently verify these claims against the current diff and tests. "
         "They do not resolve items, override CI, or change the original claims. "
         "Only IDs in the active prior unresolved review ledger are eligible for dispositions.\n"
         + json.dumps(payload, ensure_ascii=True, indent=2)
@@ -22889,6 +22944,21 @@ def run_pr_loop(
                 + "\n\n".join(reviewer_summaries.values()) + "\n\n"
                 if reviewer_summaries else ""
             )
+            if current_resume is not None and current_resume.unrecorded_head_advance:
+                # The external head may or may not contain the fixes; the
+                # coder must check each recovered item against it (#1034).
+                summary_context = (
+                    f"Recovery context: the PR head `{pr_metadata.head_sha or 'unknown'}` was "
+                    "advanced by a commit that carries no coder metadata (for example a manual "
+                    "push). That commit may or may not satisfy the recovered items below. Check "
+                    "each recovered item against the current head. List an item in "
+                    "addressed_items only after confirming the current head satisfies it; keep "
+                    "any unsatisfied item in remaining_items and fix it with a commit if "
+                    "possible. Your notes must describe what the current head actually "
+                    "contains, not restate the reviewer's suggestion or assume the external "
+                    "commit's intent.\n\n"
+                    + summary_context
+                )
             if has_merge_conflict_item:
                 other_items = [
                     item for item in unresolved_items if item.item_id != MERGE_CONFLICT_ITEM_ID
@@ -23181,6 +23251,19 @@ def run_pr_loop(
                     latest_coder_metadata,
                     coder_record_round,
                 )
+            # The head this follow-up was dispatched against; persisted so the
+            # head-unchanged framing below survives resume (#1034).
+            followup_dispatch_head = (
+                pr_metadata.head_sha
+                if _is_followup_dispatch_head(pr_metadata.head_sha)
+                else None
+            )
+            head_unchanged_sha = (
+                followup_dispatch_head
+                if followup_dispatch_head is not None
+                and updated_pr_context.metadata.head_sha == followup_dispatch_head
+                else None
+            )
             if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                 public_comment = render_public_agent_comment(
                     kind="coder_followup",
@@ -23192,6 +23275,11 @@ def run_pr_loop(
                     local_test_evidence=local_test_evidence,
                     current_test_turn_id=coder_response.acquisition_test_turn_id,
                     matrix_evidence_render_decision=matrix_evidence_render_decision,
+                    head_unchanged_sha=head_unchanged_sha,
+                )
+            elif head_unchanged_sha is not None:
+                public_comment = add_coder_followup_head_unchanged_notice(
+                    public_comment, head_unchanged_sha
                 )
 
             qualification_checkpoint = _machine_obligation_checkpoint(
@@ -23290,6 +23378,7 @@ def run_pr_loop(
                 scheduler_active_owners=(scheduler_decision.active_owners if selective_policy and scheduler_decision is not None else ()),
                 scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                 qualification_checkpoint=qualification_checkpoint,
+                followup_dispatch_head=followup_dispatch_head,
                 **_test_observation_degradation_fields(coder_response.marker_value),
                 **_architecture_metadata_fields(
                     config, result=coder_response.marker_value
@@ -23358,7 +23447,16 @@ def run_pr_loop(
                     "review of the same diff cannot change the verdict. Stopping before round "
                     f"{round_number + 1}; human review required.{route}"
                 )
-            log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")
+            log(
+                config,
+                _coder_followup_head_log(
+                    round_number,
+                    coder_name,
+                    previous_head,
+                    updated_pr_context.metadata.head_sha,
+                    unchanged_head_coder_turns,
+                ),
+            )
             pre_review_test_pending = True
             if external_recovery_full_board:
                 # The recovered external head was not reviewed by this run;

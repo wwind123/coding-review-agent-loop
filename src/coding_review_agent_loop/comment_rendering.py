@@ -1404,6 +1404,24 @@ def _render_public_plan_review_comment(
     )
 
 
+def coder_followup_head_unchanged_notice(head_sha: str) -> str:
+    """Orchestrator note for a coder follow-up that left the PR head unchanged.
+
+    Limited to observable state: an equal PR head cannot rule out an
+    unpushed local commit, only that no new commit is visible (#1034).
+    """
+    return (
+        f"> Orchestrator note: the PR head was unchanged at `{head_sha}` after this "
+        "follow-up; no new commit is visible on the PR branch. The coder statements "
+        "below are claims about the existing head, not changes attributed to this turn."
+    )
+
+
+def add_coder_followup_head_unchanged_notice(body: str, head_sha: str) -> str:
+    """Frame a freeform coder follow-up body with the head-unchanged note."""
+    return coder_followup_head_unchanged_notice(head_sha) + "\n\n" + body
+
+
 def _render_public_coder_followup_comment(
     parsed_followup: StructuredCoderFollowup,
     *,
@@ -1414,6 +1432,7 @@ def _render_public_coder_followup_comment(
     local_test_evidence: str | None = None,
     current_test_turn_id: str | None = None,
     matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
+    head_unchanged_sha: str | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
 
@@ -1434,7 +1453,7 @@ def _render_public_coder_followup_comment(
         addressed_items.extend(
             render_item(
                 item_id,
-                note_label="Resolution",
+                note_label="Coder claim" if head_unchanged_sha else "Resolution",
                 note=parsed_followup.addressed_item_notes.get(item_id),
                 placeholder=None,
             )
@@ -1466,12 +1485,28 @@ def _render_public_coder_followup_comment(
             )
         )
 
-    sections = [
-        "## Coder follow-up",
-        parsed_followup.summary.strip(),
-        "\n".join(["### Addressed items", *addressed_items]),
-        "\n".join(["### Remaining items", *remaining_items]),
-    ]
+    if head_unchanged_sha:
+        # The PR head did not move, so the coder's statements are claims about
+        # the existing head, not changes attributed to this turn (#1034).
+        sections = [
+            "## Coder follow-up",
+            coder_followup_head_unchanged_notice(head_unchanged_sha),
+            f"Coder summary (claim, unverified): {parsed_followup.summary.strip()}",
+            "\n".join(
+                [
+                    f"### Claimed already present at `{head_unchanged_sha}` (PR head unchanged)",
+                    *addressed_items,
+                ]
+            ),
+            "\n".join(["### Remaining items", *remaining_items]),
+        ]
+    else:
+        sections = [
+            "## Coder follow-up",
+            parsed_followup.summary.strip(),
+            "\n".join(["### Addressed items", *addressed_items]),
+            "\n".join(["### Remaining items", *remaining_items]),
+        ]
     if disputed_items:
         sections.append("\n".join(["### Disputed items", *disputed_items]))
     if parsed_followup.tests_run:
@@ -1984,6 +2019,7 @@ def render_public_agent_comment(
     current_test_turn_id: str | None = None,
     compact: bool = False,
     matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
+    head_unchanged_sha: str | None = None,
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -2027,6 +2063,7 @@ def render_public_agent_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
             matrix_evidence_render_decision=matrix_evidence_render_decision,
+            head_unchanged_sha=head_unchanged_sha,
         )
     if kind == "issue_implementation":
         if not isinstance(parsed, StructuredIssueImplementation):
