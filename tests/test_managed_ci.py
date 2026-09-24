@@ -7539,6 +7539,17 @@ _VALID_TEAM_BYPASS = {"actor_type": "Team", "actor_id": 5, "bypass_mode": "alway
         }),
         ([{"ruleset_id": 8}], {"enforcement": "actve", "bypass_actors": [], "rules": _final_rules()}),
         ([{"ruleset_id": 8}], {"enforcement": "", "bypass_actors": [], "rules": _final_rules()}),
+        # Unhashable JSON values must be malformed, never a TypeError.
+        ([{"ruleset_id": 8}], {"enforcement": [], "bypass_actors": [], "rules": _final_rules()}),
+        ([{"ruleset_id": 8}], {"enforcement": {"mode": "active"}, "bypass_actors": [], "rules": _final_rules()}),
+        ([{"ruleset_id": 8}], {
+            "enforcement": "active", "rules": _final_rules(),
+            "bypass_actors": [{"actor_type": ["Team"], "actor_id": 5}],
+        }),
+        ([{"ruleset_id": 8}], {
+            "enforcement": "active", "rules": _final_rules(),
+            "bypass_actors": [{"actor_type": "Team", "actor_id": 5, "bypass_mode": {"x": 1}}],
+        }),
         ([{"ruleset_id": 8}], {"enforcement": "active", "bypass_actors": "all", "rules": _final_rules()}),
         ([{"ruleset_id": 8}], {"enforcement": "active", "bypass_actors": ["team"], "rules": _final_rules()}),
         ([{"ruleset_id": 8}], {"enforcement": "active", "bypass_actors": [{}], "rules": _final_rules()}),

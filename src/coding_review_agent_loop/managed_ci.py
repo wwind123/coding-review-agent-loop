@@ -1025,7 +1025,10 @@ def _ruleset_detail_problem(ruleset: Mapping[str, object]) -> str | None:
                 for check in checks
             ):
                 return "a required_status_checks rule has malformed 'required_status_checks'"
-    if ruleset.get("enforcement") not in _RULESET_ENFORCEMENT_VALUES:
+    # Every set membership test first requires a string: JSON lists and
+    # objects are unhashable and must be reported as malformed, not raise.
+    enforcement = ruleset.get("enforcement")
+    if not isinstance(enforcement, str) or enforcement not in _RULESET_ENFORCEMENT_VALUES:
         return "'enforcement' is not a known value"
     if "bypass_actors" in ruleset:
         actors = ruleset["bypass_actors"]
@@ -1036,14 +1039,17 @@ def _ruleset_detail_problem(ruleset: Mapping[str, object]) -> str | None:
                 return "a bypass actor is not an object"
             actor_type = actor.get("actor_type")
             actor_id = actor.get("actor_id")
-            if actor_type not in _BYPASS_ACTOR_TYPES:
+            if not isinstance(actor_type, str) or actor_type not in _BYPASS_ACTOR_TYPES:
                 return "a bypass actor has an unknown 'actor_type'"
             id_valid = (
                 isinstance(actor_id, int) and not isinstance(actor_id, bool) and actor_id > 0
             ) or (actor_id is None and actor_type in _BYPASS_ACTOR_TYPES_WITHOUT_ID)
             if not id_valid:
                 return "a bypass actor has an invalid 'actor_id'"
-            if "bypass_mode" in actor and actor["bypass_mode"] not in _BYPASS_MODES:
+            if "bypass_mode" in actor and (
+                not isinstance(actor["bypass_mode"], str)
+                or actor["bypass_mode"] not in _BYPASS_MODES
+            ):
                 return "a bypass actor has an unknown 'bypass_mode'"
     return None
 
