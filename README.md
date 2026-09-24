@@ -229,7 +229,21 @@ If this prints your login, GraphQL works and you can skip this section. If it
 fails with `GitHub GraphQL is not available`, continue. A supplied personal
 token does not help: such proxies replace the `Authorization` header.
 
-**2. Install agent-loop with Python 3.12 or newer** (see [Install](#install)).
+**2. Clone the repository over HTTPS and install agent-loop with Python 3.12
+or newer.** `gh repo clone`, the first command in [Install](#install), is
+itself GraphQL-backed, so it is not available yet on these hosts. Clone
+directly with `git` instead, equivalent to what `agent-loop-gh`'s own
+`repo clone` emulation does once the shim is installed:
+
+```bash
+git clone https://github.com/wwind123/coding-review-agent-loop.git
+cd coding-review-agent-loop
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+agent-loop --help
+```
+
 The package includes a second command, `agent-loop-gh`, in the same `bin/`
 directory as `agent-loop`.
 
@@ -280,8 +294,11 @@ agent-loop pr 123 --repo OWNER/REPO \
 ```
 
 Codex's `workspace-write` sandbox blocks network access by default; the coder
-needs it to push, hence `network_access=true`. Planning and review turns do
-not push, so a plan-only run can omit that `-c` pair. `acceptEdits` lets
+needs it to push, hence `network_access=true`. Not pushing does not make
+planning offline: when the prompt omits detailed human requirements, the
+planner must fetch the issue discussion over GitHub to finalize the plan, so
+keep network access enabled unless all required context is already available
+locally. `acceptEdits` lets
 Claude write files but not run arbitrary shell commands, which suits
 reviewing; a Claude coder that must commit and push needs broader
 permissions. `--repair-backend` is needed only because its default,
