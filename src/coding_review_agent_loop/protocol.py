@@ -433,7 +433,7 @@ ARCHITECTURE_IMPACT_UNDETERMINED = "undetermined"
 ARCHITECTURE_IMPACT_STATUS_ALIASES = {"modified": "changed"}
 PARSE_DEGRADATION_FIELD_CHARS = 200
 PARSE_DEGRADATION_PREVIEW_CHARS = 120
-PARSE_DEGRADATION_OUTCOMES = frozenset({"normalized-to-changed", "degraded-to-undetermined"})
+PARSE_DEGRADATION_OUTCOMES = frozenset({"normalized-to-changed", "degraded-to-undetermined", "claim-dropped"})
 ARCHITECTURE_IMPACT_NEAR_MISS_RULE = "architecture_impact.status-closed-enum-near-miss"
 
 
@@ -921,10 +921,21 @@ class SemanticRiskCoverageClaims:
     authentication rather than rejecting the whole envelope: a dropped claim
     asserts nothing, so its row stays pending, and derivation reports each
     dropped id as an ``unapproved-row-claim`` diagnostic.
+
+    ``degradations`` holds one parser-derived record per dropped claim of any
+    row-ID defect -- unapproved, duplicated, malformed, absent or mistyped
+    (#926).  It is an accessor beside the claims, never part of
+    ``to_payload``, so an agent cannot author one.  Derivation turns the
+    records that ``dropped_row_ids`` does not already cover into
+    ``degraded-row-claim`` diagnostics.
     """
 
     claims: tuple[SemanticRiskCoverageClaim, ...] = ()
     dropped_row_ids: tuple[str, ...] = ()
+    degradations: tuple[ParseDegradation, ...] = ()
+    # Exact row ID of each unapproved-claim record, paired with the record
+    # itself, because the record's observed preview is bounded.
+    unapproved_claim_row_ids: tuple[tuple[ParseDegradation, str], ...] = ()
 
     @property
     def rows(self) -> tuple[SemanticRiskCoverageClaim, ...]:
@@ -1977,6 +1988,39 @@ def _observation_command_text(observation: object) -> str:
 
 
 UNAPPROVED_ROW_CLAIM_DIAGNOSTIC = "unapproved-row-claim"
+DEGRADED_ROW_CLAIM_DIAGNOSTIC = "degraded-row-claim"
+
+# Rules recorded on claim-scope row-ID degradations (#926).  The unapproved
+# rule keeps its historical ``unapproved-row-claim`` diagnostic, derived from
+# ``dropped_row_ids``; every other rule becomes ``degraded-row-claim``.
+CLAIM_ROW_ID_UNAPPROVED_RULE = "row_id is outside the approved enforceable set"
+CLAIM_ROW_ID_DUPLICATE_RULE = "row_id is claimed more than once; every copy is dropped"
+CLAIM_ROW_ID_MALFORMED_RULE = "row_id is not a valid matrix-specific identifier"
+CLAIM_ROW_ID_ABSENT_RULE = "row_id key is absent"
+CLAIM_ROW_ID_MISTYPED_RULE = "row_id is not a string"
+CLAIM_DROPPED_OUTCOME = "claim-dropped"
+
+
+# Identifier shapes a malformed row ID may imitate: reviewer finding IDs and
+# signed-requirement IDs, the same namespaces ``_RISK_ROW_ID_RE`` refuses.
+_RESERVED_IDENTIFIER_LIKE_RE = re.compile(r"(item|finding|review|blocker)[-_.]?(?=\d)|hr-", re.I)
+
+
+def _neutralize_identifier_like(text: str) -> str:
+    """Break finding- and requirement-like tokens so a preview cannot read as one (#926)."""
+    return _RESERVED_IDENTIFIER_LIKE_RE.sub(
+        lambda match: re.sub(r"[-_.]$", "", match.group(0)) + "\u00b7", text
+    )
+
+
+def _degraded_row_claim_message(record: ParseDegradation) -> str:
+    observed = _neutralize_identifier_like(_dropped_ref_preview(record.observed_preview))
+    return (
+        f"The semantic coverage claim at `{_dropped_ref_preview(record.element_path)}` was dropped "
+        f"before authentication: {_dropped_ref_preview(record.rule)} "
+        f"(observed `{observed}`). "
+        "The claim asserted no coverage."
+    )
 
 
 def _unapproved_row_claim_message(
@@ -1984,6 +2028,7 @@ def _unapproved_row_claim_message(
     *,
     row_owner: str | None,
     execution_owner: str | None,
+    record: ParseDegradation | None = None,
 ) -> str:
     """Name the dropped row, the scope it violated, and its real owner."""
     scope = (
@@ -1996,9 +2041,16 @@ def _unapproved_row_claim_message(
     else:
         origin = f"The row belongs to execution owner `{_dropped_ref_preview(row_owner)}`."
     return (
-        f"A semantic coverage claim for row `{_dropped_ref_preview(row_id)}` was dropped "
+        f"A semantic coverage claim for row "
+        f"`{_neutralize_identifier_like(_dropped_ref_preview(row_id))}` was dropped "
         f"because the row is not in the approved enforceable matrix set for {scope}. "
         f"{origin} The claim asserted no coverage."
+        + (
+            f" Claim `{_dropped_ref_preview(record.element_path)}`: "
+            f"{_dropped_ref_preview(record.rule)} (outcome `{_dropped_ref_preview(record.outcome)}`)."
+            if record is not None
+            else ""
+        )
     )
 
 
@@ -2111,9 +2163,43 @@ def derive_risk_test_matrix_evidence(
     ]
     if isinstance(claims, SemanticRiskCoverageClaims):
         owner_by_row = {row.row_id: row.execution_owner for row in parsed_matrix.rows}
+        # One diagnostic per dropped claim (#926).  Each unapproved record is
+        # paired with its exact row ID at parse time, because the record's
+        # preview is bounded and two records can compare equal; iterating the
+        # pairs keeps every drop, even equal-looking ones, attributed.
+        covered_dropped: set[str] = set()
+        paired_records: dict[ParseDegradation, int] = {}
+        for record, dropped_row_id in claims.unapproved_claim_row_ids:
+            paired_records[record] = paired_records.get(record, 0) + 1
+            covered_dropped.add(dropped_row_id)
+            diagnostics.append(PostAuthClaimDiagnostic(
+                dropped_row_id,
+                UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+                _unapproved_row_claim_message(
+                    dropped_row_id,
+                    row_owner=owner_by_row.get(dropped_row_id),
+                    execution_owner=execution_owner,
+                    record=record,
+                ),
+            ))
+        for record in claims.degradations:
+            if record.rule != CLAIM_ROW_ID_UNAPPROVED_RULE:
+                continue
+            if paired_records.get(record, 0):
+                paired_records[record] -= 1
+                continue
+            # A record with no exact ID cannot be attributed to a row, so it
+            # is keyed by its element path like other drops.
+            diagnostics.append(PostAuthClaimDiagnostic(
+                record.element_path,
+                UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+                _degraded_row_claim_message(record),
+            ))
         for dropped_row_id in claims.dropped_row_ids:
-            # Dropped before authentication (#920): the claim asserted nothing
-            # for this turn, but the operator should see that it was discarded.
+            if dropped_row_id in covered_dropped:
+                continue
+            # A carrier built without parser records (historical callers)
+            # still reports each dropped ID once (#920).
             diagnostics.append(PostAuthClaimDiagnostic(
                 dropped_row_id,
                 UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
@@ -2122,6 +2208,17 @@ def derive_risk_test_matrix_evidence(
                     row_owner=owner_by_row.get(dropped_row_id),
                     execution_owner=execution_owner,
                 ),
+            ))
+        for record in claims.degradations:
+            if record.rule == CLAIM_ROW_ID_UNAPPROVED_RULE:
+                continue
+            # Dropped before authentication (#926).  Keyed by the claim's
+            # element path, never by agent text; a duplicated approved row
+            # additionally reads ``missing`` below.
+            diagnostics.append(PostAuthClaimDiagnostic(
+                record.element_path,
+                DEGRADED_ROW_CLAIM_DIAGNOSTIC,
+                _degraded_row_claim_message(record),
             ))
     result_rows: list[RiskTestMatrixEvidenceRow] = []
     for row in parsed_matrix.rows:
@@ -3652,10 +3749,27 @@ def _parse_semantic_risk_coverage_claims(
     set (for example a sibling phase's row) is dropped whole and its id is
     recorded on ``dropped_row_ids`` (#920).  The rest of the envelope is kept;
     derivation reports the dropped id as an ``unapproved-row-claim``
-    diagnostic and the row's own coverage stays pending.
+    diagnostic and the row's own coverage stays pending.  ``None`` alone
+    means no approved set was supplied; an empty sequence is authoritative
+    and admits no claim.
+
+    Every other claim-scope row-ID defect degrades that claim only (#926):
+    an absent ``row_id`` key, a non-string ``row_id``, a string that fails
+    the row-ID format (including finding- or requirement-like forms), and a
+    row claimed more than once -- where every copy is dropped, so no
+    arbitrary copy becomes the row's coverage.  Each drop records one bounded
+    ``ParseDegradation`` on ``degradations`` (observed values only through the
+    sanitized preview; a non-string is recorded by type name alone), and
+    derivation reports it as a ``degraded-row-claim`` diagnostic while the
+    approved row reads ``missing``.  The one reserved fatal row-ID case is a
+    string beyond the 16,384-byte dropped-value hard cap: unbounded input.
+    A row-ID defect only decides whether the claim is kept: the non-row-ID
+    rules below still run on a degraded claim first, so a claim that would
+    have been rejected for its selectors or facts is still rejected.
 
     Still fatal, because they forge or corrupt authority, are unbounded input,
-    or are owned elsewhere: unknown keys; invalid or duplicate row IDs; a missing ``execution_refs`` key or an empty list (#855); more
+    or are owned elsewhere (the stage-3 audit decides the non-row-ID checks):
+    unknown keys; a row_id over the hard cap; a missing ``execution_refs`` key or an empty list (#855); more
     than eight refs, non-string or blank refs, or refs over the hard cap;
     an admissible selector repeated within one row (#865: the same
     admissible selector may be cited by several rows, because one wrapper
@@ -3691,29 +3805,63 @@ def _parse_semantic_risk_coverage_claims(
                 )
             catalog_by_ref[execution_ref] = observation
     result: list[SemanticRiskCoverageClaim] = []
-    seen_rows: set[str] = set()
     dropped_row_ids: list[str] = []
+    degradations: list[ParseDegradation] = []
+    unapproved_claim_row_ids: list[tuple[ParseDegradation, str]] = []
+    # Count admissible row IDs first, so a duplicated row drops every copy
+    # rather than keeping whichever happened to come first (#926).
+    row_counts: dict[str, int] = {}
+    for raw_claim in value:
+        candidate = raw_claim.get("row_id") if isinstance(raw_claim, dict) else None
+        if not isinstance(candidate, str):
+            continue
+        # Same normalization as ``_expect_non_empty_string``.
+        candidate = candidate.strip()
+        if allowed_rows is None or candidate in allowed_rows:
+            row_counts[candidate] = row_counts.get(candidate, 0) + 1
     for index, raw_claim in enumerate(value):
         claim_context = f"{context}[{index}]"
         payload = _expect_object(raw_claim, context=claim_context)
+        # ``row_id`` presence is a claim-scope defect (#926); every other key
+        # rule, including unknown keys and a missing ``execution_refs``, keeps
+        # its envelope-level behavior.
         _expect_exact_keys(
             payload,
             context=claim_context,
-            required=set(SEMANTIC_RISK_CLAIM_REQUIRED_KEYS),
-            optional=set(SEMANTIC_RISK_CLAIM_FACT_KEYS + SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS),
+            required=set(SEMANTIC_RISK_CLAIM_REQUIRED_KEYS) - {"row_id"},
+            optional=set(SEMANTIC_RISK_CLAIM_FACT_KEYS + SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS) | {"row_id"},
         )
-        row_id = _validate_risk_row_id(payload["row_id"], context=f"{claim_context}.row_id")
-        if allowed_rows is not None and row_id not in allowed_rows:
+        row_id_context = f"{claim_context}.row_id"
+        row_id, drop_record = _claim_row_id_or_degradation(payload, context=row_id_context)
+        unapproved_row_id: str | None = None
+        if drop_record is not None:
+            pass
+        elif allowed_rows is not None and row_id not in allowed_rows:
             # A claim for a row outside this turn's approved enforceable set
             # (for example a sibling phase's row) asserts nothing this turn
             # can own.  Drop just that claim (#920): the row is simply not
             # claimed, which is stricter than losing every other valid claim.
-            if row_id not in dropped_row_ids:
-                dropped_row_ids.append(row_id)
-            continue
-        if row_id in seen_rows:
-            raise AgentLoopError(f"{context} contains duplicate claim for row `{row_id}`.")
-        seen_rows.add(row_id)
+            assert row_id is not None
+            unapproved_row_id = row_id
+            drop_record = ParseDegradation.build(
+                element_path=row_id_context,
+                rule=CLAIM_ROW_ID_UNAPPROVED_RULE,
+                # The row-ID pattern is case-sensitive, so a valid unapproved
+                # ID such as ``Item9`` can still imitate a finding ID.
+                observed=_neutralize_identifier_like(row_id),
+                outcome=CLAIM_DROPPED_OUTCOME,
+            )
+        elif row_counts.get(row_id, 0) > 1:
+            drop_record = ParseDegradation.build(
+                element_path=row_id_context,
+                rule=CLAIM_ROW_ID_DUPLICATE_RULE,
+                observed=row_id,
+                outcome=CLAIM_DROPPED_OUTCOME,
+            )
+        # A row-ID defect decides only whether the claim is kept.  Every
+        # non-row-ID rule below still runs first and keeps its current
+        # consequence, so a degraded claim can never carry a selector or fact
+        # defect past this parser that would have rejected it before (#926).
         if execution_catalog is None:
             raw_refs = _risk_bounded_string_list(
                 payload["execution_refs"],
@@ -3807,15 +3955,24 @@ def _parse_semantic_risk_coverage_claims(
             # (#913).  The row's own caveats keep the remaining slots.
             keep = max(SEMANTIC_RISK_CLAIMS_MAX_CAVEATS - len(bookkeeping), 0)
             caveats = (*caveats[:keep], *bookkeeping)
+        workflow_path_claim = _optional_semantic_fact_string(
+            payload.get("workflow_path_claim"),
+            context=f"{claim_context}.workflow_path_claim",
+        )
+        if drop_record is not None:
+            degradations.append(drop_record)
+            if unapproved_row_id is not None:
+                if unapproved_row_id not in dropped_row_ids:
+                    dropped_row_ids.append(unapproved_row_id)
+                unapproved_claim_row_ids.append((drop_record, unapproved_row_id))
+            continue
+        assert row_id is not None
         claim = SemanticRiskCoverageClaim(
             row_id=row_id,
             execution_refs=tuple(admissible_refs),
             test_identifiers=test_identifiers,
             test_locations=test_locations,
-            workflow_path_claim=_optional_semantic_fact_string(
-                payload.get("workflow_path_claim"),
-                context=f"{claim_context}.workflow_path_claim",
-            ),
+            workflow_path_claim=workflow_path_claim,
             outcome_assertions=outcome_assertions,
             forbidden_effect_assertions=forbidden_effect_assertions,
             caveats=caveats,
@@ -3823,7 +3980,51 @@ def _parse_semantic_risk_coverage_claims(
             truncated_fact_fields=tuple(field for field, _ in truncated_facts),
         )
         result.append(claim)
-    return SemanticRiskCoverageClaims(tuple(result), dropped_row_ids=tuple(dropped_row_ids))
+    return SemanticRiskCoverageClaims(
+        tuple(result),
+        dropped_row_ids=tuple(dropped_row_ids),
+        degradations=tuple(degradations),
+        unapproved_claim_row_ids=tuple(unapproved_claim_row_ids),
+    )
+
+
+def _claim_row_id_or_degradation(
+    payload: Mapping[str, object], *, context: str
+) -> tuple[str | None, ParseDegradation | None]:
+    """Return a valid row ID, or the record for a claim-scope defect (#926).
+
+    Only a string beyond the dropped-value hard cap still raises: that is
+    unbounded input rather than a defect of one claim.
+    """
+    if "row_id" not in payload:
+        return None, ParseDegradation.build(
+            element_path=context,
+            rule=CLAIM_ROW_ID_ABSENT_RULE,
+            observed="absent",
+            outcome=CLAIM_DROPPED_OUTCOME,
+        )
+    value = payload["row_id"]
+    if not isinstance(value, str):
+        # Record the type alone, so no non-string value is ever rendered.
+        return None, ParseDegradation.build(
+            element_path=context,
+            rule=CLAIM_ROW_ID_MISTYPED_RULE,
+            observed=f"type {'null' if value is None else type(value).__name__}",
+            outcome=CLAIM_DROPPED_OUTCOME,
+        )
+    if len(value.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES:
+        raise AgentLoopError(
+            f"{context} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_DROPPED_REF_BYTES}-byte bound."
+        )
+    try:
+        return _validate_risk_row_id(value, context=context), None
+    except AgentLoopError:
+        return None, ParseDegradation.build(
+            element_path=context,
+            rule=CLAIM_ROW_ID_MALFORMED_RULE,
+            observed=_neutralize_identifier_like(_dropped_ref_preview(value)) or "blank",
+            outcome=CLAIM_DROPPED_OUTCOME,
+        )
 
 
 def _expect_optional_string_list(

@@ -242,8 +242,22 @@ handle, or oversize text up to a hard cap) is a claim defect, not an envelope
 defect: it is dropped with a caveat before authentication and becomes an
 `unknown-execution-ref` diagnostic afterwards. One admissible selector may be
 cited by several rows, since one wrapper run routinely covers several rows;
-each row still verifies only on its own facts. Authority violations stay fatal:
-unknown keys, bad row IDs, empty selector lists, an admissible selector
+each row still verifies only on its own facts. Row-ID defects are likewise
+claim defects (#920, #926): a claim whose `row_id` is outside the approved
+enforceable set, absent, not a string, malformed (including finding- or
+requirement-like forms), or claimed more than once is dropped -- every copy of
+a duplicate, so no arbitrary copy becomes coverage -- with one bounded,
+parser-derived degradation record on the claims carrier. A supplied approved
+set is authoritative even when empty; only an omitted set is unscoped.
+Derivation emits one diagnostic per dropped claim: the historical
+`unapproved-row-claim` code for an unapproved ID, naming the claim's position,
+and for every other record a `degraded-row-claim`
+diagnostic keyed by the claim's element path, never by agent text; it emits no
+canonical row for a dropped claim, and the affected approved row reads
+`missing`. The one
+reserved fatal row-ID case is a value beyond the 16,384-byte hard cap, which is
+unbounded input. Authority violations stay fatal:
+unknown keys, empty selector lists, an admissible selector
 repeated within one row, catalog collisions, in-catalog selectors that are non-passing or
 whose launch integrity is failing or unknown (real broker handles, so
 selecting one is an authority decision), and legacy canonical fields. The
