@@ -2401,7 +2401,27 @@ def revalidate_issue_created_handoff(
             else "draft-labeled"
         ),
     )
-    if handoff.active_label_event_id is not None:
+    if handoff.active_label_event_id is not None and validated.lifecycle != "draft-labeled":
+        # A failed activation deliberately releases the suppression label, so
+        # an unlabeled re-entry has no active label event by design (#997).
+        # `_issue_created_tuple` has already proved the PR is unlabeled; the
+        # recorded event must still be one of the trusted actor's own
+        # historical applications, and activation will re-apply the label.
+        history = _managed_label_event_history(
+            runner,
+            config=config,
+            pr_number=handoff.pr_number,
+            actor_login=handoff.trusted_actor_login,
+            actor_id=handoff.trusted_actor_id,
+        )
+        if history is None or handoff.active_label_event_id not in {
+            event_id for event_id, _login, _actor_id in history
+        }:
+            raise AgentLoopError(
+                "Managed-CI direct-resume label provenance changed before activation."
+            )
+        validated = replace(validated, active_label_event_id=handoff.active_label_event_id)
+    elif handoff.active_label_event_id is not None:
         event = _active_managed_label_event(runner, config=config, pr_number=handoff.pr_number)
         if (
             event is None
