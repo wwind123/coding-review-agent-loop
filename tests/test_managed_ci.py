@@ -8330,6 +8330,56 @@ def test_run_pr_loop_recovers_unreadable_pr_and_activates_with_both_waivers(
     assert runner.dispatch_count == 0
 
 
+def _no_lifecycle_writes(runner):
+    commands = [command for command, _cwd in runner.commands]
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert _mutations(runner) == []
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command in commands)
+
+
+@pytest.mark.parametrize("lifecycle", ["draft-labeled", "draft-unlabeled", "ready-unlabeled"])
+def test_recovery_refuses_a_base_that_became_strict_before_any_mutation(tmp_path, lifecycle):
+    # A foreign plan hash passes recovery's deferred plan check; the strict
+    # activation path would never run the resume-audit gate that checks it.
+    runner = _recovery_runner(
+        [_unreadable_record(approved_plan_hash="b" * 64)],
+        scripted={_VARIABLE: _failed(PROXY_403)},
+        lifecycle=lifecycle,
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    with pytest.raises(AgentLoopError, match="live assessment is strict") as exc_info:
+        _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert "The PR was left unchanged" in str(exc_info.value)
+    _no_lifecycle_writes(runner)
+
+
+def test_run_pr_loop_refuses_strict_transition_with_foreign_plan_hash(tmp_path, monkeypatch):
+    runner = _recovery_runner(
+        [_unreadable_record(approved_plan_hash="b" * 64)],
+        scripted={_VARIABLE: _failed(PROXY_403)},
+        lifecycle="draft-unlabeled",
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+    config = _cloud_config(
+        tmp_path,
+        managed_ci_pr_mode=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci", "--allow-unreadable-protection",
+        ),
+    )
+    _stop_after_real_activation(monkeypatch)
+
+    with pytest.raises(AgentLoopError, match="live assessment is strict"):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    _no_lifecycle_writes(runner)
+
+
 def test_recovered_record_with_foreign_plan_hash_fails_the_activation_gate(tmp_path):
     runner = _recovery_runner(
         [_unreadable_record(approved_plan_hash="b" * 64)], lifecycle="draft-unlabeled",

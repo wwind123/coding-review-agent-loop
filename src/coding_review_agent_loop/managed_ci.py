@@ -3007,7 +3007,10 @@ def _recover_issue_created_protection(
     # Confirmation pass against the recovered state and the live assessment.
     confirmed = replace(handoff, protection_mode=recovered)
     validate(recovered, confirmed)
-    if live.state != recovered and live.state != "strict":
+    # Any live/persisted disagreement refuses, including a base that became
+    # strict: activation's strict path skips the resume-audit plan-scope gate,
+    # so a deferred plan check must never be carried onto it.
+    if live.state != recovered:
         raise refuse(
             f"its persisted protection is {recovered}, but the live assessment is "
             f"{live.state} ({live.detail})"

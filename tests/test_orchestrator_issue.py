@@ -7448,6 +7448,88 @@ def test_pre_pr_number_rejection_guidance_follows_the_state_specific_waiver(
         assert "--allow-unreadable-protection" in message
 
 
+class _CloudSessionIssueRunner(_IssueRecoveryWorkflowRunner):
+    """Refuse the Actions variable and classic protection reads with gh 403s (#1040)."""
+
+    _REFUSED = {
+        "/actions/variables/AGENT_LOOP_MANAGED_ACTOR": (
+            "gh: Access to this GitHub Actions path is not permitted through this proxy (HTTP 403)\n"
+        ),
+        "/branches/main/protection/required_status_checks": (
+            "gh: Resource not accessible by integration (HTTP 403)\n"
+        ),
+    }
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next((part for part in args if part.startswith("repos/")), "")
+        for suffix, stderr in self._REFUSED.items():
+            if endpoint.endswith(suffix) and "--method" not in args:
+                recorded, cwd_path = self._record_command(args, cwd)
+                return CommandResult(recorded, cwd_path, "", stderr, 1)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+@pytest.mark.parametrize("unreadable_waiver", [True, False])
+def test_cloud_session_issue_run_creates_reserved_managed_pr_only_with_both_waivers(
+    tmp_path, monkeypatch, capsys, unreadable_waiver,
+):
+    valid = structured_issue_implementation(
+        pr_number=77,
+        tests_run=["python3 -m pytest tests/test_managed_ci.py -q"],
+    )
+    payload, end = json.JSONDecoder().raw_decode(valid)
+    payload.pop("architecture_impact")
+    rejected = json.dumps(payload) + valid[end:]
+    # The coder's implementation response is rejected after it runs, so the run
+    # stops at the creation seam: the coder prompt is the PR-creation contract.
+    runner = _CloudSessionIssueRunner(labeled=False, codex_outputs=[rejected])
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="claude",
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        allow_unreadable_protection=unreadable_waiver,
+        agent_max_retries=0,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *_a, **_k: (None, None, ()),
+    )
+
+    with pytest.raises(AgentLoopError) as exc_info:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(exc_info.value)
+    commands = [command for command, _cwd in runner.commands]
+    coder_calls = [command for command in commands if command[:2] == ["codex", "exec"]]
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert not any(
+        command[:3] == ["gh", "pr", "create"]
+        or (
+            "--method" in command
+            and any("/labels" in part or "/pulls" in part for part in command)
+        )
+        for command in commands
+    )
+    if not unreadable_waiver:
+        assert "--allow-unreadable-protection" in message
+        assert "no PR was created" in message
+        assert coder_calls == []
+        return
+    assert "rejected before a PR number was accepted" in message
+    assert len(coder_calls) == 1
+    prompt = " ".join(coder_calls[0])
+    assert "use exactly the reserved branch `agent-loop/managed-56`" in prompt
+    assert "gh pr create --draft --label agent-loop-managed" in prompt
+    assert "explicit unprotected override" in prompt
+    assert "nonce=" in prompt
+    assert "--allow-unreadable-protection is also active" in capsys.readouterr().out
+
+
 def test_managed_issue_legacy_recovery_rejects_unexpected_closing_reference(
     tmp_path,
 ):

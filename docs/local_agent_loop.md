@@ -3366,8 +3366,8 @@ the exact-head gate. Authorization records persist the waiver as
 `agent-loop pr` or `issue` rerun recovers the persisted state from the
 actor-authored creation authorization. It refuses without changing the PR
 when the flags are missing, when the records disagree, or when the live
-assessment differs from the persisted state. A base that has since become
-strictly protected is the one exception: it proceeds on the strict path.
+assessment differs from the persisted state, including when the base has
+since become strictly protected.
 
 This intentionally tightens the issue-created v2 path for workflows that can
 suppress `pull_request` CI. A repository that previously ran that v2 flow

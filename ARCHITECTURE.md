@@ -681,9 +681,9 @@ simply carries `protection=unreadable`. Issue-created recovery restores the
 persisted state read-only. A selection pass validates every actor-authored
 authorization record with protection and plan-scope comparisons deferred, and
 the creation records supply the state. A confirmation pass then requires every
-record to agree, and requires the live assessment to agree unless it is now
-`strict`. A strict base needs no waiver, and activation then uses the strict
-path. Plan-scope checks are enforced by
+record, and the live assessment, to agree. A base that has since become
+`strict` also refuses, because activation's strict path does not run the
+resume-audit plan-scope gate that recovery deferred to. Plan-scope checks are enforced by
 the activation-time resume-audit gate, after the canonical plan is bound and
 before any mutation.
 
