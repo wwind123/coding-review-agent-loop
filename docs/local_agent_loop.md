@@ -547,6 +547,7 @@ refusal metadata without triggering stability waiting.
 ## Prerequisites
 
 - `gh` is installed and authenticated for the target GitHub repository.
+  Where GitHub GraphQL is refused (for example Claude Code cloud sessions), install the `agent-loop-gh` shim as `gh` ahead of the real one and grant the agents write access to the response directory; see [Running where GitHub GraphQL is refused](../README.md#running-where-github-graphql-is-refused).
 - `claude` is installed and authenticated if either side uses Claude.
 - `codex` is installed and authenticated if either side uses Codex.
 - `gemini` is installed and authenticated if either side uses Gemini. For individual Google accounts after the consumer cutoff, prefer `agy`; direct Gemini CLI support is best-effort for enterprise/API-key users who can provide logs when issues are not locally reproducible.

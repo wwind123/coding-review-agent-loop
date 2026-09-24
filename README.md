@@ -216,33 +216,94 @@ Some hosts, notably Claude Code cloud sessions, block every GitHub GraphQL
 request at an egress proxy while allowing repository-scoped REST
 (`repos/{owner}/{repo}/...`). Much of `gh`'s porcelain (`gh issue view --json`,
 `gh pr view --json`, `gh pr create`, `gh repo clone`, …) is GraphQL-backed, so
-agent-loop and its coder agents fail there on their first GitHub read.
+without the steps below agent-loop and its coder agents fail on their first
+GitHub read.
 
-The package ships `agent-loop-gh`, a `gh`-compatible shim that answers exactly
-the porcelain forms agent-loop, its skill helpers, and its coder prompts use
-over REST, printing the same `--json` shape `gh` would. Every other command,
-including every `gh api` call, passes through to the real `gh` unchanged.
-Install it as `gh` ahead of the real one so the orchestrator and the agents it
-launches both use it:
+**1. Check whether you need this.**
 
 ```bash
-agent-loop-gh shim-install ~/.local/agent-loop-gh/bin
+gh api graphql -f query='{viewer{login}}'
+```
+
+If this prints your login, GraphQL works and you can skip this section. If it
+fails with `GitHub GraphQL is not available`, continue. A supplied personal
+token does not help: such proxies replace the `Authorization` header.
+
+**2. Install agent-loop with Python 3.12 or newer** (see [Install](#install)).
+The package includes a second command, `agent-loop-gh`, in the same `bin/`
+directory as `agent-loop`.
+
+**3. Put the shim ahead of the real `gh`.** `agent-loop-gh` is a
+`gh`-compatible shim that answers exactly the porcelain forms agent-loop, its
+skill helpers, and its coder prompts use over REST, printing the same `--json`
+shape `gh` would. Every other command, including every `gh api` call, passes
+through to the real `gh` unchanged. It must be found as `gh` on `PATH`, not only
+passed with `--gh-cmd`, because the coder and reviewer agents run `gh`
+themselves:
+
+```bash
+.venv/bin/agent-loop-gh shim-install ~/.local/agent-loop-gh/bin
 export PATH="$HOME/.local/agent-loop-gh/bin:$PATH"
 ```
 
-`AGENT_LOOP_GH_TRANSPORT` selects the transport: `auto` (default) probes
-GraphQL once and uses REST only when the proxy's refusal is identified
-(cached for 15 minutes), `rest` always emulates, and `graphql` always passes
-through. On a host where GraphQL works, `auto` passes through, so the shim can
-stay installed. Set `AGENT_LOOP_REAL_GH` if the real `gh` is not on `PATH`.
+`shim-install` creates a `gh` symlink to the installed `agent-loop-gh`.
 
-In REST mode an unsupported flag or `--json` field fails with a pointer to
-`gh api repos/...` rather than being ignored, issue search is evaluated locally
-because `search/issues` is not repository-scoped, and PR commit provenance
-fails closed above GitHub REST's 250-commit listing limit. Other notes for such
-hosts: sign Codex in with `codex login --device-auth` to use a ChatGPT plan,
-and pass `--repair-backend codex --repair-model MODEL` (or `claude`) when the
-default `antigravity` repair backend is not installed.
+**4. Verify.**
+
+```bash
+command -v gh                                   # ~/.local/agent-loop-gh/bin/gh
+gh issue view 1 --repo OWNER/REPO --json title  # answered over REST
+```
+
+**5. Authenticate the agent CLIs** as usual. On a headless host, `codex login
+--device-auth` signs Codex in to a ChatGPT plan with a link and code opened on
+another device; `CODEX_API_KEY` instead bills the API account, and takes
+precedence over the sign-in while it is set.
+
+**6. Give the agents write access without disabling their sandboxes.** Each
+agent writes its answer to a per-invocation file under
+`${TMPDIR:-/tmp}/coding-review-agent-loop/responses`, outside its checkout.
+`--dangerous-agent-permissions` turns the sandboxes off entirely; where that is
+unwanted or refused, grant only that directory:
+
+```bash
+RESP="${TMPDIR:-/tmp}/coding-review-agent-loop/responses"
+mkdir -p "$RESP"
+agent-loop pr 123 --repo OWNER/REPO \
+  --coder codex --reviewer codex --reviewer claude \
+  --repair-backend codex --repair-model MODEL \
+  --codex-arg=--sandbox --codex-arg=workspace-write \
+  --codex-arg=-c --codex-arg=sandbox_workspace_write.network_access=true \
+  --codex-arg=--add-dir --codex-arg="$RESP" \
+  --claude-arg=--permission-mode --claude-arg=acceptEdits \
+  --claude-arg=--add-dir --claude-arg="$RESP"
+```
+
+Codex's `workspace-write` sandbox blocks network access by default; the coder
+needs it to push, hence `network_access=true`. Planning and review turns do
+not push, so a plan-only run can omit that `-c` pair. `acceptEdits` lets
+Claude write files but not run arbitrary shell commands, which suits
+reviewing; a Claude coder that must commit and push needs broader
+permissions. `--repair-backend` is needed only because its default,
+`antigravity`, requires the `agy` CLI.
+
+**These settings do not persist.** The `export PATH` line lasts for the current
+shell, so add it to your shell profile or to the host's setup script. The
+symlink points into the virtual environment, so rerun `shim-install` after
+recreating `.venv`. On ephemeral hosts such as cloud containers, repeat every
+step, including the Codex sign-in, in each new session.
+
+**Transport selection.** `AGENT_LOOP_GH_TRANSPORT` chooses how the shim talks
+to GitHub: `auto` (default) probes GraphQL once and uses REST only when the
+refusal is identified (the result is cached for 15 minutes), `rest` always
+emulates, and `graphql` always passes through. On a host where GraphQL works,
+`auto` passes through, so the shim can stay installed. Set
+`AGENT_LOOP_REAL_GH` if the real `gh` is not on `PATH`.
+
+**Behavior in REST mode.** An unsupported flag or `--json` field fails with a
+pointer to `gh api repos/...` rather than being ignored; issue search is
+evaluated locally because `search/issues` is not repository-scoped; and PR
+commit provenance fails closed above GitHub REST's 250-commit listing limit.
 
 ## Quick Start
 

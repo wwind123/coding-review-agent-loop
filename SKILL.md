@@ -34,6 +34,9 @@ so this is about reducing the dependency, not a guaranteed billing outcome. See
 ## Prerequisites
 
 - `gh` authenticated and configured.
+  Where GitHub GraphQL is refused (for example Claude Code cloud sessions),
+  install the `agent-loop-gh` shim as `gh` first; see
+  [Running where GitHub GraphQL is refused](README.md#running-where-github-graphql-is-refused).
 - `codex` CLI installed (for Codex reviewer turns).
 - `gemini` CLI installed (for Gemini reviewer turns).
 - The `coding-review-agent-loop` package importable from `src/` (run from repo root).
