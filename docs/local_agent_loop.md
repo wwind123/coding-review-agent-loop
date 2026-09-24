@@ -786,6 +786,41 @@ lock and terminates nothing. Test suites that exercise `run-tests` itself must
 give the inner call its own environment (clear `AGENT_LOOP_INVOCATION_ID` and
 run from its own cwd), as this repository's `tests/conftest.py` does.
 
+**Shared host capacity.** The lock above is per invocation, so without more
+accounting two loops on one host would each size themselves against the same
+CPUs and memory. In clamp and refuse, after taking its per-invocation lock a
+command reserves its workers in a host-wide capacity record: one reservation
+file per invocation lock, in the same uid-owned lock directory, written and
+counted under a short accounting mutex that never blocks for the length of a
+test command. Each reservation records its worker count, its per-worker
+memory cost and the loop's view of host capacity, computed from host facts
+only (usable CPUs, and usable host memory minus the reserve), not from the
+loop's own cgroup caps or `--test-workers`. When no other live reservation
+exists the full budget is granted, so a single-loop host behaves as before.
+Otherwise the grant must fit both pools: the CPU pool less the workers already
+reserved, and the memory pool less each holder's workers times its own
+per-worker cost, where the strictest capacity any live holder recorded
+applies, so loops with different headroom or `--test-worker-memory` settings
+cannot overcommit memory together. The command is lowered to what fits (the
+injected plugin then enforces the lower number), or gets `worker-budget-busy`
+(exit 125) when nothing fits. Every reservation has its own record, so a
+share left behind by an earlier command of the same invocation keeps counting.
+The reservation is anchored to the target atomically at launch: the spawned
+child inherits the per-invocation lock, writes its own pid (its process-group
+id) to the reservation's anchor file, and only then drops the lock and execs,
+so a wrapper killed at any point after `fork` cannot free the share, even for
+a command that replaces its environment. A reservation keeps counting while
+its holder's per-invocation lock is held (including by the survivor watcher),
+while any member of the anchored target process group is alive, or while any
+process launched with its `AGENT_LOOP_WORKER_RESERVATION` token survives. The
+same check runs when a command finishes: a share whose target group or
+token-carrying descendants (for example a worker that escaped into a new
+session) are still alive, or whose target outlived a post-spawn failure, is
+kept rather than dropped. Once none of those holds, the next command that does
+the accounting reclaims the entry, so a crashed loop cannot deadlock the host. Set
+`AGENT_LOOP_TEST_WORKER_HOST_SHARING=off` in the wrapper's environment to opt
+out and keep the per-invocation-only behavior.
+
 **Runtime cohorts.** `test-runtime.json` cohorts are keyed on
 `(normalized command, environment fingerprint, workers)`. The normalized
 command never includes the injected plugin token. In clamp and refuse the

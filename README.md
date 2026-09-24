@@ -958,7 +958,10 @@ treated as non-evidence too.
 a containment-derived budget in `AGENT_LOOP_TEST_WORKERS`; in the default
 `clamp` mode an injected pytest plugin lowers over-budget pytest-xdist requests
 (`-n auto`, `-n 16`, config or `PYTEST_ADDOPTS`) to that budget, `refuse` rejects
-them before any test runs, and `off` only advertises the budget. See
+them before any test runs, and `off` only advertises the budget. Concurrent
+loops on one host share a host-wide worker pool: a command is lowered to the
+workers other live loops have not reserved, or gets `worker-budget-busy` when
+none are left; set `AGENT_LOOP_TEST_WORKER_HOST_SHARING=off` to opt out. See
 [Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
 
 Remembered commands are suggestions only: agents must inspect the checkout and
