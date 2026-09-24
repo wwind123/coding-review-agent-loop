@@ -13504,3 +13504,473 @@ def test_resumed_unacknowledged_pr_review_is_reinvoked_not_repaired_from_a_stale
         assert [r.outcome for r in carrier.architecture_impact_degradations] == [
             "degraded-to-undetermined"
         ]
+
+
+# --- #1034: head-aware PR coder follow-up reporting -------------------------
+
+_M1034_META_RE = re.compile(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->")
+_M1034_VERIFY_INSTRUCTION = "do not credit the turn with fixes"
+
+
+def _m1034_coder_comments(runner):
+    return [
+        comment["body"]
+        for comment in runner.pr_payload["comments"]
+        if "## Coder follow-up" in comment["body"]
+    ]
+
+
+def _m1034_metadata(body):
+    match = _M1034_META_RE.search(body)
+    assert match is not None
+    return _decode_round_metadata(match.group("payload"))
+
+
+def _m1034_reviewer_prompts(runner):
+    return [cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+
+
+def test_m1034_followup_head_log_wording():
+    from coding_review_agent_loop.orchestrator import _coder_followup_head_log
+
+    advanced = _coder_followup_head_log(3, "Claude", "a" * 40, "b" * 40, 0)
+    assert advanced == (
+        f"Round 3: PR head advanced {'a' * 12}..{'b' * 12} during Claude follow-up; re-reviewing"
+    )
+    unchanged = _coder_followup_head_log(3, "Codex", "c" * 40, "c" * 40, 1)
+    assert unchanged == f"Round 3: Codex follow-up left PR head {'c' * 12} unchanged (1/2); re-reviewing"
+    for dispatch, observed in ((None, "d" * 40), ("d" * 40, None), (None, None)):
+        unknown = _coder_followup_head_log(3, "Claude", dispatch, observed, 0)
+        assert unknown == "Round 3: Claude follow-up complete; PR head change could not be determined"
+    for message in (advanced, unchanged, unknown):
+        assert "pushed" not in message
+        assert "unchanged" not in unknown
+
+
+def test_m1034_followup_dispatch_head_round_trips_and_legacy_records_stay_byte_stable():
+    from coding_review_agent_loop.round_state import (
+        _encode_round_metadata,
+        followup_head_unchanged_sha,
+    )
+
+    recorded = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2,
+        subject="abc123", followup_dispatch_head="abc123",
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(recorded))
+    assert decoded.followup_dispatch_head == "abc123"
+    assert followup_head_unchanged_sha(decoded) == "abc123"
+    # An advanced head never yields the signal.
+    assert followup_head_unchanged_sha(dataclasses.replace(recorded, subject="def456")) is None
+    assert followup_head_unchanged_sha(
+        dataclasses.replace(recorded, subject="unknown", followup_dispatch_head="unknown")
+    ) is None
+    assert followup_head_unchanged_sha(dataclasses.replace(recorded, role="reviewer")) is None
+    assert followup_head_unchanged_sha(None) is None
+
+    legacy = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2, subject="abc123",
+    )
+    encoded = _encode_round_metadata(legacy)
+    legacy_decoded = _decode_round_metadata(encoded)
+    assert legacy_decoded.followup_dispatch_head is None
+    assert _encode_round_metadata(legacy_decoded) == encoded
+    # Legacy records never infer the head-unchanged signal from other fields.
+    assert followup_head_unchanged_sha(legacy_decoded) is None
+
+
+def test_m1034_malformed_followup_dispatch_head_is_rejected():
+    from coding_review_agent_loop.round_state import (
+        _decode_round_metadata_mapping,
+        _encode_round_metadata,
+        decode_mapping,
+    )
+
+    with pytest.raises(ValueError):
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=2,
+            subject="abc123", followup_dispatch_head="not a sha!",
+        )
+    valid = dict(decode_mapping(_encode_round_metadata(PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2,
+        subject="abc123", followup_dispatch_head="abc123",
+    ))))
+    assert _decode_round_metadata_mapping(valid).followup_dispatch_head == "abc123"
+    for bad in ("", 7, "x" * 200, "bad sha", None):
+        with pytest.raises(AgentLoopError, match="followup_dispatch_head"):
+            _decode_round_metadata_mapping({**valid, "followup_dispatch_head": bad})
+
+
+def _m1034_parsed_followup():
+    raw = structured_coder_followup(
+        summary="Fixed both items.",
+        addressed_items=["item-1"],
+        remaining_items=["item-2"],
+        addressed_item_notes={"item-1": "Qualified the network advice."},
+        remaining_item_notes={"item-2": "Needs a design call."},
+    )
+    parsed = validate_structured_coder_followup(raw)
+    assert parsed is not None
+    return parsed
+
+
+def test_m1034_renderer_frames_unchanged_head_follow_up_as_claims():
+    from coding_review_agent_loop.comment_rendering import render_public_agent_comment
+
+    parsed = _m1034_parsed_followup()
+    baseline = _render_public_coder_followup_comment(parsed, agent="Claude")
+    assert _render_public_coder_followup_comment(
+        parsed, agent="Claude", head_unchanged_sha=None
+    ) == baseline
+    assert render_public_agent_comment(
+        kind="coder_followup", parsed=parsed, agent="Claude"
+    ) == baseline
+    assert "### Addressed items" in baseline
+    assert "Orchestrator note" not in baseline
+
+    framed = render_public_agent_comment(
+        kind="coder_followup", parsed=parsed, agent="Claude", head_unchanged_sha="abc123"
+    )
+    assert framed.startswith(
+        "## Coder follow-up\n\n> Orchestrator note: the PR head was unchanged at `abc123` "
+        "after this follow-up; no new commit is visible on the PR branch."
+    )
+    assert "no commit was made" not in framed
+    assert "Coder summary (claim, unverified): Fixed both items." in framed
+    assert "### Claimed already present at `abc123` (PR head unchanged)" in framed
+    assert "### Addressed items" not in framed
+    assert "  - Coder claim: Qualified the network advice." in framed
+    assert "Resolution:" not in framed
+    # Remaining items keep their labels; the coder's prose is framed, not rewritten.
+    assert "### Remaining items" in framed
+    assert "  - Reason: Needs a design call." in framed
+
+
+def test_m1034_freeform_notice_prefixes_body():
+    from coding_review_agent_loop.comment_rendering import (
+        add_coder_followup_head_unchanged_notice,
+    )
+
+    framed = add_coder_followup_head_unchanged_notice("Fixed it.\n-- Claude", "abc123")
+    assert framed.startswith("> Orchestrator note: the PR head was unchanged at `abc123`")
+    assert framed.endswith("\n\nFixed it.\n-- Claude")
+
+
+def test_m1034_reviewer_context_flags_unchanged_head_and_keeps_other_bytes():
+    raw = structured_coder_followup(
+        summary="Fixed both items.",
+        addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "Qualified the network advice."},
+    )
+    legacy = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2, subject="abc123",
+    )
+    advanced = dataclasses.replace(legacy, followup_dispatch_head="old000")
+    unchanged = dataclasses.replace(legacy, followup_dispatch_head="abc123")
+
+    legacy_text = orchestrator._coder_followup_review_context(raw, legacy, head_sha="abc123")
+    assert '"summary": "Fixed both items."' in legacy_text
+    assert "pr_head_unchanged_during_followup" not in legacy_text
+    # Changed-head records render exactly like historical records.
+    assert orchestrator._coder_followup_review_context(raw, advanced, head_sha="abc123") == legacy_text
+
+    framed = orchestrator._coder_followup_review_context(raw, unchanged, head_sha="abc123")
+    assert '"pr_head_unchanged_during_followup": true' in framed
+    assert '"followup_dispatch_head": "abc123"' in framed
+    assert '"coder_summary_claim": "Fixed both items."' in framed
+    assert '"claimed_addressed_items"' in framed
+    assert '"claimed_addressed_item_notes"' in framed
+    assert '"addressed_items"' not in framed
+    assert '"summary"' not in framed
+    assert _M1034_VERIFY_INSTRUCTION in framed
+
+
+def test_m1034_unchanged_head_follow_up_is_logged_and_recorded_as_claims(tmp_path, capsys):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Two fixes needed.",
+                blocking_items=["Fix the README.", "Fix the docs."],
+            ),
+            structured_pr_review(
+                state="approved", summary="Already present.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                summary="Fixed both items.",
+                addressed_items=["item-1", "item-2"],
+                addressed_item_notes={"item-1": "Qualified the network advice."},
+            ),
+        ],
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    err = capsys.readouterr().err
+    assert "Round 1: Claude follow-up left PR head abc123 unchanged (1/2); re-reviewing" in err
+    assert "pushed updates" not in err
+    (coder_comment,) = _m1034_coder_comments(runner)
+    assert "> Orchestrator note: the PR head was unchanged at `abc123`" in coder_comment
+    assert "Coder summary (claim, unverified): Fixed both items." in coder_comment
+    assert "### Claimed already present at `abc123` (PR head unchanged)" in coder_comment
+    assert "  - Coder claim: Qualified the network advice." in coder_comment
+    assert "### Addressed items" not in coder_comment
+    metadata = _m1034_metadata(coder_comment)
+    assert metadata.followup_dispatch_head == metadata.subject == "abc123"
+    # The ledger meaning of addressed_items and the raw response are unchanged.
+    raw = validate_structured_coder_followup(metadata.raw_structured_coder_response)
+    assert raw is not None and tuple(raw.addressed_items) == ("item-1", "item-2")
+    assert raw.summary == "Fixed both items."
+    second_review = _m1034_reviewer_prompts(runner)[1]
+    assert '"pr_head_unchanged_during_followup": true' in second_review
+    assert '"coder_summary_claim": "Fixed both items."' in second_review
+    assert _M1034_VERIFY_INSTRUCTION in second_review
+
+
+def test_m1034_advanced_head_follow_up_keeps_legacy_framing(tmp_path, capsys):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="One fix needed.", blocking_items=["Fix the README."],
+            ),
+            structured_pr_review(
+                state="approved", summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                summary="Fixed the README.",
+                addressed_items=["item-1"],
+                addressed_item_notes={"item-1": "Rewrote the section."},
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    err = capsys.readouterr().err
+    assert "Round 1: PR head advanced abc123..abc123-coder during Claude follow-up; re-reviewing" in err
+    assert "pushed updates" not in err
+    (coder_comment,) = _m1034_coder_comments(runner)
+    assert "### Addressed items" in coder_comment
+    assert "  - Resolution: Rewrote the section." in coder_comment
+    assert "Orchestrator note" not in coder_comment
+    assert "Claimed already present" not in coder_comment
+    metadata = _m1034_metadata(coder_comment)
+    assert metadata.followup_dispatch_head == "abc123"
+    assert metadata.subject == "abc123-coder-1"
+    second_review = _m1034_reviewer_prompts(runner)[1]
+    assert "pr_head_unchanged_during_followup" not in second_review
+    assert '"summary": "Fixed the README."' in second_review
+    assert _M1034_VERIFY_INSTRUCTION not in second_review
+
+
+def test_m1034_unchanged_head_limit_still_stops_without_push_log(tmp_path, capsys):
+    blocking = structured_pr_review(
+        state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            blocking,
+            structured_pr_review(
+                state="blocking",
+                summary="Still needs a re-plan.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
+                ],
+            ),
+            structured_pr_review(state="approved"),
+        ],
+        claude_outputs=[
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+        ],
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6, quiet=False)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "unchanged in 2 consecutive follow-up rounds" in str(excinfo.value)
+    assert len(_m1034_reviewer_prompts(runner)) == 2
+    err = capsys.readouterr().err
+    assert "pushed updates for re-review" not in err
+    assert "left PR head abc123 unchanged (1/2)" in err
+    assert "unchanged (2/2)" not in err
+    coder_comments = _m1034_coder_comments(runner)
+    assert len(coder_comments) == 2
+    for comment in coder_comments:
+        assert "### Claimed already present at `abc123` (PR head unchanged)" in comment
+
+
+def _m1034_recovery_runner():
+    old_item = UnresolvedReviewItem(
+        item_id="item-2",
+        reviewer="Google Gemini",
+        source_round=1,
+        text="Preserve the metadata-backed unresolved item on rerun.",
+        status="blocking",
+    )
+    old_coder_comment = _attach_round_metadata(
+        "Opened the PR.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=1,
+            subject="old-sha", prior_items=(),
+        ),
+    )
+    old_review_comment = _attach_round_metadata(
+        "Blocked.\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Gemini", round_number=1,
+            subject="old-sha", prior_items=(), new_items=(old_item,), state="blocking",
+        ),
+    )
+    return FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(
+                summary="Fixed the recovered item.",
+                addressed_items=["item-2"],
+                addressed_item_notes={"item-2": "The metadata-backed item is preserved."},
+            )
+        ],
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="Recovered item is resolved.",
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            )
+        ],
+        pr_payload={
+            "headRefOid": "new-sha",
+            "comments": [
+                {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": old_coder_comment},
+                {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:01:00Z", "body": old_review_comment},
+            ],
+        },
+        advance_pr_head_on_coder_followup=False,
+    )
+
+
+def test_m1034_recovery_round_without_commit_records_claims(tmp_path, capsys):
+    runner = _m1034_recovery_runner()
+    config = make_config(tmp_path, reviewer="codex", quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Recovery context: the PR head `new-sha` was advanced by a commit" in coder_prompt
+    assert "may or may not satisfy the recovered items" in coder_prompt
+    assert "Check each recovered item against the current head." in coder_prompt
+    assert "keep any unsatisfied item in remaining_items" in coder_prompt
+    assert "already contains" not in coder_prompt
+    # The full-board recovery review still follows the coder turn.
+    assert command_index(runner.commands, ["claude"]) < command_index(
+        runner.commands, ["codex", "exec"]
+    )
+    err = capsys.readouterr().err
+    assert "Claude follow-up left PR head new-sha unchanged (1/2)" in err
+    assert "pushed updates" not in err
+    (coder_comment,) = _m1034_coder_comments(runner)
+    assert "> Orchestrator note: the PR head was unchanged at `new-sha`" in coder_comment
+    assert "### Claimed already present at `new-sha` (PR head unchanged)" in coder_comment
+    metadata = _m1034_metadata(coder_comment)
+    assert metadata.followup_dispatch_head == metadata.subject == "new-sha"
+    reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
+    assert '"pr_head_unchanged_during_followup": true' in reviewer_prompt
+    assert _M1034_VERIFY_INSTRUCTION in reviewer_prompt
+
+
+def test_m1034_non_recovery_follow_up_prompt_has_no_recovery_context(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="blocking", summary="Fix.", blocking_items=["Fix it."]),
+            structured_pr_review(
+                state="approved", summary="Ok.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex")) == 0
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Recovery context:" not in coder_prompt
+
+
+def _m1034_resume_runner(*, dispatch_head):
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="OpenAI Codex",
+        source_round=1,
+        text="Fix the README.",
+        status="blocking",
+    )
+    review_comment = _attach_round_metadata(
+        structured_pr_review(state="blocking", summary="Fix it.", blocking_items=["Fix the README."]),
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=1,
+            subject="abc123", prior_items=(), new_items=(item,), state="blocking",
+        ),
+    )
+    raw = structured_coder_followup(
+        summary="Fixed both items.",
+        addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "Qualified the network advice."},
+    )
+    coder_comment = _attach_round_metadata(
+        raw,
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=2,
+            subject="abc123", prior_items=(item,),
+            raw_structured_coder_response=raw,
+            followup_dispatch_head=dispatch_head,
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved", summary="Verified.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+        pr_payload={"comments": [
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": review_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:01:00Z", "body": coder_comment},
+        ]},
+    )
+    return runner, raw, coder_comment
+
+
+def test_m1034_resume_rebuilds_unchanged_head_reviewer_context(tmp_path):
+    runner, raw, coder_comment = _m1034_resume_runner(dispatch_head="abc123")
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex")) == 0
+    reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
+    assert '"pr_head_unchanged_during_followup": true' in reviewer_prompt
+    assert '"coder_summary_claim": "Fixed both items."' in reviewer_prompt
+    assert '"claimed_addressed_item_notes"' in reviewer_prompt
+    assert _M1034_VERIFY_INSTRUCTION in reviewer_prompt
+    # The stored raw structured response is untouched.
+    assert _m1034_metadata(coder_comment).raw_structured_coder_response == raw
+
+
+def test_m1034_resume_from_historical_coder_record_keeps_legacy_context(tmp_path):
+    runner, raw, _coder_comment = _m1034_resume_runner(dispatch_head=None)
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex")) == 0
+    reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
+    legacy_metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2,
+        subject="abc123", raw_structured_coder_response=raw,
+    )
+    expected = orchestrator._coder_followup_review_context(raw, legacy_metadata, head_sha="abc123")
+    assert "pr_head_unchanged_during_followup" not in expected
+    assert expected.splitlines()[1] in reviewer_prompt
+    assert '"summary": "Fixed both items."' in reviewer_prompt
+    assert "pr_head_unchanged_during_followup" not in reviewer_prompt
+    assert _M1034_VERIFY_INSTRUCTION not in reviewer_prompt
