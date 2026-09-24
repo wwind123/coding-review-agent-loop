@@ -4194,13 +4194,28 @@ def _parse_semantic_risk_coverage_claims(
                 CLAIM_UNKNOWN_KEYS_RULE,
                 _neutralize_identifier_like(_dropped_ref_preview(", ".join(unknown_keys))),  # shape-check: fatal:authentication-or-forgery
             )
+        # A mistyped row ID is an arbitrary JSON value with no bound of its
+        # own, so it keeps the whole-claim bound.
+        row_id_only_defect = defect is not None and not (
+            (row_defect is not None and row_defect[1] == CLAIM_ROW_ID_MISTYPED_RULE)
+            or refs_rule is not None
+            or oversize_ref is not None
+            or repeated_ref is not None
+            or unknown_keys
+            or fact_defects
+        )
         if defect is None and fact_defects:
             defect = fact_defects[0]
         if defect is not None:
             element_path, rule, observed = defect
             # The whole claim is the dropped value, so it is bounded before
-            # its record is built.
-            _check_dropped_value_bound(payload, context=claim_context)  # shape-check: fatal:payload-bound
+            # its record is built -- unless its only defects are row-ID
+            # rules.  Such a claim passed every per-field bound an accepted
+            # claim must pass, so it is already bounded, and a less valid
+            # claim must not be rejected more strongly than an accepted one
+            # (#920, #926).
+            if not row_id_only_defect:
+                _check_dropped_value_bound(payload, context=claim_context)  # shape-check: fatal:payload-bound
             drop_record = ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
                 element_path=element_path,
                 rule=rule,

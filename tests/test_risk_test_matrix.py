@@ -2826,3 +2826,44 @@ def test_padding_within_the_hard_cap_still_normalizes_927():
     claim = _claim_927("row-a", refs=("invocation:observation-1" + " " * 100,))
     [parsed] = _parse_927([claim]).claims
     assert parsed.execution_refs == ("invocation:observation-1",)
+
+
+def _large_bounded_claim_927(row_id):
+    """A claim within every per-field bound whose compact JSON exceeds the dropped-value bound."""
+    claim = _claim_927(row_id)
+    claim["outcome_assertions"] = [f"{index:02d}" + "a" * 998 for index in range(12)]
+    claim["test_identifiers"] = [f"{index:02d}" + "t" * 798 for index in range(6)]
+    assert len(json.dumps(claim, separators=(",", ":"))) > DROPPED_VALUE_MAX_BYTES
+    return claim
+
+
+def test_large_bounded_claim_is_accepted_for_an_approved_row_927():
+    [claim] = _parse_927([_large_bounded_claim_927("row-a")]).claims
+    assert claim.row_id == "row-a"
+
+
+@pytest.mark.parametrize(
+    ("claims", "row_ids", "rule"),
+    [
+        (lambda: [_large_bounded_claim_927("row-b")], ("row-a",), "outside the approved enforceable set"),
+        (lambda: [_large_bounded_claim_927("row-a"), _large_bounded_claim_927("row-a")], ("row-a",), "more than once"),
+        (lambda: [_large_bounded_claim_927("finding-3")], ("row-a",), "not a valid matrix-specific identifier"),
+        (lambda: [{k: v for k, v in _large_bounded_claim_927("row-a").items() if k != "row_id"}], ("row-a",), "key is absent"),
+    ],
+    ids=["unapproved", "duplicate", "malformed", "absent"],
+)
+def test_row_id_only_drop_of_a_large_bounded_claim_keeps_the_envelope_927(claims, row_ids, rule):
+    """#920/#926: a row-ID drop never rejects more strongly than accepting the claim would."""
+    parsed = _parse_927(claims(), row_ids=row_ids)
+    assert parsed.claims == ()
+    assert parsed.degradations
+    assert all(rule in record.rule for record in parsed.degradations)
+
+
+def test_large_claim_with_a_non_row_id_defect_still_hits_the_bound_927():
+    claim = {**_large_bounded_claim_927("row-b"), "notes": "x"}
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _parse_927([claim], row_ids=("row-a",))
+    mistyped = {**_claim_927("row-a"), "row_id": ["x" * 1_000] * 20}
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _parse_927([mistyped], row_ids=("row-a",))
