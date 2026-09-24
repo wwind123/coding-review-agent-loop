@@ -7387,6 +7387,67 @@ def test_strict_pre_pr_number_rejection_directs_ordinary_discovery_without_reimp
     ) == coder_calls
 
 
+@pytest.mark.parametrize(
+    ("protection_mode", "unreadable_waiver", "fresh_offered"),
+    [
+        ("unreadable", True, True),
+        ("unreadable", False, False),
+        ("voluntary", False, True),
+        ("plan_limited", False, True),
+    ],
+)
+def test_pre_pr_number_rejection_guidance_follows_the_state_specific_waiver(
+    tmp_path, monkeypatch, protection_mode, unreadable_waiver, fresh_offered,
+):
+    valid = structured_issue_implementation(
+        pr_number=77,
+        tests_run=["python3 -m pytest tests/test_managed_ci.py -q"],
+    )
+    payload, end = json.JSONDecoder().raw_decode(valid)
+    payload.pop("architecture_impact")
+    rejected = json.dumps(payload) + valid[end:]
+    runner = _IssueRecoveryWorkflowRunner(labeled=True, codex_outputs=[rejected])
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="claude",
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        allow_unreadable_protection=unreadable_waiver,
+        agent_max_retries=0,
+    )
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="agent-loop",
+        protection_mode=protection_mode,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *_a, **_k: (None, None, ()),
+    )
+
+    with pytest.raises(AgentLoopError, match="rejected before a PR number was accepted") as exc_info:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(exc_info.value)
+    assert "do not rerun implementation" in message
+    if fresh_offered:
+        assert "--managed-ci-fresh" in message
+        if protection_mode == "unreadable":
+            assert "--allow-unprotected-managed-ci --allow-unreadable-protection" in message
+        else:
+            assert "(including the unprotected waiver);" in message
+    else:
+        assert "--managed-ci-fresh" not in message
+        assert "Fresh authorization is unavailable" in message
+        assert "--allow-unreadable-protection" in message
+
+
 def test_managed_issue_legacy_recovery_rejects_unexpected_closing_reference(
     tmp_path,
 ):

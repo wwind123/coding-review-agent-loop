@@ -3326,6 +3326,49 @@ defect from bypassing the voluntary gate. The flag is rejected for adoption and
 does not waive identity, workflow, nonce, exact-head qualification, or
 `--match-head-commit` merge checks.
 
+##### Unreadable Actions variable or classic protection (cloud sessions)
+
+Some hosts, such as Claude Code cloud sessions, refuse two of these reads with
+HTTP 403 (#1040). Only gh's own trailing stderr status line, for example
+`gh: Resource not accessible by integration (HTTP 403)`, counts as a 403. Text
+in the response body, a mid-line mention, and conflicting status lines never
+do.
+
+- **`AGENT_LOOP_MANAGED_ACTOR` is refused.** `--managed-ci-trusted-actor`
+  stands in for the variable at every identity check. The authenticated login
+  must still equal it. The run logs that the actor is asserted, unverified
+  locally, and enforced by the workflow, and preflight prints
+  `variable=<login> (asserted; unverified locally, enforced by workflow)`.
+  This fails safe: the workflow compares against the real
+  `vars.AGENT_LOOP_MANAGED_ACTOR`, so a wrong assertion leaves ordinary PR CI
+  unsuppressed and fails managed dispatch validation. A readable variable that
+  differs still refuses. A `404` and every other error behave as before.
+- **Classic branch protection is refused.** agent-loop then reads the
+  effective branch rules and rulesets. An active ruleset that requires exactly
+  `final-ci/exact-head` is still strict, but only when its `bypass_actors` list
+  is visible and empty. GitHub hides bypass actors from tokens without
+  write/admin access to the ruleset, and hidden bypass actors do not prove
+  enforcement. When the rules were fully inspected and show no strict
+  enforcement (an empty list, gh's strict `404`/`422` no-rules response, or
+  only bypassable, evaluate-mode, or hidden-bypass rulesets), protection is
+  `unreadable`. Malformed rule or ruleset data, and a rules read that failed
+  any other way, remain `indeterminate`, which no waiver can override.
+
+`unreadable` is a separate state from `voluntary`. Preflight exits `10` for it
+and names both flags. It is waived only by
+`--allow-unprotected-managed-ci --allow-unreadable-protection` together, on
+every invocation. `--allow-unreadable-protection` is rejected without its
+companion flag, and so it is also rejected for adoption. Its merge-safety
+meaning is the same as voluntary protection: GitHub is not shown to enforce
+the exact-head gate. Authorization records persist the waiver as
+`allow-unreadable-protection`, the override audit record carries
+`protection=unreadable`, and resume commands keep both flags. A later
+`agent-loop pr` or `issue` rerun recovers the persisted state from the
+actor-authored creation authorization. It refuses without changing the PR
+when the flags are missing, when the records disagree, or when the live
+assessment differs from the persisted state. A base that has since become
+strictly protected is the one exception: it proceeds on the strict path.
+
 This intentionally tightens the issue-created v2 path for workflows that can
 suppress `pull_request` CI. A repository that previously ran that v2 flow
 without non-bypassable GitHub protection now uses ordinary CI unless the

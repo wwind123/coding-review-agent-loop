@@ -244,6 +244,8 @@ from .managed_ci import (
     verify_managed_pr_plan_binding,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
+    waivable_protection_states,
+    waiver_flags_for_protection,
 )
 from .managed_pr import recover_managed_pr_origin, validate_managed_pr_body
 from .migrations import validate_pr_migration_topology
@@ -975,10 +977,26 @@ def _render_ci_rerun_command(config: AgentLoopConfig, *, pr_number: int) -> str:
             config.managed_ci
             or config.managed_ci_trusted_actor is not None
             or config.allow_unprotected_managed_ci
+            or config.allow_unreadable_protection
             or config.managed_ci_adopt_existing_pr
         ),
         include_context=False,
     )
+
+
+def _print_unprotected_managed_ci_warning(protection_mode: str) -> None:
+    message = (
+        "WARNING: --allow-unprotected-managed-ci is active for this invocation. GitHub cannot "
+        "prevent a manual merge, other automation, a compromised credential, or an agent-loop "
+        "defect from bypassing the voluntary final-ci/exact-head gate."
+    )
+    if protection_mode == "unreadable":
+        message += (
+            " --allow-unreadable-protection is also active: classic branch protection could not "
+            "be read by this token, so the exact-head gate is treated as voluntary for this "
+            "invocation."
+        )
+    print(message)
 
 
 def _merge_with_exact_head_proof(
@@ -4798,14 +4816,24 @@ def _run_validated_agent(
     )
     if repair_expected_kind == "issue_implementation" and config.managed_ci:
         message += " The implementation response was rejected before a PR number was accepted."
-        if (
-            config.allow_unprotected_managed_ci
-            and managed_ci_recovery_protection in {"voluntary", "plan_limited"}
-        ):
+        if managed_ci_recovery_protection in waivable_protection_states(config):
             message += (
                 " If the coder opened a PR before that rejection, discover and resume that same PR "
-                "with explicit --managed-ci-fresh authorization (including the unprotected waiver); "
-                "do not rerun implementation to recreate it."
+                "with explicit --managed-ci-fresh authorization (including the unprotected waiver"
+                + (
+                    ": --allow-unprotected-managed-ci --allow-unreadable-protection"
+                    if managed_ci_recovery_protection == "unreadable"
+                    else ""
+                )
+                + "); do not rerun implementation to recreate it."
+            )
+        elif managed_ci_recovery_protection == "unreadable":
+            message += (
+                " If the coder opened a PR before that rejection, use the ordinary managed-CI "
+                "issue/PR discovery and resume path for that same PR. Fresh authorization is "
+                "unavailable because unreadable branch protection also requires "
+                f"{waiver_flags_for_protection('unreadable')}; do not rerun implementation "
+                "to recreate the PR."
             )
         else:
             message += (
@@ -9165,11 +9193,7 @@ def _implement_approved_issue(
         runner, config=implementation_config, issue_number=issue_number
     )
     if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
-        print(
-            "WARNING: --allow-unprotected-managed-ci is active for this invocation. GitHub cannot "
-            "prevent a manual merge, other automation, a compromised credential, or an agent-loop "
-            "defect from bypassing the voluntary final-ci/exact-head gate."
-        )
+        _print_unprotected_managed_ci_warning(managed_ci_creation_intent.protection_mode)
     log(config, f"Planning approved; invoking {coder_name} to implement issue #{issue_number}")
     assigned_head_before = _read_assigned_workdir_head(runner, implementation_config)
     coder_response = _run_validated_agent(
@@ -14827,11 +14851,7 @@ def run_issue_loop(
                 runner, config=config, issue_number=issue_number
             )
             if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
-                print(
-                    "WARNING: --allow-unprotected-managed-ci is active for this invocation. GitHub cannot "
-                    "prevent a manual merge, other automation, a compromised credential, or an agent-loop "
-                    "defect from bypassing the voluntary final-ci/exact-head gate."
-                )
+                _print_unprotected_managed_ci_warning(managed_ci_creation_intent.protection_mode)
         assigned_head_before = _read_assigned_workdir_head(runner, config)
         salvage_summary = latest_salvage_context(
             config.log_dir,

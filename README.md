@@ -335,6 +335,38 @@ pointer to `gh api repos/...` rather than being ignored; issue search is
 evaluated locally because `search/issues` is not repository-scoped; and PR
 commit provenance fails closed above GitHub REST's 250-commit listing limit.
 
+**Managed CI in such sessions.** The same hosts also refuse two reads that
+`--managed-ci` uses before it creates a PR. Both answers are `403`s:
+
+- The `AGENT_LOOP_MANAGED_ACTOR` Actions variable is refused by the proxy.
+  When gh reports a strict `HTTP 403` for that read, `--managed-ci-trusted-actor`
+  stands in for the variable. The run logs that the actor is asserted and
+  unverified locally, and `managed-ci preflight` prints it as `asserted`.
+  This fails safe because the workflow still enforces the real
+  `vars.AGENT_LOOP_MANAGED_ACTOR` server-side. A mismatch leaves ordinary PR CI
+  unsuppressed, and managed dispatches fail validation. A variable that can be
+  read and differs still refuses, as does a `404` or any other error.
+- Classic branch protection is refused by the session's GitHub App (it lacks
+  administration read). The effective rules and rulesets are still readable.
+  When they show no strict `final-ci/exact-head` enforcement, protection is
+  classified as `unreadable`, which is distinct from `voluntary`. It can be
+  waived only with `--allow-unreadable-protection`, which requires
+  `--allow-unprotected-managed-ci`. The waiver has the same merge-safety
+  meaning as voluntary protection: GitHub is not shown to enforce the
+  exact-head gate. After such a `403`, a ruleset counts as strict only when its
+  bypass actors are visible and empty. Malformed rule data, or a rules read that
+  is not gh's strict `404`/`422`, stays indeterminate, and no waiver applies.
+
+`agent-loop managed-ci preflight` exits `10` (known not ready) for `unreadable`
+protection and names both flags. A cloud-session invocation therefore looks
+like:
+
+```bash
+agent-loop issue <issue-number> --repo OWNER/REPO --plan-first \
+  --implement-after-approval --managed-ci --managed-ci-trusted-actor <login> \
+  --allow-unprotected-managed-ci --allow-unreadable-protection
+```
+
 ## Quick Start
 
 ### Review an existing PR
