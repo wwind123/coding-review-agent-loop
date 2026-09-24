@@ -25,6 +25,7 @@ from .ci_health import (
     is_wholly_infrastructure_blocked,
 )
 from .errors import AgentLoopError
+from .github_transport import TransportConfigError, is_graphql_refusal, transport_mode
 from .pr_contract import (
     PR_EXPECTED_CLOSING_MARKER,
     PR_EXPECTED_CLOSING_MARKER_RE,
@@ -339,7 +340,8 @@ def _query_pr_commit_connection(
     result = runner.run(args, cwd=active_workdir(config), check=False)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
-        raise AgentLoopError(
+        error_type = _GraphQLRefusedError if is_graphql_refusal(detail) else AgentLoopError
+        raise error_type(
             f"GitHub PR commit provenance query failed for PR #{pr_number}"
             + (f": {detail}" if detail else ".")
         )
@@ -413,9 +415,20 @@ def read_pull_request_commit_metadata(
     """
     if config.dry_run:
         return ()
-    first_payload = _query_pr_commit_connection(
-        runner, config=config, pr_number=pr_number, after=None
-    )
+    try:
+        mode = transport_mode()
+    except TransportConfigError as exc:
+        raise AgentLoopError(str(exc)) from exc
+    if mode == "rest":
+        return _read_pull_request_commit_metadata_rest(runner, config=config, pr_number=pr_number)
+    try:
+        first_payload = _query_pr_commit_connection(
+            runner, config=config, pr_number=pr_number, after=None
+        )
+    except _GraphQLRefusedError:
+        if mode != "auto":
+            raise
+        return _read_pull_request_commit_metadata_rest(runner, config=config, pr_number=pr_number)
     before_head, expected_total, first_commits, has_next, cursor = _parse_pr_commit_connection_page(
         first_payload, pr_number=pr_number
     )
@@ -456,6 +469,97 @@ def read_pull_request_commit_metadata(
     final_head, final_total, _ignored, _ignored_next, _ignored_cursor = _parse_pr_commit_connection_page(
         final_payload, pr_number=pr_number
     )
+    if final_head != before_head or final_total != expected_total:
+        raise AgentLoopError(f"PR #{pr_number} commit history changed during provenance scan.")
+    return tuple(commits)
+
+
+class _GraphQLRefusedError(AgentLoopError):
+    """The host refused GraphQL itself (not a GitHub-side query error)."""
+
+
+# GitHub's REST commit listing for a pull request stops at 250 commits.
+REST_PR_COMMIT_LIMIT = 250
+
+
+def _rest_pr_object(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> tuple[str, int]:
+    result = runner.run(
+        [config.gh_cmd, "api", f"repos/{config.repo}/pulls/{pr_number}"],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError(f"GitHub REST read of PR #{pr_number} failed during commit provenance.")
+    data = _load_json_object(result, description=f"PR #{pr_number} for commit provenance")
+    head = data.get("head")
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    total = data.get("commits")
+    if not isinstance(head_sha, str) or not head_sha:
+        raise AgentLoopError(f"GitHub returned no current head OID for PR #{pr_number}.")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise AgentLoopError(f"GitHub returned an invalid commit total for PR #{pr_number}.")
+    return head_sha, total
+
+
+def _read_pull_request_commit_metadata_rest(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+) -> tuple[PullRequestCommitMetadata, ...]:
+    """REST equivalent of the GraphQL commit connection, with the same invariants.
+
+    Used only where GraphQL is refused (#1029).  REST cannot list more than
+    250 commits, so a longer history fails closed rather than returning a
+    partial provenance set.
+    """
+    before_head, expected_total = _rest_pr_object(runner, config=config, pr_number=pr_number)
+    if expected_total > REST_PR_COMMIT_LIMIT:
+        raise AgentLoopError(
+            f"GitHub PR #{pr_number} has {expected_total} commits; the REST API used where GraphQL is "
+            f"unavailable lists at most {REST_PR_COMMIT_LIMIT}, so commit provenance cannot be read completely."
+        )
+    page_size = 100
+    commits: list[PullRequestCommitMetadata] = []
+    seen_oids: set[str] = set()
+    for page in range(1, REST_PR_COMMIT_LIMIT // page_size + 2):
+        result = runner.run(
+            [
+                config.gh_cmd,
+                "api",
+                f"repos/{config.repo}/pulls/{pr_number}/commits?per_page={page_size}&page={page}",
+            ],
+            cwd=active_workdir(config),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AgentLoopError(f"GitHub REST commit page {page} for PR #{pr_number} failed.")
+        try:
+            items = json.loads(result.stdout or "null")
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError(f"GitHub returned a malformed commit page for PR #{pr_number}.") from exc
+        if not isinstance(items, list):
+            raise AgentLoopError(f"GitHub returned a malformed commit page for PR #{pr_number}.")
+        for item in items:
+            commit = item.get("commit") if isinstance(item, dict) else None
+            oid = item.get("sha") if isinstance(item, dict) else None
+            message = commit.get("message") if isinstance(commit, dict) else None
+            if not isinstance(oid, str) or not oid or not isinstance(message, str):
+                raise AgentLoopError(f"GitHub returned an incomplete commit node for PR #{pr_number}.")
+            if oid in seen_oids:
+                raise AgentLoopError(f"GitHub commit pagination for PR #{pr_number} repeated a commit.")
+            seen_oids.add(oid)
+            commits.append(PullRequestCommitMetadata(oid=oid, message=message))
+        if len(items) < page_size:
+            break
+    else:
+        raise AgentLoopError(f"GitHub commit pagination for PR #{pr_number} did not terminate.")
+    if len(commits) != expected_total:
+        raise AgentLoopError(
+            f"GitHub PR #{pr_number} commit provenance was truncated: provider reported "
+            f"{expected_total} commits but returned {len(commits)}."
+        )
+    final_head, final_total = _rest_pr_object(runner, config=config, pr_number=pr_number)
     if final_head != before_head or final_total != expected_total:
         raise AgentLoopError(f"PR #{pr_number} commit history changed during provenance scan.")
     return tuple(commits)
@@ -1032,6 +1136,13 @@ def _parse_pr_metadata(
         url=_optional_str(data.get("url")),
         body=_optional_str(data.get("body")),
     )
+
+
+def strip_bot_login_suffix(login: str | None) -> str | None:
+    """Spell an app login as GitHub GraphQL does (REST appends ``[bot]``)."""
+    if isinstance(login, str) and login.endswith("[bot]"):
+        return login[: -len("[bot]")]
+    return login
 
 
 def _author_login(raw: object) -> str | None:
@@ -1880,14 +1991,29 @@ def _merge_issue_comment_transport_identity(
             f"GitHub issue comment recovery for issue #{issue_number} exceeded its pagination bound."
         )
     transport_comments = _parse_issue_comments(raw_transport_comments)
+    # GraphQL spells an app's login without the ``[bot]`` suffix REST uses, so
+    # the match key normalizes it; a key shared by different raw logins is
+    # ambiguous and never borrows either identity (#1029).
     by_key: dict[tuple[str | None, str | None, str | None], list[IssueComment]] = {}
     for comment in transport_comments:
-        by_key.setdefault((comment.author, comment.created_at, comment.body), []).append(comment)
+        key = (strip_bot_login_suffix(comment.author), comment.created_at, comment.body)
+        by_key.setdefault(key, []).append(comment)
     merged: list[IssueComment] = []
     matched_transport_ids: set[int] = set()
     for comment in comments:
-        candidates = by_key.get((comment.author, comment.created_at, comment.body), [])
-        transport = candidates.pop(0) if candidates else None
+        candidates = by_key.get(
+            (strip_bot_login_suffix(comment.author), comment.created_at, comment.body), []
+        )
+        ambiguous = len({candidate.author for candidate in candidates}) > 1
+        if ambiguous and isinstance(comment.body, str) and any(
+            marker in comment.body
+            for marker in ("AGENT_PLAN_VALIDATION_DIAGNOSTIC", "AGENT_LOOP_META", "AGENT_LOOP_SIDECAR")
+        ):
+            raise AgentLoopError(
+                f"GitHub issue comment recovery for issue #{issue_number} found protocol comments from "
+                "different authors that differ only by an app `[bot]` suffix; refusing to guess their identity."
+            )
+        transport = candidates.pop(0) if candidates and not ambiguous else None
         if transport is not None and transport.comment_id is not None:
             matched_transport_ids.add(transport.comment_id)
         if (
@@ -1905,11 +2031,14 @@ def _merge_issue_comment_transport_identity(
                 f"GitHub issue comment recovery for issue #{issue_number} could not authenticate "
                 "a planning diagnostic against the live REST record."
             )
+        # A matched comment takes its whole identity from the live REST record
+        # so login and numeric IDs agree for downstream authentication.
         merged.append(
             replace(
                 comment,
                 comment_id=(transport.comment_id if transport is not None else comment.comment_id),
                 author_id=(transport.author_id if transport is not None else comment.author_id),
+                author=(transport.author if transport is not None else comment.author),
             )
         )
     # The GraphQL projection can omit older comments once it reaches its

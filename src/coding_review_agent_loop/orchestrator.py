@@ -126,6 +126,7 @@ from .expected_closure import (
 )
 from .github import (
     CiWatchOutcome,
+    strip_bot_login_suffix,
     IssueContext,
     PullRequestMetadata,
     PullRequestChecks,
@@ -23765,7 +23766,8 @@ def _build_discuss_agenda_support_corpus(
     add(issue_context.title, phrase_support=True)
     add(issue_context.body, phrase_support=True)
     for comment in issue_context.comments:
-        add(comment.author)
+        # Token parity across transports: REST spells app logins with `[bot]`.
+        add(strip_bot_login_suffix(comment.author))
         add(comment.created_at)
         add(comment.body, phrase_support=True)
     for reviewer in configured_reviewers:
