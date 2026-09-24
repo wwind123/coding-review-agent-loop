@@ -179,15 +179,24 @@ def test_reservation_survives_a_killed_wrapper_while_its_target_runs(tmp_path):
         "root = Path(sys.argv[1])\n"
         "lock, _ = WorkerBudgetLock.acquire(invocation_id='victim', cwd=root, root=root)\n"
         "lock.reserve_host_workers(8, HostCapacity(8, None, 1))\n"
+        "mode = sys.argv[2]\n"
         "env = dict(os.environ)\n"
-        "if sys.argv[2] == 'token': env[ENV_WORKER_RESERVATION] = lock.reservation_token\n"
+        "if mode == 'token': env[ENV_WORKER_RESERVATION] = lock.reservation_token\n"
+        "if mode in ('anchor', 'window'): env = {}  # like env -i: no token\n"
+        "extra = {}\n"
+        "if mode == 'anchor':\n"
+        "    fd, preexec = lock.launch_anchor()\n"
+        "    extra = dict(pass_fds=(fd,), preexec_fn=preexec)\n"
+        "if mode == 'window':\n"
+        "    # The target still holds the inherited lock (killed before anchoring).\n"
+        "    extra = dict(pass_fds=(lock.handle.fileno(),))\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],"
-        " start_new_session=True, env=env)\n"
-        "if sys.argv[2] == 'pgid': lock.record_process_group(child.pid)\n"
+        " start_new_session=True, env=env, **extra)\n"
+        "if mode == 'pgid': lock.record_process_group(child.pid)\n"
         "print(child.pid, flush=True)\n"
         "time.sleep(60)\n"
     )
-    for mode in ("pgid", "token"):
+    for mode in ("pgid", "token", "anchor", "window"):
         wrapper = subprocess.Popen(
             [sys.executable, "-c", script, str(root), mode], stdout=subprocess.PIPE, text=True,
             env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
@@ -279,4 +288,98 @@ def test_run_foreground_test_shrinks_or_busies_on_shared_pool(tmp_path):
         echo_output=False, worker_budget=_budget(4), worker_lock_root=root,
     )
     assert alone.returncode == 0 and "workers=4" in alone.output_tail
+    assert _records(root) == []
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat") as stream:
+            return stream.read().rsplit(")", 1)[-1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def _eventually_granted(lock, requested, capacity, seconds=10):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        granted = lock.reserve_host_workers(requested, capacity)
+        if granted:
+            return granted
+        time.sleep(0.05)
+    return 0
+
+
+def test_normal_exit_keeps_reservation_while_escaped_descendant_runs(tmp_path):
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    root = tmp_path / "locks"
+    pid_file = tmp_path / "escaped.pid"
+    script = (
+        "import subprocess, sys; "
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True); "
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))"
+    )
+    result = run_foreground_test(
+        [sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=30, env=_env("escaper"),
+        environment_is_complete=True, echo_output=False, worker_budget=_budget(4), worker_lock_root=root,
+    )
+    escaped = int(pid_file.read_text())
+    try:
+        assert result.returncode == 0
+        assert _pid_alive(escaped)
+        assert len(_records(root)) == 1  # kept: the escaped worker carries the token
+        other = _lock(root, "next-loop")
+        try:
+            assert other.reserve_host_workers(4, _cpus(4)) == 0
+            os.kill(escaped, 9)
+            assert _eventually_granted(other, 4, _cpus(4)) == 4
+        finally:
+            other.close()
+    finally:
+        try:
+            os.kill(escaped, 9)
+        except ProcessLookupError:
+            pass
+    assert _records(root) == []
+
+
+def test_post_spawn_failure_keeps_reservation_while_target_runs(tmp_path):
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    root = tmp_path / "locks"
+    started: list[int] = []
+
+    def explode(proc):
+        started.append(proc.pid)
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError):
+        run_foreground_test(
+            [sys.executable, "-c", "import time; time.sleep(60)"], cwd=tmp_path, timeout_seconds=30,
+            env=_env("exploder"), environment_is_complete=True, echo_output=False,
+            worker_budget=_budget(4), worker_lock_root=root, process_started=explode,
+        )
+    target = started[0]
+    try:
+        assert _pid_alive(target)
+        records = _records(root)
+        assert len(records) == 1
+        # The child anchored its own process group at launch.
+        assert records[0].with_suffix(".pgid").read_text() == str(target)
+        other = _lock(root, "next-loop")
+        try:
+            assert other.reserve_host_workers(4, _cpus(4)) == 0
+            os.kill(target, 9)
+            assert _eventually_granted(other, 4, _cpus(4)) == 4
+        finally:
+            other.close()
+    finally:
+        try:
+            os.killpg(target, 9)
+        except ProcessLookupError:
+            pass
     assert _records(root) == []

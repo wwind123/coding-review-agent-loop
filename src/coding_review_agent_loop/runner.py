@@ -622,6 +622,18 @@ def run_foreground_test(
             # directory handle is still private to this parent process.
             spawn_cwd = "/"
             spawn_preexec = lambda fd=cwd_fd: os.fchdir(fd)
+        anchor = worker_lock.launch_anchor() if worker_lock is not None else None
+        if anchor is not None:
+            # Issue #987: the child keeps the reservation live from fork
+            # until it has recorded its own process group.
+            anchor_fd, anchor_preexec = anchor
+            pass_fds = (*pass_fds, anchor_fd)
+            chdir_preexec = spawn_preexec
+
+            def spawn_preexec(chdir=chdir_preexec, anchor=anchor_preexec) -> None:
+                if chdir is not None:
+                    chdir()
+                anchor()
         try:
             proc = subprocess.Popen(
                 spawn_cmd,

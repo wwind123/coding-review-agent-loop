@@ -63,6 +63,7 @@ WORKER_BUDGET_LOCK_DIR = "worker-budget"
 # per-invocation locks and a short-lived mutex serializes only the accounting.
 HOST_CAPACITY_MUTEX = "host-capacity.mutex"
 HOST_RESERVATION_SUFFIX = ".reservation"
+HOST_ANCHOR_SUFFIX = ".pgid"
 ENV_HOST_SHARING = "AGENT_LOOP_TEST_WORKER_HOST_SHARING"
 # Carried by every test command holding a host reservation, so the
 # reservation stays live while any process launched with it survives.
@@ -997,17 +998,23 @@ class WorkerBudgetLock:
         cost; the strictest recorded capacity applies and the memory already
         reserved is summed at each holder's own per-worker size, so loops
         configured with different headroom or per-worker memory cannot
-        overcommit the host together.  See ``_live_reservation`` for when a
+        overcommit the host together.  Each reservation has its own record,
+        so one left behind by an earlier command of this invocation (for a
+        survivor) keeps counting.  See ``_live_reservation`` for when a
         reservation stops counting.
         """
         requested = max(1, int(requested))
         directory = self.path.parent
         with _host_capacity_mutex(directory):
-            own = self.path.with_suffix(HOST_RESERVATION_SUFFIX)
+            previous, self.reservation = self.reservation, None
+            if previous is not None:
+                _unlink_reservation(previous)
             others = [
                 data
                 for record in sorted(directory.glob("*" + HOST_RESERVATION_SUFFIX))
-                if record != own and (data := _live_reservation(record)) is not None
+                if (
+                    data := _live_reservation(record, caller_lock=self.path.name)
+                ) is not None
             ]
             if not others:
                 granted = requested
@@ -1024,9 +1031,12 @@ class WorkerBudgetLock:
                     granted = min(granted, (min(memory_caps) - used) // capacity.per_worker_bytes)
                 granted = max(0, granted)
             if granted == 0:
+                self.reservation_token = None
+                self._reservation_data = None
                 return 0
             self.reservation_token = uuid.uuid4().hex
-            self.reservation = own
+            own = directory / f"{self.path.stem}-{self.reservation_token}{HOST_RESERVATION_SUFFIX}"
+            _anchor_path(own).unlink(missing_ok=True)
             self._reservation_data = {
                 "version": 2,
                 "workers": granted,
@@ -1038,30 +1048,66 @@ class WorkerBudgetLock:
                 "pgid": None,
             }
             _write_reservation(own, self._reservation_data)
+            self.reservation = own
         return granted
 
+    def launch_anchor(self) -> tuple[int, Callable[[], None]] | None:
+        """Anchor the reservation to the target atomically at launch.
+
+        Returns ``(fd, preexec)`` for the spawn: pass ``fd`` to the child and
+        run ``preexec`` in it after ``setsid``.  The child inherits this
+        lock's open file description, so the lock stays held (and the
+        reservation live) even if the wrapper dies right after ``fork``; the
+        child writes its own pid, which is its process-group id, to the
+        reservation's anchor file and only then drops its copy of the lock
+        and execs.  From then on the recorded group keeps the reservation
+        live, even for a command that replaces its environment.
+        """
+        if self.reservation is None or self.handle.closed:
+            return None
+        fd = self.handle.fileno()
+        target = os.fsencode(str(_anchor_path(self.reservation)))
+
+        def preexec() -> None:
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(descriptor, str(os.getpid()).encode("ascii"))
+            finally:
+                os.close(descriptor)
+            os.close(fd)
+
+        return fd, preexec
+
     def record_process_group(self, pgid: int) -> None:
-        """Record the target's process group so the reservation outlives this
-        process: if the wrapper is killed, the reservation keeps counting
-        while any member of the group is alive."""
+        """Also record the target's process group in the reservation itself."""
         if self.reservation is None or self._reservation_data is None:
             return
         self._reservation_data = {**self._reservation_data, "pgid": int(pgid)}
         try:
             with _host_capacity_mutex(self.reservation.parent):
-                _write_reservation(self.reservation, self._reservation_data)
+                if self.reservation is not None and self.reservation.exists():
+                    _write_reservation(self.reservation, self._reservation_data)
         except OSError:
-            pass  # the reservation token still keeps it live
+            pass  # the anchor file already records the group
 
     def _release_reservation(self) -> None:
+        """Drop this command's reservation unless its target still lives.
+
+        A reservation whose process group or token-carrying processes are
+        still alive (an escaped descendant, or a post-spawn failure that left
+        the target running) is kept; the next accounting reclaims it once
+        they are gone.
+        """
         record, self.reservation = self.reservation, None
         if record is None:
             return
         try:
             with _host_capacity_mutex(record.parent):
-                record.unlink(missing_ok=True)
+                data = _parse_reservation(record)
+                if data is None or not _target_alive(record, data):
+                    _unlink_reservation(record)
         except OSError:
-            pass  # a leftover entry is reclaimed once this lock is free
+            pass  # a leftover entry is reclaimed once nothing holds it
 
     def close(self) -> None:
         if self.handle.closed:
@@ -1236,29 +1282,52 @@ def _token_carried_by_live_process(token: str) -> bool:
     return False
 
 
-def _live_reservation(record: Path) -> dict | None:
+def _anchor_path(record: Path) -> Path:
+    return record.with_suffix(HOST_ANCHOR_SUFFIX)
+
+
+def _unlink_reservation(record: Path) -> None:
+    record.unlink(missing_ok=True)
+    _anchor_path(record).unlink(missing_ok=True)
+
+
+def _anchored_pgid(record: Path) -> int | None:
+    try:
+        text = _anchor_path(record).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return int(text) if text.isdigit() and int(text) > 0 else None
+
+
+def _target_alive(record: Path, data: Mapping[str, object]) -> bool:
+    """Whether the reservation's target group or token carriers are alive."""
+    for pgid in {data.get("pgid"), _anchored_pgid(record)}:
+        if isinstance(pgid, int) and process_group_alive(pgid):
+            return True
+    token = data.get("token")
+    return isinstance(token, str) and _token_carried_by_live_process(token)
+
+
+def _live_reservation(record: Path, *, caller_lock: str | None = None) -> dict | None:
     """A live reservation's data; reclaims the record and returns None when stale.
 
     A reservation stays live while its holder's per-invocation lock is held
-    (by the command or by its group watcher), while any member of the
-    recorded target process group is alive, or while any process launched
-    with its reservation token survives.  The last two keep a reservation
-    counting when the wrapper itself was killed after spawning its target,
-    including the window before the process group was recorded.  Must be
-    called with the host capacity mutex held.
+    (by the command, its group watcher, or its target between ``fork`` and
+    the launch anchor), while any member of the recorded or anchored target
+    process group is alive, or while any process launched with its
+    reservation token survives.  For the caller's own invocation the lock
+    proves nothing (the caller holds it), so only the target checks apply.
+    Must be called with the host capacity mutex held.
     """
     data = _parse_reservation(record)
     if data is None:
-        record.unlink(missing_ok=True)
+        _unlink_reservation(record)
         return None
-    held = _lock_is_held(record.parent / data["lock"])
-    if held:
+    if data["lock"] != caller_lock and _lock_is_held(record.parent / data["lock"]):
         return data
-    if data["pgid"] is not None and process_group_alive(data["pgid"]):
+    if _target_alive(record, data):
         return data
-    if data["token"] is not None and _token_carried_by_live_process(data["token"]):
-        return data
-    record.unlink(missing_ok=True)
+    _unlink_reservation(record)
     return None
 
 

@@ -803,13 +803,21 @@ per-worker cost, where the strictest capacity any live holder recorded
 applies, so loops with different headroom or `--test-worker-memory` settings
 cannot overcommit memory together. The command is lowered to what fits (the
 injected plugin then enforces the lower number), or gets `worker-budget-busy`
-(exit 125) when nothing fits. A reservation keeps counting while its holder's
-per-invocation lock is held (including by the survivor watcher), while any
-member of the recorded target process group is alive, or while any process
-launched with its `AGENT_LOOP_WORKER_RESERVATION` token survives, so a wrapper
-killed after spawning its target does not free its share while the target
-runs. Once none of those holds, the next command that does the accounting
-reclaims the entry, so a crashed loop cannot deadlock the host. Set
+(exit 125) when nothing fits. Every reservation has its own record, so a
+share left behind by an earlier command of the same invocation keeps counting.
+The reservation is anchored to the target atomically at launch: the spawned
+child inherits the per-invocation lock, writes its own pid (its process-group
+id) to the reservation's anchor file, and only then drops the lock and execs,
+so a wrapper killed at any point after `fork` cannot free the share, even for
+a command that replaces its environment. A reservation keeps counting while
+its holder's per-invocation lock is held (including by the survivor watcher),
+while any member of the anchored target process group is alive, or while any
+process launched with its `AGENT_LOOP_WORKER_RESERVATION` token survives. The
+same check runs when a command finishes: a share whose target group or
+token-carrying descendants (for example a worker that escaped into a new
+session) are still alive, or whose target outlived a post-spawn failure, is
+kept rather than dropped. Once none of those holds, the next command that does
+the accounting reclaims the entry, so a crashed loop cannot deadlock the host. Set
 `AGENT_LOOP_TEST_WORKER_HOST_SHARING=off` in the wrapper's environment to opt
 out and keep the per-invocation-only behavior.
 
