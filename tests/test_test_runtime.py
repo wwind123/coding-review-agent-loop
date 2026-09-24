@@ -766,6 +766,19 @@ def test_node_test_runner_is_a_recognized_inner_launcher(tmp_path, argv):
         ["node", "--", "--test"],
         ["node"],
         ["npx", "--test"],
+        ["node", "--test", "--version"],
+        ["node", "--test", "-v"],
+        ["node", "--test", "--help"],
+        ["node", "--test", "-h"],
+        ["node", "--test", "--v8-options"],
+        ["node", "--test", "--check", "tests/a.mjs"],
+        ["node", "--test", "--eval=process.exit(0)"],
+        ["node", "--test", "-e", "process.exit(0)"],
+        ["node", "--test", "--run", "noop"],
+        ["node", "--test", "--experimental-sea-config=sea.json"],
+        ["node", "--test", "tests/a.mjs", "--version"],
+        ["node", "--test-reporter", "spec", "--test", "tests/a.mjs"],
+        ["node", "--test", "--test-reporter="],
     ],
 )
 def test_node_without_builtin_test_runner_stays_unrecognized(tmp_path, monkeypatch, argv, no_ambient_invocation):
@@ -794,6 +807,20 @@ def test_node_test_runner_probe_uses_only_version_argv(tmp_path, monkeypatch, no
     assert result.state == "verified"
     assert calls[0][0] == (str(node), "--version")
     assert calls[0][1]["timeout_seconds"] == 5.0
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is unavailable")
+@pytest.mark.parametrize("print_only", ["--version", "--help"])
+def test_foreground_node_print_only_option_is_not_verified_evidence(tmp_path, print_only, no_ambient_invocation):
+    # Review item on #1012: ``node --test --version`` exits 0 without running
+    # any test, so it must never produce a verified, passing observation.
+    from coding_review_agent_loop import runner as runner_module
+
+    result = runner_module.run_foreground_test(
+        ["node", "--test", print_only], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+
+    assert result.suite_start != "verified"
 
 
 @requires_system_env

@@ -968,8 +968,10 @@ never runs remembered test arguments,
 installs dependencies, contacts a database, or executes an arbitrary shell.
 Recognized inner launchers receive the same bounded `--version` probe: direct
 `pytest`/`py.test`, exactly `<python> -m pytest`, and Node's built-in runner
-(`node --test ...`, with `--test` among Node's own leading options, probed as
-`node --version`); other commands remain
+(`node --test ...`, with `--test` before the first positional argument and
+every other option on a fixed allow-list so print-and-exit options such as
+`--version` or `--help` stay unrecognized; probed as `node --version`); other
+commands remain
 unknown rather than being judged from text or exit codes. The runtime result
 keeps independent `wrapper_bootstrap`, `inner_exec`, and `suite_start` states,
 so a missing executable or import is launcher health rather than a suite

@@ -2298,20 +2298,81 @@ def _direct_launcher_executable(token: str, *, cwd: Path, environment: Mapping[s
     return executable
 
 
-def _is_node_test_runner(arguments: Sequence[str]) -> bool:
-    """Return whether ``node`` options select the built-in test runner.
+# Node options accepted alongside ``--test``.  This is an allow-list because
+# Node has print-and-exit options (``--version``, ``--help``, ``--v8-options``,
+# ``--check``, ``--eval``, ``--run``, ``--experimental-sea-config``, ...) that
+# exit 0 without running a single test.  Options that take a value are only
+# accepted in ``--name=value`` form so a detached value can never hide one.
+_NODE_TEST_RUNNER_FLAGS = frozenset({
+    "--test",
+    "--test-only",
+    "--test-force-exit",
+    "--test-update-snapshots",
+    "--experimental-test-coverage",
+    "--experimental-test-module-mocks",
+    "--experimental-test-snapshots",
+    "--experimental-vm-modules",
+    "--experimental-strip-types",
+    "--experimental-transform-types",
+    "--enable-source-maps",
+    "--trace-warnings",
+    "--trace-uncaught",
+    "--no-warnings",
+    "--no-deprecation",
+})
+_NODE_TEST_RUNNER_VALUE_OPTIONS = frozenset({
+    "--test-reporter",
+    "--test-reporter-destination",
+    "--test-name-pattern",
+    "--test-skip-pattern",
+    "--test-concurrency",
+    "--test-timeout",
+    "--test-shard",
+    "--test-isolation",
+    "--test-coverage-include",
+    "--test-coverage-exclude",
+    "--test-coverage-lines",
+    "--test-coverage-branches",
+    "--test-coverage-functions",
+    "--test-global-setup",
+    "--import",
+    "--require",
+    "--loader",
+    "--experimental-loader",
+    "--conditions",
+    "--env-file",
+    "--max-old-space-size",
+})
 
-    Only Node's own leading options are inspected: ``--test`` after the first
-    positional argument belongs to the script, not to Node.
+
+def _is_node_test_runner(arguments: Sequence[str]) -> bool:
+    """Return whether ``node`` argv provably runs the built-in test runner.
+
+    ``--test`` must precede the first positional argument (after it, the flag
+    would belong to a script), and every option anywhere in argv must be on
+    the allow-list so no print-and-exit option can turn a zero exit into
+    citable evidence that ran no tests.
     """
+    selected = False
+    positional_seen = False
     for argument in arguments:
         if argument == "--":
             return False
         if not argument.startswith("-"):
-            return False
+            positional_seen = True
+            continue
         if argument == "--test":
-            return True
-    return False
+            if positional_seen:
+                return False
+            selected = True
+            continue
+        name, has_value, value = argument.partition("=")
+        if has_value:
+            if name not in _NODE_TEST_RUNNER_VALUE_OPTIONS or not value:
+                return False
+        elif argument not in _NODE_TEST_RUNNER_FLAGS:
+            return False
+    return selected
 
 
 def _recognized_inner_probe_tokens(
