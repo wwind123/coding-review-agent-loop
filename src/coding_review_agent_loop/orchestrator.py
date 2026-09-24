@@ -318,6 +318,7 @@ from .protocol import (
     DerivedRiskEvidenceResult,
     PostAuthClaimDiagnostic,
     SemanticRiskCoverageClaims,
+    DEGRADED_ROW_CLAIM_DIAGNOSTIC,
     UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     StructuredPlanState,
     StructuredPlanRevision,
@@ -5443,19 +5444,18 @@ def _parse_fresh_correction_claims(
     # The correction continuation is not a second coder handoff. Preserve all
     # coder-owned facts from the authenticated response and accept only its
     # newly validated semantic claim set.  Claims the original response lost
-    # to an unapproved row stay on the audit record (#920) even when the
-    # correction omits them.
+    # to an unapproved row (#920) or any other row-ID defect (#926) stay on
+    # the audit record even when the correction omits them.
     claims = candidate.risk_test_matrix_claims
-    original_dropped = (
-        original.risk_test_matrix_claims.dropped_row_ids
-        if original.risk_test_matrix_claims is not None
-        else ()
-    )
-    if original_dropped:
+    original_claims = original.risk_test_matrix_claims
+    original_dropped = original_claims.dropped_row_ids if original_claims is not None else ()
+    original_degradations = original_claims.degradations if original_claims is not None else ()
+    if original_dropped or original_degradations:
         claims = claims or SemanticRiskCoverageClaims()
         claims = dataclasses_replace(
             claims,
             dropped_row_ids=tuple(dict.fromkeys((*original_dropped, *claims.dropped_row_ids))),
+            degradations=tuple(dict.fromkeys((*original_degradations, *claims.degradations))),
         )
     return dataclasses_replace(
         original,
@@ -5469,6 +5469,7 @@ _NON_ACTIONABLE_RISK_DIAGNOSTICS = frozenset({
     "missing-claim",
     "unsuperseded-journal-failure",
     UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+    DEGRADED_ROW_CLAIM_DIAGNOSTIC,
 })
 
 

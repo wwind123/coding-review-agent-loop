@@ -2081,3 +2081,274 @@ def test_untruncated_semantic_claim_still_verifies() -> None:
 
     assert result.evidence.rows[0].status == "verified"
     assert not [d for d in result.diagnostics if d.code == "truncated-semantic-claim"]
+
+
+# --- #926: claim-scope row-ID degradation at the pre-authentication parser ---
+
+
+def _claim_926(row_id: object = "row-first", ref: str = "turn:observation-1") -> dict[str, object]:
+    return {
+        "row_id": row_id,
+        "execution_refs": [ref],
+        "test_identifiers": ["tests/test_protocol.py::test_first"],
+        "test_locations": ["tests/test_protocol.py"],
+        "workflow_path_claim": "The claimed workflow path ran.",
+        "outcome_assertions": ["The test passed."],
+        "forbidden_effect_assertions": ["No evidence was invented."],
+    }
+
+
+def _two_row_matrix_926():
+    return parse_risk_test_matrix({**_matrix(), "rows": [_row("row-first"), _row("row-second")]})
+
+
+def _parse_and_derive_926(claims, *, row_ids, matrix=None):
+    matrix = matrix or _two_row_matrix_926()
+    catalog = [
+        _derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1"),
+        _derived_observation(execution_ref="turn:observation-2", receipt_id="receipt-2"),
+    ]
+    parsed = validate_structured_coder_followup(
+        _followup_with_claims_920(claims),
+        delivered_risk_test_matrix_row_ids=row_ids,
+        execution_catalog=catalog,
+    )
+    assert parsed is not None
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=parsed.risk_test_matrix_claims,
+        observations=tuple(catalog),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+    return parsed, result
+
+
+def _statuses(result) -> dict[str, str]:
+    return {row.row_id: row.status for row in result.evidence.rows}
+
+
+def test_unapproved_row_claim_drops_with_record_and_keeps_complete_evidence_926() -> None:
+    """Row claim-unknown-row: an unapproved ID emits no canonical row."""
+    parsed, result = _parse_and_derive_926(
+        [_claim_926("row-first"), _claim_926("row-unknown", "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-first"]
+    assert [record.element_path for record in claims.degradations] == [
+        "coder_followup.risk_test_matrix_claims[1].row_id"
+    ]
+    assert claims.degradations[0].outcome == "claim-dropped"
+    # Every approved enforceable row exactly once; no row for the unapproved ID.
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+    assert _statuses(result) == {"row-first": "verified", "row-second": "missing"}
+    codes = [(item.row_id, item.code) for item in result.diagnostics]
+    assert ("row-unknown", "unapproved-row-claim") in codes
+    # The unapproved record keeps its historical diagnostic only, not a second one.
+    assert not [code for _row_id, code in codes if code == "degraded-row-claim"]
+
+
+def test_duplicate_row_claim_drops_every_copy_926() -> None:
+    """Row claim-duplicate-row: no arbitrary copy becomes the row's coverage."""
+    parsed, result = _parse_and_derive_926(
+        [
+            _claim_926("row-first"),
+            _claim_926("row-second", "turn:observation-2"),
+            _claim_926("row-first", "turn:observation-2"),
+        ],
+        row_ids=("row-first", "row-second"),
+    )
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-second"]
+    assert [record.element_path for record in claims.degradations] == [
+        "coder_followup.risk_test_matrix_claims[0].row_id",
+        "coder_followup.risk_test_matrix_claims[2].row_id",
+    ]
+    assert all("more than once" in record.rule for record in claims.degradations)
+    assert _statuses(result) == {"row-first": "missing", "row-second": "verified"}
+    degraded = [item for item in result.diagnostics if item.code == "degraded-row-claim"]
+    assert [item.row_id for item in degraded] == [
+        "coder_followup.risk_test_matrix_claims[0].row_id",
+        "coder_followup.risk_test_matrix_claims[2].row_id",
+    ]
+    assert "row-first" in degraded[0].message
+    assert ("row-first", "missing-claim") in [(i.row_id, i.code) for i in result.diagnostics]
+
+
+@pytest.mark.parametrize(
+    "bad_row_id",
+    ["finding-3", "hr-2", "item-1", "bad row id", "x" * 300, "`row-first`\nline two"],
+)
+def test_malformed_row_id_claim_degrades_with_sanitized_preview_926(bad_row_id) -> None:
+    """Row claim-invalid-row-id: sanitized, bounded, never admitted."""
+    parsed, result = _parse_and_derive_926(
+        [_claim_926(bad_row_id, "turn:observation-2"), _claim_926("row-first")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-first"]
+    [record] = claims.degradations
+    assert "\n" not in record.observed_preview
+    assert "`" not in record.observed_preview
+    assert len(record.observed_preview) <= 121
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+    assert _statuses(result) == {"row-first": "verified", "row-second": "missing"}
+    [degraded] = [item for item in result.diagnostics if item.code == "degraded-row-claim"]
+    # Keyed by element path, so a namespace-like value never becomes a row ID.
+    assert degraded.row_id == "coder_followup.risk_test_matrix_claims[0].row_id"
+    assert "\n" not in degraded.message
+
+
+@pytest.mark.parametrize("row_id", ["ABSENT", 7, 1.5, None, True, ["row-first"], {"row": "row-first"}])
+def test_absent_or_mistyped_row_id_claim_degrades_at_its_index_926(row_id) -> None:
+    """Row claim-rowid-absent-or-mistyped: dropped at its index, type name only."""
+    bad = _claim_926(row_id, "turn:observation-2")
+    if row_id == "ABSENT":
+        bad.pop("row_id")
+    parsed, result = _parse_and_derive_926(
+        [_claim_926("row-first"), bad, _claim_926("row-second", "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-first", "row-second"]
+    [record] = claims.degradations
+    assert record.element_path == "coder_followup.risk_test_matrix_claims[1].row_id"
+    if row_id == "ABSENT":
+        assert record.rule == "row_id key is absent"
+    else:
+        assert record.rule == "row_id is not a string"
+        assert record.observed_preview.startswith("type ")
+        # No rendering of the value itself.
+        assert "row-first" not in record.observed_preview
+    assert _statuses(result) == {"row-first": "verified", "row-second": "verified"}
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+
+
+def test_all_claims_degraded_followup_survives_with_no_coverage_926() -> None:
+    bad_absent = _claim_926()
+    bad_absent.pop("row_id")
+    parsed, result = _parse_and_derive_926(
+        [
+            bad_absent,
+            _claim_926(5),
+            _claim_926("finding-9"),
+            _claim_926("row-other"),
+            _claim_926("row-first"),
+            _claim_926("row-first"),
+        ],
+        row_ids=("row-first", "row-second"),
+    )
+
+    assert parsed.risk_test_matrix_claims.claims == ()
+    assert len(parsed.risk_test_matrix_claims.degradations) == 6
+    assert _statuses(result) == {"row-first": "missing", "row-second": "missing"}
+
+
+@pytest.mark.parametrize("context", ["zero-owned-stage", "not-applicable-matrix"])
+def test_authoritative_empty_row_set_admits_no_claim_926(context) -> None:
+    """Row claim-empty-approved-rowset: [] is authoritative, None is unscoped."""
+    if context == "zero-owned-stage":
+        _matrix_payload, approved = _staged_context_920()
+        row_ids = scope_approved_plan_matrix(
+            approved,
+            execution_owner="stage-empty",
+            valid_stage_ids=("stage-first", "stage-later", "stage-empty"),
+        ).risk_test_matrix_expected_row_ids
+    else:
+        na = parse_risk_test_matrix(_not_applicable())
+        identity = risk_test_matrix_identity(na)
+        row_ids = make_approved_plan_context(
+            render_risk_test_matrix_section(na),
+            expected_hash=None,
+            risk_test_matrix_contract_version=1,
+            risk_test_matrix_payload=na.to_payload(),
+            risk_test_matrix_changes_payload=(),
+            risk_test_matrix_identity=identity,
+            risk_test_matrix_boundary_digest=identity,
+        ).risk_test_matrix_expected_row_ids
+    assert tuple(row_ids) == ()
+    catalog = [_derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")]
+    claims = [_claim_926("row-first"), _claim_926("row-later")]
+
+    scoped = validate_structured_coder_followup(
+        _followup_with_claims_920(claims),
+        delivered_risk_test_matrix_row_ids=row_ids,
+        execution_catalog=catalog,
+    )
+    assert scoped.risk_test_matrix_claims.claims == ()
+    assert [record.element_path for record in scoped.risk_test_matrix_claims.degradations] == [
+        "coder_followup.risk_test_matrix_claims[0].row_id",
+        "coder_followup.risk_test_matrix_claims[1].row_id",
+    ]
+
+    unscoped = validate_structured_coder_followup(
+        _followup_with_claims_920(claims),
+        delivered_risk_test_matrix_row_ids=None,
+        execution_catalog=catalog,
+    )
+    assert [claim.row_id for claim in unscoped.risk_test_matrix_claims.claims] == [
+        "row-first", "row-later",
+    ]
+    assert unscoped.risk_test_matrix_claims.degradations == ()
+
+
+def test_degradation_is_never_stronger_than_the_undegraded_claim_set_926() -> None:
+    """A degraded claim set never reports more verified rows than the clean one."""
+    rank = {"verified": 2}
+    _clean_parsed, clean = _parse_and_derive_926(
+        [_claim_926("row-first"), _claim_926("row-second", "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+    for degraded_claims in (
+        [_claim_926("row-first"), _claim_926(3, "turn:observation-2")],
+        [_claim_926("row-first"), _claim_926("finding-1", "turn:observation-2")],
+        [_claim_926("row-first"), _claim_926("row-first"), _claim_926("row-second", "turn:observation-2")],
+    ):
+        _parsed, degraded = _parse_and_derive_926(degraded_claims, row_ids=("row-first", "row-second"))
+        for row_id, status in _statuses(degraded).items():
+            assert rank.get(status, 0) <= rank.get(_statuses(clean)[row_id], 0)
+        assert len(degraded.diagnostics) >= len(clean.diagnostics)
+
+
+def test_correction_keeps_claim_degradation_records_926() -> None:
+    catalog = [_derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")]
+    original = validate_structured_coder_followup(
+        _followup_with_claims_920([_claim_926(5)]),
+        delivered_risk_test_matrix_row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+    assert len(original.risk_test_matrix_claims.degradations) == 1
+
+    corrected = orchestrator_module._parse_fresh_correction_claims(
+        _followup_with_claims_920([_claim_926("row-ordinary")]),
+        original,
+        row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+
+    assert corrected.risk_test_matrix_claims.degradations == original.risk_test_matrix_claims.degradations
+    assert "degraded-row-claim" in orchestrator_module._NON_ACTIONABLE_RISK_DIAGNOSTICS
+
+
+def test_degraded_row_claim_is_rendered_as_a_dropped_claim_926() -> None:
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    _parsed, result = _parse_and_derive_926(
+        [_claim_926("row-first"), _claim_926("finding-4", "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    dropped = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert len(dropped) == 1
+    assert "coder_followup.risk_test_matrix_claims[1].row_id" in dropped[0]
+    assert "not a valid matrix-specific identifier" in dropped[0]

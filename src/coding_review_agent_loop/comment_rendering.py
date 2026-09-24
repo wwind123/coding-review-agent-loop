@@ -15,6 +15,7 @@ from .errors import AgentLoopError
 from .expected_closure import normalize_issue_ids
 from .agents.registry import agent_display_name, agent_signature
 from .protocol import (
+    DEGRADED_ROW_CLAIM_DIAGNOSTIC,
     UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     ANY_HEADING_RE,
     HTML_COMMENT_RE,
@@ -661,11 +662,12 @@ def _render_risk_test_matrix_evidence(
         f"- Matrix identity: `{safe(evidence.matrix_identity)}`",
     ]
     # Outside the collapsed block, so an operator sees that coverage was
-    # dropped rather than silently reduced (#920).
+    # dropped rather than silently reduced (#920, #926).
     lines.extend(
         f"- Dropped claim: {safe(getattr(diagnostic, 'message', ''))}"
         for diagnostic in diagnostics
-        if getattr(diagnostic, "code", None) == UNAPPROVED_ROW_CLAIM_DIAGNOSTIC
+        if getattr(diagnostic, "code", None)
+        in {UNAPPROVED_ROW_CLAIM_DIAGNOSTIC, DEGRADED_ROW_CLAIM_DIAGNOSTIC}
     )
     unchanged_line: str | None = None
     if render_decision is not None and render_decision.mode == "delta":
