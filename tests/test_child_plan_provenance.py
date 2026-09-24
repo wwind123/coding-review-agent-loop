@@ -2817,10 +2817,10 @@ def test_m1013_new_recommendation_commitments_are_an_expansion():
     expansion = orchestrator._plan_contract_expansion(old, new)
     assert len(expansion) == 1
     summary, items = expansion[0]
-    assert summary.startswith("3 new execution-recommendation commitment(s)")
-    assert "scope item `scope-b`: Do B." in items
-    assert "acceptance for scope item `scope-b`: B works." in items
-    assert "one-shot delivery acceptance: B works end to end." in items
+    assert summary.startswith("3 new or changed execution-recommendation value(s)")
+    assert "`scope_items[scope-b].requirement`: Do B." in items
+    assert "`scope_items[scope-b].acceptance_criteria`: B works." in items
+    assert "`one_shot_delivery.acceptance_criteria`: B works end to end." in items
 
 
 def _m1013_expansion_for(base, changed):
@@ -2856,8 +2856,12 @@ def test_m1013_new_coupling_constraint_alone_is_an_expansion():
          "rationale": "Shared seam."}
     )
     (summary, items), = _m1013_expansion_for(base, changed)
-    assert summary.startswith("1 new execution-recommendation commitment(s)")
-    assert items == ["coupling constraint `couple-ab` couples `scope-a`, `scope-b`"]
+    assert summary.startswith("3 new or changed execution-recommendation value(s)")
+    assert sorted(items) == [
+        "`coupling_constraints[couple-ab].rationale`: Shared seam.",
+        "`coupling_constraints[couple-ab].scope_item_ids`: scope-a",
+        "`coupling_constraints[couple-ab].scope_item_ids`: scope-b",
+    ]
 
 
 def test_m1013_stage_moved_to_child_planning_alone_is_an_expansion():
@@ -2880,13 +2884,48 @@ def test_m1013_stage_moved_to_child_planning_alone_is_an_expansion():
         "unresolved_design_decisions": ["Pick the transport."],
     }
     (summary, items), = _m1013_expansion_for(base, changed)
-    assert "stage `stage-one` execution disposition: requires-child-planning" in items
-    assert "stage `stage-one` unresolved design decision: Pick the transport." in items
+    assert (
+        "`child_stages[stage-one].execution_disposition.disposition`: requires-child-planning"
+        in items
+    )
+    assert (
+        "`child_stages[stage-one].execution_disposition.unresolved_design_decisions`: "
+        "Pick the transport." in items
+    )
     # A new dependency between existing stages is growth too.
     depends = json.loads(json.dumps(base))
     depends["child_stages"][0]["depends_on_stage_ids"] = ["stage-zero"]
     (_summary, items), = _m1013_expansion_for(base, depends)
-    assert items == ["stage `stage-one` depends on stage `stage-zero`"]
+    assert items == ["`child_stages[stage-one].depends_on_stage_ids`: stage-zero"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "label"),
+    [
+        ("summary", "Do S and also T.", "`child_stages[stage-two].summary`: Do S and also T."),
+        ("position", 3, "`child_stages[stage-two].position`: 3"),
+        ("dependency_notes", "Needs stage one's API.",
+         "`child_stages[stage-two].dependency_notes`: Needs stage one's API."),
+        ("rollout_risk", "high", "`child_stages[stage-two].rollout_risk`: high"),
+        ("non_goals", ["No UI."], "`child_stages[stage-two].non_goals`: No UI."),
+    ],
+)
+def test_m1013_any_single_stage_field_change_is_an_expansion(field, value, label):
+    def stage(stage_id, position):
+        return {
+            "stage_id": stage_id, "position": position, "title": stage_id, "summary": "Do S.",
+            "deliverables": ["D."], "non_goals": [], "acceptance_criteria": ["A."],
+            "depends_on_stage_ids": [], "dependency_notes": "", "automation": "automatic",
+            "rollout_risk": "low", "compatibility_constraints": [],
+            "covered_scope_item_ids": ["scope-a"],
+        }
+
+    base = {"strategy": "staged", "child_stages": [stage("stage-one", 1), stage("stage-two", 2)]}
+    changed = json.loads(json.dumps(base))
+    changed["child_stages"][1][field] = value
+    (summary, items), = _m1013_expansion_for(base, changed)
+    assert summary.startswith("1 new or changed execution-recommendation value(s)")
+    assert items == [label]
 
 
 def test_m1013_notice_escapes_quoted_record_text(tmp_path, monkeypatch):

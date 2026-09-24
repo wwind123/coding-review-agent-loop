@@ -507,8 +507,8 @@ Child plan supersession:
    reviewer approvals recorded before the rebind do not count under the new
    plan. `agent-loop pr <n>` never re-plans or rebinds; on an inadmissible
    binding it fails closed and prints the same route. If the replacement plan
-   adds steps, matrix rows, or execution-recommendation commitments, or
-   changes the execution strategy, the rebind comment also carries an
+   adds steps or matrix rows, or adds or changes any execution-recommendation
+   value (including its strategy), the rebind comment also carries an
    informational notice naming what grew; it never stops the run.
 
 **Deliberate re-plan of an admissible plan.** The same signed record also

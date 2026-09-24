@@ -10191,8 +10191,7 @@ class _PlanContractShape:
     steps: tuple[str, ...]
     matrix_row_ids: tuple[str, ...]
     strategy: str | None
-    # Labelled scope, coupling, delivery, and stage commitments (including
-    # stage execution fields) of the execution recommendation: work or
+    # Every execution-recommendation field value, path-labelled: work or
     # topology the PR must satisfy even when steps and rows hold.
     commitments: tuple[str, ...] = ()
 
@@ -10203,86 +10202,45 @@ _REBIND_EXPANSION_ITEM_CHARS = 160
 _REBIND_EXPANSION_HEADING = "### Rebound PR contract expanded"
 
 
+# Keys that name an element of a recommendation list; they become part of
+# the element's path instead of a separate value.
+_RECOMMENDATION_ELEMENT_ID_KEYS = ("scope_item_id", "constraint_id", "stage_id")
+
+
 def _recommendation_commitments(recommendation: Mapping[str, object]) -> tuple[str, ...]:
-    """Flatten a recommendation's reviewed commitments into comparable labels."""
+    """Flatten every field of a recommendation into path-labelled values.
 
-    def strings(value: object) -> list[str]:
-        return [str(item) for item in value] if isinstance(value, list) else []
+    The whole reviewed recommendation is the execution contract, so no field
+    is singled out: scope, coupling, allocations, and every stage field
+    (summary, order, dependencies, notes, risk, disposition and its
+    rationale, ...) each become a label such as
+    ``child_stages[stage-one].summary: ...``.  Elements of object lists are
+    addressed by their ID, so an added or changed value is a new label.  The
+    strategy is reported on its own and is left out here.
+    """
+    labels: list[str] = []
 
-    def mappings(value: object) -> list[Mapping[str, object]]:
-        return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+    def walk(value: object, path: str) -> None:
+        if isinstance(value, Mapping):
+            for key in sorted(value):
+                if key in _RECOMMENDATION_ELEMENT_ID_KEYS or (not path and key == "strategy"):
+                    continue
+                walk(value[key], f"{path}.{key}" if path else str(key))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                if isinstance(item, Mapping):
+                    element = next(
+                        (str(item[key]) for key in _RECOMMENDATION_ELEMENT_ID_KEYS if key in item),
+                        str(index),
+                    )
+                    walk(item, f"{path}[{element}]")
+                else:
+                    walk(item, path)
+        else:
+            labels.append(f"`{path}`: {value}")
 
-    commitments: list[str] = []
-    for item in mappings(recommendation.get("scope_items")):
-        scope_id = str(item.get("scope_item_id", ""))
-        commitments.append(f"scope item `{scope_id}`: {item.get('requirement', '')}")
-        commitments.extend(
-            f"acceptance for scope item `{scope_id}`: {criterion}"
-            for criterion in strings(item.get("acceptance_criteria"))
-        )
-    for constraint in mappings(recommendation.get("coupling_constraints")):
-        scope_ids = ", ".join(f"`{item}`" for item in sorted(strings(constraint.get("scope_item_ids"))))
-        commitments.append(
-            f"coupling constraint `{constraint.get('constraint_id', '')}` couples {scope_ids}"
-        )
-    allocations = (
-        ("one-shot delivery", recommendation.get("one_shot_delivery")),
-        ("retained parent work", recommendation.get("retained_parent_work")),
-        ("final integration work", recommendation.get("final_integration_work")),
-    )
-    for label, allocation in allocations:
-        if not isinstance(allocation, Mapping):
-            continue
-        if isinstance(allocation.get("status"), str) and allocation["status"] != "none":
-            commitments.append(f"{label} status: {allocation['status']}")
-        commitments.extend(
-            f"{label} deliverable: {item}" for item in strings(allocation.get("deliverables"))
-        )
-        commitments.extend(
-            f"{label} acceptance: {item}"
-            for item in strings(allocation.get("acceptance_criteria"))
-        )
-        commitments.extend(
-            f"{label} covers scope item `{item}`"
-            for item in strings(allocation.get("covered_scope_item_ids"))
-        )
-    for stage in mappings(recommendation.get("child_stages")):
-        stage_id = str(stage.get("stage_id", ""))
-        commitments.append(f"stage `{stage_id}`: {stage.get('title', '')}")
-        commitments.extend(
-            f"stage `{stage_id}` deliverable: {item}"
-            for item in strings(stage.get("deliverables"))
-        )
-        commitments.extend(
-            f"stage `{stage_id}` acceptance: {item}"
-            for item in strings(stage.get("acceptance_criteria"))
-        )
-        # Execution fields: a changed value is a new label, so moving a stage
-        # to child planning or adding a dependency is reported as growth.
-        commitments.extend(
-            f"stage `{stage_id}` covers scope item `{item}`"
-            for item in strings(stage.get("covered_scope_item_ids"))
-        )
-        commitments.extend(
-            f"stage `{stage_id}` depends on stage `{item}`"
-            for item in strings(stage.get("depends_on_stage_ids"))
-        )
-        commitments.extend(
-            f"stage `{stage_id}` compatibility constraint: {item}"
-            for item in strings(stage.get("compatibility_constraints"))
-        )
-        if isinstance(stage.get("automation"), str):
-            commitments.append(f"stage `{stage_id}` automation: {stage['automation']}")
-        disposition = stage.get("execution_disposition")
-        if isinstance(disposition, Mapping):
-            commitments.append(
-                f"stage `{stage_id}` execution disposition: {disposition.get('disposition', '')}"
-            )
-            commitments.extend(
-                f"stage `{stage_id}` unresolved design decision: {item}"
-                for item in strings(disposition.get("unresolved_design_decisions"))
-            )
-    return tuple(commitments)
+    walk(recommendation, "")
+    return tuple(labels)
 
 
 def _plan_contract_shape(comments: Sequence[object], plan_hash: str) -> _PlanContractShape | None:
@@ -10350,7 +10308,7 @@ def _plan_contract_expansion(
     """Describe how the replacement plan materially expands the contract.
 
     Structural, not numeric on review findings: new plan steps, new matrix
-    rows, new execution-recommendation commitments, or a changed strategy.
+    rows, new or changed execution-recommendation values, or a changed strategy.
     Each entry is a summary line and the (unclipped) items it names.  An
     empty list means equivalent or narrower; reworded steps at the same
     count are not an expansion.  Detection compares full text; clipping is
@@ -10379,9 +10337,7 @@ def _plan_contract_expansion(
     if new_commitments:
         expansion.append(
             (
-                f"{len(new_commitments)} new execution-recommendation commitment(s) "
-                "(scope items, coupling constraints, acceptance criteria, deliverables, "
-                "coverage, or stage execution fields):",
+                f"{len(new_commitments)} new or changed execution-recommendation value(s):",
                 new_commitments,
             )
         )
