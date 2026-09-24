@@ -87,7 +87,7 @@ audit read them back. Older marker-only copies, which GitHub renders as
 
 ## Requirements
 
-- Python 3.11 or newer.
+- Python 3.12 or newer.
 - Git and [GitHub CLI](https://cli.github.com/) with `gh auth status` succeeding.
 - Repository access sufficient for the requested issue, branch, PR, and comment
   operations.
@@ -187,6 +187,9 @@ In skill mode, the test-gate policy is selected with
 ## Install
 
 Clone the repository and install it into a virtual environment:
+
+If `python3 --version` reports an interpreter older than 3.12, name a newer
+one explicitly in the `venv` step, for example `python3.12 -m venv .venv`.
 
 ```bash
 gh repo clone wwind123/coding-review-agent-loop
