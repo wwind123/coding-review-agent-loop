@@ -2867,3 +2867,18 @@ def test_large_claim_with_a_non_row_id_defect_still_hits_the_bound_927():
     mistyped = {**_claim_927("row-a"), "row_id": ["x" * 1_000] * 20}
     with pytest.raises(AgentLoopError, match="bound for a dropped value"):
         _parse_927([mistyped], row_ids=("row-a",))
+
+
+@pytest.mark.parametrize("duplicate", [False, True], ids=["unapproved", "duplicate"])
+def test_row_id_only_drop_still_bounds_a_truncated_fact_tail_927(duplicate):
+    """The discarded tail of an over-long fact list is the one unbounded part of a row-ID-only drop."""
+    row_id = "row-a" if duplicate else "row-b"
+    claim = _claim_927(row_id)
+    claim["test_identifiers"] = [f"tests/test_x.py::t{index}" for index in range(3_000)]
+    claims = [claim, _claim_927("row-a")] if duplicate else [claim]
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _parse_927(claims, row_ids=("row-a",))
+    # A short tail stays within the bound, so the drop keeps the envelope.
+    claim["test_identifiers"] = claim["test_identifiers"][:20]
+    parsed = _parse_927(claims, row_ids=("row-a",))
+    assert parsed.degradations and parsed.claims == ()

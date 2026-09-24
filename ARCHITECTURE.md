@@ -268,7 +268,9 @@ fatal and are checked before any degradation, so a degradable defect never
 masks them: keys that name orchestrator-owned verification authority
 (`status`, `evidence_citations`, `receipt_id`, `command`, `claim`), the row,
 ref, caveat and 16,384-byte caps, a dropped value whose compact JSON exceeds
-the same byte bound, catalog collisions, in-catalog selectors that are
+the same byte bound (for a claim dropped only by a row-ID rule, which already
+passed every per-field bound, only the discarded tail of an over-long fact list
+is measured), catalog collisions, in-catalog selectors that are
 non-passing or whose launch integrity is failing or unknown (real broker
 handles, so selecting one is an authority decision), and legacy canonical
 fields. The

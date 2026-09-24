@@ -4216,6 +4216,17 @@ def _parse_semantic_risk_coverage_claims(
             # (#920, #926).
             if not row_id_only_defect:
                 _check_dropped_value_bound(payload, context=claim_context)  # shape-check: fatal:payload-bound
+            else:
+                # The one part of such a claim no per-field bound covers is
+                # the discarded tail of an over-long fact list (#913), so the
+                # tails are bounded together before the record is built.
+                _check_dropped_value_bound(  # shape-check: fatal:payload-bound
+                    {
+                        field: payload[field][RISK_MATRIX_MAX_LIST_ITEMS:]
+                        for field, _message in truncated_facts
+                    },
+                    context=claim_context,
+                )
             drop_record = ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
                 element_path=element_path,
                 rule=rule,
