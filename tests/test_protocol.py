@@ -5859,3 +5859,243 @@ def test_citation_drop_is_monotone_in_surviving_citations_and_receipt_support_92
 
     assert receipts(degraded) == receipts(removed)
     assert "verified against the parent journal" in receipts(degraded)
+
+
+# ---------------------------------------------------------------------------
+# #1016: one reserved row-ID namespace rule for validation and neutralization.
+# ---------------------------------------------------------------------------
+
+import itertools  # noqa: E402
+
+from coding_review_agent_loop import protocol as protocol_1016  # noqa: E402
+
+
+def _valid_row_id_1016(value: str) -> bool:
+    return protocol_1016._is_valid_risk_row_id(value)
+
+
+def _neutralize_1016(value: str) -> str:
+    return protocol_1016._neutralize_identifier_like(value)
+
+
+def _reserved_output_spans_1016(text: str) -> list[str]:
+    return [
+        span for span in protocol_1016._IDENTIFIER_LIKE_SPAN_RE.findall(text)
+        if protocol_1016._has_reserved_namespace(span)
+    ]
+
+
+@pytest.mark.parametrize(
+    "row_id",
+    [
+        "finding-3", "Finding-3", "FINDING-3", "fInDiNg3",
+        "hr-2", "HR-2", "Hr-2", "hR-x", "HR-", "HR-0abc", "hr-hr-2",
+        "item-1", "Item-1", "ITEM1", "Item9",
+        "blocker-2", "Blocker-2", "BLOCKER_2",
+        "review-7", "Review-7", "REVIEW.7",
+        "x-Finding-7", "x_ITEM.4", "x.Review9", "row-blocker_12",
+        "item-item-3", "finding-3-review-4",
+    ],
+)
+def test_reserved_row_id_namespaces_are_refused_in_every_case_1016(row_id):
+    """Row namespace-boundaries: capitalization no longer bypasses the refusal."""
+    assert not _valid_row_id_1016(row_id)
+    with pytest.raises(AgentLoopError, match="may not resemble a reviewer finding ID"):
+        protocol_1016._validate_risk_row_id(row_id, context="matrix.rows[0].row_id")
+    assert _neutralize_1016(row_id) != row_id
+
+
+@pytest.mark.parametrize(
+    "row_id",
+    [
+        "subitem-3", "planreview-2", "lineitem-9", "chr-1", "thr-ee",
+        "SubItem-3", "PlanReview-2", "CHR-1",
+        "x-hr-2", "a.HR-2", "row_hr-7",
+        "row-first", "Row-First", "Items", "item-x", "Item-X", "findings",
+        "Findings-3", "reviewer-3", "Blockers_2", "HRX", "hr", "Finding",
+        "x" * 128,
+    ],
+)
+def test_legal_row_ids_pass_and_are_not_neutralized_1016(row_id):
+    """Row namespace-boundaries: embedded substrings and unrelated mixed case stay legal."""
+    assert _valid_row_id_1016(row_id)
+    assert protocol_1016._validate_risk_row_id(row_id, context="matrix.rows[0].row_id") == row_id
+    assert _neutralize_1016(row_id) == row_id
+
+
+@pytest.mark.parametrize("row_id", ["-row", "bad row id", "row/1", "ïtem-3", "x" * 129, ""])
+def test_row_id_syntax_and_byte_bound_are_unchanged_1016(row_id):
+    with pytest.raises(AgentLoopError):
+        protocol_1016._validate_risk_row_id(row_id, context="matrix.rows[0].row_id")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Finding-3", "Finding·3"),
+        ("FINDING-3", "FINDING·3"),
+        ("finding3", "finding·3"),
+        ("HR-2", "HR·2"),
+        ("HR-", "HR·"),
+        ("Item9", "Item·9"),
+        ("Blocker_5", "Blocker·5"),
+        ("Review.2", "Review·2"),
+        ("x-Finding-7", "x-Finding·7"),
+        ("HR-0abc", "HR·0abc"),
+        ("hr-hr-2", "hr·hr·2"),
+        ("HR-Hr-3", "HR·Hr·3"),
+        ("x hr-hr-2", "x hr·hr·2"),
+        ("x HR-Hr-3", "x HR·Hr·3"),
+        ("hr--item-3", "hr·-item·3"),
+        ("item-item-3", "item-item·3"),
+        ("finding-3-review-4", "finding·3-review·4"),
+        ("note Finding-3", "note Finding·3"),
+        ("keys Finding-3, item-2", "keys Finding·3, item·2"),
+        ("(HR-2)", "(HR·2)"),
+        ("`item-4`", "`item·4`"),
+        ("a\nReview-1\nb", "a\nReview·1\nb"),
+        ("ids subitem-3, chr-1", "ids subitem-3, chr-1"),
+        ("planreview-2 lineitem-9 thr-ee", "planreview-2 lineitem-9 thr-ee"),
+        ("x-hr-2 and hr-2", "x-hr-2 and hr·2"),
+        ("caféhr-2", "caféhr·2"),
+    ],
+)
+def test_neutralizer_hand_written_expectations_1016(text, expected):
+    """Row preview-span-scanning: independently written expected outputs."""
+    neutralized = _neutralize_1016(text)
+    assert neutralized == expected
+    assert _reserved_output_spans_1016(neutralized) == []
+    assert _neutralize_1016(neutralized) == neutralized
+
+
+def _case_variants_1016(token: str) -> list[str]:
+    alternating = "".join(ch.upper() if i % 2 else ch for i, ch in enumerate(token))
+    return sorted({token, token.upper(), token.capitalize(), alternating})
+
+
+def _row_id_corpus_1016() -> list[tuple[str, bool]]:
+    """Candidate IDs whose expected verdict follows the rule's prose, not its code."""
+    corpus: list[tuple[str, bool]] = []
+    boundary_prefixes = ("", "x-", "x_", "x.", "row-a-")
+    embedded_prefixes = ("sub", "x", "plan", "7")
+    for token in ("item", "finding", "review", "blocker"):
+        for variant in _case_variants_1016(token):
+            for prefix, separator, suffix in itertools.product(
+                boundary_prefixes + embedded_prefixes, ("", "-", "_", "."), ("3", "42x", "x", "")
+            ):
+                reserved = prefix in boundary_prefixes and suffix[:1].isdigit()
+                corpus.append((f"{prefix}{variant}{separator}{suffix}", not reserved))
+    for variant in ("hr", "HR", "Hr", "hR"):
+        for prefix, suffix in itertools.product(("", "c", "x-", "t", "a."), ("2", "ee", "", "-1")):
+            # The requirement prefix is reserved only at the start of the ID.
+            corpus.append((f"{prefix}{variant}-{suffix}", prefix != ""))
+    return corpus
+
+
+def test_generated_row_id_corpus_validation_and_neutralization_agree_1016():
+    """Row neutralization-parity: neutralize(x) != x implies not valid(x), both directions."""
+    corpus = _row_id_corpus_1016()
+    assert len(corpus) > 500
+    for row_id, expected_valid in corpus:
+        valid = _valid_row_id_1016(row_id)
+        neutralized = _neutralize_1016(row_id)
+        assert valid == expected_valid, row_id
+        if neutralized != row_id:
+            assert not valid, row_id
+        if valid:
+            assert neutralized == row_id, row_id
+        else:
+            assert "·" in neutralized, row_id
+        assert _reserved_output_spans_1016(neutralized) == [], row_id
+        assert _neutralize_1016(neutralized) == neutralized, row_id
+
+
+def test_generated_free_text_previews_neutralize_every_reserved_span_1016():
+    """Row preview-span-scanning: prose wrappers, delimiters and legal IDs survive."""
+    wrappers = (
+        "note {}", "{}, row-first", "({})", "`{}`", "a\n{}\nb", "keys {}, subitem-3",
+        "{} chr-1", "ids lineitem-9,{}", "[{}]: thr-ee",
+    )
+    legal_neighbours = ("row-first", "subitem-3", "chr-1", "lineitem-9", "thr-ee")
+    for row_id, expected_valid in _row_id_corpus_1016():
+        for wrapper in wrappers:
+            text = wrapper.format(row_id)
+            neutralized = _neutralize_1016(text)
+            assert _reserved_output_spans_1016(neutralized) == [], text
+            assert _neutralize_1016(neutralized) == neutralized, text
+            for neighbour in legal_neighbours:
+                if neighbour in wrapper:
+                    assert neighbour in neutralized, text
+            if expected_valid:
+                assert neutralized == text, text
+            else:
+                assert neutralized != text, text
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    ("row_id", "preview"),
+    [
+        ("Finding-3", "Finding·3"),
+        ("HR-2", "HR·2"),
+        ("Item9", "Item·9"),
+        ("BLOCKER_2", "BLOCKER·2"),
+        ("bad Finding-3", "bad Finding·3"),
+        ("x HR-Hr-3", "x HR·Hr·3"),
+    ],
+)
+def test_reserved_case_variant_claim_degrades_as_malformed_in_both_envelopes_1016(kind, row_id, preview):
+    """Row claim-degradation: the reserved claim drops locally; the sibling survives."""
+    claim = {**_complete_semantic_claim(), "row_id": row_id}
+    other = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(kind, [claim, other], row_ids=("row-1", "row-2"))
+
+    claims = parsed.risk_test_matrix_claims
+    assert [item.row_id for item in claims.claims] == ["row-2"]
+    [record] = claims.degradations
+    assert record.element_path == f"{kind}.risk_test_matrix_claims[0].row_id"
+    assert record.rule == protocol_1016.CLAIM_ROW_ID_MALFORMED_RULE
+    assert record.observed_preview == preview
+    assert claims.dropped_row_ids == ()
+    assert claims.unapproved_claim_row_ids == ()
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize("row_id", ["subitem-3", "planreview-2", "lineitem-9", "chr-1", "thr-ee"])
+def test_valid_embedded_unapproved_row_id_keeps_exact_preview_1016(kind, row_id):
+    claim = {**_complete_semantic_claim(), "row_id": row_id}
+    other = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(kind, [claim, other], row_ids=("row-1", "row-2"))
+
+    claims = parsed.risk_test_matrix_claims
+    assert [item.row_id for item in claims.claims] == ["row-2"]
+    [record] = claims.degradations
+    assert record.rule == "row_id is outside the approved enforceable set"
+    assert record.observed_preview == row_id
+    assert claims.dropped_row_ids == (row_id,)
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_unknown_key_preview_neutralizes_reserved_keys_only_1016(kind):
+    claim = {**_complete_semantic_claim(), "Finding-3": "x", "subitem-3": "y"}
+    other = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(kind, [claim, other], row_ids=("row-1", "row-2"))
+
+    [record] = parsed.risk_test_matrix_claims.degradations
+    assert record.rule == protocol_1016.CLAIM_UNKNOWN_KEYS_RULE
+    assert record.observed_preview == "Finding·3, subitem-3"
+
+
+def test_citation_key_and_claim_previews_neutralize_reserved_tokens_only_1016():
+    observed = protocol_1016._citation_defect_observed(
+        {"HR-2": 1, "chr-1": 2, "item-4": 3}, protocol_1016.CITATION_KEYS_RULE
+    )
+    assert observed == "keys HR·2, chr-1, item·4"
+    observed_claim = protocol_1016._citation_defect_observed(
+        {"command": "c", "receipt_id": "r", "claim": "see Review-7 and planreview-2"},
+        protocol_1016.CITATION_CLAIM_RULE,
+    )
+    assert observed_claim == "see Review·7 and planreview-2"

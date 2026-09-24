@@ -2489,7 +2489,10 @@ def test_correction_keeps_distinct_drops_at_the_same_index_926() -> None:
 
 @pytest.mark.parametrize(
     "bad_row_id",
-    ["finding-3", "hr-2", "item-1", "blocker_5", "review.2", "HR-0abc", "x-finding-7", "Item9"],
+    [
+        "finding-3", "hr-2", "item-1", "blocker_5", "review.2", "HR-0abc", "x-finding-7", "Item9",
+        "Finding-3", "BLOCKER-2", "hr-hr-2", "x HR-Hr-3",
+    ],
 )
 def test_malformed_identifier_like_row_id_is_neutralized_in_public_output_926(bad_row_id) -> None:
     """A malformed row ID cannot surface as an intact finding- or requirement-style token."""
@@ -2505,12 +2508,11 @@ def test_malformed_identifier_like_row_id_is_neutralized_in_public_output_926(ba
     [record] = parsed.risk_test_matrix_claims.degradations
     assert not reserved.search(record.observed_preview)
     assert "·" in record.observed_preview
-    # Case-variant IDs such as ``Item9`` are valid but unapproved, so they
-    # take the unapproved-row path; both paths must neutralize the preview.
-    [dropped] = [
-        item for item in result.diagnostics
-        if item.code in {"degraded-row-claim", "unapproved-row-claim"}
-    ]
+    # Case variants such as ``Item9`` are reserved too (#1016), so every one
+    # takes the malformed-row path rather than the unapproved-row path.
+    assert record.rule == "row_id is not a valid matrix-specific identifier"
+    assert not [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    [dropped] = [item for item in result.diagnostics if item.code == "degraded-row-claim"]
     assert not reserved.search(dropped.message)
 
     metadata = PostedRoundMetadata(
@@ -2528,6 +2530,57 @@ def test_malformed_identifier_like_row_id_is_neutralized_in_public_output_926(ba
     [line] = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
     assert "·" in line
     assert not reserved.search(rendered)
+
+
+@pytest.mark.parametrize("row_id", ["Finding-3", "FINDING-3", "HR-2", "Item-1", "Blocker-2", "Review-7"])
+def test_strict_matrix_parsing_refuses_reserved_case_variants_1016(row_id) -> None:
+    """Row namespace-boundaries: capitalization no longer bypasses strict matrix parsing."""
+    with pytest.raises(AgentLoopError, match="may not resemble a reviewer finding ID"):
+        parse_risk_test_matrix({**_matrix(), "rows": [_row(row_id)]})
+
+
+@pytest.mark.parametrize("row_id", ["subitem-3", "planreview-2", "lineitem-9", "chr-1", "thr-ee", "Row-Mixed"])
+def test_strict_matrix_parsing_keeps_embedded_substring_ids_1016(row_id) -> None:
+    matrix = parse_risk_test_matrix({**_matrix(), "rows": [_row(row_id)]})
+    assert [row.row_id for row in matrix.rows] == [row_id]
+
+
+@pytest.mark.parametrize("row_id", ["subitem-3", "planreview-2", "lineitem-9", "chr-1", "thr-ee"])
+def test_unapproved_embedded_substring_row_id_keeps_exact_attribution_1016(row_id) -> None:
+    """Row diagnostic-attribution: the dropped-claim line names the real row ID."""
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    parsed, result = _parse_and_derive_926(
+        [_claim_926("row-first"), _claim_926(row_id, "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    [record] = parsed.risk_test_matrix_claims.degradations
+    assert record.rule == "row_id is outside the approved enforceable set"
+    assert record.observed_preview == row_id
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+    assert _statuses(result) == {"row-first": "verified", "row-second": "missing"}
+    [dropped] = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert dropped.row_id == row_id
+    assert f"`{row_id}`" in dropped.message
+    assert "·" not in dropped.message
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    [restored] = [item for item in decoded.risk_test_matrix_diagnostics if item["code"] == "unapproved-row-claim"]
+    assert (restored["row_id"], restored["message"]) == (row_id, dropped.message)
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    [line] = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert row_id in line
+    assert "·" not in line
 
 
 # ---------------------------------------------------------------------------
