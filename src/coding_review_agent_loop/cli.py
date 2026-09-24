@@ -80,6 +80,7 @@ from .test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     TestRuntimeConfigurationError,
     inherited_timeout_ceiling,
+    launch_integrity_state,
     record_launcher_health,
     record_test_observation,
     resolve_timeout_seconds,
@@ -1374,6 +1375,7 @@ def _record_run_tests_result(
     executed_argv: Sequence[str] | None,
     worker_enforcement: str | None,
     caveats: Sequence[str],
+    launch_integrity: str,
 ) -> None:
     record_test_observation(
         args.memory_dir,
@@ -1390,6 +1392,7 @@ def _record_run_tests_result(
         executed_argv=executed_argv,
         worker_enforcement=worker_enforcement,
         caveats=caveats,
+        launch_integrity=launch_integrity,
     )
 
 
@@ -1501,6 +1504,9 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                         executed_argv=broker_result.executed_argv or None,
                         worker_enforcement=broker_result.worker_enforcement,
                         caveats=broker_result.worker_caveats,
+                        # A launch the evidence gate refuses stays non-evidence
+                        # here too, so it is never recommended back (#989).
+                        launch_integrity=launch_integrity_state(broker_result),
                     )
                 return int(broker_result.returncode if broker_result.returncode is not None else 1)
         else:
@@ -1579,6 +1585,7 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                 executed_argv=result.args,
                 worker_enforcement=result.worker_enforcement,
                 caveats=result.worker_caveats,
+                launch_integrity=launch_integrity_state(result),
             )
         return int(result.returncode if result.returncode is not None else 1)
     except (AgentLoopError, OSError, ValueError) as exc:

@@ -65,6 +65,7 @@ from .test_runtime import (
     relevant_launcher_health,
     render_runtime_context,
     render_test_wrapper,
+    runtime_row_is_evidence,
 )
 
 if TYPE_CHECKING:
@@ -246,6 +247,11 @@ def _memory_block(
             try:
                 command = tuple(shlex.split(normalized))
             except ValueError:
+                continue
+            if not runtime_row_is_evidence(observation):
+                # Runs refused as evidence (e.g. an unauthenticated wrapper
+                # script) and legacy rows without launch state are never
+                # surfaced as remembered commands (#989).
                 continue
             if command and command not in seen:
                 commands.append(command)

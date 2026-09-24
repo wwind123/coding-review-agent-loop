@@ -1386,6 +1386,39 @@ def _unlock_file(handle) -> None:
         handle.close()
 
 
+LAUNCH_INTEGRITY_STATES = frozenset({"verified", "unverified"})
+
+
+def launch_integrity_state(result: object, *, wrapper_boundary: bool = True) -> str:
+    """Classify a runner/broker result's launch boundary for runtime history.
+
+    Mirrors the evidence gate: only a verified wrapper bootstrap, a started
+    inner exec and a verified suite start are authoritative.  Anything else
+    (for example an unrecognized shell-script wrapper whose suite start is
+    ``unknown``) is refused as evidence and must not become a recommendation.
+
+    ``wrapper_boundary=False`` is for the parent-owned configured test gate,
+    which has no ``run-tests`` wrapper to bootstrap; its suite start must
+    still be verified.
+    """
+    authoritative = (
+        (not wrapper_boundary or getattr(result, "wrapper_bootstrap", "unknown") == "verified")
+        and getattr(result, "inner_exec", "not-attempted") == "started"
+        and getattr(result, "suite_start", "not-started") == "verified"
+    )
+    return "verified" if authoritative else "unverified"
+
+
+def runtime_row_is_evidence(row: Mapping[str, object]) -> bool:
+    """Whether a remembered row carries an authenticated launch.
+
+    Fail closed: rows written before ``launch_integrity`` existed carry no
+    launch state, and their argv alone cannot prove the suite start was
+    verified, so they are non-evidence just like an ``unverified`` row.
+    """
+    return row.get("launch_integrity") == "verified"
+
+
 def record_test_observation(
     memory_dir: Path | None,
     *,
@@ -1405,12 +1438,18 @@ def record_test_observation(
     executed_argv: Sequence[str] | None = None,
     worker_enforcement: str | None = None,
     caveats: Sequence[str] = (),
+    launch_integrity: str | None = None,
 ) -> bool:
     """Append a bounded observation; persistence failure never affects execution.
 
     ``workers`` is the cohort label (``serial``, a count or ``unknown``).  When
     omitted it is derived from ``argv`` with the proven-serial rule, so an
     unconfirmed run never gains a numeric cohort.
+
+    ``launch_integrity`` (``verified`` or ``unverified``) records whether the
+    wrapper, inner exec and suite start were all authenticated.  An
+    ``unverified`` row is kept only as non-evidence: it never feeds a timeout
+    recommendation and is never surfaced to coders as a remembered command.
     """
     if memory_dir is None:
         return False
@@ -1448,6 +1487,11 @@ def record_test_observation(
                 observation["worker_enforcement"] = worker_enforcement
             if caveats:
                 observation["caveats"] = [str(item) for item in caveats]
+            if launch_integrity is not None:
+                # Fail closed: an unrecognized state is never evidence.
+                observation["launch_integrity"] = (
+                    launch_integrity if launch_integrity in LAUNCH_INTEGRITY_STATES else "unverified"
+                )
             if containment is not None:
                 # Evidence is already bounded by the runner.  Keep only JSON
                 # values and expose unsupported telemetry explicitly.
@@ -2590,6 +2634,10 @@ def recommend_timeout(
         if stamp is None or stamp < cutoff:
             continue
         if row.get("input_manifest") != current_manifest:
+            continue
+        if not runtime_row_is_evidence(row):
+            # A run refused as evidence (or a legacy row with no launch
+            # state) is not trustworthy timing either (#989).
             continue
         matching.append(row)
     timestamped: list[tuple[datetime, int, dict]] = []
