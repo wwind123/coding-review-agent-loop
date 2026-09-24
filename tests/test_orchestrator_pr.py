@@ -13562,9 +13562,7 @@ def test_m1034_followup_dispatch_head_round_trips_and_legacy_records_stay_byte_s
     assert followup_head_unchanged_sha(decoded) == "abc123"
     # An advanced head never yields the signal.
     assert followup_head_unchanged_sha(dataclasses.replace(recorded, subject="def456")) is None
-    assert followup_head_unchanged_sha(
-        dataclasses.replace(recorded, subject="unknown", followup_dispatch_head="unknown")
-    ) is None
+    assert followup_head_unchanged_sha(dataclasses.replace(recorded, subject="unknown")) is None
     assert followup_head_unchanged_sha(dataclasses.replace(recorded, role="reviewer")) is None
     assert followup_head_unchanged_sha(None) is None
 
@@ -13591,12 +13589,22 @@ def test_m1034_malformed_followup_dispatch_head_is_rejected():
             flow="pr", role="coder", agent="Claude", round_number=2,
             subject="abc123", followup_dispatch_head="not a sha!",
         )
+    # Placeholders and non-hex names are not Git commit SHAs.
+    for bad in ("unknown", "new-sha", "arbitrary.word"):
+        with pytest.raises(ValueError, match="followup_dispatch_head"):
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="Claude", round_number=2,
+                subject=bad, followup_dispatch_head=bad,
+            )
     valid = dict(decode_mapping(_encode_round_metadata(PostedRoundMetadata(
         flow="pr", role="coder", agent="Claude", round_number=2,
         subject="abc123", followup_dispatch_head="abc123",
     ))))
     assert _decode_round_metadata_mapping(valid).followup_dispatch_head == "abc123"
-    for bad in ("", 7, "x" * 200, "bad sha", None):
+    for bad in (
+        "", 7, "x" * 200, "bad sha", None, "unknown", "new-sha", "arbitrary.word",
+        "ABC123", "abc", "a" * 65,
+    ):
         with pytest.raises(AgentLoopError, match="followup_dispatch_head"):
             _decode_round_metadata_mapping({**valid, "followup_dispatch_head": bad})
 
@@ -13665,7 +13673,7 @@ def test_m1034_reviewer_context_flags_unchanged_head_and_keeps_other_bytes():
     legacy = PostedRoundMetadata(
         flow="pr", role="coder", agent="Claude", round_number=2, subject="abc123",
     )
-    advanced = dataclasses.replace(legacy, followup_dispatch_head="old000")
+    advanced = dataclasses.replace(legacy, followup_dispatch_head="0dd000")
     unchanged = dataclasses.replace(legacy, followup_dispatch_head="abc123")
 
     legacy_text = orchestrator._coder_followup_review_context(raw, legacy, head_sha="abc123")
@@ -13811,7 +13819,7 @@ def test_m1034_unchanged_head_limit_still_stops_without_push_log(tmp_path, capsy
         assert "### Claimed already present at `abc123` (PR head unchanged)" in comment
 
 
-def _m1034_recovery_runner():
+def _m1034_recovery_runner(head_sha="c0ffee42"):
     old_item = UnresolvedReviewItem(
         item_id="item-2",
         reviewer="Google Gemini",
@@ -13849,7 +13857,7 @@ def _m1034_recovery_runner():
             )
         ],
         pr_payload={
-            "headRefOid": "new-sha",
+            "headRefOid": head_sha,
             "comments": [
                 {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": old_coder_comment},
                 {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:01:00Z", "body": old_review_comment},
@@ -13866,7 +13874,7 @@ def test_m1034_recovery_round_without_commit_records_claims(tmp_path, capsys):
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
-    assert "Recovery context: the PR head `new-sha` was advanced by a commit" in coder_prompt
+    assert "Recovery context: the PR head `c0ffee42` was advanced by a commit" in coder_prompt
     assert "may or may not satisfy the recovered items" in coder_prompt
     assert "Check each recovered item against the current head." in coder_prompt
     assert "keep any unsatisfied item in remaining_items" in coder_prompt
@@ -13876,16 +13884,34 @@ def test_m1034_recovery_round_without_commit_records_claims(tmp_path, capsys):
         runner.commands, ["codex", "exec"]
     )
     err = capsys.readouterr().err
-    assert "Claude follow-up left PR head new-sha unchanged (1/2)" in err
+    assert "Claude follow-up left PR head c0ffee42 unchanged (1/2)" in err
     assert "pushed updates" not in err
     (coder_comment,) = _m1034_coder_comments(runner)
-    assert "> Orchestrator note: the PR head was unchanged at `new-sha`" in coder_comment
-    assert "### Claimed already present at `new-sha` (PR head unchanged)" in coder_comment
+    assert "> Orchestrator note: the PR head was unchanged at `c0ffee42`" in coder_comment
+    assert "### Claimed already present at `c0ffee42` (PR head unchanged)" in coder_comment
     metadata = _m1034_metadata(coder_comment)
-    assert metadata.followup_dispatch_head == metadata.subject == "new-sha"
+    assert metadata.followup_dispatch_head == metadata.subject == "c0ffee42"
     reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
     assert '"pr_head_unchanged_during_followup": true' in reviewer_prompt
     assert _M1034_VERIFY_INSTRUCTION in reviewer_prompt
+
+
+@pytest.mark.parametrize("head_sha", ["new-sha", "arbitrary.word"])
+def test_m1034_non_sha_head_is_not_persisted_or_claimed_unchanged(tmp_path, head_sha):
+    runner = _m1034_recovery_runner(head_sha=head_sha)
+    config = make_config(tmp_path, reviewer="codex")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    (coder_comment,) = _m1034_coder_comments(runner)
+    assert "Orchestrator note" not in coder_comment
+    assert "Claimed already present" not in coder_comment
+    assert "### Addressed items" in coder_comment
+    metadata = _m1034_metadata(coder_comment)
+    assert metadata.followup_dispatch_head is None
+    reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
+    assert "pr_head_unchanged_during_followup" not in reviewer_prompt
+    assert _M1034_VERIFY_INSTRUCTION not in reviewer_prompt
 
 
 def test_m1034_non_recovery_follow_up_prompt_has_no_recovery_context(tmp_path):

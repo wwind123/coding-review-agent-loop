@@ -291,7 +291,7 @@ class PostedRoundMetadata:
         if self.followup_dispatch_head is not None and not _is_followup_dispatch_head(
             self.followup_dispatch_head
         ):
-            raise ValueError("invalid follow-up dispatch head")
+            raise ValueError("invalid followup_dispatch_head: expected a hex Git commit SHA")
         if self.scheduler_force_full_source is not None and (
             self.scheduler_force_full_source not in FORCE_FULL_SOURCES
             or self.scheduler_force_full is not True
@@ -2055,7 +2055,9 @@ def _decode_parse_degradations(value: object) -> tuple[ParseDegradation, ...]:
     return tuple(records)
 
 
-_FOLLOWUP_DISPATCH_HEAD_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]{0,127}")
+# A Git commit SHA (SHA-1 or SHA-256, abbreviated or full) in lowercase hex;
+# placeholders such as ``unknown`` never qualify as a dispatch head (#1034).
+_FOLLOWUP_DISPATCH_HEAD_RE = re.compile(r"[0-9a-f]{4,64}")
 
 
 def _is_followup_dispatch_head(value: object) -> bool:
@@ -2069,7 +2071,7 @@ def _decode_followup_dispatch_head(payload: Mapping[str, object]) -> str | None:
         return None
     value = payload["followup_dispatch_head"]
     if not _is_followup_dispatch_head(value):
-        raise ValueError("followup_dispatch_head must be a bounded SHA string")
+        raise ValueError("followup_dispatch_head must be a hex Git commit SHA")
     return str(value)
 
 
