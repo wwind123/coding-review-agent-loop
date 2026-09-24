@@ -2352,3 +2352,43 @@ def test_degraded_row_claim_is_rendered_as_a_dropped_claim_926() -> None:
     assert len(dropped) == 1
     assert "coder_followup.risk_test_matrix_claims[1].row_id" in dropped[0]
     assert "not a valid matrix-specific identifier" in dropped[0]
+
+
+def test_repeated_unapproved_row_claims_each_keep_a_durable_diagnostic_926() -> None:
+    """Every dropped unapproved claim reaches round metadata and the render."""
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    parsed, result = _parse_and_derive_926(
+        [
+            _claim_926("row-sibling"),
+            _claim_926("row-first"),
+            _claim_926("row-sibling", "turn:observation-2"),
+        ],
+        row_ids=("row-first", "row-second"),
+    )
+
+    assert parsed.risk_test_matrix_claims.dropped_row_ids == ("row-sibling",)
+    dropped = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert [item.row_id for item in dropped] == ["row-sibling", "row-sibling"]
+    assert "coder_followup.risk_test_matrix_claims[0].row_id" in dropped[0].message
+    assert "coder_followup.risk_test_matrix_claims[2].row_id" in dropped[1].message
+    assert all("outside the approved enforceable set" in item.message for item in dropped)
+    assert all("claim-dropped" in item.message for item in dropped)
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    restored = [item for item in decoded.risk_test_matrix_diagnostics if item["code"] == "unapproved-row-claim"]
+    assert [item["message"] for item in restored] == [item.message for item in dropped]
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    lines = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert len(lines) == 2
+    assert "risk_test_matrix_claims[0].row_id" in lines[0]
+    assert "risk_test_matrix_claims[2].row_id" in lines[1]

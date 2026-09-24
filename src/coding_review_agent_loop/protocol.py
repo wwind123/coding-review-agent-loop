@@ -2012,6 +2012,7 @@ def _unapproved_row_claim_message(
     *,
     row_owner: str | None,
     execution_owner: str | None,
+    record: ParseDegradation | None = None,
 ) -> str:
     """Name the dropped row, the scope it violated, and its real owner."""
     scope = (
@@ -2027,6 +2028,12 @@ def _unapproved_row_claim_message(
         f"A semantic coverage claim for row `{_dropped_ref_preview(row_id)}` was dropped "
         f"because the row is not in the approved enforceable matrix set for {scope}. "
         f"{origin} The claim asserted no coverage."
+        + (
+            f" Claim `{_dropped_ref_preview(record.element_path)}`: "
+            f"{_dropped_ref_preview(record.rule)} (outcome `{_dropped_ref_preview(record.outcome)}`)."
+            if record is not None
+            else ""
+        )
     )
 
 
@@ -2139,9 +2146,38 @@ def derive_risk_test_matrix_evidence(
     ]
     if isinstance(claims, SemanticRiskCoverageClaims):
         owner_by_row = {row.row_id: row.execution_owner for row in parsed_matrix.rows}
+        # The recorded preview is bounded, so recover each unapproved record's
+        # full row ID from ``dropped_row_ids`` by preview.
+        dropped_by_preview: dict[str, str] = {}
         for dropped_row_id in claims.dropped_row_ids:
-            # Dropped before authentication (#920): the claim asserted nothing
-            # for this turn, but the operator should see that it was discarded.
+            dropped_by_preview.setdefault(
+                _bounded_single_line(dropped_row_id, PARSE_DEGRADATION_PREVIEW_CHARS),
+                dropped_row_id,
+            )
+        covered_dropped: set[str] = set()
+        for record in claims.degradations:
+            if record.rule != CLAIM_ROW_ID_UNAPPROVED_RULE:
+                continue
+            # One diagnostic per dropped claim (#926), so a row ID claimed
+            # twice outside the approved set is reported twice, each with its
+            # position; the historical code and row-ID keying are kept (#920).
+            dropped_row_id = dropped_by_preview.get(record.observed_preview, record.observed_preview)
+            covered_dropped.add(dropped_row_id)
+            diagnostics.append(PostAuthClaimDiagnostic(
+                dropped_row_id,
+                UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+                _unapproved_row_claim_message(
+                    dropped_row_id,
+                    row_owner=owner_by_row.get(dropped_row_id),
+                    execution_owner=execution_owner,
+                    record=record,
+                ),
+            ))
+        for dropped_row_id in claims.dropped_row_ids:
+            if dropped_row_id in covered_dropped:
+                continue
+            # A carrier built without parser records (historical callers)
+            # still reports each dropped ID once (#920).
             diagnostics.append(PostAuthClaimDiagnostic(
                 dropped_row_id,
                 UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,

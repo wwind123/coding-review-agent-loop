@@ -249,8 +249,9 @@ requirement-like forms), or claimed more than once is dropped -- every copy of
 a duplicate, so no arbitrary copy becomes coverage -- with one bounded,
 parser-derived degradation record on the claims carrier. A supplied approved
 set is authoritative even when empty; only an omitted set is unscoped.
-Derivation keeps the historical `unapproved-row-claim` diagnostic for an
-unapproved ID and turns every other record into a `degraded-row-claim`
+Derivation emits one diagnostic per dropped claim: the historical
+`unapproved-row-claim` code for an unapproved ID, naming the claim's position,
+and for every other record a `degraded-row-claim`
 diagnostic keyed by the claim's element path, never by agent text; it emits no
 canonical row for a dropped claim, and the affected approved row reads
 `missing`. The one
