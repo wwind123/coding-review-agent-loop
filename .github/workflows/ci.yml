@@ -70,7 +70,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -e '.[dev]'
-      - run: python -m pytest
+      - run: python -m pytest -n auto
 
   validate-managed:
     # All-empty manual dispatch is ordinary CI.  Every partial or non-empty
@@ -496,7 +496,7 @@ jobs:
           EXPECTED_HEAD_SHA: ${{ needs.validate-managed.outputs.target_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
       - run: python -m pip install -e '.[dev]'
-      - run: python -m pytest
+      - run: python -m pytest -n auto
 
   publish-exact-head:
     needs: [validate-managed, exact-head]
