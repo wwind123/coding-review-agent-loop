@@ -5228,23 +5228,39 @@ def test_publish_manual_non_404_delete_failure_reports_manual_removal(tmp_path, 
 class EntryNormalizationRunner(FakeRunner):
     """Serve the live PR for entry normalization from a mutable payload."""
 
-    def __init__(self, live_pr, *, delete_returncode=0, readback_labels=None, **kwargs):
+    def __init__(
+        self, live_pr, *, delete_returncode=0, readback_labels=None, delete_stderr=None,
+        raise_on=None, clear_on_failed_delete=False, **kwargs,
+    ):
         super().__init__(**kwargs)
+        self.clear_on_failed_delete = clear_on_failed_delete
         self.live_pr = live_pr
         self.delete_returncode = delete_returncode
         self.readback_labels = readback_labels
+        self.delete_stderr = delete_stderr or "gh: Server Error (HTTP 500)"
+        # ``raise_on`` is "delete" or "readback": that runner call raises, as a
+        # transport or subprocess failure would.
+        self.raise_on = raise_on
+        self.pr_reads = 0
 
     def _run_locked(self, args, *, cwd, check, input_text=None):
         cmd = [str(arg) for arg in args]
         if cmd == ["gh", "api", "repos/OWNER/REPO/pulls/7"]:
             cmd, cwd_path = self._record_command(args, cwd)
+            self.pr_reads += 1
+            if self.raise_on == "readback" and self.pr_reads == 2:
+                raise OSError("transport exploded during read-back")
             if isinstance(self.live_pr, str):
                 return CommandResult(cmd, cwd_path, self.live_pr, "", 0)
             return CommandResult(cmd, cwd_path, json.dumps(self.live_pr), "", 0)
         if cmd[:5] == MANAGED_LABEL_DELETE:
             cmd, cwd_path = self._record_command(args, cwd)
+            if self.raise_on == "delete":
+                raise OSError("transport exploded during DELETE")
             if self.delete_returncode:
-                return CommandResult(cmd, cwd_path, "", "gh: Server Error (HTTP 500)", 1)
+                if self.clear_on_failed_delete:
+                    self.live_pr["labels"] = []
+                return CommandResult(cmd, cwd_path, "", self.delete_stderr, 1)
             self.live_pr["labels"] = (
                 self.readback_labels if self.readback_labels is not None else [
                     item for item in self.live_pr["labels"] if item.get("name") != MANAGED_LABEL
@@ -5311,6 +5327,79 @@ def test_release_retained_managed_label_failure_names_manual_remedy(tmp_path, fa
         release_retained_managed_label(
             runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
         )
+
+
+@pytest.mark.parametrize("raise_on", ["delete", "readback"])
+def test_release_retained_managed_label_runner_exception_names_manual_remedy(tmp_path, raise_on):
+    runner = EntryNormalizationRunner(_live_pr(), raise_on=raise_on)
+
+    with pytest.raises(AgentLoopError, match="Remove the label manually, then rerun") as raised:
+        release_retained_managed_label(
+            runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+        )
+
+    assert type(raised.value) is AgentLoopError
+    assert isinstance(raised.value.__cause__, OSError)
+    assert len(_managed_label_deletes(runner)) == 1
+    if raise_on == "readback":
+        # The DELETE succeeded but absence was never confirmed, so the run
+        # still stops rather than assuming the label is gone.
+        assert runner.live_pr["labels"] == []
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Forbidden (HTTP 403)\nupstream said HTTP 404 earlier\n",
+        "gh: Not Found (HTTP 404)\ngh: Forbidden (HTTP 403)\n",
+        "error: HTTP 404 mentioned mid-line (HTTP 403)\n",
+        "HTTP 404: Not Found",
+    ],
+    ids=["incidental-404-text", "conflicting-statuses", "mid-line-404", "unstructured-404"],
+)
+def test_release_retained_managed_label_ambiguous_404_is_not_absence(tmp_path, stderr):
+    runner = EntryNormalizationRunner(_live_pr(), delete_returncode=1, delete_stderr=stderr)
+
+    with pytest.raises(AgentLoopError, match="Remove the label manually, then rerun"):
+        release_retained_managed_label(
+            runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+        )
+
+    assert runner.live_pr["labels"] == [{"name": MANAGED_LABEL}]
+
+
+def test_release_retained_managed_label_strict_404_counts_as_absent(tmp_path):
+    # Someone else removed the label between the read and the DELETE: gh's
+    # strict 404 diagnostic is absence, and the read-back confirms it.
+    runner = EntryNormalizationRunner(
+        _live_pr(), delete_returncode=1, delete_stderr="gh: Not Found (HTTP 404)\n",
+        clear_on_failed_delete=True,
+    )
+
+    assert release_retained_managed_label(
+        runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+    ) is True
+    assert runner.live_pr["labels"] == []
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Forbidden (HTTP 403)\nupstream said HTTP 404 earlier\n",
+        "gh: Not Found (HTTP 404)\ngh: Forbidden (HTTP 403)\n",
+        "HTTP 404: Not Found",
+    ],
+    ids=["incidental-404-text", "conflicting-statuses", "unstructured-404"],
+)
+def test_publish_manual_cleanup_ambiguous_404_reports_manual_removal(tmp_path, monkeypatch, stderr):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    runner = PublicationRunner(delete_outcome=(stderr, 1))
+    # The scripted DELETE clears labels for any "404" text; an ambiguous
+    # diagnostic must still be reported as a failed removal.
+    with pytest.raises(AgentLoopError, match="remove it manually"):
+        _publish(runner, tmp_path)
+
+    assert len(_managed_label_deletes(runner)) == 1
 
 
 def v2_run(
@@ -9623,3 +9712,149 @@ def test_older_workflow_guard_after_dispatch_claims_no_qualification(tmp_path, m
     assert raised.value.phase == "post-dispatch"
     assert contract.intent_state != "completed"
     assert runner.dispatch_count == 0
+
+
+# --- #1047: qualified ready/labeled PR through real recovery and activation ---
+
+
+def _qualified_ready_labeled_runner(**kwargs):
+    """A strict issue-created PR left ready and labeled by manual qualification."""
+    body = "Fixes #643"
+    return ManualQualificationRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        issue_payload={"number": 643},
+        pr_payload={
+            "number": 7,
+            "state": "OPEN",
+            "url": "https://github.com/OWNER/REPO/pull/7",
+            "title": "Managed CI",
+            "body": body,
+            "headRefName": "agent-loop/managed-643",
+            "baseRefName": "main",
+            "headRefOid": "abc123",
+            "comments": [],
+            "reviews": [],
+        },
+        rest_pr={
+            "state": "open",
+            "draft": False,
+            "labels": [{"name": MANAGED_LABEL}],
+            "body": body,
+        },
+        issue_events=[label_event()],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        **kwargs,
+    )
+
+
+def _lifecycle_writes(runner):
+    """Every label, readiness, dispatch and merge write, in command order."""
+    writes = []
+    for command, _cwd in runner.commands:
+        if command[:5] == [
+            "gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+        ]:
+            writes.append("label-delete")
+        elif command[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]:
+            writes.append("label-post")
+        elif command[:3] == ["gh", "pr", "ready"]:
+            writes.append("ready-undo" if "--undo" in command else "ready")
+        elif command[:3] == ["gh", "pr", "merge"]:
+            writes.append("merge")
+        elif any(str(part).endswith("/actions/workflows/ci.yml/dispatches") for part in command):
+            writes.append("dispatch")
+    return writes
+
+
+def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_abort(
+    tmp_path, monkeypatch,
+):
+    runner = _qualified_ready_labeled_runner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    )
+    captured = {}
+    real_activate = orchestrator.activate_managed_ci
+
+    def activate(*args, **kwargs):
+        captured["resume"] = kwargs.get("managed_resume")
+        captured["writes_before"] = _lifecycle_writes(runner)
+        captured["contract"] = real_activate(*args, **kwargs)
+        return captured["contract"]
+
+    def abort_dispatch(*args, **kwargs):
+        # The run fails after review and before publication.
+        raise AgentLoopError("dispatch aborted")
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate)
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", abort_dispatch)
+    monkeypatch.setattr(
+        orchestrator, "publish_manual_v2_qualification",
+        lambda *a, **k: pytest.fail("publication must not run"),
+    )
+
+    with pytest.raises(AgentLoopError, match="dispatch aborted"):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    # Entry released the retained label before recovery classified the PR,
+    # so the real classifier saw ready/unlabeled.
+    assert captured["writes_before"] == ["label-delete"]
+    assert captured["resume"].lifecycle == "ready-unlabeled-reentry"
+    contract = captured["contract"]
+    assert contract is not None and contract.activation_path == "managed"
+    assert contract.origin == "issue-created"
+    assert orchestrator._preserve_issue_created_managed_suppression(
+        contract, active_exception=AgentLoopError("dispatch aborted"),
+    )
+    # Exactly one release, then the existing re-entry: undo readiness first,
+    # then reapply the label; the aborted run keeps it for exact resume.
+    assert _lifecycle_writes(runner) == ["label-delete", "ready-undo", "label-post"]
+    assert runner.rest_pr["draft"] is True
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+
+    # The next invocation resumes through draft/labeled; normalization leaves
+    # the preserved draft untouched.
+    def stop_at_activation(*args, **kwargs):
+        raise _ActivationReached(kwargs.get("managed_resume"))
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", stop_at_activation)
+    before = len(runner.commands)
+    with pytest.raises(_ActivationReached) as reached:
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    assert reached.value.args[0].lifecycle == "draft-labeled"
+    later = [command for command, _cwd in runner.commands[before:]]
+    assert not any(command[:4] == ["gh", "api", "--method", "DELETE"] for command in later)
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+
+
+def test_m1047_real_implicit_invocation_releases_then_stops_with_retry_command(
+    tmp_path, monkeypatch,
+):
+    runner = _qualified_ready_labeled_runner()
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    monkeypatch.setattr(
+        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    )
+
+    with pytest.raises(AgentLoopError, match="ready/unlabeled re-entry state") as raised:
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    assert "It was left unchanged; rerun with explicit `--managed-ci`" in str(raised.value)
+    # One entry release, then the implicit path stops with the PR ready and
+    # unlabeled: no undo, relabel, dispatch or merge.
+    assert _lifecycle_writes(runner) == ["label-delete"]
+    assert runner.rest_pr["draft"] is False
+    assert runner.rest_pr["labels"] == []

@@ -5173,7 +5173,11 @@ def _read_pr_payload(
 def _delete_managed_label(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path
 ) -> bool:
-    """DELETE the managed label; success or HTTP 404 means it is absent."""
+    """DELETE the managed label; success or a strict HTTP 404 means it is absent.
+
+    Only gh's own unambiguous status diagnostic proves a 404, so incidental
+    or conflicting ``HTTP 404`` text never counts as absence.
+    """
     result = runner.run(
         [
             config.gh_cmd, "api", "--method", "DELETE",
@@ -5182,7 +5186,7 @@ def _delete_managed_label(
     )
     if result.returncode == 0:
         return True
-    return _http_status(result) == 404 or "HTTP 404" in str(result.stderr or "")
+    return _http_status(result) == 404
 
 
 def _label_event_owned_by_contract(
@@ -5464,11 +5468,21 @@ def release_retained_managed_label(
         f"PR #{pr_number} is ready and still carries `{MANAGED_LABEL}`; it could not be removed, "
         "so no managed-CI or review work was started. Remove the label manually, then rerun."
     )
-    if not _delete_managed_label(runner, config=config, pr_number=pr_number, cwd=cwd):
+    # A runner exception (transport or subprocess failure) at either step is
+    # reported with the same manual remedy; the read-back may fail after the
+    # DELETE already succeeded, so absence is never assumed.
+    try:
+        removed = _delete_managed_label(runner, config=config, pr_number=pr_number, cwd=cwd)
+    except Exception as exc:
+        raise failure from exc
+    if not removed:
         raise failure
-    after = _label_names_or_none(
-        _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
-    )
+    try:
+        after = _label_names_or_none(
+            _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
+        )
+    except Exception as exc:
+        raise failure from exc
     if after is None or MANAGED_LABEL in after:
         raise failure
     log(
