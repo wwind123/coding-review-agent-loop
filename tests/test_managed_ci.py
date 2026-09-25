@@ -8787,6 +8787,63 @@ def test_non_dict_entry_appearing_before_the_gate_blocks_dispatch(tmp_path, monk
     assert releases == []
 
 
+def test_zero_exit_empty_intent_page_is_uninspectable_not_an_empty_ledger(tmp_path, monkeypatch):
+    class EmptyBody(V2ManagedRunner):
+        def _run_locked(self, args, *, cwd, check, input_text=None):
+            endpoint = next((part for part in args if isinstance(part, str) and part.startswith("repos/")), "")
+            if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
+                cmd, cwd_path = self._record_command(args, cwd)
+                return CommandResult(cmd, cwd_path, "", "", 0)
+            return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = EmptyBody(base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD})
+    with pytest.raises(AgentLoopError, match="Unable to inspect managed-CI v2 intent history") as raised:
+        _ensure_v2_intent(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=valid_v2_contract(),
+        )
+    assert not isinstance(raised.value, managed_ci.ManagedCiIntentLedgerError)
+    assert _intent_posts(runner) == []
+
+    # At the gate, the same response is the generic inspection error, never a
+    # ledger verdict, and nothing is dispatched.
+    with pytest.raises(AgentLoopError, match="Unable to inspect managed-CI v2 intent history") as raised:
+        managed_ci._require_workflow_dispatch_authorization(
+            runner, config=config,
+            contract=valid_v2_contract(pr_number=7, intent_comment_id=17), patch_result=None,
+        )
+    assert not isinstance(raised.value, managed_ci.ManagedCiIntentLedgerError)
+    assert runner.dispatch_count == 0
+
+
+def test_footer_seen_only_on_intent_rediscovery_is_logged_once(tmp_path, monkeypatch):
+    import coding_review_agent_loop.github as github_module
+
+    lines = []
+    monkeypatch.setattr(github_module, "log", lambda _config, message: lines.append(message))
+    github_module.reset_host_footer_log_latch()
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(suffix=HOST_FOOTER)])
+    contract = valid_v2_contract(host_footer_capable=True)
+
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+
+    assert contract.intent_comment_id == 17
+    assert _intent_posts(runner) == []
+    assert len(lines) == 1 and "intent re-read" in lines[0]
+    # The raw page keeps its footer: the envelope mirror owns that form.
+    assert runner.intent_comments[0]["body"].endswith(HOST_FOOTER)
+
+    lines.clear()
+    github_module.reset_host_footer_log_latch()
+    _ensure_v2_intent(
+        valid_v2_runner(intent_comments=[v2_intent_comment()]), config=config, pr_number=7,
+        expected_head_sha=V2_HEAD, contract=valid_v2_contract(),
+    )
+    assert lines == []
+
+
 @pytest.mark.parametrize(
     ("stdout", "returncode"), [("", 1), (json.dumps({"message": "rate limited"}), 0), ("{not json", 0)]
 )

@@ -6246,12 +6246,21 @@ def _read_intent_comment_page(
     )
     if result.returncode != 0:
         raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
+    # An empty body is not an empty ledger: treating it as ``[]`` would mint
+    # a fresh intent without having inspected the existing comments.
     try:
-        payload = json.loads(result.stdout or "[]")
+        payload = json.loads(result.stdout or "")
     except json.JSONDecodeError as exc:
         raise AgentLoopError("Unable to inspect managed-CI v2 intent history.") from exc
     if not isinstance(payload, list):
         raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
+    # The page stays raw (the envelope mirror owns the footered form), but a
+    # footer seen only on this re-read is still reported once per invocation.
+    for comment in payload:
+        body = comment.get("body") if isinstance(comment, dict) else None
+        if isinstance(body, str) and INTENT_MARKER in body and strip_known_host_footer(body)[1]:
+            note_host_footer_observed(config, "managed-CI intent re-read")
+            break
     return payload
 
 
