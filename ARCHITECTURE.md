@@ -770,8 +770,8 @@ the issue, plus the issue's completely approved canonical plan, whose hash must
 still equal the bound plan. Any gap fails qualification closed. Runs that do
 have an issue-side handoff, and all non-managed runs, keep the issue-side check.
 
-The merge-conflict resolution round is the one automatic transition that has no
-reviewer to correlate. When the live head conflicts with the base branch the
+Two automatic transitions have no reviewer to correlate: the merge-conflict
+resolution round and the exact-head CI repair round. When the live head conflicts with the base branch the
 orchestrator skips reviewers by construction and routes the round to the coder,
 so no blocking reviewer record for the predecessor head can ever exist. That
 head advance is authorized instead by the tool-owned merge-conflict obligation:
@@ -782,9 +782,26 @@ merge-conflict obligation in its round items. That obligation is minted by the
 tool and sits outside the coder's classifiable item namespace, so an agent
 response cannot introduce it. The continuity comment binds that single record,
 and resume reauthenticates the same shape rather than a reviewer pair that never
-existed. A head advance carrying neither an ordered blocking-review/coder pair
-nor that obligation still fails closed, and every reviewer must still approve
-the exact final head before qualification or merge.
+existed.
+
+The exact-head CI repair round (#1024) is the second such transition. When
+managed exact-head CI fails on a head every reviewer already approved, the
+failure comes from CI rather than a reviewer, so the coder round that repairs it
+has no blocking review to pair with. That head advance is authorized by the
+tool-minted CI obligation in the state the coder record carries after the push:
+exactly one coder round metadata record for the new exact head and the
+immediately following round, authored by the bound actor, newer than the
+predecessor authorization, carrying a machine-authority `managed-exact-head-ci`
+or `github-pr-checks` obligation in `awaiting_current_head_review` whose failed
+head is the predecessor head and whose candidate head is the new head. The
+orchestrator mints the obligation and advances its lifecycle and heads; an agent
+response cannot introduce it or set those fields. Resume reauthenticates the
+same shape, bound to both heads of the transition.
+
+A head advance carrying none of an ordered blocking-review/coder pair, the
+merge-conflict obligation, or a CI obligation bound to exactly that transition
+still fails closed, and every reviewer must still approve the exact final head
+before qualification or merge.
 
 ## State and Recovery
 

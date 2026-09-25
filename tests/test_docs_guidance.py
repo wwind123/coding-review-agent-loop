@@ -486,9 +486,14 @@ def test_docs_describe_conflict_round_continuity_exception():
     assert "tool-owned merge-conflict obligation" in arch_text
     assert "outside the coder's classifiable item namespace" in arch_text
     assert "resume reauthenticates the same shape" in arch_text
-    assert "merge-conflict resolution round is the single exception" in doc_text
+    assert "Two reviewer-less rounds are the only exceptions" in doc_text
     assert "tool-owned merge-conflict obligation instead of a review pair" in doc_text
+    # #1024: the exact-head CI repair round is the second reviewer-less transition.
+    assert "exact-head CI repair round (#1024) is the second such transition" in arch_text
+    assert "An exact-head CI repair round is the second exception" in doc_text
+    assert "tool-minted CI obligation instead of a review pair" in doc_text
     for text in (arch_text, doc_text):
+        assert "awaiting_current_head_review" in text
         assert "still fails closed" in text
         assert "approve the exact final head before qualification or merge" in text
 

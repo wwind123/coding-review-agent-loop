@@ -4731,6 +4731,174 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
     assert merges == [{"expected_head_sha": "abc123-coder-1"}]
 
 
+def test_issue_managed_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
+    tmp_path, monkeypatch, capsys
+):
+    """#1024: a CI repair round authorizes head continuity from its own record."""
+    import coding_review_agent_loop.managed_ci as managed_ci_module
+
+    failed_check = PullRequestCheck(
+        name="final-ci/exact-head",
+        kind="check_run",
+        status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/555",
+    )
+    outcomes = iter(
+        [
+            ManagedCiOutcome(
+                status="failed",
+                checks=_watch_check_board("failing", failing=(failed_check,)),
+                head_sha="abc123",
+            ),
+            ManagedCiOutcome(status="passed", head_sha="abc123-coder-1"),
+        ]
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Approved."),
+            structured_pr_review(
+                state="approved",
+                summary="Approved after managed CI fix.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Fixed managed CI.", addressed_items=["item-1"],
+            )
+        ],
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="voluntary", override_nonce="root",
+        authorization_kind="creation", authorization_comment_id=17,
+    )
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
+    )
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
+    )
+    merges = []
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
+
+    def posted_rest_comments():
+        # The exact bodies the orchestrator posted, as the REST comment list
+        # the trusted actor authored; ids follow the creation authorization.
+        return [
+            {"id": 100 + index, "user": {"login": "agent-loop", "id": 1}, "body": comment["body"]}
+            for index, comment in enumerate(runner.pr_payload.get("comments", []))
+        ]
+
+    real_find = managed_ci_module.find_actor_round_metadata_comment_ids
+    selections = []
+
+    def find(runner_arg, **kwargs):
+        comments = posted_rest_comments()
+        with monkeypatch.context() as scoped:
+            scoped.setattr(managed_ci_module, "_api_list", lambda *_a, **_k: comments)
+            selected = real_find(runner_arg, **kwargs)
+        selections.append((kwargs, selected, comments))
+        return selected
+
+    published = []
+
+    def publish(*_args, handoff, predecessor_head, new_head, round_comment_ids, **_kwargs):
+        comments = selections[-1][2]
+        grant = managed_ci_module.ManagedCiIssueAuthorization(
+            kind="continuity", repository="OWNER/REPO", issue_number=56, pr_number=77,
+            base_ref="main", head_sha=new_head, actor_login="agent-loop", actor_id=1,
+            protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
+            label_event_id=101, predecessor_head=predecessor_head,
+            predecessor_comment_id=handoff.authorization_comment_id,
+            round_comment_ids=round_comment_ids,
+        )
+        # Resume reauthenticates the same grant from the same serialized record.
+        assert managed_ci_module._continuity_round_metadata_is_valid(
+            comments, authorization=grant
+        ) is True
+        published.append((predecessor_head, new_head, round_comment_ids))
+        return dataclasses.replace(
+            handoff, head_sha=new_head, authorization_kind="continuity",
+            authorization_comment_id=max(round_comment_ids) + 1,
+        )
+
+    monkeypatch.setattr(orchestrator, "find_actor_round_metadata_comment_ids", find)
+    monkeypatch.setattr(orchestrator, "publish_issue_created_continuity_authorization", publish)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=("codex",), auto_merge=True,
+        max_rounds=1, quiet=False,
+    )
+
+    assert run_pr_loop(
+        runner, pr_number=77, config=config, managed_ci_handoff=handoff,
+        managed_ci_issue_number=56,
+    ) == 0
+
+    assert len(selections) == 1
+    kwargs, selected, comments = selections[0]
+    assert (kwargs["predecessor_head"], kwargs["new_head"]) == ("abc123", "abc123-coder-1")
+    # Only the lone orchestrator-serialized coder record authorizes the move.
+    assert len(selected) == 1
+    coder_body = next(comment["body"] for comment in comments if comment["id"] == selected[0])
+    records = managed_ci_module._continuity_round_records([{"body": coder_body}])
+    assert records[0]["role"] == "coder"
+    assert records[0]["ci_repair_transitions"] == frozenset({("abc123", "abc123-coder-1")})
+    assert published == [("abc123", "abc123-coder-1", selected)]
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
+    assert merges == [{"expected_head_sha": "abc123-coder-1"}]
+    err = capsys.readouterr().err
+    assert "Claude repairing failed CI" in err
+    assert "addressing reviewer feedback" not in err
+
+
+def test_ci_repair_log_label_requires_a_nonempty_ci_only_followup_set(tmp_path, capsys):
+    config = make_config(tmp_path, quiet=False)
+    ci_item = UnresolvedReviewItem(
+        item_id="item-1", reviewer="GitHub managed exact-head CI", source_round=1,
+        text="Managed CI failed.", status="blocking", authority="machine",
+        obligation_kind="managed-exact-head-ci", lifecycle="repair_required",
+        failed_head_sha="abc123",
+    )
+    reviewer_item = UnresolvedReviewItem(
+        item_id="item-2", reviewer="Codex", source_round=1, text="Fix it.", status="blocking",
+    )
+    ack_item = UnresolvedReviewItem(
+        item_id=orchestrator.HUMAN_REQUIREMENTS_ACK_ITEM_ID, reviewer="Orchestrator",
+        source_round=1, text="Acknowledge.", status="blocking", authority="machine",
+        obligation_kind="human-requirements-acknowledgement", lifecycle="repair_required",
+    )
+    cases = {
+        "ci-only": (ci_item,),
+        "acknowledgement-only": (ack_item,),
+        "mixed": (ci_item, reviewer_item),
+        "reviewer-only": (reviewer_item,),
+    }
+    labels = {}
+    for name, items in cases.items():
+        orchestrator._log_coder_followup_dispatch(
+            config, 4, "Claude", orchestrator.select_coder_followup_items(items)
+        )
+        labels[name] = capsys.readouterr().err
+
+    assert "Round 4: Claude repairing failed CI" in labels["ci-only"]
+    for name in ("acknowledgement-only", "mixed", "reviewer-only"):
+        assert "Round 4: Claude addressing reviewer feedback" in labels[name]
+        assert "repairing failed CI" not in labels[name]
+
+
 def test_managed_qualification_resume_attaches_without_redispatch(
     tmp_path, monkeypatch
 ):

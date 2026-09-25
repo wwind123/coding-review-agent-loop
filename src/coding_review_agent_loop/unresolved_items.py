@@ -74,6 +74,19 @@ def select_coder_followup_items(
     )
 
 
+def coder_followup_is_ci_repair(
+    coder_followup_items: Sequence[UnresolvedReviewItem],
+) -> bool:
+    """Whether a coder round exists only to repair tool-owned CI failures.
+
+    The set must be non-empty: an acknowledgement-only round has no
+    classifiable items and must not be reported as a CI repair (#1024).
+    """
+    return bool(coder_followup_items) and all(
+        _machine_obligation_is_ci(item) for item in coder_followup_items
+    )
+
+
 def _normalize_disposition_section_prose(text: str) -> str:
     return " ".join(text.strip().split())
 

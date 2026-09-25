@@ -51,6 +51,7 @@ from .protocol_markers import (
     scan_reserved_markers,
     strip_known_host_footer,
 )
+from .protocol import CI_MACHINE_OBLIGATION_KINDS, MACHINE_AUTHORITY
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
 
 
@@ -1744,6 +1745,7 @@ def find_actor_round_metadata_comment_ids(
     reviewers: list[int] = []
     coders: list[int] = []
     conflict_coders: list[int] = []
+    ci_repair_coders: list[int] = []
     for index, comment in enumerate(comments):
         metadata = by_index.get(index)
         user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
@@ -1771,6 +1773,8 @@ def find_actor_round_metadata_comment_ids(
             coders.append(comment_id)
             if metadata.get("resolves_merge_conflict"):
                 conflict_coders.append(comment_id)
+            if (predecessor_head, new_head) in metadata["ci_repair_transitions"]:
+                ci_repair_coders.append(comment_id)
     # A conflict-resolution round advances the head with no reviewer pair by
     # construction: the orchestrator skips reviewers and routes the round to
     # the coder (#829).  Accept that transition on the tool-owned merge-conflict
@@ -1778,6 +1782,12 @@ def find_actor_round_metadata_comment_ids(
     # still approve the exact final head before qualification or merge.
     if not reviewers and len(conflict_coders) == 1 and len(coders) == 1:
         return (conflict_coders[0],)
+    # A managed exact-head CI repair round on an approved head has no blocking
+    # review either: the failure came from CI, not a reviewer (#1024).  Accept
+    # it only when the tool-minted CI obligation, already advanced to the
+    # pushed head, binds both the failed predecessor head and the new head.
+    if not reviewers and len(ci_repair_coders) == 1 and len(coders) == 1:
+        return (ci_repair_coders[0],)
     if (
         not reviewers
         or len(coders) != 1
@@ -1826,6 +1836,10 @@ def _continuity_round_records(
             # reviewers by construction (#829); the machine obligation on the
             # coder record is the durable evidence of that routing.
             "resolves_merge_conflict": _records_merge_conflict_obligation(payload),
+            # A CI repair round is routed by the orchestrator-minted CI
+            # obligation (#1024); the (failed, candidate) head pairs it binds
+            # are the durable evidence of that routing.
+            "ci_repair_transitions": _records_ci_repair_transitions(payload),
         }
     return result
 
@@ -1840,6 +1854,40 @@ def _records_merge_conflict_obligation(payload: Mapping[str, object]) -> bool:
             if isinstance(item, Mapping) and item.get("obligation_kind") == "merge-conflict":
                 return True
     return False
+
+
+def _records_ci_repair_transitions(
+    payload: Mapping[str, object],
+) -> frozenset[tuple[str, str]]:
+    """Return the (failed, candidate) heads bound by tool-owned CI obligations.
+
+    Only the post-push shape counts: a machine-authority CI obligation that the
+    orchestrator advanced to ``awaiting_current_head_review`` for a candidate
+    head distinct from the head that failed.
+    """
+    transitions: set[tuple[str, str]] = set()
+    for key in ("prior_items", "new_items"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            failed = item.get("failed_head_sha")
+            candidate = item.get("candidate_head_sha")
+            if (
+                item.get("authority") == MACHINE_AUTHORITY
+                and item.get("obligation_kind") in CI_MACHINE_OBLIGATION_KINDS
+                and item.get("lifecycle") == "awaiting_current_head_review"
+                and item.get("status") in {"blocking", "same-pr"}
+                and isinstance(failed, str)
+                and isinstance(candidate, str)
+                and failed
+                and candidate
+                and failed != candidate
+            ):
+                transitions.add((failed, candidate))
+    return frozenset(transitions)
 
 
 def _continuity_round_metadata_is_valid(
@@ -1896,8 +1944,14 @@ def _continuity_round_metadata_is_valid(
     if not reviewers:
         # The conflict-resolution transition is recorded by the coder record
         # alone, so reauthenticate that shape rather than demanding a reviewer
-        # pair that never existed (#829).
-        return len(selected) == 1 and bool(coder_metadata.get("resolves_merge_conflict"))
+        # pair that never existed (#829).  A CI repair round is likewise
+        # recorded by the coder record alone, bound to this exact transition
+        # by its advanced CI obligation (#1024).
+        return len(selected) == 1 and (
+            bool(coder_metadata.get("resolves_merge_conflict"))
+            or (authorization.predecessor_head, authorization.head_sha)
+            in coder_metadata["ci_repair_transitions"]
+        )
     return len(reviewers) + 1 == len(selected)
 
 
