@@ -4062,6 +4062,10 @@ def _activate_v2_managed_ci(
                     schema="body",
                     required=True,
                     expected_nonce=config.managed_ci_expected_override_nonce,
+                    additional_allowed_tokens=(
+                        frozenset({"AGENT_MANAGED_PR_SOURCE_V1"})
+                        if origin == "source-managed" else frozenset()
+                    ),
                 )
             except AgentLoopError as error:
                 _restore_ordinary_ci_after_v2_fallback(
