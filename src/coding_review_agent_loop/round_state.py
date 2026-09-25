@@ -1081,6 +1081,10 @@ def recover_plan_validation_diagnostic(
         # exactly once here.  The decoder never strips, so a doubled or variant
         # suffix stays ineligible.
         body, footered = strip_known_host_footer(raw_body)
+        # Report the observation at the boundary, before any marker, identity,
+        # or decoder exit, like the other ingestion boundaries.
+        if footered and on_host_footer is not None:
+            on_host_footer("plan-validation diagnostic recovery")
         if not PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.search(body):
             continue
         comment_id, author_login, author_id, created_at = _comment_identity(comment)
@@ -1101,8 +1105,6 @@ def recover_plan_validation_diagnostic(
             # ineligible rather than fatal; only authenticated, canonical
             # records may participate in context selection and conflicts.
             continue
-        if footered and on_host_footer is not None:
-            on_host_footer("plan-validation diagnostic recovery")
         previous_body = by_id.get(comment_id)
         if previous_body is not None and previous_body != body:
             raise AgentLoopError(
