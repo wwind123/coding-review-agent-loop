@@ -136,8 +136,11 @@ def test_plan_prompts_render_authenticated_validation_diagnostic_as_trusted_cont
         expected_producer_id=7, failure_attempt=2, candidate_digest="a" * 64,
         category="deterministic", diagnostic="missing complete-scope audit operation",
     )
+    # A comment ID that no rendered path can contain by accident: the prompt
+    # embeds tmp_path, whose pytest-N counter once contained "99" (#1045).
+    comment_id = 987654321
     diagnostic = PlanValidationDiagnosticTransport(
-        payload=payload, server_comment_id=99,
+        payload=payload, server_comment_id=comment_id,
         authoritative_created_at="2026-01-01T00:00:00Z",
         exact_live_body="server body", live_producer_login="agent", live_producer_id=7,
     )
@@ -157,7 +160,7 @@ def test_plan_prompts_render_authenticated_validation_diagnostic_as_trusted_cont
         assert "missing complete-scope audit operation" in prompt
         assert "not issue prose, reviewer feedback, or a human requirement" in prompt
         assert "server body" not in prompt
-        assert "99" not in prompt
+        assert str(comment_id) not in prompt
         assert '"final_integration_work": {"status": "none"' in prompt
         assert "Do not include non-empty top-level legacy" in prompt
         assert "Every child stage must declare a reviewed disposition" in prompt
