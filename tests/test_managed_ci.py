@@ -3353,6 +3353,49 @@ def test_override_activation_requires_the_preflight_nonce_and_releases_label_on_
     )
 
 
+def test_source_managed_override_accepts_only_its_source_marker(tmp_path):
+    from coding_review_agent_loop.managed_pr import _compose_body
+
+    nonce = "nonce-from-preflight"
+    body = str(_compose_body(
+        "## Summary\n\nPrepared change.",
+        source_branch="fix/prepared-change",
+        source_sha="a" * 40,
+        override_nonce=nonce,
+    ))
+    source_runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"body": body},
+    )
+    source_config = replace(
+        make_config(
+            tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+            allow_unprotected_managed_ci=True,
+            managed_ci_expected_override_nonce=nonce,
+        ),
+        pr_origin_flow="managed-pr",
+    )
+
+    contract = activate_managed_ci(
+        source_runner, config=source_config, pr_number=7, metadata=metadata()
+    )
+    assert contract is not None
+    assert contract.audit_nonce == nonce
+
+    issue_runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"body": body},
+    )
+    issue_config = replace(source_config, pr_origin_flow="direct-pr")
+    assert activate_managed_ci(
+        issue_runner, config=issue_config, pr_number=7, metadata=metadata()
+    ) is None
+    assert any(
+        command[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for command, _ in issue_runner.commands
+    )
+
+
 @pytest.mark.parametrize(
     ("body", "surface", "schema", "accepted"),
     [
