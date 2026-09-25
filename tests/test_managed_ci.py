@@ -3,6 +3,7 @@ import copy
 import json
 import re
 import shlex
+import subprocess
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -5650,7 +5651,7 @@ def test_publish_round_readiness_posts_success_status(tmp_path):
     config = make_config(tmp_path, auto_merge=True)
     runner = FakeRunner()
 
-    publish_round_readiness(runner, config=config, head_sha="abc123")
+    assert publish_round_readiness(runner, config=config, head_sha="abc123") is True
 
     assert runner.commands[-1][0] == [
         "gh",
@@ -9888,3 +9889,34 @@ def test_m1047_real_implicit_invocation_releases_then_stops_with_retry_command(
     assert _lifecycle_writes(runner) == ["label-delete"]
     assert runner.rest_pr["draft"] is False
     assert runner.rest_pr["labels"] == []
+
+
+class _RefusingStatusRunner:
+    """A runner whose commit-status write is refused, as by a host proxy (#1052)."""
+
+    def __init__(self, stderr):
+        self.stderr = stderr
+        self.commands = []
+
+    def run(self, args, *, cwd=None, check=True, **kwargs):
+        self.commands.append(list(args))
+        return subprocess.CompletedProcess(args, 1, "", self.stderr)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Write access to this GitHub API path is not permitted through this proxy. (HTTP 403)\n",
+        "",
+    ],
+)
+def test_refused_round_readiness_is_logged_and_does_not_abort(tmp_path, capsys, stderr):
+    config = replace(make_config(tmp_path, auto_merge=True), quiet=False)
+    runner = _RefusingStatusRunner(stderr)
+
+    assert publish_round_readiness(runner, config=config, head_sha="abc123") is False
+
+    assert runner.commands[-1][4] == "repos/OWNER/REPO/statuses/abc123"
+    err = capsys.readouterr().err
+    assert f"could not publish the non-required `{READINESS_CONTEXT}` status for abc123" in err
+    assert ("not permitted through this proxy" in err) if stderr else ("exit 1" in err)

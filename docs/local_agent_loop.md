@@ -3910,7 +3910,9 @@ hosted matrix contexts are not presented as actionable review failures.
 Actually observed non-final failures remain visible. If a configured
 pre-review `--test-command` passes, agent-loop also publishes the non-required
 `agent-loop/round-readiness` status on that head; it never publishes readiness
-without running that command.
+without running that command. Because nothing gates on it, a refused status write
+(for example on a host whose proxy forbids commit-status writes) is logged as a
+warning and the round continues.
 
 After every required reviewer approves one live head, agent-loop dispatches the
 repository's `CI` workflow with the PR number and that exact expected SHA. In
