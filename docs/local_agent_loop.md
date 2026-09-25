@@ -3487,6 +3487,9 @@ The preferred recovery for a canonical issue handoff is to rerun the original
 `agent-loop issue <number>` command. That preserves its planning and
 implementation shape and reuses the authenticated issue-to-PR association;
 `agent-loop pr <number>` is the direct fallback when the PR is already known.
+A ready PR that still carries `agent-loop-managed` from a successful explicit
+manual qualification is first returned to ready/unlabeled at PR-loop entry,
+so the rules below apply to it unchanged.
 An authenticated ready/unlabeled issue-created or `managed-pr` PR may be
 reconstructed only when the new invocation has an explicit `--managed-ci`.
 An implicit `--auto-merge` invocation leaves that state ready and unlabeled,
@@ -3829,26 +3832,68 @@ replacement.
 After correlated success, auto-merge applies the short-lived
 `agent-loop-exact-head-qualified` label, marks the PR ready, rechecks its head,
 and merges with `--match-head-commit`. Explicit `--managed-ci` never applies
-that bare label and never calls the merge API: it releases the managed label,
-marks an issue-created draft ready, writes a SHA-bearing
-`AGENT_LOOP_MANAGED_CI_QUALIFIED_V2` audit comment, and prints:
+that bare label and never calls the merge API. It keeps `agent-loop-managed`,
+verifies before readiness and again before the audit comment that the active
+label event is still the one this run authenticated (same event ID and trusted
+actor), marks an issue-created draft ready (an adopted PR must already be
+exactly non-draft), writes a SHA-bearing `AGENT_LOOP_MANAGED_CI_QUALIFIED_V2`
+audit comment, and prints:
 
 ```bash
 gh pr merge <number> --repo OWNER/REPO --merge --match-head-commit <qualified-sha>
 ```
 
-The PR stays open for a human. A later head change invalidates the result. A
-rerun of a successful issue-created manual result first makes the PR draft
-again, suspending the earlier manual command; if reconstruction fails, rerun
-managed qualification or restore readiness manually and use the old guarded
-command only after confirming that exact SHA is still live. For an explicitly
-unprotected run, the audit and terminal warning state that GitHub cannot force
-the human to use the qualified SHA after agent-loop exits. Explicit mode
-requires complete v2; it rejects v1 instead of silently claiming qualification.
+The label stays on the ready PR on purpose. Removing it would fire
+`unlabeled`, which always runs the ordinary suite, so the qualified head would
+be tested a second time. On a ready PR the label suppresses nothing: routing
+suppresses only a draft on an `agent-loop/managed-*` branch. Removing the label
+by hand still restores ordinary CI.
+
+If publication fails at any step (head check, guard, either provenance check,
+readiness, verification after readiness, the audit write, or the final head
+check), the label is released before the error is reported. This happens
+whether the PR is still draft or already ready, even for issue-created and
+`managed-pr` runs, whose other interruptions keep the label. The release
+follows these rules:
+
+- A labels list that proves the label is absent: nothing is written.
+- A label owned by this run's event: removed.
+- A present label whose event history cannot be read: removed anyway
+  (fail-open).
+- A readable label event from someone else: left in place, and the error says
+  to remove it manually if it is stale.
+- A PR that cannot be read: a removal is attempted, and HTTP 404 counts as
+  already absent.
+
+If the removal itself fails, the error names the manual label removal.
+
+The PR stays open for a human. A later head change invalidates the result.
+Every later agent-loop invocation on that PR, explicit or implicit, first
+removes a retained label from an open ready PR at PR-loop entry. That happens
+before any managed-CI authentication or workdir setup. The run then follows the
+ready/unlabeled contract below, exactly as for a PR qualified before labels were
+retained. Drafts, closed PRs, and unlabeled PRs are not touched. If the removal
+or its read-back fails, the run stops before any other work and asks you to
+remove the label manually. A rerun of a successful issue-created manual result
+therefore costs one ordinary run at entry, then makes the PR draft again,
+suspending the earlier manual command. If that re-entered run is interrupted
+before publication, it is kept draft/labeled for exact resume, like any other
+interrupted managed run. If reconstruction fails, rerun managed qualification
+or restore readiness manually, and use the old guarded command only after
+confirming that exact SHA is still live. Residual: if a human converts a
+qualified PR back to draft and pushes, the retained label suppresses ordinary
+CI for that push, as for any draft/labeled managed PR. Strict protection still
+blocks merging the new head without `final-ci/exact-head`. Remove
+`agent-loop-managed` to restore ordinary CI. For an explicitly unprotected run,
+the audit and terminal warning state that GitHub cannot force the human to use
+the qualified SHA after agent-loop exits. Explicit mode requires complete v2;
+it rejects v1 instead of silently claiming qualification.
 
 A v2 issue-created PR has zero billed routing jobs at opening, zero hosted
 minutes per intermediate revision, one final matrix, and one rounded
 publisher/aggregate minute—about 11–14 minutes for a 10–13 minute matrix.
+Because a successful manual qualification keeps the label, no second
+ordinary run follows it on the qualified head.
 `agent-loop pr <n>` has already paid the ordinary opening matrix and remains
 roughly the earlier 20–25-minute shape plus recovery work. Keep routing,
 aggregate, and qualification telemetry separate for billing comparisons.

@@ -12884,3 +12884,422 @@ def test_resumed_publication_genuine_omission_cannot_gain_an_assessment(
     assert validated is None
     assert "must not introduce one" in attempts[-1].diagnostic
     assert run.outcome != 0
+
+
+# --- #1047: retained managed label after manual qualification -----------------
+
+import coding_review_agent_loop.managed_ci as _m1047_managed_ci  # noqa: E402
+from coding_review_agent_loop.config import github_bootstrap_cwd as _m1047_bootstrap_cwd  # noqa: E402
+from coding_review_agent_loop.orchestrator import run_pr_loop as _m1047_run_pr_loop  # noqa: E402
+
+_M1047_DELETE = [
+    "gh", "api", "--method", "DELETE",
+    "repos/OWNER/REPO/issues/77/labels/agent-loop-managed",
+]
+
+
+class _M1047Stop(Exception):
+    """Sentinel that ends a run once the path under test was reached."""
+
+
+class _M1047LivePrRunner(_FakeRunner):
+    """Serve the live REST PR, its label events and label writes for PR #77."""
+
+    def __init__(
+        self,
+        *,
+        draft=False,
+        labels=("agent-loop-managed",),
+        delete_returncode=0,
+        events_fail_from=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.live_pr = {
+            "state": "open",
+            "draft": draft,
+            "labels": [{"name": name} for name in labels],
+            "head": {"sha": self.pr_payload.get("headRefOid")},
+        }
+        self.events = [{
+            "id": 101, "event": "labeled", "label": {"name": "agent-loop-managed"},
+            "actor": {"login": "agent-loop", "id": 1},
+        }]
+        self.delete_returncode = delete_returncode
+        self.events_fail_from = events_fail_from
+        self.event_reads = 0
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(arg) for arg in args]
+        endpoint = next((part for part in cmd if part.startswith("repos/")), "")
+        if cmd == ["gh", "api", "repos/OWNER/REPO/pulls/77"]:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, json.dumps(self.live_pr), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/issues/77/events?"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            index = self.event_reads
+            self.event_reads += 1
+            if self.events_fail_from is not None and index >= self.events_fail_from:
+                return CommandResult(cmd, cwd_path, "", "events unavailable", 1)
+            return CommandResult(cmd, cwd_path, json.dumps(self.events), "", 0)
+        if cmd[:5] == _M1047_DELETE:
+            cmd, cwd_path = self._record_command(args, cwd)
+            if self.delete_returncode:
+                return CommandResult(cmd, cwd_path, "", "gh: Server Error (HTTP 500)", 1)
+            self.live_pr["labels"] = [
+                item for item in self.live_pr["labels"] if item["name"] != "agent-loop-managed"
+            ]
+            self.events.append({
+                "id": 102, "event": "unlabeled", "label": {"name": "agent-loop-managed"},
+                "actor": {"login": "agent-loop", "id": 1},
+            })
+            return CommandResult(cmd, cwd_path, "", "", 0)
+        if cmd[:3] == ["gh", "pr", "ready"]:
+            cmd, cwd_path = self._record_command(args, cwd)
+            self.live_pr["draft"] = False
+            return CommandResult(cmd, cwd_path, "", "", 0)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    def managed_deletes(self):
+        return [command for command, _cwd in self.commands if command[:5] == _M1047_DELETE]
+
+    def has_managed_label(self):
+        return any(item["name"] == "agent-loop-managed" for item in self.live_pr["labels"])
+
+
+def _m1047_recorder(runner, seen, name):
+    def record(*args, **kwargs):
+        seen.append((name, runner.has_managed_label(), runner.live_pr["draft"]))
+        raise _M1047Stop(name)
+    return record
+
+
+def _m1047_contract(origin):
+    return ManagedCiContract(
+        protocol_version=2,
+        issue_created_pr=origin == "issue-created",
+        origin=origin,
+        active_label_event_id=101,
+        invocation_applied_label=True,
+        trusted_actor_login="agent-loop",
+        trusted_actor_id=1,
+        protection_mode="strict",
+        base_ref="main",
+    )
+
+
+def _m1047_release_spy(monkeypatch):
+    calls = []
+    real = orchestrator_module.release_adopted_managed_ci
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get("contract"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "release_adopted_managed_ci", spy)
+    return calls
+
+
+@pytest.mark.parametrize("path", ["activation", "revalidation", "recovery", "fresh", "source-managed"])
+def test_m1047_entry_normalization_runs_before_every_managed_resume_path(
+    tmp_path, monkeypatch, path,
+):
+    runner = _M1047LivePrRunner()
+    overrides = {"managed_ci": True, "max_rounds": 1}
+    if path == "fresh":
+        overrides.update(managed_ci_fresh_authorization=True, managed_ci_issue_number=5)
+    config = make_config(tmp_path, **overrides)
+    seen = []
+    kwargs = {}
+    if path == "activation":
+        monkeypatch.setattr(orchestrator_module, "recover_issue_created_handoff", lambda *a, **k: None)
+        monkeypatch.setattr(
+            orchestrator_module, "activate_managed_ci", _m1047_recorder(runner, seen, path)
+        )
+    elif path == "revalidation":
+        kwargs["managed_ci_handoff"] = object()
+        monkeypatch.setattr(
+            orchestrator_module, "revalidate_issue_created_handoff",
+            _m1047_recorder(runner, seen, path),
+        )
+    elif path == "recovery":
+        monkeypatch.setattr(
+            orchestrator_module, "recover_issue_created_handoff",
+            _m1047_recorder(runner, seen, path),
+        )
+    elif path == "fresh":
+        monkeypatch.setattr(orchestrator_module, "validate_open_issue", lambda *a, **k: None)
+        monkeypatch.setattr(
+            orchestrator_module, "get_issue_context",
+            lambda *a, **k: SimpleNamespace(number=5, comments=[], human_requirements=()),
+        )
+        monkeypatch.setattr(
+            orchestrator_module, "authorize_fresh_issue_created_resume",
+            _m1047_recorder(runner, seen, path),
+        )
+    else:
+        monkeypatch.setattr(
+            orchestrator_module, "recover_managed_pr_origin",
+            lambda *a, **k: ("feature", "abc123", "agent-loop/managed-77", None),
+        )
+        monkeypatch.setattr(orchestrator_module, "validate_managed_pr_body", lambda *a, **k: None)
+        monkeypatch.setattr(
+            orchestrator_module, "authenticate_source_managed_resume",
+            _m1047_recorder(runner, seen, path),
+        )
+
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config, **kwargs)
+
+    # The path saw ready/unlabeled, exactly as for a historical qualified PR.
+    assert seen == [(path, False, False)]
+    assert len(runner.managed_deletes()) == 1
+
+
+def test_m1047_implicit_invocation_also_releases_retained_label(tmp_path, monkeypatch):
+    runner = _M1047LivePrRunner()
+    config = make_config(tmp_path, max_rounds=1)
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+    )
+
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert seen == [("recovery", False, False)]
+    assert len(runner.managed_deletes()) == 1
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"draft": True},
+        {"draft": True, "labels": ()},
+        {"labels": ()},
+    ],
+    ids=["draft-labeled", "draft-unlabeled", "ready-unlabeled"],
+)
+def test_m1047_entry_normalization_leaves_other_pr_states_untouched(tmp_path, monkeypatch, state):
+    runner = _M1047LivePrRunner(**state)
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+    )
+
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert runner.managed_deletes() == []
+    assert seen == [("recovery", "labels" not in state, state.get("draft", False))]
+
+
+def test_m1047_failed_automerge_ready_labeled_pr_is_normalized_on_retry(tmp_path, monkeypatch):
+    qualified = _m1047_managed_ci.QUALIFIED_LABEL
+    runner = _M1047LivePrRunner(labels=("agent-loop-managed", qualified))
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+    )
+
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert seen == [("recovery", False, False)]
+    assert runner.live_pr["labels"] == [{"name": qualified}]
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_m1047_entry_release_failure_stops_before_any_other_work(tmp_path, monkeypatch):
+    runner = _M1047LivePrRunner(delete_returncode=1)
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    for name in (
+        "recover_issue_created_handoff", "revalidate_issue_created_handoff",
+        "authenticate_source_managed_resume", "authorize_fresh_issue_created_resume",
+        "activate_managed_ci",
+    ):
+        monkeypatch.setattr(
+            orchestrator_module, name,
+            lambda *a, _name=name, **k: pytest.fail(f"{_name} ran after a failed entry release"),
+        )
+
+    with pytest.raises(AgentLoopError, match="Remove the label manually, then rerun"):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    writes = [
+        command for command, _cwd in runner.commands
+        if command[:1] in (["claude"], ["codex"])
+        or command[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"], ["gh", "pr", "comment"])
+        or (command[:2] == ["gh", "api"] and any(m in command for m in ("POST", "PATCH", "DELETE")))
+    ]
+    assert writes == runner.managed_deletes()
+    assert runner.live_pr["draft"] is False
+
+
+@pytest.mark.parametrize("delete_returncode", [0, 1], ids=["released", "delete-fails"])
+@pytest.mark.parametrize("labels", [("agent-loop-managed",), ()], ids=["labeled", "unlabeled"])
+def test_m1047_entry_normalization_uses_bootstrap_cwd_without_coder_checkout(
+    tmp_path, monkeypatch, delete_returncode, labels,
+):
+    config = make_config(tmp_path, create_dirs=False, managed_ci=True, max_rounds=1)
+    config.codex_dir.mkdir(parents=True)
+    assert not config.claude_dir.exists()
+    bootstrap = _m1047_bootstrap_cwd(config)
+    assert bootstrap == config.codex_dir
+    runner = _M1047LivePrRunner(labels=labels, delete_returncode=delete_returncode)
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+    )
+
+    expected = (
+        pytest.raises(AgentLoopError, match="Remove the label manually")
+        if labels and delete_returncode
+        else pytest.raises(_M1047Stop)
+    )
+    with expected:
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    normalization = [
+        (command, cwd) for command, cwd in runner.commands
+        if command == ["gh", "api", "repos/OWNER/REPO/pulls/77"] or command[:5] == _M1047_DELETE
+    ]
+    assert normalization
+    assert {cwd for _command, cwd in normalization} == {bootstrap}
+    assert not config.claude_dir.exists()
+    assert len(runner.managed_deletes()) == (1 if labels else 0)
+
+
+def _m1047_reach_publication(monkeypatch, runner, contract, *, dispatch_error=None):
+    monkeypatch.setattr(orchestrator_module, "recover_issue_created_handoff", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator_module, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(orchestrator_module, "dispatch_final_qualification", lambda *a, **k: None)
+
+    def wait(*args, **kwargs):
+        if dispatch_error is not None:
+            raise dispatch_error
+        return ManagedCiOutcome(status="passed", head_sha=runner.pr_payload.get("headRefOid"))
+
+    monkeypatch.setattr(orchestrator_module, "wait_for_final_qualification", wait)
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+@pytest.mark.parametrize("state", ["draft", "ready"])
+def test_m1047_failed_publication_releases_label_despite_preservation(
+    tmp_path, monkeypatch, origin, state,
+):
+    # Draft: the pre-readiness provenance read fails.  Ready: the first read
+    # succeeds, then the pre-record read and cleanup's read fail.
+    runner = _M1047LivePrRunner(
+        draft=True,
+        events_fail_from=0 if state == "draft" else 1,
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop", max_rounds=1)
+    contract = _m1047_contract(origin)
+    assert orchestrator_module._preserve_issue_created_managed_suppression(
+        contract, active_exception=AgentLoopError("any")
+    )
+    _m1047_reach_publication(monkeypatch, runner, contract)
+    release_calls = _m1047_release_spy(monkeypatch)
+
+    with pytest.raises(AgentLoopError, match="the head is not qualified"):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not runner.has_managed_label()
+    assert len(runner.managed_deletes()) == 1
+    assert runner.live_pr["draft"] is (state == "draft")
+    # Preservation still applies in the finally block, so no second release.
+    assert release_calls == []
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+def test_m1047_interruption_before_publication_still_preserves_label(tmp_path, monkeypatch, origin):
+    runner = _M1047LivePrRunner(
+        draft=True, codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    _m1047_reach_publication(
+        monkeypatch, runner, _m1047_contract(origin),
+        dispatch_error=AgentLoopError("dispatch lost"),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "publish_manual_v2_qualification",
+        lambda *a, **k: pytest.fail("publication must not run"),
+    )
+    release_calls = _m1047_release_spy(monkeypatch)
+
+    with pytest.raises(AgentLoopError, match="dispatch lost"):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert runner.has_managed_label() and runner.live_pr["draft"] is True
+    assert runner.managed_deletes() == []
+    assert release_calls == []
+
+
+def test_m1047_successful_publication_keeps_label_and_finally_does_not_release(
+    tmp_path, monkeypatch,
+):
+    runner = _M1047LivePrRunner(
+        draft=True, codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    _m1047_reach_publication(monkeypatch, runner, _m1047_contract("issue-created"))
+
+    def publish(*args, **kwargs):
+        runner.live_pr["draft"] = False
+        return kwargs["expected_head_sha"]
+
+    monkeypatch.setattr(orchestrator_module, "publish_manual_v2_qualification", publish)
+    release_calls = _m1047_release_spy(monkeypatch)
+
+    assert _m1047_run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert runner.has_managed_label() and runner.live_pr["draft"] is False
+    assert runner.managed_deletes() == []
+    assert release_calls == []
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+def test_m1047_reentry_that_aborts_before_publication_is_preserved_for_exact_resume(
+    tmp_path, monkeypatch, origin,
+):
+    runner = _M1047LivePrRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    contract = _m1047_contract(origin)
+    _m1047_reach_publication(
+        monkeypatch, runner, contract, dispatch_error=AgentLoopError("review aborted"),
+    )
+    observed_at_activation = []
+
+    def reenter(*args, **kwargs):
+        # Existing ready/unlabeled re-entry: `ready --undo` and reapply the label.
+        observed_at_activation.append((runner.has_managed_label(), runner.live_pr["draft"]))
+        runner.live_pr["draft"] = True
+        runner.live_pr["labels"] = [{"name": "agent-loop-managed"}]
+        return contract
+
+    monkeypatch.setattr(orchestrator_module, "activate_managed_ci", reenter)
+    release_calls = _m1047_release_spy(monkeypatch)
+
+    with pytest.raises(AgentLoopError, match="review aborted"):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert observed_at_activation == [(False, False)]
+    assert len(runner.managed_deletes()) == 1
+    assert release_calls == []
+    assert runner.has_managed_label() and runner.live_pr["draft"] is True
+
+    # The next invocation resumes through the draft/labeled path untouched.
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "activate_managed_ci", _m1047_recorder(runner, seen, "activation"),
+    )
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+    assert seen == [("activation", True, True)]
+    assert len(runner.managed_deletes()) == 1

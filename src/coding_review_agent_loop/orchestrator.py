@@ -238,6 +238,7 @@ from .managed_ci import (
     publish_round_readiness,
     refresh_ordinary_recovery_capability,
     release_adopted_managed_ci,
+    release_retained_managed_label,
     revalidate_adopted_managed_ci,
     revalidate_issue_created_handoff,
     recover_issue_created_handoff,
@@ -17951,6 +17952,18 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
+        # A successful manual qualification retains the managed label on the
+        # ready PR.  Release it before any managed-CI authentication so every
+        # downstream path sees the ready/unlabeled state it already handles.
+        if release_retained_managed_label(
+            runner, config=config, pr_number=pr_number, cwd=bootstrap_cwd,
+        ):
+            initial_pr_context = get_pr_review_context(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                cwd=bootstrap_cwd,
+            )
         issue_context_refreshed = False
         parent_issue_context_refreshed = False
         # A caller-provided issue snapshot may predate plan approval. Refresh

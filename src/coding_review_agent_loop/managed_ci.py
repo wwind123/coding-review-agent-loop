@@ -5134,37 +5134,160 @@ def release_adopted_managed_ci(
     return result.returncode == 0
 
 
-def _release_managed_label_for_manual_qualification(
+def _label_names_or_none(payload: object) -> set[str] | None:
+    """Return label names only for a well-formed PR payload, else None.
+
+    Only a JSON object whose ``labels`` is a list of objects with string
+    ``name`` fields proves label state; anything else is unreadable.
+    """
+    if not isinstance(payload, dict):
+        return None
+    labels = payload.get("labels")
+    if not isinstance(labels, list):
+        return None
+    names: set[str] = set()
+    for item in labels:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            return None
+        names.add(item["name"])
+    return names
+
+
+def _read_pr_payload(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path
+) -> dict[str, object] | None:
+    """Read the live PR in ``cwd``; None for any failed or malformed read."""
+    result = runner.run(
+        [config.gh_cmd, "api", f"repos/{config.repo}/pulls/{pr_number}"],
+        cwd=cwd, check=False,
+    )
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _delete_managed_label(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path
+) -> bool:
+    """DELETE the managed label; success or a strict HTTP 404 means it is absent.
+
+    Only gh's own unambiguous status diagnostic proves a 404, so incidental
+    or conflicting ``HTTP 404`` text never counts as absence.
+    """
+    result = runner.run(
+        [
+            config.gh_cmd, "api", "--method", "DELETE",
+            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
+        ], cwd=cwd, check=False,
+    )
+    if result.returncode == 0:
+        return True
+    return _http_status(result) == 404
+
+
+def _label_event_owned_by_contract(
+    event: tuple[int, str, int] | None, contract: ManagedCiContract
+) -> bool:
+    return bool(
+        event is not None
+        and contract.active_label_event_id is not None
+        and event[0] == contract.active_label_event_id
+        and event[1].casefold() == (contract.trusted_actor_login or "").casefold()
+        and event[2] == contract.trusted_actor_id
+    )
+
+
+def _verify_manual_qualification_label_provenance(
     runner: Runner,
     *,
     config: AgentLoopConfig,
     pr_number: int,
     contract: ManagedCiContract,
 ) -> None:
-    """Release only the authenticated active suppression before manual exit."""
+    """Require the contract's authenticated label event to still be active.
+
+    This never removes the label: a successful manual qualification retains it
+    so no ``unlabeled`` event re-runs ordinary CI on the qualified head.
+    """
     event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
-    if (
-        event is None
-        or contract.active_label_event_id is None
-        or event[0] != contract.active_label_event_id
-        or event[1].casefold() != (contract.trusted_actor_login or "").casefold()
-        or event[2] != contract.trusted_actor_id
-    ):
+    if not _label_event_owned_by_contract(event, contract):
         raise AgentLoopError(
             f"PR #{pr_number} managed-label provenance changed before manual qualification; "
             "the head is not qualified and no manual merge command is safe."
         )
-    result = runner.run(
-        [
-            config.gh_cmd, "api", "--method", "DELETE",
-            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
-        ], cwd=active_workdir(config), check=False,
+
+
+def _release_label_after_failed_publication(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    contract: ManagedCiContract,
+) -> str | None:
+    """Return a failed publication to ordinary CI; never raises.
+
+    A confirmed-absent label needs no write.  A contract-owned label, a label
+    whose provenance is unreadable (fail-open, as in
+    ``release_adopted_managed_ci``) and a label on an unreadable PR are
+    removed.  A readable foreign label event is left in place and reported.
+    Returns a message fragment when the label may still suppress ordinary CI.
+    """
+    manual = (
+        f"`{MANAGED_LABEL}` could not be removed and still suppresses ordinary CI; "
+        "remove it manually"
     )
-    if result.returncode != 0:
-        raise AgentLoopError(
-            f"PR #{pr_number} qualified CI passed, but `{MANAGED_LABEL}` could not be removed; "
-            "the PR remains suppressed and must not be manually merged until the label is removed."
-        )
+    try:
+        cwd = active_workdir(config)
+        try:
+            payload = _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
+        except Exception:
+            payload = None
+        labels = _label_names_or_none(payload)
+        if labels is not None:
+            if MANAGED_LABEL not in labels:
+                return None
+            try:
+                event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+            except Exception:
+                event = None
+            if event is None:
+                log(
+                    config,
+                    f"PR #{pr_number}: managed-label provenance is unreadable after a failed "
+                    f"qualification publication; removing `{MANAGED_LABEL}` fail-open",
+                )
+            elif not _label_event_owned_by_contract(event, contract):
+                return (
+                    f"a different `{MANAGED_LABEL}` label event is active and was left untouched; "
+                    "ordinary CI may still be suppressed; remove it manually if it is stale"
+                )
+        try:
+            removed = _delete_managed_label(runner, config=config, pr_number=pr_number, cwd=cwd)
+        except Exception:
+            removed = False
+        if removed:
+            log(
+                config,
+                f"PR #{pr_number}: released `{MANAGED_LABEL}` after a failed qualification "
+                "publication; ordinary CI resumes",
+            )
+            return None
+        return manual
+    except Exception:
+        return manual
+
+
+def _attach_cleanup_fragment(original: BaseException, fragment: str) -> None:
+    """Attach a cleanup fragment without changing the original error type."""
+    sentence = f"{fragment[0].upper()}{fragment[1:]}."
+    if isinstance(original, AgentLoopError) and original.args and isinstance(original.args[0], str):
+        original.args = (f"{original.args[0]} {sentence}", *original.args[1:])
+    else:
+        original.add_note(sentence)
 
 
 def publish_manual_v2_qualification(
@@ -5176,7 +5299,41 @@ def publish_manual_v2_qualification(
     contract: ManagedCiContract,
     reviewers: tuple[str, ...],
 ) -> str:
-    """Publish a SHA-bound manual result, release suppression, and ready the PR."""
+    """Publish a SHA-bound manual result on a ready PR that keeps its label.
+
+    The managed label is retained on success, so no ``unlabeled`` event
+    re-runs ordinary CI on the qualified head; it has no effect once the PR
+    is ready.  Any failure releases an owned or unprovable label before the
+    original error propagates, independent of the orchestrator's
+    interrupted-run preservation.
+    """
+    try:
+        return _publish_manual_v2_qualification(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            expected_head_sha=expected_head_sha,
+            contract=contract,
+            reviewers=reviewers,
+        )
+    except BaseException as original:
+        fragment = _release_label_after_failed_publication(
+            runner, config=config, pr_number=pr_number, contract=contract,
+        )
+        if fragment:
+            _attach_cleanup_fragment(original, fragment)
+        raise original
+
+
+def _publish_manual_v2_qualification(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    expected_head_sha: str,
+    contract: ManagedCiContract,
+    reviewers: tuple[str, ...],
+) -> str:
     if contract.protocol_version != 2:
         raise AgentLoopError("Explicit managed-CI manual qualification requires protocol v2.")
     if get_pr_head_sha(runner, config, pr_number) != expected_head_sha:
@@ -5201,24 +5358,24 @@ def publish_manual_v2_qualification(
         if removed.returncode != 0:
             raise AgentLoopError(f"Unable to clear stale `{QUALIFIED_LABEL}` from PR #{pr_number}.")
 
-    _release_managed_label_for_manual_qualification(
+    not_published = (
+        f"PR #{pr_number} changed before manual qualification publication; "
+        "its exact head is not safely published."
+    )
+    guard = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    guard_head = guard.get("head") if isinstance(guard.get("head"), dict) else {}
+    if (
+        guard_head.get("sha") != expected_head_sha
+        # An adopted PR is never readied here, so it must already be exactly
+        # non-draft; a missing or non-boolean value is not proof.
+        or (contract.adopted_existing_pr and guard.get("draft") is not False)
+    ):
+        raise AgentLoopError(not_published)
+    _verify_manual_qualification_label_provenance(
         runner, config=config, pr_number=pr_number, contract=contract,
     )
-    after_release = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
-    after_head = after_release.get("head") if isinstance(after_release.get("head"), dict) else {}
-    after_labels = {
-        item.get("name") for item in (after_release.get("labels") or [])
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
-    if (
-        after_head.get("sha") != expected_head_sha
-        or MANAGED_LABEL in after_labels
-        or (contract.adopted_existing_pr and after_release.get("draft") is True)
-    ):
-        raise AgentLoopError(
-            f"PR #{pr_number} changed while releasing managed CI; its exact head is not safely published."
-        )
 
+    changed = not_published
     if not contract.adopted_existing_pr:
         ready = runner.run(
             [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
@@ -5226,16 +5383,22 @@ def publish_manual_v2_qualification(
         )
         if ready.returncode != 0:
             raise AgentLoopError(f"Unable to mark qualified PR #{pr_number} ready for manual review.")
-        after_ready = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
-        ready_head = after_ready.get("head") if isinstance(after_ready.get("head"), dict) else {}
-        ready_labels = {
-            item.get("name") for item in (after_ready.get("labels") or [])
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        }
-        if ready_head.get("sha") != expected_head_sha or after_ready.get("draft") is True or MANAGED_LABEL in ready_labels:
-            raise AgentLoopError(
-                f"PR #{pr_number} changed while being made ready; the approved head is not safely published."
-            )
+        changed = (
+            f"PR #{pr_number} changed while being made ready; the approved head is not safely published."
+        )
+    after = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    after_head = after.get("head") if isinstance(after.get("head"), dict) else {}
+    after_labels = _label_names_or_none(after)
+    if (
+        after_head.get("sha") != expected_head_sha
+        or after.get("draft") is not False
+        or after_labels is None
+        or MANAGED_LABEL not in after_labels
+    ):
+        raise AgentLoopError(changed)
+    _verify_manual_qualification_label_provenance(
+        runner, config=config, pr_number=pr_number, contract=contract,
+    )
 
     run_text = str(contract.attached_run_id) if contract.attached_run_id is not None else "unknown"
     attempt_text = str(contract.run_attempt) if contract.run_attempt is not None else "unknown"
@@ -5250,7 +5413,9 @@ def publish_manual_v2_qualification(
         f"protection={contract.protection_mode or 'unknown'} nonce={contract.nonce or 'unknown'} "
         f"run_id={run_text} attempt={attempt_text} generation={contract.intent_generation or 'unknown'} -->\n\n"
         f"Managed exact-head CI qualified `{expected_head_sha}` for manual merge. "
-        "The managed suppression label was released and this SHA is the only advertised merge target."
+        "The managed label is retained so ordinary CI does not re-run on this qualified head; "
+        "it has no effect while the PR is ready. Removing the label, or re-running agent-loop "
+        "on this PR, returns it to ordinary CI."
     )
     if contract.protection_mode != "strict":
         body += (
@@ -5273,6 +5438,59 @@ def publish_manual_v2_qualification(
             f"PR #{pr_number} head changed after qualification publication; rerun review and exact-head CI."
         )
     return expected_head_sha
+
+
+def release_retained_managed_label(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path,
+) -> bool:
+    """Release a label retained on an open ready PR at PR-loop entry.
+
+    A successful manual qualification keeps ``agent-loop-managed`` on the
+    ready PR.  Every later invocation first returns such a PR to the
+    ready/unlabeled state the lifecycle already handles.  Removing a label
+    from a ready PR can only restore ordinary CI, so no provenance check is
+    needed.  Drafts, closed PRs, unlabeled PRs and malformed reads are left
+    untouched (downstream reads fail on malformed state as before).  Every
+    command runs in ``cwd`` because the coder checkout may not exist yet.
+    Returns True only when the label was removed and its absence confirmed.
+    """
+    pr = _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
+    labels = _label_names_or_none(pr)
+    if (
+        pr is None
+        or labels is None
+        or pr.get("state") != "open"
+        or pr.get("draft") is not False
+        or MANAGED_LABEL not in labels
+    ):
+        return False
+    failure = AgentLoopError(
+        f"PR #{pr_number} is ready and still carries `{MANAGED_LABEL}`; it could not be removed, "
+        "so no managed-CI or review work was started. Remove the label manually, then rerun."
+    )
+    # A runner exception (transport or subprocess failure) at either step is
+    # reported with the same manual remedy; the read-back may fail after the
+    # DELETE already succeeded, so absence is never assumed.
+    try:
+        removed = _delete_managed_label(runner, config=config, pr_number=pr_number, cwd=cwd)
+    except Exception as exc:
+        raise failure from exc
+    if not removed:
+        raise failure
+    try:
+        after = _label_names_or_none(
+            _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
+        )
+    except Exception as exc:
+        raise failure from exc
+    if after is None or MANAGED_LABEL in after:
+        raise failure
+    log(
+        config,
+        f"PR #{pr_number}: released retained `{MANAGED_LABEL}` from the ready PR at entry; "
+        "ordinary CI resumes and the run continues as ready/unlabeled",
+    )
+    return True
 
 
 def _api_json(runner: Runner, config: AgentLoopConfig, endpoint: str, *, quiet: bool = False) -> dict[str, object]:
