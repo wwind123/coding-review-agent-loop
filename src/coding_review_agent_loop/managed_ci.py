@@ -5560,7 +5560,14 @@ def publish_round_readiness(
     *,
     config: AgentLoopConfig,
     head_sha: str,
-) -> None:
+) -> bool:
+    """Publish the informational ``agent-loop/round-readiness`` status.
+
+    The status is non-required: nothing gates on it (the authoritative gate is
+    the workflow-published exact-head status), so a refused write is logged and
+    the round continues.  Some hosts refuse every commit-status write, e.g. a
+    Claude Code cloud session's proxy (#1052).  Returns whether it was published.
+    """
     result = runner.run(
         [
             config.gh_cmd,
@@ -5579,7 +5586,14 @@ def publish_round_readiness(
         check=False,
     )
     if result.returncode != 0:
-        raise AgentLoopError(f"Unable to publish `{READINESS_CONTEXT}` for {head_sha}.")
+        detail = ((result.stderr or "").strip().splitlines() or [f"exit {result.returncode}"])[-1]
+        log(
+            config,
+            f"Warning: could not publish the non-required `{READINESS_CONTEXT}` status for "
+            f"{head_sha} ({detail}); continuing, since nothing gates on it.",
+        )
+        return False
+    return True
 
 
 def dispatch_final_qualification(
