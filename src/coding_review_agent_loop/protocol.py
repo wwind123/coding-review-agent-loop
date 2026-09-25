@@ -1388,7 +1388,50 @@ RISK_MATRIX_EVIDENCE_STATUSES = frozenset(
         "stale/unverified", "incomplete",
     }
 )
-_RISK_ROW_ID_RE = re.compile(r"^(?!.*(?:^|[-_.])(item|finding|review|blocker)[-_.]?\d)(?!hr-)[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Row-ID syntax is ASCII and case-sensitive; the reserved namespaces below are
+# a separate, case-insensitive rule layered on top of it.
+_RISK_ROW_ID_SYNTAX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# The single declaration of the identifier namespaces a matrix row ID may not
+# imitate (#1016): reviewer finding IDs and signed-requirement IDs.  Both the
+# row-ID validator and the diagnostic-preview neutralizer consume it, so they
+# cannot disagree.  Within an identifier-like span, a finding token is reserved
+# at the span start or right after ``-``/``_``/``.`` when an optional separator
+# and a digit follow; the requirement prefix is reserved only at the span start.
+RESERVED_FINDING_NAMESPACE_TOKENS = ("item", "finding", "review", "blocker")
+RESERVED_REQUIREMENT_PREFIX = "hr-"
+_RESERVED_NAMESPACE_SEPARATORS = "-_."
+_RESERVED_FINDING_AT_RE = re.compile(
+    r"(?:" + "|".join(RESERVED_FINDING_NAMESPACE_TOKENS) + r")[-_.]?(?=\d)",
+    re.IGNORECASE | re.ASCII,
+)
+_RESERVED_REQUIREMENT_AT_RE = re.compile(re.escape(RESERVED_REQUIREMENT_PREFIX), re.IGNORECASE | re.ASCII)
+# Identifier-like spans in free text: maximal runs of the row-ID character class.
+_IDENTIFIER_LIKE_SPAN_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _reserved_namespace_match_at(span: str, pos: int, *, span_start: int) -> re.Match[str] | None:
+    """Return the reserved-namespace match at ``pos`` of ``span``, if any."""
+    if pos == span_start:
+        match = _RESERVED_REQUIREMENT_AT_RE.match(span, pos)
+        if match is not None:
+            return match
+    elif span[pos - 1] not in _RESERVED_NAMESPACE_SEPARATORS:
+        return None
+    return _RESERVED_FINDING_AT_RE.match(span, pos)
+
+
+def _has_reserved_namespace(span: str) -> bool:
+    """Whether ``span``, read as one identifier-like span, imitates a reserved ID."""
+    return any(
+        _reserved_namespace_match_at(span, pos, span_start=0) is not None
+        for pos in range(len(span))
+    )
+
+
+def _is_valid_risk_row_id(row_id: str) -> bool:
+    return bool(_RISK_ROW_ID_SYNTAX_RE.fullmatch(row_id)) and not _has_reserved_namespace(row_id)
+
+
 # Stage IDs are approved-plan identifiers, not a second, narrower namespace.
 # Topology validation checks membership in the approved recommendation; this
 # parser must accept valid IDs such as ``api`` and ``s1`` as well as the older
@@ -1491,7 +1534,7 @@ class RiskTestMatrixChange:
 
 def _validate_risk_row_id(value: object, *, context: str) -> str:
     row_id = _risk_bounded_string(value, context=context, max_bytes=128)  # shape-check: fatal:no-conservative-reading
-    if not _RISK_ROW_ID_RE.fullmatch(row_id):
+    if not _is_valid_risk_row_id(row_id):
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             f"{context} must be a matrix-specific identifier and may not resemble a reviewer finding ID."
         )
@@ -2039,16 +2082,36 @@ CLAIM_RESERVED_AUTHORITY_KEYS = frozenset(
 )
 
 
-# Identifier shapes a malformed row ID may imitate: reviewer finding IDs and
-# signed-requirement IDs, the same namespaces ``_RISK_ROW_ID_RE`` refuses.
-_RESERVED_IDENTIFIER_LIKE_RE = re.compile(r"(item|finding|review|blocker)[-_.]?(?=\d)|hr-", re.I)
+def _neutralize_identifier_like_span(span: str) -> str:
+    """Break every reserved-namespace match in one identifier-like span.
+
+    One left-to-right scan: each match is replaced by its token (trailing
+    separator stripped) plus a middle dot, and matching restarts right after
+    it as a fresh span start, so a chained ``hr-hr-2`` becomes ``hr\u00b7hr\u00b72``
+    in one pass and no span of the output is still reserved (#1016).
+    """
+    pieces: list[str] = []
+    emitted = span_start = pos = 0
+    while pos < len(span):
+        match = _reserved_namespace_match_at(span, pos, span_start=span_start)
+        if match is None:
+            pos += 1
+            continue
+        pieces.append(span[emitted:pos])
+        pieces.append(match.group(0).rstrip(_RESERVED_NAMESPACE_SEPARATORS) + "\u00b7")
+        emitted = span_start = pos = match.end()
+    pieces.append(span[emitted:])
+    return "".join(pieces)
 
 
 def _neutralize_identifier_like(text: str) -> str:
-    """Break finding- and requirement-like tokens so a preview cannot read as one (#926)."""
-    return _RESERVED_IDENTIFIER_LIKE_RE.sub(
-        lambda match: re.sub(r"[-_.]$", "", match.group(0)) + "\u00b7", text
-    )
+    """Break finding- and requirement-like tokens so a preview cannot read as one (#926).
+
+    Applies the single reserved-namespace declaration that row-ID validation
+    refuses (``RESERVED_FINDING_NAMESPACE_TOKENS``/``RESERVED_REQUIREMENT_PREFIX``)
+    to each identifier-like span of free text (#1016).
+    """
+    return _IDENTIFIER_LIKE_SPAN_RE.sub(lambda match: _neutralize_identifier_like_span(match.group(0)), text)
 
 
 def _degraded_row_claim_message(record: ParseDegradation) -> str:
@@ -4161,8 +4224,9 @@ def _parse_semantic_risk_coverage_claims(
             # claimed, which is stricter than losing every other valid claim.
             assert row_id is not None
             unapproved_row_id = row_id
-            # The row-ID pattern is case-sensitive, so a valid unapproved ID
-            # such as ``Item9`` can still imitate a finding ID.
+            # A valid row ID never matches a reserved namespace, so this is
+            # the identity and keeps exact attribution (#1016); it stays as
+            # defence in depth.
             defect = (row_id_context, CLAIM_ROW_ID_UNAPPROVED_RULE, _neutralize_identifier_like(row_id))
         elif defect is None and row_counts.get(row_id, 0) > 1:
             defect = (row_id_context, CLAIM_ROW_ID_DUPLICATE_RULE, row_id)
