@@ -9717,9 +9717,18 @@ def test_older_workflow_guard_after_dispatch_claims_no_qualification(tmp_path, m
 # --- #1047: qualified ready/labeled PR through real recovery and activation ---
 
 
-def _qualified_ready_labeled_runner(**kwargs):
-    """A strict issue-created PR left ready and labeled by manual qualification."""
-    body = "Fixes #643"
+def _qualified_ready_labeled_runner(origin="issue-created", **kwargs):
+    """A strict managed PR left ready and labeled by manual qualification.
+
+    An issue-created PR carries the canonical closing reference; a
+    source-managed PR carries the loop-created source record instead.
+    """
+    if origin == "source-managed":
+        from coding_review_agent_loop.managed_pr import _source_marker
+
+        body = str(_source_marker(source_branch="feature/source", source_sha="source-sha"))
+    else:
+        body = "Fixes #643"
     return ManualQualificationRunner(
         workflow=SUPPRESSING_V2_WORKFLOW,
         issue_payload={"number": 643},
@@ -9766,10 +9775,12 @@ def _lifecycle_writes(runner):
     return writes
 
 
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
 def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_abort(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, origin,
 ):
     runner = _qualified_ready_labeled_runner(
+        origin,
         codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
     )
     config = make_config(
@@ -9784,6 +9795,15 @@ def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_a
     )
     captured = {}
     real_activate = orchestrator.activate_managed_ci
+    real_source_auth = orchestrator.authenticate_source_managed_resume
+    source_auth_calls = []
+
+    def source_auth(*args, **kwargs):
+        # Record the live state the real source-managed classifier observed.
+        source_auth_calls.append(
+            (_lifecycle_writes(runner), runner.rest_pr["draft"], list(runner.rest_pr["labels"]))
+        )
+        return real_source_auth(*args, **kwargs)
 
     def activate(*args, **kwargs):
         captured["resume"] = kwargs.get("managed_resume")
@@ -9796,6 +9816,7 @@ def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_a
         raise AgentLoopError("dispatch aborted")
 
     monkeypatch.setattr(orchestrator, "activate_managed_ci", activate)
+    monkeypatch.setattr(orchestrator, "authenticate_source_managed_resume", source_auth)
     monkeypatch.setattr(orchestrator, "dispatch_final_qualification", abort_dispatch)
     monkeypatch.setattr(
         orchestrator, "publish_manual_v2_qualification",
@@ -9811,7 +9832,15 @@ def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_a
     assert captured["resume"].lifecycle == "ready-unlabeled-reentry"
     contract = captured["contract"]
     assert contract is not None and contract.activation_path == "managed"
-    assert contract.origin == "issue-created"
+    assert captured["resume"].origin == origin
+    assert contract.origin == origin
+    if origin == "source-managed":
+        # Real source-managed authentication ran once, after the entry
+        # release, and saw the ready/unlabeled state.
+        assert source_auth_calls == [(["label-delete"], False, [])]
+        assert captured["resume"].source_branch == "feature/source"
+    else:
+        assert source_auth_calls == []
     assert orchestrator._preserve_issue_created_managed_suppression(
         contract, active_exception=AgentLoopError("dispatch aborted"),
     )
@@ -9832,6 +9861,7 @@ def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_a
         orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     assert reached.value.args[0].lifecycle == "draft-labeled"
+    assert reached.value.args[0].origin == origin
     later = [command for command, _cwd in runner.commands[before:]]
     assert not any(command[:4] == ["gh", "api", "--method", "DELETE"] for command in later)
     assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
