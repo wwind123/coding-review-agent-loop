@@ -149,7 +149,9 @@ from .github import (
     post_trusted_pr_comment,
     post_verified_trusted_issue_round_comment,
     post_verified_trusted_issue_protocol_comment,
+    note_host_footer_observed,
     reset_authenticated_github_actor,
+    reset_host_footer_log_latch,
     resolve_authenticated_github_actor,
     reject_forged_protocol_markers,
     search_issues,
@@ -2523,6 +2525,11 @@ def _agent_failure_classification_text(
 
 
 def _new_usage_context(config: AgentLoopConfig) -> RunUsageContext:
+    # Invariant: only the run entries that own a usage context call this
+    # (run_issue_loop, run_task_loop, run_pr_loop, run_discuss_loop), so each
+    # owning invocation starts a fresh host-footer log latch, while a nested
+    # run that received a usage context shares the outer latch (#1043).
+    reset_host_footer_log_latch()
     run_id = new_run_id()
     return RunUsageContext(run_id=run_id, summary_path=run_usage_summary_path(config, run_id))
 
@@ -11022,6 +11029,7 @@ def _recover_current_plan_validation_diagnostic(
         architecture_contract_version=architecture_version,
         execution_strategy_contract_version=execution_version,
         risk_test_matrix_contract_version=matrix_version,
+        on_host_footer=lambda ctx: note_host_footer_observed(config, ctx),
     )
 
 
@@ -11059,6 +11067,7 @@ def _persist_exhausted_plan_validation_diagnostic(
             architecture_contract_version=architecture_version,
             execution_strategy_contract_version=execution_version,
             risk_test_matrix_contract_version=matrix_version,
+            on_host_footer=lambda ctx: note_host_footer_observed(config, ctx),
         )
         payload = PlanValidationDiagnosticPayload(
             repository=config.repo,

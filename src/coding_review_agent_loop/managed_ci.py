@@ -29,9 +29,12 @@ from .github import (
     get_pr_checks,
     get_pr_head_sha,
     get_pr_mergeability,
+    note_host_footer_observed,
     parse_strong_issue_reference_evidence,
-    patch_verified_trusted_protocol_comment,
+    patch_verified_trusted_protocol_comment_observed,
     post_verified_trusted_pr_protocol_comment,
+    post_verified_trusted_pr_protocol_comment_observed,
+    WrittenProtocolComment,
 )
 from .logging import log
 from .runner import Runner
@@ -41,8 +44,10 @@ from .protocol_markers import (
     PR_BODY_SURFACE,
     PR_COMMENT_SURFACE,
     TrustedBody,
+    KNOWN_HOST_COMMENT_FOOTER,
     protocol_record_label,
     scan_reserved_markers,
+    strip_known_host_footer,
 )
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
 
@@ -67,6 +72,10 @@ RECOVERY_MARKER = "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1"
 # Advertised by a base workflow whose intent validator admits the fixed
 # visible authorization line ahead of the record (#935).
 VISIBLE_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1"
+# Advertised by a base workflow whose intent validator admits the record
+# followed by exactly the known host comment footer, matched against the raw
+# comment body (#1043).
+HOST_FOOTER_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1"
 UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
 ISSUE_AUTHORIZATION_MARKER = "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1"
 _TERMINAL_CI_STATUSES = frozenset({
@@ -213,6 +222,13 @@ class ManagedCiContract:
     # Derived from the same base workflow. Only a workflow that advertises
     # the visible-intent envelope may receive the prefixed intent body.
     visible_intent_capable: bool = False
+    # Derived from the same base workflow. Only a workflow that advertises
+    # the host-footer envelope can find an intent a footering host stored.
+    host_footer_capable: bool = False
+    # True once this generation issued a workflow dispatch or attached an
+    # existing run.  The ``dispatch-requested`` lifecycle state is never
+    # evidence of a dispatch.
+    dispatch_issued: bool = False
     # Explicit lifecycle provenance.  These fields are intentionally not
     # inferred from public mode flags after activation.
     origin: Literal["issue-created", "source-managed"] | None = None
@@ -469,7 +485,7 @@ def parse_issue_created_authorization_comment(
         raise AgentLoopError(
             "Managed-CI continuity authorization requires predecessor and round metadata."
         )
-    return ManagedCiIssueAuthorization(
+    parsed = ManagedCiIssueAuthorization(
         kind=kind,
         repository=payload["repository"],
         issue_number=payload["issue"],
@@ -487,6 +503,19 @@ def parse_issue_created_authorization_comment(
         round_comment_ids=tuple(round_comment_ids),
         approved_plan_hash=plan_hash,
     )
+    # Full-body authentication (#1043): the whole body must equal the canonical
+    # rendering of the parsed record, or exactly the historical marker-only
+    # rendering that predates the visible label (#878).  Callers remove the
+    # known host footer once at their ingestion boundary; this parser never
+    # strips, so a doubled, misplaced, or variant footer, or any other prose,
+    # is rejected here.
+    historical = (
+        f"<!-- {ISSUE_AUTHORIZATION_MARKER}: "
+        f"{_encode_issue_authorization_payload(parsed.to_payload())} -->"
+    )
+    if body not in {str(format_issue_created_authorization_comment(parsed)), historical}:
+        raise AgentLoopError("Managed-CI issue authorization record is malformed.")
+    return parsed
 
 
 def parse_managed_ci_override_record(
@@ -1636,7 +1665,7 @@ def _authorization_comment_records(
         raise AgentLoopError("Managed-CI authorization comments could not be inspected.")
     records: list[tuple[int, ManagedCiIssueAuthorization]] = []
     for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        body = _normalized_comment_body(comment, config=config)
         if ISSUE_AUTHORIZATION_MARKER not in body:
             continue
         try:
@@ -2931,7 +2960,7 @@ def _recover_issue_created_protection(
         raise refuse("the authorization comments could not be inspected")
     records: list[tuple[Mapping[str, object], ManagedCiIssueAuthorization]] = []
     for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        body = _normalized_comment_body(comment, config=config)
         user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
         if (
             ISSUE_AUTHORIZATION_MARKER not in body
@@ -3636,7 +3665,7 @@ def verify_managed_pr_plan_binding(
         raise fail("the PR authorization comments could not be inspected")
     records: list[tuple[int, ManagedCiIssueAuthorization]] = []
     for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        body = _normalized_comment_body(comment, config=config)
         if ISSUE_AUTHORIZATION_MARKER not in body:
             continue
         try:
@@ -3970,7 +3999,7 @@ def _find_resume_audit(
     authorization_candidates: list[tuple[int, ManagedCiIssueAuthorization]] = []
     malformed = False
     for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        body = _normalized_comment_body(comment, config=config)
         if ISSUE_AUTHORIZATION_MARKER in body:
             try:
                 authorization = parse_issue_created_authorization_comment(body)
@@ -4223,6 +4252,7 @@ def _activate_v2_managed_ci(
         RECOVERY_MARKER in workflow_text and "pull_request" in workflow_text and "unlabeled" in workflow_text
     )
     visible_intent_capable = VISIBLE_INTENT_MARKER in workflow_text
+    host_footer_capable = HOST_FOOTER_INTENT_MARKER in workflow_text
 
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -4809,6 +4839,7 @@ def _activate_v2_managed_ci(
         invocation_applied_label=label_applied,
         ordinary_recovery_capable=ordinary_recovery_capable,
         visible_intent_capable=visible_intent_capable,
+        host_footer_capable=host_footer_capable,
         origin=origin,
         lifecycle=lifecycle,
         authenticated_resume=managed_resume,
@@ -4834,6 +4865,24 @@ def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[di
     if not all(isinstance(item, dict) for item in payload):
         return None
     return payload
+
+
+def _normalized_comment_body(
+    comment: Mapping[str, object], *, config: AgentLoopConfig | None
+) -> str:
+    """Return one raw ``_api_list`` comment body with the host footer removed once.
+
+    This is the managed-CI comment-ingestion boundary (#1043).  Strict record
+    parsers downstream never strip, so exactly one known host footer is
+    tolerated along any path and a doubled footer still reaches the parser.
+    """
+    raw = comment.get("body")
+    if not isinstance(raw, str):
+        return ""
+    body, footered = strip_known_host_footer(raw)
+    if footered:
+        note_host_footer_observed(config, "managed-CI record re-read")
+    return body
 
 
 def _active_managed_label_event(
@@ -5008,6 +5057,7 @@ def _activate_v2_existing_pr_adoption(
         adopted_existing_pr=True, guard_head_sha=live_sha, active_label_event_id=existing[0],
         invocation_applied_label=applied,
         visible_intent_capable=VISIBLE_INTENT_MARKER in source,
+        host_footer_capable=HOST_FOOTER_INTENT_MARKER in source,
         intent_generation=(
             secrets.token_urlsafe(16)
             if config.managed_ci
@@ -5389,6 +5439,10 @@ def _dispatch_v2_qualification(
         _ensure_v2_intent(
             runner, config=config, pr_number=pr_number, expected_head_sha=expected_head_sha, contract=contract
         )
+    except (ManagedCiHostFooterIncompatibleError, ManagedCiIntentLedgerError):
+        # Terminal operator-action errors: ordinary recovery would release
+        # suppression around a ledger the workflow rejects or cannot see.
+        raise
     except AgentLoopError as exc:
         if not config.managed_ci_pr_mode and contract.authenticated_resume is None:
             raise
@@ -5442,7 +5496,18 @@ def _dispatch_v2_qualification(
         _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
     attached = _discover_v2_run(runner, config=config, contract=contract, retries=3)
     if attached is None:
-        _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+        # This PATCH directly precedes a dispatch, so it renews created_at in
+        # place: the workflow's dispatch validator bounds the record's age,
+        # and a recovered record may be stale or future-dated.  Same comment,
+        # nonce, and generation; no second intent is posted.
+        contract.created_at = int(time.time())
+        patch_result = _patch_intent(
+            runner, config=config, contract=contract, state="dispatch-requested"
+        )
+        _require_workflow_dispatch_authorization(
+            runner, config=config, contract=contract, patch_result=patch_result
+        )
+        contract.dispatch_issued = True
         result = runner.run(
             [
                 config.gh_cmd,
@@ -5470,6 +5535,7 @@ def _dispatch_v2_qualification(
             )
         attached = _discover_v2_run(runner, config=config, contract=contract, retries=3)
     if attached is not None:
+        contract.dispatch_issued = True
         contract.attached_run_id = attached[0]
         contract.run_attempt = attached[1]
         contract.terminal_outcome = None
@@ -5558,6 +5624,7 @@ def _reset_v2_intent_generation(contract: ManagedCiContract) -> None:
     contract.terminal_attempts = ()
     contract.terminal_outcome = None
     contract.intent_state = None
+    contract.dispatch_issued = False
 
 
 def _restore_v2_intent_fields(contract: ManagedCiContract, intent: dict[str, object]) -> None:
@@ -5576,6 +5643,13 @@ def _restore_v2_intent_fields(contract: ManagedCiContract, intent: dict[str, obj
     nonce = intent.get("nonce")
     if not isinstance(nonce, str) or not nonce:
         raise AgentLoopError("Managed-CI v2 intent comment lacks a nonce.")
+    if not re.fullmatch(INTENT_NONCE_PATTERN, nonce):
+        # The workflow requires this exact token shape; never resume a nonce
+        # its validator would fail.
+        raise ManagedCiIntentLedgerError(
+            "Managed-CI v2 intent comment carries a malformed nonce; repair or delete "
+            "the intent comment and resume."
+        )
     contract.nonce = nonce
     contract.created_at = intent.get("created_at") if isinstance(intent.get("created_at"), int) else None
     contract.attached_run_id = intent.get("run_id") if isinstance(intent.get("run_id"), int) else None
@@ -5659,26 +5733,42 @@ def _ensure_v2_intent(
     contract.pr_number = pr_number
     contract.expected_head_sha = expected_head_sha
     contract.repository = config.repo
-    comments = _api_list(
-        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+    trusted_login = _intent_producer_login(contract)
+    trusted_id = _intent_producer_id(contract)
+    page = _read_intent_comment_page(runner, config, pr_number)
+    # Every nonce-independent failure the workflow would raise for any nonce,
+    # including a freshly minted one, stops here: nothing is adopted, posted,
+    # or dispatched while such a comment exists.
+    fatal = intent_page_pre_nonce_fatal(
+        page,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=contract.visible_intent_capable,
+        host_footer_capable=contract.host_footer_capable,
     )
-    if comments is None:
-        raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
-    matching: list[tuple[int, dict[str, object]]] = []
-    for raw in comments:
-        body = raw.get("body")
-        author = raw.get("user") if isinstance(raw.get("user"), dict) else {}
-        if not isinstance(body, str) or INTENT_MARKER not in body:
+    if fatal is not None:
+        raise ManagedCiIntentLedgerError(
+            f"PR #{pr_number}: the managed-CI v2 intent ledger holds a comment the base workflow "
+            f"rejects ({fatal}); repair or delete that comment and resume."
+        )
+    # Candidates are trusted, envelope-matching, version-2 object payloads for
+    # this PR head and generation, including malformed ones: the workflow's
+    # verdict for that nonce decides whether one is adoptable.
+    candidates: dict[str, object] = {}
+    for raw in page:
+        assert isinstance(raw, dict)  # guaranteed by the fatal scan above
+        user = raw["user"]
+        assert isinstance(user, dict)
+        if user.get("login") != trusted_login:
             continue
-        if author.get("login") != contract.trusted_actor_login or author.get("id") != contract.trusted_actor_id:
+        match = match_intent_envelope(
+            raw.get("body"),
+            visible_capable=contract.visible_intent_capable,
+            host_footer_capable=contract.host_footer_capable,
+        )
+        if match is None:
             continue
-        try:
-            encoded = body.split(INTENT_MARKER, 1)[1].split("-->", 1)[0].strip()
-            intent = json.loads(encoded)
-        except (IndexError, json.JSONDecodeError):
-            continue
-        if not isinstance(intent, dict):
-            continue
+        intent = json.loads(match.group("payload"))
         if intent.get("repository") != config.repo:
             continue
         if contract.intent_generation is not None and intent.get("generation") != contract.intent_generation:
@@ -5690,17 +5780,33 @@ def _ensure_v2_intent(
                     "it will not be attached to this invocation",
                 )
             continue
-        if intent.get("pr") == pr_number and intent.get("expected_head_sha") == expected_head_sha:
-            cid = raw.get("id")
-            if isinstance(cid, int):
-                matching.append((cid, intent))
-    distinct = {str(item.get("nonce")) for _, item in matching}
-    if len(distinct) > 1:
+        if intent.get("pr") != pr_number or intent.get("expected_head_sha") != expected_head_sha:
+            continue
+        nonce = intent.get("nonce")
+        candidates[json.dumps(nonce, sort_keys=True)] = nonce
+    if len(candidates) > 1:
         raise AgentLoopError("Competing managed-CI v2 intent comments exist for this PR head.")
-    if matching:
-        contract.intent_comment_id, intent = matching[-1]
-        _restore_v2_intent_fields(contract, intent)
-        contract.intent_comment_id = matching[-1][0]
+    if candidates:
+        (candidate,) = candidates.values()
+        verdict = classify_intent_page(
+            page,
+            requested_nonce=candidate,
+            trusted_login=trusted_login,
+            trusted_id=trusted_id,
+            visible_capable=contract.visible_intent_capable,
+            host_footer_capable=contract.host_footer_capable,
+            binding=_intent_binding(contract, nonce=candidate),
+        )
+        if verdict.outcome == "fail" or verdict.record is None or verdict.comment_id is None:
+            raise ManagedCiIntentLedgerError(
+                f"PR #{pr_number}: the managed-CI v2 intent for this head is one the base workflow "
+                f"rejects ({verdict.reason}); repair or delete the intent comment and resume."
+            )
+        # A lone valid record of this generation is adopted whatever its
+        # age: the dispatch-requested PATCH that precedes a dispatch renews
+        # created_at in place.
+        _restore_v2_intent_fields(contract, verdict.record)
+        contract.intent_comment_id = verdict.comment_id
         return
     _reset_v2_intent_generation(contract)
     contract.nonce = secrets.token_urlsafe(24)
@@ -5708,20 +5814,24 @@ def _ensure_v2_intent(
     body = _intent_body(contract, pr_number=pr_number, expected_head_sha=expected_head_sha, state="prepared")
     # The create is verified against the stored body and the authenticated
     # producer; a numeric ID alone is not proof the ledger was persisted.
-    contract.intent_comment_id = post_verified_trusted_pr_protocol_comment(
+    written = post_verified_trusted_pr_protocol_comment_observed(
         runner,
         config=config,
         pr_number=pr_number,
         body=body,
-        expected_author_login=_intent_producer_login(contract),
-        expected_author_id=_intent_producer_id(contract),
+        expected_author_login=trusted_login,
+        expected_author_id=trusted_id,
     )
+    _guard_host_footer_compatibility(contract, written, pr_number=pr_number)
+    contract.intent_comment_id = written.comment_id
     contract.intent_state = "prepared"
 
 
-def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract, state: str) -> None:
+def _patch_intent(
+    runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract, state: str
+) -> WrittenProtocolComment | None:
     if contract.intent_comment_id is None or contract.nonce is None:
-        return
+        return None
     _validate_v2_intent_publication(contract, state=state)
     body = _intent_body(
         contract,
@@ -5732,7 +5842,7 @@ def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedC
     # The immutable identifying fields are already in the original marker;
     # state updates add only live provenance and are still actor-owned.  The
     # stored body and producer are read back before the state is recorded.
-    patch_verified_trusted_protocol_comment(
+    written = patch_verified_trusted_protocol_comment_observed(
         runner,
         config=config,
         comment_id=contract.intent_comment_id,
@@ -5740,7 +5850,489 @@ def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedC
         expected_author_login=_intent_producer_login(contract),
         expected_author_id=_intent_producer_id(contract),
     )
+    _guard_host_footer_compatibility(contract, written, pr_number=contract.pr_number)
     contract.intent_state = state
+    return written
+
+
+def _guard_host_footer_compatibility(
+    contract: ManagedCiContract, written: WrittenProtocolComment, *, pr_number: int | None
+) -> None:
+    """Stop when the host footered an intent that the base workflow cannot see.
+
+    An older base workflow fullmatches only the unfootered envelope, so it
+    would skip this intent: a dispatch would fail to find its authorization,
+    and an already-dispatched run can no longer be trusted to qualify.
+    """
+    if not written.host_footer_observed or contract.host_footer_capable:
+        return
+    phase: Literal["pre-dispatch", "post-dispatch"] = (
+        "post-dispatch"
+        if contract.dispatch_issued or contract.attached_run_id is not None
+        else "pre-dispatch"
+    )
+    raise ManagedCiHostFooterIncompatibleError(pr_number=pr_number, phase=phase, run_id=contract.attached_run_id)
+
+
+class ManagedCiHostFooterIncompatibleError(AgentLoopError):
+    """A footering host wrote an intent that an older base workflow would skip.
+
+    Terminal and exempt from ordinary recovery: the operator must merge the
+    workflow that advertises ``AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1`` first.
+    """
+
+    def __init__(
+        self,
+        *,
+        pr_number: int | None,
+        phase: Literal["pre-dispatch", "post-dispatch"],
+        run_id: int | None = None,
+    ) -> None:
+        self.phase = phase
+        subject = f"PR #{pr_number}" if pr_number is not None else "The managed PR"
+        if phase == "pre-dispatch":
+            outcome = "No managed-CI run was dispatched."
+        else:
+            run_text = f" ({run_id})" if run_id is not None else ""
+            outcome = (
+                f"The managed-CI run already dispatched{run_text} is left in place, "
+                "is not cancelled, and does not qualify this head."
+            )
+        super().__init__(
+            f"{subject}: this host appended its known comment footer to the managed-CI intent "
+            f"record, but the base workflow does not advertise {HOST_FOOTER_INTENT_MARKER} and "
+            f"would skip the footered intent ({phase}). {outcome} Merge the updated "
+            f".github/workflows/ci.yml into the base branch, or run from a host that does not "
+            "footer comments, then resume."
+        )
+
+
+class ManagedCiIntentLedgerError(AgentLoopError):
+    """The PR's intent ledger holds a state the base workflow would fail.
+
+    Terminal and exempt from ordinary recovery; the message names the
+    offending comment so the operator can repair or delete it and resume.
+    """
+
+
+class ManagedCiIntentFreshnessError(ManagedCiIntentLedgerError):
+    """The renewed intent would fall outside the workflow's age window."""
+
+
+# Mirror of the base workflow's MANAGED_CI_V2_VALIDATOR block in
+# .github/workflows/ci.yml.  Keep the key set, patterns, states, envelope
+# forms, and failure order in lockstep with that block; the page-level
+# parity test runs both against one corpus.
+INTENT_REQUIRED_KEYS = frozenset({
+    "version", "repository", "pr", "expected_head_sha", "base_ref",
+    "workflow_revision", "generation", "nonce", "created_at", "state",
+    "run_id", "run_attempt", "terminal_run_id", "terminal_run_attempt",
+    "terminal_outcome", "terminal_attempts",
+})
+INTENT_ALLOWED_STATES = frozenset({"prepared", "dispatch-requested", "attached", "completed"})
+INTENT_SHA_PATTERN = r"[0-9a-f]{40}"
+INTENT_NONCE_PATTERN = r"[A-Za-z0-9_-]{32}"
+_INTENT_VISIBLE_LINE = r"(?:Managed CI authorization for exact head (?P<visible_sha>[0-9a-f]{40})\.\n\n)?"
+_INTENT_RECORD = r"<!-- AGENT_MANAGED_CI_INTENT_V2 (?P<payload>.*?) -->"
+_INTENT_ENVELOPE_RE = re.compile(r"^" + _INTENT_VISIBLE_LINE + _INTENT_RECORD + r"$")
+_INTENT_FOOTERED_ENVELOPE_RE = re.compile(
+    _INTENT_VISIBLE_LINE + _INTENT_RECORD + re.escape(KNOWN_HOST_COMMENT_FOOTER)
+)
+# The workflow's dispatch validator (MANAGED_CI_V2_DISPATCH_VALIDATOR) bounds
+# the record's age in both directions.  The start margin covers queue and
+# runner start-up latency between this gate and that validator.
+INTENT_MAX_AGE_SECONDS = 15 * 60
+INTENT_MAX_FUTURE_SKEW_SECONDS = 5 * 60
+DISPATCH_START_MARGIN_SECONDS = 5 * 60
+
+
+@dataclass(frozen=True)
+class IntentBinding:
+    """The PR/head tuple a workflow binds an intent record to."""
+
+    repository: str | None
+    pr: int | None
+    expected_head_sha: str | None
+    base_ref: str | None
+    workflow_revision: str | None
+    nonce: object
+    require_generation: bool = True
+
+
+@dataclass(frozen=True)
+class IntentPageVerdict:
+    """The workflow's decision for one requested nonce over one comment page.
+
+    ``recoverable`` is a lone valid ``prepared`` record: the workflow fails it
+    as not yet a dispatch authorization, but the producer may advance it.
+    """
+
+    outcome: Literal["fail", "recoverable", "authorized"]
+    record: dict[str, object] | None = None
+    comment_id: int | None = None
+    reason: str | None = None
+
+
+def _intent_binding(contract: ManagedCiContract, *, nonce: object) -> IntentBinding:
+    return IntentBinding(
+        repository=contract.repository,
+        pr=contract.pr_number,
+        expected_head_sha=contract.expected_head_sha,
+        base_ref=contract.base_ref,
+        workflow_revision=contract.workflow_revision,
+        nonce=nonce,
+    )
+
+
+def match_intent_envelope(
+    body: object, *, visible_capable: bool, host_footer_capable: bool
+) -> re.Match[str] | None:
+    """Match one comment body exactly as the base workflow's envelope does.
+
+    The bare and visible-line forms are matched against the stripped body.
+    The footered form is matched against the raw body, only when the
+    workflow advertises it, so no whitespace or doubled footer is admitted.
+    """
+    if not isinstance(body, str):
+        return None
+    match = _INTENT_ENVELOPE_RE.fullmatch(body.strip())
+    if match is None and host_footer_capable:
+        match = _INTENT_FOOTERED_ENVELOPE_RE.fullmatch(body)
+    if match is None:
+        return None
+    if match.group("visible_sha") is not None and not visible_capable:
+        return None
+    return match
+
+
+def _exact_int(value: object, *, positive: bool = False) -> bool:
+    return type(value) is int and (not positive or value > 0)
+
+
+def _exact_string(value: object, pattern: str | None = None) -> bool:
+    return type(value) is str and (pattern is None or re.fullmatch(pattern, value) is not None)
+
+
+def validate_intent_record(
+    record: dict[str, object], match: re.Match[str], *, binding: IntentBinding
+) -> str | None:
+    """Return the workflow's failure reason for one same-nonce record, if any."""
+    visible_sha = match.group("visible_sha")
+    if visible_sha is not None and visible_sha != record.get("expected_head_sha"):
+        return "visible intent line disagrees with the authorized head"
+    if set(record) != INTENT_REQUIRED_KEYS:
+        return "trusted intent has an invalid schema"
+    checks: tuple[tuple[bool, str], ...] = (
+        (_exact_string(record.get("repository"), r"[^/\s]+/[^/\s]+"), "repository"),
+        (_exact_int(record.get("pr"), positive=True), "pr"),
+        (_exact_string(record.get("expected_head_sha"), INTENT_SHA_PATTERN), "expected_head_sha"),
+        (_exact_string(record.get("base_ref"), r"[^\s]+"), "base_ref"),
+        (_exact_string(record.get("workflow_revision"), INTENT_SHA_PATTERN), "workflow_revision"),
+    )
+    for valid, name in checks:
+        if not valid:
+            return "invalid " + name
+    if binding.require_generation or record.get("generation") is not None:
+        if not _exact_string(record.get("generation"), r"[A-Za-z0-9_-]+"):
+            return "invalid generation"
+    if not _exact_string(record.get("nonce"), INTENT_NONCE_PATTERN):
+        return "invalid nonce"
+    if not _exact_int(record.get("created_at"), positive=True):
+        return "invalid created_at"
+    state = record.get("state")
+    if not _exact_string(state, r"(?:prepared|dispatch-requested|attached|completed)"):
+        return "invalid state"
+    if state not in INTENT_ALLOWED_STATES:
+        return "invalid lifecycle state"
+    run_id, run_attempt = record.get("run_id"), record.get("run_attempt")
+    if state in {"prepared", "dispatch-requested"}:
+        if run_id is not None or run_attempt is not None:
+            return "early lifecycle state has run fields"
+    elif not _exact_int(run_id, positive=True) or not _exact_int(run_attempt, positive=True):
+        return "attached lifecycle state lacks paired run fields"
+    terminal_id = record.get("terminal_run_id")
+    terminal_attempt = record.get("terminal_run_attempt")
+    if terminal_id is not None and not _exact_int(terminal_id, positive=True):
+        return "invalid terminal run ID"
+    if terminal_id is None and terminal_attempt is not None:
+        return "terminal attempt has no terminal run ID"
+    if terminal_id is not None and not _exact_int(terminal_attempt, positive=True):
+        return "invalid terminal run attempt"
+    outcome = record.get("terminal_outcome")
+    if outcome not in {None, "no-status"}:
+        return "invalid terminal outcome"
+    attempts = record.get("terminal_attempts")
+    if not isinstance(attempts, list):
+        return "terminal attempt history is not a list"
+    seen_attempts: set[tuple[object, object]] = set()
+    for item in attempts:
+        if not isinstance(item, dict) or set(item) != {"run_id", "run_attempt"}:
+            return "malformed terminal attempt history"
+        item_id, item_attempt = item["run_id"], item["run_attempt"]
+        if not _exact_int(item_id, positive=True):
+            return "invalid terminal history run ID"
+        if not _exact_int(item_attempt, positive=True):
+            return "invalid terminal history run attempt"
+        key = (item_id, item_attempt)
+        if key in seen_attempts:
+            return "duplicate terminal attempt history"
+        seen_attempts.add(key)
+    terminal_key = (terminal_id, terminal_attempt)
+    if terminal_id is not None and terminal_key not in seen_attempts:
+        return "terminal run is absent from terminal attempt history"
+    if state == "prepared" and (
+        terminal_id is not None or terminal_attempt is not None or outcome is not None or attempts
+    ):
+        return "prepared intent has terminal lifecycle fields"
+    if state == "dispatch-requested" and terminal_id is not None and outcome != "no-status":
+        return "dispatch-requested retry lacks no-status outcome"
+    if state == "attached" and outcome is not None:
+        return "attached intent has terminal outcome"
+    if state == "completed" and outcome == "no-status" and (run_id, run_attempt) != terminal_key:
+        return "completed no-status record is not bound to its terminal run"
+    if state in {"attached", "completed"} and outcome is None and (run_id, run_attempt) in seen_attempts:
+        return "active run is already terminal history"
+    expected = {
+        "repository": binding.repository,
+        "pr": binding.pr,
+        "expected_head_sha": binding.expected_head_sha,
+        "base_ref": binding.base_ref,
+        "workflow_revision": binding.workflow_revision,
+        "nonce": binding.nonce,
+    }
+    if any(record[key] != value for key, value in expected.items()):
+        return "trusted intent binding drifted"
+    return None
+
+
+def _walk_intent_page(
+    page: list[object],
+    *,
+    requested_nonce: object,
+    check_nonce: bool,
+    trusted_login: str,
+    trusted_id: int | None,
+    visible_capable: bool,
+    host_footer_capable: bool,
+    binding: IntentBinding | None,
+) -> tuple[str | None, list[tuple[int | None, dict[str, object]]]]:
+    """Walk one page in the workflow's exact order.
+
+    Returns the first failure reason (naming the comment) and the validated
+    records for ``requested_nonce``.  With ``check_nonce`` false the walk
+    stops before nonce comparison, reporting only nonce-independent failures.
+    """
+    validated: list[tuple[int | None, dict[str, object]]] = []
+    for index, comment in enumerate(page):
+        if not isinstance(comment, dict):
+            return f"comment #{index}: malformed comment object", validated
+        comment_id = comment.get("id") if _exact_int(comment.get("id")) else None
+        label = f"comment {comment_id}" if comment_id is not None else f"comment #{index}"
+        user = comment.get("user")
+        if not isinstance(user, dict) or type(user.get("login")) is not str:
+            return f"{label}: malformed comment author", validated
+        if user["login"] != trusted_login:
+            continue
+        if trusted_id is not None and user.get("id") != trusted_id:
+            return f"{label}: trusted comment author ID drifted", validated
+        body = comment.get("body")
+        if type(body) is not str:
+            return f"{label}: trusted comment body is not text", validated
+        match = match_intent_envelope(
+            body, visible_capable=visible_capable, host_footer_capable=host_footer_capable
+        )
+        if match is None:
+            continue
+        try:
+            record = json.loads(match.group("payload"))
+        except json.JSONDecodeError:
+            return f"{label}: trusted intent envelope contains malformed JSON", validated
+        if not isinstance(record, dict):
+            return f"{label}: trusted intent payload is not an object", validated
+        if record.get("version") != 2:
+            return f"{label}: unsupported intent version", validated
+        if not check_nonce or record.get("nonce") != requested_nonce:
+            continue
+        assert binding is not None
+        reason = validate_intent_record(record, match, binding=binding)
+        if reason is not None:
+            return f"{label}: {reason}", validated
+        validated.append((comment_id, record))
+    return None, validated
+
+
+def intent_page_pre_nonce_fatal(
+    page: list[object],
+    *,
+    trusted_login: str,
+    trusted_id: int | None,
+    visible_capable: bool,
+    host_footer_capable: bool,
+) -> str | None:
+    """Return the first failure the workflow raises for every requested nonce."""
+    reason, _ = _walk_intent_page(
+        page,
+        requested_nonce=None,
+        check_nonce=False,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=visible_capable,
+        host_footer_capable=host_footer_capable,
+        binding=None,
+    )
+    return reason
+
+
+def classify_intent_page(
+    page: list[object],
+    *,
+    requested_nonce: object,
+    trusted_login: str,
+    trusted_id: int | None,
+    visible_capable: bool,
+    host_footer_capable: bool,
+    binding: IntentBinding,
+) -> IntentPageVerdict:
+    """Mirror the workflow's ``validate()`` decision for one requested nonce.
+
+    Freshness is deliberately not judged here: the workflow checks the age
+    window separately in its dispatch validator.
+    """
+    reason, validated = _walk_intent_page(
+        page,
+        requested_nonce=requested_nonce,
+        check_nonce=True,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=visible_capable,
+        host_footer_capable=host_footer_capable,
+        binding=binding,
+    )
+    if reason is not None:
+        return IntentPageVerdict("fail", reason=reason)
+    if len(validated) != 1:
+        return IntentPageVerdict(
+            "fail", reason="expected exactly one fresh intent for requested nonce"
+        )
+    comment_id, record = validated[0]
+    if record["state"] == "prepared":
+        return IntentPageVerdict(
+            "recoverable",
+            record=record,
+            comment_id=comment_id,
+            reason="prepared intent is not a dispatch authorization",
+        )
+    return IntentPageVerdict("authorized", record=record, comment_id=comment_id)
+
+
+def _read_intent_comment_page(
+    runner: Runner, config: AgentLoopConfig, pr_number: int
+) -> list[object]:
+    """Read the PR comment page exactly as the workflow receives it.
+
+    Unlike ``_api_list``, a JSON list is returned unfiltered: a non-dict entry
+    must reach the workflow-mirror scan, which fails closed on it as the
+    workflow does, instead of collapsing to an uninspectable read.
+    """
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "api",
+            "--paginate",
+            f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
+    # An empty body is not an empty ledger: treating it as ``[]`` would mint
+    # a fresh intent without having inspected the existing comments.
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError("Unable to inspect managed-CI v2 intent history.") from exc
+    if not isinstance(payload, list):
+        raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
+    # The page stays raw (the envelope mirror owns the footered form), but a
+    # footer seen only on this re-read is still reported once per invocation.
+    for comment in payload:
+        body = comment.get("body") if isinstance(comment, dict) else None
+        if isinstance(body, str) and INTENT_MARKER in body and strip_known_host_footer(body)[1]:
+            note_host_footer_observed(config, "managed-CI intent re-read")
+            break
+    return payload
+
+
+def _require_workflow_dispatch_authorization(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    contract: ManagedCiContract,
+    patch_result: WrittenProtocolComment | None,
+) -> None:
+    """Dispatch only what the workflow would accept, within its age window.
+
+    The page is re-read after the dispatch-requested PATCH and must classify
+    as ``authorized`` for this contract's comment.  The age window is checked
+    against the PATCH's server ``updated_at`` (or local time when absent),
+    never against the comment's creation time, which predates the renewal.
+    """
+    pr_number = contract.pr_number or 0
+    trusted_login = _intent_producer_login(contract)
+    trusted_id = _intent_producer_id(contract)
+    page = _read_intent_comment_page(runner, config, pr_number)
+    fatal = intent_page_pre_nonce_fatal(
+        page,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=contract.visible_intent_capable,
+        host_footer_capable=contract.host_footer_capable,
+    )
+    if fatal is not None:
+        raise ManagedCiIntentLedgerError(
+            f"PR #{pr_number}: managed-CI dispatch refused because the intent ledger holds a "
+            f"comment the base workflow rejects ({fatal}); repair or delete that comment and resume."
+        )
+    verdict = classify_intent_page(
+        page,
+        requested_nonce=contract.nonce,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=contract.visible_intent_capable,
+        host_footer_capable=contract.host_footer_capable,
+        binding=_intent_binding(contract, nonce=contract.nonce),
+    )
+    if (
+        verdict.outcome != "authorized"
+        or verdict.record is None
+        or verdict.comment_id != contract.intent_comment_id
+    ):
+        reason = verdict.reason or (
+            f"authorized comment {verdict.comment_id} is not this invocation's intent "
+            f"{contract.intent_comment_id}"
+        )
+        raise ManagedCiIntentLedgerError(
+            f"PR #{pr_number}: managed-CI dispatch refused because the base workflow would not "
+            f"authorize intent {contract.intent_comment_id} ({reason}); repair or delete the "
+            "named comment and resume."
+        )
+    server_time = patch_result.server_updated_at if patch_result is not None else None
+    reference = server_time if server_time is not None else int(time.time())
+    source = "server updated_at" if server_time is not None else "local clock"
+    created_at = verdict.record["created_at"]
+    assert isinstance(created_at, int)
+    age = reference - created_at
+    if not (
+        -INTENT_MAX_FUTURE_SKEW_SECONDS
+        <= age
+        <= INTENT_MAX_AGE_SECONDS - DISPATCH_START_MARGIN_SECONDS
+    ):
+        raise ManagedCiIntentFreshnessError(
+            f"PR #{pr_number}: managed-CI dispatch refused because intent "
+            f"{contract.intent_comment_id} has created_at={created_at}, which is outside the "
+            f"workflow's age window at {reference} ({source}). Correct the local clock and resume."
+        )
 
 
 def _discover_v2_snapshot(

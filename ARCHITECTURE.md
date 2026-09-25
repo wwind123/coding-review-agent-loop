@@ -66,7 +66,7 @@ Source paths below are relative to
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py`, `plan_review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head or a candidate plan. |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. Structured plan coder comments additionally have a bounded visible digest, selected only when the full comment overflows the body budget (see *Compact-on-overflow plan presentation*). The visible coder matrix-evidence section is collapsed and, on PR coder follow-ups, projected as a delta against the previous coder round, while canonical evidence stays complete (see *Delta matrix-evidence presentation*). |
-| GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier. |
+| GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier, which tolerates exactly one known host comment footer (#1043). |
 | Workflow transaction model (#827, stage A) | `workflow_transaction.py` | Typed transition intent whose canonical hash is the transaction ID; append-only prepared/terminal transaction record codec (PR-comment-only); version-2 handoff and PR contract derivation; lineage, era, approved-plan anchor, scheduler-checkpoint, and legacy-root resolvers. Every resolver accepts only the author-authenticated comment view read by `github.read_authenticated_protocol_comments`. Model only: no writer emits these records and no orchestration call site consumes them yet; the version-1 reader entry points are unchanged and still reject version 2. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
@@ -792,6 +792,32 @@ alike — is verified by comparing the server's stored body for that comment wit
 the exact posted carrier and checking the producing login and ID, fetching the
 comment when the write response carries no envelope; a rejected read-back takes
 that seam's existing failure path rather than being accepted on an exit status.
+
+Some hosts append a fixed footer to every posted comment (Claude Code cloud
+sessions; #1043). The one byte-exact suffix `KNOWN_HOST_COMMENT_FOOTER` in
+`protocol_markers.py` is tolerated once and nowhere else:
+
+- Read-back accepts the stored body when it equals the posted body, or the
+  posted body plus that suffix. Each write reports whether the footer was
+  observed and the server's `updated_at`, never the comment's `created_at`.
+- The suffix is stripped exactly once, where a raw comment body enters a strict
+  reader. There are three such boundaries: `_authenticated_comment_from_rest`,
+  managed-CI `_normalized_comment_body`, and plan-validation diagnostic
+  recovery. Strict parsers never strip, so doubled or variant footers are still
+  rejected.
+- The managed-CI issue authorization parser requires the whole body to equal
+  its canonical rendering, or the historical marker-only rendering.
+- The base workflow admits a footered intent only through a raw-body match, and
+  advertises that with `AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1`. Agent-loop's
+  intent rediscovery and pre-dispatch gate mirror that workflow's page
+  decision. The mirror returns `authorized`, `recoverable` (a lone `prepared`
+  record), or `fail`, plus nonce-independent fatal comments.
+- Before a dispatch, agent-loop renews the intent's `created_at` in place and
+  checks it against the workflow's age window.
+- Against an older workflow, an observed footer on an intent write raises a
+  terminal, recovery-exempt error. That is `pre-dispatch` unless a dispatch was
+  issued or a run attached.
+- Observation is logged once per owned usage context.
 
 Resume reconstructs state from recorded evidence and then checks it against the
 live PR, issue, plan, requirements, and policy. GitHub metadata is durable but

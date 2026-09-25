@@ -6692,3 +6692,70 @@ def test_m953_discuss_round_comment_with_spilled_prior_items_is_bot_authored():
         )
 
     assert _discuss_subject(context(spilled)) == _discuss_subject(context())
+
+
+# --- host footer log once per owning invocation (#1043) ----------------------
+
+_OWNING_RUN_ENTRIES = {"run_issue_loop", "run_task_loop", "run_pr_loop", "run_discuss_loop"}
+
+
+def _orchestrator_tree():
+    return ast.parse(Path(orchestrator_module.__file__).read_text(encoding="utf-8"))
+
+
+def test_only_owning_run_entries_create_a_usage_context():
+    callers = {}
+    for function in ast.walk(_orchestrator_tree()):
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        for node in ast.walk(function):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_new_usage_context":
+                callers.setdefault(function.name, []).append(node)
+    callers.pop("_new_usage_context", None)
+    assert set(callers) == _OWNING_RUN_ENTRIES
+    # Each owning entry creates a context (and so resets the latch) only when
+    # it did not receive one, so a nested run shares the outer latch.
+    for function in ast.walk(_orchestrator_tree()):
+        if isinstance(function, ast.FunctionDef) and function.name in _OWNING_RUN_ENTRIES:
+            owned = [
+                node for node in ast.walk(function)
+                if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+                and getattr(node.values[0], "id", None) == "usage_context"
+                and isinstance(node.values[1], ast.Call)
+                and getattr(node.values[1].func, "id", None) == "_new_usage_context"
+            ]
+            assert len(owned) == 1, function.name
+
+
+def test_nested_run_pr_loop_calls_pass_the_outer_usage_context():
+    nested = [
+        node for node in ast.walk(_orchestrator_tree())
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "run_pr_loop"
+    ]
+    assert nested
+    for call in nested:
+        assert any(keyword.arg == "usage_context" for keyword in call.keywords), call.lineno
+
+
+def test_host_footer_log_latch_resets_with_each_owned_usage_context(tmp_path, monkeypatch):
+    import coding_review_agent_loop.github as github_module
+
+    lines = []
+    monkeypatch.setattr(github_module, "log", lambda _config, message: lines.append(message))
+    config = make_config(tmp_path)
+    # An earlier invocation in this process left the latch set.
+    github_module.reset_host_footer_log_latch()
+    github_module.note_host_footer_observed(config, "earlier invocation")
+    assert len(lines) == 1
+
+    # Two successive owning invocations each log once, however often the
+    # footer is observed on write and re-read paths.
+    for expected in (2, 3):
+        orchestrator_module._new_usage_context(config)
+        for context in ("write", "re-read", "nested PR run"):
+            github_module.note_host_footer_observed(config, context)
+        assert len(lines) == expected
+
+    # With no footer observed, an owning invocation logs nothing.
+    orchestrator_module._new_usage_context(config)
+    assert len(lines) == 3

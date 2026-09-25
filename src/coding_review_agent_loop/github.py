@@ -50,6 +50,8 @@ from .protocol_markers import (
     TrustedBody,
     named_reserved_marker_tokens,
     record_shaped_untrusted_markers,
+    stored_body_matches_posted,
+    strip_known_host_footer,
 )
 from .runner import Runner
 from .workdirs import active_workdir
@@ -2424,7 +2426,41 @@ class AuthenticatedCommentView:
         )
 
 
-def _authenticated_comment_from_rest(raw: object, *, surface: str) -> AuthenticatedComment:
+_host_footer_logged = False
+
+
+def reset_host_footer_log_latch() -> None:
+    """Start a new invocation's host-footer log latch.
+
+    Called only from ``_new_usage_context``, whose callers are exactly the run
+    entries that own a usage context, so every owning invocation logs the
+    footer once and a nested run that received a usage context shares it.
+    """
+    global _host_footer_logged
+    _host_footer_logged = False
+
+
+def note_host_footer_observed(config: AgentLoopConfig | None, context: str) -> None:
+    """Log once per invocation that the known host comment footer was seen."""
+    global _host_footer_logged
+    if _host_footer_logged or config is None:
+        return
+    _host_footer_logged = True
+    log(
+        config,
+        "GitHub host appended its known comment footer to a stored protocol record "
+        f"({context}); the exact footer is tolerated once and removed before parsing.",
+    )
+
+
+def _authenticated_comment_from_rest(
+    raw: object, *, surface: str, config: AgentLoopConfig | None = None
+) -> AuthenticatedComment:
+    """Build one authenticated envelope from a raw REST comment.
+
+    This is a comment-ingestion boundary: the known host footer is removed
+    here exactly once (#1043), so downstream strict parsers never strip it.
+    """
     if not isinstance(raw, dict):
         raise AgentLoopError(f"Authenticated comment read of {surface} returned an incomplete page.")
     user = raw.get("user")
@@ -2433,6 +2469,10 @@ def _authenticated_comment_from_rest(raw: object, *, surface: str) -> Authentica
             f"Authenticated comment read of {surface} returned a comment without an author."
         )
     body = raw.get("body")
+    if isinstance(body, str):
+        body, footered = strip_known_host_footer(body)
+        if footered:
+            note_host_footer_observed(config, f"re-read on {surface}")
     return AuthenticatedComment(
         surface=surface,
         comment_id=raw.get("id"),  # type: ignore[arg-type]
@@ -2497,7 +2537,9 @@ def read_authenticated_protocol_comments(
                 f"Authenticated comment read of {surface} returned an oversized page {page}."
             )
         for raw_comment in raw_page:
-            envelope = _authenticated_comment_from_rest(raw_comment, surface=surface)
+            envelope = _authenticated_comment_from_rest(
+                raw_comment, surface=surface, config=config
+            )
             if envelope.comment_id in seen_ids:
                 raise AgentLoopError(
                     f"Authenticated comment read of {surface} repeated comment ID "
@@ -2614,12 +2656,61 @@ def verify_written_protocol_comment(
     expected_author_id: int | None,
     context: str,
 ) -> int:
+    """Apply the uniform read-back contract and return the comment ID."""
+    return verify_written_protocol_comment_observed(
+        runner,
+        config=config,
+        payload=payload,
+        body=body,
+        expected_author_login=expected_author_login,
+        expected_author_id=expected_author_id,
+        context=context,
+    ).comment_id
+
+
+@dataclass(frozen=True)
+class WrittenProtocolComment:
+    """One verified comment write and what its read-back observed.
+
+    ``server_updated_at`` is the epoch-second value of the read-back
+    envelope's ``updated_at`` only.  It never falls back to ``created_at``,
+    which is the comment's immutable creation time and would misdate a PATCH
+    of an older comment.
+    """
+
+    comment_id: int
+    host_footer_observed: bool
+    server_updated_at: int | None
+
+
+def _envelope_updated_at_epoch(envelope: dict[str, object]) -> int | None:
+    value = envelope.get("updated_at")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return int(parse_comment_timestamp(value).timestamp())
+    except AgentLoopError:
+        return None
+
+
+def verify_written_protocol_comment_observed(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    payload: dict[str, object],
+    body: TrustedBody,
+    expected_author_login: str | None,
+    expected_author_id: int | None,
+    context: str,
+) -> WrittenProtocolComment:
     """Apply the uniform read-back contract to one comment write response.
 
     Every tool-owned comment write compares the server's stored body for the
     just-written comment against the exact posted carrier and verifies the
     producing identity.  When the write response carries no body or author, the
-    comment is fetched explicitly rather than trusted on its status code.
+    comment is fetched explicitly rather than trusted on its status code.  The
+    stored body may carry exactly one known host footer (#1043); any other
+    difference fails closed.
     """
     comment_id = payload.get("id")
     if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id < 1:
@@ -2631,7 +2722,8 @@ def verify_written_protocol_comment(
         envelope = _fetch_protocol_comment_envelope(
             runner, config=config, comment_id=comment_id, context=context
         )
-    if envelope.get("body") != str(body):
+    matches, footer_observed = stored_body_matches_posted(envelope.get("body"), str(body))
+    if not matches:
         raise AgentLoopError(f"{context} returned a different body.")
     returned_user = envelope.get("user") or envelope.get("author")
     if not isinstance(returned_user, dict):
@@ -2642,7 +2734,13 @@ def verify_written_protocol_comment(
         raise AgentLoopError(f"{context} was authored by an unexpected actor.")
     if expected_author_id is not None and user_id != expected_author_id:
         raise AgentLoopError(f"{context} has an unexpected actor identity.")
-    return comment_id
+    if footer_observed:
+        note_host_footer_observed(config, context)
+    return WrittenProtocolComment(
+        comment_id=comment_id,
+        host_footer_observed=footer_observed,
+        server_updated_at=_envelope_updated_at_epoch(envelope),
+    )
 
 
 def post_verified_trusted_pr_protocol_comment(
@@ -2654,7 +2752,27 @@ def post_verified_trusted_pr_protocol_comment(
     expected_author_login: str | None = None,
     expected_author_id: int | None = None,
 ) -> int:
-    """Persist one trusted PR protocol record and return its server ID.
+    """Persist one trusted PR protocol record and return its server ID."""
+    return post_verified_trusted_pr_protocol_comment_observed(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=body,
+        expected_author_login=expected_author_login,
+        expected_author_id=expected_author_id,
+    ).comment_id
+
+
+def post_verified_trusted_pr_protocol_comment_observed(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    body: TrustedBody,
+    expected_author_login: str | None = None,
+    expected_author_id: int | None = None,
+) -> WrittenProtocolComment:
+    """Persist one trusted PR protocol record and report its read-back.
 
     Durable authorization records use the REST issue-comment endpoint so the
     returned comment identity is available to the caller.  The body is
@@ -2694,7 +2812,7 @@ def post_verified_trusted_pr_protocol_comment(
         raise AgentLoopError(
             f"Trusted PR protocol record for PR #{pr_number} returned no comment ID."
         )
-    return verify_written_protocol_comment(
+    return verify_written_protocol_comment_observed(
         runner,
         config=config,
         payload=payload,
@@ -2715,6 +2833,28 @@ def patch_verified_trusted_protocol_comment(
     expected_author_id: int | None = None,
     surface: str = PR_COMMENT_SURFACE,
 ) -> int:
+    """Update one trusted protocol comment and return its verified ID."""
+    return patch_verified_trusted_protocol_comment_observed(
+        runner,
+        config=config,
+        comment_id=comment_id,
+        body=body,
+        expected_author_login=expected_author_login,
+        expected_author_id=expected_author_id,
+        surface=surface,
+    ).comment_id
+
+
+def patch_verified_trusted_protocol_comment_observed(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    comment_id: int,
+    body: TrustedBody,
+    expected_author_login: str | None = None,
+    expected_author_id: int | None = None,
+    surface: str = PR_COMMENT_SURFACE,
+) -> WrittenProtocolComment:
     """Update one trusted protocol comment and verify the stored result.
 
     A successful exit status is not proof that the new body was persisted, so
@@ -2751,7 +2891,7 @@ def patch_verified_trusted_protocol_comment(
         raise AgentLoopError(f"{context} returned no comment envelope.")
     if payload.get("id") is None:
         payload = {**payload, "id": comment_id}
-    updated_id = verify_written_protocol_comment(
+    written = verify_written_protocol_comment_observed(
         runner,
         config=config,
         payload=payload,
@@ -2760,9 +2900,9 @@ def patch_verified_trusted_protocol_comment(
         expected_author_id=expected_author_id,
         context=context,
     )
-    if updated_id != comment_id:
+    if written.comment_id != comment_id:
         raise AgentLoopError(f"{context} returned a different comment identity.")
-    return updated_id
+    return written
 
 
 def post_trusted_pr_contract_record(
@@ -2863,11 +3003,14 @@ def post_verified_trusted_issue_protocol_comment(
         raise AgentLoopError(
             f"Trusted issue protocol record for issue #{issue_number} returned no numeric comment ID."
         )
-    returned_body = payload.get("body")
-    if returned_body != str(body):
+    matches, footer_observed = stored_body_matches_posted(payload.get("body"), str(body))
+    if not matches:
         raise AgentLoopError(
             f"Trusted issue protocol record for issue #{issue_number} returned a different body."
         )
+    # The wrapper carries the posted canonical body, never the host-footered
+    # stored body, so downstream byte-exact checks stay exact (#1043).
+    returned_body = str(body)
     created_at = payload.get("created_at") or payload.get("createdAt")
     if not isinstance(created_at, str) or not created_at:
         raise AgentLoopError(
@@ -2893,6 +3036,10 @@ def post_verified_trusted_issue_protocol_comment(
     if login != expected_author_login or author_id != expected_author_id:
         raise AgentLoopError(
             f"Trusted issue protocol record for issue #{issue_number} was authored by an unexpected actor."
+        )
+    if footer_observed:
+        note_host_footer_observed(
+            config, f"Trusted issue protocol record for issue #{issue_number}"
         )
     return IssueComment(
         author=login,

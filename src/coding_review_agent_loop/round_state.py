@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -36,6 +36,7 @@ from .protocol_markers import (
     protocol_record_label,
     sanitize_historical_text,
     scan_reserved_markers,
+    strip_known_host_footer,
 )
 from .workdir_guard import validate_checkout_inspected_evidence
 from .protocol import (
@@ -1065,6 +1066,7 @@ def recover_plan_validation_diagnostic(
     architecture_contract_version: int | None,
     execution_strategy_contract_version: int | None,
     risk_test_matrix_contract_version: int | None,
+    on_host_footer: Callable[[str], None] | None = None,
 ) -> PlanValidationDiagnosticTransport | None:
     """Recover one authenticated current diagnostic using payload attempt order."""
     if not expected_author_login or expected_author_id < 1:
@@ -1072,8 +1074,18 @@ def recover_plan_validation_diagnostic(
     candidates: list[PlanValidationDiagnosticTransport] = []
     by_id: dict[int, str] = {}
     for comment in comments:
-        body = getattr(comment, "body", None)
-        if not isinstance(body, str) or not PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.search(body):
+        raw_body = getattr(comment, "body", None)
+        if not isinstance(raw_body, str):
+            continue
+        # Comment-ingestion boundary (#1043): remove the known host footer
+        # exactly once here.  The decoder never strips, so a doubled or variant
+        # suffix stays ineligible.
+        body, footered = strip_known_host_footer(raw_body)
+        # Report the observation at the boundary, before any marker, identity,
+        # or decoder exit, like the other ingestion boundaries.
+        if footered and on_host_footer is not None:
+            on_host_footer("plan-validation diagnostic recovery")
+        if not PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.search(body):
             continue
         comment_id, author_login, author_id, created_at = _comment_identity(comment)
         # Old or shape-only comments are not trusted recovery records.
