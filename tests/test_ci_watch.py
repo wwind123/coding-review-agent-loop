@@ -42,8 +42,9 @@ def _checks(
     )
 
 
-def _mergeability():
-    return PullRequestMergeability("mergeable", "MERGEABLE", "CLEAN", "sha", "main")
+def _mergeability(merge_state="CLEAN", *, state="mergeable", head_sha="sha"):
+    mergeable_raw = "MERGEABLE" if state == "mergeable" else "UNKNOWN"
+    return PullRequestMergeability(state, mergeable_raw, merge_state, head_sha, "main")
 
 
 def test_watch_pending_to_failure_reports_failed_records_and_sleeps(tmp_path):
@@ -106,7 +107,9 @@ def test_watch_success_and_head_change_are_terminal(tmp_path):
         assert watch_pr_checks(runner, make_config(tmp_path, watch_pending_ci=True), 7, metadata=_metadata()).status == "head_changed"
 
 
-def test_watch_forbidden_branch_protection_never_reports_success(tmp_path):
+def test_watch_forbidden_protection_with_clean_merge_state_passes(tmp_path):
+    # #1055: a classic-protection 403 is resolved by GitHub's own merge-state
+    # computation for the same head, which accounts for unreadable contexts.
     runner = _Runner()
     with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
          patch("coding_review_agent_loop.github.get_pr_mergeability", return_value=_mergeability()), \
@@ -127,7 +130,89 @@ def test_watch_forbidden_branch_protection_never_reports_success(tmp_path):
             attempts=1,
         )
 
+    assert outcome.status == "passed"
+    assert outcome.mergeability == _mergeability()
+    assert runner.commands == []
+
+
+@pytest.mark.parametrize(
+    "mergeability",
+    [
+        _mergeability("BLOCKED"),
+        _mergeability("UNSTABLE"),
+        _mergeability("UNKNOWN", state="unknown"),
+        _mergeability(None, state="unknown"),
+        _mergeability("CLEAN", head_sha="other-sha"),
+    ],
+)
+def test_watch_forbidden_protection_without_clean_merge_state_stops_fast(
+    tmp_path, mergeability
+):
+    runner = _Runner()
+    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
+         patch("coding_review_agent_loop.github.get_pr_mergeability", return_value=mergeability), \
+         patch(
+             "coding_review_agent_loop.github.get_pr_checks",
+             return_value=_checks("passing", protection="forbidden"),
+         ):
+        outcome = watch_pr_checks(
+            runner,
+            make_config(
+                tmp_path,
+                watch_pending_ci=True,
+                ci_timeout_seconds=1200,
+                ci_poll_interval_seconds=30,
+                ci_startup_timeout_seconds=60,
+            ),
+            7,
+            metadata=_metadata(),
+        )
+
+    # The bounded startup window (2 polls), not the 1200s watch timeout.
+    assert outcome.status == "protection_unreadable"
+    assert outcome.attempts_used == 2
+    assert outcome.mergeability == mergeability
+    assert [command[0] for command in runner.commands] == ["sleep"]
+
+
+def test_watch_forbidden_protection_pending_board_keeps_waiting(tmp_path):
+    runner = _Runner()
+    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
+         patch("coding_review_agent_loop.github.get_pr_mergeability", return_value=_mergeability("BLOCKED")), \
+         patch(
+             "coding_review_agent_loop.github.get_pr_checks",
+             return_value=_checks("pending", protection="forbidden"),
+         ):
+        outcome = watch_pr_checks(
+            runner,
+            make_config(
+                tmp_path,
+                watch_pending_ci=True,
+                ci_timeout_seconds=90,
+                ci_poll_interval_seconds=30,
+                ci_startup_timeout_seconds=30,
+            ),
+            7,
+            metadata=_metadata(),
+        )
+
     assert outcome.status == "timeout"
+
+
+@pytest.mark.parametrize("protection", ["configured", "not_found"])
+def test_watch_readable_protection_ignores_merge_state(tmp_path, protection):
+    runner = _Runner()
+    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
+         patch("coding_review_agent_loop.github.get_pr_mergeability", return_value=_mergeability("BLOCKED")), \
+         patch(
+             "coding_review_agent_loop.github.get_pr_checks",
+             return_value=_checks("passing", protection=protection),
+         ):
+        outcome = watch_pr_checks(
+            runner, make_config(tmp_path, watch_pending_ci=True), 7, metadata=_metadata(),
+        )
+
+    assert outcome.status == "passed"
 
 
 def test_watch_empty_rollup_stops_as_not_started_never_as_success(tmp_path):
@@ -170,7 +255,7 @@ def test_watch_rejects_forbidden_branch_protection_after_flaky_head_probe(tmp_pa
         side_effect=[AgentLoopError("temporary gh failure"), "sha"],
     ), patch(
         "coding_review_agent_loop.github.get_pr_mergeability",
-        return_value=_mergeability(),
+        return_value=_mergeability("BLOCKED"),
     ), patch(
         "coding_review_agent_loop.github.get_pr_checks",
         side_effect=[_checks("pending"), _checks("passing", protection="forbidden")],
@@ -186,5 +271,60 @@ def test_watch_rejects_forbidden_branch_protection_after_flaky_head_probe(tmp_pa
             7,
             metadata=_metadata(),
         )
-    assert outcome.status == "timeout"
+    # The green BLOCKED board arrives on the final poll: the budget expires
+    # on the unreadable protection, never a pass (#1055 late-green deadline).
+    assert outcome.status == "protection_unreadable"
+    assert outcome.mergeability == _mergeability("BLOCKED")
     assert [command[0] for command in runner.commands] == ["sleep"]
+
+
+@pytest.mark.parametrize("deadline_kind", ["attempts", "clock"])
+def test_watch_late_green_unreadable_board_at_deadline_names_protection(tmp_path, deadline_kind):
+    runner = _Runner()
+    config = make_config(
+        tmp_path,
+        watch_pending_ci=True,
+        ci_timeout_seconds=90,
+        ci_poll_interval_seconds=30,
+        ci_startup_timeout_seconds=300,
+    )
+    kwargs = {"attempts": 3} if deadline_kind == "attempts" else {"deadline": 0.0, "attempts": 10}
+    boards = (
+        [_checks("pending", protection="forbidden")] * 2
+        + [_checks("passing", protection="forbidden")]
+        if deadline_kind == "attempts"
+        else [_checks("passing", protection="forbidden")]
+    )
+    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
+         patch("coding_review_agent_loop.github.get_pr_mergeability",
+               return_value=_mergeability("UNKNOWN", state="unknown")), \
+         patch("coding_review_agent_loop.github.get_pr_checks", side_effect=boards):
+        outcome = watch_pr_checks(runner, config, 7, metadata=_metadata(), **kwargs)
+
+    assert outcome.status == "protection_unreadable"
+    assert outcome.mergeability == _mergeability("UNKNOWN", state="unknown")
+    assert outcome.attempts_used == len(boards)
+
+
+def test_watch_deadline_after_green_turned_pending_is_a_plain_timeout(tmp_path):
+    runner = _Runner()
+    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
+         patch("coding_review_agent_loop.github.get_pr_mergeability", return_value=_mergeability("BLOCKED")), \
+         patch(
+             "coding_review_agent_loop.github.get_pr_checks",
+             side_effect=[
+                 _checks("passing", protection="forbidden"),
+                 _checks("pending", protection="forbidden"),
+             ],
+         ):
+        outcome = watch_pr_checks(
+            runner,
+            make_config(
+                tmp_path, watch_pending_ci=True, ci_timeout_seconds=60,
+                ci_poll_interval_seconds=30, ci_startup_timeout_seconds=300,
+            ),
+            7,
+            metadata=_metadata(),
+        )
+    assert outcome.status == "timeout"
+    assert outcome.mergeability is None

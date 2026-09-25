@@ -6386,6 +6386,92 @@ def test_pr_loop_auto_merge_stall_plus_partial_query_keeps_waiting(tmp_path):
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
 
 
+def _forbidden_protection_runner(merge_state):
+    return FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="LGTM.")],
+        pr_payload={"mergeable": "MERGEABLE", "mergeStateStatus": merge_state},
+        pr_check_runs_payload={
+            "check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]
+        },
+        pr_status_payload={"state": "success", "statuses": []},
+        pr_branch_protection_returncode=1,
+        pr_branch_protection_stderr="gh: Resource not accessible by integration (HTTP 403)",
+    )
+
+
+def test_pr_loop_auto_merge_unreadable_protection_with_clean_merge_state_merges(tmp_path):
+    # #1055: the classic protection endpoint returns 403, but GitHub reports
+    # CLEAN for the green current head, so the head-pinned merge proceeds.
+    runner = _forbidden_protection_runner("CLEAN")
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1200, ci_poll_interval_seconds=30)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    merges = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "merge"]]
+    assert len(merges) == 1
+    assert merges[0][-2:] == ["--match-head-commit", "abc123"]
+
+
+@pytest.mark.parametrize("merge_state", ["BLOCKED", "UNSTABLE", "UNKNOWN"])
+def test_pr_loop_auto_merge_unreadable_protection_without_clean_stops_fast(tmp_path, merge_state):
+    runner = _forbidden_protection_runner(merge_state)
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1200, ci_poll_interval_seconds=30,
+        ci_startup_timeout_seconds=60,
+    )
+
+    with pytest.raises(AgentLoopError, match="merge state is not CLEAN; no merge attempted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+    stop_comments = [c for c in runner.comments if "merge readiness cannot be confirmed" in c]
+    assert len(stop_comments) == 1
+    assert "every observed GitHub check passed" in stop_comments[0]
+    assert "HTTP 403" in stop_comments[0]
+    assert f"GitHub merge state for the current head: {merge_state}" in stop_comments[0]
+    assert not any("GitHub checks are still pending" in c for c in runner.comments)
+    # Bounded by the startup window, not the 1200s watch timeout.
+    sleep_commands = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["sleep"]]
+    assert len(sleep_commands) < 1200 // 30 - 1
+
+
+def test_ordinary_checks_authority_accepts_forbidden_protection_with_clean_head():
+    checks = _watch_check_board("passing", protection="forbidden")
+    clean = PullRequestMergeability("mergeable", "MERGEABLE", "CLEAN", "abc123", "main")
+
+    assert orchestrator._ordinary_checks_snapshot_is_authoritative(
+        checks, clean, head_sha="abc123"
+    )
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+        checks, clean, head_sha="other"
+    )
+    for merge_state in ("BLOCKED", "UNSTABLE", "BEHIND", "DRAFT", None):
+        assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+            checks,
+            PullRequestMergeability("mergeable", "MERGEABLE", merge_state, "abc123", "main"),
+            head_sha="abc123",
+        )
+    # Deferral (the recovery finalizer re-checks CLEAN after readiness) only
+    # relaxes an unreadable protection; the board conditions still apply.
+    draft = PullRequestMergeability("mergeable", "MERGEABLE", "DRAFT", "abc123", "main")
+    assert orchestrator._ordinary_checks_snapshot_is_authoritative(
+        checks, draft, head_sha="abc123", defer_unreadable_protection=True,
+    )
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+        _watch_check_board("passing", protection="unavailable"),
+        draft,
+        head_sha="abc123",
+        defer_unreadable_protection=True,
+    )
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+        _watch_check_board("pending", pending=(PullRequestCheck("x", "check_run", "queued"),),
+                           protection="forbidden"),
+        draft,
+        head_sha="abc123",
+        defer_unreadable_protection=True,
+    )
+
+
 def test_pr_loop_summarizes_approved_followups_before_pending_check_stop(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
