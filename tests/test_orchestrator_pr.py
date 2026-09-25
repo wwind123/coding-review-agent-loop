@@ -4811,6 +4811,111 @@ def test_run_pr_loop_labels_reviewer_and_acknowledgement_rounds_as_reviewer_feed
     ]
 
 
+class _AcknowledgementDispatchReached(Exception):
+    """Stop right after the acknowledgement-only coder dispatch is labelled."""
+
+
+def test_run_pr_loop_labels_an_acknowledgement_only_round_as_reviewer_feedback(
+    tmp_path, monkeypatch, capsys,
+):
+    """The dedicated acknowledgement obligation alone selects an empty coder set.
+
+    A signed requirement that appears after the coder's last acknowledgement
+    mints the acknowledgement obligation; once the reviewer resolves every
+    other item and keeps only that obligation blocking, the next coder
+    dispatch carries it alone and must not be labelled a CI repair (#1024).
+    """
+    ack_item_id = HUMAN_REQUIREMENTS_ACK_ITEM_ID
+    first = HumanReviewRequirement(
+        source_type="PR comment", author="maintainer", created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the audit trail.",
+    )
+    second = HumanReviewRequirement(
+        source_type="PR comment", author="maintainer", created_at="2026-05-18T11:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-2",
+        body="Also log every audit write.",
+    )
+    ack_markdown = (
+        "Implemented the fix.\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n- Requirement 1: kept the audit trail.\n"
+        "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    note = (
+        "src/audit.py still lacks the acknowledged logging requirement; acknowledge "
+        "requirement 2 and add tests/test_audit.py coverage for the audit log."
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Fix.", blocking_items=["Fix the bug."],
+                human_requirements_resolved=True,
+            ),
+            # Approves without the acknowledgement: the run re-injects it as item-2.
+            structured_pr_review(
+                state="approved", summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+            # Resolves item-2 and keeps only the acknowledgement obligation open.
+            structured_pr_review(
+                state="blocking", summary="The new requirement is unacknowledged.",
+                prior_item_dispositions=[
+                    {"item_id": "item-2", "disposition": "resolved"},
+                    {"item_id": ack_item_id, "disposition": "blocking", "note": note},
+                ],
+            ),
+        ],
+        claude_outputs=[ack_markdown, ack_markdown],
+    )
+    metadata = PullRequestMetadata(
+        number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
+        base_branch="main", head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+    )
+    fetches = []
+
+    def review_context(*_args, **_kwargs):
+        fetches.append(True)
+        # The second signed requirement arrives after the first coder turn.
+        requirements = (first,) if len(fetches) <= 2 else (first, second)
+        return PullRequestReviewContext(
+            metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
+            comments=(), human_requirements=requirements,
+        )
+
+    monkeypatch.setattr(orchestrator, "get_pr_review_context", review_context)
+    selections = []
+    real_select = orchestrator.select_coder_followup_items
+
+    def select(items):
+        selected = real_select(items)
+        selections.append(([item.item_id for item in items], selected))
+        return selected
+
+    monkeypatch.setattr(orchestrator, "select_coder_followup_items", select)
+    dispatched = []
+    real_log = orchestrator._log_coder_followup_dispatch
+
+    def log_dispatch(config, round_number, coder_name, coder_followup_items):
+        dispatched.append((round_number, tuple(coder_followup_items)))
+        real_log(config, round_number, coder_name, coder_followup_items)
+        if round_number == 3:
+            raise _AcknowledgementDispatchReached
+
+    monkeypatch.setattr(orchestrator, "_log_coder_followup_dispatch", log_dispatch)
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=4, quiet=False)
+
+    with pytest.raises(_AcknowledgementDispatchReached):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    # Round 3's real dispatch carried only the acknowledgement obligation,
+    # which selects an empty classifiable follow-up set.
+    assert selections[-1] == ([ack_item_id], ())
+    assert dispatched[-1] == (3, ())
+    labels = _round_label_lines(capsys.readouterr().err)
+    assert labels[-1] == "Round 3: Claude addressing reviewer feedback"
+    assert not any("repairing failed CI" in label for label in labels)
+
+
 def test_run_pr_loop_labels_a_mixed_reviewer_and_ci_round_as_reviewer_feedback(
     tmp_path, monkeypatch, capsys,
 ):
