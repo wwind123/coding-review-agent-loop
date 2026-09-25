@@ -61,6 +61,7 @@ from coding_review_agent_loop.managed_ci import (
     publish_manual_v2_qualification,
     publish_round_readiness,
     release_adopted_managed_ci,
+    release_retained_managed_label,
     revalidate_adopted_managed_ci,
     OrdinaryRecoveryCapability,
     refresh_ordinary_recovery_capability,
@@ -4783,7 +4784,16 @@ def v2_contract(**overrides):
     return ManagedCiContract(**fields)
 
 
-def test_publish_manual_v2_qualification_releases_label_readies_and_audits_sha(tmp_path):
+MANAGED_LABEL_DELETE = [
+    "gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+]
+
+
+def _managed_label_deletes(runner):
+    return [command for command, _cwd in runner.commands if command[:5] == MANAGED_LABEL_DELETE]
+
+
+def test_publish_manual_v2_qualification_retains_label_readies_and_audits_sha(tmp_path):
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
     )
@@ -4809,15 +4819,24 @@ def test_publish_manual_v2_qualification_releases_label_readies_and_audits_sha(t
 
     assert qualified == "abc123"
     commands = [command for command, _cwd in runner.commands]
-    release_index = next(
+    # Retaining the label means no `unlabeled` event re-runs ordinary CI.
+    assert _managed_label_deletes(runner) == []
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+    assert runner.rest_pr["draft"] is False
+    event_reads = [
         index for index, command in enumerate(commands)
-        if command[:5] == [
-            "gh", "api", "--method", "DELETE",
-            f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
-        ]
-    )
+        if any(part.startswith("repos/OWNER/REPO/issues/7/events?") for part in command)
+    ]
     ready_index = next(index for index, command in enumerate(commands) if command[:4] == ["gh", "pr", "ready", "7"])
-    assert release_index < ready_index
+    audit_index = next(
+        index for index, command in enumerate(commands) if QUALIFICATION_MARKER in " ".join(command)
+    )
+    # Provenance is verified before readiness and again before the record.
+    assert len(event_reads) == 2
+    assert event_reads[0] < ready_index < event_reads[1] < audit_index
+    audit_body = next(iter(runner.audit_comments.values()))["body"]
+    assert "The managed label is retained so ordinary CI does not re-run" in audit_body
+    assert "was released" not in audit_body
     assert not any(
         command[:5] == [
             "gh", "api", "--method", "POST",
@@ -4876,7 +4895,10 @@ def test_publish_manual_v2_qualification_rejects_head_change_before_release(tmp_
         )
 
     assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
-    assert not any(command[:4] == ["gh", "api", "--method", "DELETE"] for command, _cwd in runner.commands)
+    assert not any(QUALIFICATION_MARKER in " ".join(command) for command, _cwd in runner.commands)
+    # A failed publication returns the owned label to ordinary CI.
+    assert len(_managed_label_deletes(runner)) == 1
+    assert runner.rest_pr["labels"] == []
 
 
 def test_publish_manual_v2_qualification_rejects_head_change_after_audit(tmp_path, monkeypatch):
@@ -4901,6 +4923,394 @@ def test_publish_manual_v2_qualification_rejects_head_change_after_audit(tmp_pat
 
     assert any(QUALIFICATION_MARKER in " ".join(command) for command, _cwd in runner.commands)
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+    # The final head check runs after the record on a ready PR; the owned
+    # label is still released so the drifted head gets ordinary CI.
+    assert len(_managed_label_deletes(runner)) == 1
+    assert runner.rest_pr["draft"] is False
+
+
+class PublicationRunner(ManualQualificationRunner):
+    """Script per-read PR/event responses and label DELETE outcomes.
+
+    ``pr_overrides`` and ``event_overrides`` map a zero-based read index to
+    either raw stdout (``str``), a ``(stdout, returncode)`` tuple, or a
+    callable taking the current payload and returning a replacement payload.
+    ``foreign_event_before_read`` replaces the active label event with one
+    applied by another actor before the given events read.
+    """
+
+    def __init__(
+        self,
+        *,
+        pr_overrides=None,
+        event_overrides=None,
+        delete_outcome=None,
+        ready_returncode=0,
+        foreign_event_before_read=None,
+        **kwargs,
+    ):
+        kwargs.setdefault("issue_events", [label_event()])
+        super().__init__(**kwargs)
+        self.pr_overrides = dict(pr_overrides or {})
+        self.event_overrides = dict(event_overrides or {})
+        self.delete_outcome = delete_outcome
+        self.ready_returncode = ready_returncode
+        self.foreign_event_before_read = foreign_event_before_read
+        self.pr_reads = 0
+        self.event_reads = 0
+
+    @staticmethod
+    def _scripted(override, payload):
+        if callable(override):
+            return json.dumps(override(copy.deepcopy(payload))), 0
+        if isinstance(override, tuple):
+            return override
+        return override, 0
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(arg) for arg in args]
+        endpoint = next((part for part in cmd if part.startswith("repos/")), "")
+        if cmd == ["gh", "api", "repos/OWNER/REPO/pulls/7"]:
+            index = self.pr_reads
+            self.pr_reads += 1
+            if index in self.pr_overrides:
+                cmd, cwd_path = self._record_command(args, cwd)
+                stdout, returncode = self._scripted(self.pr_overrides[index], self.rest_pr)
+                return CommandResult(cmd, cwd_path, stdout, "", returncode)
+        if endpoint.startswith("repos/OWNER/REPO/issues/7/events?"):
+            index = self.event_reads
+            self.event_reads += 1
+            if self.foreign_event_before_read == index:
+                self.issue_events.append(label_event(event="unlabeled"))
+                self.issue_events.append(label_event(202, login="someone-else", actor_id=9))
+            if index in self.event_overrides:
+                cmd, cwd_path = self._record_command(args, cwd)
+                stdout, returncode = self._scripted(self.event_overrides[index], self.issue_events)
+                return CommandResult(cmd, cwd_path, stdout, "", returncode)
+        if cmd[:5] == MANAGED_LABEL_DELETE and self.delete_outcome is not None:
+            if self.delete_outcome == "raise":
+                self._record_command(args, cwd)
+                raise RuntimeError("transport exploded")
+            cmd, cwd_path = self._record_command(args, cwd)
+            stderr, returncode = self.delete_outcome
+            if "404" in stderr:
+                self.rest_pr["labels"] = []
+            return CommandResult(cmd, cwd_path, "", stderr, returncode)
+        if cmd[:3] == ["gh", "pr", "ready"] and self.ready_returncode:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, "", "ready failed", self.ready_returncode)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def _publish(runner, tmp_path, **contract_overrides):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    fields = {
+        "issue_created_pr": True,
+        "active_label_event_id": 101,
+        "invocation_applied_label": True,
+        "protection_mode": "strict",
+    }
+    fields.update(contract_overrides)
+    contract = v2_contract(**fields)
+    return publish_manual_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123",
+        contract=contract, reviewers=("Codex",),
+    ), contract
+
+
+def _audit_posted(runner):
+    return any(QUALIFICATION_MARKER in " ".join(command) for command, _cwd in runner.commands)
+
+
+def _without_draft(payload):
+    payload.pop("draft", None)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "draft_value",
+    [True, "missing", None, "false", 0],
+    ids=["true", "missing", "none", "string", "zero"],
+)
+@pytest.mark.parametrize("stage", ["initial-guard", "pre-record-reread"])
+def test_publish_manual_rejects_adopted_pr_whose_draft_is_not_exactly_false(
+    tmp_path, draft_value, stage,
+):
+    def with_draft(payload):
+        if draft_value == "missing":
+            payload.pop("draft", None)
+        else:
+            payload["draft"] = draft_value
+        return payload
+
+    # PR reads: 0 stale-label cleanup, 1 initial guard, 2 pre-record re-read.
+    runner = PublicationRunner(
+        rest_pr={"draft": False},
+        pr_overrides={1 if stage == "initial-guard" else 2: with_draft},
+    )
+
+    with pytest.raises(AgentLoopError, match="changed before manual qualification publication"):
+        _publish(runner, tmp_path, issue_created_pr=False, adopted_existing_pr=True)
+
+    assert not _audit_posted(runner)
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+    # The owned label is released so the unproven PR returns to ordinary CI.
+    assert len(_managed_label_deletes(runner)) == 1
+
+
+def test_publish_manual_adopted_ready_pr_retains_label_without_readying(tmp_path):
+    runner = PublicationRunner(rest_pr={"draft": False})
+
+    qualified, _contract = _publish(runner, tmp_path, issue_created_pr=False, adopted_existing_pr=True)
+
+    assert qualified == "abc123"
+    assert _managed_label_deletes(runner) == []
+    assert runner.event_reads == 2
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("state", ["draft", "ready"])
+def test_publish_manual_unreadable_provenance_releases_label_fail_open(tmp_path, state):
+    # Event read 0 is the pre-readiness check (draft PR); read 1 is the
+    # pre-record check (ready PR).  Cleanup's own read (next index) also fails.
+    failing = 0 if state == "draft" else 1
+    runner = PublicationRunner(
+        event_overrides={failing: ("", 1), failing + 1: ("", 1)},
+    )
+
+    with pytest.raises(AgentLoopError, match="the head is not qualified") as raised:
+        _publish(runner, tmp_path)
+
+    assert not _audit_posted(runner)
+    assert len(_managed_label_deletes(runner)) == 1
+    assert runner.rest_pr["labels"] == []
+    assert runner.rest_pr["draft"] is (state == "draft")
+    assert "remove it manually" not in str(raised.value)
+
+
+@pytest.mark.parametrize("before_read", [0, 1], ids=["before-readiness", "before-record"])
+def test_publish_manual_replaced_label_event_fails_closed_and_is_left(tmp_path, before_read):
+    runner = PublicationRunner(foreign_event_before_read=before_read)
+
+    with pytest.raises(AgentLoopError, match="provenance changed") as raised:
+        _publish(runner, tmp_path)
+
+    assert not _audit_posted(runner)
+    assert _managed_label_deletes(runner) == []
+    assert "different `agent-loop-managed` label event is active" in str(raised.value)
+    assert type(raised.value) is AgentLoopError
+
+
+def test_publish_manual_readiness_failure_releases_owned_label(tmp_path):
+    runner = PublicationRunner(ready_returncode=1)
+
+    with pytest.raises(AgentLoopError, match="Unable to mark qualified PR #7 ready"):
+        _publish(runner, tmp_path)
+
+    assert runner.rest_pr["draft"] is True
+    assert len(_managed_label_deletes(runner)) == 1
+    assert not _audit_posted(runner)
+
+
+def test_publish_manual_post_ready_verification_failure_releases_owned_label(tmp_path):
+    # PR read 2 follows `gh pr ready`; a drifted head there fails verification.
+    def drifted(payload):
+        payload["head"] = dict(payload["head"], sha="other")
+        return payload
+
+    runner = PublicationRunner(pr_overrides={2: drifted})
+
+    with pytest.raises(AgentLoopError, match="changed while being made ready"):
+        _publish(runner, tmp_path)
+
+    assert len(_managed_label_deletes(runner)) == 1
+    assert not _audit_posted(runner)
+
+
+def test_publish_manual_record_failure_releases_owned_label(tmp_path, monkeypatch):
+    def failed_post(*args, **kwargs):
+        raise AgentLoopError("record write failed")
+
+    monkeypatch.setattr(managed_ci, "post_verified_trusted_pr_protocol_comment", failed_post)
+    runner = PublicationRunner()
+
+    with pytest.raises(AgentLoopError, match="record write failed"):
+        _publish(runner, tmp_path)
+
+    assert runner.rest_pr["draft"] is False
+    assert len(_managed_label_deletes(runner)) == 1
+
+
+def test_publish_manual_cleanup_confirmed_absent_label_makes_no_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    runner = PublicationRunner(rest_pr={"labels": [{"name": "bug"}]})
+
+    with pytest.raises(AgentLoopError, match="head changed before"):
+        _publish(runner, tmp_path)
+
+    assert _managed_label_deletes(runner) == []
+    assert runner.event_reads == 0
+
+
+@pytest.mark.parametrize(
+    "pr_read",
+    [
+        ("", 1),
+        ("", 0),
+        ("not json", 0),
+        ("[]", 0),
+        ("{}", 0),
+        (json.dumps({"labels": "agent-loop-managed"}), 0),
+        (json.dumps({"labels": [{"id": 3}]}), 0),
+        (json.dumps({"labels": ["agent-loop-managed"]}), 0),
+    ],
+    ids=[
+        "nonzero-exit", "empty-body", "invalid-json", "non-object", "missing-labels",
+        "non-list-labels", "entry-without-name", "string-entry",
+    ],
+)
+@pytest.mark.parametrize(
+    "delete_outcome,expect_fragment",
+    [(None, False), (("gh: Not Found (HTTP 404)", 1), False)],
+    ids=["deleted", "already-absent-404"],
+)
+def test_publish_manual_cleanup_unreadable_pr_attempts_delete(
+    tmp_path, monkeypatch, pr_read, delete_outcome, expect_fragment,
+):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    runner = PublicationRunner(pr_overrides={0: pr_read}, delete_outcome=delete_outcome)
+
+    with pytest.raises(AgentLoopError, match="head changed before") as raised:
+        _publish(runner, tmp_path)
+
+    assert len(_managed_label_deletes(runner)) == 1
+    assert ("remove it manually" in str(raised.value)) is expect_fragment
+
+
+def test_publish_manual_cleanup_never_masks_the_publication_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    # Invalid events JSON is unreadable provenance (fail-open DELETE), and the
+    # DELETE itself raises: the helper swallows both.
+    runner = PublicationRunner(event_overrides={0: "not json"}, delete_outcome="raise")
+
+    with pytest.raises(AgentLoopError) as raised:
+        _publish(runner, tmp_path)
+
+    assert type(raised.value) is AgentLoopError
+    message = str(raised.value)
+    assert message.startswith("PR #7 head changed before manual qualification publication")
+    assert "`agent-loop-managed` could not be removed and still suppresses ordinary CI" in message
+
+
+def test_publish_manual_cleanup_attaches_note_to_non_agent_loop_error(tmp_path, monkeypatch):
+    def exploding(*args, **kwargs):
+        raise KeyError("boom")
+
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", exploding)
+    runner = PublicationRunner(delete_outcome=("gh: Server Error (HTTP 500)", 1))
+
+    with pytest.raises(KeyError) as raised:
+        _publish(runner, tmp_path)
+
+    assert any("remove it manually" in note for note in raised.value.__notes__)
+
+
+def test_publish_manual_non_404_delete_failure_reports_manual_removal(tmp_path, monkeypatch):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    runner = PublicationRunner(delete_outcome=("gh: Server Error (HTTP 500)", 1))
+
+    with pytest.raises(AgentLoopError, match="remove it manually"):
+        _publish(runner, tmp_path)
+
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+
+
+class EntryNormalizationRunner(FakeRunner):
+    """Serve the live PR for entry normalization from a mutable payload."""
+
+    def __init__(self, live_pr, *, delete_returncode=0, readback_labels=None, **kwargs):
+        super().__init__(**kwargs)
+        self.live_pr = live_pr
+        self.delete_returncode = delete_returncode
+        self.readback_labels = readback_labels
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(arg) for arg in args]
+        if cmd == ["gh", "api", "repos/OWNER/REPO/pulls/7"]:
+            cmd, cwd_path = self._record_command(args, cwd)
+            if isinstance(self.live_pr, str):
+                return CommandResult(cmd, cwd_path, self.live_pr, "", 0)
+            return CommandResult(cmd, cwd_path, json.dumps(self.live_pr), "", 0)
+        if cmd[:5] == MANAGED_LABEL_DELETE:
+            cmd, cwd_path = self._record_command(args, cwd)
+            if self.delete_returncode:
+                return CommandResult(cmd, cwd_path, "", "gh: Server Error (HTTP 500)", 1)
+            self.live_pr["labels"] = (
+                self.readback_labels if self.readback_labels is not None else [
+                    item for item in self.live_pr["labels"] if item.get("name") != MANAGED_LABEL
+                ]
+            )
+            return CommandResult(cmd, cwd_path, "", "", 0)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def _live_pr(*, state="open", draft=False, labels=(MANAGED_LABEL,)):
+    return {"state": state, "draft": draft, "labels": [{"name": name} for name in labels]}
+
+
+def test_release_retained_managed_label_releases_open_ready_labeled_pr(tmp_path):
+    runner = EntryNormalizationRunner(_live_pr(labels=(MANAGED_LABEL, "bug")))
+    config = make_config(tmp_path)
+
+    assert release_retained_managed_label(runner, config=config, pr_number=7, cwd=tmp_path) is True
+
+    assert len(_managed_label_deletes(runner)) == 1
+    assert runner.live_pr["labels"] == [{"name": "bug"}]
+    # Every command (read, DELETE, read-back) runs in the supplied cwd.
+    assert {cwd for _command, cwd in runner.commands} == {tmp_path}
+
+
+@pytest.mark.parametrize(
+    "live_pr",
+    [
+        _live_pr(draft=True),
+        _live_pr(draft=True, labels=()),
+        _live_pr(labels=()),
+        _live_pr(state="closed"),
+        _live_pr(draft=None),
+        {"state": "open", "draft": False},
+        {"state": "open", "draft": False, "labels": "agent-loop-managed"},
+        "not json",
+        "",
+    ],
+    ids=[
+        "draft-labeled", "draft-unlabeled", "ready-unlabeled", "closed", "draft-none",
+        "missing-labels", "malformed-labels", "invalid-json", "empty",
+    ],
+)
+def test_release_retained_managed_label_leaves_other_states_untouched(tmp_path, live_pr):
+    runner = EntryNormalizationRunner(live_pr)
+
+    assert release_retained_managed_label(
+        runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+    ) is False
+
+    assert _managed_label_deletes(runner) == []
+    assert len(runner.commands) == 1
+
+
+@pytest.mark.parametrize("failure", ["delete", "readback"])
+def test_release_retained_managed_label_failure_names_manual_remedy(tmp_path, failure):
+    runner = EntryNormalizationRunner(
+        _live_pr(),
+        delete_returncode=1 if failure == "delete" else 0,
+        readback_labels=[{"name": MANAGED_LABEL}] if failure == "readback" else None,
+    )
+
+    with pytest.raises(AgentLoopError, match="Remove the label manually, then rerun"):
+        release_retained_managed_label(
+            runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+        )
 
 
 def v2_run(

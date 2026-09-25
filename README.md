@@ -115,6 +115,19 @@ require `agent-loop-managed`. Unlabeled events always run the ordinary Python
 PRs fail open to that suite. Pushes to `main` and all-empty manual dispatches
 also run the complete suite.
 
+A successful explicit `--managed-ci` manual qualification keeps
+`agent-loop-managed` on the PR it has just made ready. Removing the label would
+fire `unlabeled` and re-run the full suite on the head that exact-head CI has
+just qualified. A ready PR is never suppressed, so the retained label has no
+effect there. Removing it by hand still returns the PR to ordinary CI. If
+publication fails at any step, agent-loop releases the label, unless a
+readable label event from someone else owns it; that label is left and
+reported. Any later agent-loop invocation on the PR removes a retained label
+from an open ready PR before any other managed-CI work, then continues exactly
+as for a ready/unlabeled PR. If a qualified PR is converted back to draft and
+pushed by hand, the label suppresses ordinary CI for that push. Remove the label
+to restore it.
+
 After the workflow change is merged, the sole-maintainer rollout is ordered:
 
 1. Set the repository Actions variable to the trusted actor:

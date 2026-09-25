@@ -372,6 +372,39 @@ def test_routing_matrix_is_label_race_safe_and_fail_open():
     assert _ordinary_route("synchronize", _pr(head={"sha": "b" * 40, "ref": "feature", "repo": {"full_name": "fork/REPO"}}), "agent-loop") is True
 
 
+def test_retained_managed_label_never_suppresses_a_ready_or_unmanaged_pr():
+    """A qualified PR keeps its label; the unchanged routing ignores it (#1047).
+
+    The job-level routing expression itself stays pinned byte-for-byte by
+    ``test_routing_matrix_is_label_race_safe_and_fail_open``.
+    """
+    qualified_ready = _pr(draft=False)
+    adopted_labeled = _pr(
+        draft=False,
+        head={"sha": "b" * 40, "ref": "feature", "repo": {"full_name": "OWNER/REPO"}},
+    )
+    adopted_draft_labeled = _pr(
+        head={"sha": "b" * 40, "ref": "feature", "repo": {"full_name": "OWNER/REPO"}},
+    )
+    for action in ("synchronize", "reopened"):
+        assert _ordinary_route(action, qualified_ready, "agent-loop") is True
+        assert _ordinary_route(action, adopted_labeled, "agent-loop") is True
+        assert _ordinary_route(action, adopted_draft_labeled, "agent-loop") is True
+    # Every label release, including a manual removal after qualification or
+    # a publication-failure cleanup in either draft state, runs ordinary CI.
+    for pr in (qualified_ready, _pr(), _pr(labels=[]), adopted_labeled):
+        assert _ordinary_route("unlabeled", pr, "agent-loop") is True
+
+
+def test_draft_conversion_of_qualified_pr_is_a_documented_suppression_residual():
+    """A human-made draft on a managed branch keeps today's draft/labeled routing."""
+    converted = _pr(draft=True)
+    assert _ordinary_route("synchronize", converted, "agent-loop") is False
+    # The documented remedy: removing the label restores ordinary CI.
+    assert _ordinary_route("unlabeled", converted, "agent-loop") is True
+    assert _ordinary_route("synchronize", _pr(draft=True, labels=[]), "agent-loop") is True
+
+
 def _dispatch_validate(*, record=None, **overrides):
     values = {
         "protocol": "2",

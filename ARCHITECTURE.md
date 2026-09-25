@@ -609,6 +609,24 @@ fail open. Pushes to `main` and all-empty manual dispatches remain full-suite
 paths; label-addition, readiness, and draft-conversion events are deliberately
 not subscribed to.
 
+Explicit manual qualification keeps the managed label on the PR it readies, so
+no `unlabeled` event re-runs ordinary CI on the qualified head. A ready PR is
+never suppressed, and `unlabeled` still restores ordinary CI whenever the label
+is removed. Publication checks twice, before readiness and before the audit
+record, that the active label event is the contract's event and actor. Any
+publication failure releases the label, whether the PR is still draft or
+already ready, and regardless of the orchestrator's interrupted-run
+preservation. The label is removed when the event is owned or unprovable
+(fail-open). A readable label event from someone else is left and reported.
+The next agent-loop invocation removes a retained label from an open ready PR
+at PR-loop entry, in the bootstrap directory, before lifecycle authentication
+and workdir setup. Every lifecycle classifier therefore still sees only the
+draft/labeled and ready/unlabeled states. If a re-entered run aborts before
+publication, it is kept draft/labeled for exact resume, like any other
+interrupted managed run. Residual: if a human converts a qualified PR back to
+draft and pushes, that push is suppressed until the label is removed. Strict
+protection still requires `final-ci/exact-head` for the new head.
+
 Managed dispatch is authorized in base-workflow code. It resolves the
 configured `AGENT_LOOP_MANAGED_ACTOR` to the live identity, requires both the
 initiating and re-run actors to match, validates the live PR and current base
