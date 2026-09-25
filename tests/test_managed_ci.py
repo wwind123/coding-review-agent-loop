@@ -3,7 +3,9 @@ import copy
 import json
 import re
 import shlex
+import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -83,7 +85,7 @@ from coding_review_agent_loop.runner import CommandResult
 from coding_review_agent_loop.cli import build_parser
 from coding_review_agent_loop.config import resolve_base_branch
 
-from fixtures.managed_ci import current_router, historical_router, local_router
+from fixtures.managed_ci import current_router, dispatch_validator, historical_router, local_router
 
 from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
 
@@ -203,9 +205,11 @@ class V2ManagedRunner(ManagedRunner):
         unreadable_issue_events_after_label=False,
         issue_timeline=None,
         compare_payload=None,
+        base_sha="base-sha",
         **kwargs,
     ):
         workflow = kwargs.pop("workflow", V2_WORKFLOW)
+        self.base_sha = base_sha
         super().__init__(workflow=workflow, **kwargs)
         self.rest_pr = {
             "head": {
@@ -354,7 +358,7 @@ class V2ManagedRunner(ManagedRunner):
             return CommandResult(cmd, cwd_path, "", "", 0)
         if endpoint == "repos/OWNER/REPO/commits/main":
             cmd, cwd_path = self._record_command(args, cwd)
-            return CommandResult(cmd, cwd_path, json.dumps({"sha": "base-sha"}), "", 0)
+            return CommandResult(cmd, cwd_path, json.dumps({"sha": self.base_sha}), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, json.dumps(self.intent_comments), "", 0)
@@ -4553,15 +4557,15 @@ def test_pr_mode_keeps_readable_non_owned_label_event_fail_closed(tmp_path):
 def test_resume_intent_generation_ignores_historical_same_head_ledger_and_run(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     historical = v2_intent_comment(run_id=100, run_attempt=1)
-    contract = v2_contract(intent_generation="fresh-generation")
-    runner = V2ManagedRunner(
+    contract = valid_v2_contract(intent_generation="fresh-generation")
+    runner = valid_v2_runner(
         intent_comments=[historical],
-        workflow_runs=[v2_run(run_id=100)],
+        workflow_runs=[valid_v2_run(run_id=100)],
     )
 
-    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
 
-    assert contract.nonce != "nonce-1"
+    assert contract.nonce != V2_NONCE
     assert contract.attached_run_id is None
     assert any("issues/7/comments" in " ".join(cmd) and "POST" in cmd for cmd, _ in runner.commands)
 
@@ -4571,10 +4575,13 @@ def test_intent_history_malformed_page_fails_closed_instead_of_minting_nonce(tmp
     contract = v2_contract(intent_generation="fresh-generation")
     runner = V2ManagedRunner(intent_comments=[{"id": 17}, "malformed-entry"])
 
-    with pytest.raises(AgentLoopError, match="Unable to inspect managed-CI v2 intent history"):
+    # The workflow fails every nonce on a malformed entry, so a fresh nonce
+    # is never minted while one is present (#1043).
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="malformed comment author"):
         _ensure_v2_intent(
             runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract,
         )
+    assert not any("issues/7/comments" in " ".join(cmd) and "POST" in cmd for cmd, _ in runner.commands)
 
 
 def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, monkeypatch):
@@ -4877,38 +4884,77 @@ def v2_run(
     }
 
 
-def v2_intent_comment(
-    *, nonce="nonce-1", run_id=None, run_attempt=None, state=None,
+# Workflow-valid identities for seeded intent ledgers.  Rediscovery adopts
+# only a record the base workflow would accept (#1043), so a seeded record
+# carries 40-hex SHAs, a 32-character nonce, and the full key set.
+V2_HEAD = "abc123" + "0" * 34
+V2_REVISION = "ba5e" + "0" * 36
+V2_NONCE = "nonce-1" + "x" * 25
+V2_GENERATION = "generation-1"
+
+
+def v2_intent_payload(
+    *, nonce=V2_NONCE, run_id=None, run_attempt=None, state=None,
     terminal_run_id=None, terminal_run_attempt=None,
-    terminal_attempts=None, terminal_outcome=None,
+    terminal_attempts=None, terminal_outcome=None, created_at=1,
+    generation=V2_GENERATION, expected_head_sha=V2_HEAD,
 ):
-    payload = {
+    if state is None:
+        state = "attached" if run_id is not None else "dispatch-requested"
+    return {
+        "version": 2,
         "repository": "OWNER/REPO",
         "pr": 7,
-        "expected_head_sha": "abc123",
+        "expected_head_sha": expected_head_sha,
+        "base_ref": "main",
+        "workflow_revision": V2_REVISION,
+        "generation": generation,
         "nonce": nonce,
-        "created_at": 1,
+        "created_at": created_at,
+        "state": state,
         "run_id": run_id,
         "run_attempt": run_attempt,
+        "terminal_run_id": terminal_run_id,
+        "terminal_run_attempt": terminal_run_attempt,
+        "terminal_outcome": terminal_outcome,
+        "terminal_attempts": [
+            {"run_id": item_id, "run_attempt": attempt}
+            for item_id, attempt in (terminal_attempts or ())
+        ],
     }
-    if state is not None:
-        payload["state"] = state
-    if terminal_run_id is not None:
-        payload["terminal_run_id"] = terminal_run_id
-    if terminal_run_attempt is not None:
-        payload["terminal_run_attempt"] = terminal_run_attempt
-    if terminal_outcome is not None:
-        payload["terminal_outcome"] = terminal_outcome
-    if terminal_attempts is not None:
-        payload["terminal_attempts"] = [
-            {"run_id": run_id, "run_attempt": attempt}
-            for run_id, attempt in terminal_attempts
-        ]
+
+
+def v2_intent_comment(*, comment_id=17, suffix="", **fields):
+    payload = v2_intent_payload(**fields)
     return {
-        "id": 17,
+        "id": comment_id,
         "user": {"login": "agent-loop", "id": 1},
-        "body": f"<!-- AGENT_MANAGED_CI_INTENT_V2 {json.dumps(payload)} -->",
+        "body": f"<!-- AGENT_MANAGED_CI_INTENT_V2 {json.dumps(payload)} -->{suffix}",
     }
+
+
+def valid_v2_contract(**overrides):
+    """A same-generation contract whose ledger the workflow would accept."""
+    fields = {
+        "workflow_revision": V2_REVISION,
+        "nonce": V2_NONCE,
+        "intent_generation": V2_GENERATION,
+    }
+    fields.update(overrides)
+    return v2_contract(**fields)
+
+
+def valid_v2_runner(**kwargs):
+    kwargs.setdefault("base_sha", V2_REVISION)
+    kwargs.setdefault("pr_payload", {"headRefOid": V2_HEAD})
+    return V2ManagedRunner(**kwargs)
+
+
+def valid_v2_run(**kwargs):
+    kwargs.setdefault("name", f"managed-ci-v2 nonce={V2_NONCE}")
+    run = v2_run(**kwargs)
+    run["head_sha"] = V2_REVISION
+    return run
 
 
 def checks(
@@ -5393,20 +5439,20 @@ def test_v2_cancelled_run_during_candidate_jobs_stops_without_publishing_status(
 
 def test_v2_terminal_exclusion_does_not_attach_stale_cancelled_run(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
+    runner = valid_v2_runner(
         workflow_runs=[
-            v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
-            v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
+            valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
+            valid_v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
         ],
         intent_comments=[v2_intent_comment(
-            run_id=100, run_attempt=1, state="terminal-no-status",
-            terminal_run_id=100, terminal_run_attempt=1,
+            run_id=100, run_attempt=1, state="completed", terminal_outcome="no-status",
+            terminal_run_id=100, terminal_run_attempt=1, terminal_attempts=((100, 1),),
         )],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
@@ -5416,17 +5462,17 @@ def test_v2_terminal_exclusion_does_not_attach_stale_cancelled_run(tmp_path):
 
 def test_v2_terminal_ledger_clears_old_attachment_before_fresh_dispatch(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
-        workflow_runs=[v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled")],
+    runner = valid_v2_runner(
+        workflow_runs=[valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled")],
         intent_comments=[v2_intent_comment(
-            run_id=100, run_attempt=1, state="terminal-no-status",
-            terminal_run_id=100, terminal_run_attempt=1,
+            run_id=100, run_attempt=1, state="completed", terminal_outcome="no-status",
+            terminal_run_id=100, terminal_run_attempt=1, terminal_attempts=((100, 1),),
         )],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert contract.attached_run_id is None
@@ -5436,22 +5482,22 @@ def test_v2_terminal_ledger_clears_old_attachment_before_fresh_dispatch(tmp_path
 
 def test_v2_terminal_ledger_excludes_all_prior_cancelled_attempts(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
+    runner = valid_v2_runner(
         workflow_runs=[
-            v2_run(run_id=100, attempt=2, status="completed", conclusion="cancelled"),
-            v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
-            v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
+            valid_v2_run(run_id=100, attempt=2, status="completed", conclusion="cancelled"),
+            valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
+            valid_v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
         ],
         intent_comments=[v2_intent_comment(
-            run_id=100, run_attempt=2, state="terminal-no-status",
+            run_id=100, run_attempt=2, state="completed", terminal_outcome="no-status",
             terminal_run_id=100, terminal_run_attempt=2,
             terminal_attempts=((100, 1), (100, 2)),
         )],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
@@ -5460,31 +5506,32 @@ def test_v2_terminal_ledger_excludes_all_prior_cancelled_attempts(tmp_path):
 
 def test_v2_later_legitimate_rerun_attempt_is_accepted_after_terminal_stop(tmp_path):
     config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
-    runner = V2ManagedRunner(
+    runner = valid_v2_runner(
         workflow_runs=[
-            v2_run(run_id=100, attempt=2, status="completed", conclusion="success"),
-            v2_run(run_id=100, attempt=1, status="completed", conclusion="timed_out"),
+            valid_v2_run(run_id=100, attempt=2, status="completed", conclusion="success"),
+            valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="timed_out"),
         ],
         intent_comments=[v2_intent_comment(
-            run_id=100, run_attempt=1, state="terminal-no-status",
-            terminal_run_id=100, terminal_run_attempt=1,
+            run_id=100, run_attempt=1, state="completed", terminal_outcome="no-status",
+            terminal_run_id=100, terminal_run_attempt=1, terminal_attempts=((100, 1),),
         )],
         pr_status_payload={"statuses": [{
             "context": FINAL_CONTEXT,
             "state": "success",
-            "description": "nonce=nonce-1;run_id=100;attempt=2",
+            "description": f"nonce={V2_NONCE};run_id=100;attempt=2",
             "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
             "creator": {"login": "github-actions[bot]", "id": 41898282},
         }]},
         pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
     outcome = wait_for_final_qualification(
-        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+        runner, config=config, pr_number=7,
+        metadata=replace(metadata(), head_sha=V2_HEAD), contract=contract,
     )
 
     assert outcome.status == "passed"
@@ -5749,16 +5796,16 @@ def test_v2_intent_body_leads_with_fixed_visible_line_for_capable_workflow():
 
 def test_v2_visible_intent_body_round_trips_through_intent_rediscovery(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner()
-    contract = v2_contract(visible_intent_capable=True)
+    runner = valid_v2_runner()
+    contract = valid_v2_contract(visible_intent_capable=True)
 
-    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
     nonce = contract.nonce
     _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
 
     assert [snapshot["state"] for snapshot in runner.intent_snapshots] == ["prepared", "dispatch-requested"]
-    resumed = v2_contract(visible_intent_capable=True, nonce=None)
-    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=resumed)
+    resumed = valid_v2_contract(visible_intent_capable=True, nonce=None)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=resumed)
     assert resumed.nonce == nonce
     assert resumed.intent_state == "dispatch-requested"
 
@@ -6025,22 +6072,24 @@ def test_explicit_activation_release_is_terminal_and_unqualified(tmp_path):
 def test_v2_intent_resumes_matching_comment_and_rejects_competing_nonce(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     comment = v2_intent_comment(run_id=100, run_attempt=1)
-    runner = V2ManagedRunner(intent_comments=[comment])
-    contract = v2_contract()
+    runner = valid_v2_runner(intent_comments=[comment])
+    contract = valid_v2_contract()
 
     _ensure_v2_intent(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
-    assert (contract.intent_comment_id, contract.nonce, contract.attached_run_id) == (17, "nonce-1", 100)
+    assert (contract.intent_comment_id, contract.nonce, contract.attached_run_id) == (17, V2_NONCE, 100)
     competing = dict(comment)
     competing["id"] = 18
-    competing["body"] = v2_intent_comment(nonce="nonce-2")["body"]
-    runner = V2ManagedRunner(intent_comments=[comment, competing])
-    with pytest.raises(AgentLoopError, match="Competing managed-CI v2 intent"):
+    competing["body"] = v2_intent_comment(nonce="nonce-2" + "y" * 25)["body"]
+    runner = valid_v2_runner(intent_comments=[comment, competing])
+    with pytest.raises(AgentLoopError, match="Competing managed-CI v2 intent") as raised:
         _ensure_v2_intent(
-            runner, config=config, pr_number=7, expected_head_sha="abc123", contract=v2_contract()
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=valid_v2_contract()
         )
+    # Differing nonces keep the existing, recoverable competing-intents route.
+    assert not isinstance(raised.value, managed_ci.ManagedCiIntentLedgerError)
 
 
 def test_v2_fresh_generation_resets_attachment_terminal_history_and_early_fields(tmp_path):
@@ -6084,13 +6133,13 @@ def test_v2_fresh_generation_resets_attachment_terminal_history_and_early_fields
 
 def test_v2_same_nonce_non_excluded_attachment_survives_discovery_miss_without_redispatch(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(intent_comments=[v2_intent_comment(
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(
         run_id=100, run_attempt=1, state="attached"
     )])
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert (contract.attached_run_id, contract.run_attempt) == (100, 1)
@@ -6100,18 +6149,18 @@ def test_v2_same_nonce_non_excluded_attachment_survives_discovery_miss_without_r
 
 def test_v2_excluded_attachment_transitions_to_dispatch_requested_before_replacement(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
-        workflow_runs=[v2_run(run_id=101, status="in_progress", conclusion=None)],
+    runner = valid_v2_runner(
+        workflow_runs=[valid_v2_run(run_id=101, status="in_progress", conclusion=None)],
         intent_comments=[v2_intent_comment(
             run_id=100, run_attempt=1, state="completed",
             terminal_run_id=100, terminal_run_attempt=1,
             terminal_attempts=((100, 1),), terminal_outcome="no-status",
         )],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
@@ -6217,23 +6266,26 @@ def test_v2_current_pinned_consumer_scopes_lifecycle_validation_to_requested_non
         )
 
 
-def test_v2_legacy_no_status_restoration_preserves_missing_attempt_exclusion(tmp_path):
+def test_v2_legacy_no_status_record_is_refused_instead_of_restored(tmp_path):
+    """A legacy terminal-no-status state is one the base workflow fails.
+
+    Rediscovery mirrors the workflow's verdict (#1043), so such a record is
+    never adopted and no fresh intent is minted beside it.
+    """
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(intent_comments=[v2_intent_comment(
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(
         run_id=100, run_attempt=None, state="terminal-no-status",
         terminal_run_id=100, terminal_run_attempt=None,
     )])
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
-    _ensure_v2_intent(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
-    )
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="invalid state"):
+        _ensure_v2_intent(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
 
-    assert contract.intent_state == "terminal-no-status"
-    assert contract.terminal_outcome == "no-status"
-    assert contract.terminal_attempts == ((100, None),)
-    assert contract.attached_run_id is None
-    assert contract.run_attempt is None
+    assert contract.intent_comment_id is None
+    assert runner.intent_snapshots == []
 
 
 def test_v2_missing_terminal_attempt_excludes_same_run_but_allows_fresh_run():
@@ -6245,11 +6297,11 @@ def test_v2_missing_terminal_attempt_excludes_same_run_but_allows_fresh_run():
 
 def test_v2_dispatch_discovers_existing_run_before_dispatching(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(workflow_runs=[v2_run()], intent_comments=[v2_intent_comment()])
-    contract = v2_contract()
+    runner = valid_v2_runner(workflow_runs=[valid_v2_run()], intent_comments=[v2_intent_comment()])
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert contract.attached_run_id == 100
@@ -6288,20 +6340,20 @@ def test_v2_dispatch_ledger_failure_uses_authenticated_ordinary_recovery_capabil
 
 def test_v2_dispatch_discovers_run_with_display_title_and_qualified_path(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
+    runner = valid_v2_runner(
         workflow_runs=[
-            v2_run(
+            valid_v2_run(
                 name="CI",
-                display_title="managed-ci-v2 nonce=nonce-1",
+                display_title=f"managed-ci-v2 nonce={V2_NONCE}",
                 path="OWNER/REPO/.github/workflows/ci.yml@refs/heads/main",
             )
         ],
         intent_comments=[v2_intent_comment()],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert contract.attached_run_id == 100
@@ -6618,27 +6670,33 @@ def test_intent_body_stays_marker_only_for_the_base_workflow_validator(tmp_path)
     assert envelope.match(second) is not None
 
 
-def test_labeled_intent_comment_is_rediscovered_like_a_marker_only_one(tmp_path):
+def test_labeled_intent_comment_is_skipped_like_the_base_workflow_skips_it(tmp_path):
+    """A free-form label ahead of the record is not a workflow envelope.
+
+    The base workflow skips such a comment, so rediscovery must not adopt it
+    either (#1043); a fresh intent is posted instead.
+    """
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     historical = v2_intent_comment(run_id=100, run_attempt=1)
     labeled = dict(historical)
     labeled["body"] = (
         protocol_record_label(
-            "managed_ci_intent", pr_number=7, head_sha="abc123", state="attached"
+            "managed_ci_intent", pr_number=7, head_sha=V2_HEAD, state="attached"
         )
         + "\n\n"
         + historical["body"]
     )
-    runner = V2ManagedRunner(intent_comments=[labeled])
-    contract = v2_contract()
+    runner = valid_v2_runner(intent_comments=[labeled])
+    contract = valid_v2_contract()
 
     _ensure_v2_intent(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
-    assert (contract.intent_comment_id, contract.nonce, contract.attached_run_id) == (
-        17, "nonce-1", 100,
-    )
+    assert contract.intent_comment_id != 17
+    assert contract.nonce != V2_NONCE
+    assert contract.attached_run_id is None
+    assert [snapshot["state"] for snapshot in runner.intent_snapshots] == ["prepared"]
 
 
 class AlteredLabelIntentRunner(V2ManagedRunner):
@@ -8411,3 +8469,647 @@ def test_recovered_record_with_foreign_plan_hash_fails_the_activation_gate(tmp_p
     assert runner.labels_posted is False
     assert runner.dispatch_count == 0
     assert _mutations(runner) == []
+
+
+# --- known host comment footer (#1043) ---------------------------------------
+
+HOST_FOOTER = managed_ci.KNOWN_HOST_COMMENT_FOOTER
+_NEAR_MISS_SUFFIXES = (
+    HOST_FOOTER + HOST_FOOTER,
+    HOST_FOOTER + "\n",
+    "\n\n---\n_Generated by [Claude Code](http://claude.ai/code)_",
+    "\n\nextra prose",
+)
+
+
+def _footer_authorization_comment(body, *, comment_id=31):
+    return {"id": comment_id, "user": {"login": "agent-loop", "id": 1}, "body": body}
+
+
+def _read_authorization_records(tmp_path, comments):
+    runner = V2ManagedRunner(intent_comments=comments)
+    return managed_ci._authorization_comment_records(
+        runner, config=make_config(tmp_path, managed_ci_trusted_actor="agent-loop"),
+        pr_number=7, actor_login="agent-loop", actor_id=1,
+    )
+
+
+@pytest.mark.parametrize("kind", ["creation", "fresh", "continuity"])
+def test_footered_authorization_authenticates_like_a_clean_record(tmp_path, kind):
+    record = _authorization_record(kind)
+    body = str(format_issue_created_authorization_comment(record))
+
+    clean = _read_authorization_records(tmp_path, [_footer_authorization_comment(body)])
+    footered = _read_authorization_records(
+        tmp_path, [_footer_authorization_comment(body + HOST_FOOTER)]
+    )
+
+    assert clean == footered == [(31, record)]
+
+
+@pytest.mark.parametrize("suffix", _NEAR_MISS_SUFFIXES)
+def test_authorization_readers_reject_doubled_or_variant_footers(tmp_path, suffix):
+    body = str(format_issue_created_authorization_comment(_authorization_record("creation")))
+
+    with pytest.raises(AgentLoopError, match="authorization comment is malformed"):
+        _read_authorization_records(tmp_path, [_footer_authorization_comment(body + suffix)])
+
+
+def test_authorization_reader_rejects_footer_before_the_marker(tmp_path):
+    record = _authorization_record("creation")
+    label, _, marker = str(format_issue_created_authorization_comment(record)).partition("\n\n")
+    misplaced = label + HOST_FOOTER + "\n\n" + marker
+
+    with pytest.raises(AgentLoopError, match="authorization comment is malformed"):
+        _read_authorization_records(tmp_path, [_footer_authorization_comment(misplaced)])
+
+
+def test_authorization_parser_authenticates_the_whole_body_and_never_strips():
+    record = _authorization_record("fresh")
+    body = str(format_issue_created_authorization_comment(record))
+
+    assert parse_issue_created_authorization_comment(body) == record
+    # The pre-#878 marker-only rendering is still accepted, byte for byte.
+    assert parse_issue_created_authorization_comment(_authorization_marker(record)) == record
+    for tampered in (body + HOST_FOOTER, "Extra prose\n\n" + body, body + "\n", " " + body):
+        with pytest.raises(AgentLoopError, match="malformed"):
+            parse_issue_created_authorization_comment(tampered)
+
+
+def test_authenticated_comment_ingestion_strips_one_footer_before_authorization_parse(tmp_path):
+    import coding_review_agent_loop.github as github_module
+
+    record = _authorization_record("creation")
+    body = str(format_issue_created_authorization_comment(record))
+    config = make_config(tmp_path)
+
+    def envelope(text):
+        return github_module._authenticated_comment_from_rest(
+            {
+                "id": 31, "body": text, "user": {"login": "agent-loop", "id": 1},
+                "created_at": "2026-09-25T00:00:00Z", "updated_at": "2026-09-25T00:00:00Z",
+            },
+            surface="pr#7",
+            config=config,
+        )
+
+    assert parse_issue_created_authorization_comment(envelope(body + HOST_FOOTER).body) == record
+    doubled = envelope(body + HOST_FOOTER + HOST_FOOTER)
+    assert doubled.body == body + HOST_FOOTER
+    with pytest.raises(AgentLoopError, match="malformed"):
+        parse_issue_created_authorization_comment(doubled.body)
+
+
+class HostFooterRunner(V2ManagedRunner):
+    """A host that appends the known footer to chosen intent writes.
+
+    ``footer_states`` names the intent lifecycle states whose write the host
+    footers.  ``server_clock`` adds an ``updated_at`` to each write response;
+    ``envelope_created_at`` adds the comment's own creation time.
+    """
+
+    def __init__(
+        self, *, footer_states=(), server_clock=None, envelope_created_at=None,
+        after_write=None, **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.footer_states = set(footer_states)
+        self.server_clock = server_clock
+        self.envelope_created_at = envelope_created_at
+        self.after_write = after_write
+        self.release_calls = []
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        result = super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+        cmd = list(args)
+        endpoint = next((part for part in cmd if isinstance(part, str) and part.startswith("repos/")), "")
+        body = self._form_value(cmd, "body")
+        writing = body is not None and (
+            endpoint == "repos/OWNER/REPO/issues/7/comments"
+            or endpoint.startswith("repos/OWNER/REPO/issues/comments/")
+        )
+        if not writing or "AGENT_MANAGED_CI_INTENT_V2" not in body:
+            return result
+        envelope = json.loads(result.stdout)
+        state = json.loads(body.split("AGENT_MANAGED_CI_INTENT_V2 ", 1)[1].rsplit(" -->", 1)[0])["state"]
+        if state in self.footer_states:
+            envelope["body"] = body + HOST_FOOTER
+            for comment in self.intent_comments:
+                if comment.get("id") == envelope["id"]:
+                    comment["body"] = body + HOST_FOOTER
+        if self.server_clock is not None:
+            stamp = datetime.fromtimestamp(self.server_clock(), tz=timezone.utc)
+            envelope["updated_at"] = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if self.envelope_created_at is not None:
+            stamp = datetime.fromtimestamp(self.envelope_created_at, tz=timezone.utc)
+            envelope["created_at"] = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if self.after_write is not None:
+            self.after_write(self, state)
+        return CommandResult(result.args, result.cwd, json.dumps(envelope), "", 0)
+
+
+def _spy_release(monkeypatch):
+    calls = []
+
+    def release(*args, **kwargs):
+        calls.append(kwargs)
+        raise AssertionError("terminal managed-CI errors must not reach ordinary recovery")
+
+    monkeypatch.setattr(managed_ci, "_release_for_ordinary_recovery", release)
+    return calls
+
+
+def _intent_posts(runner):
+    return [
+        cmd for cmd, _cwd in runner.commands
+        if "repos/OWNER/REPO/issues/7/comments" in cmd and "POST" in cmd
+    ]
+
+
+def _authorized_resume():
+    return AuthenticatedManagedResume(
+        origin="issue-created", lifecycle="draft-labeled",
+        issue_created_handoff=_authorization_handoff(head=V2_HEAD),
+    )
+
+
+def test_rediscovery_adopts_a_footered_intent_only_when_the_workflow_admits_it(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    comment = v2_intent_comment(suffix=HOST_FOOTER)
+
+    capable = valid_v2_contract(host_footer_capable=True)
+    _ensure_v2_intent(
+        valid_v2_runner(intent_comments=[dict(comment)]), config=config, pr_number=7,
+        expected_head_sha=V2_HEAD, contract=capable,
+    )
+    assert (capable.intent_comment_id, capable.nonce) == (17, V2_NONCE)
+
+    older = valid_v2_contract()
+    runner = valid_v2_runner(intent_comments=[dict(comment)])
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=older)
+    # An older workflow would skip the footered comment, so it is not adopted.
+    assert older.intent_comment_id != 17 and older.nonce != V2_NONCE
+    assert len(_intent_posts(runner)) == 1
+
+
+@pytest.mark.parametrize("suffix", [HOST_FOOTER + HOST_FOOTER, HOST_FOOTER + "\n", HOST_FOOTER + " "])
+def test_rediscovery_skips_doubled_and_whitespace_footers(tmp_path, suffix):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(suffix=suffix)])
+    contract = valid_v2_contract(host_footer_capable=True)
+
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+
+    assert contract.intent_comment_id != 17 and contract.nonce != V2_NONCE
+
+
+@pytest.mark.parametrize(
+    ("comments", "reason"),
+    [
+        (
+            [v2_intent_comment(comment_id=17), v2_intent_comment(comment_id=18)],
+            "expected exactly one fresh intent",
+        ),
+        (
+            [
+                v2_intent_comment(comment_id=17),
+                {**v2_intent_comment(comment_id=18), "body": v2_intent_comment()["body"].replace(
+                    '"version": 2', '"version": 2, "extra": 1'
+                )},
+            ],
+            "invalid schema",
+        ),
+        (
+            [{**v2_intent_comment(), "body": (
+                f"Managed CI authorization for exact head {'c' * 40}.\n\n" + v2_intent_comment()["body"]
+            )}],
+            "visible intent line disagrees",
+        ),
+        ([v2_intent_comment(nonce="short")], "invalid nonce"),
+    ],
+)
+def test_rediscovery_fails_closed_on_a_candidate_the_workflow_fails(tmp_path, monkeypatch, comments, reason):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+    runner = valid_v2_runner(intent_comments=comments)
+    contract = valid_v2_contract(visible_intent_capable=True)
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match=reason):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert _intent_posts(runner) == []
+    assert runner.dispatch_count == 0
+    assert releases == []
+
+
+@pytest.mark.parametrize(
+    ("entry", "reason"),
+    [
+        ({"id": 40, "user": {"id": 5}, "body": "hello"}, "malformed comment author"),
+        ({"id": 40, "user": "someone", "body": "hello"}, "malformed comment author"),
+        ({"id": 40, "user": {"login": "agent-loop", "id": 99}, "body": "hello"}, "author ID drifted"),
+        ({"id": 40, "user": {"login": "agent-loop", "id": 1}, "body": None}, "body is not text"),
+        (
+            {"id": 40, "user": {"login": "agent-loop", "id": 1},
+             "body": "<!-- AGENT_MANAGED_CI_INTENT_V2 {not json} -->"},
+            "malformed JSON",
+        ),
+        (
+            {"id": 40, "user": {"login": "agent-loop", "id": 1},
+             "body": "<!-- AGENT_MANAGED_CI_INTENT_V2 [1] -->"},
+            "not an object",
+        ),
+        (
+            {"id": 40, "user": {"login": "agent-loop", "id": 1},
+             "body": "<!-- AGENT_MANAGED_CI_INTENT_V2 {\"version\": 1} -->"},
+            "unsupported intent version",
+        ),
+    ],
+)
+def test_nonce_independent_fatal_page_posts_nothing(tmp_path, entry, reason):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(intent_comments=[entry])
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match=reason):
+        _ensure_v2_intent(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD,
+            contract=valid_v2_contract(),
+        )
+    assert _intent_posts(runner) == []
+
+
+def test_restore_rejects_a_malformed_nonce():
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="malformed nonce"):
+        managed_ci._restore_v2_intent_fields(valid_v2_contract(), {"nonce": "nonce-1"})
+
+
+@pytest.mark.parametrize("mode", ["managed-pr", "issue-created-resume"])
+def test_non_dict_page_entry_reaches_rediscovery_through_the_api_seam(tmp_path, monkeypatch, mode):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_pr_mode=mode == "managed-pr",
+    )
+    releases = _spy_release(monkeypatch)
+    runner = valid_v2_runner(intent_comments=["not a comment", v2_intent_comment()])
+    contract = valid_v2_contract(
+        authenticated_resume=_authorized_resume() if mode == "issue-created-resume" else None,
+    )
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="malformed comment object"):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert _intent_posts(runner) == []
+    assert runner.dispatch_count == 0
+    assert releases == []
+
+
+def test_non_dict_entry_appearing_before_the_gate_blocks_dispatch(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+
+    def inject(runner, state):
+        if state == "dispatch-requested":
+            runner.intent_comments.append(None)
+
+    runner = HostFooterRunner(after_write=inject, base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD})
+    contract = valid_v2_contract(nonce=None)
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="malformed comment object"):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert runner.dispatch_count == 0
+    assert releases == []
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode"), [("", 1), (json.dumps({"message": "rate limited"}), 0), ("{not json", 0)]
+)
+def test_uninspectable_intent_page_keeps_the_generic_inspection_error(tmp_path, stdout, returncode):
+    class Unreadable(V2ManagedRunner):
+        def _run_locked(self, args, *, cwd, check, input_text=None):
+            endpoint = next((part for part in args if isinstance(part, str) and part.startswith("repos/")), "")
+            if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
+                cmd, cwd_path = self._record_command(args, cwd)
+                return CommandResult(cmd, cwd_path, stdout, "", returncode)
+            return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    with pytest.raises(AgentLoopError, match="Unable to inspect managed-CI v2 intent history") as raised:
+        _ensure_v2_intent(
+            Unreadable(), config=config, pr_number=7, expected_head_sha=V2_HEAD,
+            contract=valid_v2_contract(),
+        )
+    assert not isinstance(raised.value, managed_ci.ManagedCiIntentLedgerError)
+    # _api_list keeps its contract for every other caller.
+    runner = V2ManagedRunner(intent_comments=["not a comment"])
+    assert _api_list(runner, config, "repos/OWNER/REPO/issues/7/comments?per_page=100") is None
+
+
+def _page_for_router(runner):
+    return [[comment for comment in runner.intent_comments]]
+
+
+def _router_pr():
+    return {
+        "state": "open", "draft": True, "number": 7, "base": {"ref": "main"},
+        "head": {"sha": V2_HEAD, "ref": "agent-loop/managed-7", "repo": {"full_name": "OWNER/REPO"}},
+        "user": {"login": "agent-loop", "id": 1}, "labels": [{"name": MANAGED_LABEL}],
+    }
+
+
+def _route(runner, nonce):
+    return local_router.validate(
+        _router_pr(), _page_for_router(runner), "OWNER/REPO", "7", V2_HEAD, nonce,
+        "agent-loop", V2_REVISION, 1,
+    )
+
+
+def test_prepared_intent_is_recovered_in_place_then_authorized_at_the_gate(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+    runner = HostFooterRunner(base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD})
+    contract = valid_v2_contract(nonce=None)
+    # The first attempt posted its prepared intent and was interrupted before
+    # the dispatch-requested PATCH.
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+    prepared_id, nonce = contract.intent_comment_id, contract.nonce
+    with pytest.raises(ValueError, match="prepared intent is not a dispatch authorization"):
+        _route(runner, nonce)
+    verdict = managed_ci.classify_intent_page(
+        list(runner.intent_comments), requested_nonce=nonce, trusted_login="agent-loop",
+        trusted_id=1, visible_capable=False, host_footer_capable=False,
+        binding=managed_ci._intent_binding(contract, nonce=nonce),
+    )
+    assert verdict.outcome == "recoverable"
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+
+    assert contract.intent_comment_id == prepared_id and contract.nonce == nonce
+    assert len(_intent_posts(runner)) == 1
+    assert runner.dispatch_count == 1
+    assert contract.dispatch_issued is True
+    assert _route(runner, nonce)["state"] == "dispatch-requested"
+    assert releases == []
+
+
+def test_same_nonce_sibling_before_the_gate_blocks_dispatch(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+
+    def sibling(runner, state):
+        if state == "dispatch-requested":
+            original = runner.intent_comments[-1]
+            runner.intent_comments.append({**original, "id": original["id"] + 100})
+
+    runner = HostFooterRunner(after_write=sibling, base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD})
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="exactly one fresh intent"):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD,
+            contract=valid_v2_contract(nonce=None),
+        )
+
+    assert runner.dispatch_count == 0
+    assert releases == []
+
+
+def test_adopted_contract_without_generation_recovers_prepared_intent_of_its_ledger(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(state="prepared", created_at=int(time.time()))])
+    contract = valid_v2_contract(intent_generation=None)
+
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+
+    assert (contract.intent_comment_id, contract.intent_state) == (17, "prepared")
+    assert _intent_posts(runner) == []
+
+
+def test_fresh_generation_supersedes_an_earlier_prepared_intent(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = HostFooterRunner(
+        intent_comments=[v2_intent_comment(state="prepared", generation="earlier-generation")],
+        base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract(nonce=None, intent_generation="later-generation")
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+
+    assert contract.intent_comment_id != 17 and contract.nonce != V2_NONCE
+    assert runner.dispatch_count == 1
+    # The superseded intent is only a nonce mismatch for the new request.
+    assert _route(runner, contract.nonce)["generation"] == "later-generation"
+
+
+NOW = 1_800_000_000
+
+
+def _dispatch_validate(runner, *, current_time, nonce):
+    return dispatch_validator.validate_dispatch(
+        protocol="2", pr_number_text="7", expected_head=V2_HEAD, nonce=nonce,
+        repo="OWNER/REPO", ref="refs/heads/main", configured_actor="agent-loop",
+        initiating_actor="agent-loop", rerun_actor="agent-loop", current_run_id="200",
+        current_run_attempt="1", current_time=current_time,
+        api_json=lambda path: {
+            "users/agent-loop": {"login": "agent-loop", "id": 1},
+            "repos/OWNER/REPO": {"full_name": "OWNER/REPO"},
+            "repos/OWNER/REPO/pulls/7": _router_pr(),
+            "repos/OWNER/REPO/commits/main": {"sha": V2_REVISION},
+        }[path],
+        api_pages=lambda path: _page_for_router(runner),
+        validate=local_router.validate,
+    )
+
+
+def _freshness_run(tmp_path, monkeypatch, *, created_at, local, server, envelope_created_at=None):
+    monkeypatch.setattr(managed_ci.time, "time", lambda: local)
+    runner = HostFooterRunner(
+        intent_comments=[v2_intent_comment(state="prepared", created_at=created_at)],
+        server_clock=None if server is None else (lambda: server),
+        envelope_created_at=envelope_created_at,
+        base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract(nonce=None)
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    return runner, contract, config
+
+
+@pytest.mark.parametrize(
+    ("created_at", "control"),
+    [(NOW - 1200, "managed intent record is stale"), (NOW + 1200, "too far in the future")],
+)
+def test_recovered_intent_is_renewed_in_place_before_dispatch(tmp_path, monkeypatch, created_at, control):
+    releases = _spy_release(monkeypatch)
+    runner, contract, config = _freshness_run(
+        tmp_path, monkeypatch, created_at=created_at, local=NOW, server=NOW
+    )
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+
+    assert contract.intent_comment_id == 17 and contract.nonce == V2_NONCE
+    assert _intent_posts(runner) == []
+    assert runner.dispatch_count == 1
+    assert runner.intent_snapshots[-1]["created_at"] == NOW
+    assert _dispatch_validate(runner, current_time=NOW + 60, nonce=V2_NONCE)["record"]["created_at"] == NOW
+    # Without the renewal the workflow's dispatch validator rejects the record.
+    stale = json.loads(json.dumps(runner.intent_comments))
+    stale[0]["body"] = stale[0]["body"].replace(f'"created_at":{NOW}', f'"created_at":{created_at}')
+    runner.intent_comments = stale
+    with pytest.raises(ValueError, match=control):
+        _dispatch_validate(runner, current_time=NOW + 60, nonce=V2_NONCE)
+    assert releases == []
+
+
+@pytest.mark.parametrize("skew", [600, -720])
+def test_skewed_local_clock_fails_the_freshness_gate_without_dispatch(tmp_path, monkeypatch, skew):
+    releases = _spy_release(monkeypatch)
+    runner, contract, config = _freshness_run(
+        tmp_path, monkeypatch, created_at=NOW, local=NOW + skew, server=NOW
+    )
+
+    with pytest.raises(managed_ci.ManagedCiIntentFreshnessError, match="server updated_at"):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert runner.dispatch_count == 0
+    assert releases == []
+    if skew > 0:
+        with pytest.raises(ValueError, match="too far in the future"):
+            _dispatch_validate(runner, current_time=NOW, nonce=V2_NONCE)
+
+
+def test_patch_without_updated_at_uses_local_time_not_the_comment_creation_time(tmp_path, monkeypatch):
+    releases = _spy_release(monkeypatch)
+    runner, contract, config = _freshness_run(
+        tmp_path, monkeypatch, created_at=NOW - 1200, local=NOW, server=None,
+        envelope_created_at=NOW - 1200,
+    )
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+
+    assert runner.dispatch_count == 1
+    assert runner.intent_snapshots[-1]["created_at"] == NOW
+    assert _dispatch_validate(runner, current_time=NOW + 60, nonce=V2_NONCE)["record"]["state"] == "dispatch-requested"
+    # Control: the comment's own creation time would place the renewed record
+    # 20 minutes in the future and fail the gate, so it is never used as T.
+    assert (NOW - 1200) - NOW < -managed_ci.INTENT_MAX_FUTURE_SKEW_SECONDS
+    assert releases == []
+
+
+def test_attach_path_patch_keeps_created_at(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(
+        workflow_runs=[valid_v2_run(run_id=101, status="in_progress", conclusion=None)],
+        intent_comments=[v2_intent_comment(
+            run_id=100, run_attempt=1, state="completed", created_at=5,
+            terminal_run_id=100, terminal_run_attempt=1,
+            terminal_attempts=((100, 1),), terminal_outcome="no-status",
+        )],
+    )
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=valid_v2_contract()
+    )
+
+    assert runner.dispatch_count == 0
+    assert [snapshot["created_at"] for snapshot in runner.intent_snapshots] == [5, 5]
+
+
+@pytest.mark.parametrize("footered_state", ["prepared", "dispatch-requested"])
+def test_older_workflow_guard_stops_before_dispatch(tmp_path, monkeypatch, footered_state):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+    runner = HostFooterRunner(
+        footer_states={footered_state}, base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract(nonce=None, authenticated_resume=_authorized_resume())
+
+    with pytest.raises(managed_ci.ManagedCiHostFooterIncompatibleError) as raised:
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert raised.value.phase == "pre-dispatch"
+    assert managed_ci.HOST_FOOTER_INTENT_MARKER in str(raised.value)
+    assert "No managed-CI run was dispatched" in str(raised.value)
+    assert runner.dispatch_count == 0
+    assert contract.dispatch_issued is False
+    assert contract.intent_state == ("prepared" if footered_state == "dispatch-requested" else None)
+    assert releases == []
+
+
+def test_older_workflow_guard_after_dispatch_on_the_attached_patch(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+
+    def run_appears(runner, state):
+        if state == "dispatch-requested":
+            runner.workflow_runs = [valid_v2_run(
+                run_id=300, status="in_progress", conclusion=None,
+                name=f"managed-ci-v2 nonce={runner.intent_snapshots[-1]['nonce']}",
+            )]
+
+    runner = HostFooterRunner(
+        footer_states={"attached"}, after_write=run_appears,
+        base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract(nonce=None)
+
+    with pytest.raises(managed_ci.ManagedCiHostFooterIncompatibleError) as raised:
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert raised.value.phase == "post-dispatch"
+    assert "is not cancelled" in str(raised.value)
+    assert runner.dispatch_count == 1
+    assert contract.intent_state == "dispatch-requested"
+    assert not any("cancel" in " ".join(cmd) for cmd, _cwd in runner.commands)
+    assert releases == []
+
+
+def test_older_workflow_guard_after_dispatch_claims_no_qualification(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    runner = HostFooterRunner(
+        footer_states={"completed"},
+        workflow_runs=[valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="success")],
+        intent_comments=[v2_intent_comment(run_id=100, run_attempt=1, state="attached")],
+        pr_status_payload={"statuses": [{
+            "context": FINAL_CONTEXT,
+            "state": "success",
+            "description": f"nonce={V2_NONCE};run_id=100;attempt=1",
+            "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
+            "creator": {"login": "github-actions[bot]", "id": 41898282},
+        }]},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+        base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract()
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+    assert runner.dispatch_count == 0 and contract.attached_run_id == 100
+
+    with pytest.raises(managed_ci.ManagedCiHostFooterIncompatibleError) as raised:
+        wait_for_final_qualification(
+            runner, config=config, pr_number=7,
+            metadata=replace(metadata(), head_sha=V2_HEAD), contract=contract,
+        )
+
+    assert raised.value.phase == "post-dispatch"
+    assert contract.intent_state != "completed"
+    assert runner.dispatch_count == 0
