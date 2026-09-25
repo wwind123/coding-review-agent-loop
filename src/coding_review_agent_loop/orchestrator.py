@@ -134,6 +134,7 @@ from .github import (
     PullRequestReviewContext,
     HumanReviewRequirement,
     board_protection_is_reliable,
+    protection_awaits_readiness,
     deduplicate_human_requirements,
     get_pr_head_sha,
     get_issue_context,
@@ -451,6 +452,7 @@ from .checks import (
     _pending_ci_stop_message,
     _pr_check_blocking_review,
     _pr_check_details,
+    _unreadable_protection_stop_message,
     run_optional_tests,
     run_pre_review_tests,
 )
@@ -15522,8 +15524,14 @@ def _finalize_ordinary_recovery_merge(
             f"PR #{pr_number} ordinary recovery did not qualify the exact head "
             f"({outcome.status}); the draft was left unmerged."
         )
-    if not _ordinary_checks_snapshot_is_authoritative(
+    clean_required_after_ready = outcome.checks is not None and protection_awaits_readiness(
         outcome.checks, outcome.mergeability, head_sha=outcome.head_sha,
+    )
+    if not _ordinary_checks_snapshot_is_authoritative(
+        outcome.checks,
+        outcome.mergeability,
+        head_sha=outcome.head_sha,
+        defer_unreadable_protection=clean_required_after_ready,
     ):
         details = (
             _pr_check_details(outcome.checks)
@@ -15559,6 +15567,15 @@ def _finalize_ordinary_recovery_merge(
             f"PR #{pr_number} head or provenance changed after `gh pr ready`; "
             "the PR remains ready and was not merged."
         )
+    if clean_required_after_ready:
+        assert outcome.checks is not None
+        _require_clean_merge_state_after_ready(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            checks=outcome.checks,
+            head_sha=capability.expected_head_sha,
+        )
     try:
         _merge_with_exact_head_proof(
             runner,
@@ -15575,6 +15592,56 @@ def _finalize_ordinary_recovery_merge(
         log(config, f"PR #{pr_number}: merge failed after ordinary recovery readiness; PR remains ready")
         raise
     return True
+
+
+def _require_clean_merge_state_after_ready(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    checks: PullRequestChecks,
+    head_sha: str,
+) -> None:
+    """Require GitHub's CLEAN merge state after a draft recovery is readied.
+
+    Under unreadable (403) classic protection, the draft could only report
+    ``DRAFT``.  Once ready, GitHub recomputes the merge state from the real
+    protection; poll it for the bounded startup window and refuse to merge
+    unless it is ``CLEAN`` for the same exact head.
+    """
+    attempts = max(
+        1,
+        (config.ci_startup_timeout_seconds + config.ci_poll_interval_seconds - 1)
+        // config.ci_poll_interval_seconds,
+    )
+    mergeability: PullRequestMergeability | None = None
+    for attempt in range(attempts):
+        mergeability = get_pr_mergeability(runner, config=config, pr_number=pr_number)
+        if board_protection_is_reliable(checks, mergeability, head_sha=head_sha):
+            return
+        if mergeability.state == "conflicted" or (
+            mergeability.head_sha is not None and mergeability.head_sha != head_sha
+        ):
+            break
+        if attempt < attempts - 1:
+            runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
+    merge_state = mergeability.merge_state_raw if mergeability is not None else None
+    log(
+        config,
+        f"PR #{pr_number}: branch protection is unreadable and the readied PR's merge state "
+        f"is {merge_state or 'unavailable'}, not CLEAN; PR remains ready and unmerged",
+    )
+    print(
+        f"PR #{pr_number} was marked ready after ordinary recovery CI passed, but the current "
+        "GitHub token cannot read branch protection (HTTP 403) and GitHub reports merge state "
+        f"{merge_state or 'unavailable'} (CLEAN is required) for {head_sha}. Satisfy the remaining "
+        "protection rules or grant the token administration read access, then merge manually "
+        f"with `--match-head-commit {head_sha}` or rerun agent-loop."
+    )
+    raise AgentLoopError(
+        f"PR #{pr_number} branch protection is unreadable and GitHub's merge state is not CLEAN "
+        "after readiness; the PR remains ready and was not merged."
+    )
 
 
 def _stop_on_terminal_without_status(
@@ -15673,7 +15740,11 @@ def _stop_after_ci_watch_timeout(
         runner,
         config=config,
         pr_number=pr_number,
-        body=_pending_ci_stop_message(pr_number, "pending", details),
+        body=(
+            _unreadable_protection_stop_message(pr_number, details)
+            if reason == "protection_unreadable"
+            else _pending_ci_stop_message(pr_number, "pending", details)
+        ),
     )
     rerun = _render_ci_rerun_command(config, pr_number=pr_number)
     note = (
@@ -16087,6 +16158,7 @@ def _ordinary_checks_snapshot_is_authoritative(
     mergeability: PullRequestMergeability | None = None,
     *,
     head_sha: str | None = None,
+    defer_unreadable_protection: bool = False,
 ) -> bool:
     """Return whether a fresh ordinary-check snapshot can clear its ledger.
 
@@ -16094,7 +16166,9 @@ def _ordinary_checks_snapshot_is_authoritative(
     this decision. Requiring both API surfaces and a known branch-protection
     result keeps a passing-looking partial, absent, or unavailable snapshot
     from becoming a final gate. An unreadable (403) classic protection is
-    accepted only with GitHub's ``CLEAN`` merge state for ``head_sha``.
+    accepted only with GitHub's ``CLEAN`` merge state for ``head_sha``, unless
+    ``defer_unreadable_protection`` says the caller checks ``CLEAN`` itself
+    after readiness and before merging (a draft reports ``DRAFT``).
     """
     # ``PullRequestChecks.state`` deliberately treats neutral and skipped
     # conclusions as passing for ordinary status reporting.  That aggregate is
@@ -16118,7 +16192,13 @@ def _ordinary_checks_snapshot_is_authoritative(
         checks is not None
         and checks.state == "passing"
         and checks.check_query_status == "ok"
-        and board_protection_is_reliable(checks, mergeability, head_sha=head_sha)
+        and (
+            board_protection_is_reliable(checks, mergeability, head_sha=head_sha)
+            or (
+                defer_unreadable_protection
+                and checks.branch_protection_status == "forbidden"
+            )
+        )
         and not checks.pending
         and not checks.missing_required
         and successful_checks

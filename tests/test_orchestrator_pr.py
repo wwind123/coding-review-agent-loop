@@ -6424,6 +6424,12 @@ def test_pr_loop_auto_merge_unreadable_protection_without_clean_stops_fast(tmp_p
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+    stop_comments = [c for c in runner.comments if "merge readiness cannot be confirmed" in c]
+    assert len(stop_comments) == 1
+    assert "every observed GitHub check passed" in stop_comments[0]
+    assert "HTTP 403" in stop_comments[0]
+    assert f"GitHub merge state for the current head: {merge_state}" in stop_comments[0]
+    assert not any("GitHub checks are still pending" in c for c in runner.comments)
     # Bounded by the startup window, not the 1200s watch timeout.
     sleep_commands = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["sleep"]]
     assert len(sleep_commands) < 1200 // 30 - 1
@@ -6445,6 +6451,25 @@ def test_ordinary_checks_authority_accepts_forbidden_protection_with_clean_head(
             PullRequestMergeability("mergeable", "MERGEABLE", merge_state, "abc123", "main"),
             head_sha="abc123",
         )
+    # Deferral (the recovery finalizer re-checks CLEAN after readiness) only
+    # relaxes an unreadable protection; the board conditions still apply.
+    draft = PullRequestMergeability("mergeable", "MERGEABLE", "DRAFT", "abc123", "main")
+    assert orchestrator._ordinary_checks_snapshot_is_authoritative(
+        checks, draft, head_sha="abc123", defer_unreadable_protection=True,
+    )
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+        _watch_check_board("passing", protection="unavailable"),
+        draft,
+        head_sha="abc123",
+        defer_unreadable_protection=True,
+    )
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+        _watch_check_board("pending", pending=(PullRequestCheck("x", "check_run", "queued"),),
+                           protection="forbidden"),
+        draft,
+        head_sha="abc123",
+        defer_unreadable_protection=True,
+    )
 
 
 def test_pr_loop_summarizes_approved_followups_before_pending_check_stop(tmp_path):

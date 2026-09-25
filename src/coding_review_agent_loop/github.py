@@ -3321,6 +3321,30 @@ def board_protection_is_reliable(
     )
 
 
+def protection_awaits_readiness(
+    checks: PullRequestChecks,
+    mergeability: PullRequestMergeability | None,
+    *,
+    head_sha: str | None,
+) -> bool:
+    """Return whether an unreadable protection can only be judged after readiness.
+
+    GitHub reports ``DRAFT`` rather than ``CLEAN`` for a draft PR, so a draft
+    under a classic-protection 403 cannot prove its required checks yet.  This
+    is never merge evidence by itself: the caller must mark the PR ready and
+    then require ``CLEAN`` for the same head via
+    :func:`board_protection_is_reliable` before merging.
+    """
+    return (
+        checks.branch_protection_status == "forbidden"
+        and mergeability is not None
+        and mergeability.state == "mergeable"
+        and mergeability.merge_state_raw == "DRAFT"
+        and head_sha is not None
+        and mergeability.head_sha == head_sha
+    )
+
+
 def _observed_board_complete(checks: PullRequestChecks) -> bool:
     return (
         checks.check_query_status == "ok"

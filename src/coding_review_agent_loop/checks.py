@@ -183,6 +183,23 @@ def _pending_ci_stop_message(pr_number: int, state: str, details: list[str]) -> 
     return "\n".join(lines)
 
 
+def _unreadable_protection_stop_message(pr_number: int, details: list[str]) -> str:
+    lines = [
+        f"Reviewers approved PR #{pr_number}, and every observed GitHub check passed, "
+        "but merge readiness cannot be confirmed.",
+        "",
+        "The current GitHub token cannot read branch protection (HTTP 403), so the "
+        "required checks are unknown, and GitHub did not report a `CLEAN` merge state "
+        "for the current head. An unmet protection rule, such as a required review or "
+        "a required check that has not reported, may remain. Satisfy it, or grant the "
+        "token administration read access, then merge manually or rerun agent-loop.",
+        "",
+    ]
+    lines.extend(f"- {detail}" for detail in details)
+    lines.extend(["", "-- coding-review-agent-loop"])
+    return "\n".join(lines)
+
+
 def _pending_ci_status_summary(state: str) -> str:
     return {
         "pending": "GitHub checks are still pending",

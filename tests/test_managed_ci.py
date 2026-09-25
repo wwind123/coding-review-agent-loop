@@ -4671,6 +4671,77 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
     assert merged == [(7, "abc123")]
 
 
+@pytest.mark.parametrize(
+    ("after_ready", "expect_merge"),
+    [
+        (["BLOCKED", "CLEAN"], True),
+        (["CLEAN"], True),
+        (["BLOCKED", "BLOCKED", "BLOCKED"], False),
+        (["UNSTABLE", "UNKNOWN", "UNSTABLE"], False),
+    ],
+)
+def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
+    tmp_path, monkeypatch, after_ready, expect_merge,
+):
+    # #1055: a draft reports DRAFT, so under a classic-protection 403 the
+    # recovery qualifies the green draft board, marks it ready, and merges
+    # only once GitHub reports CLEAN for the same exact head.
+    config = make_config(
+        tmp_path, auto_merge=True, ci_poll_interval_seconds=30, ci_startup_timeout_seconds=90,
+    )
+    runner = V2ManagedRunner(issue_events=[])
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
+    )
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: SimpleNamespace(
+            status="passed",
+            checks=checks(
+                passing=(PullRequestCheck("test", "check_run", "success"),),
+                required=(),
+                protection="forbidden",
+            ),
+            mergeability=PullRequestMergeability("mergeable", "MERGEABLE", "DRAFT", "abc123", "main"),
+            head_sha="abc123",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
+    )
+    events: list[str] = []
+    states = list(after_ready)
+
+    def fake_mergeability(*args, **kwargs):
+        assert any(command[:3] == ["gh", "pr", "ready"] for command, _ in runner.commands)
+        events.append("probe")
+        return PullRequestMergeability("mergeable", "MERGEABLE", states.pop(0), "abc123", "main")
+
+    monkeypatch.setattr(orchestrator, "get_pr_mergeability", fake_mergeability)
+    merged: list[tuple[int, str | None]] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda _runner, _config, number, *, expected_head_sha: merged.append((number, expected_head_sha)),
+    )
+
+    if expect_merge:
+        _finalize_ordinary_recovery_merge(runner, config=config, pr_number=7, capability=capability)
+        assert merged == [(7, "abc123")]
+    else:
+        with pytest.raises(AgentLoopError, match="merge state is not CLEAN after readiness"):
+            _finalize_ordinary_recovery_merge(runner, config=config, pr_number=7, capability=capability)
+        assert merged == []
+        # Bounded by the startup window (90s / 30s), not the CI timeout.
+        assert len(events) == 3
+    assert not states
+
+
 def test_fake_runner_models_gh_parser_failure_when_check_is_true(tmp_path):
     runner = FakeRunner()
 
@@ -4698,7 +4769,9 @@ def test_ordinary_recovery_rejects_green_checks_without_post_release_run(monkeyp
 @pytest.mark.parametrize(
     ("merge_state", "head", "expected"),
     [
-        ("DRAFT", "abc123", "timeout"),
+        # DRAFT defers the CLEAN check to the finalizer after readiness.
+        ("DRAFT", "abc123", "passed"),
+        ("DRAFT", "other", "timeout"),
         ("BLOCKED", "abc123", "timeout"),
         ("CLEAN", "other", "timeout"),
         ("CLEAN", "abc123", "passed"),

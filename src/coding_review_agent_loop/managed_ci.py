@@ -28,6 +28,7 @@ from .github import (
     PullRequestMetadata,
     board_protection_is_reliable,
     get_pr_checks,
+    protection_awaits_readiness,
     get_pr_head_sha,
     get_pr_mergeability,
     note_host_footer_observed,
@@ -7142,8 +7143,11 @@ def wait_for_ordinary_recovery(
         completed = [run for run in recovery_runs if run.get("status") == "completed"]
         if completed and any(run.get("conclusion") != "success" for run in completed):
             return ManagedCiOutcome(status="failed", checks=latest, head_sha=live_head)
-        reliable = latest.check_query_status == "ok" and board_protection_is_reliable(
-            latest, mergeability, head_sha=live_head,
+        # A draft reports DRAFT, never CLEAN; under unreadable protection the
+        # finalizer re-checks CLEAN after readiness and before any merge.
+        reliable = latest.check_query_status == "ok" and (
+            board_protection_is_reliable(latest, mergeability, head_sha=live_head)
+            or protection_awaits_readiness(latest, mergeability, head_sha=live_head)
         )
         if (
             recovery_runs

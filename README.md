@@ -1222,7 +1222,11 @@ protection. The merge still pins that head with `--match-head-commit`. If
 every observed check passed but the merge state stays `BLOCKED`, `UNSTABLE`,
 `UNKNOWN`, or unavailable for the bounded startup window
 (`--ci-startup-timeout-seconds`), the watch stops without merging and says why,
-instead of polling until `--ci-timeout-seconds`.
+instead of polling until `--ci-timeout-seconds`. Managed ordinary recovery
+keeps its PR draft while CI runs, and GitHub reports `DRAFT` rather than
+`CLEAN` for a draft. So recovery qualifies the green draft board for the same
+head and marks the PR ready. It merges only if GitHub then reports `CLEAN`
+within the same bounded window. Otherwise the PR stays ready and unmerged.
 
 ### Managed exact-head CI
 
