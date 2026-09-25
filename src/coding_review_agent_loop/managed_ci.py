@@ -26,6 +26,7 @@ from .errors import AgentLoopError
 from .github import (
     PullRequestMergeability,
     PullRequestMetadata,
+    board_protection_is_reliable,
     get_pr_checks,
     get_pr_head_sha,
     get_pr_mergeability,
@@ -7141,9 +7142,9 @@ def wait_for_ordinary_recovery(
         completed = [run for run in recovery_runs if run.get("status") == "completed"]
         if completed and any(run.get("conclusion") != "success" for run in completed):
             return ManagedCiOutcome(status="failed", checks=latest, head_sha=live_head)
-        reliable = latest.check_query_status == "ok" and latest.branch_protection_status in {
-            "configured", "not_found",
-        }
+        reliable = latest.check_query_status == "ok" and board_protection_is_reliable(
+            latest, mergeability, head_sha=live_head,
+        )
         if (
             recovery_runs
             and any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in completed)
@@ -7154,7 +7155,9 @@ def wait_for_ordinary_recovery(
             and not latest.missing_required
         ):
             log(config, f"PR #{capability.pr_number}: ordinary unlabeled recovery passed at {expected_head}")
-            return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
+            return ManagedCiOutcome(
+                status="passed", checks=latest, mergeability=mergeability, head_sha=live_head,
+            )
         if not recovery_runs and attempt + 1 >= startup_attempt_limit:
             return ManagedCiOutcome(status="not_started", checks=latest, head_sha=live_head)
         if attempt < attempts - 1:

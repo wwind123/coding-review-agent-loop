@@ -3281,6 +3281,7 @@ class CiWatchOutcome:
         "infrastructure_stall",
         "merge_conflict",
         "head_changed",
+        "protection_unreadable",
         "dry_run",
     ]
     pr_checks: PullRequestChecks | None = None
@@ -3289,6 +3290,44 @@ class CiWatchOutcome:
     head_sha: str | None = None
     stall: CiInfrastructureStall | None = None
     attempts_used: int = 0
+
+
+def board_protection_is_reliable(
+    checks: PullRequestChecks,
+    mergeability: PullRequestMergeability | None = None,
+    *,
+    head_sha: str | None = None,
+) -> bool:
+    """Return whether the board's required-check set is known well enough.
+
+    Readable classic protection (``configured``) or its confirmed absence
+    (``not_found``) lets the observed board stand on its own.  A classic
+    protection 403 (``forbidden``) hides the required contexts, so the board
+    is trusted only when GitHub's own merge-state computation for the same
+    head is ``CLEAN``: GitHub derives it from the real protection, including
+    required contexts this token cannot read.  The merge itself still pins the
+    head, and GitHub enforces protection again at merge time.
+    """
+    status = checks.branch_protection_status
+    if status in {"configured", "not_found"}:
+        return True
+    if status != "forbidden" or mergeability is None:
+        return False
+    return (
+        mergeability.state == "mergeable"
+        and mergeability.merge_state_raw == "CLEAN"
+        and head_sha is not None
+        and mergeability.head_sha == head_sha
+    )
+
+
+def _observed_board_complete(checks: PullRequestChecks) -> bool:
+    return (
+        checks.check_query_status == "ok"
+        and checks.state == "passing"
+        and not checks.pending
+        and not checks.missing_required
+    )
 
 
 def watch_pr_checks(
@@ -3313,6 +3352,7 @@ def watch_pr_checks(
     )
     latest: PullRequestChecks | None = None
     empty_attempts = 0
+    unverified_green_attempts = 0
     startup_attempt_limit = max(
         1,
         (config.ci_startup_timeout_seconds + config.ci_poll_interval_seconds - 1)
@@ -3347,9 +3387,9 @@ def watch_pr_checks(
                 stall=CiInfrastructureStall(checks=snapshot.infrastructure_stalls),
                 attempts_used=attempt + 1,
             )
-        reliable = snapshot.check_query_status == "ok" and snapshot.branch_protection_status in {
-            "configured", "not_found",
-        }
+        reliable = snapshot.check_query_status == "ok" and board_protection_is_reliable(
+            snapshot, mergeability, head_sha=current_head,
+        )
         # A positively observed failure is actionable even when another query
         # was partial or a required check has not materialized yet. Those
         # conditions can delay a passing decision, but they must not hide a
@@ -3361,9 +3401,24 @@ def watch_pr_checks(
             )
         if snapshot.state == "passing" and reliable and not snapshot.pending and not snapshot.missing_required:
             return CiWatchOutcome(
-                status="passed", pr_checks=snapshot, head_sha=current_head,
-                attempts_used=attempt + 1,
+                status="passed", pr_checks=snapshot, mergeability=mergeability,
+                head_sha=current_head, attempts_used=attempt + 1,
             )
+        if snapshot.branch_protection_status == "forbidden" and _observed_board_complete(snapshot):
+            # Every observed check passed, yet GitHub does not report a CLEAN
+            # merge state and the required set is unreadable.  Allow the same
+            # bounded window used for a board that has not materialized (an
+            # unseen required check may still be starting, or GitHub may still
+            # be recomputing), then stop instead of polling to the timeout.
+            unverified_green_attempts += 1
+            if unverified_green_attempts >= startup_attempt_limit:
+                return CiWatchOutcome(
+                    status="protection_unreadable", pr_checks=snapshot,
+                    mergeability=mergeability, head_sha=current_head,
+                    attempts_used=attempt + 1,
+                )
+        else:
+            unverified_green_attempts = 0
         if snapshot.state == "no_checks" and reliable and not snapshot.missing_required:
             empty_attempts += 1
             # GitHub can expose an empty rollup while a pull_request workflow

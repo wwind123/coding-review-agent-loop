@@ -1214,6 +1214,16 @@ with `--ci-timeout-seconds` (default 1200) and its polling interval with
 `--ci-queued-grace-seconds`; see
 [External CI infrastructure stalls](docs/local_agent_loop.md#external-ci-infrastructure-stalls).
 
+When the token cannot read classic branch protection (an `HTTP 403`, as in
+sessions whose GitHub App lacks administration read), the required checks are
+unknown. A green board then counts as reliable only when GitHub reports a
+`CLEAN` merge state for the same head, which GitHub computes from the real
+protection. The merge still pins that head with `--match-head-commit`. If
+every observed check passed but the merge state stays `BLOCKED`, `UNSTABLE`,
+`UNKNOWN`, or unavailable for the bounded startup window
+(`--ci-startup-timeout-seconds`), the watch stops without merging and says why,
+instead of polling until `--ci-timeout-seconds`.
+
 ### Managed exact-head CI
 
 Managed CI is an advanced, repository-integrated workflow that suppresses

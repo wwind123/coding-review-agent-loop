@@ -133,6 +133,7 @@ from .github import (
     PullRequestMergeability,
     PullRequestReviewContext,
     HumanReviewRequirement,
+    board_protection_is_reliable,
     deduplicate_human_requirements,
     get_pr_head_sha,
     get_issue_context,
@@ -15521,7 +15522,9 @@ def _finalize_ordinary_recovery_merge(
             f"PR #{pr_number} ordinary recovery did not qualify the exact head "
             f"({outcome.status}); the draft was left unmerged."
         )
-    if not _ordinary_checks_snapshot_is_authoritative(outcome.checks):
+    if not _ordinary_checks_snapshot_is_authoritative(
+        outcome.checks, outcome.mergeability, head_sha=outcome.head_sha,
+    ):
         details = (
             _pr_check_details(outcome.checks)
             if outcome.checks is not None
@@ -15651,7 +15654,7 @@ def _stop_after_ci_watch_timeout(
     pr_comments: Sequence[object],
     followups: list[ApprovedFollowup],
     details: list[str],
-    reason: Literal["budget_exhausted", "timeout", "non_authoritative"],
+    reason: Literal["budget_exhausted", "timeout", "non_authoritative", "protection_unreadable"],
     source_context: FollowupSourceContext,
     usage_context: RunUsageContext | None = None,
 ) -> int:
@@ -15703,6 +15706,24 @@ def _stop_after_ci_watch_timeout(
             raise AgentLoopError(
                 f"PR #{pr_number} full-board CI watch did not pass within "
                 f"{config.ci_timeout_seconds}s; no merge attempted."
+            )
+    elif reason == "protection_unreadable":
+        log(
+            config,
+            f"Round {round_number}: PR #{pr_number} branch protection is unreadable and "
+            "GitHub did not report a CLEAN merge state for the green board; no merge attempted",
+        )
+        print(
+            f"PR #{pr_number} CI watch stopped: every observed check passed, but the current "
+            "GitHub token cannot read branch protection (HTTP 403) and GitHub did not report "
+            f"a CLEAN merge state for the current head: {'; '.join(details)}. "
+            "Grant the token administration read access, or satisfy the remaining protection "
+            f"rules (for example required reviews), then rerun: {rerun}{note}"
+        )
+        if config.auto_merge:
+            raise AgentLoopError(
+                f"PR #{pr_number} branch protection is unreadable and GitHub's merge state "
+                "is not CLEAN; no merge attempted."
             )
     else:
         log(
@@ -16048,15 +16069,32 @@ def _finalize_ordinary_recovery_checked(
     )
 
 
+def _mergeability_for_unreadable_protection(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    checks: PullRequestChecks | None,
+) -> PullRequestMergeability | None:
+    """Fetch GitHub's merge state only when classic protection returned 403."""
+    if checks is None or checks.branch_protection_status != "forbidden":
+        return None
+    return get_pr_mergeability(runner, config=config, pr_number=pr_number)
+
+
 def _ordinary_checks_snapshot_is_authoritative(
     checks: PullRequestChecks | None,
+    mergeability: PullRequestMergeability | None = None,
+    *,
+    head_sha: str | None = None,
 ) -> bool:
     """Return whether a fresh ordinary-check snapshot can clear its ledger.
 
     ``get_pr_checks`` is queried against the current PR head immediately before
     this decision. Requiring both API surfaces and a known branch-protection
     result keeps a passing-looking partial, absent, or unavailable snapshot
-    from becoming a final gate.
+    from becoming a final gate. An unreadable (403) classic protection is
+    accepted only with GitHub's ``CLEAN`` merge state for ``head_sha``.
     """
     # ``PullRequestChecks.state`` deliberately treats neutral and skipped
     # conclusions as passing for ordinary status reporting.  That aggregate is
@@ -16080,7 +16118,7 @@ def _ordinary_checks_snapshot_is_authoritative(
         checks is not None
         and checks.state == "passing"
         and checks.check_query_status == "ok"
-        and checks.branch_protection_status in {"configured", "not_found"}
+        and board_protection_is_reliable(checks, mergeability, head_sha=head_sha)
         and not checks.pending
         and not checks.missing_required
         and successful_checks
@@ -22007,7 +22045,9 @@ def run_pr_loop(
                         # source-specific proof predicate used by the review-only
                         # snapshot path before clearing or merging.
                         if not _ordinary_checks_snapshot_is_authoritative(
-                            watch_outcome.pr_checks
+                            watch_outcome.pr_checks,
+                            watch_outcome.mergeability,
+                            head_sha=watch_outcome.head_sha,
                         ):
                             details = (
                                 _pr_check_details(watch_outcome.pr_checks)
@@ -22129,6 +22169,34 @@ def run_pr_loop(
                             usage_context=usage_context,
                             details=details,
                             reason="timeout",
+                        )
+                    if watch_outcome.status == "protection_unreadable":
+                        details = (
+                            _pr_check_details(watch_outcome.pr_checks)
+                            if watch_outcome.pr_checks
+                            else ["No reliable check snapshot was available."]
+                        )
+                        merge_state = (
+                            watch_outcome.mergeability.merge_state_raw
+                            if watch_outcome.mergeability is not None
+                            else None
+                        )
+                        details.append(
+                            f"GitHub merge state for the current head: {merge_state or 'unavailable'} "
+                            "(CLEAN is required when branch protection is unreadable)."
+                        )
+                        return _stop_after_ci_watch_timeout(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            round_number=round_number,
+                            head_sha=pr_metadata.head_sha,
+                            pr_comments=pr_comments,
+                            followups=future_followups,
+                            source_context=followup_source_context,
+                            usage_context=usage_context,
+                            details=details,
+                            reason="protection_unreadable",
                         )
                     if watch_outcome.status == "head_changed":
                         log(config, f"PR #{pr_number} head changed while watching; re-review is required")
@@ -22297,11 +22365,17 @@ def run_pr_loop(
                     elif (
                         not managed_ci_active(pr_metadata)
                         and not ordinary_recovery_selected
-                        and _ordinary_checks_snapshot_is_authoritative(pr_checks)
                         and any(
                             _is_machine_obligation(item)
                             and item.obligation_kind == "github-pr-checks"
                             for item in unresolved_items
+                        )
+                        and _ordinary_checks_snapshot_is_authoritative(
+                            pr_checks,
+                            _mergeability_for_unreadable_protection(
+                                runner, config=config, pr_number=pr_number, checks=pr_checks,
+                            ),
+                            head_sha=pr_metadata.head_sha,
                         )
                     ):
                         # In review-only mode the foreground watcher is

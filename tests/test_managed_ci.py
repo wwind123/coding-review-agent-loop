@@ -19,6 +19,7 @@ from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import (
     PullRequestCheck,
     PullRequestChecks,
+    PullRequestMergeability,
     PullRequestMetadata,
     merge_pr,
 )
@@ -4646,6 +4647,7 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
                 passing=(PullRequestCheck("test", "check_run", "success"),),
                 required=("test",),
             ),
+            mergeability=None,
             head_sha="abc123",
         ),
     )
@@ -4693,7 +4695,18 @@ def test_ordinary_recovery_rejects_green_checks_without_post_release_run(monkeyp
     assert outcome.status == "timeout"
 
 
-def test_ordinary_recovery_forbidden_branch_protection_never_reports_success(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("merge_state", "head", "expected"),
+    [
+        ("DRAFT", "abc123", "timeout"),
+        ("BLOCKED", "abc123", "timeout"),
+        ("CLEAN", "other", "timeout"),
+        ("CLEAN", "abc123", "passed"),
+    ],
+)
+def test_ordinary_recovery_forbidden_branch_protection_requires_clean_merge_state(
+    monkeypatch, tmp_path, merge_state, head, expected,
+):
     config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
     capability = OrdinaryRecoveryCapability(
         pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
@@ -4704,11 +4717,12 @@ def test_ordinary_recovery_forbidden_branch_protection_never_reports_success(mon
         required=("test",),
         protection="forbidden",
     )
+    mergeability = PullRequestMergeability("mergeable", "MERGEABLE", merge_state, head, "main")
     monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
     monkeypatch.setattr(
         managed_ci,
         "get_pr_mergeability",
-        lambda *args, **kwargs: type("M", (), {"state": "mergeable"})(),
+        lambda *args, **kwargs: mergeability,
     )
     monkeypatch.setattr(
         managed_ci,
@@ -4721,7 +4735,9 @@ def test_ordinary_recovery_forbidden_branch_protection_never_reports_success(mon
         runner=FakeRunner(), config=config, capability=capability, metadata=metadata(),
     )
 
-    assert outcome.status == "timeout"
+    assert outcome.status == expected
+    if expected == "passed":
+        assert outcome.mergeability == mergeability
 
 
 def test_ordinary_recovery_accepts_current_head_run_without_local_clock_filter(monkeypatch, tmp_path):
