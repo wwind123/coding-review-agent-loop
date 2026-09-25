@@ -7181,6 +7181,13 @@ def wait_for_ordinary_recovery(
             return ManagedCiOutcome(status="not_started", checks=latest, head_sha=live_head)
         if attempt < attempts - 1:
             runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
+    if unverified_green_attempts:
+        # The budget expired on a green board that only the unreadable
+        # protection kept from qualifying; report that cause, not a timeout.
+        return ManagedCiOutcome(
+            status="protection_unreadable", checks=latest,
+            mergeability=mergeability, head_sha=live_head,
+        )
     return ManagedCiOutcome(status="timeout", checks=latest, head_sha=expected_head)
 
 

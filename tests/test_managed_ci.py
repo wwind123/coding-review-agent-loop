@@ -4771,9 +4771,12 @@ def test_ordinary_recovery_rejects_green_checks_without_post_release_run(monkeyp
     [
         # DRAFT defers the CLEAN check to the finalizer after readiness.
         ("DRAFT", "abc123", "passed"),
-        ("DRAFT", "other", "timeout"),
-        ("BLOCKED", "abc123", "timeout"),
-        ("CLEAN", "other", "timeout"),
+        # The single poll is also the last one (1s budget, 120s startup
+        # window): a green board that cannot qualify reports the unreadable
+        # protection instead of a generic timeout (late-green deadline).
+        ("DRAFT", "other", "protection_unreadable"),
+        ("BLOCKED", "abc123", "protection_unreadable"),
+        ("CLEAN", "other", "protection_unreadable"),
         ("CLEAN", "abc123", "passed"),
     ],
 )
@@ -4809,8 +4812,7 @@ def test_ordinary_recovery_forbidden_branch_protection_requires_clean_merge_stat
     )
 
     assert outcome.status == expected
-    if expected == "passed":
-        assert outcome.mergeability == mergeability
+    assert outcome.mergeability == mergeability
 
 
 @pytest.mark.parametrize(
@@ -4860,6 +4862,45 @@ def test_ordinary_recovery_unqualifiable_merge_state_stops_within_startup_window
     assert outcome.mergeability == mergeability
     assert len(probes) == 2
     assert len([cmd for cmd, _ in runner.commands if cmd[:1] == ["sleep"]]) == 1
+
+
+def test_ordinary_recovery_late_green_board_at_deadline_reports_unreadable_protection(
+    monkeypatch, tmp_path,
+):
+    # The board turns green only on the final poll, with fewer polls left
+    # than the startup window; the deadline must still name the cause.
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=90, ci_poll_interval_seconds=30,
+        ci_startup_timeout_seconds=300,
+    )
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100, prior_run_ids=frozenset(),
+    )
+    success = PullRequestCheck("test", "check_run", "success")
+    boards = [
+        checks(pending=(PullRequestCheck("test", "check_run", "in_progress"),), protection="forbidden"),
+        checks(pending=(PullRequestCheck("test", "check_run", "in_progress"),), protection="forbidden"),
+        checks(passing=(success,), required=("test",), protection="forbidden"),
+    ]
+    runs = [
+        [{"id": 3, "status": "in_progress"}],
+        [{"id": 3, "status": "in_progress"}],
+        [{"id": 3, "status": "completed", "conclusion": "success"}],
+    ]
+    blocked = PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "abc123", "main")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: blocked)
+    monkeypatch.setattr(managed_ci, "_workflow_runs_payload", lambda *args, **kwargs: runs.pop(0))
+    monkeypatch.setattr(managed_ci, "get_pr_checks", lambda *args, **kwargs: boards.pop(0))
+
+    outcome = wait_for_ordinary_recovery(
+        runner=FakeRunner(), config=config, capability=capability, metadata=metadata(),
+    )
+
+    assert outcome.status == "protection_unreadable"
+    assert outcome.mergeability == blocked
+    assert not boards
 
 
 def test_ordinary_fallback_protection_unreadable_stops_with_guidance(tmp_path, monkeypatch, capsys):

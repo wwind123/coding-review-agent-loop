@@ -3456,8 +3456,14 @@ def watch_pr_checks(
         else:
             empty_attempts = 0
         if time.monotonic() >= deadline or attempt == limit - 1:
+            # A budget that expires on a complete green board which only the
+            # unreadable protection keeps from passing reports that cause,
+            # not a generic timeout.
             return CiWatchOutcome(
-                status="timeout", pr_checks=latest, head_sha=current_head,
+                status="protection_unreadable" if unverified_green_attempts else "timeout",
+                pr_checks=latest,
+                mergeability=mergeability if unverified_green_attempts else None,
+                head_sha=current_head,
                 attempts_used=attempt + 1,
             )
         runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
