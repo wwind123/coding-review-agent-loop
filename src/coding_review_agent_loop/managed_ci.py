@@ -642,6 +642,7 @@ class ManagedCiOutcome:
         "infrastructure_stall",
         "terminal_without_status",
         "not_started",
+        "protection_unreadable",
     ]
     checks: PullRequestChecks | None = None
     mergeability: PullRequestMergeability | None = None
@@ -7113,6 +7114,7 @@ def wait_for_ordinary_recovery(
         // config.ci_poll_interval_seconds,
     )
     latest: PullRequestChecks | None = None
+    unverified_green_attempts = 0
     for attempt in range(attempts):
         live_head = get_pr_head_sha(runner, config, capability.pr_number)
         if live_head != expected_head:
@@ -7149,19 +7151,32 @@ def wait_for_ordinary_recovery(
             board_protection_is_reliable(latest, mergeability, head_sha=live_head)
             or protection_awaits_readiness(latest, mergeability, head_sha=live_head)
         )
-        if (
+        green_board = (
             recovery_runs
             and any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in completed)
+            and latest.check_query_status == "ok"
             and latest.state == "passing"
             and bool(latest.passing)
-            and reliable
             and not latest.pending
             and not latest.missing_required
-        ):
+        )
+        if green_board and reliable:
             log(config, f"PR #{capability.pr_number}: ordinary unlabeled recovery passed at {expected_head}")
             return ManagedCiOutcome(
                 status="passed", checks=latest, mergeability=mergeability, head_sha=live_head,
             )
+        if green_board and latest.branch_protection_status == "forbidden":
+            # The board is green but neither CLEAN nor a same-head DRAFT can
+            # stand in for the unreadable protection.  Stop after the bounded
+            # startup window instead of polling to the full CI timeout.
+            unverified_green_attempts += 1
+            if unverified_green_attempts >= startup_attempt_limit:
+                return ManagedCiOutcome(
+                    status="protection_unreadable", checks=latest,
+                    mergeability=mergeability, head_sha=live_head,
+                )
+        else:
+            unverified_green_attempts = 0
         if not recovery_runs and attempt + 1 >= startup_attempt_limit:
             return ManagedCiOutcome(status="not_started", checks=latest, head_sha=live_head)
         if attempt < attempts - 1:

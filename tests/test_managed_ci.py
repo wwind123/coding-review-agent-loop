@@ -4813,6 +4813,92 @@ def test_ordinary_recovery_forbidden_branch_protection_requires_clean_merge_stat
         assert outcome.mergeability == mergeability
 
 
+@pytest.mark.parametrize(
+    "mergeability",
+    [
+        PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "abc123", "main"),
+        PullRequestMergeability("unknown", None, None, None, None),
+        PullRequestMergeability("mergeable", "MERGEABLE", "BLOCKED", "abc123", "main"),
+    ],
+)
+def test_ordinary_recovery_unqualifiable_merge_state_stops_within_startup_window(
+    monkeypatch, tmp_path, mergeability,
+):
+    # #1055 review: a green board under unreadable protection whose merge
+    # state is neither same-head DRAFT nor CLEAN must not poll to the timeout.
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1200, ci_poll_interval_seconds=30,
+        ci_startup_timeout_seconds=60,
+    )
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100, prior_run_ids=frozenset(),
+    )
+    passing = checks(
+        passing=(PullRequestCheck("test", "check_run", "success"),),
+        required=("test",),
+        protection="forbidden",
+    )
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: mergeability)
+    monkeypatch.setattr(
+        managed_ci,
+        "_workflow_runs_payload",
+        lambda *args, **kwargs: [{"id": 3, "status": "completed", "conclusion": "success"}],
+    )
+    probes: list[int] = []
+    monkeypatch.setattr(
+        managed_ci, "get_pr_checks", lambda *args, **kwargs: probes.append(1) or passing,
+    )
+    runner = FakeRunner()
+
+    outcome = wait_for_ordinary_recovery(
+        runner=runner, config=config, capability=capability, metadata=metadata(),
+    )
+
+    assert outcome.status == "protection_unreadable"
+    assert outcome.mergeability == mergeability
+    assert len(probes) == 2
+    assert len([cmd for cmd, _ in runner.commands if cmd[:1] == ["sleep"]]) == 1
+
+
+def test_ordinary_fallback_protection_unreadable_stops_with_guidance(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path, auto_merge=True)
+    runner = V2ManagedRunner(issue_events=[])
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
+    )
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: SimpleNamespace(
+            status="protection_unreadable",
+            checks=checks(
+                passing=(PullRequestCheck("test", "check_run", "success"),),
+                protection="forbidden",
+            ),
+            mergeability=PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "abc123", "main"),
+            head_sha="abc123",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
+    )
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("must not merge"))
+
+    with pytest.raises(AgentLoopError, match="branch protection is unreadable"):
+        _finalize_ordinary_recovery_merge(runner, config=config, pr_number=7, capability=capability)
+
+    out = capsys.readouterr().out
+    assert "HTTP 403" in out
+    assert "merge state UNKNOWN" in out
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _ in runner.commands)
+
+
 def test_ordinary_recovery_accepts_current_head_run_without_local_clock_filter(monkeypatch, tmp_path):
     config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
     capability = OrdinaryRecoveryCapability(

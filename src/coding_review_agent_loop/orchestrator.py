@@ -15520,6 +15520,31 @@ def _finalize_ordinary_recovery_merge(
                 f"materialize for the current head. Resume with `{command}`."
             )
             return False
+        if outcome.status == "protection_unreadable":
+            merge_state = (
+                outcome.mergeability.merge_state_raw
+                if outcome.mergeability is not None
+                else None
+            )
+            log(
+                config,
+                f"PR #{pr_number}: ordinary recovery board is green but branch protection is "
+                f"unreadable and the merge state is {merge_state or 'unavailable'}; "
+                "leaving the PR draft and unmerged",
+            )
+            print(
+                f"PR #{pr_number} remains draft and unmerged: ordinary recovery CI passed for "
+                f"{capability.expected_head_sha}, but the current GitHub token cannot read branch "
+                "protection (HTTP 403) and GitHub reports merge state "
+                f"{merge_state or 'unavailable'} (DRAFT or CLEAN for the same head is required). "
+                "Grant the token administration read access or resolve the merge state, then "
+                "rerun agent-loop."
+            )
+            raise AgentLoopError(
+                f"PR #{pr_number} ordinary recovery could not confirm merge readiness: branch "
+                "protection is unreadable and GitHub's merge state is neither DRAFT nor CLEAN "
+                "for the exact head; the draft was left unmerged."
+            )
         raise AgentLoopError(
             f"PR #{pr_number} ordinary recovery did not qualify the exact head "
             f"({outcome.status}); the draft was left unmerged."

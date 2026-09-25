@@ -1226,7 +1226,10 @@ instead of polling until `--ci-timeout-seconds`. Managed ordinary recovery
 keeps its PR draft while CI runs, and GitHub reports `DRAFT` rather than
 `CLEAN` for a draft. So recovery qualifies the green draft board for the same
 head and marks the PR ready. It merges only if GitHub then reports `CLEAN`
-within the same bounded window. Otherwise the PR stays ready and unmerged.
+within the same bounded window. Otherwise the PR stays ready and unmerged. If
+the recovery board is green but its merge state is neither a same-head `DRAFT`
+nor `CLEAN` (for example `UNKNOWN`) for that window, recovery stops early with
+the PR still a draft.
 
 ### Managed exact-head CI
 
