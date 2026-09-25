@@ -4731,137 +4731,125 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
     assert merges == [{"expected_head_sha": "abc123-coder-1"}]
 
 
-def test_issue_managed_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
-    tmp_path, monkeypatch, capsys
-):
-    """#1024: a CI repair round authorizes head continuity from its own record."""
-    import coding_review_agent_loop.managed_ci as managed_ci_module
+def _spy_coder_followup_dispatch(monkeypatch):
+    """Record the item set each real coder dispatch labels, then log it (#1024)."""
+    dispatched = []
+    real = orchestrator._log_coder_followup_dispatch
 
-    failed_check = PullRequestCheck(
-        name="final-ci/exact-head",
-        kind="check_run",
-        status="failure",
-        url="https://github.com/OWNER/REPO/actions/runs/555",
+    def spy(config, round_number, coder_name, coder_followup_items):
+        dispatched.append((round_number, tuple(coder_followup_items)))
+        return real(config, round_number, coder_name, coder_followup_items)
+
+    monkeypatch.setattr(orchestrator, "_log_coder_followup_dispatch", spy)
+    return dispatched
+
+
+def _round_label_lines(err):
+    return [
+        line.split("] ", 1)[-1] for line in err.splitlines()
+        if "addressing reviewer feedback" in line or "repairing failed CI" in line
+    ]
+
+
+def test_run_pr_loop_labels_reviewer_and_acknowledgement_rounds_as_reviewer_feedback(
+    tmp_path, monkeypatch, capsys,
+):
+    """Round 1 is reviewer-driven; round 2 is the acknowledgement re-injection."""
+    requirement = HumanReviewRequirement(
+        source_type="PR comment", author="maintainer", created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the audit trail.",
     )
-    outcomes = iter(
-        [
-            ManagedCiOutcome(
-                status="failed",
-                checks=_watch_check_board("failing", failing=(failed_check,)),
-                head_sha="abc123",
-            ),
-            ManagedCiOutcome(status="passed", head_sha="abc123-coder-1"),
-        ]
+    ack_markdown = (
+        "Implemented the fix.\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n- Requirement 1: kept the audit trail.\n"
+        "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
     )
     runner = FakeRunner(
         codex_outputs=[
-            structured_pr_review(state="approved", summary="Approved."),
             structured_pr_review(
-                state="approved",
-                summary="Approved after managed CI fix.",
+                state="blocking", summary="Fix.", blocking_items=["Fix the bug."],
+                human_requirements_resolved=True,
+            ),
+            # Approves without the acknowledgement, so the run re-injects it.
+            structured_pr_review(
+                state="approved", summary="Fixed.",
                 prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
             ),
+            structured_pr_review(
+                state="approved", summary="Acknowledged.", human_requirements_resolved=True,
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            ),
         ],
-        claude_outputs=[
-            structured_coder_followup(
-                state="blocking", summary="Fixed managed CI.", addressed_items=["item-1"],
-            )
+        claude_outputs=[ack_markdown, ack_markdown],
+    )
+    metadata = PullRequestMetadata(
+        number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
+        base_branch="main", head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_pr_review_context",
+        lambda *_a, **_k: PullRequestReviewContext(
+            metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
+            comments=(), human_requirements=(requirement,),
+        ),
+    )
+    dispatched = _spy_coder_followup_dispatch(monkeypatch)
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3, quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert [round_number for round_number, _items in dispatched] == [1, 2]
+    for _round_number, items in dispatched:
+        assert items and not any(item.is_machine_obligation for item in items)
+    assert [item.item_id for item in dispatched[1][1]] == ["item-2"]
+    err = capsys.readouterr().err
+    assert "re-injecting as blocking item" in err
+    assert _round_label_lines(err) == [
+        "Round 1: Claude addressing reviewer feedback",
+        "Round 2: Claude addressing reviewer feedback",
+    ]
+
+
+def test_run_pr_loop_labels_a_mixed_reviewer_and_ci_round_as_reviewer_feedback(
+    tmp_path, monkeypatch, capsys,
+):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Fix the application bug.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Both fixes verified."
+            + prior_item_dispositions("[item-1] resolved", "[item-2] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
-        pr_payload={
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
-            "baseRefName": "main", "body": "Fixes #56",
-        },
+        claude_outputs=["Fixed the application and CI.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
     )
-    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
-        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56",
-        trusted_actor_login="agent-loop", trusted_actor_id=1,
-        protection_mode="voluntary", override_nonce="root",
-        authorization_kind="creation", authorization_comment_id=17,
-    )
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
-    monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
-        lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
-    )
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *_a, **_k: None)
-    monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
-    )
-    merges = []
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
-
-    def posted_rest_comments():
-        # The exact bodies the orchestrator posted, as the REST comment list
-        # the trusted actor authored; ids follow the creation authorization.
-        return [
-            {"id": 100 + index, "user": {"login": "agent-loop", "id": 1}, "body": comment["body"]}
-            for index, comment in enumerate(runner.pr_payload.get("comments", []))
-        ]
-
-    real_find = managed_ci_module.find_actor_round_metadata_comment_ids
-    selections = []
-
-    def find(runner_arg, **kwargs):
-        comments = posted_rest_comments()
-        with monkeypatch.context() as scoped:
-            scoped.setattr(managed_ci_module, "_api_list", lambda *_a, **_k: comments)
-            selected = real_find(runner_arg, **kwargs)
-        selections.append((kwargs, selected, comments))
-        return selected
-
-    published = []
-
-    def publish(*_args, handoff, predecessor_head, new_head, round_comment_ids, **_kwargs):
-        comments = selections[-1][2]
-        grant = managed_ci_module.ManagedCiIssueAuthorization(
-            kind="continuity", repository="OWNER/REPO", issue_number=56, pr_number=77,
-            base_ref="main", head_sha=new_head, actor_login="agent-loop", actor_id=1,
-            protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
-            label_event_id=101, predecessor_head=predecessor_head,
-            predecessor_comment_id=handoff.authorization_comment_id,
-            round_comment_ids=round_comment_ids,
-        )
-        # Resume reauthenticates the same grant from the same serialized record.
-        assert managed_ci_module._continuity_round_metadata_is_valid(
-            comments, authorization=grant
-        ) is True
-        published.append((predecessor_head, new_head, round_comment_ids))
-        return dataclasses.replace(
-            handoff, head_sha=new_head, authorization_kind="continuity",
-            authorization_comment_id=max(round_comment_ids) + 1,
-        )
-
-    monkeypatch.setattr(orchestrator, "find_actor_round_metadata_comment_ids", find)
-    monkeypatch.setattr(orchestrator, "publish_issue_created_continuity_authorization", publish)
-    config = make_config(
-        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
-        allow_unprotected_managed_ci=True, reviewer=("codex",), auto_merge=True,
-        max_rounds=1, quiet=False,
-    )
+    failed = PullRequestCheck(name="test", kind="check_run", status="failure", url="https://example.test/555")
+    snapshots = iter([
+        _watch_check_board("pending"),
+        _watch_check_board("failing", failing=(failed,)),
+        _watch_check_board("passing"),
+        _watch_check_board("passing"),
+    ])
+    monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: next(snapshots))
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    dispatched = _spy_coder_followup_dispatch(monkeypatch)
 
     assert run_pr_loop(
-        runner, pr_number=77, config=config, managed_ci_handoff=handoff,
-        managed_ci_issue_number=56,
+        runner, pr_number=77,
+        config=make_config(tmp_path, watch_pending_ci=True, quiet=False),
     ) == 0
 
-    assert len(selections) == 1
-    kwargs, selected, comments = selections[0]
-    assert (kwargs["predecessor_head"], kwargs["new_head"]) == ("abc123", "abc123-coder-1")
-    # Only the lone orchestrator-serialized coder record authorizes the move.
-    assert len(selected) == 1
-    coder_body = next(comment["body"] for comment in comments if comment["id"] == selected[0])
-    records = managed_ci_module._continuity_round_records([{"body": coder_body}])
-    assert records[0]["role"] == "coder"
-    assert records[0]["ci_repair_transitions"] == frozenset({("abc123", "abc123-coder-1")})
-    assert published == [("abc123", "abc123-coder-1", selected)]
-    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
-    assert merges == [{"expected_head_sha": "abc123-coder-1"}]
-    err = capsys.readouterr().err
-    assert "Claude repairing failed CI" in err
-    assert "addressing reviewer feedback" not in err
+    ((round_number, items),) = dispatched
+    assert round_number == 1
+    kinds = sorted(item.obligation_kind or "reviewer" for item in items)
+    assert kinds == ["github-pr-checks", "reviewer"]
+    assert _round_label_lines(capsys.readouterr().err) == [
+        "Round 1: Claude addressing reviewer feedback"
+    ]
 
 
 def test_ci_repair_log_label_requires_a_nonempty_ci_only_followup_set(tmp_path, capsys):
