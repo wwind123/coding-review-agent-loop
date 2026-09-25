@@ -641,6 +641,7 @@ from .unresolved_items import (
     _reconcile_human_requirements_ack_item,
     _raise_if_maintained_disputed_items,
     select_coder_followup_items,
+    coder_followup_is_ci_repair,
     _upsert_human_requirements_ack_item,
     _validate_coder_followup_response,
     _validate_plan_review_response,
@@ -15927,6 +15928,19 @@ def _partition_unresolved_items(
     }
 
 
+def _log_coder_followup_dispatch(
+    config: AgentLoopConfig,
+    round_number: int,
+    coder_name: str,
+    coder_followup_items: Sequence[UnresolvedReviewItem],
+) -> None:
+    """Announce a coder round by what actually routed it (#1024)."""
+    if coder_followup_is_ci_repair(coder_followup_items):
+        log(config, f"Round {round_number}: {coder_name} repairing failed CI")
+    else:
+        log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
+
+
 def _machine_obligation_checkpoint(
     items: Sequence[UnresolvedReviewItem],
     *,
@@ -23241,7 +23255,7 @@ def run_pr_loop(
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
                 )
-                log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
+                _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             else:
                 coder_followup_items = select_coder_followup_items(unresolved_items)
                 combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items)
@@ -23260,7 +23274,7 @@ def run_pr_loop(
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
                 )
-                log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
+                _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             repair_unresolved_item_ids = tuple(
                 item.item_id for item in coder_followup_items
             )

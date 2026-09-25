@@ -3610,19 +3610,35 @@ malformed metadata and authorization-comment fallbacks are rejected. A push,
 branch name, PR body, author, label, draft state, missing link, fork, or race cannot extend
 authority; recovery prints the explicit fresh-authorization command instead.
 
-A merge-conflict resolution round is the single exception, because it runs no
-reviewer. When the head conflicts with the base branch, agent-loop skips the
+Two reviewer-less rounds are the only exceptions. A merge-conflict resolution
+round is the first, because it runs no reviewer. When the head conflicts with the base branch, agent-loop skips the
 board and routes the round to the coder, so continuity accepts that head move on
 the tool-owned merge-conflict obligation instead of a review pair: exactly one
 actor-authored coder round metadata record for the new exact head, newer than
 the predecessor authorization, carrying the orchestrator-minted merge-conflict
 obligation that no agent response can add or classify. The continuity record
-binds that one record, and resume re-parses and rechecks the same shape. A head
-advance with neither an ordered review/coder pair nor that obligation still
-fails closed, and the board must still approve the exact final head before
-qualification or merge. This removes the second `--managed-ci-fresh` grant that
-an ordinary base-branch move used to require, without widening what counts as an
-approval.
+binds that one record, and resume re-parses and rechecks the same shape. This
+removes the second `--managed-ci-fresh` grant that an ordinary base-branch move
+used to require, without widening what counts as an approval.
+
+An exact-head CI repair round is the second exception. When managed exact-head
+CI fails on a head the whole board already approved, the failure did not come
+from a reviewer, and the run logs `repairing failed CI` for that coder round.
+Continuity accepts the resulting head move on the tool-minted CI obligation
+instead of a review pair: exactly one actor-authored coder round metadata record
+for the new exact head, newer than the predecessor authorization, carrying the
+orchestrator-minted `managed-exact-head-ci` or `github-pr-checks` obligation in
+`awaiting_current_head_review`, bound to the failed predecessor head and the new
+candidate head. No agent response can introduce that obligation or set its
+heads. The run therefore repairs a post-approval CI failure and continues to
+re-review, qualification, and merge in one invocation instead of stopping for a
+PR-mode resume (#1024). An older binary resuming such a chain cannot
+reauthenticate the link and stops rather than granting anything.
+
+A head advance with none of an ordered review/coder pair, the merge-conflict
+obligation, or a CI obligation bound to exactly that transition still fails
+closed, and the board must still approve the exact final head before
+qualification or merge.
 
 #### Creating a managed PR from an existing branch
 
