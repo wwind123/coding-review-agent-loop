@@ -1174,7 +1174,9 @@ Everything else is checked against closed allowlists before git or gh runs:
 - **Forced git config.** git runs with `--no-pager`, `--no-ext-diff`, and
   `--no-textconv`, and with `-c` overrides that disable the pager, fsmonitor,
   external diff, signature display and every gpg program, all transports,
-  hooks, and Trace2 targets.
+  hooks, submodule recursion, and Trace2 targets. `status`, `diff`, `log`,
+  and `show` also get `--ignore-submodules=all`, so git never runs inside a
+  submodule whose own config the gate does not scan.
 - **Repository-config gate.** Before any git or gh subprocess, the inspector
   lists the checkout's config with `git config --list --show-origin
   --show-scope --includes` and refuses to run if any non-command key is

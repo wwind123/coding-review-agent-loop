@@ -402,6 +402,57 @@ def test_real_git_planted_clean_filter_never_runs(repo, tmp_path):
     assert not marker.exists()
 
 
+def _plant_submodule_clean_filter(repo: Path, script: Path) -> None:
+    """Coder-style setup: a populated gitlink whose own config runs ``script``."""
+    sub = repo / "sub"
+    sub.mkdir()
+    _git(sub, "init", "-q")
+    _git(sub, "config", "user.name", "Test")
+    _git(sub, "config", "user.email", "t@example.com")
+    (sub / "b.txt").write_text("one\n", encoding="utf-8")
+    _git(sub, "add", "b.txt")
+    _git(sub, "commit", "-q", "-m", "sub")
+    _git(repo, "add", "sub")
+    (repo / ".gitmodules").write_text(
+        '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n\tignore = none\n', encoding="utf-8"
+    )
+    _git(repo, "add", ".gitmodules")
+    _git(repo, "commit", "-q", "-m", "add submodule")
+    # Planted only in the submodule's config, which the top-level gate never scans.
+    (sub / ".gitattributes").write_text("* filter=x\n", encoding="utf-8")
+    _git(sub, "config", "filter.x.clean", str(script))
+    (sub / "b.txt").write_text("two\n", encoding="utf-8")
+
+
+def test_real_git_submodule_clean_filter_never_runs(repo, tmp_path):
+    script, marker = _marker_script(tmp_path)
+    _plant_submodule_clean_filter(repo, script)
+    assert not marker.exists()
+    for args in (
+        ["git", "status"],
+        ["git", "status", "--porcelain"],
+        ["git", "diff"],
+        ["git", "diff", "--stat"],
+        ["git", "log", "-n", "1", "-p"],
+        ["git", "show", "HEAD"],
+    ):
+        code, _out, err = _real(repo, args)
+        assert code == 0, (args, err)
+        assert not marker.exists(), args
+
+
+def test_submodule_recursion_is_forced_off_in_git_argv():
+    for sub in ("diff", "log", "show", "status"):
+        argv = inspect_tool.git_argv("/usr/bin/git", sub, [])
+        assert "--ignore-submodules=all" in argv
+        assert argv.index("--ignore-submodules=all") > argv.index(sub)
+    for item in ("diff.ignoreSubmodules=all", "submodule.recurse=false"):
+        assert item in inspect_tool.FORCED_GIT_CONFIG
+    assert inspect_tool.FORCED_GIT_CONFIG[-3:] == (
+        "trace2.eventTarget=", "trace2.perfTarget=", "trace2.normalTarget=",
+    )
+
+
 def test_real_git_included_filter_is_rejected_naming_included_origin(repo, tmp_path):
     script, marker = _marker_script(tmp_path)
     included = tmp_path / "included.cfg"

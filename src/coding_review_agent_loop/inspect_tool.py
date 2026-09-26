@@ -57,6 +57,10 @@ _GIT_FORMAT = frozenset({"log", "show"})
 _GIT_MAX_COUNT = frozenset({"log"})
 # These subcommands can render content through diff drivers and textconv.
 _GIT_DIFF_RENDERING = frozenset({"diff", "log", "show"})
+# Subcommands that would otherwise recurse into populated submodules.  A
+# submodule's own local config is outside the repository-config gate, so its
+# status or diff could run a coder-planted clean filter.
+_GIT_SUBMODULE_IGNORING = frozenset({"diff", "log", "show", "status"})
 
 NAMED_FORMATS = frozenset({"oneline", "short", "medium", "full", "fuller", "reference"})
 # Longest tokens first so ``%an`` is not read as ``%a`` + ``n``.
@@ -79,7 +83,8 @@ _DIGITS_RE = re.compile(r"^[0-9]{1,6}$")
 
 # Forced git configuration.  The command scope overrides repository config,
 # so these neutralize pagers, fsmonitor hooks, external diff drivers,
-# signature verification programs, transports, hooks, and Trace2 targets.
+# signature verification programs, transports, hooks, submodule recursion,
+# and Trace2 targets.  The Trace2 entries must stay last.
 FORCED_GIT_CONFIG = (
     "core.pager=cat",
     "core.fsmonitor=false",
@@ -90,6 +95,9 @@ FORCED_GIT_CONFIG = (
     "gpg.x509.program=false",
     "protocol.allow=never",
     "core.hooksPath=/dev/null",
+    "diff.ignoreSubmodules=all",
+    "status.submoduleSummary=false",
+    "submodule.recurse=false",
     "trace2.eventTarget=",
     "trace2.perfTarget=",
     "trace2.normalTarget=",
@@ -382,6 +390,10 @@ def git_argv(git: str, sub: str, args: Sequence[str]) -> list[str]:
     argv.append(sub)
     if sub in _GIT_DIFF_RENDERING:
         argv += ["--no-ext-diff", "--no-textconv"]
+    if sub in _GIT_SUBMODULE_IGNORING:
+        # The command-line option outranks submodule.<name>.ignore from
+        # .gitmodules, which the config gate does not scan.
+        argv.append("--ignore-submodules=all")
     argv += list(args)
     return argv
 

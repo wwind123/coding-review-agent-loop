@@ -66,7 +66,9 @@ flowchart LR
   inherited environment, `PATH` entries, coder-controlled git config
   (filters, diff drivers, gpg programs, includes, aliases, hooks, trace
   targets), and `.gitattributes` from making an inspection run a program or
-  write a file. Its interpreter (`-I`), package files, and the pinned git and
+  write a file. Submodule recursion is forced off (`--ignore-submodules=all`
+  plus `-c` overrides), because a populated submodule's own local config lies
+  outside the gate. Its interpreter (`-I`), package files, and the pinned git and
   gh are fingerprinted at startup and re-verified before each read-only Claude
   spawn; a mismatch is reported as agent-unavailable without spawning.
 - Residual: sandboxed coders run tests and `git` (including their own hooks,
