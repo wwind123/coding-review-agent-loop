@@ -10,6 +10,7 @@ from .errors import AgentLoopError
 from .protocol import (
     ParseDegradation,
     _extract_json_object_prefix,
+    _flatten_plan_review_finding,
     classify_architecture_status_near_miss,
     _normalize_requirement_label,
     normalize_response_file_structured_text,
@@ -1319,11 +1320,16 @@ def validate_repair_preservation(
         "pr_review": ("blocking_items", "same_pr_followups"),
         "plan_review": ("blocking_plan_issues", "same_plan_followups"),
     }.get(source["kind"], ())
+    # Compare plan-review objects using the parser's canonical finding text.
     available = [
-        _normalized(entry)
+        _normalized(
+            _flatten_plan_review_finding(entry, item_context=field)
+            if source["kind"] == "plan_review" else entry
+        )
         for field in finding_fields
         for entry in target.get(field, [])
         if isinstance(entry, str)
+        or (source["kind"] == "plan_review" and isinstance(entry, dict))
     ]
     available.sort(key=len)
     for field in finding_fields:
