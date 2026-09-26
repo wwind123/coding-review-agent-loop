@@ -768,6 +768,21 @@ def inspect_prefix(config: AgentLoopConfig) -> str:
     return require_inspect_provenance(config).prefix_text
 
 
+def neutralized_git_env() -> dict[str, str]:
+    """Safe values for the inherited git variables, for agent-loop and its children.
+
+    ``0`` disables each trace target, and ``GIT_CONFIG_COUNT=0`` makes any
+    inherited ``GIT_CONFIG_KEY_n`` / ``GIT_CONFIG_VALUE_n`` pair unreadable.
+    Values are overridden rather than removed so one mapping serves both
+    ``os.environ.update`` here and the runner's ``{**os.environ, **env}`` merge.
+    """
+    env = {name: "0" for name in GIT_TRACE_VARIABLES}
+    env["GIT_CONFIG_COUNT"] = "0"
+    # A pure exec hook: git runs it for every diff, and no role needs it.
+    env["GIT_EXTERNAL_DIFF"] = ""
+    return env
+
+
 def establish_sandboxed_run(
     config: AgentLoopConfig, *, command: str, plan_first: bool = False
 ) -> None:
@@ -776,6 +791,14 @@ def establish_sandboxed_run(
         return
     validate_sandboxed_selections(config)
     validate_sandboxed_flow(config, command=command, plan_first=plan_first)
+    # agent-loop runs git in its own process too (checkout identity, HEAD
+    # snapshots, config probes), and those calls inherit the caller's
+    # environment.  Scrubbing only the agent subprocess left an inherited
+    # GIT_TRACE2_EVENT writing trace2.json into the checkout from
+    # agent-loop's own `git rev-parse HEAD` -- the trace file named
+    # `python` as its parent, not the CLI.  Neutralize here, once, so every
+    # in-process git call and every child inherits the safe values.
+    os.environ.update(neutralized_git_env())
     establish_response_root_boundary(config)
     if any(selection.agent == "claude" for selection in configured_agent_selections(config)):
         establish_inspect_provenance(config)
@@ -871,11 +894,7 @@ def role_permission_env(config: AgentLoopConfig, provider: str, role: str | None
     """
     if not is_sandboxed(config):
         return {}
-    env = {name: "0" for name in GIT_TRACE_VARIABLES}
-    env["GIT_CONFIG_COUNT"] = "0"
-    # A pure exec hook: git runs it for every diff, and no role needs it.
-    env["GIT_EXTERNAL_DIFF"] = ""
-    return env
+    return dict(neutralized_git_env())
 
 
 def prepare_sandboxed_spawn(config: AgentLoopConfig, provider: str, role: str | None) -> Path:

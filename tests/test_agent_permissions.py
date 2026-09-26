@@ -829,3 +829,30 @@ def test_unsandboxed_env_is_untouched(tmp_path):
     config = sandboxed_config(tmp_path, agent_permissions="default")
     assert ap.role_permission_env(config, "claude", "reviewer") == {}
     assert ap.role_permission_env(config, "codex", "coder") == {}
+
+
+def test_establish_neutralizes_git_env_in_agent_loop_own_process(tmp_path, sandbox, monkeypatch):
+    """agent-loop runs git in-process; scrubbing only the child was not enough.
+
+    At 85988b4 an inherited GIT_TRACE2_EVENT survived into agent-loop's own
+    ``git rev-parse HEAD`` and wrote trace2.json into the checkout; the trace
+    named ``python`` as its parent process, not the agent CLI.
+    """
+    trace = tmp_path / "trace2.json"
+    monkeypatch.setenv("GIT_TRACE2_EVENT", str(trace))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", "/bin/false")
+    config = sandboxed_config(tmp_path)
+    # The full startup path, not the fixture's provenance-only helper: the
+    # neutralization belongs to establishing the run, before any git call.
+    ap.establish_sandboxed_run(config, command="pr")
+    assert os.environ["GIT_TRACE2_EVENT"] == "0"
+    assert os.environ["GIT_CONFIG_COUNT"] == "0"
+    assert os.environ["GIT_EXTERNAL_DIFF"] == ""
+
+
+def test_default_mode_leaves_the_process_environment_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_TRACE2_EVENT", "/tmp/keep-me.json")
+    config = sandboxed_config(tmp_path, agent_permissions="default")
+    ap.establish_sandboxed_run(config, command="pr")
+    assert os.environ["GIT_TRACE2_EVENT"] == "/tmp/keep-me.json"
