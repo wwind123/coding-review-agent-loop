@@ -3436,6 +3436,16 @@ an existing valid creation, fresh, or continuity authorization at that exact
 head instead of publishing a competing grant; conflicting records,
 ambiguous provenance, or changed live state fail closed before labels,
 readiness, review dispatch, qualification, or merge writes.
+The one exception is accumulated history that differs only in its recorded
+protection (#1065) — for example, grants written by earlier resume attempts
+on a host that read the base as unreadable, none of which reaches the live
+head. Rather than refusing on the conflict it exists to clear, the fresh grant
+then retires every prior actor-owned authorization record for the PR: it
+publishes one superseding record that names the retired comment IDs, and
+every later reader (fresh reuse, ordinary recovery, the resume audit, and the
+plan-binding check) treats those records as history. Nothing is deleted. A
+record whose base, actor, managed-label provenance, or approved plan (other
+than a verified retired plan) differs still refuses and is never superseded.
 The grant records the live voluntary or plan-limited protection assessment,
 and the PR tuple, managed-label event, and authorization-comment set are read
 again immediately before publication. Managed issue recovery from a legacy

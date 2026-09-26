@@ -10697,3 +10697,155 @@ def test_refused_round_readiness_is_logged_and_does_not_abort(tmp_path, capsys, 
     err = capsys.readouterr().err
     assert f"could not publish the non-required `{READINESS_CONTEXT}` status for abc123" in err
     assert ("not permitted through this proxy" in err) if stderr else ("exit 1" in err)
+
+
+# --- #1065: a fresh grant supersedes accumulated unbound authorization records ---
+
+_PLAN_1065 = "a" * 64
+
+
+def _stale_unreadable_records():
+    """Two actor-owned grants from an unreadable-protection host, neither at the live head."""
+    return [
+        _unreadable_record(head_sha="old-1", approved_plan_hash=_PLAN_1065),
+        _unreadable_record(
+            kind="fresh", head_sha="old-2", nonce="second", approved_plan_hash=_PLAN_1065,
+        ),
+    ]
+
+
+def _stale_record_comments(records, *, first_id=41):
+    return [
+        {
+            "id": first_id + index,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": str(format_issue_created_authorization_comment(record)),
+        }
+        for index, record in enumerate(records)
+    ]
+
+
+def _fresh_1065(runner, config):
+    return authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643", body="Fixes #643"),
+        approved_plan_hash=_PLAN_1065,
+    )
+
+
+def test_m1065_fresh_authorization_supersedes_stale_conflicting_records(tmp_path):
+    # Live protection now reads voluntary; both prior grants recorded unreadable
+    # and neither reaches the live head.  Previously this refused outright.
+    runner = CloudAuthorizationRunner(
+        scripted={},
+        issue_events=[label_event()],
+        intent_comments=_stale_record_comments(_stale_unreadable_records()),
+    )
+    config = _cloud_config(tmp_path)
+
+    handoff = _fresh_1065(runner, config)
+
+    assert handoff.authorization_kind == "fresh"
+    assert handoff.protection_mode == "voluntary"
+    assert handoff.head_sha == "abc123"
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.superseded_comment_ids == (41, 42)
+    assert record.predecessor_head is None and record.predecessor_comment_id is None
+    # The superseded records are retired, not deleted.
+    assert [item["id"] for item in runner.intent_comments[:2]] == [41, 42]
+
+    # A rerun reuses the superseding grant instead of appending another record.
+    posted = len(runner.intent_comments)
+    again = _fresh_1065(runner, config)
+    assert again.authorization_comment_id == handoff.authorization_comment_id
+    assert len(runner.intent_comments) == posted
+
+    # The resume audit and the plan binding both see one live-head terminal.
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123",
+        expected_handoff=handoff, expected_protection="voluntary",
+        require_actor_owned_label_event=True,
+    )
+    assert audit is not None
+    assert audit[0] == handoff.authorization_comment_id
+    managed_ci.verify_managed_pr_plan_binding(
+        runner, config=config, pr_number=7, issue_number=643,
+        live_head="abc123", approved_plan_hash=_PLAN_1065,
+    )
+
+
+def test_m1065_fresh_authorization_still_refuses_non_protection_conflicts(tmp_path):
+    stale = _stale_unreadable_records()
+    stale[1] = replace(stale[1], label_event_id=999)
+    runner = CloudAuthorizationRunner(
+        scripted={},
+        issue_events=[label_event()],
+        intent_comments=_stale_record_comments(stale),
+    )
+
+    with pytest.raises(AgentLoopError, match="conflicting actor-owned record"):
+        _fresh_1065(runner, _cloud_config(tmp_path))
+
+    assert len(runner.intent_comments) == 2
+
+
+def test_m1065_recovery_after_supersession_uses_the_superseding_grant(tmp_path):
+    superseding = ManagedCiIssueAuthorization(
+        kind="fresh", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="fresh",
+        label_event_id=101, approved_plan_hash=_PLAN_1065, superseded_comment_ids=(41, 42),
+    )
+    runner = _recovery_runner(_stale_unreadable_records() + [superseding], scripted={})
+
+    handoff = _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert handoff is not None
+    assert handoff.protection_mode == "voluntary"
+    assert _mutations(runner) == []
+
+
+def test_m1065_supersession_is_scoped_to_earlier_same_scope_records():
+    base = _unreadable_record(approved_plan_hash=_PLAN_1065)
+    foreign = replace(base, issue_number=644)
+    later = replace(base, head_sha="later")
+    fresh = replace(
+        base, kind="fresh", nonce="fresh", superseded_comment_ids=(41, 42, 44),
+    )
+    ids = managed_ci._superseded_authorization_ids(
+        [(41, base), (42, foreign), (43, fresh), (44, later)]
+    )
+    assert ids == frozenset({41})
+    # Only a fresh grant may supersede.
+    assert managed_ci._superseded_authorization_ids(
+        [(41, base), (43, replace(fresh, kind="creation"))]
+    ) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("kind", "superseded", "extra"),
+    [
+        ("creation", [41], {}),
+        ("fresh", [42, 41], {}),
+        ("fresh", [41, 41], {}),
+        ("fresh", [], {}),
+        ("fresh", [0], {}),
+        ("fresh", [True], {}),
+    ],
+)
+def test_m1065_parser_rejects_invalid_supersession_fields(kind, superseded, extra):
+    payload = _unreadable_record(kind=kind).to_payload()
+    payload["superseded_comment_ids"] = superseded
+    payload.update(extra)
+    with pytest.raises(AgentLoopError):
+        parse_issue_created_authorization_comment(_encoded_authorization(payload))
+
+
+def test_m1065_superseding_record_round_trips():
+    record = _unreadable_record(kind="fresh", superseded_comment_ids=(41, 42))
+    parsed = parse_issue_created_authorization_comment(
+        str(format_issue_created_authorization_comment(record))
+    )
+    assert parsed == record
