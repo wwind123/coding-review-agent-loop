@@ -729,6 +729,31 @@ def test_reordered_findings_with_shared_prefix_are_not_combined():
     check(source, {"kind": "pr_review", "blocking_items": ["Fix A and add test B", "Fix A"]})
 
 
+def test_footer_repair_preserves_plan_review_finding_object():
+    source = _plan_review(blocking_plan_issues=[{
+        "item_id": "retry-limit",
+        "title": "Fix the retry loop",
+        "evidence": "The loop has no timeout.",
+    }])
+    repaired = _plan_review(same_plan_followups=source["blocking_plan_issues"])
+
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(repaired) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex",
+    )
+
+
+def test_plan_review_finding_object_cannot_drop_source_prose():
+    source = _plan_review(blocking_plan_issues=[
+        "Fix the retry loop and add a timeout."
+    ])
+    repaired = _plan_review(blocking_plan_issues=[{
+        "title": "Fix the retry loop",
+    }])
+
+    rejects(source, repaired, match="blocking_plan_issues")
+
+
 def test_forbidden_fields_and_future_items_can_be_removed():
     source = {"kind": "issue_implementation", "addressed_item_notes": {"item-1": "Invalid field"}}
     check(source, {"kind": "issue_implementation"})
