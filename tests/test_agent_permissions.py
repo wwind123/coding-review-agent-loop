@@ -374,6 +374,92 @@ def test_system_symlink_base_is_accepted(tmp_path, monkeypatch):
     ap.reset_sandbox_state()
 
 
+def test_tmpdir_inside_repository_checkout_fails_fast(tmp_path, monkeypatch):
+    """The orchestrator's repository checkout bounds the response root too."""
+    repository = tmp_path / "orchestrator-repo"
+    (repository / ".git").mkdir(parents=True)
+    inside = repository / "tmp"
+    inside.mkdir()
+    monkeypatch.chdir(repository)
+    monkeypatch.setattr(tempfile, "tempdir", str(inside))
+    ap.reset_sandbox_state()
+    config = sandboxed_config(tmp_path)  # every provider uses a separate clone
+    with pytest.raises(AgentLoopError, match="overlaps repository checkout"):
+        ap.establish_response_root_boundary(config)
+    ap.reset_sandbox_state()
+
+
+def test_repository_checkout_is_reverified_but_may_hold_the_install(tmp_path, sandbox, monkeypatch):
+    repository = tmp_path / "orchestrator-repo"
+    (repository / ".git").mkdir(parents=True)
+    monkeypatch.chdir(repository)
+    config = sandboxed_config(tmp_path)
+    state = ap.establish_response_root_boundary(config)
+    assert state.checkouts[str(repository)].agent is False
+    # A development install inside the orchestrator's own clone is allowed.
+    sandbox["establish"](config, locator=lambda _i: str(repository / "src" / "pkg"))
+    repository.rename(tmp_path / "moved-repo")
+    repository.symlink_to(state.resolved_root)
+    with pytest.raises(ap.SandboxBoundaryError):
+        ap.prepare_response_file(config, "claude")
+
+
+@pytest.mark.parametrize("mode", [0o777, 0o770, 0o722])
+def test_group_or_world_writable_component_is_rejected(tmp_path, sandbox, mode):
+    config = sandboxed_config(tmp_path)
+    existing = sandbox["tmp"] / "coding-review-agent-loop"
+    existing.mkdir()
+    existing.chmod(mode)
+    with pytest.raises(AgentLoopError, match="group- or world-writable"):
+        ap.establish_response_root_boundary(config)
+
+
+def test_component_mode_widened_between_turns_blocks_spawn(tmp_path, sandbox):
+    config = sandboxed_config(tmp_path)
+    state = ap.establish_response_root_boundary(config)
+    (state.resolved_root / "claude").chmod(0o777)
+    with pytest.raises(ap.SandboxBoundaryError, match="group- or world-writable"):
+        ap.prepare_response_file(config, "claude")
+
+
+def test_absent_checkout_ancestor_redirect_blocks_spawn(tmp_path, sandbox):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    config = sandboxed_config(tmp_path, claude_dir=parent / "later" / "claude", create_dirs=False)
+    state = ap.establish_response_root_boundary(config)
+    assert state.checkouts[str(config.claude_dir)].exists is False
+    # The checkout is still absent, but its ancestor now points elsewhere.
+    parent.rename(tmp_path / "parent-old")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    parent.symlink_to(elsewhere)
+    with pytest.raises(ap.SandboxBoundaryError, match="not yet created"):
+        ap.prepare_response_file(config, "claude")
+
+
+def test_mixed_provider_implementation_coder_resolves_in_its_own_checkout(tmp_path, sandbox, monkeypatch):
+    seen = []
+
+    def verified(**kwargs):
+        seen.append(kwargs["cwd"])
+        return WRAPPER if kwargs["cwd"] == config.claude_dir.resolve() else None
+
+    monkeypatch.setattr(test_runtime, "verified_wrapper_prefix", verified)
+    config = sandboxed_config(
+        tmp_path, coder="codex", implementation_coder="claude",
+        plan_execution_mode="implement-one-shot", test_command=("pytest",),
+    )
+    sandbox["establish"](config)
+    ap.validate_sandboxed_flow(config, command="issue", plan_first=True)
+    rules = _allowed_tools(list(ap.role_permission_args(config, "claude", "coder")))
+    test_rules = [rule for rule in rules if "run-tests" in rule]
+    assert len(test_rules) == 1
+    assert seen == [config.claude_dir.resolve()]
+    # The switched implementation config's prompt shows the same string.
+    switched = dataclasses.replace(config, coder="claude")
+    assert test_rules[0][5:-1] in _coder_workdir_guidance(switched)
+
+
 def test_ephemeral_checkout_records_are_dropped(tmp_path, sandbox):
     config = sandboxed_config(tmp_path)
     ap.establish_response_root_boundary(config)

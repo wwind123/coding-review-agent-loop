@@ -4224,10 +4224,13 @@ its role (implemented in `agent_permissions.py`):
   every `--<agent>-arg` are rejected before any agent runs;
   `run_agent_result` refuses an unsupported agent as a runtime backstop.
 - At startup the response root is created one private component at a time,
-  checked to be real directories owned by you, and checked not to overlap any
-  agent checkout in either direction. Immediately before every sandboxed spawn
-  those components, every recorded checkout's resolved target and
-  device/inode, and the overlap are re-verified, and the per-invocation file is
+  checked to be real directories owned by you that are not group- or
+  world-writable, and checked not to overlap any agent checkout or the
+  repository checkout agent-loop runs from, in either direction. Immediately
+  before every sandboxed spawn those components, every recorded checkout's
+  resolved target and device/inode (for a not-yet-created checkout, the
+  location its nearest existing ancestor resolves to), and the overlap are
+  re-verified, and the per-invocation file is
   created with `O_CREAT|O_EXCL|O_NOFOLLOW`. Before every read-only Claude spawn
   the inspector's interpreter, package files, and pinned git and gh are
   re-fingerprinted. Any mismatch reports agent-unavailable (`environment`)

@@ -335,11 +335,14 @@ Requirements and limitations of sandboxed mode:
   the pinned `gh` is the step-3 shim, the inspector's gh subcommands work only
   if the real `gh` sits in the same directory as the pinned `git`, because the
   shim finds the real `gh` on the inspector's constructed `PATH`.
-- **`TMPDIR` must resolve outside every checkout.** Responses go to a private
-  directory under `${TMPDIR:-/tmp}/coding-review-agent-loop/responses/`, whose
-  agent-loop-created components must be real directories owned by you (no
-  symlinks). The directory and every checkout are re-verified before each
-  spawn, so checkouts must not be moved, replaced, or redirected during a run.
+- **`TMPDIR` must resolve outside every checkout**, including the repository
+  checkout you run agent-loop from. Responses go to a private directory under
+  `${TMPDIR:-/tmp}/coding-review-agent-loop/responses/`, whose
+  agent-loop-created components must be real directories owned by you that
+  are not group- or world-writable (no symlinks; fix an old component with
+  `chmod go-w`). The directory and every checkout, including one not yet
+  created, are re-verified before each spawn, so checkouts and their parent
+  directories must not be moved, replaced, or redirected during a run.
 - **Pass-through agent arguments are rejected** (`--claude-arg`,
   `--codex-arg`, `--gemini-arg`, `--antigravity-arg`); use the dedicated
   model and effort options instead.

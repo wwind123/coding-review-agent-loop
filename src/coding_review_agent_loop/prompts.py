@@ -780,7 +780,7 @@ def _sandboxed_permission_guidance(
     if not is_sandboxed(config):
         return ""
     if implementation:
-        return coder_sandbox_guidance(config)
+        return coder_sandbox_guidance(config, agent)
     if agent == "codex":
         return (
             "Sandboxed permissions are active: your sandbox is read-only and has no "

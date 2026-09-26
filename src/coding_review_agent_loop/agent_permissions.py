@@ -20,6 +20,7 @@ response root, so configs derived with ``dataclasses.replace`` share it.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -213,6 +214,10 @@ class _CheckoutRecord:
     resolved: str
     dev: int | None
     ino: int | None
+    # False for the orchestrator's repository checkout: it bounds the response
+    # root but is not an agent checkout for the inspect provenance rule, so
+    # agent-loop may run from a development clone there.
+    agent: bool = True
 
 
 @dataclass(frozen=True)
@@ -322,6 +327,18 @@ def _observe_checkout(path: str) -> _CheckoutRecord:
     return _CheckoutRecord(lexical, True, os.path.realpath(lexical), info.st_dev, info.st_ino)
 
 
+def repository_checkout(cwd: str | None = None) -> str | None:
+    """The git work tree containing the orchestrator's working directory, if any."""
+    current = os.path.abspath(cwd or os.getcwd())
+    while True:
+        if os.path.lexists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
 def configured_checkouts(config: AgentLoopConfig) -> tuple[str, ...]:
     paths: list[str] = []
     for value in (config.claude_dir, config.codex_dir, config.gemini_dir, config.antigravity_dir):
@@ -353,6 +370,14 @@ def _check_component(path: str, *, create: bool) -> _ComponentRecord:
             f"Sandboxed response directory component {path} is owned by uid {info.st_uid}, "
             "not the current user. Remove it or set TMPDIR to a private directory."
         )
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        # A group- or world-writable component would let another local user
+        # replace entries between verification and the CLI's response write.
+        raise SandboxBoundaryError(
+            f"Sandboxed response directory component {path} is group- or world-writable "
+            f"(mode {stat.S_IMODE(info.st_mode):o}). Run `chmod go-w {path}` or set TMPDIR "
+            "to a private directory."
+        )
     return _ComponentRecord(path, info.st_dev, info.st_ino)
 
 
@@ -372,7 +397,8 @@ def _response_component_paths(config: AgentLoopConfig) -> tuple[Path, list[str]]
 def _check_overlap(resolved_root: Path, record: _CheckoutRecord) -> None:
     if _overlaps(str(resolved_root), record.resolved):
         raise SandboxBoundaryError(
-            f"The sandboxed response root {resolved_root} overlaps agent checkout "
+            f"The sandboxed response root {resolved_root} overlaps "
+            f"{'agent' if record.agent else 'repository'} checkout "
             f"{record.stored} (resolves to {record.resolved}). Set TMPDIR to a directory "
             "outside every agent checkout, and do not nest checkouts in the response root."
         )
@@ -388,8 +414,13 @@ def establish_response_root_boundary(config: AgentLoopConfig) -> SandboxState:
             resolved_root=resolved_root,
             components=components,
         )
-        for checkout in configured_checkouts(config):
-            record = _observe_checkout(checkout)
+        records = [_observe_checkout(checkout) for checkout in configured_checkouts(config)]
+        repository = repository_checkout()
+        if repository is not None and repository not in {record.stored for record in records}:
+            # The orchestrator's own repository checkout is part of the
+            # overlap set even when every provider uses a separate clone.
+            records.append(dataclasses.replace(_observe_checkout(repository), agent=False))
+        for record in records:
             _check_overlap(resolved_root, record)
             state.checkouts[record.stored] = record
             state.persistent.add(record.stored)
@@ -446,7 +477,15 @@ def verify_response_boundary(config: AgentLoopConfig) -> SandboxState:
                 _check_overlap(state.resolved_root, record)
                 state.checkouts[record.stored] = record
         for stored, record in list(state.checkouts.items()):
-            current = _observe_checkout(stored)
+            current = dataclasses.replace(_observe_checkout(stored), agent=record.agent)
+            if not record.exists and current.resolved != record.resolved:
+                # An absent checkout is tracked through its nearest existing
+                # ancestor; a redirected ancestor changes where it would land.
+                raise SandboxBoundaryError(
+                    f"Checkout {stored} (not yet created when recorded) now resolves to "
+                    f"{current.resolved} instead of {record.resolved}; an ancestor directory "
+                    "was replaced or redirected by a symlink."
+                )
             if record.exists:
                 if not current.exists:
                     raise SandboxBoundaryError(
@@ -569,7 +608,7 @@ def _provenance_paths(provenance: InspectProvenance) -> list[tuple[str, str]]:
 def _check_provenance_outside(
     provenance: InspectProvenance, records: Iterable[_CheckoutRecord], response_root_path: str | None = None
 ) -> None:
-    roots = [(record.stored, record.resolved) for record in records]
+    roots = [(record.stored, record.resolved) for record in records if record.agent]
     for label, path in _provenance_paths(provenance):
         resolved = os.path.realpath(path)
         for stored, root in roots:
@@ -715,10 +754,11 @@ def _claude_path_rule(tool: str, root: Path) -> str:
     return f"{tool}(/{root}/**)"
 
 
-def coder_test_invocation(config: AgentLoopConfig) -> str | None:
+def coder_test_invocation(config: AgentLoopConfig, agent: str = "claude") -> str | None:
+    """The exact test invocation for a coder turn run by ``agent`` (Claude in sandboxed mode)."""
     from .test_runtime import resolve_coder_test_invocation
 
-    return resolve_coder_test_invocation(config)
+    return resolve_coder_test_invocation(config, agent=agent)
 
 
 def role_permission_args(config: AgentLoopConfig, provider: str, role: str | None) -> tuple[str, ...]:
@@ -749,7 +789,7 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
                 f"Bash({prefix} *)",
             )
         rules = ["Bash(git *)", *(f"Bash({sub} *)" for sub in CODER_GH_SUBCOMMANDS), f"Bash({prefix} *)"]
-        test_invocation = coder_test_invocation(config)
+        test_invocation = coder_test_invocation(config, provider)
         if test_invocation:
             rules.append(f"Bash({test_invocation})")
         return (
@@ -845,8 +885,8 @@ def inspect_forms(config: AgentLoopConfig, *, base_branch: str | None = None) ->
     return "\n".join(lines) + "\n"
 
 
-def coder_sandbox_guidance(config: AgentLoopConfig) -> str:
-    invocation = coder_test_invocation(config)
+def coder_sandbox_guidance(config: AgentLoopConfig, agent: str = "claude") -> str:
+    invocation = coder_test_invocation(config, agent)
     if invocation:
         test_line = (
             "The only test command you may run is this exact invocation (no edits, "

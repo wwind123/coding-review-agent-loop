@@ -2244,18 +2244,24 @@ def resolve_coder_test_invocation(
     config: object,
     memory: object | None = None,
     cwd: Path | None = None,
+    *,
+    agent: str | None = None,
 ) -> str | None:
     """The single sandboxed coder test invocation, shared by the grant and the prompt.
 
     The command is ``--test-command`` or else the first verified profile
     command; the wrapper is the preflight-verified, virtualenv-preserving
     prefix (never ``resolve_wrapper_prefix()``, which resolves the virtualenv
-    interpreter away).  The result is memoized per process and checkout so the
-    permission rule and the prompt line are byte-identical.
+    interpreter away).  ``agent`` names the provider whose coder turn uses the
+    grant (for example the Claude implementation coder of a Codex-planned
+    run); its checkout is where the wrapper is verified.  The result is
+    memoized per process and checkout so the permission rule and the prompt
+    line are byte-identical.
     """
     from .workdirs import agent_workdir
 
-    root = Path(cwd or agent_workdir(config, config.coder)).resolve()  # type: ignore[attr-defined]
+    selected = agent or config.coder  # type: ignore[attr-defined]
+    root = Path(cwd or agent_workdir(config, selected)).resolve()  # type: ignore[arg-type]
     key = (str(root), str(getattr(config, "repo", "")))
     with _CODER_TEST_INVOCATIONS_LOCK:
         if key in _CODER_TEST_INVOCATIONS:
