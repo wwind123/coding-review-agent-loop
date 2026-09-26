@@ -24,6 +24,12 @@ Run with ``-s`` to print the evidence summary that belongs in the PR:
 
 Optional: ``AGENT_LOOP_LIVE_CLAUDE_MODEL`` and ``AGENT_LOOP_LIVE_CODEX_MODEL``
 pin the models; otherwise each CLI's default is used.
+
+The suite clears the inherited Claude session variables itself, so it is safe
+to launch from inside a Claude Code session; without that every child turn
+would share the parent's session id and read another test's transcript.  Build
+the virtualenv from the head under test: ``inspect`` is invoked through
+``python -I``, which ignores ``PYTHONPATH``.
 """
 
 from __future__ import annotations
@@ -185,6 +191,28 @@ class Attempts:
         wanted = exact if exact is not None else contains
         rendered = "\n".join(f"  {call.name}: {call.command[:160]}" for call in self.calls) or "  (none)"
         pytest.fail(f"no unmatched {tool} attempt for {wanted!r}; observed attempts:\n{rendered}")
+
+    def find(
+        self, *, tool: str, exact: str | None = None, contains: str | None = None
+    ) -> ToolCall | None:
+        """``take`` for an action the role may legitimately decline to attempt.
+
+        A refusal to try is not evidence of enforcement, so the caller must
+        still assert the side effect never happened; when an attempt *is* made
+        it is consumed and returned, and the usual denial assertions apply.
+        """
+        for call in self.calls:
+            if call.id in self.used or call.name != tool:
+                continue
+            if exact is not None and _normalize(call.command) != _normalize(exact):
+                continue
+            if contains is not None and contains not in call.command:
+                continue
+            self.used.add(call.id)
+            if not call.has_result:
+                pytest.fail(f"{tool} attempt {call.command!r} has no recorded result")
+            return call
+        return None
 
 
 def is_permission_denial(call: ToolCall) -> bool:
@@ -355,10 +383,23 @@ def _require_cli(name: str) -> None:
         pytest.fail(f"AGENT_LOOP_LIVE_PERMISSION_TESTS=1 but the {name} CLI is not on PATH")
 
 
+# Inside a Claude Code session every child ``claude -p`` inherits these, so all
+# turns share one session id and ``_claude_calls`` globs a stale transcript from
+# another test.  Removed here so the suite is correct however it is launched.
+INHERITED_CLAUDE_SESSION_VARS = (
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_REMOTE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDECODE",
+)
+
+
 @pytest.fixture
 def live(tmp_path, monkeypatch):
     tmp = tmp_path / "tmp"
     tmp.mkdir()
+    for name in INHERITED_CLAUDE_SESSION_VARS:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp))
     ap.reset_sandbox_state()
     evidence: list[dict] = []
@@ -578,7 +619,13 @@ def test_live_codex_reviewer_checkout_write_denied_and_cli_writes_response(live)
         {"test": "codex-reviewer", "calls": _summary(calls), "text_source": result.text_source,
          "response_path": str(result.response_file_path)}
     )
-    assert_sandbox_denied(Attempts(calls).take(tool="shell", contains=f"touch {target}"))
+    # agent-loop's own reviewer role suffix tells Codex the sandbox is
+    # read-only and not to try writing, so a compliant model makes no attempt.
+    # Absence of an attempt proves nothing about enforcement, so the binding
+    # assertion is the side effect; an attempt, if made, must still be denied.
+    attempt = Attempts(calls).find(tool="shell", contains=f"touch {target}")
+    if attempt is not None:
+        assert_sandbox_denied(attempt)
     assert not target.exists()
     assert result.text_source == "response_file"
     assert result.response_file_text

@@ -47,6 +47,40 @@ PERMISSION_CLASS_CODER = "coder"
 PERMISSION_CLASS_READ_ONLY = "read-only"
 
 CLAUDE_READ_ONLY_TOOLS = "Read,Grep,Glob,Write,Edit,Bash"
+# Claude Code auto-approves some read-only shell commands (``git status`` among
+# them) whatever ``--allowedTools`` says, so absence from the allow list is not
+# a refusal.  A read-only role must reach the checkout only through
+# ``agent-loop inspect``: a bare ``git`` in the shared checkout would run a
+# planted ``.git/config`` (``core.fsmonitor`` and friends).  Deny the two
+# programs outright, in both rule spellings, so the auto-approval cannot apply.
+CLAUDE_READ_ONLY_DENIED_TOOLS = (
+    "Bash(git)",
+    "Bash(git *)",
+    "Bash(git:*)",
+    "Bash(gh)",
+    "Bash(gh *)",
+    "Bash(gh:*)",
+)
+# Inherited git variables that steer the agent CLI's *own* git calls, before
+# any ``inspect`` runs.  ``inspect`` has an environment allowlist; the agent
+# process does not, so these are neutralized on the process itself.  Tracing
+# writes attacker-named files into the checkout (observed: GIT_TRACE2_EVENT
+# producing trace2.json), and the GIT_CONFIG_* injection trio sets arbitrary
+# config -- including exec hooks -- for every git the CLI runs.
+GIT_TRACE_VARIABLES = (
+    "GIT_TRACE",
+    "GIT_TRACE2",
+    "GIT_TRACE2_EVENT",
+    "GIT_TRACE2_PERF",
+    "GIT_TRACE_CURL",
+    "GIT_TRACE_FSMONITOR",
+    "GIT_TRACE_PACKET",
+    "GIT_TRACE_PACK_ACCESS",
+    "GIT_TRACE_PERFORMANCE",
+    "GIT_TRACE_REFS",
+    "GIT_TRACE_SETUP",
+    "GIT_TRACE_SHALLOW",
+)
 EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 # gh subcommands the coder prompts instruct (PR creation/edits, body-file
 # comments, label verification, bounded CI snapshots, issue reads).
@@ -783,6 +817,10 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
                 "none",
                 "--add-dir",
                 str(root),
+                # Deny before allow: the allow list cannot withdraw an
+                # auto-approved command, an explicit deny can.
+                "--disallowedTools",
+                *CLAUDE_READ_ONLY_DENIED_TOOLS,
                 "--allowedTools",
                 _claude_path_rule("Write", root),
                 _claude_path_rule("Edit", root),
@@ -822,10 +860,22 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
 def role_permission_env(config: AgentLoopConfig, provider: str, role: str | None) -> dict[str, str]:
     """Extra agent subprocess environment for a role; empty outside sandboxed mode.
 
-    The agent process keeps its inherited environment. The closed allowlist,
-    constructed PATH, and pinned executables apply inside ``inspect``.
+    The agent process otherwise keeps its inherited environment: the closed
+    allowlist, constructed PATH and pinned executables apply inside
+    ``inspect``, not to the CLI that calls it.  An inherited ``GIT_TRACE*`` or
+    ``GIT_CONFIG_*`` therefore still reaches the CLI's own git calls, so those
+    are neutralized here.  They are overridden rather than removed because the
+    runner merges this mapping over ``os.environ``; git treats ``0`` as off and
+    ``GIT_CONFIG_COUNT=0`` makes any inherited ``GIT_CONFIG_KEY_n`` /
+    ``GIT_CONFIG_VALUE_n`` pair unreadable.
     """
-    return {}
+    if not is_sandboxed(config):
+        return {}
+    env = {name: "0" for name in GIT_TRACE_VARIABLES}
+    env["GIT_CONFIG_COUNT"] = "0"
+    # A pure exec hook: git runs it for every diff, and no role needs it.
+    env["GIT_EXTERNAL_DIFF"] = ""
+    return env
 
 
 def prepare_sandboxed_spawn(config: AgentLoopConfig, provider: str, role: str | None) -> Path:

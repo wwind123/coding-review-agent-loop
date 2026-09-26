@@ -74,14 +74,22 @@ def sandboxed_config(tmp_path, **overrides):
     return make_config(tmp_path, **values)
 
 
-def _allowed_tools(argv):
-    index = argv.index("--allowedTools")
+def _rule_section(argv, option):
+    index = argv.index(option)
     rules = []
     for item in argv[index + 1 :]:
         if item.startswith("--"):
             break
         rules.append(item)
     return rules
+
+
+def _allowed_tools(argv):
+    return _rule_section(argv, "--allowedTools")
+
+
+def _disallowed_tools(argv):
+    return _rule_section(argv, "--disallowedTools")
 
 
 # ----------------------------------------------------------- grant builder
@@ -128,7 +136,8 @@ def test_role_less_and_unknown_roles_get_read_only_grant(tmp_path, sandbox, role
     sandbox["establish"](config)
     argv = ap.role_permission_args(config, "claude", role)
     assert "--restricted" in argv and "acceptEdits" not in argv
-    assert "Bash(git *)" not in argv
+    assert "Bash(git *)" not in _allowed_tools(list(argv))
+    assert "Bash(git *)" in _disallowed_tools(list(argv))
     assert ap.role_permission_args(config, "codex", role)[:2] == ("--sandbox", "read-only")
 
 
@@ -763,3 +772,60 @@ def test_prompts_unchanged_outside_sandbox(tmp_path):
     config = make_config(tmp_path)
     assert "Sandboxed permissions" not in _coder_workdir_guidance(config)
     assert "inspect" not in _coder_workdir_guidance(config, implementation=False, agent="claude")
+
+
+def test_read_only_roles_deny_bare_git_and_gh_because_allow_lists_cannot(tmp_path, sandbox):
+    """Claude auto-approves some read-only commands whatever --allowedTools says.
+
+    ``git status`` succeeded for a reviewer in the live suite at 85988b4, which
+    would run a planted ``.git/config`` in the shared checkout, so the grant has
+    to deny the programs outright rather than merely omit them.
+    """
+    config = sandboxed_config(tmp_path)
+    sandbox["establish"](config)
+    argv = list(ap.role_permission_args(config, "claude", "reviewer"))
+    denied = _disallowed_tools(argv)
+    for program in ("git", "gh"):
+        assert f"Bash({program})" in denied
+        assert f"Bash({program} *)" in denied
+        assert f"Bash({program}:*)" in denied
+    # The deny section must not swallow the inspect grant that replaces them.
+    prefix = ap.inspect_prefix(config)
+    assert f"Bash({prefix} *)" in _allowed_tools(argv)
+    assert not any(rule.startswith(f"Bash({prefix}") for rule in denied)
+    # Deny is declared before allow so neither variadic option absorbs the other.
+    assert argv.index("--disallowedTools") < argv.index("--allowedTools")
+
+
+def test_coder_keeps_git_and_gh(tmp_path, sandbox):
+    """The deny rules are read-only-role scoped; a coder still commits and pushes."""
+    config = sandboxed_config(tmp_path)
+    sandbox["establish"](config)
+    argv = list(ap.role_permission_args(config, "claude", "coder"))
+    assert "Bash(git *)" in _allowed_tools(argv)
+    assert "--disallowedTools" not in argv
+
+
+@pytest.mark.parametrize("role", [None, "reviewer", "coder", "planner"])
+def test_sandboxed_env_neutralizes_inherited_git_tracing_and_config_injection(
+    tmp_path, sandbox, role
+):
+    """GIT_TRACE2_EVENT reached the CLI itself and wrote trace2.json at 85988b4.
+
+    ``inspect`` has an environment allowlist; the CLI that calls it does not, so
+    the variables are overridden on the agent process for every role.
+    """
+    config = sandboxed_config(tmp_path)
+    sandbox["establish"](config)
+    env = ap.role_permission_env(config, "claude", role)
+    for name in ap.GIT_TRACE_VARIABLES:
+        assert env[name] == "0"
+    assert "GIT_TRACE2_EVENT" in ap.GIT_TRACE_VARIABLES
+    assert env["GIT_CONFIG_COUNT"] == "0"
+    assert env["GIT_EXTERNAL_DIFF"] == ""
+
+
+def test_unsandboxed_env_is_untouched(tmp_path):
+    config = sandboxed_config(tmp_path, agent_permissions="default")
+    assert ap.role_permission_env(config, "claude", "reviewer") == {}
+    assert ap.role_permission_env(config, "codex", "coder") == {}

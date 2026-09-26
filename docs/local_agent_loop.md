@@ -4213,8 +4213,18 @@ its role (implemented in `agent_permissions.py`):
   Read,Grep,Glob,Write,Edit,Bash`, an empty `--strict-mcp-config`,
   `--permission-mode dontAsk`, `--permission-prompts none`, `Write`/`Edit`
   rules for the validated response root only, and one Bash rule: the pinned
-  `agent-loop inspect` prefix. See the README's
-  [inspector reference](../README.md#sandboxed-role-permissions).
+  `agent-loop inspect` prefix. It also gets `--disallowedTools` for `git` and
+  `gh`: Claude Code auto-approves some read-only commands (`git status` among
+  them) whatever the allow list says, so omitting a program does not refuse it,
+  and a bare `git` in the shared checkout would run a planted `.git/config`.
+  The deny rules are declared before the allow rules so neither variadic option
+  absorbs the other, and they do not cover the inspector prefix. See the
+  README's [inspector reference](../README.md#sandboxed-role-permissions).
+- Every sandboxed invocation also has the inherited `GIT_TRACE*` variables,
+  `GIT_CONFIG_COUNT` and `GIT_EXTERNAL_DIFF` neutralized on the agent process
+  itself. `inspect` has an environment allowlist, but the CLI that calls it
+  does not, so an inherited `GIT_TRACE2_EVENT` otherwise reaches the CLI's own
+  git calls and writes `trace2.json` into the checkout.
 - A Codex non-coder gets `--sandbox read-only` and `approval_policy="never"`,
   and `--output-last-message` points at the pre-created public response file,
   so failed-exit salvage reads it as usual. It has no network.
