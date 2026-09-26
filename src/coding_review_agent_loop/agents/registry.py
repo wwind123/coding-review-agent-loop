@@ -96,8 +96,13 @@ def agent_signature(
     return f"{base}: {label}"
 
 
-def default_agent_args(agent: AgentName, *, dangerous: bool) -> tuple[str, ...]:
-    return get_backend(agent).default_args(dangerous=dangerous)
+def default_agent_args(
+    agent: AgentName, *, dangerous: bool, mode: str | None = None
+) -> tuple[str, ...]:
+    # Sandboxed grants are built per invocation from the role, never statically.
+    if mode == "sandboxed":
+        return ()
+    return get_backend(agent).default_args(dangerous=dangerous or mode == "dangerous")
 
 
 def run_agent_result(
@@ -113,6 +118,15 @@ def run_agent_result(
     timeout_seconds: float | None = None,
     attempt_suffix: str | None = None,
 ) -> AgentResult:
+    from ..agent_permissions import SANDBOXED_PROVIDERS, is_sandboxed
+
+    if is_sandboxed(config) and agent not in SANDBOXED_PROVIDERS:
+        # Runtime backstop for config validation: an unsupported backend has
+        # no role grant, so it must never be spawned in sandboxed mode.
+        raise AgentLoopError(
+            f"--agent-permissions sandboxed refuses to run {agent!r}: only Claude and "
+            "Codex have role-scoped grants."
+        )
     # Configure the runner at the backend boundary so direct library callers,
     # skill-mode callers, and the CLI all use the same immutable containment
     # policy.  Test doubles inherit this method but their scripted spawn path

@@ -13,6 +13,7 @@ from coding_review_agent_loop.agents.claude import (
     _normalize_claude_usage,
     _parse_claude_output,
 )
+from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.runner import CommandResult, ExecutableIdentity, ExecutionObservation
 from coding_review_agent_loop.agents.codex import (
     BACKEND as CODEX_BACKEND,
@@ -1352,3 +1353,103 @@ def test_claude_backend_pins_effort_and_replaces_inherited_environment(tmp_path)
     assert command[command.index("--effort") + 1] == "xhigh"
     assert command[command.index("--resume") + 1] == "session-1"
     assert runner.agent_envs[-1]["CLAUDE_CODE_EFFORT_LEVEL"] == "xhigh"
+
+
+# ------------------------------------------------ agent permission modes (#1035)
+
+
+@pytest.mark.parametrize("mode", ["default", "dangerous"])
+@pytest.mark.parametrize("role", ["coder", "reviewer", None])
+def test_default_and_dangerous_backend_argv_unchanged(tmp_path, mode, role):
+    dangerous = mode == "dangerous"
+    config = make_config(
+        tmp_path,
+        agent_permissions=mode,
+        claude_args=("--dangerously-skip-permissions",) if dangerous else (),
+        codex_args=("--dangerously-bypass-approvals-and-sandbox",) if dangerous else (),
+    )
+    runner = FakeRunner(
+        claude_outputs=[json.dumps({"result": "ok"})],
+        codex_outputs=[{"public_response": "ok", "stdout": "", "returncode": 0}],
+    )
+    CLAUDE_BACKEND.run(runner, config, "Prompt.", run_id="r", role=role)
+    claude_argv = runner.argv_commands[-1][0]
+    assert claude_argv == [
+        "claude", "--print", "--output-format", "json",
+        *(["--dangerously-skip-permissions"] if dangerous else []),
+        "--effort", "medium",
+    ]
+    CODEX_BACKEND.run(runner, config, "Prompt.", run_id="r", role=role)
+    codex_argv = runner.argv_commands[-1][0]
+    last_message = codex_argv[codex_argv.index("--output-last-message") + 1]
+    assert codex_argv == [
+        "codex", "exec", "--cd", str(config.codex_dir), "--json",
+        "--output-last-message", last_message,
+        "-c", 'model_reasoning_effort="medium"',
+        *(["--dangerously-bypass-approvals-and-sandbox"] if dangerous else []),
+        "-",
+    ]
+    # Default and dangerous modes keep the temporary last-message path.
+    assert "/responses/" not in last_message
+    assert not Path(last_message).exists()
+
+
+@pytest.mark.parametrize("returncode", [1, 2])
+def test_sandboxed_codex_nonzero_exit_artifact_is_salvaged(tmp_path, monkeypatch, returncode):
+    from coding_review_agent_loop import agent_permissions
+    from coding_review_agent_loop.orchestrator import _run_validated_agent
+    import tempfile as tempfile_module
+
+    monkeypatch.setattr(tempfile_module, "tempdir", str(tmp_path))
+    agent_permissions.reset_sandbox_state()
+    config = make_config(
+        tmp_path, agent_permissions="sandboxed", repair_backend="claude",
+        repair_models=("m",), semantic_followup_backend="claude",
+        antigravity_dir=tmp_path / "agy", agent_max_retries=0,
+    )
+    runner = FakeRunner(codex_outputs=[
+        {"public_response": "VALID artifact", "stdout": "VALID stdout", "returncode": returncode}
+    ])
+
+    def validate(text):
+        if text != "VALID artifact":
+            raise AgentLoopError("invalid")
+        return text
+
+    try:
+        response = _run_validated_agent(
+            runner, agent="codex", config=config, prompt="Review.",
+            marker_description="VALID", validate=validate, role="reviewer",
+        )
+    finally:
+        agent_permissions.reset_sandbox_state()
+    assert response.text == "VALID artifact"
+
+
+def test_sandboxed_codex_timeout_without_artifact_is_not_salvaged(tmp_path, monkeypatch):
+    from coding_review_agent_loop import agent_permissions
+    from coding_review_agent_loop.errors import AgentInvocationError
+    from coding_review_agent_loop.orchestrator import _run_validated_agent
+    import tempfile as tempfile_module
+
+    monkeypatch.setattr(tempfile_module, "tempdir", str(tmp_path))
+    agent_permissions.reset_sandbox_state()
+    config = make_config(
+        tmp_path, agent_permissions="sandboxed", repair_backend="claude",
+        repair_models=("m",), semantic_followup_backend="claude",
+        antigravity_dir=tmp_path / "agy", agent_max_retries=0,
+    )
+    runner = FakeRunner(codex_outputs=[
+        {"public_response": "", "stdout": "VALID stdout", "returncode": None}
+    ])
+    try:
+        with pytest.raises(AgentInvocationError):
+            _run_validated_agent(
+                runner, agent="codex", config=config, prompt="Review.",
+                marker_description="VALID",
+                validate=lambda text: (_ for _ in ()).throw(AgentLoopError("invalid"))
+                if text != "VALID stdout" else text,
+                role="reviewer",
+            )
+    finally:
+        agent_permissions.reset_sandbox_state()

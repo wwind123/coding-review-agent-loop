@@ -620,3 +620,78 @@ def test_docs_document_the_review_contract_dimension_and_freezing_procedure():
         assert "review_contract_runs.json" in document
     assert "no per-flow or cross-policy contract rollup" in architecture
     assert "never pooled across policies" in readme
+
+
+def _readme_sandboxed_example() -> list[str]:
+    import shlex
+
+    text = README.read_text(encoding="utf-8")
+    section = text.split("### Running where GitHub GraphQL is refused", 1)[1].split("\n### ", 1)[0]
+    blocks = re.findall(r"```bash\n(.*?)```", section, re.S)
+    examples = [block for block in blocks if "--agent-permissions sandboxed" in block]
+    assert len(examples) == 1
+    return shlex.split(examples[0].replace("\\\n", " "))
+
+
+def test_readme_sandboxed_example_passes_sandboxed_validation(tmp_path):
+    from coding_review_agent_loop import agent_permissions
+    from coding_review_agent_loop.config import config_from_args
+
+    from agent_loop_helpers import FakeRunner
+
+    tokens = _readme_sandboxed_example()
+    assert tokens[0] == "agent-loop"
+    args = build_parser().parse_args([
+        *tokens[1:],
+        "--claude-dir", str(tmp_path / "claude"),
+        "--codex-dir", str(tmp_path / "codex"),
+        "--subprocess-log-dir", str(tmp_path / "logs"),
+        "--dry-run",
+    ])
+    config = config_from_args(args, FakeRunner())
+    config = type(config)(**{**config.__dict__, "plan_execution_mode": args.plan_execution_mode})
+    assert config.agent_permissions == "sandboxed"
+    assert config.repair_backend == "claude" and config.repair_models == ("MODEL",)
+    assert config.semantic_followup_backend == "claude"
+    agent_permissions.validate_sandboxed_selections(config)
+    agent_permissions.validate_sandboxed_flow(config, command=args.command, plan_first=args.plan_first)
+
+
+def test_readme_sandboxed_step_documents_requirements_and_limits():
+    text = README.read_text(encoding="utf-8")
+    step = text.split("**6. Give each agent only the access its role needs.**", 1)[1].split(
+        "**These settings do not persist.**", 1
+    )[0]
+    for phrase in (
+        "--no-semantic-followup-dedupe",
+        "default repair backend\n(`antigravity`)",
+        "Install agent-loop outside the agent checkouts",
+        "`git` and `gh` found first on `PATH` must also live outside every\n  checkout",
+        "`TMPDIR` must resolve outside every checkout",
+        "Pass-through agent arguments are rejected",
+        "A committing Codex coder is rejected",
+        "Codex non-coders have no network",
+        "closed environment\n  allowlist",
+        "refuses to run when the checkout's\n  local, worktree, or included config has a key outside its allowlist",
+        "same OS user",
+    ):
+        assert phrase in step, phrase
+    assert "need\n`--dangerous-agent-permissions`" not in step
+    assert "therefore need" not in step
+    reference = text.split("### Sandboxed role permissions", 1)[1].split("\n### ", 1)[0]
+    for phrase in ("GIT_CONFIG_GLOBAL=/dev/null", "%G", "remote.<name>.{url,pushurl,fetch,gh-resolved}", "--git=", "--gh="):
+        assert phrase in reference, phrase
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    for phrase in ("agent_permissions.py", "inspect_tool.py", "same OS user", "no network"):
+        assert phrase in architecture, phrase
+
+
+def test_cli_help_documents_agent_permissions_and_inspect():
+    parser = build_parser()
+    # argparse may wrap inside hyphenated words, so compare without whitespace.
+    help_text = "".join(parser._subparsers._group_actions[0].choices["pr"].format_help().split())
+    assert "--agent-permissions{default,sandboxed,dangerous}" in help_text
+    assert "Aliasfor--agent-permissionsdangerous" in help_text
+    assert "exactresolvedtestinvocation" in help_text
+    top = " ".join(parser.format_help().split())
+    assert "inspect" in top and "Hardened read-only git/gh runner" in top

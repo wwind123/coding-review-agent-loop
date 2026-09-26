@@ -15,6 +15,7 @@ from .base import (
     public_response_path,
     read_public_response_file,
     with_public_response_file_instruction,
+    with_sandboxed_last_message_instruction,
 )
 from ..logging import agent_log_path, log
 from ..runner import CommandResult, Runner, executable_identity_changed
@@ -310,10 +311,55 @@ class CodexBackend:
     ) -> AgentResult:
         from ..config import resolve_invocation
 
+        from ..agent_permissions import (
+            SandboxBoundaryError,
+            boundary_unavailable_text,
+            is_sandboxed,
+            prepare_sandboxed_spawn,
+            role_permission_args,
+            role_permission_env,
+        )
+
         invocation = resolve_invocation(config, provider="codex", role=role)
         log_path = agent_log_path(config, "codex", run_id=run_id, label=label, attempt_suffix=attempt_suffix)
-        response_path = public_response_path(config, "codex")
-        prompt_with_response_file = with_public_response_file_instruction(prompt, response_path)
+        sandboxed = is_sandboxed(config)
+        if sandboxed:
+            # Codex's read-only sandbox cannot write the response file, so the
+            # CLI writes its last message straight to the pre-created,
+            # physically validated public response path.
+            permission_args = role_permission_args(config, "codex", role)
+            try:
+                response_path = prepare_sandboxed_spawn(config, "codex", role)
+            except SandboxBoundaryError as exc:
+                log(config, f"Codex sandboxed spawn refused: {exc}")
+                text = boundary_unavailable_text(self.signature, exc)
+                return AgentResult(
+                    text=text,
+                    raw_output="",
+                    text_source="stdout",
+                    message_text=text,
+                    returncode=0,
+                    model_used=_codex_model_label(config, role=role),
+                    provider="codex",
+                    role=role,
+                    configured_model=invocation.configured_model,
+                    configured_effort=invocation.resolved_effort,
+                    effort_source=invocation.effort_source,
+                )
+            prompt_with_response_file = with_sandboxed_last_message_instruction(prompt)
+            last_message_args = ["--output-last-message", str(response_path)]
+        else:
+            permission_args = ()
+            response_path = public_response_path(config, "codex")
+            prompt_with_response_file = with_public_response_file_instruction(prompt, response_path)
+            last_message_args = []
+        agent_env = {
+            "AGENT_LOOP_WORKDIR": str(config.codex_dir.resolve()),
+            "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
+                config.coder_test_command_timeout_seconds
+            ),
+            **role_permission_env(config, "codex", role),
+        }
         # Always deliver the prompt on stdin via `codex exec -` (#870): argv is
         # capped per argument by exec and is visible to every local user
         # through ps/proc cmdline.
@@ -329,18 +375,15 @@ class CodexBackend:
                     "exec",
                     "--cd",
                     str(config.codex_dir),
+                    *last_message_args,
                     *_codex_model_args(config, role=role),
                     *config.codex_args,
+                    *permission_args,
                     "-",
                 ],
                 cwd=config.codex_dir,
                 input_text=input_text,
-                env={
-                    "AGENT_LOOP_WORKDIR": str(config.codex_dir.resolve()),
-                    "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
-                        config.coder_test_command_timeout_seconds
-                    ),
-                },
+                env=agent_env,
             )
             log(config, f"Codex finished; log: {log_path}")
             return AgentResult(
@@ -361,8 +404,11 @@ class CodexBackend:
                 effort_source=invocation.effort_source,
             )
 
-        with tempfile.NamedTemporaryFile("r", encoding="utf-8", delete=False) as handle:
-            output_path = handle.name
+        if sandboxed:
+            output_path = str(response_path)
+        else:
+            with tempfile.NamedTemporaryFile("r", encoding="utf-8", delete=False) as handle:
+                output_path = handle.name
         try:
             result = runner.run_with_log(
                 [
@@ -375,6 +421,7 @@ class CodexBackend:
                     output_path,
                     *_codex_model_args(config, role=role),
                     *config.codex_args,
+                    *permission_args,
                     "-",
                 ],
                 cwd=config.codex_dir,
@@ -382,12 +429,7 @@ class CodexBackend:
                 label="Codex",
                 progress_interval_seconds=config.progress_interval_seconds,
                 check=False,
-                env={
-                    "AGENT_LOOP_WORKDIR": str(config.codex_dir.resolve()),
-                    "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
-                        config.coder_test_command_timeout_seconds
-                    ),
-                },
+                env=agent_env,
                 input_text=input_text,
                 timeout_seconds=timeout_seconds,
             )
@@ -432,10 +474,11 @@ class CodexBackend:
                 ),
             )
         finally:
-            try:
-                os.unlink(output_path)
-            except FileNotFoundError:
-                pass
+            if not sandboxed:
+                try:
+                    os.unlink(output_path)
+                except FileNotFoundError:
+                    pass
 
 
 BACKEND = CodexBackend()

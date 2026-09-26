@@ -288,43 +288,86 @@ gh issue view 1 --repo OWNER/REPO --json title  # answered over REST
 another device; `CODEX_API_KEY` instead bills the API account, and takes
 precedence over the sign-in while it is set.
 
-**6. Give the agents the access their role needs.** Each agent writes its
-answer to a per-invocation file under
-`${TMPDIR:-/tmp}/coding-review-agent-loop/responses`, outside its checkout.
-`--dangerous-agent-permissions` turns the agents' sandboxes off entirely.
-
-*Planning and review turns* can keep their sandboxes and be granted only that
-directory plus network access, as in this plan-only run:
+**6. Give each agent only the access its role needs.** Where
+`--dangerous-agent-permissions` is unwanted or refused (a Claude Code cloud
+session's permission classifier, for example, blocks spawning agents with
+sandboxes disabled), use `--agent-permissions sandboxed`. agent-loop then builds
+CLI-enforced grants for every invocation from the provider and the role, so no
+`--claude-arg`/`--codex-arg` is needed (and none is accepted):
 
 ```bash
-RESP="${TMPDIR:-/tmp}/coding-review-agent-loop/responses"
-mkdir -p "$RESP"
 agent-loop issue 123 --repo OWNER/REPO --plan-first \
-  --coder codex --reviewer codex --reviewer claude \
-  --repair-backend codex --repair-model MODEL \
-  --codex-arg=--sandbox --codex-arg=workspace-write \
-  --codex-arg=-c --codex-arg=sandbox_workspace_write.network_access=true \
-  --codex-arg=--add-dir --codex-arg="$RESP" \
-  --claude-arg=--permission-mode --claude-arg=acceptEdits \
-  --claude-arg=--add-dir --claude-arg="$RESP"
+  --plan-execution-mode implement-one-shot \
+  --agent-permissions sandboxed \
+  --coder claude --reviewer codex --reviewer claude \
+  --repair-backend claude --repair-model MODEL \
+  --semantic-followup-backend claude \
+  --test-command "python -m pytest tests/ -q"
 ```
 
-Keep `network_access=true` even though these turns do not push: Codex's
-`workspace-write` sandbox otherwise blocks all network access, including the
-GitHub reads a planning prompt can require (for example fetching the issue
-discussion when detailed requirements are omitted from the prompt).
-`acceptEdits` lets Claude write files but not run arbitrary shell commands,
-which suits reviewing.
+Instead of `--semantic-followup-backend claude` you may pass
+`--no-semantic-followup-dedupe`. Both helper backends must be overridden
+because their defaults are rejected in this mode: the default repair backend
+(`antigravity`) and the default semantic-followup backend (`gemini`) have no
+role grant. Codex or Claude repair needs an explicit `--repair-model`.
 
-*Coder turns that commit and push* cannot use these narrow grants. Codex's
-`workspace-write` sandbox keeps the repository's `.git` read-only even when it
-is passed with `--add-dir`, so `git commit` fails, and `acceptEdits` does not
-let Claude run `git`. Implementation and PR-fix runs therefore need
-`--dangerous-agent-permissions` (or an equivalent coder permission grant) on a
-host where that is acceptable.
+What each role gets:
 
-`--repair-backend` is needed only because its default, `antigravity`, requires
-the `agy` CLI.
+| Role | Claude | Codex |
+|------|--------|-------|
+| Coder (implementation, PR fixes, completion recovery) | `acceptEdits` in its checkout; user-only setting sources; `Bash(git *)`; the gh subcommands coder prompts use (`gh pr create/view/edit/comment/checks/diff`, `gh issue view/comment`, `gh run view`, `gh label create/list`, `gh repo view`); the read-only inspector; and exactly one test rule, the resolved `agent-loop run-tests … -- <test command>` invocation shown in the prompt | rejected (see below) |
+| Every other role (reviewer, planner, analyzer, summary, repair, semantic dedupe, and any unknown or missing role) | `--restricted` with an explicit `--tools` set, `dontAsk`, no permission prompts, an empty strict MCP config, writes only to its response file, and one shell grant: `agent-loop inspect` | `--sandbox read-only` with approvals set to `never`; the Codex CLI writes its final message to the validated response file |
+
+Requirements and limitations of sandboxed mode:
+
+- **Install agent-loop outside the agent checkouts** (for example with
+  `uv tool install`, or a separate clone's virtual environment). The inspector
+  grant is pinned to the orchestrator's interpreter in Python isolated mode
+  (`-I`), and its installed package files are fingerprinted at startup and
+  re-verified before every read-only Claude turn; startup fails fast when the
+  interpreter or package lies inside a checkout.
+- **`git` and `gh` found first on `PATH` must also live outside every
+  checkout**; they are pinned by absolute path for the run, and checkout
+  directories must not precede them on `PATH`. The inspector runs only those
+  pinned binaries, so a `git` or `gh` planted in a checkout later is never
+  executed. Upgrading git or gh during a run blocks read-only turns until the
+  run is restarted. Without `gh` on `PATH`, gh inspection is unavailable. When
+  the pinned `gh` is the step-3 shim, the inspector's gh subcommands work only
+  if the real `gh` sits in the same directory as the pinned `git`, because the
+  shim finds the real `gh` on the inspector's constructed `PATH`.
+- **`TMPDIR` must resolve outside every checkout.** Responses go to a private
+  directory under `${TMPDIR:-/tmp}/coding-review-agent-loop/responses/`, whose
+  agent-loop-created components must be real directories owned by you (no
+  symlinks). The directory and every checkout are re-verified before each
+  spawn, so checkouts must not be moved, replaced, or redirected during a run.
+- **Pass-through agent arguments are rejected** (`--claude-arg`,
+  `--codex-arg`, `--gemini-arg`, `--antigravity-arg`); use the dedicated
+  model and effort options instead.
+- **A committing Codex coder is rejected.** Codex's sandbox keeps the
+  repository's `.git` read-only even with `--add-dir`, so `git commit` fails.
+  Use `--coder claude` (or `--implementation-coder claude`); a Codex planner in
+  a plan-only run is allowed.
+- **Codex non-coders have no network**, because the read-only sandbox disables
+  it; they rely on the issue and PR context in the prompt.
+- **Gemini and Antigravity cannot be selected** on any path (coder, reviewer,
+  analyzer, repair, or semantic dedupe).
+- **The inspector refuses checkouts with unusual git config.** `agent-loop
+  inspect` runs only the pinned git and gh with a closed environment
+  allowlist and a `PATH` built from their directories (inherited `GIT_*`
+  variables, including every trace variable, and `GH_DEBUG` never apply),
+  ignores system and global git config, and refuses to run when the checkout's
+  local, worktree, or included config has a key outside its allowlist, for
+  example a filter (including LFS), signing, include, trace-target, or alias
+  setting. The refusal names the key and the file it came from; the reviewer can
+  still read files directly. See [the inspector reference](#sandboxed-role-permissions).
+- **Coders run tests as the same OS user.** The mode stops accidental and
+  prompt-driven checkout mutation by non-coders and detects or refuses
+  between-turn tampering with the inspector code, the pinned git and gh
+  binaries, git configuration, and the response directory. It is not OS-level
+  isolation from a deliberately hostile coder.
+
+`--dangerous-agent-permissions` is unchanged and still turns the agents'
+sandboxes off entirely; `--agent-permissions dangerous` is its alias.
 
 **These settings do not persist.** The venv activation and `export PATH` lines
 last only for the current shell. Add both to your shell profile or the host's
@@ -1077,6 +1120,69 @@ agent-loop pr 456 --repo OWNER/REPO \
 
 The flag is intentionally explicit. It does not make agent output, fetched
 issue text, dependencies, shell commands, or generated code trustworthy.
+
+### Sandboxed role permissions
+
+`--agent-permissions {default,sandboxed,dangerous}` selects the permission
+mode (default: `default`). `default` passes no permission arguments, and
+`dangerous` is the same as `--dangerous-agent-permissions`; combining that flag
+with another mode is an error. `sandboxed` builds role-scoped, CLI-enforced
+grants for Claude and Codex per invocation; see
+[Running where GitHub GraphQL is refused](#running-where-github-graphql-is-refused),
+step 6, for a complete invocation, the per-role grants, and the requirements.
+
+In sandboxed mode the only shell command a Claude non-coder may run is the
+read-only inspector:
+
+```text
+agent-loop inspect --git=<absolute git> [--gh=<absolute gh>] git|gh ARGS
+```
+
+The grant runs it as `<python> -I -m coding_review_agent_loop.cli inspect
+--git=<pinned git> --gh=<pinned gh> …`, with the paths pinned at startup, and
+`--git=`/`--gh=` are accepted only once each in those leading positions.
+Everything else is checked against closed allowlists before git or gh runs:
+
+- **Subcommands and options.** `git diff|log|show|status|rev-parse|ls-files`
+  with `--stat`, `--name-only`, `--name-status`, `--numstat`, `--patch`/`-p`,
+  `-U<n>`/`--unified=<n>`, `--format=`/`--pretty=`, `-n <k>`/`--max-count=<k>`,
+  `--oneline`, `--porcelain`, `--short`, `--branch`, and `--abbrev-ref` (each
+  where it applies); and, only with `--gh=`, `gh issue view|pr view|pr diff|pr
+  checks` with `--repo`, `--comments`, `--json <fields>`, and `--name-only`.
+  Positional arguments may not start with `-` except after `--`. Abbreviations,
+  unknown options, `git grep`, `-O`/`--open-files-in-pager`, `--output`,
+  `--ext-diff`, `--textconv`, `--no-index`, `--show-signature`, `git -c`,
+  `gh api`, `--web`, `--jq`, and `--template` are rejected.
+- **Format placeholders.** `--format`/`--pretty` accept `oneline`, `short`,
+  `medium`, `full`, `fuller`, `reference`, or a `format:`/`tformat:` string
+  whose placeholders are all among `%H %h %T %t %P %p %an %ae %ad %ar %at %aI
+  %cn %ce %cd %cr %ct %cI %s %b %B %d %D %n %%`; every `%G` form, `%(...)`, and
+  `%C...` are rejected.
+- **Environment.** git and gh get an environment built from an empty mapping:
+  `HOME`, `USER`, `LOGNAME`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`,
+  `TMPDIR`, `XDG_{CONFIG,CACHE,DATA,STATE}_HOME`, `SSL_CERT_FILE`,
+  `SSL_CERT_DIR`, the proxy variables (either case), `GH_TOKEN`,
+  `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`,
+  `GH_CONFIG_DIR`, and `AGENT_LOOP_GH_TRANSPORT`, plus a `PATH` made of the
+  pinned executables' directories and forced `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_NO_LAZY_FETCH=1`, `GIT_OPTIONAL_LOCKS=0`,
+  `GIT_TERMINAL_PROMPT=0`, and `cat` pagers. No inherited `GIT_*` variable is
+  ever passed.
+- **Forced git config.** git runs with `--no-pager`, `--no-ext-diff`, and
+  `--no-textconv`, and with `-c` overrides that disable the pager, fsmonitor,
+  external diff, signature display and every gpg program, all transports,
+  hooks, and Trace2 targets.
+- **Repository-config gate.** Before any git or gh subprocess, the inspector
+  lists the checkout's config with `git config --list --show-origin
+  --show-scope --includes` and refuses to run if any non-command key is
+  outside `core.{repositoryformatversion,filemode,bare=false,logallrefupdates,
+  ignorecase,precomposeunicode,symlinks,autocrlf,eol,safecrlf,quotepath,abbrev}`,
+  `extensions.{objectformat,worktreeconfig,refstorage}`,
+  `remote.<name>.{url,pushurl,fetch,gh-resolved}`,
+  `branch.<name>.{remote,merge,rebase}`, and `user.{name,email}`. The error
+  names the key and its origin, for example `agent-loop inspect: rejected:
+  repository git config key 'filter.lfs.clean' from file:.git/config is
+  outside the inspect allowlist`.
 
 Other important boundaries:
 

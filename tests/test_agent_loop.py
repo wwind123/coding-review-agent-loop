@@ -3540,6 +3540,105 @@ def test_explicit_agent_args_replace_dangerous_profile(tmp_path):
     assert config.gemini_args == ("--approval-mode", "auto_edit")
 
 
+def _permission_args(tmp_path, *extra):
+    return build_parser().parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+        *extra,
+    ])
+
+
+SANDBOXED_HELPERS = (
+    "--repair-backend", "claude", "--repair-model", "claude-haiku-4-5",
+    "--semantic-followup-backend", "claude",
+)
+
+
+def test_agent_permissions_sandboxed_parses_with_empty_static_args(tmp_path):
+    config = config_from_args(
+        _permission_args(tmp_path, "--agent-permissions", "sandboxed", *SANDBOXED_HELPERS),
+        FakeRunner(),
+    )
+    assert config.agent_permissions == "sandboxed"
+    assert config.claude_args == config.codex_args == config.gemini_args == config.antigravity_args == ()
+
+
+def test_agent_permissions_dangerous_is_byte_identical_to_legacy_flag(tmp_path):
+    legacy = config_from_args(_permission_args(tmp_path, "--dangerous-agent-permissions"), FakeRunner())
+    explicit = config_from_args(_permission_args(tmp_path, "--agent-permissions", "dangerous"), FakeRunner())
+    both = config_from_args(
+        _permission_args(tmp_path, "--dangerous-agent-permissions", "--agent-permissions", "dangerous"),
+        FakeRunner(),
+    )
+    default = config_from_args(_permission_args(tmp_path, "--agent-permissions", "default"), FakeRunner())
+    for config in (legacy, explicit, both):
+        assert config.agent_permissions == "dangerous"
+        assert config.claude_args == ("--dangerously-skip-permissions",)
+        assert config.codex_args == ("--dangerously-bypass-approvals-and-sandbox",)
+        assert config.gemini_args == ("--yolo", "--skip-trust")
+    assert default.agent_permissions == "default"
+    assert default.claude_args == default.codex_args == default.gemini_args == ()
+
+
+@pytest.mark.parametrize("mode", ["sandboxed", "default"])
+def test_dangerous_flag_conflicts_with_other_agent_permissions(tmp_path, mode):
+    args = _permission_args(tmp_path, "--dangerous-agent-permissions", "--agent-permissions", mode, *SANDBOXED_HELPERS)
+    with pytest.raises(AgentLoopError, match="conflicts with --agent-permissions"):
+        config_from_args(args, FakeRunner())
+
+
+@pytest.mark.parametrize(
+    "passthrough",
+    [
+        "--claude-arg=--permission-mode",
+        "--claude-arg=--dangerously-skip-permissions",
+        "--codex-arg=-c",
+        "--codex-arg=--config=sandbox_mode=danger-full-access",
+        "--gemini-arg=--yolo",
+        "--antigravity-arg=--x",
+    ],
+)
+def test_sandboxed_rejects_every_passthrough_agent_arg(tmp_path, passthrough):
+    args = _permission_args(tmp_path, "--agent-permissions", "sandboxed", *SANDBOXED_HELPERS, passthrough)
+    option = passthrough.split("=", 1)[0]
+    with pytest.raises(AgentLoopError, match=f"{option} .* is not allowed with --agent-permissions sandboxed"):
+        config_from_args(args, FakeRunner())
+
+
+def test_sandboxed_names_default_repair_backend_before_command_preflight(tmp_path):
+    args = _permission_args(tmp_path, "--agent-permissions", "sandboxed", "--semantic-followup-backend", "claude")
+    with pytest.raises(AgentLoopError, match="--repair-backend claude\\|codex --repair-model MODEL"):
+        config_from_args(args, FakeRunner())
+    args = _permission_args(
+        tmp_path, "--agent-permissions", "sandboxed", "--repair-backend", "codex", "--repair-model", "m"
+    )
+    with pytest.raises(AgentLoopError, match="--no-semantic-followup-dedupe"):
+        config_from_args(args, FakeRunner())
+
+
+def test_sandboxed_codex_pr_coder_fails_before_any_agent_runs(tmp_path, monkeypatch, capsys):
+    from coding_review_agent_loop import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("no agent may run")
+    )
+    code = cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--dry-run",
+        "--claude-dir", str(tmp_path / "claude"), "--codex-dir", str(tmp_path / "codex"),
+        "--subprocess-log-dir", str(tmp_path / "logs"),
+        "--agent-permissions", "sandboxed", "--coder", "codex", "--reviewer", "claude",
+        *SANDBOXED_HELPERS,
+    ])
+    assert code == 1
+    assert "cannot run a committing Codex coder" in capsys.readouterr().err
+
+
 def test_resume_plan_round_prefers_latest_metadata_ledger_for_same_plan_replay():
     current_plan = "Revised plan.\n- Add the active-ledger replay test.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     subject = _plan_subject(current_plan)
