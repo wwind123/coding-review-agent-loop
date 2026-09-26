@@ -764,6 +764,39 @@ def verify_inspect_provenance(config: AgentLoopConfig) -> InspectProvenance:
     return provenance
 
 
+@dataclass(frozen=True)
+class _ProbeResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def hardened_git_probe_runner(config: AgentLoopConfig) -> Callable[[tuple[str, ...], Path], _ProbeResult]:
+    """A git runner for agent-loop's own probes of a sandboxed checkout.
+
+    It runs the pinned git through ``inspect``'s config gate, closed
+    environment, and forced overrides, so the workdir snapshot taken before
+    and after a sandboxed turn cannot run a coder-planted ``core.fsmonitor``,
+    filter, or submodule config.  A gate refusal surfaces as an
+    ``AgentLoopError``, which the tolerant snapshot records as unavailable.
+    """
+    from . import inspect_tool
+
+    def run(args: tuple[str, ...], workdir: Path) -> _ProbeResult:
+        try:
+            git = require_inspect_provenance(config).git.path
+            result = inspect_tool.run_hardened_git(git, args[0], args[1:], cwd=str(workdir))
+        except inspect_tool.InspectRejected as exc:
+            raise AgentLoopError(f"sandboxed workdir probe refused: {exc}") from exc
+        return _ProbeResult(
+            result.returncode,
+            result.stdout.decode("utf-8", "replace"),
+            result.stderr.decode("utf-8", "replace"),
+        )
+
+    return run
+
+
 def inspect_prefix(config: AgentLoopConfig) -> str:
     return require_inspect_provenance(config).prefix_text
 

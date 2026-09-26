@@ -199,6 +199,7 @@ class ClaudeBackend:
         from ..agent_permissions import (
             SandboxBoundaryError,
             boundary_unavailable_text,
+            hardened_git_probe_runner,
             is_sandboxed,
             prepare_sandboxed_spawn,
             role_permission_args,
@@ -264,10 +265,14 @@ class ClaudeBackend:
         # This is deliberately before every Claude invocation, including an
         # ordinary retry and the dedicated replay. Snapshot failures are
         # diagnostic evidence for the replay gate, not backend failures.
+        # Sandboxed turns share a checkout with the coder, so the probe goes
+        # through inspect's pinned, config-gated git instead of a bare `git`.
+        probe_git = hardened_git_probe_runner(config) if sandboxed else None
         before_snapshot = capture_workdir_snapshot(
             runner,
             config.claude_dir,
             tolerate_exceptions=True,
+            git_runner=probe_git,
         )
         result = runner.run_with_log(
             args,
@@ -304,6 +309,7 @@ class ClaudeBackend:
                 runner,
                 config.claude_dir,
                 tolerate_exceptions=True,
+                git_runner=probe_git,
             )
             candidate = classify_self_update_interruption(
                 result,

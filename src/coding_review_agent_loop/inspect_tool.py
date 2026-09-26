@@ -447,6 +447,39 @@ def check_repository_config(entries: Sequence[tuple[str, str, str, str]]) -> Non
             )
 
 
+def run_config_gate(git: str, env: Mapping[str, str], cwd: str, execute: Executor) -> None:
+    """Refuse (``InspectRejected``) unless the checkout's config is allowlisted."""
+    gate = execute(config_gate_argv(git), env, cwd, True)
+    if gate.returncode != 0:
+        detail = gate.stderr.decode("utf-8", "replace").strip()
+        raise InspectRejected(
+            "repository config gate could not read git config; refusing to run"
+            + (f": {detail}" if detail else ".")
+        )
+    check_repository_config(parse_config_listing(gate.stdout))
+
+
+def run_hardened_git(
+    git: str,
+    sub: str,
+    args: Sequence[str],
+    *,
+    cwd: str,
+    environ: Mapping[str, str] | None = None,
+    executor: Executor | None = None,
+) -> ExecResult:
+    """Run one fixed git probe with inspect's gate, closed env, and forced config.
+
+    For agent-loop's own probes of a shared checkout (for example the
+    workdir snapshot before a sandboxed turn); ``sub`` and ``args`` come from
+    agent-loop, not from an agent, so they bypass the argument allowlist.
+    """
+    execute = executor or _subprocess_executor
+    env = build_subprocess_env(os.environ if environ is None else environ, [os.path.dirname(git)])
+    run_config_gate(git, env, cwd, execute)
+    return execute(git_argv(git, sub, args), env, cwd, True)
+
+
 def run_inspect(
     argv: Sequence[str],
     *,
@@ -473,14 +506,7 @@ def run_inspect(
             pinned_dirs.append(os.path.dirname(request.gh))
         env = build_subprocess_env(values, pinned_dirs)
         workdir = cwd or values.get("AGENT_LOOP_WORKDIR") or os.getcwd()
-        gate = execute(config_gate_argv(request.git), env, workdir, True)
-        if gate.returncode != 0:
-            detail = gate.stderr.decode("utf-8", "replace").strip()
-            raise InspectRejected(
-                "repository config gate could not read git config; refusing to run"
-                + (f": {detail}" if detail else ".")
-            )
-        check_repository_config(parse_config_listing(gate.stdout))
+        run_config_gate(request.git, env, workdir, execute)
     except InspectRejected as exc:
         print(f"agent-loop inspect: rejected: {exc}", file=err)
         return EXIT_REJECTED

@@ -856,3 +856,78 @@ def test_default_mode_leaves_the_process_environment_alone(tmp_path, monkeypatch
     config = sandboxed_config(tmp_path, agent_permissions="default")
     ap.establish_sandboxed_run(config, command="pr")
     assert os.environ["GIT_TRACE2_EVENT"] == "/tmp/keep-me.json"
+
+
+# ------------------------------------------- orchestrator's own git probes
+
+
+def _real_git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(repo.parent),
+             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
+    )
+
+
+def _plant_fsmonitor_checkout(checkout: Path, marker: Path) -> None:
+    _real_git(checkout, "init", "-q")
+    _real_git(checkout, "config", "user.name", "Test")
+    _real_git(checkout, "config", "user.email", "t@example.com")
+    (checkout / "a.txt").write_text("one\n", encoding="utf-8")
+    _real_git(checkout, "add", "a.txt")
+    _real_git(checkout, "commit", "-q", "-m", "first")
+    hook = _executable(checkout.parent / "hostile" / "fsmonitor.sh", f"#!/bin/sh\ntouch {marker}\n")
+    # What a coder turn can plant with its own `Bash(git *)` grant.
+    _real_git(checkout, "config", "core.fsmonitor", str(hook))
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_planted_fsmonitor_runs_under_bare_git_status(tmp_path):
+    # Sanity check for the test below: the plant is live for an unhardened probe.
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    marker = tmp_path / "MARKER"
+    _plant_fsmonitor_checkout(checkout, marker)
+    subprocess.run(["git", "status", "--porcelain"], cwd=checkout, capture_output=True, check=False)
+    assert marker.exists()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_sandboxed_claude_workdir_snapshot_never_runs_planted_git_config(tmp_path, sandbox):
+    config = sandboxed_config(tmp_path)
+    marker = tmp_path / "MARKER"
+    _plant_fsmonitor_checkout(config.claude_dir, marker)
+    real_git = shutil.which("git")
+    sandbox["establish"](
+        config, which=lambda name: real_git if name == "git" else str(sandbox["tools"][name])
+    )
+    runner = FakeRunner(claude_outputs=[json.dumps({"result": "ok"})])
+    CLAUDE_BACKEND.run(runner, config, "Review.", run_id="r", role="reviewer")
+    # The pre-spawn snapshot went through the config gate, not the runner's bare git.
+    assert not [cmd for cmd, *_ in runner.commands if cmd and cmd[0] == "git"]
+    assert not marker.exists()
+    with pytest.raises(AgentLoopError, match="core.fsmonitor"):
+        ap.hardened_git_probe_runner(config)(("status", "--porcelain"), config.claude_dir)
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_hardened_probe_reads_clean_checkout(tmp_path, sandbox):
+    config = sandboxed_config(tmp_path)
+    checkout = config.claude_dir
+    _real_git(checkout, "init", "-q")
+    _real_git(checkout, "config", "user.name", "Test")
+    _real_git(checkout, "config", "user.email", "t@example.com")
+    (checkout / "a.txt").write_text("one\n", encoding="utf-8")
+    _real_git(checkout, "add", "a.txt")
+    _real_git(checkout, "commit", "-q", "-m", "first")
+    real_git = shutil.which("git")
+    sandbox["establish"](
+        config, which=lambda name: real_git if name == "git" else str(sandbox["tools"][name])
+    )
+    probe = ap.hardened_git_probe_runner(config)
+    head = probe(("rev-parse", "HEAD"), checkout)
+    assert head.returncode == 0 and len(head.stdout.strip()) == 40
+    (checkout / "a.txt").write_text("two\n", encoding="utf-8")
+    status = probe(("status", "--porcelain"), checkout)
+    assert status.returncode == 0 and "a.txt" in status.stdout

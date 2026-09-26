@@ -68,7 +68,9 @@ flowchart LR
   targets), and `.gitattributes` from making an inspection run a program or
   write a file. Submodule recursion is forced off (`--ignore-submodules=all`
   plus `-c` overrides), because a populated submodule's own local config lies
-  outside the gate. Its interpreter (`-I`), package files, and the pinned git and
+  outside the gate. agent-loop's own workdir snapshot around a sandboxed
+  Claude turn uses the same pinned, gated, hardened git, so it cannot run
+  coder-planted config either. Its interpreter (`-I`), package files, and the pinned git and
   gh are fingerprinted at startup and re-verified before each read-only Claude
   spawn; a mismatch is reported as agent-unavailable without spawning.
 - Residual: sandboxed coders run tests and `git` (including their own hooks,
