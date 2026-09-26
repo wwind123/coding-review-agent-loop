@@ -3436,11 +3436,12 @@ an existing valid creation, fresh, or continuity authorization at that exact
 head instead of publishing a competing grant; conflicting records,
 ambiguous provenance, or changed live state fail closed before labels,
 readiness, review dispatch, qualification, or merge writes.
-The one exception is accumulated history that differs only in its recorded
-protection (#1065) — for example, grants written by earlier resume attempts
-on a host that read the base as unreadable, none of which reaches the live
-head. Rather than refusing on the conflict it exists to clear, the fresh grant
-then retires every prior actor-owned authorization record for the PR: it
+The one exception is accumulated unbound history (#1065): prior grants that
+differ from the live grant only in their recorded protection (for example,
+grants written by earlier resume attempts on a host that read the base as
+unreadable), or compatible grants whose heads GitHub cannot prove are
+ancestors of the live head. Neither kind reaches the live head. Rather than
+refusing on the conflict it exists to clear, the fresh grant then retires every prior actor-owned authorization record for the PR: it
 publishes one superseding record that names the retired comment IDs, and
 every later reader (fresh reuse, ordinary recovery, the resume audit, and the
 plan-binding check) treats those records as history. Nothing is deleted. A

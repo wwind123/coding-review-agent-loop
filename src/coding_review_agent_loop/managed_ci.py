@@ -2811,10 +2811,6 @@ def authorize_fresh_issue_created_resume(
             "actor, label provenance, or approved plan differs; only records that differ in "
             "recorded protection can be superseded. Refusing to proceed."
         )
-    superseded_comment_ids = (
-        tuple(sorted({comment_id for comment_id, _record in scoped_records}))
-        if supersede else ()
-    )
     predecessor: tuple[int, ManagedCiIssueAuthorization] | None = None
     for candidate in (
         () if supersede
@@ -2838,11 +2834,17 @@ def authorize_fresh_issue_created_resume(
         ):
             predecessor = candidate
             break
-    if scoped_records and predecessor is None and not supersede:
-        raise AgentLoopError(
-            "Managed-CI fresh authorization found prior actor-owned authorization, but GitHub "
-            "did not prove that the live head is its descendant; refusing to proceed."
-        )
+    if scoped_records and predecessor is None:
+        # Compatible grants that GitHub cannot chain to the live head are
+        # unbound history too (#1065): none reaches the live head, so none is
+        # evidence for it.  The explicit fresh grant, issued only after the
+        # live tuple and server-observed issue association checks above,
+        # retires them instead of refusing.
+        supersede = True
+    superseded_comment_ids = (
+        tuple(sorted({comment_id for comment_id, _record in scoped_records}))
+        if supersede else ()
+    )
     authorization = ManagedCiIssueAuthorization(
         kind="fresh",
         repository=config.repo,

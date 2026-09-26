@@ -2692,13 +2692,15 @@ def test_public_pr_missing_authorization_reaches_parser_valid_fresh_remedy(tmp_p
     assert runner.dispatch_count == 0
 
 
-def test_fresh_authorization_rejects_unrelated_replacement_head(tmp_path):
+def test_fresh_authorization_supersedes_grant_on_unrelated_replacement_head(tmp_path):
+    # #1065: a grant GitHub cannot chain to the live head is unbound history;
+    # the explicit fresh grant retires it rather than chaining or refusing.
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
     )
-    authorize_fresh_issue_created_resume(
+    first = authorize_fresh_issue_created_resume(
         runner, config=config, pr_number=7, issue_number=643,
         metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
     )
@@ -2709,13 +2711,18 @@ def test_fresh_authorization_rejects_unrelated_replacement_head(tmp_path):
         "merge_base_commit": {"sha": "other"},
     }
 
-    with pytest.raises(AgentLoopError, match="did not prove.*descendant"):
-        authorize_fresh_issue_created_resume(
-            runner, config=config, pr_number=7, issue_number=643,
-            metadata=replace(
-                metadata(), head_branch="agent-loop/managed-643", head_sha="replacement"
-            ),
-        )
+    replacement = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(
+            metadata(), head_branch="agent-loop/managed-643", head_sha="replacement"
+        ),
+    )
+
+    assert replacement.head_sha == "replacement"
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.predecessor_head is None and record.predecessor_comment_id is None
+    assert record.superseded_comment_ids == (first.authorization_comment_id,)
 
 
 def test_fresh_authorization_rejects_missing_server_issue_association(tmp_path):
@@ -10849,3 +10856,52 @@ def test_m1065_superseding_record_round_trips():
         str(format_issue_created_authorization_comment(record))
     )
     assert parsed == record
+
+
+def test_m1065_fresh_authorization_supersedes_same_protection_unbound_records(tmp_path):
+    # Both prior grants match the live protection, base, actor, label event and
+    # plan, but neither head is an ancestor of the live head.
+    stale = [
+        replace(
+            record, protection="voluntary", waiver="allow-unprotected-managed-ci",
+        )
+        for record in _stale_unreadable_records()
+    ]
+    runner = CloudAuthorizationRunner(
+        scripted={},
+        issue_events=[label_event()],
+        intent_comments=_stale_record_comments(stale),
+    )
+    runner.compare_payload = {
+        "status": "diverged",
+        "base_commit": {"sha": "old"},
+        "merge_base_commit": {"sha": "other"},
+    }
+    config = _cloud_config(tmp_path)
+
+    handoff = _fresh_1065(runner, config)
+
+    assert handoff.authorization_kind == "fresh"
+    assert handoff.protection_mode == "voluntary"
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.superseded_comment_ids == (41, 42)
+    assert record.predecessor_head is None
+
+    posted = len(runner.intent_comments)
+    again = _fresh_1065(runner, config)
+    assert again.authorization_comment_id == handoff.authorization_comment_id
+    assert len(runner.intent_comments) == posted
+
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123",
+        expected_handoff=handoff, expected_protection="voluntary",
+        require_actor_owned_label_event=True,
+    )
+    assert audit is not None
+    assert audit[0] == handoff.authorization_comment_id
+    managed_ci.verify_managed_pr_plan_binding(
+        runner, config=config, pr_number=7, issue_number=643,
+        live_head="abc123", approved_plan_hash=_PLAN_1065,
+    )
