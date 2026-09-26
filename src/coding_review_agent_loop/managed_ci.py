@@ -175,6 +175,31 @@ def _waiver_for_protection(state: str) -> str | None:
     return None
 
 
+def reconcile_live_protection(
+    persisted: str | None, live: ProtectionAssessment, *, config: AgentLoopConfig
+) -> ProtectionAssessment:
+    """Continue a persisted ``unreadable`` PR on a host that reads ``voluntary`` (#1063).
+
+    ``unreadable`` already waives an unknown, non-strict base, so a live
+    ``voluntary`` reading (this host can see more, and it is still not strict)
+    is covered by the same explicit waivers.  The PR keeps its persisted
+    state so every authorization and resume record stays consistent.  Every
+    other disagreement, notably a base that became strict, is returned as-is
+    and still refuses.
+    """
+    if (
+        persisted == "unreadable"
+        and live.state == "voluntary"
+        and "unreadable" in waivable_protection_states(config)
+    ):
+        return replace(
+            live,
+            state="unreadable",
+            detail=f"persisted unreadable; live assessment is voluntary ({live.detail})",
+        )
+    return live
+
+
 PREFLIGHT_STRICT_READY = 0
 PREFLIGHT_KNOWN_NOT_READY = 10
 PREFLIGHT_INDETERMINATE = 11
@@ -2998,11 +3023,25 @@ def _recover_issue_created_protection(
         config, pr_number=pr_number, issue_number=issue_number, managed_ci=True,
     )
 
-    def refuse(reason: str) -> AgentLoopError:
+    def refuse(reason: str, *, remedy: str | None = None) -> AgentLoopError:
         return AgentLoopError(
             f"Managed-CI issue-created recovery for PR #{pr_number} refused: {reason}. "
-            f"The PR was left unchanged. Resume with `{command}`."
+            f"The PR was left unchanged. " + (remedy or f"Resume with `{command}`.")
         )
+
+    def waiver_remedy(state: str) -> str:
+        # The remedy must differ from the invocation that just failed (#1063).
+        waived = replace(
+            config,
+            allow_unprotected_managed_ci=True,
+            allow_unreadable_protection=(
+                config.allow_unreadable_protection or state == "unreadable"
+            ),
+        )
+        resume = render_managed_ci_resume_command(
+            waived, pr_number=pr_number, issue_number=issue_number, managed_ci=True,
+        )
+        return f"Resume with `{resume}`."
 
     valid_label_event_ids = _actor_owned_label_event_ids(
         runner, config=config, pr_number=pr_number,
@@ -3065,7 +3104,8 @@ def _recover_issue_created_protection(
         needed = "unreadable" if "unreadable" in unwaived else next(iter(unwaived))
         raise refuse(
             f"its authorization records carry protection {', '.join(sorted(unwaived))}, "
-            f"which requires {waiver_flags_for_protection(needed)}"
+            f"which requires {waiver_flags_for_protection(needed)}",
+            remedy=waiver_remedy(needed),
         )
     # Selection pass: protection and plan scope are deliberately deferred.
     validate(None, handoff)
@@ -3094,18 +3134,25 @@ def _recover_issue_created_protection(
     if recovered not in waivable_protection_states(config):
         raise refuse(
             f"its persisted protection is {recovered}, which requires "
-            f"{waiver_flags_for_protection(recovered)}"
+            f"{waiver_flags_for_protection(recovered)}",
+            remedy=waiver_remedy(recovered),
         )
     # Confirmation pass against the recovered state and the live assessment.
     confirmed = replace(handoff, protection_mode=recovered)
     validate(recovered, confirmed)
-    # Any live/persisted disagreement refuses, including a base that became
-    # strict: activation's strict path skips the resume-audit plan-scope gate,
-    # so a deferred plan check must never be carried onto it.
+    # Any other live/persisted disagreement refuses, including a base that
+    # became strict: activation's strict path skips the resume-audit
+    # plan-scope gate, so a deferred plan check must never be carried onto it.
+    live = reconcile_live_protection(recovered, live, config=config)
     if live.state != recovered:
         raise refuse(
             f"its persisted protection is {recovered}, but the live assessment is "
-            f"{live.state} ({live.detail})"
+            f"{live.state} ({live.detail})",
+            remedy=(
+                "No resume flag reconciles this protection change, so rerunning this "
+                "command will refuse again. Restore the base's original protection "
+                "before retrying."
+            ),
         )
     return confirmed
 
@@ -4425,6 +4472,10 @@ def _activate_v2_managed_ci(
         )
         if protection.state != "strict" and managed_resume is not None:
             handoff = managed_resume.issue_created_handoff
+            if handoff is not None:
+                protection = reconcile_live_protection(
+                    handoff.protection_mode, protection, config=config,
+                )
             if protection.state not in waivable_protection_states(config):
                 reason = "strict protection is unavailable and the explicit waiver is absent"
                 if MANAGED_LABEL in labels:
