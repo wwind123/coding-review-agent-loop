@@ -9498,7 +9498,12 @@ def test_issue_created_recovery_without_creation_record_uses_live_waivable_state
     ("records", "scripted", "config_overrides", "match"),
     [
         ([_unreadable_record()], None, {"unreadable": False}, _BOTH_WAIVERS),
-        ([_unreadable_record()], {}, {}, "live assessment is voluntary"),
+        (
+            [_unreadable_record()],
+            {_CLASSIC: _failed(PLAN_LIMITED), _RULES: _failed(PLAN_LIMITED)},
+            {},
+            "live assessment is plan_limited",
+        ),
         (
             [
                 _unreadable_record(),
@@ -9516,8 +9521,21 @@ def test_issue_created_recovery_without_creation_record_uses_live_waivable_state
             ],
             None, {}, "authorization comment 42",
         ),
+        (
+            [
+                _unreadable_record(),
+                _unreadable_record(
+                    kind="fresh", protection="voluntary",
+                    waiver="allow-unprotected-managed-ci", nonce="fresh-nonce",
+                ),
+            ],
+            None, {"unreadable": False}, r"records disagree on protection \(unreadable, voluntary\)",
+        ),
     ],
-    ids=["missing-flag", "live-disagrees", "creation-records-disagree", "fresh-record-disagrees"],
+    ids=[
+        "missing-flag", "live-disagrees", "creation-records-disagree",
+        "fresh-record-disagrees", "unwaived-records-disagree",
+    ],
 )
 def test_issue_created_recovery_refuses_without_mutation(
     tmp_path, records, scripted, config_overrides, match
@@ -9528,7 +9546,90 @@ def test_issue_created_recovery_refuses_without_mutation(
         _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True, **config_overrides))
 
     assert "The PR was left unchanged" in str(exc_info.value)
+    if match != _BOTH_WAIVERS:
+        # #1063: no flag resolves these, so no command is offered as a remedy.
+        assert _resume_command(exc_info.value) is None
+        assert "No resume flag reconciles" in str(exc_info.value)
     assert _mutations(runner) == []
+
+
+_FAILED_ARGV = (
+    "agent-loop", "pr", "7", "--managed-ci",
+    "--managed-ci-trusted-actor", "agent-loop", "--allow-unprotected-managed-ci",
+)
+
+
+def _resume_command(error):
+    match = re.search(r"Resume with `([^`]+)`", str(error))
+    return None if match is None else match.group(1)
+
+
+def test_issue_created_recovery_missing_waiver_remedy_is_not_the_failing_command(tmp_path):
+    # #1063: the printed remedy must add the missing flag, not replay argv.
+    runner = _recovery_runner([_unreadable_record()])
+    config = _cloud_config(
+        tmp_path, unreadable=False, managed_ci_pr_mode=True, invocation_argv=_FAILED_ARGV,
+    )
+
+    with pytest.raises(AgentLoopError, match=_BOTH_WAIVERS) as exc_info:
+        _recover(runner, config)
+
+    resume = _resume_command(exc_info.value)
+    assert resume is not None
+    assert resume != shlex.join(_FAILED_ARGV)
+    assert "--allow-unreadable-protection" in shlex.split(resume)
+    assert _mutations(runner) == []
+
+
+def test_issue_created_recovery_reconciles_persisted_unreadable_with_live_voluntary(tmp_path):
+    # #1063: a PR authorized where protection was unreadable resumes on a host
+    # that reads voluntary; the persisted state is kept for every record.
+    runner = _recovery_runner([_unreadable_record()], scripted={})
+
+    handoff = _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert handoff is not None
+    assert handoff.protection_mode == "unreadable"
+    assert _mutations(runner) == []
+
+
+def test_issue_created_recovery_irreconcilable_mismatch_prints_no_identical_command(tmp_path):
+    argv = _FAILED_ARGV + ("--allow-unreadable-protection",)
+    runner = _recovery_runner(
+        [_unreadable_record()],
+        scripted={_CLASSIC: _failed(PLAN_LIMITED), _RULES: _failed(PLAN_LIMITED)},
+    )
+    config = _cloud_config(tmp_path, managed_ci_pr_mode=True, invocation_argv=argv)
+
+    with pytest.raises(AgentLoopError, match="live assessment is plan_limited") as exc_info:
+        _recover(runner, config)
+
+    assert _resume_command(exc_info.value) is None
+    assert "No resume flag reconciles" in str(exc_info.value)
+    assert _mutations(runner) == []
+
+
+def test_run_pr_loop_resumes_unreadable_pr_where_protection_reads_voluntary(
+    tmp_path, monkeypatch,
+):
+    runner = _recovery_runner([_unreadable_record()], scripted={})
+    config = _cloud_config(
+        tmp_path,
+        managed_ci_pr_mode=True,
+        invocation_argv=_FAILED_ARGV + ("--allow-unreadable-protection",),
+    )
+    captured = {}
+    _stop_after_real_activation(monkeypatch, captured)
+
+    with pytest.raises(_ActivationReached) as exc_info:
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    contract = exc_info.value.args[0]
+    assert contract is not None
+    assert contract.activation_path == "managed"
+    assert contract.protection_mode == "unreadable"
+    assert captured["managed_resume"].issue_created_handoff.protection_mode == "unreadable"
+    assert runner.dispatch_count == 0
 
 
 @pytest.mark.parametrize(
@@ -9551,9 +9652,10 @@ def test_issue_created_recovery_rejects_invalid_records_without_selecting_protec
         _unreadable_record(**overrides),
     ])
 
-    with pytest.raises(AgentLoopError, match="authorization comment 42"):
+    with pytest.raises(AgentLoopError, match="authorization comment 42") as exc_info:
         _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
 
+    assert _resume_command(exc_info.value) is None
     assert _mutations(runner) == []
 
 
@@ -9576,8 +9678,10 @@ def test_issue_created_recovery_refuses_unreadable_label_history(tmp_path):
         [_unreadable_record()], scripted=scripted, lifecycle="draft-unlabeled",
     )
 
-    with pytest.raises(AgentLoopError, match="event history could not be inspected"):
+    with pytest.raises(AgentLoopError, match="event history could not be inspected") as exc_info:
         _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert "may be transient; retry" in str(exc_info.value)
 
     assert _mutations(runner) == []
 
