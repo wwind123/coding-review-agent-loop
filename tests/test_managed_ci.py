@@ -9521,8 +9521,21 @@ def test_issue_created_recovery_without_creation_record_uses_live_waivable_state
             ],
             None, {}, "authorization comment 42",
         ),
+        (
+            [
+                _unreadable_record(),
+                _unreadable_record(
+                    kind="fresh", protection="voluntary",
+                    waiver="allow-unprotected-managed-ci", nonce="fresh-nonce",
+                ),
+            ],
+            None, {"unreadable": False}, r"records disagree on protection \(unreadable, voluntary\)",
+        ),
     ],
-    ids=["missing-flag", "live-disagrees", "creation-records-disagree", "fresh-record-disagrees"],
+    ids=[
+        "missing-flag", "live-disagrees", "creation-records-disagree",
+        "fresh-record-disagrees", "unwaived-records-disagree",
+    ],
 )
 def test_issue_created_recovery_refuses_without_mutation(
     tmp_path, records, scripted, config_overrides, match
@@ -9533,6 +9546,10 @@ def test_issue_created_recovery_refuses_without_mutation(
         _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True, **config_overrides))
 
     assert "The PR was left unchanged" in str(exc_info.value)
+    if match != _BOTH_WAIVERS:
+        # #1063: no flag resolves these, so no command is offered as a remedy.
+        assert _resume_command(exc_info.value) is None
+        assert "No resume flag reconciles" in str(exc_info.value)
     assert _mutations(runner) == []
 
 
@@ -9635,9 +9652,10 @@ def test_issue_created_recovery_rejects_invalid_records_without_selecting_protec
         _unreadable_record(**overrides),
     ])
 
-    with pytest.raises(AgentLoopError, match="authorization comment 42"):
+    with pytest.raises(AgentLoopError, match="authorization comment 42") as exc_info:
         _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
 
+    assert _resume_command(exc_info.value) is None
     assert _mutations(runner) == []
 
 
@@ -9660,8 +9678,10 @@ def test_issue_created_recovery_refuses_unreadable_label_history(tmp_path):
         [_unreadable_record()], scripted=scripted, lifecycle="draft-unlabeled",
     )
 
-    with pytest.raises(AgentLoopError, match="event history could not be inspected"):
+    with pytest.raises(AgentLoopError, match="event history could not be inspected") as exc_info:
         _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert "may be transient; retry" in str(exc_info.value)
 
     assert _mutations(runner) == []
 

@@ -3372,9 +3372,13 @@ since become strictly protected. A missing-flag refusal prints a resume
 command that adds the missing flags. One disagreement is reconciled rather
 than refused: a PR authorized where protection was `unreadable` resumes, with
 both flags, on a host that reads the base as `voluntary`. The PR keeps its
-persisted `unreadable` state, and the new resume audit record carries it. Any
-other disagreement says that no resume flag reconciles it, and prints no
-command.
+persisted `unreadable` state, and the new resume audit record carries it.
+Every other refusal that no flag can resolve, such as a different live
+disagreement, authorization records that disagree with each other, or a
+record that does not match the PR, says that no resume flag reconciles it and
+prints no command. A missing-flag refusal whose records also disagree is
+reported as that disagreement. Only a transient GitHub read failure offers a
+retry of the same command, and it is labeled as a retry.
 
 This intentionally tightens the issue-created v2 path for workflows that can
 suppress `pull_request` CI. A repository that previously ran that v2 flow

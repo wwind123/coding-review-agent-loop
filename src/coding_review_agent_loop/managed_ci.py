@@ -3023,10 +3023,19 @@ def _recover_issue_created_protection(
         config, pr_number=pr_number, issue_number=issue_number, managed_ci=True,
     )
 
+    # A remedy must never be the invocation that just failed (#1063): only a
+    # transient read failure offers a retry of it, and only a missing waiver
+    # offers a (different) resume command.  Everything else is irreconcilable.
+    irreconcilable = (
+        "No resume flag reconciles this state, so rerunning this command will "
+        "refuse again."
+    )
+    retry = f"This read may be transient; retry `{command}` once it succeeds."
+
     def refuse(reason: str, *, remedy: str | None = None) -> AgentLoopError:
         return AgentLoopError(
             f"Managed-CI issue-created recovery for PR #{pr_number} refused: {reason}. "
-            f"The PR was left unchanged. " + (remedy or f"Resume with `{command}`.")
+            f"The PR was left unchanged. " + (remedy or irreconcilable)
         )
 
     def waiver_remedy(state: str) -> str:
@@ -3048,12 +3057,12 @@ def _recover_issue_created_protection(
         actor_login=handoff.trusted_actor_login, actor_id=handoff.trusted_actor_id,
     )
     if valid_label_event_ids is None:
-        raise refuse("the managed-label event history could not be inspected")
+        raise refuse("the managed-label event history could not be inspected", remedy=retry)
     comments = _api_list(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
-        raise refuse("the authorization comments could not be inspected")
+        raise refuse("the authorization comments could not be inspected", remedy=retry)
     records: list[tuple[Mapping[str, object], ManagedCiIssueAuthorization]] = []
     for comment in comments:
         body = _normalized_comment_body(comment, config=config)
@@ -3102,6 +3111,14 @@ def _recover_issue_created_protection(
     }
     if unwaived:
         needed = "unreadable" if "unreadable" in unwaived else next(iter(unwaived))
+        record_states = {authorization.protection for _comment, authorization in records}
+        if len(record_states) > 1:
+            # Every record must later equal one recovered state, so adding
+            # waiver flags would only reach an irreconcilable refusal.
+            raise refuse(
+                "its authorization records disagree on protection ("
+                + ", ".join(sorted(record_states)) + ")"
+            )
         raise refuse(
             f"its authorization records carry protection {', '.join(sorted(unwaived))}, "
             f"which requires {waiver_flags_for_protection(needed)}",
@@ -3148,11 +3165,7 @@ def _recover_issue_created_protection(
         raise refuse(
             f"its persisted protection is {recovered}, but the live assessment is "
             f"{live.state} ({live.detail})",
-            remedy=(
-                "No resume flag reconciles this protection change, so rerunning this "
-                "command will refuse again. Restore the base's original protection "
-                "before retrying."
-            ),
+            remedy=f"{irreconcilable} Restore the base's original protection before retrying.",
         )
     return confirmed
 
