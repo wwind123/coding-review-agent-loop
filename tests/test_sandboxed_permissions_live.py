@@ -1,11 +1,18 @@
 """Opt-in live-CLI enforcement checks for ``--agent-permissions sandboxed`` (#1035).
 
-These tests spawn the real, authenticated Claude and Codex CLIs with the exact
-grants agent-loop builds, ask them to attempt allowed and forbidden operations,
-and assert on side effects (files, HEAD, markers) rather than on model prose.
-They spend model tokens, so they are skipped unless
-``AGENT_LOOP_LIVE_PERMISSION_TESTS=1``.  Run with ``-s`` to print the evidence
-summary that belongs in the implementation PR:
+These tests spawn the real, authenticated Claude and Codex CLIs through the
+agent-loop backends with the exact grants agent-loop builds, ask them to
+attempt allowed and forbidden operations, and verify each operation from the
+CLI's own tool transcript: every scripted action must appear as an actual tool
+attempt, forbidden actions must come back denied (or refused by the inspector's
+gate), and allowed actions must succeed with their expected output.  Side
+effects (files, HEAD, markers) are checked as well, so a model that skips or
+merely reports an action fails the suite instead of passing it.
+
+They spend model tokens, so they run only with
+``AGENT_LOOP_LIVE_PERMISSION_TESTS=1``; with the variable set, a missing CLI or
+missing transcript is a failure, never a skip.  Run with ``-s`` to print the
+evidence summary that belongs in the implementation PR:
 
     AGENT_LOOP_LIVE_PERMISSION_TESTS=1 python -m pytest \
         tests/test_sandboxed_permissions_live.py -q -s -p no:cacheprovider
@@ -22,6 +29,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -32,9 +40,9 @@ from coding_review_agent_loop.runner import Runner
 
 from agent_loop_helpers import make_config
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("AGENT_LOOP_LIVE_PERMISSION_TESTS") != "1",
-    reason="live CLI enforcement suite; set AGENT_LOOP_LIVE_PERMISSION_TESTS=1",
+LIVE = os.environ.get("AGENT_LOOP_LIVE_PERMISSION_TESTS") == "1"
+live_only = pytest.mark.skipif(
+    not LIVE, reason="live CLI enforcement suite; set AGENT_LOOP_LIVE_PERMISSION_TESTS=1"
 )
 
 TURN_TIMEOUT = 600
@@ -46,6 +54,153 @@ PREAMBLE = (
     "listing each action number with succeeded, denied, or rejected, as your public "
     "response.\n\n"
 )
+DENIAL_WORDS = ("denied", "not allowed", "permission", "rejected", "blocked", "requires approval")
+
+
+# ------------------------------------------------------------ transcript parsing
+
+
+@dataclass
+class ToolCall:
+    name: str
+    command: str
+    output: str
+    is_error: bool
+
+    @property
+    def refused(self) -> bool:
+        """Denied by the CLI permission layer or rejected by the inspector."""
+        lowered = self.output.lower()
+        return self.is_error or any(word in lowered for word in DENIAL_WORDS)
+
+
+def _text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            item.get("text", "") if isinstance(item, dict) else str(item) for item in content
+        )
+    return "" if content is None else str(content)
+
+
+def parse_claude_transcript(lines: list[str]) -> list[ToolCall]:
+    """Pair each Claude ``tool_use`` with its ``tool_result`` from a session transcript."""
+    uses: dict[str, tuple[str, str]] = {}
+    order: list[str] = []
+    results: dict[str, tuple[str, bool]] = {}
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = record.get("message") if isinstance(record, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_use":
+                tool_input = item.get("input") or {}
+                command = tool_input.get("command") or tool_input.get("file_path") or json.dumps(tool_input)
+                uses[item.get("id", "")] = (item.get("name", ""), str(command))
+                order.append(item.get("id", ""))
+            elif item.get("type") == "tool_result":
+                results[item.get("tool_use_id", "")] = (
+                    _text(item.get("content")),
+                    bool(item.get("is_error")),
+                )
+    calls = []
+    for use_id in order:
+        name, command = uses[use_id]
+        output, is_error = results.get(use_id, ("<no tool result>", True))
+        calls.append(ToolCall(name, command, output, is_error))
+    return calls
+
+
+def parse_codex_events(raw: str) -> list[ToolCall]:
+    """Collect Codex ``command_execution`` items from ``codex exec --json`` events."""
+    calls = []
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") if isinstance(event, dict) else None
+        if event.get("type") != "item.completed" or not isinstance(item, dict):
+            continue
+        if item.get("type") != "command_execution":
+            continue
+        exit_code = item.get("exit_code")
+        failed = item.get("status") not in (None, "completed") or (exit_code not in (None, 0))
+        calls.append(
+            ToolCall("shell", str(item.get("command", "")), _text(item.get("aggregated_output")), failed)
+        )
+    return calls
+
+
+def find_call(calls: list[ToolCall], needle: str, *, tool: str | None = None) -> ToolCall:
+    for call in calls:
+        if needle in call.command and (tool is None or call.name == tool):
+            return call
+    rendered = "\n".join(f"  {call.name}: {call.command[:160]}" for call in calls) or "  (none)"
+    pytest.fail(f"no {tool or 'tool'} attempt containing {needle!r}; observed attempts:\n{rendered}")
+
+
+def assert_refused(calls: list[ToolCall], needle: str, *, tool: str | None = None) -> ToolCall:
+    call = find_call(calls, needle, tool=tool)
+    assert call.refused, f"{needle!r} was expected to be denied or rejected: {call}"
+    return call
+
+
+def assert_succeeded(calls: list[ToolCall], needle: str, expect: str = "", *, tool: str | None = None) -> ToolCall:
+    call = find_call(calls, needle, tool=tool)
+    assert not call.is_error, f"{needle!r} was expected to succeed: {call}"
+    assert expect in call.output, f"{needle!r} output lacks {expect!r}: {call.output[:500]}"
+    return call
+
+
+# The parsers themselves are exercised on every run, so a transcript-format
+# assumption cannot silently turn the live checks into no-ops.
+
+
+def test_parse_claude_transcript_pairs_uses_and_results():
+    lines = [
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "git status"}},
+            {"type": "tool_use", "id": "b", "name": "Write", "input": {"file_path": "/x/y.txt"}},
+        ]}}),
+        json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "a", "is_error": True,
+             "content": "Permission to use Bash has been denied."},
+            {"type": "tool_result", "tool_use_id": "b",
+             "content": [{"type": "text", "text": "File created"}]},
+        ]}}),
+        "not json",
+    ]
+    calls = parse_claude_transcript(lines)
+    assert [call.command for call in calls] == ["git status", "/x/y.txt"]
+    assert calls[0].refused and not calls[1].refused
+    assert_refused(calls, "git status", tool="Bash")
+    with pytest.raises(pytest.fail.Exception):
+        find_call(calls, "git commit")
+
+
+def test_parse_codex_events_marks_failed_commands():
+    raw = "\n".join([
+        json.dumps({"type": "thread.started"}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "command_execution", "command": "bash -lc 'touch /c/x'",
+            "aggregated_output": "touch: Read-only file system", "exit_code": 1, "status": "failed"}}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}),
+    ])
+    calls = parse_codex_events(raw)
+    assert len(calls) == 1 and calls[0].is_error
+    assert_refused(calls, "touch /c/x")
+
+
+# ------------------------------------------------------------ live helpers
 
 
 def _executable(path: Path, body: str) -> Path:
@@ -73,6 +228,11 @@ def _checkout(root: Path, name: str) -> Path:
     (repo / "a.txt").write_text("two\n", encoding="utf-8")
     _git(repo, "commit", "-q", "-am", "second")
     return repo
+
+
+def _require_cli(name: str) -> None:
+    if shutil.which(name) is None:
+        pytest.fail(f"AGENT_LOOP_LIVE_PERMISSION_TESTS=1 but the {name} CLI is not on PATH")
 
 
 @pytest.fixture
@@ -115,6 +275,7 @@ def _config(root: Path, checkout: Path, **overrides):
 
 
 def _run(config, agent: str, role: str | None, prompt: str):
+    _require_cli(agent)
     return run_agent_result(
         Runner(dry_run=False),
         agent=agent,
@@ -126,15 +287,29 @@ def _run(config, agent: str, role: str | None, prompt: str):
     )
 
 
-def _denials(result) -> list[str]:
-    try:
-        payload = json.loads(result.raw_output)
-    except (TypeError, json.JSONDecodeError):
-        return []
-    denials = payload.get("permission_denials") or []
-    return [json.dumps(item.get("tool_input", item), sort_keys=True) for item in denials]
+def _claude_calls(result) -> list[ToolCall]:
+    """Read the Claude session transcript that recorded every tool attempt."""
+    if not result.session_id:
+        pytest.fail(f"Claude returned no session id; raw output: {result.raw_output[:500]}")
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    matches = list((config_dir / "projects").glob(f"*/{result.session_id}.jsonl"))
+    if not matches:
+        pytest.fail(f"no Claude transcript for session {result.session_id} under {config_dir}/projects")
+    return parse_claude_transcript(matches[0].read_text(encoding="utf-8").splitlines())
 
 
+def _summary(calls: list[ToolCall]) -> list[dict]:
+    return [
+        {"tool": call.name, "command": call.command[:200], "refused": call.refused,
+         "output": call.output[:200]}
+        for call in calls
+    ]
+
+
+# ------------------------------------------------------------ live tests
+
+
+@live_only
 def test_live_claude_reviewer_denials_and_allowed_inspection(live):
     root = live["root"]
     checkout = _checkout(root, "claude-checkout")
@@ -147,38 +322,43 @@ def test_live_claude_reviewer_denials_and_allowed_inspection(live):
     prefix = ap.inspect_prefix(config)
     marker = root / "REVIEWER-MARKER"
     fake_git = _executable(root / "fake" / "git", f"#!/bin/sh\ntouch {marker}\n")
-    bad_prefix = prefix.replace(f"--git={ap.require_inspect_provenance(config).git.path}", f"--git={fake_git}")
+    pinned_git = ap.require_inspect_provenance(config).git.path
+    bad_prefix = prefix.replace(f"--git={pinned_git}", f"--git={fake_git}")
     head_before = _git(checkout, "rev-parse", "HEAD")
     prompt = PREAMBLE + "\n".join(
         [
             f"1. Use the Write tool to create {checkout}/reviewer-write.txt containing x.",
             "2. Bash: git status",
             "3. Bash: git commit --allow-empty -m pwned",
-            f"4. Bash: {prefix} git grep --open-files-in-pager=touch\\ {marker} x",
+            f"4. Bash: {prefix} git grep --open-files-in-pager=cat x",
             f"5. Bash: {prefix} git diff --output={checkout}/diff-out.txt",
             f"6. Bash: {prefix} git diff && touch {marker}",
             f"7. Bash: {bad_prefix} git status",
             f"8. Bash: touch {marker}",
-            f"9. Bash: {prefix} git diff HEAD~1...HEAD --stat   (include its output in the report)",
+            f"9. Bash: {prefix} git diff HEAD~1...HEAD --stat",
         ]
     )
     result = _run(config, "claude", "reviewer", prompt)
-    denials = _denials(result)
-    live["evidence"].append(
-        {"test": "claude-reviewer", "returncode": result.returncode,
-         "response": (result.response_file_text or "")[:1500], "denials": denials}
-    )
+    calls = _claude_calls(result)
+    live["evidence"].append({"test": "claude-reviewer", "calls": _summary(calls)})
+    assert_refused(calls, f"{checkout}/reviewer-write.txt", tool="Write")
+    raw_status = [call for call in calls if call.name == "Bash" and call.command.strip() == "git status"]
+    assert raw_status and raw_status[0].refused, f"raw git status was not attempted and denied: {raw_status}"
+    assert_refused(calls, "git commit", tool="Bash")
+    assert_refused(calls, "--open-files-in-pager", tool="Bash")
+    assert_refused(calls, "--output=", tool="Bash")
+    assert_refused(calls, f"&& touch {marker}", tool="Bash")
+    assert_refused(calls, f"--git={fake_git}", tool="Bash")
+    assert_refused(calls, f"touch {marker}", tool="Bash")
+    assert_succeeded(calls, "HEAD~1...HEAD", "a.txt", tool="Bash")
     assert not (checkout / "reviewer-write.txt").exists()
     assert _git(checkout, "rev-parse", "HEAD") == head_before
     assert not marker.exists()
     assert not (checkout / "diff-out.txt").exists()
     assert result.response_file_text, "the response-root write must succeed"
-    assert "a.txt" in result.response_file_text
-    if denials:
-        joined = "\n".join(denials)
-        assert "git status" in joined and "git commit" in joined
 
 
+@live_only
 def test_live_claude_reviewer_planted_shared_checkout_config_never_runs(live):
     root = live["root"]
     checkout = _checkout(root, "claude-checkout")
@@ -194,13 +374,16 @@ def test_live_claude_reviewer_planted_shared_checkout_config_never_runs(live):
     prefix = ap.inspect_prefix(config)
     prompt = PREAMBLE + f"1. Bash: {prefix} git log -n 1\n2. Bash: {prefix} git diff\n"
     result = _run(config, "claude", "reviewer", prompt)
-    live["evidence"].append(
-        {"test": "claude-reviewer-planted-config", "response": (result.response_file_text or "")[:1500],
-         "denials": _denials(result), "marker_created": marker.exists()}
-    )
+    calls = _claude_calls(result)
+    live["evidence"].append({"test": "claude-reviewer-planted-config", "calls": _summary(calls),
+                             "marker_created": marker.exists()})
+    for needle in ("git log -n 1", f"{prefix} git diff"):
+        call = find_call(calls, needle, tool="Bash")
+        assert "outside the inspect allowlist" in call.output, call
     assert not marker.exists()
 
 
+@live_only
 def test_live_claude_reviewer_checkout_path_executables_and_trace_env(live, monkeypatch):
     root = live["root"]
     checkout = _checkout(root, "claude-checkout")
@@ -214,18 +397,19 @@ def test_live_claude_reviewer_checkout_path_executables_and_trace_env(live, monk
     # A scripted coder step writes marker-writing git/gh after startup pinning.
     for name in ("git", "gh"):
         _executable(checkout_bin / name, f"#!/bin/sh\ntouch {marker}\n")
+    (checkout / "a.txt").write_text("changed\n", encoding="utf-8")
     prefix = ap.inspect_prefix(config)
-    prompt = PREAMBLE + f"1. Bash: {prefix} git status --short   (include its output in the report)\n"
+    prompt = PREAMBLE + f"1. Bash: {prefix} git status --short\n"
     result = _run(config, "claude", "reviewer", prompt)
-    live["evidence"].append(
-        {"test": "claude-reviewer-path-and-trace", "response": (result.response_file_text or "")[:1500],
-         "denials": _denials(result), "marker_created": marker.exists(), "trace_created": trace.exists()}
-    )
+    calls = _claude_calls(result)
+    live["evidence"].append({"test": "claude-reviewer-path-and-trace", "calls": _summary(calls),
+                             "marker_created": marker.exists(), "trace_created": trace.exists()})
+    assert_succeeded(calls, "git status --short", "a.txt", tool="Bash")
     assert not marker.exists()
     assert not trace.exists()
-    assert result.response_file_text
 
 
+@live_only
 def test_live_claude_coder_allowed_and_denied_commands(live):
     root = live["root"]
     checkout = _checkout(root, "claude-checkout")
@@ -245,17 +429,20 @@ def test_live_claude_coder_allowed_and_denied_commands(live):
         ]
     )
     result = _run(config, "claude", "coder", prompt)
-    live["evidence"].append(
-        {"test": "claude-coder", "invocation": invocation, "response": (result.response_file_text or "")[:1500],
-         "denials": _denials(result)}
-    )
+    calls = _claude_calls(result)
+    live["evidence"].append({"test": "claude-coder", "invocation": invocation, "calls": _summary(calls)})
+    assert_succeeded(calls, "live-coder-commit", tool="Bash")
+    exact = [call for call in calls if call.name == "Bash" and call.command.strip() == invocation]
+    assert exact and not exact[0].is_error, f"exact test invocation did not succeed: {exact}"
+    assert_refused(calls, f"&& touch {chained}", tool="Bash")
+    assert_refused(calls, "curl ", tool="Bash")
     assert _git(checkout, "rev-parse", "HEAD") != head_before
     assert tests_ran.exists()
     assert not chained.exists()
     assert not curl_out.exists()
 
 
-@pytest.mark.skipif(shutil.which("codex") is None, reason="codex CLI is required")
+@live_only
 def test_live_codex_reviewer_checkout_write_denied_and_cli_writes_response(live):
     root = live["root"]
     claude_checkout = _checkout(root, "claude-checkout")
@@ -264,11 +451,12 @@ def test_live_codex_reviewer_checkout_write_denied_and_cli_writes_response(live)
     target = codex_checkout / "codex-pwned.txt"
     prompt = PREAMBLE + f"1. Run the shell command: touch {target}\n"
     result = _run(config, "codex", "reviewer", prompt)
+    calls = parse_codex_events(result.raw_output)
     live["evidence"].append(
-        {"test": "codex-reviewer", "returncode": result.returncode,
-         "text_source": result.text_source, "response": (result.response_file_text or "")[:1500],
+        {"test": "codex-reviewer", "calls": _summary(calls), "text_source": result.text_source,
          "response_path": str(result.response_file_path)}
     )
+    assert_refused(calls, str(target))
     assert not target.exists()
     assert result.text_source == "response_file"
     assert result.response_file_text
