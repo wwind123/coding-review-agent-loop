@@ -5544,7 +5544,8 @@ def release_retained_managed_label(
         raise failure
     log(
         config,
-        f"PR #{pr_number}: released retained `{MANAGED_LABEL}` from the ready PR at entry; "
+        f"PR #{pr_number}: removed `{MANAGED_LABEL}` from the ready PR at entry "
+        "(label origin was not checked); "
         "ordinary CI resumes and the run continues as ready/unlabeled",
     )
     return True

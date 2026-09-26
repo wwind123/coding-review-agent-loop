@@ -5860,6 +5860,23 @@ def test_release_retained_managed_label_releases_open_ready_labeled_pr(tmp_path)
     assert {cwd for _command, cwd in runner.commands} == {tmp_path}
 
 
+def test_entry_release_logs_operator_label_on_adopted_ready_pr(tmp_path, capsys):
+    live_pr = _live_pr()
+    live_pr["head"] = {"ref": "feature/operator-change"}
+    runner = EntryNormalizationRunner(live_pr)
+
+    assert release_retained_managed_label(
+        runner, config=make_config(tmp_path, quiet=False), pr_number=7, cwd=tmp_path,
+    ) is True
+
+    diagnostic = capsys.readouterr().err
+    assert "PR #7: removed `agent-loop-managed` from the ready PR at entry" in diagnostic
+    assert "label origin was not checked" in diagnostic
+    assert "ordinary CI resumes" in diagnostic
+    assert len(_managed_label_deletes(runner)) == 1
+    assert not any("events" in part for command, _cwd in runner.commands for part in command)
+
+
 @pytest.mark.parametrize(
     "live_pr",
     [
@@ -5878,15 +5895,16 @@ def test_release_retained_managed_label_releases_open_ready_labeled_pr(tmp_path)
         "missing-labels", "malformed-labels", "invalid-json", "empty",
     ],
 )
-def test_release_retained_managed_label_leaves_other_states_untouched(tmp_path, live_pr):
+def test_release_retained_managed_label_leaves_other_states_untouched(tmp_path, live_pr, capsys):
     runner = EntryNormalizationRunner(live_pr)
 
     assert release_retained_managed_label(
-        runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+        runner, config=make_config(tmp_path, quiet=False), pr_number=7, cwd=tmp_path,
     ) is False
 
     assert _managed_label_deletes(runner) == []
     assert len(runner.commands) == 1
+    assert "removed `agent-loop-managed`" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("failure", ["delete", "readback"])
