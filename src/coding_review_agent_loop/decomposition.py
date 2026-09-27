@@ -292,6 +292,9 @@ class ExecutionDecision:
     final_integration_status: str = "none"
     architecture_identity: dict | None = None
     architecture_impact: dict | None = None
+    # Plan hashes of unrealized decisions this one supersedes (#1087).  Audit
+    # state only, never identity: the superseded records stay on the thread.
+    retires_plan_hashes: tuple[str, ...] = ()
 
     def identity(self) -> dict[str, object]:
         return {
@@ -316,6 +319,9 @@ class ExecutionDecision:
             "architecture_identity": self.architecture_identity,
             "architecture_impact": sanitize_architecture_impact(self.architecture_impact),
         }
+        if self.retires_plan_hashes:
+            # Omitted when empty so earlier records stay byte-identical.
+            payload["retires_plan_hashes"] = list(self.retires_plan_hashes)
         return payload
 
 
@@ -2232,9 +2238,20 @@ def _decode_execution_decision(encoded: str) -> ExecutionDecision:
             final_integration_status=str(payload.get("final_integration_status", "none")),
             architecture_identity=architecture_identity,
             architecture_impact=architecture_impact,
+            retires_plan_hashes=_decode_retires_plan_hashes(
+                payload.get("retires_plan_hashes", [])
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise AgentLoopError("Invalid AGENT_PLAN_EXECUTION_DECISION payload.") from exc
+
+
+def _decode_retires_plan_hashes(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise ValueError("retires_plan_hashes must be a list of plan hashes")
+    return tuple(value)
 
 
 def format_execution_decision(decision: ExecutionDecision) -> str:
@@ -2247,6 +2264,15 @@ def format_execution_decision(decision: ExecutionDecision) -> str:
             f"Canonical strategy: {decision.strategy}",
             f"Execution action: {decision.current_action}",
             f"Recommendation digest: {decision.recommendation_digest}",
+            *(
+                (
+                    "Supersedes unrealized decision(s) under plan hash "
+                    + ", ".join(decision.retires_plan_hashes)
+                    + ".",
+                )
+                if decision.retires_plan_hashes
+                else ()
+            ),
             "",
             f"<!-- AGENT_PLAN_EXECUTION_DECISION: {encoded} -->",
             "-- coding-review-agent-loop",
@@ -2273,6 +2299,11 @@ def find_existing_execution_decision(
     child-plan supersession chain replaced (#988).  A decision bound to one
     of them is history, not a competing topology, and is skipped.  Any other
     decision under a different hash still fails closed.
+
+    A decision that superseded unrealized ones (#1087) names their hashes;
+    the records it replaced are history too, so a resume after that decision
+    was acted on does not resurrect them.  Supersession is per record, not per
+    hash (see ``live_execution_decisions``).
     """
     found: ExecutionDecision | None = None
     retired = frozenset(retired_plan_hashes)
@@ -2285,36 +2316,72 @@ def find_existing_execution_decision(
         "topology_source": EXECUTION_TOPOLOGY_SOURCE,
         "recommendation_digest": recommendation_digest,
     }
+    for decision in live_execution_decisions(comments, parent_issue=parent_issue):
+        if decision.plan_hash != plan_hash:
+            if decision.plan_hash in retired:
+                continue
+            # A decision is durable approval-bound state, not a cache keyed
+            # only by the currently visible plan.  If approval changed
+            # after a crash, publishing a second decision would allow the
+            # same parent to acquire two competing execution topologies.
+            raise AgentLoopError(
+                "Conflicting execution decision exists for this parent under a different "
+                f"approved plan hash ({decision.plan_hash} vs {plan_hash}); repair or "
+                "resume the recorded plan before publishing a new execution decision. "
+                "A plan-first re-approval retires the recorded decision automatically "
+                "only while nothing has acted on it (no PR, branch, handoff, or child issue)."
+            )
+        if decision.identity() != expected_identity:
+            raise AgentLoopError(
+                "Conflicting execution decision identity exists for the approved plan; "
+                "refusing to publish or adopt a different topology."
+            )
+        # Requested policy and current action are diagnostics only.
+        # Explicit staged actions may resume the same canonical
+        # decision, so do not fork identity on those fields.
+        found = decision
+    return found
+
+
+def live_execution_decisions(
+    comments: Sequence[object], *, parent_issue: int
+) -> tuple[ExecutionDecision, ...]:
+    """Decisions for ``parent_issue`` that no later decision superseded (#1087).
+
+    A superseding decision retires only the records *before* it that carry a
+    hash it names.  A plan re-approved back to a retired hash therefore gets
+    a new, live record: A, then B retiring A, then A retiring B leaves only
+    the last A live, so work acting on it still blocks a later plan C.
+    """
+    decisions = execution_decisions_for_parent(comments, parent_issue=parent_issue)
+    return tuple(
+        decision
+        for index, decision in enumerate(decisions)
+        if not any(
+            decision.plan_hash in later.retires_plan_hashes
+            for later in decisions[index + 1:]
+        )
+    )
+
+
+def execution_decisions_for_parent(
+    comments: Sequence[object], *, parent_issue: int
+) -> tuple[ExecutionDecision, ...]:
+    """Every execution decision recorded for ``parent_issue``, in thread order.
+
+    An undecodable record raises, so a caller deciding whether a decision may
+    be retired fails closed instead of overlooking it.
+    """
+    found: list[ExecutionDecision] = []
     for comment in comments:
         body = getattr(comment, "body", None)
         if not isinstance(body, str):
             continue
         for match in EXECUTION_DECISION_MARKER_RE.finditer(body):
             decision = _decode_execution_decision(match.group("payload"))
-            if decision.parent_issue != parent_issue:
-                continue
-            if decision.plan_hash != plan_hash:
-                if decision.plan_hash in retired:
-                    continue
-                # A decision is durable approval-bound state, not a cache keyed
-                # only by the currently visible plan.  If approval changed
-                # after a crash, publishing a second decision would allow the
-                # same parent to acquire two competing execution topologies.
-                raise AgentLoopError(
-                    "Conflicting execution decision exists for this parent under a different "
-                    f"approved plan hash ({decision.plan_hash} vs {plan_hash}); repair or "
-                    "resume the recorded plan before publishing a new execution decision."
-                )
-            if decision.identity() != expected_identity:
-                raise AgentLoopError(
-                    "Conflicting execution decision identity exists for the approved plan; "
-                    "refusing to publish or adopt a different topology."
-                )
-            # Requested policy and current action are diagnostics only.
-            # Explicit staged actions may resume the same canonical
-            # decision, so do not fork identity on those fields.
-            found = decision
-    return found
+            if decision.parent_issue == parent_issue:
+                found.append(decision)
+    return tuple(found)
 
 
 def issue_has_execution_decision(comments: Sequence[object], *, issue_number: int) -> bool:

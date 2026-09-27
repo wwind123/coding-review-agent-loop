@@ -31,7 +31,22 @@ resolved only after approval: `one-shot` selects `implement-one-shot`, while
 actionable request for a reviewed revision, and incompatible explicit pairs
 fail closed before approval-bound writes. A compact execution decision records the approved
 plan identity and full recommendation digest, while the complete recommendation
-and any bounded transport sidecars remain the recovery source. Fresh topology
+and any bounded transport sidecars remain the recovery source. A decision is
+bound to its approved plan hash, so a second decision under a different hash
+normally fails closed. The exception is an *unrealized* decision (#1087): when
+a plan-first run re-approves the plan under a new hash (for example after the
+implementation turn died before opening a PR and `main` moved) and nothing has
+acted on the old decision — no issue-to-PR, one-shot, or phase handoff, no
+decomposition, checkpoint, or split record, no child issue titled for the
+parent, no PR in any state (open or closed) closing the parent or on
+`agent-loop/managed-<issue>`, and no such branch — the new decision is published with the superseded hash named
+in its `retires_plan_hashes` field. The old record stays on the thread for
+audit, and later runs treat it as history. Supersession is per record: a
+decision retires only the earlier records under the hashes it names, so a
+plan re-approved back to a retired hash gets a new live record, and replacing
+that record later requires the same no-evidence check.
+If any of that evidence exists, or an inventory cannot be read or may be
+truncated, the run still refuses and names the evidence. Fresh topology
 summaries, child identities, and handoffs are keyed by strategy `staged`, source
 `approved-plan-v1`, contract version, digest, ordinal, and stable stage ID;
 legacy records keep their exact historical mode/source lookup and serializer.

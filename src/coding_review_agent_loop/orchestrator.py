@@ -12,6 +12,7 @@ import re
 import shlex
 import sys
 import time
+import urllib.parse
 import zoneinfo
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -89,6 +90,7 @@ from .decomposition import (
     ExecutionDecision,
     EXECUTION_TOPOLOGY_SOURCE,
     find_existing_execution_decision,
+    live_execution_decisions,
     reject_legacy_topology_collision,
     post_execution_decision,
     find_existing_topology_checkpoint,
@@ -107,7 +109,7 @@ from .decomposition import (
     retained_parent_scope_matches,
 )
 from .protocol import EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING
-from .child_topology import NeedsHumanDecision, NestedTopologyDecision
+from .child_topology import NeedsHumanDecision, NestedTopologyDecision, parent_child_search_queries
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
@@ -146,6 +148,7 @@ from .github import (
     get_issue_context,
     get_pr_mergeability,
     parse_linked_issue_numbers,
+    parse_strong_issue_reference_evidence,
     get_pr_checks,
     get_pr_review_context,
     get_pr_state,
@@ -8234,6 +8237,7 @@ def _persist_execution_decision_if_needed(
     requested_policy: str,
     resolved_execution: ResolvedExecution | None = None,
     retired_plan_hashes: frozenset[str] = frozenset(),
+    retires_plan_hashes: tuple[str, ...] = (),
 ) -> None:
     if resolved_execution is not None:
         recommendation = resolved_execution.recommendation
@@ -8264,6 +8268,7 @@ def _persist_execution_decision_if_needed(
             config.architecture_context.identity()
             if hasattr(config.architecture_context, "identity") else None
         ),
+        retires_plan_hashes=retires_plan_hashes,
     )
     existing = find_existing_execution_decision(
         issue_comments,
@@ -8272,10 +8277,190 @@ def _persist_execution_decision_if_needed(
         plan_subject=plan_subject,
         strategy=recommendation.strategy,
         recommendation_digest=str(identity["recommendation_sha256"]),
-        retired_plan_hashes=retired_plan_hashes,
+        retired_plan_hashes=retired_plan_hashes | frozenset(retires_plan_hashes),
     )
-    if existing is None:
+    # A supersession must be recorded even over an equal existing decision
+    # (a plan re-approved back to an earlier hash), or the retirement would
+    # have to be re-derived on every later run.
+    if existing is None or retires_plan_hashes:
         post_execution_decision(runner, config=config, decision=decision)
+
+
+_REALIZATION_LISTING_LIMIT = 100000
+
+
+def _strict_gh_listing(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    args: Sequence[str],
+) -> list[dict] | None:
+    """A complete ``gh ... list --json`` result, or ``None`` when unreadable.
+
+    A failed command, output that is not a JSON list of objects, or a result
+    that fills the limit (possibly truncated) is ``None``.
+    """
+    result = runner.run(
+        [config.gh_cmd, *args], cwd=active_workdir(config), check=False
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        items = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        return None
+    if len(items) >= _REALIZATION_LISTING_LIMIT:
+        return None
+    return items
+
+
+def _execution_decision_realization_evidence(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    comments: Sequence[object],
+) -> list[str]:
+    """What, if anything, has acted on an execution decision for this parent (#1087).
+
+    A decision only forks a topology once something depends on it: a PR
+    handoff, an implementation or phase handoff, a decomposition record, a
+    child issue, a PR in any state closing the parent or on the reserved
+    managed branch, or that branch.  Unreadable, incomplete, or unavailable
+    state counts as evidence, so the caller fails closed.
+    """
+    evidence: list[str] = []
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(body):
+            try:
+                handoff = decode_issue_pr_handoff_record(match.group("payload"))
+            except AgentLoopError:
+                evidence.append("an unreadable issue-to-PR handoff record")
+                continue
+            if handoff.issue_number == issue_number:
+                evidence.append(f"an issue-to-PR handoff to PR #{handoff.pr_number}")
+        for marker in SPLIT_CHILD_MARKER_RE.finditer(body):
+            if int(marker.group("parent")) == issue_number:
+                evidence.append("a split child record")
+    if find_decompositions_for_parent(comments, parent_issue=issue_number):
+        evidence.append("a decomposition summary")
+    if find_topology_checkpoints_for_parent(comments, parent_issue=issue_number):
+        evidence.append("a topology checkpoint")
+    if find_phase_implementation_handoffs_for_parent(comments, parent_issue=issue_number):
+        evidence.append("a phase implementation handoff")
+    if find_one_shot_impl_handoffs(
+        comments, parent_issue=issue_number, mode="implement-one-shot"
+    ):
+        evidence.append("a one-shot implementation handoff")
+    materialization = find_existing_split_materialization(comments, parent_issue=issue_number)
+    if materialization is not None and materialization.children:
+        evidence.append("a split materialization")
+    if config.dry_run:
+        # Remote inventory is not read in a dry run, which publishes nothing.
+        return list(dict.fromkeys(evidence))
+    # Both inventories are read strictly: an unreadable or possibly truncated
+    # listing is evidence, never proof of absence (`search_issues` maps bad
+    # output to an empty result, which is right for adoption, not here).
+    for query in parent_child_search_queries(issue_number):
+        children = _strict_gh_listing(
+            runner,
+            config=config,
+            args=[
+                "issue", "list", "--repo", config.repo, "--search", query,
+                "--state", "all", "--limit", str(_REALIZATION_LISTING_LIMIT),
+                "--json", "number,title",
+            ],
+        )
+        if children is None:
+            evidence.append(f"child issues that could not be listed ({query})")
+            continue
+        for candidate in children:
+            evidence.append(f"child issue #{candidate.get('number')}")
+    managed_branch = f"agent-loop/managed-{issue_number}"
+    # Closed PRs count too: a PR opened before its handoff record was posted,
+    # then closed with its branch deleted, still acted on the decision.
+    pr_items = _strict_gh_listing(
+        runner,
+        config=config,
+        args=[
+            "pr", "list", "--repo", config.repo, "--state", "all",
+            "--json", "number,body,headRefName", "--limit", str(_REALIZATION_LISTING_LIMIT),
+        ],
+    )
+    if pr_items is None:
+        evidence.append("pull requests that could not be listed")
+        pr_items = []
+    for item in pr_items:
+        if item.get("headRefName") == managed_branch or parse_strong_issue_reference_evidence(
+            str(item.get("body") or ""), repo=config.repo, issue_number=issue_number
+        ):
+            evidence.append(f"PR #{item.get('number')}")
+    # The branch name contains `/`, which the branches endpoint only accepts
+    # encoded; an unencoded path 404s even when the branch exists.
+    branch = runner.run(
+        [
+            config.gh_cmd,
+            "api",
+            f"repos/{config.repo}/branches/{urllib.parse.quote(managed_branch, safe='')}",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    branch_error = branch.stderr or ""
+    if branch.returncode == 0:
+        evidence.append(f"branch `{managed_branch}`")
+    elif "404" not in branch_error and "Not Found" not in branch_error:
+        evidence.append(f"branch `{managed_branch}`, whose existence could not be checked")
+    return list(dict.fromkeys(evidence))
+
+
+def _retirable_execution_decision_hashes(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    comments: Sequence[object],
+    plan_hash: str,
+) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Resolve the decisions a plan-first re-approval supersedes (#1087).
+
+    Returns ``(retired, newly_retired)``: the hashes the preflight may skip
+    and the ones the next published decision records.  Only *live* records
+    count (``live_execution_decisions``): supersession is per record, so a
+    plan re-approved back to a retired hash yields a live record that still
+    needs the realization check before a later plan replaces it.
+
+    A decision under another hash that something has already acted on still
+    fails closed: replacing it would fork the parent's topology.
+    """
+    stale = tuple(dict.fromkeys(
+        decision.plan_hash
+        for decision in live_execution_decisions(comments, parent_issue=issue_number)
+        if decision.plan_hash != plan_hash
+    ))
+    if not stale:
+        return frozenset(), ()
+    evidence = _execution_decision_realization_evidence(
+        runner, config=config, issue_number=issue_number, comments=comments
+    )
+    if evidence:
+        raise AgentLoopError(
+            "Conflicting execution decision exists for this parent under a different "
+            f"approved plan hash ({', '.join(stale)} vs {plan_hash}) and has already been "
+            f"acted on ({'; '.join(evidence)}). Resume or close that work before "
+            "publishing a decision for the re-approved plan."
+        )
+    log(
+        config,
+        f"Issue #{issue_number}: superseding unrealized execution decision(s) under plan "
+        f"hash {', '.join(stale)}; nothing has acted on them.",
+    )
+    return frozenset(stale), stale
 
 
 def _preflight_fresh_staged_topology(
@@ -14389,6 +14574,21 @@ def _run_plan_first_loop(
                 log(config, str(nested))
                 print(json.dumps(nested.as_dict(), sort_keys=True))
                 return 2
+            # A re-approval under a new hash supersedes a decision nothing has
+            # acted on yet (#1087); a realized one still fails closed here.
+            retired_decision_hashes: frozenset[str] = frozenset()
+            retiring_decision_hashes: tuple[str, ...] = ()
+            if recommendation is not None and mode != "plan-only":
+                (
+                    retired_decision_hashes,
+                    retiring_decision_hashes,
+                ) = _retirable_execution_decision_hashes(
+                    runner,
+                    config=config,
+                    issue_number=issue_number,
+                    comments=issue_context.comments,
+                    plan_hash=plan_hash,
+                )
             normalized_topology = None
             if recommendation is not None and canonical_strategy == "staged":
                 normalized_topology = normalize_execution_recommendation(
@@ -14409,6 +14609,7 @@ def _run_plan_first_loop(
                     issue_context=issue_context,
                     mode=mode,
                     normalized_topology=normalized_topology,
+                    retired_plan_hashes=retired_decision_hashes,
                 )
                 if isinstance(staged_preflight, NeedsHumanDecision):
                     print(json.dumps(staged_preflight.as_dict(), sort_keys=True))
@@ -14421,6 +14622,7 @@ def _run_plan_first_loop(
                     config=config,
                     issue_context=issue_context,
                     recommendation=recommendation,
+                    retired_plan_hashes=retired_decision_hashes,
                 )
             plan_additions = _extract_current_expected_closing_issue_ids(current_plan)
             split_topology = bool(
@@ -14465,6 +14667,8 @@ def _run_plan_first_loop(
                 recommendation=recommendation,
                 requested_policy=resolved_execution.requested_policy,
                 resolved_execution=resolved_execution,
+                retired_plan_hashes=retired_decision_hashes,
+                retires_plan_hashes=retiring_decision_hashes,
             )
             _publish_plan_approved_followups(
                 runner,

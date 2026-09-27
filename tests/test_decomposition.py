@@ -436,6 +436,92 @@ def test_execution_decision_recovery_rejects_a_changed_parent_plan():
         )
 
 
+def test_execution_decision_honors_a_recorded_supersession():
+    """#1087: a decision naming the unrealized one it retired keeps it retired."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    old = ExecutionDecision(
+        parent_issue=56,
+        plan_hash="old-plan-hash",
+        plan_subject="old-subject",
+        execution_strategy_contract_version=1,
+        strategy="one-shot",
+        topology_source="approved-plan-v1",
+        recommendation_digest="old-digest",
+        requested_policy="implement-one-shot",
+        current_action="implement-one-shot",
+    )
+    # An empty field is omitted, so records predating it stay byte-identical.
+    assert "retires_plan_hashes" not in old.to_payload()
+    new = replace(
+        old,
+        plan_hash="new-plan-hash",
+        plan_subject="new-subject",
+        recommendation_digest="new-digest",
+        retires_plan_hashes=("old-plan-hash",),
+    )
+    assert new.identity() == replace(new, retires_plan_hashes=()).identity()
+    body = format_execution_decision(new)
+    assert "Supersedes unrealized decision(s) under plan hash old-plan-hash." in body
+    comments = (
+        SimpleNamespace(body=format_execution_decision(old)),
+        SimpleNamespace(body=body),
+    )
+    kwargs = dict(
+        parent_issue=56, plan_subject="new-subject", strategy="one-shot",
+        recommendation_digest="new-digest",
+    )
+
+    assert find_existing_execution_decision(
+        comments, plan_hash="new-plan-hash", **kwargs
+    ) == new
+    # The superseding decision itself is not retired: a later plan still conflicts.
+    with pytest.raises(AgentLoopError, match=r"\(new-plan-hash vs later-plan-hash\)"):
+        find_existing_execution_decision(comments, plan_hash="later-plan-hash", **kwargs)
+
+
+def test_execution_decision_supersession_is_per_record_not_per_hash():
+    """#1087: A, B retiring A, then A retiring B leaves the last A live."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop.decomposition import live_execution_decisions
+
+    first_a = ExecutionDecision(
+        parent_issue=56,
+        plan_hash="plan-a",
+        plan_subject="subject-a",
+        execution_strategy_contract_version=1,
+        strategy="one-shot",
+        topology_source="approved-plan-v1",
+        recommendation_digest="digest-a",
+        requested_policy="implement-one-shot",
+        current_action="implement-one-shot",
+    )
+    b = replace(
+        first_a, plan_hash="plan-b", plan_subject="subject-b",
+        recommendation_digest="digest-b", retires_plan_hashes=("plan-a",),
+    )
+    second_a = replace(first_a, retires_plan_hashes=("plan-b",))
+    comments = tuple(
+        SimpleNamespace(body=format_execution_decision(item))
+        for item in (first_a, b, second_a)
+    )
+
+    assert live_execution_decisions(comments, parent_issue=56) == (second_a,)
+    assert find_existing_execution_decision(
+        comments, parent_issue=56, plan_hash="plan-a", plan_subject="subject-a",
+        strategy="one-shot", recommendation_digest="digest-a",
+    ) == second_a
+    # The re-approved A is live, so a later plan C conflicts with it.
+    with pytest.raises(AgentLoopError, match=r"\(plan-a vs plan-c\)"):
+        find_existing_execution_decision(
+            comments, parent_issue=56, plan_hash="plan-c", plan_subject="subject-c",
+            strategy="one-shot", recommendation_digest="digest-c",
+        )
+
+
 def _parent_recovery_record(kind: str) -> str:
     old_plan_hash = "old-plan-hash"
     phase = _phase("Recorded stage")
