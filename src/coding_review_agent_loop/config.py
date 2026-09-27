@@ -8,7 +8,6 @@ import os
 import shlex
 import shutil
 import sys
-import tempfile
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -20,6 +19,7 @@ from .expected_closure import normalize_issue_ids
 from .github import PullRequestMetadata, detect_repo, get_repo_default_branch
 from .logging import datetime_stamp, log
 from .runner import Runner
+from .scratch import make_private_dirs, scratch_root
 from .test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from .workdirs import active_workdir, agent_workdir
 from .plan_review_scheduling import PLAN_REVIEW_POLICIES
@@ -906,7 +906,7 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
 
 def default_agent_workdir(repo: str, agent: AgentName) -> Path:
     repo_slug = repo_cache_slug(repo)
-    return Path(tempfile.gettempdir()) / "coding-review-agent-loop" / repo_slug / agent / "repo"
+    return scratch_root() / repo_slug / agent / "repo"
 
 
 def repo_cache_slug(repo: str) -> str:
@@ -1100,7 +1100,7 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
 
     if not path.exists():
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            make_private_dirs(path.parent)
         except OSError as exc:
             raise AgentLoopError(f"Could not create parent directory for {agent} checkout at {path}: {exc}") from exc
         runner.run((config.gh_cmd, "repo", "clone", config.repo, str(path)), cwd=path.parent)

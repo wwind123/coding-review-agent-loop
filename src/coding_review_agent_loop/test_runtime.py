@@ -30,6 +30,7 @@ from statistics import median
 from typing import Iterable, Mapping, Sequence
 
 from .errors import AgentLoopError
+from .scratch import make_private_dirs, scratch_root
 
 DEFAULT_TEST_TIMEOUT_SECONDS = 1800
 RUNTIME_SCHEMA_VERSION = 1
@@ -153,9 +154,9 @@ class CommandLaneLock:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         root = Path(values.get("XDG_RUNTIME_DIR", "")) / "agent-loop" / COMMAND_LANE_LOCK_DIR
         if str(root) == f"agent-loop/{COMMAND_LANE_LOCK_DIR}":
-            root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / COMMAND_LANE_LOCK_DIR
+            root = scratch_root() / COMMAND_LANE_LOCK_DIR
         try:
-            root.mkdir(parents=True, exist_ok=True)
+            make_private_dirs(root)
             path = root / f"{digest}.lock"
             handle = path.open("a+")
             if os.name == "nt":

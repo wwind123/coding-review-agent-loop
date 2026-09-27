@@ -43,6 +43,7 @@ from ..errors import AgentLoopError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
 from ..runner import CommandResult, Runner, strip_ansi
+from ..scratch import make_private_dirs, scratch_root
 from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
 if TYPE_CHECKING:
@@ -327,8 +328,7 @@ class AntigravityBackend:
         self, runner: Runner, config: AgentLoopConfig, *, timeout_seconds: float
     ) -> tuple[set[str] | None, str]:
         """Query agy's model catalog once, preserving the PTY requirement."""
-        repair_root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
-        repair_root.mkdir(parents=True, exist_ok=True)
+        repair_root = make_private_dirs(scratch_root() / "repair")
         log_path = agent_log_path(config, "antigravity-repair-models")
         with tempfile.TemporaryDirectory(prefix="agy-catalog-", dir=repair_root) as temp_dir:
             try:
@@ -604,8 +604,7 @@ class AntigravityBackend:
         log_path: Path | None = None,
     ) -> AgentResult:
         """Run one isolated, no-tools Antigravity format-repair attempt."""
-        repair_root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
-        repair_root.mkdir(parents=True, exist_ok=True)
+        repair_root = make_private_dirs(scratch_root() / "repair")
         with tempfile.TemporaryDirectory(prefix="agy-", dir=repair_root) as temp_dir:
             workdir = Path(temp_dir)
             repair_config = replace(

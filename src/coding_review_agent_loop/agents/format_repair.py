@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from ..config import DEFAULT_REASONING_EFFORT
+from ..scratch import make_private_dirs, scratch_root
 from .base import AgentName, AgentResult
 from .claude import _parse_claude_output
 from .codex import _extract_codex_usage
@@ -28,8 +29,7 @@ def run_cli_repair(
     if backend not in {"codex", "claude"}:
         raise ValueError(f"Unsupported format repair backend: {backend}")
     effort = config.repair_reasoning_effort or DEFAULT_REASONING_EFFORT
-    root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
-    root.mkdir(parents=True, exist_ok=True)
+    root = make_private_dirs(scratch_root() / "repair")
     with tempfile.TemporaryDirectory(prefix=f"{backend}-", dir=root) as directory:
         cwd = Path(directory)
         message_path = cwd / "last-message.txt"

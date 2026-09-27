@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from .errors import AgentLoopError
+from .scratch import make_private_dirs, scratch_root
 
 
 CONTAINMENT_MODES = frozenset({"auto", "required", "off"})
@@ -649,8 +650,7 @@ def preflight_containment(policy: ContainmentPolicy, *, cgroup_root: Path = Path
     if not user_manager:
         return _fallback_manifest(policy, "systemctl is not installed; the user manager cannot be probed")
     if probe:
-        cache = policy.cache_dir or Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "containment"
-        cache.mkdir(parents=True, exist_ok=True)
+        cache = make_private_dirs(policy.cache_dir or scratch_root() / "containment")
         report = cache / f"preflight-{uuid.uuid4().hex}.json"
         unit = f"agent-loop-preflight-{uuid.uuid4().hex[:12]}.scope"
         process = None
