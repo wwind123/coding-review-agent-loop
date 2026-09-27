@@ -13660,15 +13660,24 @@ _M1087_BRANCH_ENDPOINT = "repos/OWNER/REPO/branches/agent-loop/managed-56"
 class _M1087Runner(FakeRunner):
     """Serves the reserved managed branch as absent unless told otherwise."""
 
-    def __init__(self, *, branch_exists=False, **kwargs):
+    def __init__(self, *, branch_exists=False, unreadable_child_search=False, **kwargs):
         super().__init__(**kwargs)
         self.branch_exists = branch_exists
+        self.unreadable_child_search = unreadable_child_search
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         cmd = [str(arg) for arg in args]
         if cmd[:3] == ["gh", "api", _M1087_BRANCH_ENDPOINT] and not self.branch_exists:
             cmd, cwd_path = self._record_command(cmd, cwd)
             return CommandResult(cmd, cwd_path, "", "gh: Not Found (HTTP 404)", 1)
+        if (
+            self.unreadable_child_search
+            and cmd[:3] == ["gh", "issue", "list"]
+            and cmd[cmd.index("--json") + 1] == "number,title"
+        ):
+            # The realization inventory's own search; adoption searches differ.
+            cmd, cwd_path = self._record_command(cmd, cwd)
+            return CommandResult(cmd, cwd_path, "not json", "", 0)
         return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
 
 
@@ -13776,9 +13785,45 @@ def test_1087_decision_with_an_open_managed_pr_still_refuses(tmp_path):
     message = str(excinfo.value)
     assert "Conflicting execution decision exists" in message
     assert _M1087_STALE_HASH in message
-    assert "open PR #81" in message
+    assert "PR #81" in message
     assert _m1087_posted_decisions(runner) == []
     # Only the planning turn ran; no implementation was dispatched.
+    assert not _m1087_implementation_dispatched(runner)
+
+
+def test_1087_decision_with_a_closed_pr_still_refuses(tmp_path):
+    # A PR opened before its handoff record was posted, then closed with its
+    # branch deleted, still acted on the decision.
+    runner = _m1087_runner(
+        open_prs_payload=[
+            {
+                "number": 82,
+                "state": "CLOSED",
+                "body": "Abandoned attempt.",
+                "headRefName": "agent-loop/managed-56",
+            }
+        ]
+    )
+
+    with pytest.raises(AgentLoopError, match="PR #82"):
+        run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True)
+
+    inventory = [
+        cmd for cmd, _cwd in runner.commands
+        if cmd[:3] == ["gh", "pr", "list"] and "headRefName" in cmd[cmd.index("--json") + 1]
+    ]
+    assert inventory and inventory[-1][inventory[-1].index("--state") + 1] == "all"
+    assert _m1087_posted_decisions(runner) == []
+    assert not _m1087_implementation_dispatched(runner)
+
+
+def test_1087_unreadable_child_issue_search_still_refuses(tmp_path):
+    runner = _m1087_runner(unreadable_child_search=True)
+
+    with pytest.raises(AgentLoopError, match="child issues that could not be listed"):
+        run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True)
+
+    assert _m1087_posted_decisions(runner) == []
     assert not _m1087_implementation_dispatched(runner)
 
 

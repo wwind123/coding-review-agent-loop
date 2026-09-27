@@ -38,12 +38,12 @@ a plan-first run re-approves the plan under a new hash (for example after the
 implementation turn died before opening a PR and `main` moved) and nothing has
 acted on the old decision — no issue-to-PR, one-shot, or phase handoff, no
 decomposition, checkpoint, or split record, no child issue titled for the
-parent, no open PR closing the parent or on `agent-loop/managed-<issue>`, and
-no such branch — the new decision is published with the superseded hash named
+parent, no PR in any state (open or closed) closing the parent or on
+`agent-loop/managed-<issue>`, and no such branch — the new decision is published with the superseded hash named
 in its `retires_plan_hashes` field. The old record stays on the thread for
 audit, and later runs treat any hash a recorded decision retired as history.
-If any of that evidence exists, or cannot be read, the run still refuses and
-names the evidence. Fresh topology
+If any of that evidence exists, or an inventory cannot be read or may be
+truncated, the run still refuses and names the evidence. Fresh topology
 summaries, child identities, and handoffs are keyed by strategy `staged`, source
 `approved-plan-v1`, contract version, digest, ordinal, and stable stage ID;
 legacy records keep their exact historical mode/source lookup and serializer.

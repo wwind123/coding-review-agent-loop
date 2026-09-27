@@ -8285,6 +8285,36 @@ def _persist_execution_decision_if_needed(
         post_execution_decision(runner, config=config, decision=decision)
 
 
+_REALIZATION_LISTING_LIMIT = 100000
+
+
+def _strict_gh_listing(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    args: Sequence[str],
+) -> list[dict] | None:
+    """A complete ``gh ... list --json`` result, or ``None`` when unreadable.
+
+    A failed command, output that is not a JSON list of objects, or a result
+    that fills the limit (possibly truncated) is ``None``.
+    """
+    result = runner.run(
+        [config.gh_cmd, *args], cwd=active_workdir(config), check=False
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        items = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        return None
+    if len(items) >= _REALIZATION_LISTING_LIMIT:
+        return None
+    return items
+
+
 def _execution_decision_realization_evidence(
     runner: Runner,
     *,
@@ -8296,9 +8326,9 @@ def _execution_decision_realization_evidence(
 
     A decision only forks a topology once something depends on it: a PR
     handoff, an implementation or phase handoff, a decomposition record, a
-    child issue, an open PR closing the parent, or the reserved managed
-    branch.  Unreadable or unavailable state counts as evidence, so the
-    caller fails closed.
+    child issue, a PR in any state closing the parent or on the reserved
+    managed branch, or that branch.  Unreadable, incomplete, or unavailable
+    state counts as evidence, so the caller fails closed.
     """
     evidence: list[str] = []
     for comment in comments:
@@ -8332,34 +8362,43 @@ def _execution_decision_realization_evidence(
     if config.dry_run:
         # Remote inventory is not read in a dry run, which publishes nothing.
         return list(dict.fromkeys(evidence))
+    # Both inventories are read strictly: an unreadable or possibly truncated
+    # listing is evidence, never proof of absence (`search_issues` maps bad
+    # output to an empty result, which is right for adoption, not here).
     for query in parent_child_search_queries(issue_number):
-        for candidate in search_issues(runner, config=config, search=query, state="all"):
-            evidence.append(f"child issue #{candidate.number}")
+        children = _strict_gh_listing(
+            runner,
+            config=config,
+            args=[
+                "issue", "list", "--repo", config.repo, "--search", query,
+                "--state", "all", "--limit", str(_REALIZATION_LISTING_LIMIT),
+                "--json", "number,title",
+            ],
+        )
+        if children is None:
+            evidence.append(f"child issues that could not be listed ({query})")
+            continue
+        for candidate in children:
+            evidence.append(f"child issue #{candidate.get('number')}")
     managed_branch = f"agent-loop/managed-{issue_number}"
-    prs = runner.run(
-        [
-            config.gh_cmd, "pr", "list", "--repo", config.repo, "--state", "open",
-            "--json", "number,body,headRefName", "--limit", "100000",
+    # Closed PRs count too: a PR opened before its handoff record was posted,
+    # then closed with its branch deleted, still acted on the decision.
+    pr_items = _strict_gh_listing(
+        runner,
+        config=config,
+        args=[
+            "pr", "list", "--repo", config.repo, "--state", "all",
+            "--json", "number,body,headRefName", "--limit", str(_REALIZATION_LISTING_LIMIT),
         ],
-        cwd=active_workdir(config),
-        check=False,
     )
-    pr_items: object = None
-    if prs.returncode == 0:
-        try:
-            pr_items = json.loads(prs.stdout or "[]")
-        except json.JSONDecodeError:
-            pr_items = None
-    if not isinstance(pr_items, list):
-        evidence.append("open pull requests that could not be listed")
+    if pr_items is None:
+        evidence.append("pull requests that could not be listed")
         pr_items = []
     for item in pr_items:
-        if not isinstance(item, dict):
-            continue
         if item.get("headRefName") == managed_branch or parse_strong_issue_reference_evidence(
             str(item.get("body") or ""), repo=config.repo, issue_number=issue_number
         ):
-            evidence.append(f"open PR #{item.get('number')}")
+            evidence.append(f"PR #{item.get('number')}")
     branch = runner.run(
         [config.gh_cmd, "api", f"repos/{config.repo}/branches/{managed_branch}"],
         cwd=active_workdir(config),
