@@ -1199,6 +1199,13 @@ def test_continuity_publication_rejects_different_head_fork(tmp_path):
         _round_comment(91, role="coder", subject="head-b", round_number=2),
     ])
     runner.rest_pr["head"]["sha"] = "head-b"
+    # head-a is still in head-b's history, so it is a live sibling rather
+    # than a discarded one (#1069 retires only the latter).
+    runner.compare_payload = {
+        "status": "ahead",
+        "base_commit": {"sha": "head-a"},
+        "merge_base_commit": {"sha": "head-a"},
+    }
     with pytest.raises(AgentLoopError, match="forked predecessor"):
         publish_issue_created_continuity_authorization(
             runner, config=config, handoff=initial, predecessor_head="abc123",
@@ -10825,7 +10832,7 @@ def test_m1065_supersession_is_scoped_to_earlier_same_scope_records():
         [(41, base), (42, foreign), (43, fresh), (44, later)]
     )
     assert ids == frozenset({41})
-    # Only a fresh grant may supersede.
+    # A creation checkpoint never supersedes.
     assert managed_ci._superseded_authorization_ids(
         [(41, base), (43, replace(fresh, kind="creation"))]
     ) == frozenset()
@@ -10905,3 +10912,248 @@ def test_m1065_fresh_authorization_supersedes_same_protection_unbound_records(tm
         runner, config=config, pr_number=7, issue_number=643,
         live_head="abc123", approved_plan_hash=_PLAN_1065,
     )
+
+
+# --- #1069: ordinary continuity supersedes this actor's unbound records ---
+
+
+def _continuity_1069_runner(extra_records):
+    root = _unreadable_record(
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="nonce-643",
+    )
+    comments = [
+        {"id": 41, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(root))},
+    ]
+    comments.extend(_stale_record_comments(extra_records, first_id=42))
+    comments.extend([
+        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="next-head", round_number=2),
+    ])
+    runner = AuthorizationCommentRunner(issue_events=[label_event()], intent_comments=comments)
+    runner.rest_pr["head"]["sha"] = "next-head"
+    return runner
+
+
+def _continue_1069(runner, config, handoff, *, predecessor, new_head, rounds):
+    return publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=handoff, predecessor_head=predecessor,
+        new_head=new_head, round_comment_ids=rounds,
+    )
+
+
+def _ancestors_1069(monkeypatch, ancestors):
+    monkeypatch.setattr(
+        managed_ci, "_github_proves_descendant",
+        lambda _runner, *, config, predecessor_head, live_head: predecessor_head in ancestors,
+    )
+
+
+def test_m1069_resume_across_head_advance_supersedes_stranded_record(tmp_path, monkeypatch):
+    # An interrupted earlier attempt left a compatible grant at a head that the
+    # live history no longer contains.
+    stray = _unreadable_record(
+        kind="fresh", head_sha="stray-head", nonce="stray",
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+    )
+    runner = _continuity_1069_runner([stray])
+    _ancestors_1069(monkeypatch, {"abc123", "next-head"})
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = replace(_authorization_handoff(), authorization_comment_id=41)
+
+    first = _continue_1069(
+        runner, config, handoff, predecessor="abc123", new_head="next-head", rounds=(88, 89),
+    )
+    first_record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert first_record is not None
+    assert first_record.kind == "continuity"
+    assert first_record.predecessor_comment_id == 41
+    assert first_record.superseded_comment_ids == (42,)
+    # Nothing is deleted: the stranded record stays as history.
+    assert 42 in [item["id"] for item in runner.intent_comments]
+
+    # A second resume after another head advance extends the live chain and
+    # has nothing left to retire; it does not append a competing record.
+    runner.intent_comments.extend([
+        _round_comment(200, role="reviewer", subject="next-head", round_number=2, state="blocking"),
+        _round_comment(201, role="coder", subject="third-head", round_number=3),
+    ])
+    runner.rest_pr["head"]["sha"] = "third-head"
+    second = _continue_1069(
+        runner, config, first, predecessor="next-head", new_head="third-head", rounds=(200, 201),
+    )
+    second_record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert second_record is not None
+    assert second_record.predecessor_comment_id == first.authorization_comment_id
+    assert second_record.superseded_comment_ids == ()
+
+    live = managed_ci._authorization_comment_records(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+    )
+    assert [comment_id for comment_id, _record in live] == [
+        41, first.authorization_comment_id, second.authorization_comment_id,
+    ]
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="third-head",
+    )
+    assert audit is not None
+    assert audit[0] == second.authorization_comment_id
+
+
+def test_m1069_continuity_supersedes_only_compatible_unbound_records(tmp_path, monkeypatch):
+    voluntary = dict(protection="voluntary", waiver="allow-unprotected-managed-ci")
+    extra = [
+        # 42: compatible, cannot chain to the new head -> retired.
+        _unreadable_record(kind="fresh", head_sha="stray-head", nonce="a", **voluntary),
+        # 43: recorded a different protection -> kept; recovery adjudicates it.
+        _unreadable_record(kind="fresh", head_sha="old-unreadable", nonce="b"),
+        # 44: foreign managed-label provenance -> not merely stranded; kept.
+        _unreadable_record(
+            kind="fresh", head_sha="foreign-label", nonce="c", label_event_id=999, **voluntary,
+        ),
+        # 45: a different approved plan -> kept.
+        _unreadable_record(
+            kind="fresh", head_sha="other-plan", nonce="d", approved_plan_hash="b" * 64,
+            **voluntary,
+        ),
+        # 46: compatible and its head is an ancestor of the new head -> kept.
+        _unreadable_record(kind="fresh", head_sha="ancestor-head", nonce="e", **voluntary),
+    ]
+    runner = _continuity_1069_runner(extra)
+    _ancestors_1069(monkeypatch, {"abc123", "ancestor-head"})
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = replace(_authorization_handoff(), authorization_comment_id=41)
+
+    _continue_1069(
+        runner, config, handoff, predecessor="abc123", new_head="next-head", rounds=(88, 89),
+    )
+
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.superseded_comment_ids == (42,)
+
+
+def _discarded_child_1069(head):
+    return _unreadable_record(
+        kind="continuity", head_sha=head, nonce="child",
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        predecessor_head="abc123", predecessor_comment_id=41, round_comment_ids=(88, 89),
+    )
+
+
+def test_m1069_discarded_continuity_child_is_retired_not_a_fork(tmp_path, monkeypatch):
+    # An interrupted attempt authorized abc123 -> discarded-head; the branch
+    # then returned to abc123 and the next coder turn produced next-head.
+    runner = _continuity_1069_runner([_discarded_child_1069("discarded-head")])
+    _ancestors_1069(monkeypatch, {"abc123"})
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    continued = _continue_1069(
+        runner, config, replace(_authorization_handoff(), authorization_comment_id=41),
+        predecessor="abc123", new_head="next-head", rounds=(88, 89),
+    )
+
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.predecessor_comment_id == 41
+    assert record.superseded_comment_ids == (42,)
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="next-head",
+    )
+    assert audit is not None
+    assert audit[0] == continued.authorization_comment_id
+
+
+def test_m1069_child_that_reaches_the_new_head_still_refuses_as_fork(tmp_path, monkeypatch):
+    runner = _continuity_1069_runner([_discarded_child_1069("middle-head")])
+    _ancestors_1069(monkeypatch, {"abc123", "middle-head"})
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="forked predecessor"):
+        _continue_1069(
+            runner, config, replace(_authorization_handoff(), authorization_comment_id=41),
+            predecessor="abc123", new_head="next-head", rounds=(88, 89),
+        )
+    assert len(runner.intent_comments) == posted
+
+
+def test_m1069_ordinary_recovery_admits_same_protection_stranded_record(tmp_path):
+    # The ordinary resume must get past recovery for a continuity round to
+    # retire the stranded record at all.
+    stray = _unreadable_record(kind="fresh", head_sha="stray-head", nonce="stray")
+    runner = _recovery_runner([_unreadable_record(), stray])
+
+    handoff = _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert handoff is not None
+    assert handoff.protection_mode == "unreadable"
+    assert _mutations(runner) == []
+
+
+def test_m1069_protection_disagreement_is_left_to_recovery_refusal(tmp_path):
+    # A record whose protection differs is not ordinary-path history: recovery
+    # refuses before any continuity round, and fresh adjudicates the state.
+    stray = _unreadable_record(
+        kind="fresh", head_sha="stray-head", nonce="stray",
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+    )
+    runner = _recovery_runner([_unreadable_record(), stray])
+
+    with pytest.raises(AgentLoopError, match="refused"):
+        _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+    assert _mutations(runner) == []
+
+
+def test_m1069_failed_comparison_keeps_the_record(tmp_path, monkeypatch):
+    stray = _unreadable_record(
+        kind="fresh", head_sha="stray-head", nonce="stray",
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+    )
+    runner = _continuity_1069_runner([stray])
+
+    def unavailable(_runner, *, config, predecessor_head, live_head):
+        raise AgentLoopError("Managed-CI API request failed: compare.")
+
+    monkeypatch.setattr(managed_ci, "_github_proves_descendant", unavailable)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    _continue_1069(
+        runner, config, replace(_authorization_handoff(), authorization_comment_id=41),
+        predecessor="abc123", new_head="next-head", rounds=(88, 89),
+    )
+
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.superseded_comment_ids == ()
+
+
+def test_m1069_continuity_supersession_is_honored_and_round_trips():
+    base = _unreadable_record()
+    continuity = replace(
+        base, kind="continuity", head_sha="next", nonce="c", predecessor_head="abc123",
+        predecessor_comment_id=40, round_comment_ids=(88, 89), superseded_comment_ids=(41,),
+    )
+    assert parse_issue_created_authorization_comment(
+        str(format_issue_created_authorization_comment(continuity))
+    ) == continuity
+    assert managed_ci._superseded_authorization_ids(
+        [(40, base), (41, replace(base, head_sha="stray")), (43, continuity)]
+    ) == frozenset({41})

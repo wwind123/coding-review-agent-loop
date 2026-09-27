@@ -3447,6 +3447,22 @@ every later reader (fresh reuse, ordinary recovery, the resume audit, and the
 plan-binding check) treats those records as history. Nothing is deleted. A
 record whose base, actor, managed-label provenance, or approved plan (other
 than a verified retired plan) differs still refuses and is never superseded.
+Ordinary resumes retire the same history as they go (#1069), so an
+interrupted run does not require the fresh grant. When a continuity record is
+published for an orchestrator-produced head, it names in the same act every
+earlier record of this actor for the PR that is otherwise compatible (same
+base, actor, actor-owned managed-label event, approved plan, and the
+protection of the chain being extended) but cannot reach the new head because
+GitHub cannot prove its head is an ancestor. That includes a continuity child
+of the same predecessor left by an interrupted attempt whose head the branch
+has since discarded; a child that can still reach the new head remains a fork
+and refuses. The continuity record's own predecessor chain is never retired,
+and a failed ancestry comparison keeps the record rather than retiring it.
+Records whose recorded protection differs are not retired on the ordinary
+path: recovery and the resume audit refuse on them before any round runs,
+because which protection state governs the PR is for the fresh grant to
+adjudicate. Records that differ in base, actor, label provenance, or plan are
+likewise left for the existing checks to refuse.
 The grant records the live voluntary or plan-limited protection assessment,
 and the PR tuple, managed-label event, and authorization-comment set are read
 again immediately before publication. Managed issue recovery from a legacy

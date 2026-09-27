@@ -801,6 +801,10 @@ at the live head. The only accepted exception follows resume: a single fresh
 grant may supersede the creation record at the same head. That terminal must
 link through round-backed continuity records to a creation or fresh root, the
 chain must not fork, and every record in it must carry the approved plan hash.
+Records retired by a later fresh grant (#1065) or continuity record (#1069)
+are history and are ignored by this check; a continuity record retires only
+the actor's otherwise compatible records that cannot reach its new head, never
+its own predecessor chain.
 A strictly protected base publishes no authorization record, so the binding
 comes from the same sources its resume used: the reserved managed branch for
 the issue, plus the issue's completely approved canonical plan, whose hash must
