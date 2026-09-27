@@ -149,6 +149,12 @@ class ReviewRoundSpool:
             return None
         return {name: response.get(name) for name in SPOOLED_RESPONSE_FIELDS}
 
+    def has_records(self) -> bool:
+        try:
+            return any(self.directory.glob("*.json"))
+        except OSError:
+            return False
+
     def remove(self, reviewer_name: str) -> None:
         try:
             self._path(reviewer_name).unlink()

@@ -2000,9 +2000,14 @@ Execution model:
     must invoke it again, nothing is posted: the healthy reviews stay in the
     spool, the failure is raised, and the rerun replays them while only the
     failed reviewer runs, with no peer body visible.
-  - If a same-round peer is already public and a reviewer's spooled outcome is
-    missing or no longer validates (for example, a rerun on another host), the
-    run stops before invoking it. Rerun from the host that holds the spool, or
+  - A round that still holds spooled outcomes is always finished through this
+    withhold-then-publish path, even when the rerun omits `--review-parallel`
+    (reviewers that need a fresh turn then run one at a time), so a sequential
+    rerun never posts a replayed review before a retried reviewer runs.
+  - If a same-round peer is already public -- including a posted review that
+    resume rejected, for example after the requirements changed -- and a
+    reviewer's spooled outcome is missing or no longer validates (for example,
+    a rerun on another host), the run stops before invoking it. Rerun from the host that holds the spool, or
     delete the round's already-posted reviewer comments so the whole round runs
     again.
 - The orchestrator still waits for every reviewer to settle before shared state

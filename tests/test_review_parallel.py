@@ -1072,9 +1072,12 @@ def test_pr_parallel_resume_after_publication_does_not_duplicate_or_lose_items(t
 class _PartialPublicationProbeRunner(FakeRunner):
     """Records every reviewer launch and the same-round bodies public at that moment."""
 
-    def __init__(self, *, round_markers, **kwargs):
+    def __init__(self, *, round_markers, slow_reviewer=None, **kwargs):
         super().__init__(**kwargs)
         self.round_markers = round_markers
+        # Delaying one reviewer's first turn fixes the completion (and so
+        # publication) order of the first round.
+        self.slow_reviewer = slow_reviewer
         self.reviewer_launches: list[str] = []
         self.peer_body_visible_at_launch = False
 
@@ -1084,6 +1087,8 @@ class _PartialPublicationProbeRunner(FakeRunner):
             self.reviewer_launches.append(cmd[0])
             if any(marker in body for marker in self.round_markers for body in self.comments):
                 self.peer_body_visible_at_launch = True
+            if cmd[0] == self.slow_reviewer and self.reviewer_launches.count(cmd[0]) == 1:
+                time.sleep(0.2)
         return super().run_with_log(args, cwd=cwd, **kwargs)
 
 
@@ -1199,10 +1204,11 @@ def test_plan_parallel_interruption_between_publications_replays_withheld_review
     assert _spool_files(config) == []
 
 
-def _pr_partial_round_runner():
+def _pr_partial_round_runner(slow_reviewer=None):
     markers = ("Codex found a blocker.", "Gemini approves independently.")
     runner = _PartialPublicationProbeRunner(
         round_markers=markers,
+        slow_reviewer=slow_reviewer,
         codex_outputs=[
             structured_pr_review(
                 state="blocking", summary="Codex found a blocker.", blocking_items=["Persist this item."]
@@ -1372,6 +1378,96 @@ def test_pr_partial_round_replays_unavailable_reviewer_without_reinvoking(tmp_pa
     # The unavailable Codex outcome is replayed, not re-run against public peers.
     assert runner.reviewer_launches == launches_before
     assert [_published_count(runner, marker) for marker in markers] == [1, 1]
+
+
+def test_pr_held_round_sequential_rerun_never_shows_withheld_peer_to_retry(tmp_path):
+    runner = _PartialPublicationProbeRunner(
+        round_markers=("Codex approves the PR first.",),
+        codex_outputs=[structured_pr_review(summary="Codex approves the PR first.")],
+        gemini_outputs=[("gemini exploded", 1)],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True, agent_max_retries=0
+    )
+    with pytest.raises(AgentLoopError, match="Gemini"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _published_count(runner, "Codex approves the PR first.") == 0
+    assert _spool_files(config)
+
+    runner.gemini_outputs.append(
+        structured_pr_review(summary="Gemini approves on retry.", reviewer="Google Gemini")
+    )
+    launches_before = list(runner.reviewer_launches)
+    sequential = dataclasses.replace(config, review_parallel=False)
+    assert run_pr_loop(runner, pr_number=77, config=sequential) == 0
+
+    # Codex, first in configured order, is replayed rather than posted before
+    # Gemini's retry, so the retry cannot read it.
+    assert runner.reviewer_launches[len(launches_before):] == ["gemini"]
+    assert not runner.peer_body_visible_at_launch
+    assert _published_count(runner, "Codex approves the PR first.") == 1
+    assert _published_count(runner, "Gemini approves on retry.") == 1
+    assert _spool_files(config) == []
+
+
+def test_plan_held_round_sequential_rerun_never_shows_withheld_peer_to_retry(tmp_path):
+    runner = _PartialPublicationProbeRunner(
+        round_markers=("Codex plan approval with a unique note.",),
+        claude_outputs=[_initial_plan()],
+        codex_outputs=[structured_plan_review(summary="Codex plan approval with a unique note.")],
+        gemini_outputs=[structured_plan_review(
+            state="blocking",
+            summary="Review incomplete: could not confirm the prior finding.",
+            reviewer="Google Gemini",
+        )],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    with pytest.raises(AgentLoopError, match="Gemini"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert _published_count(runner, "Codex plan approval with a unique note.") == 0
+
+    runner.gemini_outputs.append(
+        structured_plan_review(summary="Gemini approves on retry.", reviewer="Google Gemini")
+    )
+    sequential = dataclasses.replace(config, review_parallel=False)
+    assert run_issue_loop(runner, issue_number=56, config=sequential, plan_first=True) == 0
+
+    assert sorted(runner.reviewer_launches) == ["codex", "gemini", "gemini"]
+    assert not runner.peer_body_visible_at_launch
+    assert _published_count(runner, "Codex plan approval with a unique note.") == 1
+    assert _spool_files(config) == []
+
+
+@pytest.mark.parametrize("review_parallel", [True, False])
+@pytest.mark.parametrize("spool_state", ["missing", "invalid"])
+@pytest.mark.parametrize("slow_reviewer", ["codex", "gemini"])
+def test_pr_partial_round_with_rejected_posted_record_stops_before_invoking(
+    tmp_path, monkeypatch, review_parallel, spool_state, slow_reviewer
+):
+    runner, markers = _pr_partial_round_runner(slow_reviewer=slow_reviewer)
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    for path in _spool_files(config):
+        if spool_state == "missing":
+            path.unlink()
+        else:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["response"]["text"] = "not a structured PR review"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+    # Resume rejects the posted record (e.g. requirements changed), but its
+    # body is still public on the PR.
+    monkeypatch.setattr(
+        orchestrator, "_resumed_pr_reviewer_matches_requirements", lambda *args, **kwargs: False
+    )
+    launches_before = len(runner.reviewer_launches)
+
+    with pytest.raises(orchestrator.PartialReviewRoundError, match="partially published"):
+        run_pr_loop(
+            runner, pr_number=77,
+            config=dataclasses.replace(config, review_parallel=review_parallel),
+        )
+
+    assert len(runner.reviewer_launches) == launches_before
 
 
 def test_review_round_spool_rejects_foreign_or_malformed_records(tmp_path):

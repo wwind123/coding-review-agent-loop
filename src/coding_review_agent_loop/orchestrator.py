@@ -11402,6 +11402,29 @@ def _replay_spooled_failure(fields: dict[str, object], reviewer_name: str) -> Ag
     )
 
 
+def _refuse_partial_round_before_sequential_turns(
+    *,
+    spool: ReviewRoundSpool,
+    fresh_turn_reviewers: Sequence[AgentName],
+    public_peers: Sequence[AgentName],
+) -> None:
+    """Stop before any sequential turn when one of them would face a public peer.
+
+    A sequential round only reaches this with no spooled outcomes (a round
+    holding them is finished by the withhold-then-publish launcher), so a
+    reviewer needing a fresh turn beside a public same-batch peer could never
+    be replayed.  Checking the whole round first avoids re-running one
+    reviewer and then stopping at the next.
+    """
+    for reviewer in fresh_turn_reviewers:
+        peers = sorted(agent_display_name(peer) for peer in public_peers if peer != reviewer)
+        if peers:
+            raise _partial_round_refusal(
+                surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                reviewer_name=agent_display_name(reviewer), public_peers=peers,
+            )
+
+
 def _same_round_replay_or_invoke(
     runner: Runner,
     *,
@@ -11455,6 +11478,7 @@ def _launch_reviewer_turns(
     configured_order: Sequence[AgentName] = (),
     config: AgentLoopConfig | None = None,
     already_posted: Sequence[AgentName] = (),
+    max_workers: int | None = None,
 ) -> dict[AgentName, _ReviewerTurnResult]:
     """Run workers concurrently, then deliver results in completion order.
 
@@ -11511,16 +11535,22 @@ def _launch_reviewer_turns(
                 results[reviewer] = result
                 replayed.add(reviewer)
     to_launch = [reviewer for reviewer in pending if reviewer not in replayed]
-    if spool is not None and to_launch:
-        peers = sorted(agent_display_name(peer) for peer in public_peers if peer not in to_launch)
-        if peers:
-            raise _partial_round_refusal(
-                surface=spool.surface, number=spool.number, round_number=spool.round_number,
-                reviewer_name=", ".join(agent_display_name(reviewer) for reviewer in to_launch),
-                public_peers=peers,
-            )
+    if spool is not None:
+        for reviewer in to_launch:
+            peers = sorted(agent_display_name(peer) for peer in public_peers if peer != reviewer)
+            if peers:
+                raise _partial_round_refusal(
+                    surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                    reviewer_name=agent_display_name(reviewer), public_peers=peers,
+                )
     if to_launch:
-        executor = ThreadPoolExecutor(max_workers=len(to_launch), thread_name_prefix=thread_name_prefix)
+        # A sequential run finishing a held round launches one reviewer at a
+        # time (reviewer workdirs may be shared); publication is still withheld
+        # until all of them return.
+        executor = ThreadPoolExecutor(
+            max_workers=min(len(to_launch), max_workers or len(to_launch)),
+            thread_name_prefix=thread_name_prefix,
+        )
         try:
             futures = {executor.submit(run_turn, reviewer): reviewer for reviewer in to_launch}
             for future in as_completed(futures):
@@ -12786,7 +12816,25 @@ def _run_plan_first_loop(
             config, surface="plan", number=issue_number,
             round_number=round_number, subject=current_plan_subject,
         )
-        if config.review_parallel:
+        # A round that holds withheld outcomes began as a parallel round; finish
+        # it through the same withhold-then-publish launcher even when this run
+        # is sequential, so no retried reviewer sees a same-round peer's body.
+        plan_round_parallel = config.review_parallel or plan_round_spool.has_records()
+        plan_round_public_peers = tuple(
+            reviewer for reviewer in round_reviewers
+            if (record := resumed_by_name.get(agent_display_name(reviewer))) is not None
+            and record.metadata.phase == "publication"
+        )
+        if not plan_round_parallel:
+            _refuse_partial_round_before_sequential_turns(
+                spool=plan_round_spool,
+                fresh_turn_reviewers=[
+                    reviewer for reviewer in round_reviewers
+                    if resumed_by_name.get(agent_display_name(reviewer)) is None
+                ],
+                public_peers=plan_round_public_peers,
+            )
+        if plan_round_parallel:
             pending_plan_reviewers = [
                 reviewer for reviewer in round_reviewers
                 if resumed_by_name.get(agent_display_name(reviewer)) is None
@@ -12906,8 +12954,9 @@ def _run_plan_first_loop(
                         runner, config=config, reviewer=reviewer, fields=fields,
                         validators=_plan_review_validators(agent_display_name(reviewer)),
                     ),
-                    public_peers=tuple(early_published_plan_reviewers),
+                    public_peers=plan_round_public_peers,
                     retry_bound=_plan_retry_bound,
+                    max_workers=None if config.review_parallel else 1,
                     configured_order=round_reviewers,
                     config=config,
                 )
@@ -12948,7 +12997,7 @@ def _run_plan_first_loop(
                 review_state = parsed_review.state
                 log(config, f"Planning round {round_number}: resuming {reviewer_name}'s completed review")
                 reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)
-            elif config.review_parallel:
+            elif plan_round_parallel:
                 turn = plan_turn_results[reviewer]
                 if turn.error is not None:
                     category = getattr(turn.error, "failure_category", None) or "error"
@@ -12999,7 +13048,7 @@ def _run_plan_first_loop(
                     config=config,
                     reviewer=reviewer,
                     spool=plan_round_spool,
-                    public_peers=tuple(early_published_plan_reviewers),
+                    public_peers=plan_round_public_peers,
                     validators=sequential_plan_validators,
                     invoke=lambda reviewer=reviewer, validators=sequential_plan_validators: _run_validated_agent(
                         runner,
@@ -13049,7 +13098,7 @@ def _run_plan_first_loop(
                     "stopping without a coder follow-up",
                 )
                 incomplete_review_error = _incomplete_plan_review_error(reviewer_name)
-                if config.review_parallel:
+                if plan_round_parallel:
                     plan_fatal_errors.append((reviewer_name, incomplete_review_error))
                     continue
                 raise incomplete_review_error
@@ -13127,7 +13176,7 @@ def _run_plan_first_loop(
             # Every same-round outcome is now published; a sequential resume
             # that replayed withheld reviews no longer needs them.
             plan_round_spool.discard()
-        if config.review_parallel and not (current_resume is not None and current_resume.reconciled):
+        if plan_round_parallel and not (current_resume is not None and current_resume.reconciled):
             settled = ", ".join(agent_display_name(reviewer) for reviewer in round_reviewers)
             post_issue_comment(
                 runner, config=config, issue_number=issue_number,
@@ -21042,12 +21091,28 @@ def run_pr_loop(
             pr_launch_phase = (
                 scheduler_decision.phase if selective_policy and scheduler_decision is not None else None
             )
+            # Built from every posted same-round record, including records
+            # resume rejected: their bodies are just as public.
             pr_same_batch_public_peers = tuple(
-                reviewer for reviewer in early_published_pr_reviewers
-                if (record := resumed_by_name.get(agent_display_name(reviewer))) is not None
+                reviewer for reviewer in configured_reviewers
+                if (record := completed_by_name.get(agent_display_name(reviewer))) is not None
+                and record.metadata.phase == "publication"
                 and record.metadata.scheduler_phase == pr_launch_phase
             )
-            if config.review_parallel and not skip_reviewers_this_round:
+            # A round that holds withheld outcomes began as a parallel round;
+            # finish it through the same withhold-then-publish launcher even
+            # when this run is sequential (#1025).
+            pr_round_parallel = config.review_parallel or pr_round_spool.has_records()
+            if not pr_round_parallel and not skip_reviewers_this_round:
+                _refuse_partial_round_before_sequential_turns(
+                    spool=pr_round_spool,
+                    fresh_turn_reviewers=[
+                        reviewer for reviewer in configured_reviewers
+                        if _pr_reviewer_prelaunch_kind(reviewer) == "turn"
+                    ],
+                    public_peers=pr_same_batch_public_peers,
+                )
+            if pr_round_parallel and not skip_reviewers_this_round:
                 pending_pr_reviewers = [
                     reviewer for reviewer in configured_reviewers
                     if _pr_reviewer_prelaunch_kind(reviewer) == "turn"
@@ -21263,6 +21328,7 @@ def run_pr_loop(
                             ),
                             public_peers=pr_same_batch_public_peers,
                             retry_bound=_pr_retry_bound,
+                            max_workers=None if config.review_parallel else 1,
                             already_posted=tuple(
                                 reviewer for reviewer in configured_reviewers
                                 if agent_display_name(reviewer) in completed_by_name
@@ -21370,7 +21436,7 @@ def run_pr_loop(
                         f"Round {round_number}: skipping {reviewer_name}; it approved unchanged "
                         f"PR head {current_pr_subject} in round {prior_approval.metadata.round_number}",
                     )
-                elif config.review_parallel:
+                elif pr_round_parallel:
                     review_failure: AgentInvocationError | AgentLoopError | None = (
                         pr_prep_failures.get(reviewer)
                     )
@@ -21600,7 +21666,7 @@ def run_pr_loop(
                 if _is_incomplete_pr_review(parsed_review):
                     if len(configured_reviewers) == 1:
                         incomplete_pr_review_error = _incomplete_pr_review_error(reviewer_name)
-                        if config.review_parallel:
+                        if pr_round_parallel:
                             pr_fatal_errors.append((reviewer_name, incomplete_pr_review_error))
                             continue
                         raise incomplete_pr_review_error
@@ -21752,7 +21818,7 @@ def run_pr_loop(
                 # resume that replayed withheld reviews no longer needs them.
                 pr_round_spool.discard()
             if (
-                (config.review_parallel or selective_policy)
+                (pr_round_parallel or selective_policy)
                 and not skip_reviewers_this_round
                 and not (current_resume is not None and current_resume.reconciled)
             ):
