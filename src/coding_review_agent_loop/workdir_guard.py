@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, Sequence
 from urllib.parse import urlsplit
@@ -615,6 +615,10 @@ class _Clause:
     tokens: list[str]
     mode: ClauseMode
     command_by_contract: bool
+    # Where a working-directory change stops applying: the nesting level of a
+    # shell -c script, and whether the text has a subshell or substitution.
+    shell_depth: int = 0
+    in_subshell: bool = False
 
 
 def _tokenize(text: str) -> list[str]:
@@ -632,6 +636,10 @@ def _tokenize(text: str) -> list[str]:
 
 def _split_into_clauses(text: str, mode: ClauseMode) -> list[_Clause]:
     tokens = _tokenize(text)
+    in_subshell = any(
+        token and set(token) <= _SHELL_PUNCTUATION_CHARS and ("(" in token or ")" in token)
+        for token in tokens
+    )
     clauses: list[_Clause] = []
     current: list[str] = []
     command_by_contract = True
@@ -644,6 +652,7 @@ def _split_into_clauses(text: str, mode: ClauseMode) -> list[_Clause]:
                     tokens=current,
                     mode=mode,
                     command_by_contract=command_by_contract if mode == "structured" else False,
+                    in_subshell=in_subshell,
                 )
             )
         current = []
@@ -752,9 +761,16 @@ def _expand_shell_clause(clause: _Clause, depth: int = 0) -> list[_Clause]:
         tokens=clause.tokens[:index] + clause.tokens[index + 1 :],
         mode=clause.mode,
         command_by_contract=clause.command_by_contract,
+        shell_depth=clause.shell_depth,
+        in_subshell=clause.in_subshell,
     )
     expanded = [outer]
     for inner in _split_into_clauses(script, "structured"):
+        inner = replace(
+            inner,
+            shell_depth=clause.shell_depth + 1,
+            in_subshell=inner.in_subshell or clause.in_subshell,
+        )
         expanded.extend(_expand_shell_clause(inner, depth + 1))
     return expanded
 
@@ -847,7 +863,14 @@ def _path_roles(clause: _Clause) -> list[tuple[str, str]]:
     return results
 
 
-def _check_path_role(raw_path: str, role: str, *, command: str, assigned: Path) -> None:
+def _check_path_role(
+    raw_path: str,
+    role: str,
+    *,
+    command: str,
+    assigned: Path,
+    path_violations: list[str] | None = None,
+) -> None:
     path = _normalize_reported_path(raw_path)
     if path is None:
         return
@@ -858,6 +881,11 @@ def _check_path_role(raw_path: str, role: str, *, command: str, assigned: Path) 
     if role == "interpreter_value":
         return
     if role == "output":
+        return
+    if path_violations is not None:
+        # The caller degrades this report to out-of-checkout context instead
+        # of rejecting the whole payload; every other check still applies.
+        path_violations.append(raw_path)
         return
     raise AgentLoopError(
         "Coder reported tests from outside the assigned checkout: "
@@ -1167,7 +1195,191 @@ def _url_targets_in_clause(clause: _Clause) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _validate_command_contents(command: str, *, assigned: Path, origin: Origin) -> None:
+class _PathLog(list):
+    """Out-of-checkout path violations plus where the run's test targets lie."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.inside_target = False
+        self.outside_target = False
+        self.cwd_outside = False
+        # The current directory can no longer be proven: a popd, ``cd -``, a
+        # relative or unresolvable cd, or a cd whose scope may have ended.
+        self.cwd_unknown = False
+        self.cwd_depth = 0
+        # A target whose location cannot be proven blocks the context label.
+        self.ambiguous_target = False
+
+
+# Options whose following operand is a value (config file, plugin, expression,
+# worker count, report path, ...) rather than a test target.  The list can
+# never be complete, so an absolute path after an *unknown* option is also
+# ignored; see _record_test_targets for why that is the fail-safe direction.
+_VALUE_TAKING_OPTIONS = frozenset({
+    "-c", "-p", "-k", "-m", "-o", "-n", "-r", "-W", "--config", "--config-file",
+    "--confcutdir", "--basetemp", "--cache-dir", "--ignore", "--ignore-glob",
+    "--deselect", "--cov", "--cov-config", "--cov-report", "--override-ini",
+    "--junitxml", "--junit-xml", "--html", "--log-file", "--log-level",
+    "--import-mode", "--numprocesses", "--dist", "--maxfail", "--tb",
+    "--timeout", "--timeout-method", "--durations", "--capture", "--color",
+    "--rootdir",
+})
+# Flags known to take no value, so a following path is a test operand.
+_BOOLEAN_SHORT_FLAGS_RE = re.compile(r"-[qvxslh]+")
+_BOOLEAN_LONG_FLAGS = frozenset({
+    "--quiet", "--verbose", "--exitfirst", "--lf", "--last-failed", "--ff",
+    "--failed-first", "--sw", "--stepwise", "--no-header", "--strict-markers",
+    "--showlocals", "--collect-only", "--co",
+})
+# Options that change the process working directory.  pytest's --rootdir is
+# deliberately absent: it selects configuration, not where operands resolve.
+_CWD_FLAGS = frozenset({"-C", "--directory", "--chdir", "--cwd"})
+_CWD_FLAG_PREFIXES = ("--directory=", "--chdir=", "--cwd=")
+# Clause heads that never run tests themselves.  A shell's own clause is here
+# because its -c script is expanded into separate clauses.
+_NON_TEST_HEADS = frozenset({
+    "pwd", "echo", "printf", "true", "false", "ls", "cat", "export", "set",
+    "source", ".", "mkdir", "rm", "cp", "mv", "which", "git",
+    "sh", "bash", "zsh",
+})
+
+
+def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> None:
+    """Note whether a clause's test targets lie inside and/or outside the checkout.
+
+    This is fail-safe: a run counts as out-of-checkout context only with
+    positive evidence that everything it tested lies elsewhere.  Every
+    positional operand that does not resolve outside -- relative paths, bare
+    words such as ``tests``, node IDs such as ``test_a.py::t`` -- is an inside
+    target, resolved against the current directory.  That is the confined
+    in-checkout ``cwd`` unless a ``cd``/``pushd`` clause or a real
+    working-directory option (``-C``, ``--chdir``, ...) moved it; ``--rootdir``
+    does not.  A test clause with no positional operand tests its current
+    directory.  An outside path after a value-taking or unknown option is not
+    a target, so an unrecognized report or config path can never turn an
+    in-checkout run into context; an inside path there still counts, and
+    every token after ``--`` is an operand.
+
+    The directory is tracked only through resolvable absolute moves outside
+    any subshell.  After ``popd``, ``cd -``, a relative or unresolvable
+    target, a subshell or substitution, or the end of the ``sh -c`` script
+    that moved it, the directory is unknown and a relative or implicit target
+    is ambiguous, which keeps the run authoritative.
+    """
+
+    def outside(raw: str) -> bool | None:
+        path = _normalize_reported_path(raw)
+        if path is None:
+            return None
+        return not (path == assigned or _is_inside(path, assigned))
+
+    tokens = clause.tokens
+    if log.cwd_depth > clause.shell_depth:
+        # The shell -c script that moved the directory has exited.
+        log.cwd_unknown = True
+    _, head = _program_position_indices(tokens)
+    if head is None or head >= len(tokens):
+        return
+    head_name = _program_basename(tokens[head])
+    if head_name in {"cd", "pushd", "popd"}:
+        moved = outside(tokens[head + 1]) if head + 1 < len(tokens) else None
+        if moved is None or clause.in_subshell or head_name == "popd":
+            # Only one resolvable move outside any subshell is tracked; a
+            # restore or unresolvable target leaves the directory unknown.
+            log.cwd_unknown = True
+        else:
+            log.cwd_outside = moved
+            log.cwd_depth = max(log.cwd_depth, clause.shell_depth)
+        return
+    if head_name in _NON_TEST_HEADS:
+        return
+
+    cwd_outside: bool | None = None if log.cwd_unknown else log.cwd_outside
+    index = head + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if token in _CWD_FLAGS and index + 1 < len(tokens):
+            cwd_outside = outside(tokens[index + 1])
+            index += 2
+            continue
+        for prefix in _CWD_FLAG_PREFIXES:
+            if token.startswith(prefix):
+                cwd_outside = outside(token[len(prefix) :])
+        index += 1
+
+    def record_relative() -> None:
+        if cwd_outside is None:
+            log.ambiguous_target = True
+        elif cwd_outside:
+            log.outside_target = True
+        else:
+            log.inside_target = True
+
+    saw_positional = False
+    terminated = False
+    for index in range(head + 1, len(tokens)):
+        token = tokens[index]
+        previous = tokens[index - 1]
+        if terminated:
+            # After ``--`` every token is an operand, never an option value.
+            cleaned = _strip_wrap(token)
+            if not cleaned:
+                continue
+            saw_positional = True
+            if _is_path_shaped(cleaned):
+                if outside(cleaned):
+                    log.outside_target = True
+                else:
+                    log.inside_target = True
+            else:
+                record_relative()
+            continue
+        if token == "--":
+            terminated = True
+            continue
+        if (
+            token.startswith("-")
+            or VAR_ASSIGNMENT_RE.match(token)
+            or _is_url_token(token)
+            or previous in _CWD_FLAGS
+            or previous in WORKDIR_FLAGS
+            or previous in _VALUE_TAKING_OPTIONS
+            or previous in INTERPRETER_VALUE_FLAGS
+            or previous in OUTPUT_VALUE_FLAGS
+        ):
+            continue
+        cleaned = _strip_wrap(token)
+        if not cleaned or cleaned.isdigit():
+            continue
+        after_unknown_option = previous.startswith("-") and not (
+            _BOOLEAN_SHORT_FLAGS_RE.fullmatch(previous) or previous in _BOOLEAN_LONG_FLAGS
+        )
+        if _is_path_shaped(cleaned):
+            is_outside = outside(cleaned)
+            if after_unknown_option and is_outside:
+                # Possibly an option value; an inside path still counts.
+                continue
+            saw_positional = True
+            if is_outside:
+                log.outside_target = True
+            else:
+                log.inside_target = True
+            continue
+        saw_positional = True
+        record_relative()
+    if not saw_positional:
+        record_relative()
+
+
+def _validate_command_contents(
+    command: str,
+    *,
+    assigned: Path,
+    origin: Origin,
+    path_violations: list[str] | None = None,
+) -> None:
     for raw_windows in WINDOWS_PATH_RE.findall(command):
         if _windows_path_is_exempt(command, raw_windows, origin):
             continue
@@ -1185,12 +1397,21 @@ def _validate_command_contents(command: str, *, assigned: Path, origin: Origin) 
         if not _validate_managed_command(
             shlex.join(clause.tokens), assigned=assigned,
             origin="structured" if clause.mode in {"structured", "code"} else "response",
+            path_violations=path_violations,
         ):
             ordinary_clauses.append(clause)
 
     for clause in ordinary_clauses:
         for raw_path, role in _path_roles(clause):
-            _check_path_role(raw_path, role, command=command, assigned=assigned)
+            _check_path_role(
+                raw_path,
+                role,
+                command=command,
+                assigned=assigned,
+                path_violations=path_violations,
+            )
+        if isinstance(path_violations, _PathLog):
+            _record_test_targets(clause, assigned=assigned, log=path_violations)
 
     for clause in ordinary_clauses:
         for target in _url_targets_in_clause(clause):
@@ -1215,7 +1436,13 @@ def _validate_command_contents(command: str, *, assigned: Path, origin: Origin) 
                 )
 
 
-def _validate_managed_command(command: str, *, assigned: Path, origin: Origin) -> bool:
+def _validate_managed_command(
+    command: str,
+    *,
+    assigned: Path,
+    origin: Origin,
+    path_violations: list[str] | None = None,
+) -> bool:
     # The managed wrapper itself is an absolute executable outside the checkout
     # by design, and its memory directory is an output location.  Once the
     # exact contract is recognized, validate leading shell assignments and the
@@ -1235,18 +1462,34 @@ def _validate_managed_command(command: str, *, assigned: Path, origin: Origin) -
         # prose response; the inner report retains its original source mode.
         if prefix_len:
             _validate_command_contents(
-                shlex.join(tokens[:prefix_len]), assigned=assigned, origin="structured"
+                shlex.join(tokens[:prefix_len]),
+                assigned=assigned,
+                origin="structured",
+                path_violations=path_violations,
             )
         _validate_single_command(
-            shlex.join(managed.inner_argv), assigned=assigned, origin=origin
+            shlex.join(managed.inner_argv),
+            assigned=assigned,
+            origin=origin,
+            path_violations=path_violations,
         )
         return True
     return False
 
 
-def _validate_single_command(command: str, *, assigned: Path, origin: Origin) -> None:
-    if not _validate_managed_command(command, assigned=assigned, origin=origin):
-        _validate_command_contents(command, assigned=assigned, origin=origin)
+def _validate_single_command(
+    command: str,
+    *,
+    assigned: Path,
+    origin: Origin,
+    path_violations: list[str] | None = None,
+) -> None:
+    if not _validate_managed_command(
+        command, assigned=assigned, origin=origin, path_violations=path_violations
+    ):
+        _validate_command_contents(
+            command, assigned=assigned, origin=origin, path_violations=path_violations
+        )
 
 
 def validate_test_commands_within_workdir(
@@ -1260,6 +1503,124 @@ def validate_test_commands_within_workdir(
     assigned = _canonical(assigned_workdir)
     for command in tests_run:
         _validate_single_command(command, assigned=assigned, origin=origin)
+
+
+@dataclass(frozen=True)
+class ReportedTestsPartition:
+    """Display-only ``tests_run`` split by whether it ran in the assigned checkout."""
+
+    in_checkout: tuple[str, ...] | None
+    out_of_checkout: tuple[str, ...] = ()
+
+
+def partition_reported_tests_by_workdir(
+    tests_run: Sequence[str] | None,
+    *,
+    assigned_workdir: Path,
+) -> ReportedTestsPartition:
+    """Separate out-of-checkout context runs from a display-only test report.
+
+    A coder may honestly report a baseline run on a clean copy of the base
+    branch.  That run is context, not evidence: it is split out so it never
+    becomes a self-reported evidence row, and it does not reject the whole
+    hand-off.  Only a run proven to test *only* outside the checkout degrades
+    this way.  A command that names an outside path but may also test the
+    checkout -- mixed operands, an outside config or ignore path, a directory
+    the guard cannot track -- is ambiguous and refused with guidance to run
+    the two separately.  Live remote targets, unvalidatable Windows paths, and
+    malformed shell text still fail closed, as do receipt citations, which
+    keep using the strict validator.
+    """
+    if not tests_run:
+        return ReportedTestsPartition(in_checkout=None if tests_run is None else ())
+    assigned = _canonical(assigned_workdir)
+    kept: list[str] = []
+    context: list[str] = []
+    for command in tests_run:
+        violations = _PathLog()
+        _validate_single_command(
+            command, assigned=assigned, origin="structured", path_violations=violations
+        )
+        if not violations:
+            kept.append(command)
+        elif _tests_only_outside(violations):
+            context.append(command)
+        else:
+            raise AgentLoopError(
+                "Coder reported a test command that names a path outside the "
+                f"assigned checkout ({', '.join(repr(p) for p in violations)}) "
+                "but may also test the checkout itself, in command "
+                f"{command!r}. Report in-checkout tests and any baseline run "
+                "outside the checkout as separate commands; a baseline command "
+                "must name only outside test targets. Assigned checkout: "
+                f"{assigned}"
+            )
+    return ReportedTestsPartition(in_checkout=tuple(kept), out_of_checkout=tuple(context))
+
+
+def command_is_admissible_evidence(
+    argv: Sequence[str] | str,
+    *,
+    assigned_workdir: Path,
+) -> bool:
+    """Return whether a recorded test command may back an evidence selector.
+
+    A command that targets a location outside the assigned checkout is
+    context, not evidence, even when the managed broker ran it from inside the
+    checkout (#991).  Anything the guard cannot validate is inadmissible too.
+    """
+    violations = _command_path_violations(argv, assigned_workdir=assigned_workdir)
+    return violations is not None and not violations
+
+
+def command_targets_outside_workdir(
+    argv: Sequence[str] | str,
+    *,
+    assigned_workdir: Path,
+) -> bool:
+    """Return whether a validatable command tests *only* outside the checkout.
+
+    Unlike :func:`command_is_admissible_evidence`, a command the guard cannot
+    validate is *not* reported as outside: callers use this to relabel a run
+    as context, and an unvalidatable failure must stay authoritative.  A mixed
+    run that also names an in-checkout test target, or whose only outside
+    path is an option value such as a config or ignore path, is not context
+    either: its failure may be a real in-checkout failure.
+    """
+    log = _command_path_violations(argv, assigned_workdir=assigned_workdir)
+    return isinstance(log, _PathLog) and _tests_only_outside(log)
+
+
+def _tests_only_outside(log: "_PathLog") -> bool:
+    """Whether a validated command names outside paths and tests nothing else."""
+    return (
+        bool(log)
+        and log.outside_target
+        and not log.inside_target
+        and not log.ambiguous_target
+    )
+
+
+def _command_path_violations(
+    argv: Sequence[str] | str,
+    *,
+    assigned_workdir: Path,
+) -> "_PathLog | None":
+    """Out-of-checkout paths in ``argv``, or ``None`` when unvalidatable."""
+    command = argv if isinstance(argv, str) else shlex.join(str(item) for item in argv)
+    if not command.strip():
+        return None
+    violations = _PathLog()
+    try:
+        _validate_single_command(
+            command,
+            assigned=_canonical(assigned_workdir),
+            origin="structured",
+            path_violations=violations,
+        )
+    except AgentLoopError:
+        return None
+    return violations
 
 
 def validate_test_observation_citations_within_workdir(

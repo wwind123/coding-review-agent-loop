@@ -986,6 +986,9 @@ class StructuredCoderFollowup:
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
     # Parser-derived records of dropped malformed citations (#927).
     test_observation_degradations: tuple[ParseDegradation, ...] = ()
+    # Orchestrator-derived, never parsed: reported runs outside the assigned
+    # checkout (e.g. a clean-base baseline). Visible context, never evidence.
+    out_of_checkout_tests_run: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1009,6 +1012,8 @@ class StructuredIssueImplementation:
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
     # Parser-derived records of dropped malformed citations (#927).
     test_observation_degradations: tuple[ParseDegradation, ...] = ()
+    # Orchestrator-derived, never parsed: see StructuredCoderFollowup.
+    out_of_checkout_tests_run: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
