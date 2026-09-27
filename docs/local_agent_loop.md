@@ -4402,6 +4402,17 @@ its role (implemented in `agent_permissions.py`):
   selection (including the default repair and semantic-followup backends), and
   every `--<agent>-arg` are rejected before any agent runs;
   `run_agent_result` refuses an unsupported agent as a runtime backstop.
+  Antigravity stays refused because `agy` offers no per-invocation,
+  CLI-enforced read-only grant (#1079). Observed live with agy 1.2.11,
+  `agy --sandbox` confines only its terminal tool: shell writes to the
+  workspace fail as a read-only file system, but its file-writing tool still
+  writes the checkout, and a bare `git status` there runs a planted
+  `core.fsmonitor`. Its allow rules (`permissions.allow`) exist only in the
+  shared per-user settings file, and headless mode ends the whole turn with no
+  output at the first tool it cannot prompt for. The refusal therefore names
+  the trade: a sandboxed review board has only Claude and Codex reviewers. The
+  live suite's Antigravity case asserts these premises, so a change in agy's
+  sandbox fails it and prompts revisiting the refusal.
 - At startup the response root is created one private component at a time,
   checked to be real directories owned by you that are not group- or
   world-writable, and checked not to overlap any agent checkout or the

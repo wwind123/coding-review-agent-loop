@@ -355,7 +355,13 @@ Requirements and limitations of sandboxed mode:
 - **Codex non-coders have no network**, because the read-only sandbox disables
   it; they rely on the issue and PR context in the prompt.
 - **Gemini and Antigravity cannot be selected** on any path (coder, reviewer,
-  analyzer, repair, or semantic dedupe).
+  analyzer, repair, or semantic dedupe), so a sandboxed review board has at
+  most the Claude and Codex reviewers. That is a trade of review depth for
+  containment: to keep an Antigravity reviewer, run with `default` or
+  `dangerous` permissions. Antigravity has no CLI-enforced read-only grant.
+  `agy --sandbox` restricts only its terminal, so its file-writing tool can
+  still write the checkout and a bare `git` there runs the checkout's
+  `.git/config`. Its allow rules live only in the shared user settings file.
 - **The inspector refuses checkouts with unusual git config.** `agent-loop
   inspect` runs only the pinned git and gh with a closed environment
   allowlist and a `PATH` built from their directories (inherited `GIT_*`

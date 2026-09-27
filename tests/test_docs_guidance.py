@@ -674,6 +674,8 @@ def test_readme_sandboxed_step_documents_requirements_and_limits():
         "closed environment\n  allowlist",
         "refuses to run when the checkout's\n  local, worktree, or included config has a key outside its allowlist",
         "same OS user",
+        "`agy --sandbox` restricts only its terminal",
+        "trade of review depth for\n  containment",
     ):
         assert phrase in step, phrase
     assert "need\n`--dangerous-agent-permissions`" not in step

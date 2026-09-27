@@ -865,6 +865,33 @@ def test_unsupported_selection_is_rejected(tmp_path, overrides, fragment):
     assert fragment in str(info.value)
 
 
+def test_antigravity_reviewer_refusal_explains_the_gap_and_the_trade(tmp_path):
+    # #1079: the refusal must say why agy has no grant and that the board
+    # shrinks, so the operator trades review depth for containment knowingly.
+    with pytest.raises(AgentLoopError) as info:
+        sandboxed_config(tmp_path, reviewer=("codex", "claude", "antigravity"))
+    message = str(info.value)
+    assert "reviewer selects 'antigravity'" in message
+    assert "`agy --sandbox` restricts only its terminal" in message
+    assert "shared user settings file" in message
+    assert "limited to Claude and Codex reviewers" in message
+    assert "--agent-permissions default|dangerous" in message
+
+
+def test_non_reviewer_refusal_omits_the_board_trade(tmp_path):
+    with pytest.raises(AgentLoopError) as info:
+        sandboxed_config(tmp_path, repair_backend="antigravity")
+    assert "`agy --sandbox` restricts only its terminal" in str(info.value)
+    assert "review board" not in str(info.value)
+
+
+@pytest.mark.parametrize("provider", ["antigravity", "gemini"])
+def test_role_permission_args_refuses_unsandboxable_provider_with_reason(tmp_path, provider):
+    config = sandboxed_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="has no CLI-enforced read-only grant"):
+        ap.role_permission_args(config, provider, "reviewer")
+
+
 @pytest.mark.parametrize("field_name", ["primary_reviewer", "primary_plan_reviewer"])
 def test_primary_reviewer_selections_are_rejected(field_name):
     from types import SimpleNamespace
