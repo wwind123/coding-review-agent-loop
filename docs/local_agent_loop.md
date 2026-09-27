@@ -1987,8 +1987,16 @@ Execution model:
   tool-enabled reviewer could echo it), so agreement across the panel would no
   longer be independent (#1025). Each provisional publication checkpoint is
   durable, so resume avoids duplicate comments even if the next run is
-  sequential. An interruption before the round settles loses the finished
-  reviewers' unpublished output, and a rerun re-invokes them.
+  sequential. Before the first post, every validated response is also written
+  to a private per-round spool under the repo cache
+  (`<agent-memory-dir>/../review-round-spool/`). If the run stops between two
+  posts, a rerun replays the unpublished reviewers' spooled responses through
+  the same validator instead of re-invoking them against their peers' visible
+  bodies; the spool is deleted once every post succeeds. An interruption before
+  the workers all return publishes nothing, and a rerun re-invokes the whole
+  round. A reviewer that fails fatally is still rerun after its healthy peers
+  are published (the collect-then-raise behavior below), so that rerun can see
+  same-round peer bodies.
 - The orchestrator still waits for every reviewer to settle before shared state
   changes: it aggregates outcomes, numbers unresolved items, and may begin
   coder work only in configured `--reviewer` order. It then posts a neutral

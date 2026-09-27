@@ -612,6 +612,7 @@ from .review_scheduling import (
     select_reviewers,
     undecodable_history_message,
 )
+from .review_spool import ReviewRoundSpool, review_spool_root
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
     CODER_DISPUTE_NOTE_PREFIX,
@@ -11268,6 +11269,93 @@ def _post_plan_coder_round_comment(
     return True
 
 
+def _review_round_spool(
+    config: AgentLoopConfig, *, surface: str, number: int, round_number: int, subject: str
+) -> ReviewRoundSpool:
+    return ReviewRoundSpool(
+        root=review_spool_root(config.agent_memory_dir),
+        repo=config.repo,
+        surface=surface,
+        number=number,
+        round_number=round_number,
+        subject=subject,
+    )
+
+
+def _replay_spooled_review(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    reviewer: AgentName,
+    fields: dict[str, object],
+    validators: dict[str, object],
+) -> _ReviewerTurnResult | None:
+    """Rebuild a spooled reviewer response through its round's own validator.
+
+    The spooled text is the accepted text of the original invocation, so the
+    same validate/strict re-parse chain yields the same accepted response.
+    ``None`` means the text no longer validates in this run's context and
+    the caller must fall back to a fresh reviewer turn.
+    """
+    reviewer_name = agent_display_name(reviewer)
+    text = fields.get("text")
+    validate = validators["validate"]
+    strict_revalidate = validators.get("strict_revalidate")
+    assert isinstance(text, str) and callable(validate)
+    try:
+        marker_value = _with_validation_context(validate, runner=runner, acquisition=None)(text)
+        candidate = _accept_candidate(
+            text,
+            marker_value,
+            strict_revalidate=strict_revalidate,  # type: ignore[arg-type]
+            runner=runner,
+            acquisition=None,
+        )
+    except AgentLoopError as exc:
+        log(
+            config,
+            f"{reviewer_name}: withheld same-round review no longer validates ({exc}); "
+            "invoking a fresh review turn instead",
+        )
+        return None
+    identity = {
+        name: fields.get(name)
+        for name in (
+            "session_id", "model_used", "provider", "role", "configured_model",
+            "configured_effort", "effort_source", "observed_model", "observed_effort",
+            "observation_provenance", "acquisition_returncode",
+        )
+    }
+    acquisition_outcome = fields.get("acquisition_outcome")
+    if acquisition_outcome not in {"success", "accepted_nonzero_exit", "accepted_timeout"}:
+        acquisition_outcome = "success"
+    log(config, f"{reviewer_name}: replaying its withheld same-round review instead of re-invoking it")
+    return _ReviewerTurnResult(
+        reviewer_name=reviewer_name,
+        response=_accepted_validated_response(
+            candidate, acquisition_outcome=acquisition_outcome, **identity
+        ),
+    )
+
+
+def _spooled_response_fields(response: ValidatedAgentResponse) -> dict[str, object]:
+    return {
+        "text": response.text,
+        "session_id": response.session_id,
+        "model_used": response.model_used,
+        "provider": response.provider,
+        "role": response.role,
+        "configured_model": response.configured_model,
+        "configured_effort": response.configured_effort,
+        "effort_source": response.effort_source,
+        "observed_model": response.observed_model,
+        "observed_effort": response.observed_effort,
+        "observation_provenance": response.observation_provenance,
+        "acquisition_outcome": response.acquisition_outcome,
+        "acquisition_returncode": response.acquisition_returncode,
+    }
+
+
 def _launch_reviewer_turns(
     runner: Runner,
     pending: Sequence[AgentName],
@@ -11275,6 +11363,8 @@ def _launch_reviewer_turns(
     thread_name_prefix: str,
     run_turn: Callable[[AgentName], _ReviewerTurnResult],
     on_completion: Callable[[AgentName, _ReviewerTurnResult], None] | None = None,
+    spool: ReviewRoundSpool | None = None,
+    replay_turn: Callable[[AgentName, dict[str, object]], _ReviewerTurnResult | None] | None = None,
 ) -> dict[AgentName, _ReviewerTurnResult]:
     """Run workers concurrently, then deliver results in completion order.
 
@@ -11290,21 +11380,47 @@ def _launch_reviewer_turns(
     so a late reviewer could echo it and panel agreement would stop being
     independent corroboration.  Completion order is still preserved for the
     publications themselves.
+
+    Publication is one comment per reviewer, so an interruption between two
+    posts leaves part of the round public.  With a ``spool``, every healthy
+    response is persisted privately before the first post; a rerun replays a
+    spooled response through ``replay_turn`` instead of re-invoking that
+    reviewer against its peers' visible bodies.  The round's spool is
+    discarded only after every publication succeeded.
     """
-    executor = ThreadPoolExecutor(max_workers=len(pending), thread_name_prefix=thread_name_prefix)
-    try:
-        futures = {executor.submit(run_turn, reviewer): reviewer for reviewer in pending}
-        results: dict[AgentName, _ReviewerTurnResult] = {}
-        for future in as_completed(futures):
-            results[futures[future]] = future.result()
-    except KeyboardInterrupt:
-        runner.terminate_active_processes()
-        raise
-    finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+    results: dict[AgentName, _ReviewerTurnResult] = {}
+    replayed: set[AgentName] = set()
+    if spool is not None and replay_turn is not None:
+        for reviewer in pending:
+            fields = spool.load(agent_display_name(reviewer))
+            if fields is None:
+                continue
+            result = replay_turn(reviewer, fields)
+            if result is not None:
+                results[reviewer] = result
+                replayed.add(reviewer)
+    to_launch = [reviewer for reviewer in pending if reviewer not in replayed]
+    if to_launch:
+        executor = ThreadPoolExecutor(max_workers=len(to_launch), thread_name_prefix=thread_name_prefix)
+        try:
+            futures = {executor.submit(run_turn, reviewer): reviewer for reviewer in to_launch}
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        except KeyboardInterrupt:
+            runner.terminate_active_processes()
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+    if spool is not None:
+        for reviewer, result in results.items():
+            if reviewer in replayed or result.error is not None or result.response is None:
+                continue
+            spool.store(agent_display_name(reviewer), _spooled_response_fields(result.response))
     if on_completion is not None:
         for reviewer, result in results.items():
             on_completion(reviewer, result)
+    if spool is not None:
+        spool.discard()
     return results
 
 
@@ -12520,6 +12636,22 @@ def _run_plan_first_loop(
                     f"in parallel on issue #{issue_number}",
                 )
 
+                def _plan_review_validators(reviewer_name: str) -> dict[str, object]:
+                    return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_plan_review_response(
+                        text,
+                        reviewer=reviewer_name,
+                        unresolved_items=prior_unresolved_items,
+                        # Never share the mutable round_new_unresolved_items list
+                        # with concurrent workers (#594): it only enriches the
+                        # UnknownPriorItemDispositionError message, so an empty
+                        # tuple here changes no validation outcome.
+                        current_round_items=(),
+                        surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
+                            issue_context.human_requirements,
+                            requirement_scope="planning requirements",
+                        ), architecture_status_mode=mode,
+                    ))
+
                 def _plan_reviewer_worker(reviewer: AgentName) -> _ReviewerTurnResult:
                     reviewer_name = agent_display_name(reviewer)
                     try:
@@ -12530,20 +12662,7 @@ def _run_plan_first_loop(
                             prompt=plan_prompts[reviewer],
                             session_id=reviewer_session_ids.get(reviewer),
                             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                            **_architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_plan_review_response(
-                                text,
-                                reviewer=reviewer_name,
-                                unresolved_items=prior_unresolved_items,
-                                # Never share the mutable round_new_unresolved_items list
-                                # with concurrent workers (#594): it only enriches the
-                                # UnknownPriorItemDispositionError message, so an empty
-                                # tuple here changes no validation outcome.
-                                current_round_items=(),
-                                surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
-                                    issue_context.human_requirements,
-                                    requirement_scope="planning requirements",
-                                ), architecture_status_mode=mode,
-                            )),
+                            **_plan_review_validators(reviewer_name),
                             usage_context=usage_context,
                             use_repair=True,
                             repair_expected_kind="plan_review",
@@ -12602,6 +12721,14 @@ def _run_plan_first_loop(
                     thread_name_prefix=f"plan-review-r{round_number}",
                     run_turn=_plan_reviewer_worker,
                     on_completion=_publish_plan_completion,
+                    spool=_review_round_spool(
+                        config, surface="plan", number=issue_number,
+                        round_number=round_number, subject=current_plan_subject,
+                    ),
+                    replay_turn=lambda reviewer, fields: _replay_spooled_review(
+                        runner, config=config, reviewer=reviewer, fields=fields,
+                        validators=_plan_review_validators(agent_display_name(reviewer)),
+                    ),
                 )
 
         for reviewer in round_reviewers:
@@ -20799,6 +20926,18 @@ def run_pr_loop(
                             f"in parallel on PR #{pr_number}",
                         )
 
+                        def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
+                            return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_review_response(
+                                text,
+                                reviewer=reviewer_name,
+                                unresolved_items=prior_unresolved_items,
+                                # Never share the mutable round_new_unresolved_items
+                                # list with concurrent workers (#594): it only
+                                # enriches the UnknownPriorItemDispositionError
+                                # message, so an empty tuple changes no outcome.
+                                current_round_items=(), architecture_status_mode=mode,
+                            ))
+
                         def _pr_reviewer_worker(reviewer: AgentName) -> _ReviewerTurnResult:
                             reviewer_name = agent_display_name(reviewer)
                             try:
@@ -20813,16 +20952,7 @@ def run_pr_loop(
                                         else reviewer_session_ids.get(reviewer)
                                     ),
                                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                                    **_architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_review_response(
-                                        text,
-                                        reviewer=reviewer_name,
-                                        unresolved_items=prior_unresolved_items,
-                                        # Never share the mutable round_new_unresolved_items
-                                        # list with concurrent workers (#594): it only
-                                        # enriches the UnknownPriorItemDispositionError
-                                        # message, so an empty tuple changes no outcome.
-                                        current_round_items=(), architecture_status_mode=mode,
-                                    )),
+                                    **_pr_review_validators(reviewer_name),
                                     usage_context=usage_context,
                                     use_repair=True,
                                     repair_expected_kind="pr_review",
@@ -20887,6 +21017,14 @@ def run_pr_loop(
                             thread_name_prefix=f"pr-review-r{round_number}",
                             run_turn=_pr_reviewer_worker,
                             on_completion=_publish_pr_completion,
+                            spool=_review_round_spool(
+                                config, surface="pr", number=pr_number,
+                                round_number=round_number, subject=current_pr_subject,
+                            ),
+                            replay_turn=lambda reviewer, fields: _replay_spooled_review(
+                                runner, config=config, reviewer=reviewer, fields=fields,
+                                validators=_pr_review_validators(agent_display_name(reviewer)),
+                            ),
                         )
                     else:
                         log(

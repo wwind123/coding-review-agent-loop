@@ -1069,6 +1069,156 @@ def test_pr_parallel_resume_after_publication_does_not_duplicate_or_lose_items(t
     assert "Persist this item." not in summary_block
 
 
+class _PartialPublicationProbeRunner(FakeRunner):
+    """Records every reviewer launch and the same-round bodies public at that moment."""
+
+    def __init__(self, *, round_markers, **kwargs):
+        super().__init__(**kwargs)
+        self.round_markers = round_markers
+        self.reviewer_launches: list[str] = []
+        self.peer_body_visible_at_launch = False
+
+    def run_with_log(self, args, *, cwd, **kwargs):
+        cmd = [str(arg) for arg in args]
+        if cmd[:1] in (["codex"], ["gemini"]):
+            self.reviewer_launches.append(cmd[0])
+            if any(marker in body for marker in self.round_markers for body in self.comments):
+                self.peer_body_visible_at_launch = True
+        return super().run_with_log(args, cwd=cwd, **kwargs)
+
+
+def _interrupt_on_second_review_post(real_post, markers):
+    """Interrupt the second same-round reviewer publication, whichever finished first."""
+    state = {"posted": 0, "fired": False}
+
+    def post(*args, **kwargs):
+        body = str(kwargs["body"])
+        if not state["fired"] and any(marker in body for marker in markers):
+            state["posted"] += 1
+            if state["posted"] == 2:
+                state["fired"] = True
+                raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    return post
+
+
+def _published_count(runner, marker):
+    return sum(marker in body for body in runner.comments)
+
+
+def _spool_files(config):
+    root = orchestrator.review_spool_root(config.agent_memory_dir)
+    return sorted(root.rglob("*.json")) if root.exists() else []
+
+
+def test_pr_parallel_interruption_between_publications_replays_withheld_review(tmp_path):
+    markers = ("Codex found a blocker.", "Gemini approves independently.")
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Codex found a blocker.", blocking_items=["Persist this item."]
+            ),
+            structured_pr_review(
+                summary="Codex approves after the fix.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[
+            structured_pr_review(summary="Gemini approves independently.", reviewer="Google Gemini"),
+            structured_pr_review(
+                summary="Gemini approves after the fix.", reviewer="Google Gemini",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(
+            summary="Fixed the persisted item.", addressed_items=["item-1"]
+        )],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    real_post = orchestrator.post_pr_comment
+
+    # Stop after the first reviewer body is public but before the second one.
+    with patch.object(
+        orchestrator, "post_pr_comment",
+        side_effect=_interrupt_on_second_review_post(real_post, markers),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert sorted(_published_count(runner, marker) for marker in markers) == [0, 1]
+    assert _spool_files(config), "withheld review was not persisted before publication"
+    launches_before_rerun = list(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    rerun_launches = runner.reviewer_launches[len(launches_before_rerun):]
+    # Round 1 is completed from the spool: neither round-1 reviewer runs again.
+    # The next launches belong to round 2, after the coder follow-up.
+    assert rerun_launches.count("gemini") == 1 and rerun_launches.count("codex") == 1
+    first_claude = next(
+        index for index, (cmd, _cwd) in enumerate(runner.commands) if cmd[:1] == ["claude"]
+    )
+    round_one_reviewers = [
+        cmd[0] for cmd, _cwd in runner.commands[:first_claude] if cmd[:1] in (["codex"], ["gemini"])
+    ]
+    assert sorted(round_one_reviewers) == ["codex", "gemini"]
+    assert [_published_count(runner, marker) for marker in markers] == [1, 1]
+    assert _spool_files(config) == []
+
+
+def test_plan_parallel_interruption_between_publications_replays_withheld_review(tmp_path):
+    markers = ("Codex plan approval with a unique note.", "Gemini independent plan approval.")
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        claude_outputs=[_initial_plan()],
+        codex_outputs=[structured_plan_review(summary="Codex plan approval with a unique note.")],
+        gemini_outputs=[structured_plan_review(
+            summary="Gemini independent plan approval.", reviewer="Google Gemini"
+        )],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    real_post = orchestrator.post_issue_comment
+
+    with patch.object(
+        orchestrator, "post_issue_comment",
+        side_effect=_interrupt_on_second_review_post(real_post, markers),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert sorted(_published_count(runner, marker) for marker in markers) == [0, 1]
+    assert _spool_files(config)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    # The withheld review was replayed, never re-run against its peer's
+    # already-public body.
+    assert sorted(runner.reviewer_launches) == ["codex", "gemini"]
+    assert not runner.peer_body_visible_at_launch
+    assert [_published_count(runner, marker) for marker in markers] == [1, 1]
+    assert _spool_files(config) == []
+
+
+def test_review_round_spool_rejects_foreign_or_malformed_records(tmp_path):
+    from coding_review_agent_loop.review_spool import ReviewRoundSpool
+
+    spool = ReviewRoundSpool(
+        root=tmp_path, repo="o/r", surface="pr", number=7, round_number=1, subject="abc"
+    )
+    spool.store("Codex", {"text": "body", "model_used": "m"})
+    assert spool.load("Codex")["text"] == "body"
+    assert spool.load("Google Gemini") is None
+    other_round = dataclasses.replace(spool, round_number=2)
+    assert other_round.load("Codex") is None
+    other_subject = dataclasses.replace(spool, subject="def")
+    assert other_subject.load("Codex") is None
+    path = next(spool.directory.glob("*.json"))
+    path.write_text("{not json", encoding="utf-8")
+    assert spool.load("Codex") is None
+    spool.discard()
+    assert not spool.directory.exists()
+
+
 # ---------------------------------------------------------------------------
 # Collect-then-apply-then-raise, with resume
 # ---------------------------------------------------------------------------
