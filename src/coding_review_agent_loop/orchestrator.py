@@ -54,6 +54,8 @@ from .board_amendment import (
 )
 from .decomposition import (
     _decode_json_payload,
+    EXECUTION_DECISION_MARKER_RE,
+    issue_has_execution_decision,
     CreatedPhaseIssue,
     PlanDecomposition,
     RecordedPhase,
@@ -128,6 +130,7 @@ from .expected_closure import (
     resolve_issue_contract,
 )
 from .github import (
+    _REST_ISSUE_COMMENT_PAGE_SIZE,
     CiWatchOutcome,
     strip_bot_login_suffix,
     IssueContext,
@@ -157,6 +160,7 @@ from .github import (
     note_host_footer_observed,
     reset_authenticated_github_actor,
     reset_host_footer_log_latch,
+    read_rest_issue_comments,
     resolve_authenticated_github_actor,
     reject_forged_protocol_markers,
     search_issues,
@@ -169,6 +173,8 @@ from .github import (
     watch_pr_checks,
 )
 from .issue_pr_handoff import (
+    AGENT_ISSUE_PR_HANDOFF_RE,
+    decode_issue_pr_handoff_record,
     find_latest_issue_pr_handoff,
     authenticate_canonical_issue_pr,
     format_issue_pr_handoff_comment,
@@ -508,6 +514,8 @@ from .comment_rendering import (
 )
 from .followups import (
     APPROVED_FOLLOWUP_MARKER_RE,
+    PLAN_APPROVED_FOLLOWUP_MARKER_RE,
+    approved_plan_hashes_for_issue,
     GroupedApprovedFollowup,
     MAX_APPROVED_FOLLOWUP_ISSUES,
     _append_approved_followups_marker,
@@ -7386,6 +7394,126 @@ def _child_resume_hint(child_issue_number: int, disposition: str) -> str:
     if disposition == EXECUTION_DISPOSITION_PLANNING:
         return f"agent-loop issue {child_issue_number} --plan-first --plan-execution-mode auto"
     return f"agent-loop issue {child_issue_number}"
+
+
+def _projection_may_carry_planning_record(comments: Sequence[object]) -> bool:
+    """Whether the issue-view projection could hide or show planning state.
+
+    A cheap, unauthenticated pre-check: it only decides whether the complete,
+    author-authenticated history must be read.  The ``gh issue view``
+    projection is capped, so a full projection may have dropped older
+    records and always triggers the authenticated read.
+    """
+    if len(comments) >= _REST_ISSUE_COMMENT_PAGE_SIZE:
+        return True
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        if PLAN_APPROVED_FOLLOWUP_MARKER_RE.search(body) or EXECUTION_DECISION_MARKER_RE.search(body):
+            return True
+        for match in ROUND_RESUME_MARKER_RE.finditer(body):
+            try:
+                flow = decode_mapping(match.group("payload")).get("flow")
+            except Exception:  # noqa: BLE001 - malformed text only widens the read
+                return True
+            if flow == "plan":
+                return True
+        # An approved-plan handoff can be the only planning record left in
+        # view; a direct-flow handoff is ordinary resume state and is not.
+        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(body):
+            try:
+                handoff = decode_issue_pr_handoff_record(match.group("payload"))
+            except Exception:  # noqa: BLE001 - malformed text only widens the read
+                return True
+            if handoff.flow == "approved-plan-implementation":
+                return True
+    return False
+
+
+def _refuse_plain_mode_over_planning(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    projection_comments: Sequence[object],
+) -> None:
+    """Refuse plain issue mode on an issue that planning already decided (#1088).
+
+    Plain mode implements from the issue text and never consults an approved
+    plan, so running it over one would silently discard the reviewed plan.
+    This mirrors the decomposition-child guard for a top-level issue.
+
+    Only records authored by the authenticated agent-loop actor count, read
+    from the complete REST history so the projection's connection cap cannot
+    hide them; a foreign comment can neither fabricate nor mask a decision.
+    """
+    if not _projection_may_carry_planning_record(projection_comments):
+        return
+    login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    comments = tuple(
+        comment
+        for comment in read_rest_issue_comments(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            purpose="plain issue mode cannot confirm the issue has no approved plan",
+        )
+        if comment.author_id == actor_id
+        and strip_bot_login_suffix(comment.author) == strip_bot_login_suffix(login)
+    )
+    evidence: list[str] = []
+    try:
+        plan_records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError as exc:
+        raise AgentLoopError(
+            f"Issue #{issue_number} carries planning round records that cannot be read ({exc}); "
+            "plain issue mode will not implement over them. Repair the records, or rerun "
+            f"`agent-loop issue {issue_number} --plan-first`."
+        ) from exc
+    if any(
+        record.metadata.role == "reviewer" and record.metadata.state == "approved"
+        for record in plan_records
+    ):
+        evidence.append("an approved planning review")
+    plan_hashes = approved_plan_hashes_for_issue(comments, issue_number=issue_number)
+    if plan_hashes:
+        evidence.append(f"an approved plan (hash {plan_hashes[-1]})")
+    # Our own decision records on this thread are posted to their parent
+    # issue, so an undecodable one still belongs here and fails closed.
+    if issue_has_execution_decision(comments, issue_number=issue_number):
+        evidence.append("a recorded execution decision")
+    # Every handoff counts, not only the latest: a later direct-flow handoff
+    # to another PR does not retire the approved plan an earlier one bound.
+    approved_handoff_prs: list[int] = []
+    unreadable_handoff = False
+    for comment in comments:
+        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(comment.body or ""):
+            try:
+                handoff = decode_issue_pr_handoff_record(match.group("payload"))
+            except AgentLoopError:
+                unreadable_handoff = True
+                continue
+            if (
+                handoff.issue_number == issue_number
+                and handoff.flow == "approved-plan-implementation"
+                and handoff.pr_number not in approved_handoff_prs
+            ):
+                approved_handoff_prs.append(handoff.pr_number)
+    if approved_handoff_prs:
+        evidence.append(
+            "an approved-plan implementation handoff to "
+            + ", ".join(f"PR #{number}" for number in approved_handoff_prs)
+        )
+    if unreadable_handoff:
+        evidence.append("an implementation handoff record that cannot be read")
+    if not evidence:
+        return
+    raise AgentLoopError(
+        f"Issue #{issue_number} already carries {', '.join(evidence)}; plain issue mode "
+        "implements from the issue text and would bypass the reviewed plan. Rerun "
+        f"`agent-loop issue {issue_number} --plan-first` to resume from the approved plan."
+    )
 
 
 def _post_child_planning_handoff(
@@ -15367,6 +15495,16 @@ def run_issue_loop(
                     runner, config=config, issue_number=fresh_child.parent_issue
                 )
 
+        if not plan_first:
+            # A decomposition child was routed above; this is the structurally
+            # identical top-level case, which must fail closed too (#1088).
+            _refuse_plain_mode_over_planning(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                projection_comments=issue_context.comments,
+            )
+
         recovered_plan_hash: str | None = None
         recovered_plan_additions: tuple[int, ...] | None = None
         recovered_plan_context: ApprovedPlanContext | None = None
@@ -15770,6 +15908,14 @@ def run_issue_loop(
         # The first issue snapshot was used for validation and provenance; the
         # implementation handoff must use fresh target and parent snapshots.
         issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
+        # A concurrent plan-first run may have approved since the first
+        # snapshot; recheck the one the coder is dispatched from (#1088).
+        _refuse_plain_mode_over_planning(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            projection_comments=issue_context.comments,
+        )
         if parent_issue_context is not None:
             parent_issue_context = get_issue_context(
                 runner, config=config, issue_number=parent_issue_context.number

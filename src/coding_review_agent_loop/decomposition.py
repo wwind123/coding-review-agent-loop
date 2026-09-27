@@ -2317,6 +2317,26 @@ def find_existing_execution_decision(
     return found
 
 
+def issue_has_execution_decision(comments: Sequence[object], *, issue_number: int) -> bool:
+    """Whether any execution decision record is bound to ``issue_number``.
+
+    Used by plain issue mode to refuse bypassing a planning decision (#1088).
+    An undecodable record counts as present so the check fails closed.
+    """
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in EXECUTION_DECISION_MARKER_RE.finditer(body):
+            try:
+                decision = _decode_execution_decision(match.group("payload"))
+            except AgentLoopError:
+                return True
+            if decision.parent_issue == issue_number:
+                return True
+    return False
+
+
 def post_execution_decision(
     runner: Runner,
     *,

@@ -567,6 +567,27 @@ def _has_plan_approved_followups_marker(
     return False
 
 
+def approved_plan_hashes_for_issue(
+    comments: Sequence[object],
+    *,
+    issue_number: int,
+) -> tuple[str, ...]:
+    """Plan hashes named by this issue's plan-approval announcements, in order.
+
+    Every approved plan-first round posts one announcement carrying this
+    record, so plain issue mode can see a plan was approved (#1088).
+    """
+    hashes: list[str] = []
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in PLAN_APPROVED_FOLLOWUP_MARKER_RE.finditer(body):
+            if int(match.group("issue")) == issue_number and match.group("plan") not in hashes:
+                hashes.append(match.group("plan"))
+    return tuple(hashes)
+
+
 def _followup_issue_title(followup: ApprovedFollowup) -> str:
     text = " ".join(_safe_followup_main_text(followup.text).split())
     title = f"Follow up future review note: {text}"

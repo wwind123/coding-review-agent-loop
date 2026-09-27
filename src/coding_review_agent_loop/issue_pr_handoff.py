@@ -806,6 +806,19 @@ def issue_pr_handoff_payload_schema_version(encoded: str) -> object:
     return _decode_json_payload(encoded).get("schema_version")
 
 
+def decode_issue_pr_handoff_record(
+    encoded: str,
+) -> IssuePrHandoffMetadata | IssuePrHandoffMetadataV2:
+    """Decode one handoff record of either schema version.
+
+    Both versions share one record label, so the declared version selects
+    the decoder.  A malformed payload raises ``AgentLoopError``.
+    """
+    if issue_pr_handoff_payload_schema_version(encoded) == HANDOFF_V2_SCHEMA_VERSION:
+        return decode_issue_pr_handoff_v2(encoded)
+    return _decode_issue_pr_handoff_metadata(encoded)
+
+
 def issue_pr_handoff_record_hash(
     metadata: IssuePrHandoffMetadata | IssuePrHandoffMetadataV2,
 ) -> str:

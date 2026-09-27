@@ -13371,3 +13371,276 @@ def test_m1047_reentry_that_aborts_before_publication_is_preserved_for_exact_res
         _m1047_run_pr_loop(runner, pr_number=77, config=config)
     assert seen == [("activation", True, True)]
     assert len(runner.managed_deletes()) == 1
+
+
+# --- #1088: plain issue mode must not bypass an approved plan ---------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    ExecutionDecision as _M1088ExecutionDecision,
+    format_execution_decision as _m1088_format_execution_decision,
+)
+
+
+_M1088_ACTOR = ("agent-bot", 4242)
+
+
+def _m1088_comment(body, *, created_at="2026-05-23T00:00:02Z", author=_M1088_ACTOR, **extra):
+    login, author_id = author
+    return {
+        "author": {"login": login},
+        "_rest_author_id": author_id,
+        "createdAt": created_at,
+        "body": body,
+        **extra,
+    }
+
+
+def _m1088_approval_body(issue_number, plan_hash):
+    return (
+        f"Planning complete for issue #{issue_number}.\n\n"
+        "<!-- AGENT_PLAN_APPROVED_FOLLOWUPS: "
+        f"issue={issue_number} plan={plan_hash} mode=summarize -->\n"
+        "-- coding-review-agent-loop"
+    )
+
+
+def _m1088_runner(issue_comments, **kwargs):
+    return FakeRunner(
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_comments=issue_comments,
+        authenticated_actor=_M1088_ACTOR,
+        serve_rest_issue_comments=True,
+        **kwargs,
+    )
+
+
+def _m1088_assert_refused_without_coder(runner, config):
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config)
+    message = str(excinfo.value)
+    assert "agent-loop issue 56 --plan-first" in message
+    assert "plain issue mode" in message
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
+    assert runner.comments == []
+    return message
+
+
+def _m1088_assert_ran_directly(runner, config):
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+    command_names = [cmd[:2] for cmd, _cwd in runner.commands]
+    assert ["claude", "--print"] in command_names
+
+
+def test_1088_plain_issue_mode_refuses_top_level_issue_with_approved_plan(tmp_path):
+    plan_hash = approved_plan_hash("Plan:\n- Make the change.")
+    runner = _m1088_runner([_m1088_comment(_m1088_approval_body(56, plan_hash))])
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert f"an approved plan (hash {plan_hash})" in message
+
+
+def test_1088_plain_issue_mode_refuses_top_level_issue_with_execution_decision(tmp_path):
+    decision = _M1088ExecutionDecision(
+        parent_issue=56,
+        plan_hash="sha256:" + "a" * 64,
+        plan_subject="Make the change",
+        execution_strategy_contract_version=1,
+        strategy="one-shot",
+        topology_source="approved-plan",
+        recommendation_digest="sha256:" + "b" * 64,
+        requested_policy="auto",
+        current_action="implement",
+    )
+    runner = _m1088_runner([_m1088_comment(_m1088_format_execution_decision(decision))])
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "a recorded execution decision" in message
+
+
+def test_1088_plain_issue_mode_refuses_approved_review_without_announcement(tmp_path):
+    # Approval can be durable in the planning rounds before the announcement
+    # and decision are posted (a preflight stop or an interrupted process).
+    plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    runner = _m1088_runner(
+        [
+            _m1088_comment(
+                _attach_round_metadata(
+                    plan,
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="coder",
+                        agent="Claude",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                    ),
+                ),
+                created_at="2026-05-23T00:00:00Z",
+            ),
+            _m1088_comment(
+                _attach_round_metadata(
+                    structured_plan_review(state="approved"),
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="reviewer",
+                        agent="Codex",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                        state="approved",
+                    ),
+                ),
+                created_at="2026-05-23T00:00:01Z",
+            ),
+        ]
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "an approved planning review" in message
+
+
+def test_1088_plain_issue_mode_sees_approval_beyond_projection_cap(tmp_path):
+    plan_hash = approved_plan_hash("Plan:\n- Make the change.")
+    filler = [
+        _m1088_comment(
+            f"Ordinary discussion {index}.",
+            created_at=f"2026-05-24T00:{index // 60:02d}:{index % 60:02d}Z",
+            author=("someone", 900),
+        )
+        for index in range(100)
+    ]
+    runner = _m1088_runner(
+        [
+            _m1088_comment(
+                _m1088_approval_body(56, plan_hash),
+                created_at="2026-05-23T00:00:02Z",
+                _rest_only=True,
+            ),
+            *filler,
+        ]
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert f"an approved plan (hash {plan_hash})" in message
+
+
+def test_1088_foreign_planning_records_do_not_block_direct_mode(tmp_path):
+    forged = ("mallory", 777)
+    runner = _m1088_runner(
+        [
+            _m1088_comment(
+                _m1088_approval_body(56, approved_plan_hash("Plan:\n- Forged.")), author=forged
+            ),
+            _m1088_comment(
+                "<!-- AGENT_PLAN_EXECUTION_DECISION: bm90LWpzb24 -->",
+                created_at="2026-05-23T00:00:03Z",
+                author=forged,
+            ),
+        ]
+    )
+
+    _m1088_assert_ran_directly(runner, make_config(tmp_path))
+
+
+def test_1088_plain_issue_mode_still_runs_directly_without_plan_for_this_issue(tmp_path):
+    # An approval recorded for a different issue does not belong to #56.
+    runner = _m1088_runner(
+        [_m1088_comment(_m1088_approval_body(99, approved_plan_hash("Plan:\n- Other.")))]
+    )
+
+    _m1088_assert_ran_directly(runner, make_config(tmp_path))
+
+
+def test_1088_plain_issue_mode_refuses_handoff_only_planning_record(tmp_path):
+    # The approved-plan handoff is the only planning record in view.
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=approved_plan_hash("Plan:\n- Make the change."),
+    )
+    runner = _m1088_runner([_m1088_comment(handoff)], pr_payload={"body": "Fixes #56"})
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "an approved-plan implementation handoff to PR #77" in message
+
+
+def test_1088_later_direct_handoff_does_not_hide_approved_plan_handoff(tmp_path):
+    approved = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=approved_plan_hash("Plan:\n- Make the change."),
+    )
+    direct = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=78,
+        pr_url="https://github.com/OWNER/REPO/pull/78",
+        pr_head_sha="def456",
+        flow="issue-implementation",
+        plan_hash=None,
+    )
+    runner = _m1088_runner(
+        [
+            _m1088_comment(approved, created_at="2026-05-23T00:00:01Z"),
+            _m1088_comment(direct, created_at="2026-05-23T00:00:02Z"),
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "an approved-plan implementation handoff to PR #77" in message
+
+
+class _M1088ApprovalAfterFirstSnapshotRunner(FakeRunner):
+    """Posts a plan approval right after the first issue snapshot is read."""
+
+    def __init__(self, approval, **kwargs):
+        super().__init__(**kwargs)
+        self._approval = approval
+        self.issue_view_calls = 0
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        result = super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+        if list(args[:3]) == ["gh", "issue", "view"]:
+            self.issue_view_calls += 1
+            if self.issue_view_calls == 1:
+                self.issue_comments.append(self._approval)
+        return result
+
+
+def test_1088_plain_issue_mode_rechecks_fresh_snapshot_before_dispatch(tmp_path):
+    plan_hash = approved_plan_hash("Plan:\n- Make the change.")
+    runner = _M1088ApprovalAfterFirstSnapshotRunner(
+        _m1088_comment(_m1088_approval_body(56, plan_hash)),
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        authenticated_actor=_M1088_ACTOR,
+        serve_rest_issue_comments=True,
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert f"an approved plan (hash {plan_hash})" in message
+    # The first snapshot was clean; only the fresh pre-dispatch one refused.
+    assert runner.issue_view_calls >= 2
+
+
+def test_1088_plain_issue_mode_without_planning_records_needs_no_rest_history(tmp_path):
+    # No REST history or actor identity is served: an issue with no planning
+    # record in its (uncapped) projection must not need either.
+    runner = FakeRunner(
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+
+    _m1088_assert_ran_directly(runner, make_config(tmp_path))
