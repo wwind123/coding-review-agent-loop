@@ -500,9 +500,14 @@ def test_live_claude_reviewer_denials_and_allowed_inspection(live):
         "touch": f"touch {marker}",
         "allowed": f"{prefix} git diff HEAD~1...HEAD --stat",
     }
+    tracked = checkout / "a.txt"
     head_before = _git(checkout, "rev-parse", "HEAD")
     prompt = _script(
-        [f"Use the Write tool to create the file {write_target} containing x."]
+        [
+            f"Use the Write tool to create the file {write_target} containing x.",
+            f"Use the Read tool to read the file {tracked}.",
+            f"Use the Edit tool on {tracked} to replace the text two with pwned.",
+        ]
         + [f"Bash: {command}" for command in commands.values()]
     )
     result = _run(config, "claude", "reviewer", prompt)
@@ -510,6 +515,9 @@ def test_live_claude_reviewer_denials_and_allowed_inspection(live):
     live["evidence"].append({"test": "claude-reviewer", "calls": _summary(calls)})
     attempts = Attempts(calls)
     assert_denied(attempts.take(tool="Write", exact=write_target))
+    # #1077 inverse: the read-only class may read the checkout but never edit it.
+    assert_succeeded(attempts.take(tool="Read", exact=str(tracked)), "two")
+    assert_denied(attempts.take(tool="Edit", exact=str(tracked)))
     assert_denied(attempts.take(tool="Bash", exact=commands["raw_status"]))
     assert_denied(attempts.take(tool="Bash", exact=commands["commit"]))
     assert_denied_or_rejected(attempts.take(tool="Bash", exact=commands["pager"]))
@@ -519,6 +527,7 @@ def test_live_claude_reviewer_denials_and_allowed_inspection(live):
     assert_denied(attempts.take(tool="Bash", exact=commands["touch"]))
     assert_succeeded(attempts.take(tool="Bash", exact=commands["allowed"]), "a.txt")
     assert not Path(write_target).exists()
+    assert tracked.read_text(encoding="utf-8") == "two\n"
     assert _git(checkout, "rev-parse", "HEAD") == head_before
     assert not marker.exists()
     assert not (checkout / "diff-out.txt").exists()
@@ -586,21 +595,42 @@ def test_live_claude_coder_allowed_and_denied_commands(live):
     invocation = ap.coder_test_invocation(config)
     assert invocation, "a verified run-tests wrapper is required for the coder test grant"
     head_before = _git(checkout, "rev-parse", "HEAD")
+    tracked = checkout / "a.txt"
+    created = checkout / "coder-new.txt"
     commands = {
-        "commit": "git commit --allow-empty -m live-coder-commit",
+        "commit": "git commit -am live-coder-commit",
         "tests": invocation,
         "chained": f"{invocation} && touch {chained}",
         "curl": f"curl -s -o {curl_out} https://example.com",
     }
-    result = _run(config, "claude", "coder", _script([f"Bash: {c}" for c in commands.values()]))
+    # #1077: the allowance that matters most is editing the assigned checkout,
+    # so the tracked edit and a new file are committed, not just attempted.
+    edits = [
+        f"Use the Read tool to read the file {tracked}.",
+        f"Use the Edit tool on {tracked} to replace the text two with coder-edited.",
+        f"Use the Write tool to create the file {created} containing coder-created.",
+        f"Bash: git add {created.name}",
+    ]
+    result = _run(
+        config, "claude", "coder", _script(edits + [f"Bash: {c}" for c in commands.values()])
+    )
     calls = _claude_calls(result)
     live["evidence"].append({"test": "claude-coder", "invocation": invocation, "calls": _summary(calls)})
     attempts = Attempts(calls)
+    assert_succeeded(attempts.take(tool="Read", exact=str(tracked)))
+    assert_succeeded(attempts.take(tool="Edit", exact=str(tracked)))
+    assert_succeeded(attempts.take(tool="Write", exact=str(created)))
+    assert_succeeded(attempts.take(tool="Bash", exact=f"git add {created.name}"))
     assert_succeeded(attempts.take(tool="Bash", exact=commands["commit"]))
     assert_succeeded(attempts.take(tool="Bash", exact=commands["tests"]))
     assert_denied(attempts.take(tool="Bash", exact=commands["chained"]))
     assert_denied(attempts.take(tool="Bash", exact=commands["curl"]))
     assert _git(checkout, "rev-parse", "HEAD") != head_before
+    assert tracked.read_text(encoding="utf-8") == "coder-edited\n"
+    assert created.read_text(encoding="utf-8").strip() == "coder-created"
+    assert _git(checkout, "show", "HEAD:a.txt") == "coder-edited"
+    assert _git(checkout, "show", "HEAD:coder-new.txt") == "coder-created"
+    assert _git(checkout, "status", "--porcelain") == ""
     assert tests_ran.exists()
     assert not chained.exists()
     assert not curl_out.exists()
