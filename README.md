@@ -544,7 +544,9 @@ creating a waiver record.
 Repeat `--reviewer` to require multiple approvals. Use `--review-parallel` when
 the reviewers have distinct workdirs and may run concurrently. Same-round
 review comments are posted only after every reviewer in the round has
-returned, so no reviewer can read a peer's findings mid-turn:
+returned, so no reviewer can read a peer's findings mid-turn. A reviewer that
+must be retried, or a round interrupted mid-publication, is resumed from a
+private local spool rather than re-run against peers' posted reviews:
 
 ```bash
 agent-loop pr 456 \

@@ -11356,15 +11356,105 @@ def _spooled_response_fields(response: ValidatedAgentResponse) -> dict[str, obje
     }
 
 
+def _incomplete_plan_review_error(reviewer_name: str) -> AgentLoopError:
+    return AgentLoopError(
+        f"{reviewer_name} did not complete plan review and reported no actionable "
+        "blocking plan issues or Same-Plan follow-ups. This is a reviewer-internal error; "
+        "agent-loop stopped before a coder follow-up. Rerun or switch the reviewer/model "
+        "after resolving the reviewer environment."
+    )
+
+
+def _incomplete_pr_review_error(reviewer_name: str) -> AgentLoopError:
+    return AgentLoopError(
+        f"{reviewer_name} did not complete PR review and reported no actionable "
+        "blocking items or Same-PR follow-ups. This is a reviewer-internal error; "
+        "agent-loop stopped before a coder follow-up. Rerun or switch the reviewer/model "
+        "after resolving the reviewer environment."
+    )
+
+
+class PartialReviewRoundError(AgentLoopError):
+    """A reviewer would have to run while a same-round peer's body is public (#1025)."""
+
+
+def _partial_round_refusal(
+    *, surface: str, number: int, round_number: int, reviewer_name: str, public_peers: Sequence[str]
+) -> PartialReviewRoundError:
+    target = f"PR #{number}" if surface == "pr" else f"issue #{number}"
+    return PartialReviewRoundError(
+        f"Review round {round_number} on {target} is partially published "
+        f"({', '.join(public_peers)} already posted) but {reviewer_name}'s withheld "
+        "same-round outcome is missing or no longer validates, so invoking it now would "
+        "let it read its peers' findings. Rerun from the host whose agent-loop cache "
+        "holds the round's review spool, or delete the round's already-posted reviewer "
+        "comments so the whole round runs again independently."
+    )
+
+
+def _replay_spooled_failure(fields: dict[str, object], reviewer_name: str) -> AgentInvocationError | None:
+    failure = fields.get("failure")
+    if not isinstance(failure, dict):
+        return None
+    return AgentInvocationError(
+        f"{reviewer_name} (replayed from its withheld same-round outcome): {failure.get('message')}",
+        failure_category=failure.get("failure_category"),  # type: ignore[arg-type]
+    )
+
+
+def _same_round_replay_or_invoke(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    reviewer: AgentName,
+    spool: ReviewRoundSpool,
+    public_peers: Sequence[AgentName],
+    validators: dict[str, object],
+    invoke: Callable[[], ValidatedAgentResponse],
+    already_posted: bool = False,
+) -> ValidatedAgentResponse:
+    """Sequential-mode seam: never invoke a reviewer against public same-round peers.
+
+    A parallel round interrupted between publications may be resumed without
+    ``--review-parallel``.  The unpublished reviewer's withheld outcome is then
+    replayed exactly as in parallel mode; without a valid one the run stops
+    instead of invoking the reviewer.
+    """
+    reviewer_name = agent_display_name(reviewer)
+    peers = [agent_display_name(peer) for peer in public_peers if peer != reviewer]
+    if not peers:
+        return invoke()
+    fields = None if already_posted else spool.load(reviewer_name)
+    if fields is not None:
+        failure = _replay_spooled_failure(fields, reviewer_name)
+        if failure is not None:
+            raise failure
+        replayed = _replay_spooled_review(
+            runner, config=config, reviewer=reviewer, fields=fields, validators=validators
+        )
+        if replayed is not None and replayed.response is not None:
+            return replayed.response
+    raise _partial_round_refusal(
+        surface=spool.surface, number=spool.number, round_number=spool.round_number,
+        reviewer_name=reviewer_name, public_peers=sorted(peers),
+    )
+
+
 def _launch_reviewer_turns(
     runner: Runner,
     pending: Sequence[AgentName],
     *,
     thread_name_prefix: str,
     run_turn: Callable[[AgentName], _ReviewerTurnResult],
-    on_completion: Callable[[AgentName, _ReviewerTurnResult], None] | None = None,
+    on_completion: Callable[[AgentName, _ReviewerTurnResult], bool | None] | None = None,
     spool: ReviewRoundSpool | None = None,
     replay_turn: Callable[[AgentName, dict[str, object]], _ReviewerTurnResult | None] | None = None,
+    public_peers: Sequence[AgentName] = (),
+    retry_bound: Callable[[AgentName, _ReviewerTurnResult], AgentLoopError | None] | None = None,
+    prelaunch_failures: dict[AgentName, _ReviewerTurnResult] | None = None,
+    configured_order: Sequence[AgentName] = (),
+    config: AgentLoopConfig | None = None,
+    already_posted: Sequence[AgentName] = (),
 ) -> dict[AgentName, _ReviewerTurnResult]:
     """Run workers concurrently, then deliver results in completion order.
 
@@ -11381,25 +11471,54 @@ def _launch_reviewer_turns(
     independent corroboration.  Completion order is still preserved for the
     publications themselves.
 
-    Publication is one comment per reviewer, so an interruption between two
-    posts leaves part of the round public.  With a ``spool``, every healthy
-    response is persisted privately before the first post; a rerun replays a
-    spooled response through ``replay_turn`` instead of re-invoking that
-    reviewer against its peers' visible bodies.  The round's spool is
-    discarded only after every publication succeeded.
+    With a ``spool``, no reviewer is ever invoked while a same-round peer's
+    body is public:
+
+    * every settled outcome (validated response, or a failure that settles the
+      reviewer as unavailable) is persisted privately before the first post,
+      and a rerun replays it instead of re-invoking the reviewer, so an
+      interruption between posts is harmless;
+    * when ``retry_bound`` reports that some reviewer must be re-invoked (a
+      fatal failure or an incomplete review), nothing is published: the
+      healthy outcomes stay in the spool and that failure is raised, so the
+      retried reviewer later runs with no same-round peer body visible;
+    * a reviewer still needing a fresh turn while ``public_peers`` is
+      non-empty -- a lost or invalid spool record -- stops the run.
+
+    A reviewer in ``already_posted`` has its own same-round record on the
+    surface that resume rejected; it is re-invoked, never replayed.
+
+    The round's spool is discarded only after every publication succeeded.
     """
     results: dict[AgentName, _ReviewerTurnResult] = {}
     replayed: set[AgentName] = set()
     if spool is not None and replay_turn is not None:
         for reviewer in pending:
-            fields = spool.load(agent_display_name(reviewer))
+            reviewer_name = agent_display_name(reviewer)
+            if reviewer in already_posted:
+                spool.remove(reviewer_name)
+                continue
+            fields = spool.load(reviewer_name)
             if fields is None:
                 continue
-            result = replay_turn(reviewer, fields)
+            failure = _replay_spooled_failure(fields, reviewer_name)
+            result = (
+                _ReviewerTurnResult(reviewer_name=reviewer_name, error=failure)
+                if failure is not None
+                else replay_turn(reviewer, fields)
+            )
             if result is not None:
                 results[reviewer] = result
                 replayed.add(reviewer)
     to_launch = [reviewer for reviewer in pending if reviewer not in replayed]
+    if spool is not None and to_launch:
+        peers = sorted(agent_display_name(peer) for peer in public_peers if peer not in to_launch)
+        if peers:
+            raise _partial_round_refusal(
+                surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                reviewer_name=", ".join(agent_display_name(reviewer) for reviewer in to_launch),
+                public_peers=peers,
+            )
     if to_launch:
         executor = ThreadPoolExecutor(max_workers=len(to_launch), thread_name_prefix=thread_name_prefix)
         try:
@@ -11411,16 +11530,57 @@ def _launch_reviewer_turns(
             raise
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
-    if spool is not None:
-        for reviewer, result in results.items():
-            if reviewer in replayed or result.error is not None or result.response is None:
-                continue
-            spool.store(agent_display_name(reviewer), _spooled_response_fields(result.response))
+    if spool is None:
+        if on_completion is not None:
+            for reviewer, result in results.items():
+                on_completion(reviewer, result)
+        return results
+
+    settled: dict[AgentName, _ReviewerTurnResult] = {**(prelaunch_failures or {}), **results}
+    retry_errors: dict[AgentName, AgentLoopError] = {}
+    if retry_bound is not None:
+        for reviewer, result in settled.items():
+            error = retry_bound(reviewer, result)
+            if error is not None:
+                retry_errors[reviewer] = error
+    for reviewer, result in settled.items():
+        if reviewer in replayed or reviewer in retry_errors:
+            continue
+        reviewer_name = agent_display_name(reviewer)
+        if result.error is not None:
+            spool.store_failure(
+                reviewer_name,
+                message=str(result.error),
+                failure_category=getattr(result.error, "failure_category", None),
+            )
+        elif result.response is not None:
+            spool.store(reviewer_name, _spooled_response_fields(result.response))
+    withheld = [
+        reviewer for reviewer, result in results.items()
+        if reviewer not in retry_errors and result.error is None and result.response is not None
+    ]
+    if retry_errors and withheld:
+        order = {reviewer: index for index, reviewer in enumerate(configured_order or pending)}
+        failed = sorted(retry_errors, key=lambda reviewer: order.get(reviewer, len(order)))
+        if config is not None:
+            log(
+                config,
+                "Withholding the same-round review(s) of "
+                f"{', '.join(agent_display_name(r) for r in withheld)} until "
+                f"{', '.join(agent_display_name(r) for r in failed)} completes an independent "
+                "turn; rerun to retry",
+            )
+        for reviewer in failed:
+            if isinstance(retry_errors[reviewer], QuotaResetExceededError):
+                raise retry_errors[reviewer]
+        raise retry_errors[failed[0]]
     if on_completion is not None:
         for reviewer, result in results.items():
-            on_completion(reviewer, result)
-    if spool is not None:
-        spool.discard()
+            if on_completion(reviewer, result):
+                # Published now: a rerun resumes (or, if the posted record is
+                # rejected, re-invokes) it rather than replaying a stale outcome.
+                spool.remove(agent_display_name(reviewer))
+    spool.discard()
     return results
 
 
@@ -12620,6 +12780,12 @@ def _run_plan_first_loop(
                 ),
             )
 
+        # One private spool per round, shared by the parallel launcher and the
+        # sequential resume seam (#1025).
+        plan_round_spool = _review_round_spool(
+            config, surface="plan", number=issue_number,
+            round_number=round_number, subject=current_plan_subject,
+        )
         if config.review_parallel:
             pending_plan_reviewers = [
                 reviewer for reviewer in round_reviewers
@@ -12684,27 +12850,40 @@ def _run_plan_first_loop(
                         return _ReviewerTurnResult(reviewer_name=reviewer_name, error=exc)
                     return _ReviewerTurnResult(reviewer_name=reviewer_name, response=response)
 
-                def _publish_plan_completion(reviewer: AgentName, turn: _ReviewerTurnResult) -> None:
-                    """Publish a validated reviewer response without mutating round state.
-
-                    Numbering and ledger mutations stay below the settlement barrier.
-                    The raw validated response in metadata makes this checkpoint
-                    resumable even though its ``new_items`` are provisional.
-                    """
+                def _plan_publication_parsed(turn: _ReviewerTurnResult) -> ParsedPlanReview | None:
                     if turn.error is not None or turn.response is None:
-                        return
-                    reviewer_name = agent_display_name(reviewer)
+                        return None
                     parsed = turn.response.marker_value
                     assert isinstance(parsed, ParsedPlanReview)
-                    parsed = dataclasses_replace(
+                    return dataclasses_replace(
                         parsed,
                         items=_drop_repeated_carried_plan_future_followups(
                             parsed.items, prior_items=prior_unresolved_items,
                             dispositions=parsed.dispositions,
                         ),
                     )
-                    if _is_incomplete_plan_review(parsed):
-                        return
+
+                def _plan_retry_bound(reviewer: AgentName, turn: _ReviewerTurnResult) -> AgentLoopError | None:
+                    """Every plan-review failure or incomplete review is retried by a rerun."""
+                    if turn.error is not None:
+                        return turn.error
+                    parsed = _plan_publication_parsed(turn)
+                    if parsed is not None and _is_incomplete_plan_review(parsed):
+                        return _incomplete_plan_review_error(agent_display_name(reviewer))
+                    return None
+
+                def _publish_plan_completion(reviewer: AgentName, turn: _ReviewerTurnResult) -> bool:
+                    """Publish a validated reviewer response without mutating round state.
+
+                    Numbering and ledger mutations stay below the settlement barrier.
+                    The raw validated response in metadata makes this checkpoint
+                    resumable even though its ``new_items`` are provisional.
+                    """
+                    parsed = _plan_publication_parsed(turn)
+                    if parsed is None or _is_incomplete_plan_review(parsed):
+                        return False
+                    assert turn.response is not None
+                    reviewer_name = agent_display_name(reviewer)
                     _post_plan_reviewer_comment(
                         reviewer_name, parsed, review_output=turn.response.text,
                         model_used=turn.response.model_used,
@@ -12714,6 +12893,7 @@ def _run_plan_first_loop(
                         phase="publication",
                     )
                     early_published_plan_reviewers.add(reviewer)
+                    return True
 
                 plan_turn_results = _launch_reviewer_turns(
                     runner,
@@ -12721,14 +12901,15 @@ def _run_plan_first_loop(
                     thread_name_prefix=f"plan-review-r{round_number}",
                     run_turn=_plan_reviewer_worker,
                     on_completion=_publish_plan_completion,
-                    spool=_review_round_spool(
-                        config, surface="plan", number=issue_number,
-                        round_number=round_number, subject=current_plan_subject,
-                    ),
+                    spool=plan_round_spool,
                     replay_turn=lambda reviewer, fields: _replay_spooled_review(
                         runner, config=config, reviewer=reviewer, fields=fields,
                         validators=_plan_review_validators(agent_display_name(reviewer)),
                     ),
+                    public_peers=tuple(early_published_plan_reviewers),
+                    retry_bound=_plan_retry_bound,
+                    configured_order=round_reviewers,
+                    config=config,
                 )
 
         for reviewer in round_reviewers:
@@ -12803,35 +12984,44 @@ def _run_plan_first_loop(
                     f"Planning round {round_number}: {reviewer_name} reviewing issue #{issue_number} "
                     f"(context mode: {context_mode}{context_reason})",
                 )
-                review_response = _run_validated_agent(
-                    runner,
-                    agent=reviewer,
-                    config=config,
-                    prompt=_build_plan_review_prompt(reviewer),
-                    session_id=reviewer_session_ids.get(reviewer),
-                    marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                    **_architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name, items=prior_unresolved_items: _validate_plan_review_response(
-                        text,
-                        reviewer=reviewer_name,
-                        unresolved_items=items,
-                        current_round_items=round_new_unresolved_items,
-                        surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
-                            issue_context.human_requirements,
-                            requirement_scope="planning requirements",
-                        ), architecture_status_mode=mode,
-                    )),
-                    usage_context=usage_context,
-                    use_repair=True,
-                    repair_expected_kind="plan_review",
-                    repair_reviewer_requirement_ids=_surfaced_reviewer_requirement_ids(
+                sequential_plan_validators = _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name, items=prior_unresolved_items: _validate_plan_review_response(
+                    text,
+                    reviewer=reviewer_name,
+                    unresolved_items=items,
+                    current_round_items=round_new_unresolved_items,
+                    surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
                         issue_context.human_requirements,
                         requirement_scope="planning requirements",
+                    ), architecture_status_mode=mode,
+                ))
+                review_response = _same_round_replay_or_invoke(
+                    runner,
+                    config=config,
+                    reviewer=reviewer,
+                    spool=plan_round_spool,
+                    public_peers=tuple(early_published_plan_reviewers),
+                    validators=sequential_plan_validators,
+                    invoke=lambda reviewer=reviewer, validators=sequential_plan_validators: _run_validated_agent(
+                        runner,
+                        agent=reviewer,
+                        config=config,
+                        prompt=_build_plan_review_prompt(reviewer),
+                        session_id=reviewer_session_ids.get(reviewer),
+                        marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+                        **validators,
+                        usage_context=usage_context,
+                        use_repair=True,
+                        repair_expected_kind="plan_review",
+                        repair_reviewer_requirement_ids=_surfaced_reviewer_requirement_ids(
+                            issue_context.human_requirements,
+                            requirement_scope="planning requirements",
+                        ),
+                        repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
+                        ledger_incomplete=round_ledger_incomplete,
+                        repair_resolved_history_item_ids=round_resolved_history_item_ids,
+                        role="reviewer",
+                        operation_description="plan review",
                     ),
-                    repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
-                    ledger_incomplete=round_ledger_incomplete,
-                    repair_resolved_history_item_ids=round_resolved_history_item_ids,
-                    role="reviewer",
-                    operation_description="plan review",
                 )
                 review_output = review_response.text
                 review_model_used = review_response.model_used
@@ -12858,12 +13048,7 @@ def _run_plan_first_loop(
                     "and reported no actionable blocking plan issues or Same-Plan follow-ups; "
                     "stopping without a coder follow-up",
                 )
-                incomplete_review_error = AgentLoopError(
-                    f"{reviewer_name} did not complete plan review and reported no actionable "
-                    "blocking plan issues or Same-Plan follow-ups. This is a reviewer-internal error; "
-                    "agent-loop stopped before a coder follow-up. Rerun or switch the reviewer/model "
-                    "after resolving the reviewer environment."
-                )
+                incomplete_review_error = _incomplete_plan_review_error(reviewer_name)
                 if config.review_parallel:
                     plan_fatal_errors.append((reviewer_name, incomplete_review_error))
                     continue
@@ -12938,6 +13123,10 @@ def _run_plan_first_loop(
             else:
                 round_new_unresolved_items.extend(reviewer_new_unresolved_items)
 
+        if not plan_fatal_errors:
+            # Every same-round outcome is now published; a sequential resume
+            # that replayed withheld reviews no longer needs them.
+            plan_round_spool.discard()
         if config.review_parallel and not (current_resume is not None and current_resume.reconciled):
             settled = ", ".join(agent_display_name(reviewer) for reviewer in round_reviewers)
             post_issue_comment(
@@ -20841,6 +21030,23 @@ def run_pr_loop(
                 for reviewer in configured_reviewers
             }
 
+            # One private spool per round, shared by the parallel launcher and
+            # the sequential resume seam (#1025).
+            pr_round_spool = _review_round_spool(
+                config, surface="pr", number=pr_number,
+                round_number=round_number, subject=current_pr_subject,
+            )
+            # Only peers published by the same launch batch count: under
+            # primary-then-panel the panel is meant to see the primary's
+            # earlier review, which carries a different scheduler phase.
+            pr_launch_phase = (
+                scheduler_decision.phase if selective_policy and scheduler_decision is not None else None
+            )
+            pr_same_batch_public_peers = tuple(
+                reviewer for reviewer in early_published_pr_reviewers
+                if (record := resumed_by_name.get(agent_display_name(reviewer))) is not None
+                and record.metadata.scheduler_phase == pr_launch_phase
+            )
             if config.review_parallel and not skip_reviewers_this_round:
                 pending_pr_reviewers = [
                     reviewer for reviewer in configured_reviewers
@@ -20850,6 +21056,13 @@ def run_pr_loop(
                     launchable_pr_reviewers: list[AgentName] = []
                     for reviewer in pending_pr_reviewers:
                         reviewer_name = agent_display_name(reviewer)
+                        if (
+                            reviewer_name not in completed_by_name
+                            and pr_round_spool.load(reviewer_name) is not None
+                        ):
+                            # A withheld same-round outcome is replayed, not re-run.
+                            launchable_pr_reviewers.append(reviewer)
+                            continue
                         try:
                             sync_reviewer_pr_before_review(config, runner, reviewer, pr_number, pr_metadata)
                         except AgentLoopError as exc:
@@ -20974,11 +21187,9 @@ def run_pr_loop(
                                 return _ReviewerTurnResult(reviewer_name=reviewer_name, error=exc)
                             return _ReviewerTurnResult(reviewer_name=reviewer_name, response=response)
 
-                        def _publish_pr_completion(reviewer: AgentName, turn: _ReviewerTurnResult) -> None:
-                            """Publish a PR review after the round's workers return; settlement remains below."""
+                        def _pr_publication_parsed(turn: _ReviewerTurnResult) -> ParsedReview | None:
                             if turn.error is not None or turn.response is None:
-                                return
-                            reviewer_name = agent_display_name(reviewer)
+                                return None
                             parsed = turn.response.marker_value
                             assert isinstance(parsed, ParsedReview)
                             parsed = dataclasses_replace(
@@ -20999,8 +21210,35 @@ def run_pr_loop(
                                     pr_checks=shared_reviewer_pr_checks,
                                     current_head_sha=current_pr_subject,
                                 )
-                            if _is_incomplete_pr_review(parsed):
-                                return
+                            return parsed
+
+                        def _pr_failure_is_fatal(error: AgentLoopError) -> bool:
+                            # Mirrors the settlement below: fatal failures stop the
+                            # round and are re-invoked by a rerun; others settle
+                            # the reviewer as unavailable for this round.
+                            return len(configured_reviewers) == 1 or getattr(
+                                error, "failure_category", None
+                            ) in {None, "deterministic"}
+
+                        def _pr_retry_bound(reviewer: AgentName, turn: _ReviewerTurnResult) -> AgentLoopError | None:
+                            if turn.error is not None:
+                                return turn.error if _pr_failure_is_fatal(turn.error) else None
+                            parsed = _pr_publication_parsed(turn)
+                            if (
+                                parsed is not None
+                                and _is_incomplete_pr_review(parsed)
+                                and len(configured_reviewers) == 1
+                            ):
+                                return _incomplete_pr_review_error(agent_display_name(reviewer))
+                            return None
+
+                        def _publish_pr_completion(reviewer: AgentName, turn: _ReviewerTurnResult) -> bool:
+                            """Publish a PR review after the round's workers return; settlement remains below."""
+                            parsed = _pr_publication_parsed(turn)
+                            if parsed is None or _is_incomplete_pr_review(parsed):
+                                return False
+                            assert turn.response is not None
+                            reviewer_name = agent_display_name(reviewer)
                             _post_pr_reviewer_comment(
                                 reviewer_name, parsed, review_output=turn.response.text,
                                 model_used=turn.response.model_used,
@@ -21010,6 +21248,7 @@ def run_pr_loop(
                                 phase="publication",
                             )
                             early_published_pr_reviewers.add(reviewer)
+                            return True
 
                         pr_turn_results = _launch_reviewer_turns(
                             runner,
@@ -21017,14 +21256,25 @@ def run_pr_loop(
                             thread_name_prefix=f"pr-review-r{round_number}",
                             run_turn=_pr_reviewer_worker,
                             on_completion=_publish_pr_completion,
-                            spool=_review_round_spool(
-                                config, surface="pr", number=pr_number,
-                                round_number=round_number, subject=current_pr_subject,
-                            ),
+                            spool=pr_round_spool,
                             replay_turn=lambda reviewer, fields: _replay_spooled_review(
                                 runner, config=config, reviewer=reviewer, fields=fields,
                                 validators=_pr_review_validators(agent_display_name(reviewer)),
                             ),
+                            public_peers=pr_same_batch_public_peers,
+                            retry_bound=_pr_retry_bound,
+                            already_posted=tuple(
+                                reviewer for reviewer in configured_reviewers
+                                if agent_display_name(reviewer) in completed_by_name
+                            ),
+                            prelaunch_failures={
+                                reviewer: _ReviewerTurnResult(
+                                    reviewer_name=agent_display_name(reviewer), error=error
+                                )
+                                for reviewer, error in pr_prep_failures.items()
+                            },
+                            configured_order=configured_reviewers,
+                            config=config,
                         )
                     else:
                         log(
@@ -21185,8 +21435,22 @@ def run_pr_loop(
                         if use_compact_pr_context
                         else None
                     )
+                    sequential_pr_validators = _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name, items=prior_unresolved_items: _validate_review_response(
+                        text,
+                        reviewer=reviewer_name,
+                        unresolved_items=items,
+                        current_round_items=round_new_unresolved_items, architecture_status_mode=mode,
+                    ))
                     review_response, review_failure = _capture_agent_invocation(
-                        lambda: _run_validated_agent(
+                        lambda: _same_round_replay_or_invoke(
+                            runner,
+                            config=config,
+                            reviewer=reviewer,
+                            spool=pr_round_spool,
+                            public_peers=pr_same_batch_public_peers,
+                            validators=sequential_pr_validators,
+                            already_posted=reviewer_name in completed_by_name,
+                            invoke=lambda: _run_validated_agent(
                             runner,
                             agent=reviewer,
                             config=config,
@@ -21225,12 +21489,7 @@ def run_pr_loop(
                                 else reviewer_session_ids.get(reviewer)
                             ),
                             marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                            **_architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name, items=prior_unresolved_items: _validate_review_response(
-                                text,
-                                reviewer=reviewer_name,
-                                unresolved_items=items,
-                                current_round_items=round_new_unresolved_items, architecture_status_mode=mode,
-                            )),
+                            **sequential_pr_validators,
                             usage_context=usage_context,
                             use_repair=True,
                             repair_expected_kind="pr_review",
@@ -21245,6 +21504,7 @@ def run_pr_loop(
                             repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
                             operation_description="PR review",
+                            ),
                         )
                     )
                     if review_failure is not None:
@@ -21339,12 +21599,7 @@ def run_pr_loop(
 
                 if _is_incomplete_pr_review(parsed_review):
                     if len(configured_reviewers) == 1:
-                        incomplete_pr_review_error = AgentLoopError(
-                            f"{reviewer_name} did not complete PR review and reported no actionable "
-                            "blocking items or Same-PR follow-ups. This is a reviewer-internal error; "
-                            "agent-loop stopped before a coder follow-up. Rerun or switch the reviewer/model "
-                            "after resolving the reviewer environment."
-                        )
+                        incomplete_pr_review_error = _incomplete_pr_review_error(reviewer_name)
                         if config.review_parallel:
                             pr_fatal_errors.append((reviewer_name, incomplete_pr_review_error))
                             continue
@@ -21492,6 +21747,10 @@ def run_pr_loop(
                     if resumed_record is not None:
                         round_new_unresolved_items.extend(reviewer_new_unresolved_items)
 
+            if not pr_fatal_errors and not skip_reviewers_this_round:
+                # Every same-round outcome is now published; a sequential
+                # resume that replayed withheld reviews no longer needs them.
+                pr_round_spool.discard()
             if (
                 (config.review_parallel or selective_policy)
                 and not skip_reviewers_this_round
