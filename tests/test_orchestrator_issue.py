@@ -13654,7 +13654,7 @@ from coding_review_agent_loop.decomposition import (  # noqa: E402
 )
 
 _M1087_STALE_HASH = "de76758b0293d117"
-_M1087_BRANCH_ENDPOINT = "repos/OWNER/REPO/branches/agent-loop/managed-56"
+_M1087_BRANCH_ENDPOINT = "repos/OWNER/REPO/branches/agent-loop%2Fmanaged-56"
 
 
 class _M1087Runner(FakeRunner):
@@ -13667,8 +13667,14 @@ class _M1087Runner(FakeRunner):
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         cmd = [str(arg) for arg in args]
-        if cmd[:3] == ["gh", "api", _M1087_BRANCH_ENDPOINT] and not self.branch_exists:
+        if cmd[:2] == ["gh", "api"] and len(cmd) > 2 and "/branches/" in cmd[2]:
+            # Like GitHub, only the encoded branch path resolves; the raw
+            # `agent-loop/managed-56` path 404s even when the branch exists.
             cmd, cwd_path = self._record_command(cmd, cwd)
+            if cmd[2] == _M1087_BRANCH_ENDPOINT and self.branch_exists:
+                return CommandResult(
+                    cmd, cwd_path, json.dumps({"name": "agent-loop/managed-56"}), "", 0
+                )
             return CommandResult(cmd, cwd_path, "", "gh: Not Found (HTTP 404)", 1)
         if (
             self.unreadable_child_search
@@ -13865,6 +13871,8 @@ def test_1087_decision_with_its_managed_branch_still_refuses(tmp_path):
     with pytest.raises(AgentLoopError, match="branch `agent-loop/managed-56`"):
         run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True)
 
+    # The probe used the encoded path; the fake resolves nothing else.
+    assert ["gh", "api", _M1087_BRANCH_ENDPOINT] in [cmd[:3] for cmd, _cwd in runner.commands]
     assert _m1087_posted_decisions(runner) == []
     assert not _m1087_implementation_dispatched(runner)
 

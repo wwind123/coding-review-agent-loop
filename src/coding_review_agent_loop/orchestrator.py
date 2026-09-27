@@ -12,6 +12,7 @@ import re
 import shlex
 import sys
 import time
+import urllib.parse
 import zoneinfo
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8399,8 +8400,14 @@ def _execution_decision_realization_evidence(
             str(item.get("body") or ""), repo=config.repo, issue_number=issue_number
         ):
             evidence.append(f"PR #{item.get('number')}")
+    # The branch name contains `/`, which the branches endpoint only accepts
+    # encoded; an unencoded path 404s even when the branch exists.
     branch = runner.run(
-        [config.gh_cmd, "api", f"repos/{config.repo}/branches/{managed_branch}"],
+        [
+            config.gh_cmd,
+            "api",
+            f"repos/{config.repo}/branches/{urllib.parse.quote(managed_branch, safe='')}",
+        ],
         cwd=active_workdir(config),
         check=False,
     )
