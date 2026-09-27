@@ -174,7 +174,7 @@ from .github import (
 )
 from .issue_pr_handoff import (
     AGENT_ISSUE_PR_HANDOFF_RE,
-    _decode_issue_pr_handoff_metadata,
+    decode_issue_pr_handoff_record,
     find_latest_issue_pr_handoff,
     authenticate_canonical_issue_pr,
     format_issue_pr_handoff_comment,
@@ -7423,7 +7423,7 @@ def _projection_may_carry_planning_record(comments: Sequence[object]) -> bool:
         # view; a direct-flow handoff is ordinary resume state and is not.
         for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(body):
             try:
-                handoff = _decode_issue_pr_handoff_metadata(match.group("payload"))
+                handoff = decode_issue_pr_handoff_record(match.group("payload"))
             except Exception:  # noqa: BLE001 - malformed text only widens the read
                 return True
             if handoff.flow == "approved-plan-implementation":
@@ -7483,9 +7483,30 @@ def _refuse_plain_mode_over_planning(
     # issue, so an undecodable one still belongs here and fails closed.
     if issue_has_execution_decision(comments, issue_number=issue_number):
         evidence.append("a recorded execution decision")
-    handoff = find_latest_issue_pr_handoff(comments, issue_number=issue_number, repo=config.repo)
-    if handoff is not None and handoff.flow == "approved-plan-implementation":
-        evidence.append(f"an approved-plan implementation handoff to PR #{handoff.pr_number}")
+    # Every handoff counts, not only the latest: a later direct-flow handoff
+    # to another PR does not retire the approved plan an earlier one bound.
+    approved_handoff_prs: list[int] = []
+    unreadable_handoff = False
+    for comment in comments:
+        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(comment.body or ""):
+            try:
+                handoff = decode_issue_pr_handoff_record(match.group("payload"))
+            except AgentLoopError:
+                unreadable_handoff = True
+                continue
+            if (
+                handoff.issue_number == issue_number
+                and handoff.flow == "approved-plan-implementation"
+                and handoff.pr_number not in approved_handoff_prs
+            ):
+                approved_handoff_prs.append(handoff.pr_number)
+    if approved_handoff_prs:
+        evidence.append(
+            "an approved-plan implementation handoff to "
+            + ", ".join(f"PR #{number}" for number in approved_handoff_prs)
+        )
+    if unreadable_handoff:
+        evidence.append("an implementation handoff record that cannot be read")
     if not evidence:
         return
     raise AgentLoopError(

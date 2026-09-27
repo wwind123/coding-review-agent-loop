@@ -13571,6 +13571,36 @@ def test_1088_plain_issue_mode_refuses_handoff_only_planning_record(tmp_path):
     assert "an approved-plan implementation handoff to PR #77" in message
 
 
+def test_1088_later_direct_handoff_does_not_hide_approved_plan_handoff(tmp_path):
+    approved = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=approved_plan_hash("Plan:\n- Make the change."),
+    )
+    direct = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=78,
+        pr_url="https://github.com/OWNER/REPO/pull/78",
+        pr_head_sha="def456",
+        flow="issue-implementation",
+        plan_hash=None,
+    )
+    runner = _m1088_runner(
+        [
+            _m1088_comment(approved, created_at="2026-05-23T00:00:01Z"),
+            _m1088_comment(direct, created_at="2026-05-23T00:00:02Z"),
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "an approved-plan implementation handoff to PR #77" in message
+
+
 class _M1088ApprovalAfterFirstSnapshotRunner(FakeRunner):
     """Posts a plan approval right after the first issue snapshot is read."""
 
