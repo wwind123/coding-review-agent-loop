@@ -13644,3 +13644,167 @@ def test_1088_plain_issue_mode_without_planning_records_needs_no_rest_history(tm
     )
 
     _m1088_assert_ran_directly(runner, make_config(tmp_path))
+
+
+# --- #1087: an unrealized execution decision is superseded on re-approval ---
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    EXECUTION_DECISION_MARKER_RE as _M1087_DECISION_RE,
+    _decode_execution_decision as _m1087_decode_decision,
+)
+
+_M1087_STALE_HASH = "de76758b0293d117"
+_M1087_BRANCH_ENDPOINT = "repos/OWNER/REPO/branches/agent-loop/managed-56"
+
+
+class _M1087Runner(FakeRunner):
+    """Serves the reserved managed branch as absent unless told otherwise."""
+
+    def __init__(self, *, branch_exists=False, **kwargs):
+        super().__init__(**kwargs)
+        self.branch_exists = branch_exists
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        cmd = [str(arg) for arg in args]
+        if cmd[:3] == ["gh", "api", _M1087_BRANCH_ENDPOINT] and not self.branch_exists:
+            cmd, cwd_path = self._record_command(cmd, cwd)
+            return CommandResult(cmd, cwd_path, "", "gh: Not Found (HTTP 404)", 1)
+        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+
+def _m1087_stale_decision_comment():
+    decision = _M1088ExecutionDecision(
+        parent_issue=56,
+        plan_hash=_M1087_STALE_HASH,
+        plan_subject="An earlier approval of the same issue",
+        execution_strategy_contract_version=1,
+        strategy="one-shot",
+        topology_source="approved-plan-v1",
+        recommendation_digest="f" * 64,
+        requested_policy="implement-one-shot",
+        current_action="implement-one-shot",
+    )
+    return {
+        "author": {"login": "coding-review-agent-loop"},
+        "createdAt": "2026-05-22T00:00:00Z",
+        "body": _m1088_format_execution_decision(decision),
+    }
+
+
+def _m1087_runner(**kwargs):
+    return _M1087Runner(
+        claude_outputs=[
+            structured_v1_plan_state(),
+            "Implemented the approved fresh plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        issue_comments=[_m1087_stale_decision_comment()],
+        **kwargs,
+    )
+
+
+def _m1087_config(tmp_path):
+    return make_config(
+        tmp_path,
+        plan_execution_mode="implement-one-shot",
+        execution_strategy_contract_required=True,
+    )
+
+
+def _m1087_posted_decisions(runner):
+    return [
+        _m1087_decode_decision(match.group("payload"))
+        for body in runner.comments
+        for match in _M1087_DECISION_RE.finditer(body)
+    ]
+
+
+def _m1087_implementation_dispatched(runner):
+    # The scripted plan is consumed by planning; the second output only by
+    # the implementation turn.
+    return runner.claude_outputs == []
+
+
+def test_1087_reapproval_supersedes_an_unrealized_decision(tmp_path):
+    runner = _m1087_runner()
+
+    assert run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True) == 0
+
+    posted = _m1087_posted_decisions(runner)
+    assert len(posted) == 1
+    assert posted[0].plan_hash != _M1087_STALE_HASH
+    # The superseding decision names the hash it retires; the old record stays.
+    assert posted[0].retires_plan_hashes == (_M1087_STALE_HASH,)
+    thread_hashes = [
+        _m1087_decode_decision(match.group("payload")).plan_hash
+        for comment in runner.issue_comments
+        for match in _M1087_DECISION_RE.finditer(comment["body"])
+    ]
+    assert thread_hashes == [_M1087_STALE_HASH, posted[0].plan_hash]
+    assert sum("AGENT_PLAN_ONE_SHOT_IMPL" in body for body in runner.comments) == 1
+    assert _m1087_implementation_dispatched(runner)
+
+
+def test_1087_superseded_decision_stays_retired_after_the_pr_exists(tmp_path):
+    runner = _m1087_runner()
+    config = _m1087_config(tmp_path)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert _m1087_implementation_dispatched(runner)
+
+    # The rerun resumes the PR bound to the superseding decision (scripted
+    # coder output is exhausted, so a second implementation would fail); the
+    # old decision does not come back as a conflict.
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert len(_m1087_posted_decisions(runner)) == 1
+
+
+def test_1087_decision_with_an_open_managed_pr_still_refuses(tmp_path):
+    runner = _m1087_runner(
+        open_prs_payload=[
+            {"number": 81, "body": "Work in progress.", "headRefName": "agent-loop/managed-56"}
+        ]
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True)
+
+    message = str(excinfo.value)
+    assert "Conflicting execution decision exists" in message
+    assert _M1087_STALE_HASH in message
+    assert "open PR #81" in message
+    assert _m1087_posted_decisions(runner) == []
+    # Only the planning turn ran; no implementation was dispatched.
+    assert not _m1087_implementation_dispatched(runner)
+
+
+def test_1087_decision_with_its_managed_branch_still_refuses(tmp_path):
+    runner = _m1087_runner(branch_exists=True)
+
+    with pytest.raises(AgentLoopError, match="branch `agent-loop/managed-56`"):
+        run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True)
+
+    assert _m1087_posted_decisions(runner) == []
+    assert not _m1087_implementation_dispatched(runner)
+
+
+def test_1087_decision_with_a_child_issue_still_refuses(tmp_path):
+    runner = _m1087_runner(
+        search_issues_payload=[
+            {
+                "number": 90,
+                "title": "Phase 1: Earlier stage (from #56)",
+                "url": "https://github.com/OWNER/REPO/issues/90",
+                "body": "",
+            }
+        ]
+    )
+
+    with pytest.raises(AgentLoopError, match="child issue #90"):
+        run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True)
+
+    assert _m1087_posted_decisions(runner) == []
