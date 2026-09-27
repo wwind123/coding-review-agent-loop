@@ -31,30 +31,48 @@ def mkdir_private(path: Path | str) -> bool:
 
     ``os.mkdir``'s mode is masked by the umask, which can clear owner bits
     too (``umask 0o700`` would yield mode ``000`` and an unusable
-    directory), so a newly created directory is explicitly re-moded.  The
-    ``fchmod`` goes through a no-follow descriptor so a component swapped
-    for a symlink after creation is never re-moded through the link.
+    directory), so a newly created directory is explicitly re-moded through
+    a no-follow descriptor.  A component swapped for a symlink after
+    creation is never re-moded through the link: re-opening it fails and
+    the error propagates (fail closed).
     """
     try:
         os.mkdir(path, PRIVATE_DIR_MODE)
     except FileExistsError:
         return False
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    if hasattr(os, "fchmod"):
-        try:
-            fd = os.open(path, flags)
-        except PermissionError:
-            # A umask that cleared the owner's read bit makes the directory
-            # unopenable; chmod by path is then the only way back.
-            os.chmod(path, PRIVATE_DIR_MODE)
-        else:
-            try:
-                os.fchmod(fd, PRIVATE_DIR_MODE)
-            finally:
-                os.close(fd)
-    else:
-        os.chmod(path, PRIVATE_DIR_MODE)
+    _restore_private_mode(path)
     return True
+
+
+def _restore_private_mode(path: Path | str) -> None:
+    if not hasattr(os, "fchmod"):
+        # Windows: POSIX mode bits do not apply.
+        return
+    nofollow = os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow)
+    except PermissionError:
+        # The umask removed the owner's read bit.  An O_PATH descriptor
+        # needs no permission on the directory itself, and chmod through its
+        # /proc/self/fd link acts on that exact inode, never a later
+        # replacement at ``path``.
+        o_path = getattr(os, "O_PATH", None)
+        if o_path is None or not os.path.isdir("/proc/self/fd"):
+            raise PermissionError(
+                f"Created {path}, but the umask removed owner access and the directory "
+                "cannot be safely re-opened to restore mode 700. Use a umask that keeps "
+                "owner permissions, for example 077."
+            ) from None
+        fd = os.open(path, o_path | nofollow)
+        try:
+            os.chmod(f"/proc/self/fd/{fd}", PRIVATE_DIR_MODE)
+        finally:
+            os.close(fd)
+        return
+    try:
+        os.fchmod(fd, PRIVATE_DIR_MODE)
+    finally:
+        os.close(fd)
 
 
 def make_private_dirs(path: Path | str) -> Path:

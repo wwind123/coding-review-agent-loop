@@ -529,6 +529,35 @@ def test_scratch_creation_restores_owner_access_under_restrictive_umask(tmp_path
     ap.prepare_response_file(config, "claude")
 
 
+@pytest.mark.skipif(not hasattr(os, "O_PATH") or os.geteuid() == 0, reason="needs O_PATH, non-root")
+def test_owner_access_fallback_never_chmods_a_swapped_in_symlink(tmp_path, monkeypatch):
+    from coding_review_agent_loop.scratch import mkdir_private
+
+    victim = tmp_path / "victim"
+    victim.write_text("x")
+    victim.chmod(0o644)
+    target = tmp_path / "new"
+    real_open = os.open
+
+    def swapping_open(path, flags, *args, **kwargs):
+        if flags & os.O_PATH and str(path) == str(target):
+            # Another user replaces the fresh directory between the failed
+            # read-open and the owner-access fallback.
+            os.chmod(target, 0o700)
+            os.rmdir(target)
+            os.symlink(victim, target)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    previous = os.umask(0o777)
+    try:
+        with pytest.raises(OSError):
+            mkdir_private(target)
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+
+
 def test_every_writable_component_widened_between_turns_is_reported(tmp_path, sandbox):
     config = sandboxed_config(tmp_path)
     state = ap.establish_response_root_boundary(config)
