@@ -9821,10 +9821,10 @@ class _ReviewerTurnResult:
     """Outcome of one plan/PR reviewer turn: a validated response or a captured failure.
 
     Worker threads in the --review-parallel path return these instead of
-    raising, so exceptions never cross the thread boundary; the main thread
-    delivers completed turns to the main thread in completion order.  The
-    caller may publish an individual validated review immediately, but must
-    retain configured-order aggregation until every launched turn settles.
+    raising, so exceptions never cross the thread boundary; once every launched
+    turn has returned, the main thread publishes each validated review in
+    completion order (never mid-round, #1025) and then performs
+    configured-order aggregation.
     """
 
     reviewer_name: str
@@ -11276,38 +11276,36 @@ def _launch_reviewer_turns(
     run_turn: Callable[[AgentName], _ReviewerTurnResult],
     on_completion: Callable[[AgentName, _ReviewerTurnResult], None] | None = None,
 ) -> dict[AgentName, _ReviewerTurnResult]:
-    """Run workers concurrently, delivering completion-order results before settlement.
+    """Run workers concurrently, then deliver results in completion order.
 
     ``run_turn`` must never let an exception escape; it is responsible for
     capturing any failure into the returned ``_ReviewerTurnResult`` so the
     thread pool never needs to propagate a worker exception. On
     KeyboardInterrupt, active agent processes are killed so worker wait loops
     return promptly before the interrupt is re-raised.
+
+    ``on_completion`` (publication) runs only after every worker has returned
+    (#1025).  Publishing a finished reviewer's body while a peer is still
+    running would put that body on the PR/issue the peer can read mid-turn,
+    so a late reviewer could echo it and panel agreement would stop being
+    independent corroboration.  Completion order is still preserved for the
+    publications themselves.
     """
     executor = ThreadPoolExecutor(max_workers=len(pending), thread_name_prefix=thread_name_prefix)
     try:
         futures = {executor.submit(run_turn, reviewer): reviewer for reviewer in pending}
         results: dict[AgentName, _ReviewerTurnResult] = {}
         for future in as_completed(futures):
-            reviewer = futures[future]
-            result = future.result()
-            results[reviewer] = result
-            if on_completion is not None:
-                try:
-                    on_completion(reviewer, result)
-                except BaseException:
-                    # A publication failure must not leave reviewer subprocesses
-                    # running or allow a later reconciliation/coder turn.
-                    for other in futures:
-                        other.cancel()
-                    runner.terminate_active_processes()
-                    raise
-        return results
+            results[futures[future]] = future.result()
     except KeyboardInterrupt:
         runner.terminate_active_processes()
         raise
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+    if on_completion is not None:
+        for reviewer, result in results.items():
+            on_completion(reviewer, result)
+    return results
 
 
 def _run_plan_first_loop(
@@ -20847,7 +20845,7 @@ def run_pr_loop(
                             return _ReviewerTurnResult(reviewer_name=reviewer_name, response=response)
 
                         def _publish_pr_completion(reviewer: AgentName, turn: _ReviewerTurnResult) -> None:
-                            """Publish a completion-order PR review; settlement remains below."""
+                            """Publish a PR review after the round's workers return; settlement remains below."""
                             if turn.error is not None or turn.response is None:
                                 return
                             reviewer_name = agent_display_name(reviewer)

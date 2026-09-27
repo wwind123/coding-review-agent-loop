@@ -912,21 +912,35 @@ def test_pr_parallel_resolves_disputed_scope_claim_and_tracks_translation_defect
     )
 
 
-class _EarlyPublicationBarrierRunner(FakeRunner):
-    """Makes Gemini slow enough to observe completion-order publication."""
+class _PeerVisibilityBarrierRunner(FakeRunner):
+    """Makes Gemini's first turn slow and records what it could read mid-turn (#1025).
+
+    The observation window is the first parallel review round: from the first
+    reviewer launch until Gemini's first turn returns.
+    """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.review_round_started = threading.Event()
         self.gemini_finished = threading.Event()
-        self.codex_published_before_gemini_finished = False
+        self.comment_posted_before_gemini_finished = False
         self.coder_started_before_gemini_finished = False
+        self.surface_bodies_seen_by_gemini: list[str] = []
+
+    def _in_first_review_window(self) -> bool:
+        return self.review_round_started.is_set() and not self.gemini_finished.is_set()
 
     def run_with_log(self, args, *, cwd, **kwargs):
         cmd = [str(arg) for arg in args]
-        if cmd[:1] == ["claude"] and not self.gemini_finished.is_set():
+        if cmd[:1] == ["claude"] and self._in_first_review_window():
             self.coder_started_before_gemini_finished = True
-        if cmd[:1] == ["gemini"]:
+        if cmd[:1] in (["codex"], ["gemini"]):
+            self.review_round_started.set()
+        if cmd[:1] == ["gemini"] and not self.gemini_finished.is_set():
             time.sleep(0.15)
+            # Everything a tool-enabled reviewer could read from the shared
+            # PR/issue surface at the end of its turn.
+            self.surface_bodies_seen_by_gemini.extend(self.comments)
             result = super().run_with_log(args, cwd=cwd, **kwargs)
             self.gemini_finished.set()
             return result
@@ -934,13 +948,13 @@ class _EarlyPublicationBarrierRunner(FakeRunner):
 
     def run(self, args, *, cwd, **kwargs):
         cmd = [str(arg) for arg in args]
-        if cmd[:3] == ["gh", "pr", "comment"] and not self.gemini_finished.is_set():
-            self.codex_published_before_gemini_finished = True
+        if cmd[:3] in (["gh", "pr", "comment"], ["gh", "issue", "comment"]) and self._in_first_review_window():
+            self.comment_posted_before_gemini_finished = True
         return super().run(args, cwd=cwd, **kwargs)
 
 
-def test_pr_parallel_publishes_fast_review_before_settlement_and_coder_followup(tmp_path):
-    runner = _EarlyPublicationBarrierRunner(
+def test_pr_parallel_withholds_fast_review_until_round_settles(tmp_path):
+    runner = _PeerVisibilityBarrierRunner(
         codex_outputs=[structured_pr_review(
             state="blocking", summary="Codex found two blockers.",
             blocking_items=["First blocker.", "Second blocker."],
@@ -967,10 +981,36 @@ def test_pr_parallel_publishes_fast_review_before_settlement_and_coder_followup(
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert runner.codex_published_before_gemini_finished
+    # The fast Codex review is not published while Gemini is still running,
+    # so the slow reviewer cannot read (and echo) its peer's findings.
+    assert not runner.comment_posted_before_gemini_finished
+    assert not any(
+        "First blocker." in body or "Codex found two blockers." in body
+        for body in runner.surface_bodies_seen_by_gemini
+    )
     assert not runner.coder_started_before_gemini_finished
+    # The review is still published once the round settles.
+    assert any("Codex found two blockers." in body for body in runner.comments)
     coder_prompt = next("\n".join(cmd) for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
     assert "[item-1]" in coder_prompt and "[item-2]" in coder_prompt
+
+
+def test_plan_parallel_withholds_fast_review_until_round_settles(tmp_path):
+    runner = _PeerVisibilityBarrierRunner(
+        claude_outputs=[_initial_plan()],
+        codex_outputs=[structured_plan_review(summary="Codex plan approval with a unique note.")],
+        gemini_outputs=[structured_plan_review(summary="Gemini approves the plan.", reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert not runner.comment_posted_before_gemini_finished
+    assert not any(
+        "Codex plan approval with a unique note." in body
+        for body in runner.surface_bodies_seen_by_gemini
+    )
+    assert any("Codex plan approval with a unique note." in body for body in runner.comments)
 
 
 def test_pr_parallel_resume_after_publication_does_not_duplicate_or_lose_items(tmp_path):

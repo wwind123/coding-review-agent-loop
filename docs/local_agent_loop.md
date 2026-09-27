@@ -1980,9 +1980,15 @@ Execution model:
   plan/PR state (current plan or PR diff, prior unresolved items, PR checks
   snapshot), then all pending turns are submitted to a thread pool. Same-round
   reviewers never see each other's in-progress output.
-- A validated healthy review is posted by the main thread as soon as its worker
-  completes. Its provisional publication checkpoint is durable, so resume
-  avoids duplicate comments even if the next run is sequential.
+- Reviewer bodies are withheld until every reviewer in the round has
+  returned; the main thread then posts each validated healthy review in
+  completion order. Publishing a finished review while a peer is still running
+  would put it on the PR/issue the slower reviewer can read mid-turn (a
+  tool-enabled reviewer could echo it), so agreement across the panel would no
+  longer be independent (#1025). Each provisional publication checkpoint is
+  durable, so resume avoids duplicate comments even if the next run is
+  sequential. An interruption before the round settles loses the finished
+  reviewers' unpublished output, and a rerun re-invokes them.
 - The orchestrator still waits for every reviewer to settle before shared state
   changes: it aggregates outcomes, numbers unresolved items, and may begin
   coder work only in configured `--reviewer` order. It then posts a neutral
