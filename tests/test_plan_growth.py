@@ -575,6 +575,7 @@ def test_ordinary_plan_is_approved_unchanged(tmp_path):
     assert run_issue_loop(runner, issue_number=56, config=_config(tmp_path), plan_first=True) == 0
     assert len(_prompts(runner, "claude")) == 1
     assert all("Orchestrator plan-growth notice" not in prompt for prompt in _prompts(runner, "codex"))
+    assert all("Plan-growth measurements" not in prompt for prompt in _prompts(runner, "codex"))
     coder = [record for record in _plan_records(runner) if record.role == "coder"]
     assert "one_shot_growth_justification" not in coder[0].assembled_plan_sidecar["canonical_json"]
 
@@ -596,6 +597,11 @@ def test_fresh_candidate_is_self_checked_before_any_reviewer(tmp_path):
     # Exactly one reviewer round, on the justified candidate only.
     reviews = _prompts(runner, "codex")
     assert len(reviews) == 1 and RATIONALE in reviews[0]
+    # The justified plan still shows reviewers its measurements, but not the
+    # corrective non-compliance notice.
+    assert "Plan-growth measurements" in reviews[0]
+    assert "scope items 1 (threshold 1)" in reviews[0]
+    assert "Orchestrator plan-growth notice" not in reviews[0]
     coder = [record for record in _plan_records(runner) if record.role == "coder"]
     assert len(coder) == 1
     assert coder[0].assembled_plan_sidecar["canonical_json"]["one_shot_growth_justification"] == (
@@ -889,3 +895,125 @@ def test_staged_conversion_revision_is_ledger_checked_with_the_gate_on_or_off(tm
     ] == "staged"
     # The rejected conversion never reached a reviewer.
     assert len(_prompts(runner, "codex")) == 2
+
+
+
+# --- review round 1 follow-up: measurements and live revision paths ---------
+
+LONG_SUMMARY = "Fresh execution strategy plan. " + "Detailed parent design. " * 250
+
+
+def test_review_prompts_show_measurements_for_justified_plans(tmp_path):
+    """Item-1: measurements reach full and compact review prompts."""
+    config = _config(tmp_path)
+    measurements = "Plan-growth measurements (orchestrator, not a reviewer finding): MEASURED."
+    for compact in (False, True):
+        prompt = build_plan_review_prompt(
+            56, 2, "Plan.", config, reviewer="codex", compact_context=compact,
+            plan_growth_measurements=measurements,
+        )
+        assert "MEASURED." in prompt
+        assert "Orchestrator plan-growth notice" not in prompt
+
+
+def _patch_text(base_text, operations, *, base_round=1, dispositions=()):
+    identity = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(base_text), round_number=base_round
+    ).state_identity
+    return json.dumps({
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking",
+        "summary": "Revise.", "prior_plan_item_dispositions": list(dispositions),
+        "base_round_number": base_round, "base_state_identity": identity,
+        "operations": operations,
+    }) + FOOTER
+
+
+def test_live_revision_after_notice_shrinks_and_clears_a_leftover_justification(tmp_path):
+    """Row `shrink-below-threshold` through a semantic revision after a growth notice."""
+    grown = _state_text(
+        summary=LONG_SUMMARY,
+        one_shot_growth_justification=_justification("scope-items"),
+    )
+    history_runner = FakeRunner(
+        claude_outputs=[grown], codex_outputs=[structured_plan_review(state="approved")],
+    )
+    # Approved with the gate off, so the stale scope-items claim was never checked.
+    assert run_issue_loop(
+        history_runner, issue_number=56,
+        config=_config(tmp_path, plan_growth_gate="off"), plan_first=True,
+    ) == 0
+    history = list(history_runner.issue_comments)
+    canonical = render_canonical_plan_state(validate_structured_plan_state(grown))
+    shrink = {"op": "replace", "field": "summary", "value": "Short summary."}
+    leftover = _patch_text(grown, [shrink])
+    cleared = _patch_text(grown, [
+        shrink, {"op": "replace", "field": "one_shot_growth_justification", "value": None},
+    ])
+    runner = FakeRunner(
+        issue_comments=history,
+        claude_outputs=[leftover, cleared],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    # The recovered candidate crosses rendered-size, which its justification omits.
+    config = _config(tmp_path, plan_growth_max_chars=len(canonical) - 2_000)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    planner = _prompts(runner, "claude")
+    assert len(planner) == 2
+    assert "Orchestrator plan-growth notice" in planner[0] and "`rendered-size`" in planner[0]
+    # The shrunk revision still carrying the leftover justification is rejected
+    # as stale before any reviewer turn; the cleared one is reviewed.
+    assert "stale" in planner[1]
+    reviews = _prompts(runner, "codex")
+    assert len(reviews) == 1
+    new_coders = [
+        record for record in _plan_records(runner)[len(_plan_records(history_runner)):]
+        if record.role == "coder"
+    ]
+    assert len(new_coders) == 1
+    payload = new_coders[0].assembled_plan_sidecar["canonical_json"]
+    assert payload["summary"] == "Short summary."
+    assert "one_shot_growth_justification" not in payload
+    assert payload["execution_recommendation"]["strategy"] == "one-shot"
+
+
+def test_live_revision_newly_crossing_a_signal_is_rejected_before_review(tmp_path):
+    """Row `new-signal-validation` through a semantic revision."""
+    base = _state_text(one_shot_growth_justification=_justification("scope-items"))
+    base_len = len(render_canonical_plan_state(validate_structured_plan_state(base)))
+    grow = {"op": "replace", "field": "summary", "value": LONG_SUMMARY}
+    stale = _patch_text(
+        base, [grow], dispositions=[{"item_id": "item-1", "disposition": "resolved"}]
+    )
+    rejustified = _patch_text(base, [
+        grow,
+        {"op": "replace", "field": "one_shot_growth_justification",
+         "value": _justification("rendered-size", "scope-items")},
+    ], dispositions=[{"item_id": "item-1", "disposition": "resolved"}])
+    runner = FakeRunner(
+        claude_outputs=[base, stale, rejustified],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Expand the design."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    config = _config(
+        tmp_path, plan_growth_max_scope_items=1, plan_growth_max_chars=base_len + 2_000
+    )
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    planner = _prompts(runner, "claude")
+    assert len(planner) == 3
+    assert "missing `rendered-size`" in planner[2]
+    # Exactly two reviewer rounds: the base and the re-justified revision.
+    reviews = _prompts(runner, "codex")
+    assert len(reviews) == 2
+    # The re-justified revision's (compact) review shows its measurements.
+    assert "Plan-growth measurements" in reviews[1] and "`rendered-size`" in reviews[1]
+    coders = [record for record in _plan_records(runner) if record.role == "coder"]
+    assert len(coders) == 2
+    assert coders[1].assembled_plan_sidecar["canonical_json"]["one_shot_growth_justification"][
+        "crossed_signals"
+    ] == ["rendered-size", "scope-items"]

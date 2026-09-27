@@ -2882,6 +2882,54 @@ def test_m886_small_replacement_shows_only_the_expansion_notice(tmp_path, monkey
     assert _m886_advisories(world) == []
 
 
+def test_m886_size_only_crossing_from_the_disposition_section_gets_the_advisory(
+    tmp_path, monkeypatch
+):
+    """Row `rebind-advisory` case (f) through the real rebind transition."""
+    from coding_review_agent_loop.comment_rendering import (
+        render_canonical_plan_revision,
+        render_canonical_plan_state,
+    )
+    from coding_review_agent_loop.plan_assembly import assemble_authenticated_plan_revision
+
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    patch = _m886_with_justification(
+        _m936_patch(world.old_state, None, summary="Justified summary."), "rendered-size"
+    )
+    base = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(world.old_state), round_number=1
+    )
+    assembled, _sidecar = assemble_authenticated_plan_revision(
+        base, json.loads(patch.split("\n<!--", 1)[0]), result_round_number=2
+    )
+    config = world.config()
+    canonical = render_canonical_plan_revision(assembled, (), config)
+    state_only = render_canonical_plan_state(
+        dataclasses.replace(
+            validate_structured_plan_state(world.old_state),
+            summary=assembled.summary,
+            one_shot_growth_justification=assembled.one_shot_growth_justification,
+        ),
+        config,
+    )
+    # Only the revision's prior-item disposition section pushes the stored
+    # canonical text over the threshold; a state-only re-render stays under.
+    assert "### Prior plan review item dispositions" in canonical
+    threshold = len(canonical)
+    assert len(state_only) < threshold
+    assert world.run_issue(
+        config=world.config(plan_growth_max_chars=threshold),
+        claude_outputs=[patch],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    (advisory,) = _m886_advisories(world)
+    assert f"canonical plan size {threshold} characters" in advisory
+    assert "`rendered-size`" in advisory and "Reviewed justification signals: `rendered-size`" in advisory
+    assert _m1013_notices(world) == []
+    # Non-blocking: the PR was still reviewed under the rebound plan.
+    assert len(world.agent_calls("codex")) == 2
+
+
 def test_m886_growth_advisory_failure_never_blocks_the_rebind(tmp_path, monkeypatch):
     world = _M936World(tmp_path, monkeypatch, weak=False)
 

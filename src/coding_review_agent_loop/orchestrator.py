@@ -587,6 +587,7 @@ from .plan_growth import (
     plan_growth_gate_enforced,
     plan_justification,
     plan_strategy,
+    render_growth_measurements,
     render_growth_notice,
 )
 from .plan_review_scheduling import (
@@ -12642,6 +12643,16 @@ def _run_plan_first_loop(
             if plan_growth_violation is not None and plan_growth_assessment is not None
             else None
         )
+        # Reviewers see the measurements of every crossed one-shot candidate,
+        # justified or not; the corrective notice is only for non-compliant ones.
+        plan_growth_measurements = (
+            render_growth_measurements(plan_growth_assessment)
+            if plan_growth_assessment is not None
+            and plan_growth_assessment.crossed
+            and current_plan_sidecar is not None
+            and plan_strategy(current_plan_sidecar.canonical_json) == "one-shot"
+            else None
+        )
         plan_scheduler_decision = None
         plan_panel_evidence = PlanPanelEvidence()
         plan_qualifying_approvals: tuple[str, ...] = ()
@@ -13002,6 +13013,7 @@ def _run_plan_first_loop(
                 inherited_reviewed_deltas=inherited_review_deltas,
                 inherited_check_failure=inherited_review_failure,
                 plan_growth_notice=plan_growth_notice,
+                plan_growth_measurements=plan_growth_measurements,
             )
 
         plan_fatal_errors: list[tuple[str, AgentLoopError]] = []

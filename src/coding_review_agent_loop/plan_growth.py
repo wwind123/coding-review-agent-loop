@@ -310,6 +310,22 @@ def check_scope_ledger_preservation(prior: PlanLike | None, candidate: PlanLike)
         )
 
 
+def render_growth_measurements(assessment: PlanGrowthAssessment) -> str:
+    """Reviewer-facing measurements for any one-shot plan that crosses a signal.
+
+    Shown whether or not the plan is justified, so reviewers can evaluate a
+    justification against the crossed signals and thresholds.
+    """
+    return (
+        "Plan-growth measurements (orchestrator, not a reviewer finding): this one-shot plan "
+        "crosses plan-growth threshold(s) "
+        + ", ".join(f"`{signal}`" for signal in assessment.crossed)
+        + f". Measurements: {assessment.describe()}. Evaluate its "
+        "`one_shot_growth_justification` against these signals as a semantic claim, or block "
+        "with the plan-growth lever."
+    )
+
+
 def render_growth_notice(assessment: PlanGrowthAssessment) -> str:
     """Orchestrator growth notice for prompts; never a reviewer item."""
     return (

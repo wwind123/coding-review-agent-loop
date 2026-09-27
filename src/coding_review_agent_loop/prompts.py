@@ -2715,7 +2715,9 @@ def _plan_growth_planner_guidance(
 
 
 def _plan_growth_review_guidance(
-    config: AgentLoopConfig, growth_notice: str | None = None
+    config: AgentLoopConfig,
+    growth_notice: str | None = None,
+    growth_measurements: str | None = None,
 ) -> str:
     """Reviewer-facing plan-growth lever (#886)."""
     lever = (
@@ -2725,6 +2727,8 @@ def _plan_growth_review_guidance(
         "`one_shot_growth_justification` in the plan as a semantic claim like any other: "
         "block it when the rationale does not show why one-shot remains correct."
     )
+    if growth_measurements:
+        lever += f"\n{growth_measurements}"
     if growth_notice:
         lever += (
             f"\n{growth_notice} The orchestrator will not approve this plan as one-shot until a "
@@ -2861,6 +2865,7 @@ def build_plan_review_prompt(
     inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
     inherited_check_failure: str | None = None,
     plan_growth_notice: str | None = None,
+    plan_growth_measurements: str | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2880,6 +2885,7 @@ def build_plan_review_prompt(
             inherited_reviewed_deltas=inherited_reviewed_deltas,
             inherited_check_failure=inherited_check_failure,
             plan_growth_notice=plan_growth_notice,
+            plan_growth_measurements=plan_growth_measurements,
         )
         return compact_prompt
     coder_name = agent_display_name(config.coder)
@@ -2917,7 +2923,7 @@ Plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{_plan_growth_review_guidance(config, plan_growth_notice)}
+{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}
 Review the plan for correctness, architecture fit, missing edge cases, test
 strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -3003,6 +3009,7 @@ def _build_compact_plan_review_prompt(
     inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
     inherited_check_failure: str | None = None,
     plan_growth_notice: str | None = None,
+    plan_growth_measurements: str | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_name = agent_display_name(reviewer)
@@ -3066,7 +3073,7 @@ Current implementation plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{_agent_unavailable_guidance(reviewer_signature)}
+{(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{_agent_unavailable_guidance(reviewer_signature)}
 {_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
 items left active for this planning round. Do not place your signature before
