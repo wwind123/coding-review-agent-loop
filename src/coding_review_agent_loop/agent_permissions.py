@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -382,7 +383,34 @@ def configured_checkouts(config: AgentLoopConfig) -> tuple[str, ...]:
     return tuple(paths)
 
 
-def _check_component(path: str, *, create: bool) -> _ComponentRecord:
+def _writable_components_error(offenders: list[tuple[str, int]]) -> SandboxBoundaryError:
+    # Name every offending component and one command that fixes them all, so
+    # an operator with a deep pre-existing tree needs a single fix, not one
+    # failed run per directory.
+    if len(offenders) == 1:
+        path, mode = offenders[0]
+        return SandboxBoundaryError(
+            f"Sandboxed response directory component {path} is group- or world-writable "
+            f"(mode {mode:o}). Run `chmod go-w {shlex.quote(path)}` or set TMPDIR "
+            "to a private directory."
+        )
+    listing = ", ".join(f"{path} (mode {mode:o})" for path, mode in offenders)
+    paths = " ".join(shlex.quote(path) for path, _mode in offenders)
+    return SandboxBoundaryError(
+        f"Sandboxed response directory components are group- or world-writable: {listing}. "
+        f"Run `chmod go-w {paths}` or set TMPDIR to a private directory."
+    )
+
+
+def _check_component(
+    path: str, *, create: bool, writable: list[tuple[str, int]] | None = None
+) -> _ComponentRecord:
+    """Validate one component.
+
+    With ``writable`` supplied, a group- or world-writable component is
+    recorded there instead of raised, so the caller can report every offender
+    at once.  Every other defect still raises immediately.
+    """
     if create:
         try:
             os.mkdir(path, 0o700)
@@ -407,11 +435,10 @@ def _check_component(path: str, *, create: bool) -> _ComponentRecord:
     if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         # A group- or world-writable component would let another local user
         # replace entries between verification and the CLI's response write.
-        raise SandboxBoundaryError(
-            f"Sandboxed response directory component {path} is group- or world-writable "
-            f"(mode {stat.S_IMODE(info.st_mode):o}). Run `chmod go-w {path}` or set TMPDIR "
-            "to a private directory."
-        )
+        offender = (path, stat.S_IMODE(info.st_mode))
+        if writable is None:
+            raise _writable_components_error([offender])
+        writable.append(offender)
     return _ComponentRecord(path, info.st_dev, info.st_ino)
 
 
@@ -442,7 +469,12 @@ def establish_response_root_boundary(config: AgentLoopConfig) -> SandboxState:
     """Create and validate the response root and record the checkout set."""
     resolved_root, component_paths = _response_component_paths(config)
     with _STATE_LOCK:
-        components = tuple(_check_component(path, create=True) for path in component_paths)
+        writable: list[tuple[str, int]] = []
+        components = tuple(
+            _check_component(path, create=True, writable=writable) for path in component_paths
+        )
+        if writable:
+            raise _writable_components_error(writable)
         state = SandboxState(
             lexical_root=_state_key(config),
             resolved_root=resolved_root,

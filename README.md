@@ -339,8 +339,10 @@ Requirements and limitations of sandboxed mode:
   checkout you run agent-loop from. Responses go to a private directory under
   `${TMPDIR:-/tmp}/coding-review-agent-loop/responses/`, whose
   agent-loop-created components must be real directories owned by you that
-  are not group- or world-writable (no symlinks; fix an old component with
-  `chmod go-w`). The directory and every checkout, including one not yet
+  are not group- or world-writable (no symlinks). agent-loop creates its
+  scratch directories with mode `700` whatever your umask; a component left
+  group-writable by an older release is refused, and the refusal lists every
+  such component with a single `chmod go-w` command that fixes them all. The directory and every checkout, including one not yet
   created, are re-verified before each spawn, so checkouts and their parent
   directories must not be moved, replaced, or redirected during a run.
 - **Pass-through agent arguments are rejected** (`--claude-arg`,

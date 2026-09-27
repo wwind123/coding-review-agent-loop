@@ -41,6 +41,10 @@ def _executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
 
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
+    # Pin the umask: fixture directories (agent checkouts nested in the
+    # response root, for example) must not inherit a caller's group-writable
+    # umask and trip the mode check before the check a test targets (#1078).
+    previous_umask = os.umask(0o022)
     tmp = tmp_path / "tmp"
     tmp.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(tmp))
@@ -57,8 +61,11 @@ def sandbox(tmp_path, monkeypatch):
             package_locator=locator or (lambda _interpreter: PACKAGE_DIR),
         )
 
-    yield {"tmp": tmp, "tools": tools, "establish": establish, "trusted": trusted}
-    ap.reset_sandbox_state()
+    try:
+        yield {"tmp": tmp, "tools": tools, "establish": establish, "trusted": trusted}
+    finally:
+        os.umask(previous_umask)
+        ap.reset_sandbox_state()
 
 
 def sandboxed_config(tmp_path, **overrides):
@@ -457,6 +464,66 @@ def test_group_or_world_writable_component_is_rejected(tmp_path, sandbox, mode):
     existing.chmod(mode)
     with pytest.raises(AgentLoopError, match="group- or world-writable"):
         ap.establish_response_root_boundary(config)
+
+
+@pytest.fixture
+def umask_002():
+    previous = os.umask(0o002)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def _assert_private(path: Path) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert not mode & (stat.S_IWGRP | stat.S_IWOTH), f"{path} has mode {mode:o}"
+
+
+def test_scratch_tree_created_under_umask_002_is_accepted_by_sandbox(tmp_path, sandbox, umask_002):
+    # #1078: a non-sandboxed response file creates the shared scratch tree;
+    # a later sandboxed run must accept it on any umask.
+    from coding_review_agent_loop.agents.base import public_response_path
+
+    config = sandboxed_config(tmp_path)
+    response = public_response_path(config, "claude")
+    top = sandbox["tmp"] / "coding-review-agent-loop"
+    current = response.parent
+    while current != sandbox["tmp"]:
+        _assert_private(current)
+        current = current.parent
+    state = ap.establish_response_root_boundary(config)
+    for component in state.components:
+        _assert_private(Path(component.path))
+    assert Path(state.components[0].path) == top
+
+
+def test_make_private_dirs_ignores_umask_and_keeps_existing_modes(tmp_path, umask_002):
+    from coding_review_agent_loop.scratch import make_private_dirs
+
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    existing.chmod(0o755)
+    created = make_private_dirs(existing / "a" / "b" / "c")
+    for path in (existing / "a", existing / "a" / "b", created):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o755
+    assert make_private_dirs(created) == created
+
+
+def test_every_writable_component_is_reported_with_one_fix(tmp_path, sandbox):
+    config = sandboxed_config(tmp_path)
+    top = sandbox["tmp"] / "coding-review-agent-loop"
+    responses = top / "responses"
+    responses.mkdir(parents=True)
+    top.chmod(0o775)
+    responses.chmod(0o775)
+    with pytest.raises(ap.SandboxBoundaryError) as excinfo:
+        ap.establish_response_root_boundary(config)
+    message = str(excinfo.value)
+    assert f"{top} (mode 775)" in message
+    assert f"{responses} (mode 775)" in message
+    assert f"`chmod go-w {top} {responses}`" in message
 
 
 def test_component_mode_widened_between_turns_blocks_spawn(tmp_path, sandbox):

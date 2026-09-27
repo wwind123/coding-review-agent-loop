@@ -8,6 +8,7 @@ import uuid
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from ..runner import CommandResult, Runner
+from ..scratch import make_private_dirs
 from ..containment import ContainmentEvidence
 from ..usage import UsageMetadata
 
@@ -120,7 +121,7 @@ def public_response_path(
         / agent
         / f"{uuid.uuid4().hex}.md"
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
+    make_private_dirs(path.parent)
     return path
 
 
