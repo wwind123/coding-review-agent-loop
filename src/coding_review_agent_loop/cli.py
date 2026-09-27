@@ -110,9 +110,25 @@ _ALLOW_UNREADABLE_PROTECTION_HELP = (
 )
 
 
+_PR_SIGNED_REQUIREMENT_EPILOG = (
+    "Adding instructions to a PR, including one already approved at its head: post a "
+    "PR comment that ends with a line containing exactly `-- Human Reviewer`, then "
+    "rerun `agent-loop pr <number>`. The signed comment becomes a requirement that "
+    "invalidates carried approvals, so reviewers re-check the PR against it and any "
+    "unmet part is sent to the coder. Unsigned comments are not read as requirements, "
+    "and --pr-review-force-full changes who reviews, not what must be fixed. Only a "
+    "human may sign; an agent relaying an operator decision must disclose the relay."
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a local coder -> reviewer PR review loop."
+        description="Run a local coder -> reviewer PR review loop.",
+        epilog=(
+            "To give a PR new instructions, including after it is approved, post a PR "
+            "comment ending with a line containing exactly `-- Human Reviewer` and "
+            "rerun `agent-loop pr <number>`; see `agent-loop pr --help`."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -986,7 +1002,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_review_parallel(issue)
 
-    pr = subparsers.add_parser("pr", help="Run the reviewer/coder loop on an existing PR.")
+    pr = subparsers.add_parser(
+        "pr",
+        help="Run the reviewer/coder loop on an existing PR.",
+        description="Run the reviewer/coder loop on an existing PR.",
+        epilog=_PR_SIGNED_REQUIREMENT_EPILOG,
+    )
     pr.add_argument("pr_number", type=int)
     pr.add_argument(
         "--expected-closing-issue",

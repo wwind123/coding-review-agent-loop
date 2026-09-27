@@ -641,6 +641,21 @@ action in a comment ending with `-- Human Reviewer`, then resume the PR. An
 issue-created managed PR keeps its suppression label while waiting, so ordinary
 CI is not released before approval.
 
+The same signed comment is also how an operator adds instructions to a PR that
+is **already approved at its head**. Without one, rerunning `agent-loop pr
+<number>` on an approved head prints the approval and exits without invoking any
+agent: a plain PR comment is not read as a requirement, and
+`--pr-review-force-full` changes who reviews, not what must be fixed. Post the
+new instructions in a PR comment ending with a line containing exactly
+`-- Human Reviewer`, then rerun `agent-loop pr <number>`. A new or edited signed
+requirement invalidates every carried approval, so reviewers re-check the same
+head against it and any unmet part becomes a coder obligation in that PR. The
+approval message and `agent-loop pr --help` name this path.
+
+The signature certifies that a human wrote the requirement, and nothing verifies
+authorship. An agent must not apply it on its own initiative; when an operator
+tells an agent to relay a decision, the relay must be disclosed in the comment.
+
 ## Current Limitations
 
 - Run only one active `agent-loop` invocation per repository per machine. The

@@ -16912,6 +16912,21 @@ def _qualification_checkpoint_review_identity_matches(
     )
 
 
+def approved_pr_reopen_hint(pr_number: int) -> str:
+    """Name the operator path for new instructions on an approved PR (#1020).
+
+    An ordinary PR comment is not a requirement, so an approved head exits
+    without dispatching an agent. A signed human requirement invalidates the
+    carried approvals and re-invokes reviewers against it at the same head.
+    """
+    return (
+        f" To add instructions this PR must still satisfy, post a PR comment that ends "
+        f"with a line containing exactly `-- Human Reviewer`, then rerun `agent-loop pr "
+        f"{pr_number}`. Unsigned comments are not read as requirements. Only a human may "
+        "sign; an agent relaying an operator decision must disclose the relay in the body."
+    )
+
+
 def _round_limit_diagnostic(
     *,
     pr_number: int,
@@ -23938,6 +23953,7 @@ def run_pr_loop(
                                         f"Qualified head: {qualified_head}. Run `{merge_command}` after "
                                         f"confirming the live head.{risk}"
                                         + announce_reduced_board_completion()
+                                        + approved_pr_reopen_hint(pr_number)
                                     )
                                 return 0
                             if managed_outcome.status == "head_changed":
@@ -24117,6 +24133,7 @@ def run_pr_loop(
                         print(
                             f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}."
                             + announce_reduced_board_completion()
+                            + approved_pr_reopen_hint(pr_number)
                         )
                         return 0
             if round_number == allowed_rounds:
