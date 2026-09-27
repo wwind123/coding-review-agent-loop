@@ -663,7 +663,7 @@ def _names_worker_choice(tokens: Sequence[str], start: int) -> bool:
     return False
 
 
-def _project_root(cwd: Path) -> Path:
+def repository_root(cwd: Path) -> Path:
     """The nearest ancestor of ``cwd`` holding ``.git``; ``cwd`` when none does."""
     try:
         start = Path(cwd).resolve()
@@ -702,7 +702,7 @@ def parallel_default_applies(
     if _names_worker_choice(tokens, shape.pytest_args_start):
         return False
     if parallel_supported is None:
-        parallel_supported = detect_parallel_support(_project_root(cwd))
+        parallel_supported = detect_parallel_support(repository_root(cwd))
     return parallel_supported
 
 

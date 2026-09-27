@@ -4949,22 +4949,47 @@ def test_plain_pytest_lookup_prefers_parallel_cohort_then_serial(tmp_path):
         assert _expected_worker_cohorts(config, [*command, *extra])[0] != "3", extra
 
 
-@pytest.mark.parametrize("remembered", [False, True])
-def test_parallel_sample_never_shortens_a_possibly_serial_watchdog(tmp_path, remembered):
-    """Review item-3 (#1073): a declared-xdist repo may still run a plain pytest serially."""
+@pytest.mark.parametrize(
+    "remembered, subdirectory, declared",
+    [
+        (False, False, True), (True, False, True), (False, True, True), (True, True, True),
+        # A remembered parallel row still yields the safe watchdog when the
+        # prompt's detection sees no declaration at all.
+        (True, False, False),
+    ],
+)
+def test_parallel_sample_never_shortens_a_possibly_serial_watchdog(
+    tmp_path, remembered, subdirectory, declared,
+):
+    """Review item-3 (#1073): a declared-xdist repo may still run a plain pytest serially.
+
+    With ``subdirectory`` the coder works below the repository root and only
+    the root declares pytest-xdist, which the wrapper still detects.
+    """
     memory_dir = tmp_path / "memory"
     command = ["python3", "-m", "pytest", "tests/", "-q"]
+    repo = tmp_path / "repo"
+    workdir = repo / "pkg" if subdirectory else repo
+    workdir.mkdir(parents=True)
+    (repo / ".git").mkdir()
     config = make_config(
         tmp_path,
+        claude_dir=workdir,
         test_command=None if remembered else command,
         test_workers=3,
         test_worker_enforcement="clamp",
         coder_test_command_timeout_seconds=1800,
         agent_memory_dir=memory_dir,
     )
-    (config.claude_dir / "pyproject.toml").write_text(
-        '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n', encoding="utf-8",
-    )
+    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+
+    if declared:
+        (repo / "pyproject.toml").write_text(
+            '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n', encoding="utf-8",
+        )
+        assert _expected_worker_cohorts(config, command) == ["3", "serial"]
+    else:
+        assert _expected_worker_cohorts(config, command) == ["serial"]
     now = datetime_type.now(timezone.utc)
     for _ in range(3):
         assert runtime.record_test_observation(

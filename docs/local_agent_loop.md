@@ -806,7 +806,9 @@ because an explicit `--dist no` parses to the same value as the default. For a
 command the wrapper would give the default, the coder prompt's timeout
 recommendation takes the larger watchdog of the parallel and serial cohorts,
 because the run still goes serial when xdist is missing or addopts say
-`--dist no`; other commands use only their own cohort. When xdist is not installed or is disabled, the
+`--dist no`. It uses the wrapper's repository-root detection, and a
+remembered cohort that differs from the expected one is also folded into the
+maximum. When xdist is not installed or is disabled, the
 run stays serial and the plugin prints a one-line notice. The confirmation
 record carries `defaulted`. Pass `-n 0` or `-p no:xdist` to keep a focused run
 serial.
