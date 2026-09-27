@@ -1099,3 +1099,18 @@ def test_growth_notice_for_staged_or_uncrossed_plans_names_the_violation():
         plan, rendered_chars=10, revision_count=1, thresholds=PlanGrowthThresholds(max_scope_items=1)
     )
     assert "`scope-items`" in render_growth_notice(crossed, violation="x")
+
+
+def test_rebind_advisory_asserts_no_approval_time_gate_state(tmp_path):
+    """Item-6: an unjustified plan approved under enforced, higher thresholds and
+    rebound after the thresholds were lowered gets no false 'gate was off' claim."""
+    payload = structured_plan_revision_to_payload(_parsed())
+    canonical = render_canonical_plan_state(_parsed())
+    advisory = orchestrator_module._rebind_growth_advisory(
+        config=_config(tmp_path, plan_growth_gate="enforce", plan_growth_max_scope_items=1),
+        issue_number=56, comments=[_rebind_record(canonical, payload)], pr_number=77,
+        plan_hash=orchestrator_module.approved_plan_hash(canonical),
+    )
+    assert advisory is not None and "`scope-items`" in advisory
+    assert "No reviewed one-shot growth justification exists for this plan." in advisory
+    assert "gate was off" not in advisory and "not justified under" not in advisory

@@ -2867,7 +2867,8 @@ def test_m886_gate_off_replacement_advisory_says_no_justification(tmp_path, monk
         codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
     ) == 0
     (advisory,) = _m886_advisories(world)
-    assert "was not justified under the plan-growth gate" in advisory
+    assert "No reviewed one-shot growth justification exists" in advisory
+    assert "gate was off" not in advisory
     assert _m1013_notices(world) == []
 
 

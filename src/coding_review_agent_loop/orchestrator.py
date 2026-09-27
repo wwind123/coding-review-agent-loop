@@ -10678,8 +10678,9 @@ def _render_rebind_growth_advisory(
     ]
     if justification is None:
         lines.append(
-            "- The one-shot choice was not justified under the plan-growth gate (no reviewed "
-            "justification exists; the gate was off when the plan was approved)."
+            # Only the absence is authenticated: approval-time gate mode and
+            # thresholds are not recorded, so no reason is asserted.
+            "- No reviewed one-shot growth justification exists for this plan."
         )
     else:
         named = justification.get("crossed_signals")
