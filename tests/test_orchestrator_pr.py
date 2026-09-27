@@ -10226,6 +10226,41 @@ def test_pr_loop_rejects_structured_followup_live_target_tests_before_posting(tm
     assert runner.comments[0].startswith("**Review verdict:** Blocking")
     assert not any("Added the test." in comment for comment in runner.comments)
 
+
+@pytest.mark.parametrize("command", [
+    "python -m pytest tests/test_foo.py /tmp/scratch-main/tests/test_foo.py",
+    "pytest -c /tmp/scratch-main/pytest.ini tests/test_foo.py",
+])
+def test_pr_loop_refuses_structured_followup_mixed_outside_tests(tmp_path, command):
+    """Issue #991: a run that may also test the checkout is never context."""
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Needs a test.",
+                blocking_items=["Add a regression test."],
+                reviewer="Anthropic Claude",
+            ),
+            "Looks good.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_coder_followup(
+                summary="Added the test.",
+                addressed_items=["item-1"],
+                tests_run=[command],
+                reviewer="OpenAI Codex",
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    with pytest.raises(AgentLoopError, match="as separate commands"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any("Added the test." in comment for comment in runner.comments)
+    assert not any("Out-of-checkout context runs" in comment for comment in runner.comments)
+
+
 def test_gemini_review_loop_prefers_public_response_file_over_stdout(tmp_path):
     runner = FakeRunner(
         gemini_outputs=[

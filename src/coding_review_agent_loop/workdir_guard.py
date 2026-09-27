@@ -1523,9 +1523,13 @@ def partition_reported_tests_by_workdir(
     A coder may honestly report a baseline run on a clean copy of the base
     branch.  That run is context, not evidence: it is split out so it never
     becomes a self-reported evidence row, and it does not reject the whole
-    hand-off.  Only path containment degrades this way.  Live remote targets,
-    unvalidatable Windows paths, and malformed shell text still fail closed,
-    as do receipt citations, which keep using the strict validator.
+    hand-off.  Only a run proven to test *only* outside the checkout degrades
+    this way.  A command that names an outside path but may also test the
+    checkout -- mixed operands, an outside config or ignore path, a directory
+    the guard cannot track -- is ambiguous and refused with guidance to run
+    the two separately.  Live remote targets, unvalidatable Windows paths, and
+    malformed shell text still fail closed, as do receipt citations, which
+    keep using the strict validator.
     """
     if not tests_run:
         return ReportedTestsPartition(in_checkout=None if tests_run is None else ())
@@ -1533,11 +1537,24 @@ def partition_reported_tests_by_workdir(
     kept: list[str] = []
     context: list[str] = []
     for command in tests_run:
-        violations: list[str] = []
+        violations = _PathLog()
         _validate_single_command(
             command, assigned=assigned, origin="structured", path_violations=violations
         )
-        (context if violations else kept).append(command)
+        if not violations:
+            kept.append(command)
+        elif _tests_only_outside(violations):
+            context.append(command)
+        else:
+            raise AgentLoopError(
+                "Coder reported a test command that names a path outside the "
+                f"assigned checkout ({', '.join(repr(p) for p in violations)}) "
+                "but may also test the checkout itself, in command "
+                f"{command!r}. Report in-checkout tests and any baseline run "
+                "outside the checkout as separate commands; a baseline command "
+                "must name only outside test targets. Assigned checkout: "
+                f"{assigned}"
+            )
     return ReportedTestsPartition(in_checkout=tuple(kept), out_of_checkout=tuple(context))
 
 
@@ -1571,9 +1588,13 @@ def command_targets_outside_workdir(
     either: its failure may be a real in-checkout failure.
     """
     log = _command_path_violations(argv, assigned_workdir=assigned_workdir)
+    return isinstance(log, _PathLog) and _tests_only_outside(log)
+
+
+def _tests_only_outside(log: "_PathLog") -> bool:
+    """Whether a validated command names outside paths and tests nothing else."""
     return (
-        isinstance(log, _PathLog)
-        and bool(log)
+        bool(log)
         and log.outside_target
         and not log.inside_target
         and not log.ambiguous_target

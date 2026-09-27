@@ -1475,6 +1475,36 @@ def test_partition_moves_managed_wrapper_outside_target_to_context(tmp_path):
 
 
 @pytest.mark.parametrize("command", [
+    "python -m pytest tests/test_foo.py /tmp/scratch-main/tests/test_foo.py",
+    "pytest -c /tmp/scratch-main/pytest.ini tests/test_foo.py",
+    "pytest -c /tmp/scratch-main/pytest.ini",
+    "(cd /tmp/scratch-main && pytest tests/)",
+])
+def test_partition_refuses_command_that_may_also_test_the_checkout(tmp_path, command):
+    """Issue #991: only a run proven to test only outside becomes context."""
+    with pytest.raises(AgentLoopError, match="as separate commands") as exc_info:
+        workdir_guard.partition_reported_tests_by_workdir(
+            ["python3 -m pytest tests/test_api.py -q", command],
+            assigned_workdir=tmp_path,
+        )
+    assert "/tmp/scratch-main" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("command", [
+    "cd /tmp/scratch-main && pytest tests/",
+    "bash -c 'cd /tmp/scratch-main && pytest'",
+    "python -m pytest -q -- /tmp/scratch-main/tests/test_foo.py",
+])
+def test_partition_keeps_pure_outside_runs_as_context(tmp_path, command):
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        [command], assigned_workdir=tmp_path
+    )
+
+    assert partition.in_checkout == ()
+    assert partition.out_of_checkout == (command,)
+
+
+@pytest.mark.parametrize("command", [
     "cd /tmp/scratch-main && pytest tests/ https://live.example",
     "pytest /tmp/scratch-main/tests/ --base-url https://live.example",
     r"pytest C:\outside\tests",

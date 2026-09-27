@@ -3244,7 +3244,12 @@ honestly reported baseline run on a clean copy of the base branch -- does not
 reject the hand-off (#991). The orchestrator moves it out of `tests_run`, so it
 never becomes a self-reported evidence row, and renders it in a separate
 "Out-of-checkout context runs (not evidence)" section; the next reviewer's
-handoff context applies the same classification. A managed-broker run whose
+handoff context applies the same classification. Only an entry proven to test
+nothing but outside targets is context. An entry that names an outside path
+but may also test the checkout -- mixed operands, an outside config or ignore
+path, or a working directory the guard cannot track -- is refused with a
+message telling the coder to report the in-checkout run and the baseline as
+separate commands. A managed-broker run whose
 test operands point outside the assigned checkout is likewise excluded from
 the selectable execution catalog and the journal used for risk-matrix
 evidence, so it can never back a verified row. On the failure side the
