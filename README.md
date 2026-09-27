@@ -522,7 +522,8 @@ their recorded protection, or that GitHub cannot chain to the live head, are
 retired by one superseding record rather than refused; any other conflicting
 record still fails closed. Ordinary resumes prevent that accumulation: each
 continuity record they publish also retires the same actor's otherwise
-compatible records that cannot reach the new head, so an interrupted run does
+compatible, same-protection records that GitHub cannot chain to the new head
+(a protection disagreement still needs the fresh grant), so an interrupted run does
 not leave a stranded grant behind for a later `--managed-ci-fresh` to clear. If structured response validation rejected the implementation
 before accepting its PR number, strict protection instead uses ordinary
 same-PR issue/PR discovery and resume; the fresh unprotected grant is not

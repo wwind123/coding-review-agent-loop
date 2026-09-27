@@ -2238,14 +2238,17 @@ def _stranded_continuity_comment_ids(
 ) -> tuple[int, ...]:
     """Return this actor's unbound records a continuity record retires (#1069).
 
-    Uses the #1065 predicate: a record is unbound when it does not reach the
-    new head, because its recorded protection differs from the chain this
-    record extends or because GitHub cannot prove its head is an ancestor of
-    the new head.  Only records that are otherwise compatible are in scope:
-    same repository/issue/PR, base, actor, an actor-owned managed-label event,
-    and the handoff's approved plan.  The predecessor's own ancestry is never
-    retired, and any record that differs in base, actor, label provenance, or
-    plan is left in place for the existing readers to refuse on.
+    A record is retired when GitHub cannot prove its head is an ancestor of
+    the new head, so it can never reach it.  Only records that are otherwise
+    compatible are in scope: same repository/issue/PR, base, actor, an
+    actor-owned managed-label event, the handoff's approved plan, and the
+    protection and waiver of the chain this record extends.  A record whose
+    recorded protection differs is not retired here: ordinary recovery and
+    the resume audit refuse on it before any continuity round can run, because
+    which protection state governs the PR is an operator decision that the
+    explicit fresh grant adjudicates (#1065).  The predecessor's own ancestry
+    is never retired, and any record that differs in base, actor, label
+    provenance, or plan is left in place for the existing readers to refuse on.
     """
     by_comment_id = dict(records)
     chain_ids: set[int] = set(predecessor_comment_ids)
@@ -2267,6 +2270,9 @@ def _stranded_continuity_comment_ids(
         and record.actor_login.casefold() == handoff.trusted_actor_login.casefold()
         and record.actor_id == handoff.trusted_actor_id
         and (record.approved_plan_hash or None) == (handoff.approved_plan_hash or None)
+        and record.protection == predecessor.protection
+        and record.waiver == predecessor.waiver
+        and record.head_sha != new_head
     ]
     if not candidates:
         return ()
@@ -2285,11 +2291,6 @@ def _stranded_continuity_comment_ids(
     stranded: set[int] = set()
     for comment_id, record in candidates:
         if record.label_event_id not in valid_label_event_ids:
-            continue
-        if record.protection != predecessor.protection or record.waiver != predecessor.waiver:
-            stranded.add(comment_id)
-            continue
-        if record.head_sha == new_head:
             continue
         try:
             reaches = _github_proves_descendant(
@@ -2396,19 +2397,11 @@ def publish_issue_created_continuity_authorization(
         for comment_id, record in predecessor_records
         if record == predecessor
     }
-    predecessor_children = [
-        record
-        for _comment_id, record in records
-        if (
-            record.kind == "continuity"
-            and record.predecessor_head == predecessor_head
-            and record.predecessor_comment_id in predecessor_comment_ids
-        )
-    ]
-    if any(record.head_sha != new_head for record in predecessor_children):
-        raise AgentLoopError(
-            "Managed-CI head continuity found a forked predecessor authorization; refusing to proceed."
-        )
+    # Classify stranded records first (#1069): a child left by an interrupted
+    # attempt whose head the branch has since discarded cannot reach the new
+    # head, so the new record retires it rather than treating it as a
+    # competing fork.  A child that can still reach the new head remains a
+    # fork and refuses.
     superseded_comment_ids = _stranded_continuity_comment_ids(
         runner,
         config=config,
@@ -2418,6 +2411,32 @@ def publish_issue_created_continuity_authorization(
         predecessor_comment_ids=predecessor_comment_ids,
         new_head=new_head,
     )
+    predecessor_children = [
+        (comment_id, record)
+        for comment_id, record in records
+        if (
+            record.kind == "continuity"
+            and record.predecessor_head == predecessor_head
+            and record.predecessor_comment_id in predecessor_comment_ids
+        )
+    ]
+    # The exemption holds only when this call will publish the superseding
+    # record.  An existing child at the new head is reused or refused below,
+    # never re-published, so the fork it forms with a stranded sibling is
+    # still on record and must refuse.
+    fork_exempt = (
+        frozenset(superseded_comment_ids)
+        if not any(record.head_sha == new_head for _cid, record in predecessor_children)
+        else frozenset()
+    )
+    if any(
+        record.head_sha != new_head
+        for comment_id, record in predecessor_children
+        if comment_id not in fork_exempt
+    ):
+        raise AgentLoopError(
+            "Managed-CI head continuity found a forked predecessor authorization; refusing to proceed."
+        )
     normalized_round_comment_ids = tuple(sorted(set(round_comment_ids)))
 
     def revalidate_before_publication(authorization: ManagedCiIssueAuthorization) -> None:
