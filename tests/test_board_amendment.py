@@ -122,7 +122,7 @@ def test_signed_record_parses_with_canonical_digest():
     assert ignored == ()
     (record,) = records
     assert record.removed_reviewers == ("Antigravity",)
-    assert record.amended_required_reviewers == ("Codex", "Claude")
+    assert record.amended_board(BOARD) == ("Codex", "Claude")
     assert len(record.digest) == 64
     # The digest is canonical: key order and whitespace do not matter.
     payload = json.loads(body.split("```json\n", 1)[1].split("\n```", 1)[0])
@@ -574,6 +574,43 @@ def test_restore_of_removed_reviewer_is_required_from_its_effective_round():
     require_amendment_activation(pending, start_round_number=4, template=lambda a, n: "")
     with pytest.raises(AgentLoopError, match="re-enters round 5"):
         require_amendment_activation(pending, start_round_number=5, template=lambda a, n: "")
+
+
+def test_restoring_a_mid_board_reviewer_keeps_c0_order():
+    middle = ("Codex", "Antigravity", "Claude")
+    base = make_plan_contract(middle, "primary-then-panel", "Codex")
+    reduced = make_plan_contract(("Codex", "Claude"), "primary-then-panel", "Codex")
+    comments = [_comment("x")] * 6
+    comments[1] = _comment(
+        _amendment_body(original_required_reviewers=middle, effective_from_round=2)
+    )
+    comments[4] = _comment(_restore_body(effective_from_round=4))
+    amendments = _plan_amendments(comments)
+    d1, d2 = (record.digest for record in amendments)
+    assert amendments[1].amended_board(middle) == middle
+    lineage = _resolve(
+        [
+            _checkpoint(0, 1, base),
+            _checkpoint(2, 2, reduced, digest=d1),
+            _checkpoint(5, 4, base, digest=d2),
+        ],
+        amendments,
+        base,
+    )
+    assert lineage.contracts == (base, reduced, base)
+    assert lineage.current_board == middle
+    # The appended order would be drift, not the restored C0 board.
+    appended = make_plan_contract(("Codex", "Claude", "Antigravity"), "primary-then-panel", "Codex")
+    with pytest.raises(AgentLoopError, match="configured contract does not match"):
+        _resolve(
+            [
+                _checkpoint(0, 1, base),
+                _checkpoint(2, 2, reduced, digest=d1),
+                _checkpoint(5, 4, base, digest=d2),
+            ],
+            amendments,
+            appended,
+        )
 
 
 def test_restore_naming_a_reviewer_never_removed_fails_closed():

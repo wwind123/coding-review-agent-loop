@@ -90,16 +90,15 @@ class ReviewerBoardAmendment:
     restored_reviewers: tuple[str, ...] = ()
 
     def amended_board(self, base_board: Sequence[str]) -> tuple[str, ...]:
-        """original - removed + restored, in the order of the C0 ``base_board``."""
+        """original - removed + restored, in the order of the C0 ``base_board``.
+
+        The record alone cannot know where a restored reviewer sat in C0, so
+        there is deliberately no board property on the record: callers pass
+        the chain's base board (#984).
+        """
         kept = set(self.original_required_reviewers) - set(self.removed_reviewers)
         kept |= set(self.restored_reviewers)
         return tuple(name for name in base_board if name in kept)
-
-    @property
-    def amended_required_reviewers(self) -> tuple[str, ...]:
-        return self.amended_board(
-            (*self.original_required_reviewers, *self.restored_reviewers)
-        )
 
 
 @dataclass(frozen=True)
