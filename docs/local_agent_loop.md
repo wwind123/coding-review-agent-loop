@@ -41,7 +41,10 @@ decomposition, checkpoint, or split record, no child issue titled for the
 parent, no PR in any state (open or closed) closing the parent or on
 `agent-loop/managed-<issue>`, and no such branch — the new decision is published with the superseded hash named
 in its `retires_plan_hashes` field. The old record stays on the thread for
-audit, and later runs treat any hash a recorded decision retired as history.
+audit, and later runs treat it as history. Supersession is per record: a
+decision retires only the earlier records under the hashes it names, so a
+plan re-approved back to a retired hash gets a new live record, and replacing
+that record later requires the same no-evidence check.
 If any of that evidence exists, or an inventory cannot be read or may be
 truncated, the run still refuses and names the evidence. Fresh topology
 summaries, child identities, and handoffs are keyed by strategy `staged`, source

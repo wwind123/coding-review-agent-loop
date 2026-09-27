@@ -2301,15 +2301,12 @@ def find_existing_execution_decision(
     decision under a different hash still fails closed.
 
     A decision that superseded unrealized ones (#1087) names their hashes;
-    those are history too, so a resume after that decision was acted on does
-    not resurrect the record it replaced.
+    the records it replaced are history too, so a resume after that decision
+    was acted on does not resurrect them.  Supersession is per record, not per
+    hash (see ``live_execution_decisions``).
     """
     found: ExecutionDecision | None = None
-    retired = frozenset(retired_plan_hashes) | frozenset(
-        superseded
-        for decision in execution_decisions_for_parent(comments, parent_issue=parent_issue)
-        for superseded in decision.retires_plan_hashes
-    )
+    retired = frozenset(retired_plan_hashes)
     expected_identity = {
         "parent_issue": parent_issue,
         "plan_hash": plan_hash,
@@ -2319,38 +2316,52 @@ def find_existing_execution_decision(
         "topology_source": EXECUTION_TOPOLOGY_SOURCE,
         "recommendation_digest": recommendation_digest,
     }
-    for comment in comments:
-        body = getattr(comment, "body", None)
-        if not isinstance(body, str):
-            continue
-        for match in EXECUTION_DECISION_MARKER_RE.finditer(body):
-            decision = _decode_execution_decision(match.group("payload"))
-            if decision.parent_issue != parent_issue:
+    for decision in live_execution_decisions(comments, parent_issue=parent_issue):
+        if decision.plan_hash != plan_hash:
+            if decision.plan_hash in retired:
                 continue
-            if decision.plan_hash != plan_hash:
-                if decision.plan_hash in retired:
-                    continue
-                # A decision is durable approval-bound state, not a cache keyed
-                # only by the currently visible plan.  If approval changed
-                # after a crash, publishing a second decision would allow the
-                # same parent to acquire two competing execution topologies.
-                raise AgentLoopError(
-                    "Conflicting execution decision exists for this parent under a different "
-                    f"approved plan hash ({decision.plan_hash} vs {plan_hash}); repair or "
-                    "resume the recorded plan before publishing a new execution decision. "
-                    "A plan-first re-approval retires the recorded decision automatically "
-                    "only while nothing has acted on it (no PR, branch, handoff, or child issue)."
-                )
-            if decision.identity() != expected_identity:
-                raise AgentLoopError(
-                    "Conflicting execution decision identity exists for the approved plan; "
-                    "refusing to publish or adopt a different topology."
-                )
-            # Requested policy and current action are diagnostics only.
-            # Explicit staged actions may resume the same canonical
-            # decision, so do not fork identity on those fields.
-            found = decision
+            # A decision is durable approval-bound state, not a cache keyed
+            # only by the currently visible plan.  If approval changed
+            # after a crash, publishing a second decision would allow the
+            # same parent to acquire two competing execution topologies.
+            raise AgentLoopError(
+                "Conflicting execution decision exists for this parent under a different "
+                f"approved plan hash ({decision.plan_hash} vs {plan_hash}); repair or "
+                "resume the recorded plan before publishing a new execution decision. "
+                "A plan-first re-approval retires the recorded decision automatically "
+                "only while nothing has acted on it (no PR, branch, handoff, or child issue)."
+            )
+        if decision.identity() != expected_identity:
+            raise AgentLoopError(
+                "Conflicting execution decision identity exists for the approved plan; "
+                "refusing to publish or adopt a different topology."
+            )
+        # Requested policy and current action are diagnostics only.
+        # Explicit staged actions may resume the same canonical
+        # decision, so do not fork identity on those fields.
+        found = decision
     return found
+
+
+def live_execution_decisions(
+    comments: Sequence[object], *, parent_issue: int
+) -> tuple[ExecutionDecision, ...]:
+    """Decisions for ``parent_issue`` that no later decision superseded (#1087).
+
+    A superseding decision retires only the records *before* it that carry a
+    hash it names.  A plan re-approved back to a retired hash therefore gets
+    a new, live record: A, then B retiring A, then A retiring B leaves only
+    the last A live, so work acting on it still blocks a later plan C.
+    """
+    decisions = execution_decisions_for_parent(comments, parent_issue=parent_issue)
+    return tuple(
+        decision
+        for index, decision in enumerate(decisions)
+        if not any(
+            decision.plan_hash in later.retires_plan_hashes
+            for later in decisions[index + 1:]
+        )
+    )
 
 
 def execution_decisions_for_parent(

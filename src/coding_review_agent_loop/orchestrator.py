@@ -89,7 +89,7 @@ from .decomposition import (
     ExecutionDecision,
     EXECUTION_TOPOLOGY_SOURCE,
     find_existing_execution_decision,
-    execution_decisions_for_parent,
+    live_execution_decisions,
     reject_legacy_topology_collision,
     post_execution_decision,
     find_existing_topology_checkpoint,
@@ -8422,25 +8422,22 @@ def _retirable_execution_decision_hashes(
 ) -> tuple[frozenset[str], tuple[str, ...]]:
     """Resolve the decisions a plan-first re-approval supersedes (#1087).
 
-    Returns ``(retired, newly_retired)``.  ``retired`` also holds hashes an
-    earlier superseding decision already named, so work later bound to that
-    decision does not resurrect the one it replaced.  ``newly_retired``
-    names the unrealized decisions the next published decision records.
+    Returns ``(retired, newly_retired)``: the hashes the preflight may skip
+    and the ones the next published decision records.  Only *live* records
+    count (``live_execution_decisions``): supersession is per record, so a
+    plan re-approved back to a retired hash yields a live record that still
+    needs the realization check before a later plan replaces it.
 
     A decision under another hash that something has already acted on still
     fails closed: replacing it would fork the parent's topology.
     """
-    decisions = execution_decisions_for_parent(comments, parent_issue=issue_number)
-    recorded = frozenset(
-        retired for decision in decisions for retired in decision.retires_plan_hashes
-    )
     stale = tuple(dict.fromkeys(
         decision.plan_hash
-        for decision in decisions
-        if decision.plan_hash != plan_hash and decision.plan_hash not in recorded
+        for decision in live_execution_decisions(comments, parent_issue=issue_number)
+        if decision.plan_hash != plan_hash
     ))
     if not stale:
-        return recorded, ()
+        return frozenset(), ()
     evidence = _execution_decision_realization_evidence(
         runner, config=config, issue_number=issue_number, comments=comments
     )
@@ -8456,7 +8453,7 @@ def _retirable_execution_decision_hashes(
         f"Issue #{issue_number}: superseding unrealized execution decision(s) under plan "
         f"hash {', '.join(stale)}; nothing has acted on them.",
     )
-    return recorded | frozenset(stale), stale
+    return frozenset(stale), stale
 
 
 def _preflight_fresh_staged_topology(

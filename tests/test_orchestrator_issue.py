@@ -13681,10 +13681,10 @@ class _M1087Runner(FakeRunner):
         return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
 
 
-def _m1087_stale_decision_comment():
+def _m1087_stale_decision_comment(plan_hash=_M1087_STALE_HASH, retires=(), second=0):
     decision = _M1088ExecutionDecision(
         parent_issue=56,
-        plan_hash=_M1087_STALE_HASH,
+        plan_hash=plan_hash,
         plan_subject="An earlier approval of the same issue",
         execution_strategy_contract_version=1,
         strategy="one-shot",
@@ -13692,15 +13692,17 @@ def _m1087_stale_decision_comment():
         recommendation_digest="f" * 64,
         requested_policy="implement-one-shot",
         current_action="implement-one-shot",
+        retires_plan_hashes=tuple(retires),
     )
     return {
         "author": {"login": "coding-review-agent-loop"},
-        "createdAt": "2026-05-22T00:00:00Z",
+        "createdAt": f"2026-05-22T00:00:{second:02d}Z",
         "body": _m1088_format_execution_decision(decision),
     }
 
 
 def _m1087_runner(**kwargs):
+    kwargs.setdefault("issue_comments", [_m1087_stale_decision_comment()])
     return _M1087Runner(
         claude_outputs=[
             structured_v1_plan_state(),
@@ -13711,7 +13713,6 @@ def _m1087_runner(**kwargs):
             structured_plan_review(state="approved"),
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
-        issue_comments=[_m1087_stale_decision_comment()],
         **kwargs,
     )
 
@@ -13813,6 +13814,37 @@ def test_1087_decision_with_a_closed_pr_still_refuses(tmp_path):
         if cmd[:3] == ["gh", "pr", "list"] and "headRefName" in cmd[cmd.index("--json") + 1]
     ]
     assert inventory and inventory[-1][inventory[-1].index("--state") + 1] == "all"
+    assert _m1087_posted_decisions(runner) == []
+    assert not _m1087_implementation_dispatched(runner)
+
+
+def test_1087_reapproved_retired_hash_is_live_again_and_still_checked(tmp_path):
+    # A, B retiring A, then A retiring B: the last A is live.  A PR that acted
+    # on it (closed before its handoff record, branch deleted) must still
+    # block the re-approved plan C, even though both hashes were once retired.
+    other_hash = "0123456789abcdef"
+    runner = _m1087_runner(
+        issue_comments=[
+            _m1087_stale_decision_comment(second=0),
+            _m1087_stale_decision_comment(other_hash, retires=[_M1087_STALE_HASH], second=1),
+            _m1087_stale_decision_comment(retires=[other_hash], second=2),
+        ],
+        open_prs_payload=[
+            {
+                "number": 83,
+                "state": "CLOSED",
+                "body": "Abandoned attempt.",
+                "headRefName": "agent-loop/managed-56",
+            }
+        ],
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True)
+
+    message = str(excinfo.value)
+    assert _M1087_STALE_HASH in message and other_hash not in message
+    assert "PR #83" in message
     assert _m1087_posted_decisions(runner) == []
     assert not _m1087_implementation_dispatched(runner)
 
