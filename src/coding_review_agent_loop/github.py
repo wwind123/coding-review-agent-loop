@@ -3269,6 +3269,41 @@ def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> 
     return sha
 
 
+def get_pr_merge_commit_sha(
+    runner: Runner, config: AgentLoopConfig, pr_number: int
+) -> str | None:
+    """Return a merged PR's merge commit, or ``None`` when it cannot be read.
+
+    Only descriptive records use this, so an unreadable value degrades to an
+    absent commit instead of failing the caller.
+    """
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            config.repo,
+            "--json",
+            "mergeCommit",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "null")
+    except json.JSONDecodeError:
+        return None
+    commit = data.get("mergeCommit") if isinstance(data, dict) else None
+    oid = commit.get("oid") if isinstance(commit, dict) else None
+    if isinstance(oid, str) and re.fullmatch(r"[0-9a-f]{7,64}", oid):
+        return oid
+    return None
+
+
 @dataclass(frozen=True)
 class CiWatchOutcome:
     """Terminal result from the full-board post-approval watcher."""

@@ -2615,6 +2615,138 @@ def test_staged_parent_reports_a_terminal_state_when_every_phase_is_complete(tmp
     assert not any(cmd[:3] == ["gh", "issue", "close"] for cmd, _cwd in runner.commands)
 
 
+def _merged_pr_payload(pr_number, merge_commit):
+    return {**pr_payload_for_state(pr_number, "MERGED"), "mergeCommit": {"oid": merge_commit}}
+
+
+def _two_stage_parent_records():
+    plan, created, summary = staged_legacy_plan_records(stage_count=2)
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+        phase_handoff_comment(plan, created, 1),
+        phase_handoff_comment(plan, created, 2),
+    ]
+    return plan, parent_comments
+
+
+def _completion_records(runner):
+    return [comment for comment in runner.comments if "AGENT_PLAN_STAGED_COMPLETION" in comment]
+
+
+def test_delivered_staged_parent_carries_one_completion_record_naming_every_child(
+    tmp_path, capsys
+):
+    """#1018: completing both stages writes a completion record back to the parent."""
+    plan, parent_comments = _two_stage_parent_records()
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={
+            99: [child_pr_handoff_comment(99, 912)],
+            100: [child_pr_handoff_comment(100, 913)],
+        },
+        issue_payloads_by_number={99: {"state": "closed"}, 100: {"state": "closed"}},
+        pr_payloads_by_number={
+            912: _merged_pr_payload(912, "0c657e93" + "a" * 32),
+            913: _merged_pr_payload(913, "3c48424d" + "b" * 32),
+        },
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    records = _completion_records(runner)
+    assert len(records) == 1
+    record = records[0]
+    assert "All 2 staged phases of the approved plan for issue #56 are delivered." in record
+    assert "| #99 | PR #912 merged at `0c657e93aaaa` |" in record
+    assert "| #100 | PR #913 merged at `3c48424dbbbb` |" in record
+    assert "agent-loop does not close this issue itself" in record
+    metadata = phase_progress_module.find_staged_completion_record(
+        [IssueComment(author="bot", body=record, created_at=None)],
+        parent_issue=56,
+        plan_hash=approved_plan_hash(plan),
+        mode="implement-by-phase",
+    )
+    assert [
+        (stage.child_issue_number, stage.pr_number, stage.merge_commit)
+        for stage in metadata.stages
+    ] == [(99, 912, "0c657e93" + "a" * 32), (100, 913, "3c48424d" + "b" * 32)]
+    assert "Recorded the staged completion on issue #56." in capsys.readouterr().out
+    assert not any(cmd[:3] == ["gh", "issue", "close"] for cmd, _cwd in runner.commands)
+
+
+def _staged_child_context(number):
+    return IssueContext(
+        number=number,
+        repo="OWNER/REPO",
+        title=f"Stage {number}",
+        body="Child phase issue for parent #56.\n\nStage work.",
+        url=f"https://github.com/OWNER/REPO/issues/{number}",
+        comments=(),
+    )
+
+
+@pytest.mark.parametrize(
+    "last_pr_state,merged_pr,recorded",
+    [
+        pytest.param("MERGED", 913, True, id="last-stage-merged"),
+        pytest.param("OPEN", 913, False, id="last-stage-still-open"),
+        pytest.param("MERGED", 999, False, id="other-pr-merged"),
+    ],
+)
+def test_child_merge_of_the_last_stage_records_parent_completion(
+    tmp_path, capsys, last_pr_state, merged_pr, recorded
+):
+    """#1018: the child run that merges the final stage writes the parent record.
+
+    GitHub closes the child from its PR asynchronously, so the child is still
+    OPEN here; only the exact child/PR pair this run merged counts as complete.
+    """
+    _plan, parent_comments = _two_stage_parent_records()
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={
+            99: [child_pr_handoff_comment(99, 912)],
+            100: [child_pr_handoff_comment(100, 913)],
+        },
+        issue_payloads_by_number={99: {"state": "closed"}, 100: {"state": "open"}},
+        pr_payloads_by_number={
+            912: _merged_pr_payload(912, "0c657e93" + "a" * 32),
+            913: (
+                _merged_pr_payload(913, "3c48424d" + "b" * 32)
+                if last_pr_state == "MERGED"
+                else pr_payload_for_state(913, "OPEN")
+            ),
+        },
+    )
+
+    def merge_hook():
+        orchestrator_module._record_staged_parent_completion_after_merge(
+            runner,
+            config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+            issue_context=_staged_child_context(100),
+            pr_number=merged_pr,
+        )
+
+    merge_hook()
+
+    records = _completion_records(runner)
+    output = capsys.readouterr().out
+    if recorded:
+        assert len(records) == 1
+        assert "| #99 | PR #912 merged" in records[0]
+        assert "| #100 | PR #913 merged" in records[0]
+        assert "PR #913 delivered the last staged phase of issue #56" in output
+        # The record is written once per plan identity: a second writer (a
+        # parent rerun, or a repeated hook) finds it and posts nothing.
+        merge_hook()
+        assert len(_completion_records(runner)) == 1
+    else:
+        assert records == []
+    if merged_pr == 999:
+        assert "no completion record was written" in output
+
+
 @pytest.mark.parametrize("pr_state", [None, "OPEN"])
 def test_staged_parent_hints_only_for_an_open_child(tmp_path, capsys, pr_state):
     """Matrix row `open-child-runnable-hint`."""

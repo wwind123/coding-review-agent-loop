@@ -1247,7 +1247,14 @@ The modes are:
   While a phase's child is still open the rerun names it and prints the exact
   command to resume it. Once every phase is complete the rerun reports a
   terminal state instead - one line per stage, plus any retained-parent and
-  final-integration obligations - and dispatches nothing. Completion evidence
+  final-integration obligations - and dispatches nothing. The same terminal
+  state is also written back to the parent as a completion comment
+  (`AGENT_PLAN_STAGED_COMPLETION`) naming each stage, its child issue, and its
+  merged PR and merge commit, so the parent's newest record no longer announces
+  the last dispatched phase. The child run whose auto-merge delivers the last
+  phase writes it immediately; otherwise the next parent rerun does. It is
+  written once per plan identity, and it states that agent-loop leaves the
+  parent open for the operator to verify and close. Completion evidence
   is authenticated: a closed child whose PR evidence is missing, unreadable or
   unmerged, an open child whose canonical PR is merged or closed, and a handoff
   recorded for a later phase while an earlier one is incomplete all stop the run
@@ -2789,7 +2796,8 @@ What each mechanism produces and where the run stops:
   current (first incomplete) `agent-pr` phase and stops after that phase's PR
   review loop. Rerunning the parent advances to the next phase once the current
   phase's child is closed with a merged PR, and reports a terminal delivery
-  report once every phase is complete. If the selected phase is `human-action`
+  report once every phase is complete, recording it on the parent as an
+  `AGENT_PLAN_STAGED_COMPLETION` comment. If the selected phase is `human-action`
   or `manual-close` and its child is still open, the run stops without
   implementing anything. Resume an in-progress child with
   `agent-loop issue <child>`; rerun the parent to move on to the next phase.
@@ -2848,7 +2856,9 @@ Two worked examples:
    parent. When every phase is delivered the parent rerun prints a terminal
    report naming each stage and any operator-owned retained-parent or
    final-integration work, and dispatches nothing further; it does not close
-   the parent for you. `--materialize-split-issues` is not used anywhere in
+   the parent for you. That report is also posted to the parent once as a
+   completion record - by the child run that auto-merges the last phase, or
+   by the next parent rerun. `--materialize-split-issues` is not used anywhere in
    this flow — the phase children already are the detailed decomposition.
 2. **Discuss-mode split consensus.** Run
    `agent-loop discuss 123 --repo OWNER/REPO --materialize-split-issues` to

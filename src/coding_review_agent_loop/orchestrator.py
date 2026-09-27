@@ -179,6 +179,7 @@ from .phase_progress import (
     STATUS_HUMAN_PENDING,
     PhaseProgress,
     StagedTopologyOutcome,
+    record_staged_completion,
     render_phase_status_line,
     resolve_staged_phase_progress,
     select_current_phase,
@@ -7614,6 +7615,123 @@ def _print_staged_terminal_report(
         )
 
 
+def _recorded_staged_outcome_for_child(
+    parent_comments: Sequence[object],
+    *,
+    parent_issue: int,
+    child_issue: int,
+) -> StagedTopologyOutcome | None:
+    """Rebuild a parent's staged topology from its records, seen from one child.
+
+    Returns ``None`` when the parent holds no phase handoff for ``child_issue``
+    or no decomposition summary for that handoff's plan identity: the child
+    then is not a dispatched phase of a recorded staged topology.
+    """
+    identities = {
+        (handoff.plan_hash, handoff.mode)
+        for handoff in find_phase_implementation_handoffs_for_parent(
+            parent_comments, parent_issue=parent_issue
+        )
+        if handoff.child_issue_number == child_issue
+    }
+    if not identities:
+        return None
+    if len(identities) > 1:
+        raise AgentLoopError(
+            f"Issue #{parent_issue} records phase handoffs for child issue #{child_issue} "
+            "under more than one plan identity."
+        )
+    plan_hash, mode = identities.pop()
+    existing = find_existing_decomposition(
+        parent_comments, parent_issue=parent_issue, plan_hash=plan_hash, mode=mode
+    )
+    if existing is None:
+        return None
+    adopted = tuple(
+        CreatedPhaseIssue(
+            phase=RecordedPhase(title=title, automation=automation),
+            issue_url=url,
+            issue_number=number,
+        )
+        for (title, url, number), automation in zip(
+            existing.children, existing.automation, strict=False
+        )
+    )
+    return StagedTopologyOutcome(
+        created=adopted,
+        stage_ids=_resolved_stage_ids(adopted, recorded_stage_ids=existing.stage_ids),
+        automations=tuple(item.phase.automation for item in adopted),
+        plan_hash=plan_hash,
+        mode=mode,
+        topology_source=existing.topology_source,
+        retained_parent_scope=existing.retained_parent_scope,
+        final_integration_work=existing.final_integration_work,
+    )
+
+
+def _record_staged_parent_completion_after_merge(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_context: IssueContext | None,
+    pr_number: int,
+) -> None:
+    """Write the parent's completion record when this merge delivered its last phase.
+
+    The child run that merges the final stage is the one run that knows the
+    decomposition just finished (#1018).  It is best effort: the PR is already
+    merged, so a parent that cannot be authenticated here is reported with the
+    rerun that records it, never raised.
+    """
+    if issue_context is None or config.dry_run:
+        return
+    parent_issue: int | None = None
+    try:
+        parent_issue = _infer_staged_parent_issue(issue_context)
+        if parent_issue is None:
+            return
+        parent_context = get_issue_context(runner, config=config, issue_number=parent_issue)
+        outcome = _recorded_staged_outcome_for_child(
+            parent_context.comments,
+            parent_issue=parent_issue,
+            child_issue=issue_context.number,
+        )
+        if outcome is None:
+            return
+        progress = resolve_staged_phase_progress(
+            runner,
+            config=config,
+            parent_issue=parent_issue,
+            parent_comments=parent_context.comments,
+            outcome=outcome,
+            just_merged=(issue_context.number, pr_number),
+        )
+        if select_current_phase(progress) is not None:
+            return
+        if record_staged_completion(
+            runner,
+            config=config,
+            parent_issue=parent_issue,
+            parent_comments=parent_context.comments,
+            progress=progress,
+            outcome=outcome,
+        ):
+            print(
+                f"PR #{pr_number} delivered the last staged phase of issue #{parent_issue}; "
+                "recorded the staged completion on the parent."
+            )
+    except AgentLoopError as exc:
+        if parent_issue is None:
+            log(config, f"Staged parent completion check skipped: {exc}")
+            return
+        log(config, f"Staged parent #{parent_issue} completion record not written: {exc}")
+        print(
+            f"Could not confirm whether issue #{parent_issue} has staged work left, so no "
+            f"completion record was written ({exc}). Rerunning the parent's staged plan "
+            "records it once every phase is delivered."
+        )
+
+
 def _dispatch_current_decomposition_phase(
     runner: Runner,
     *,
@@ -7680,6 +7798,15 @@ def _dispatch_current_decomposition_phase(
         _print_staged_terminal_report(
             issue_number=issue_number, progress=progress, outcome=outcome
         )
+        if record_staged_completion(
+            runner,
+            config=config,
+            parent_issue=issue_number,
+            parent_comments=parent_issue_context.comments,
+            progress=progress,
+            outcome=outcome,
+        ):
+            print(f"Recorded the staged completion on issue #{issue_number}.")
         return 0
 
     phase_index = selected.phase_index
@@ -22885,6 +23012,10 @@ def run_pr_loop(
                         unresolved_items = _clear_machine_obligations(
                             unresolved_items, kind="github-pr-checks"
                         )
+                        _record_staged_parent_completion_after_merge(
+                            runner, config=config, issue_context=issue_context,
+                            pr_number=pr_number,
+                        )
                     return 0
                 if (
                     not must_fix_items
@@ -23122,6 +23253,10 @@ def run_pr_loop(
                             print(
                                 f"PR #{pr_number} merged after CI watch completed."
                                 + announce_reduced_board_completion()
+                            )
+                            _record_staged_parent_completion_after_merge(
+                                runner, config=config, issue_context=issue_context,
+                                pr_number=pr_number,
                             )
                         else:
                             print(
@@ -23655,6 +23790,10 @@ def run_pr_loop(
                                     unresolved_items = _clear_machine_obligations(
                                         unresolved_items, kind="github-pr-checks"
                                     )
+                                    _record_staged_parent_completion_after_merge(
+                                        runner, config=config, issue_context=issue_context,
+                                        pr_number=pr_number,
+                                    )
                                 return 0
                             managed_outcome = wait_for_final_qualification(
                                 runner,
@@ -23761,6 +23900,10 @@ def run_pr_loop(
                                         f"PR #{pr_number} approved by "
                                         f"{format_agent_list(configured_reviewers)}."
                                         + announce_reduced_board_completion()
+                                    )
+                                    _record_staged_parent_completion_after_merge(
+                                        runner, config=config, issue_context=issue_context,
+                                        pr_number=pr_number,
                                     )
                                 else:
                                     qualified_head = publish_manual_v2_qualification(
@@ -23937,6 +24080,10 @@ def run_pr_loop(
                             if merged:
                                 unresolved_items = _clear_machine_obligations(
                                     unresolved_items, kind="github-pr-checks"
+                                )
+                                _record_staged_parent_completion_after_merge(
+                                    runner, config=config, issue_context=issue_context,
+                                    pr_number=pr_number,
                                 )
                             return 0
                         elif config.auto_merge:

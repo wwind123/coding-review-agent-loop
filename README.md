@@ -670,7 +670,7 @@ Plan-first mode supports five post-approval choices:
 | `plan-only` | Post the approved plan and stop. This is the default. |
 | `implement-one-shot` | Implement the approved plan in one PR. |
 | `decompose-only` | Create detailed child issues for the approved phases and stop. |
-| `implement-by-phase` | Create the phase issues and implement the current (first incomplete) phase; rerun the parent to advance to the next phase, and to get a terminal delivery report once every phase is complete. |
+| `implement-by-phase` | Create the phase issues and implement the current (first incomplete) phase; rerun the parent to advance to the next phase, and to get a terminal delivery report once every phase is complete. That report is also posted once to the parent as a completion record (by the child run that auto-merges the last phase, or by the next parent rerun); the parent is left open for the operator to close. |
 | `auto` | After approval, select one-shot or by-phase, then route each staged child from its reviewed disposition. |
 
 Example:
