@@ -4925,8 +4925,103 @@ def test_coder_prompt_parallel_worker_guidance(tmp_path, fixture, supported, mod
         assert "lowered to the budget" not in prompt
     if supported:
         assert "keep focused single-file runs serial" in prompt
+        # Issue #1073: only an enforcing mode gives a plain pytest the default.
+        assert ("gives a plain pytest" in prompt) == (mode != "off")
     else:
         assert "do not add parallel worker flags" in prompt
+
+
+def test_plain_pytest_lookup_prefers_parallel_cohort_then_serial(tmp_path):
+    """Issue #1073: a plain pytest in an xdist repo may run parallel or, without xdist, serially."""
+    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+
+    config = make_config(tmp_path, test_workers=3, test_worker_enforcement="clamp")
+    command = ["python3", "-m", "pytest", "tests/"]
+    assert _expected_worker_cohorts(config, command) == ["serial"]
+    (config.claude_dir / "pyproject.toml").write_text(
+        '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n', encoding="utf-8",
+    )
+    assert _expected_worker_cohorts(config, command) == ["3", "serial"]
+    assert _expected_worker_cohorts(config, [*command, "-n", "2"]) == ["2"]
+    # Serial-only invocations never borrow the parallel cohort (review item-2).
+    for extra in (["--collect-only"], ["--co"], ["--pdb"], ["--trace"], ["--looponfail"], ["-f"],
+                  ["--distload"], ["--dist", "no"], ["-p", "no:xdist"]):
+        assert _expected_worker_cohorts(config, [*command, *extra])[0] != "3", extra
+
+
+@pytest.mark.parametrize(
+    "remembered, subdirectory, declared",
+    [
+        (False, False, True), (True, False, True), (False, True, True), (True, True, True),
+        # A remembered parallel row still yields the safe watchdog when the
+        # prompt's detection sees no declaration at all.
+        (True, False, False),
+    ],
+)
+def test_parallel_sample_never_shortens_a_possibly_serial_watchdog(
+    tmp_path, remembered, subdirectory, declared,
+):
+    """Review item-3 (#1073): a declared-xdist repo may still run a plain pytest serially.
+
+    With ``subdirectory`` the coder works below the repository root and only
+    the root declares pytest-xdist, which the wrapper still detects.
+    """
+    memory_dir = tmp_path / "memory"
+    command = ["python3", "-m", "pytest", "tests/", "-q"]
+    repo = tmp_path / "repo"
+    workdir = repo / "pkg" if subdirectory else repo
+    workdir.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    config = make_config(
+        tmp_path,
+        claude_dir=workdir,
+        test_command=None if remembered else command,
+        test_workers=3,
+        test_worker_enforcement="clamp",
+        coder_test_command_timeout_seconds=1800,
+        agent_memory_dir=memory_dir,
+    )
+    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+
+    if declared:
+        (repo / "pyproject.toml").write_text(
+            '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n', encoding="utf-8",
+        )
+        assert _expected_worker_cohorts(config, command) == ["3", "serial"]
+    else:
+        assert _expected_worker_cohorts(config, command) == ["serial"]
+    now = datetime_type.now(timezone.utc)
+    for _ in range(3):
+        assert runtime.record_test_observation(
+            memory_dir,
+            argv=command,
+            cwd=config.claude_dir,
+            outcome="passed",
+            elapsed_seconds=30,
+            attempted_timeout_seconds=1800,
+            policy_ceiling_seconds=1800,
+            timestamp=now,
+            workers="3",
+            launch_integrity="verified",
+        )
+    parallel_only = runtime.recommend_timeout(
+        memory_dir, argv=command, cwd=config.claude_dir, policy_ceiling_seconds=1800, workers="3",
+    )
+    assert parallel_only.recommended_timeout_seconds < 1800
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit="abc123",
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary="REPO SUMMARY TEXT",
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+        runtime_observations=tuple(runtime.load_runtime_memory(memory_dir)),
+    )
+    prompt = build_issue_prompt(56, config, memory=memory)
+    assert "Recommended whole-command timeout: 1800s" in prompt
+    assert f"Recommended whole-command timeout: {parallel_only.recommended_timeout_seconds}s" not in prompt
 
 
 def test_reviewer_prompt_has_no_parallel_worker_guidance(tmp_path):

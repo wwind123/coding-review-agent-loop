@@ -42,6 +42,7 @@ from coding_review_agent_loop.test_workers import (
     derive_worker_budget,
     detect_parallel_support,
     expected_workers_label,
+    parallel_default_applies,
     parse_worker_count,
     parse_worker_memory,
     plugin_directory,
@@ -393,6 +394,68 @@ def test_prefixed_other_commands_keep_argv_unchanged(tmp_path, argv, mode):
         decision.cleanup()
 
 
+def _xdist_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text('[project.optional-dependencies]\ndev = ["pytest-xdist>=3"]\n')
+    (repo / "sub").mkdir()
+    return repo
+
+
+def test_plain_pytest_in_xdist_repo_asks_for_budget_default(tmp_path):
+    """Issue #1073: the budget is a default for a plain pytest, not only a cap."""
+    repo = _xdist_repo(tmp_path)
+    for cwd in (repo, repo / "sub"):
+        decision = apply_worker_budget(
+            ["python3", "-m", "pytest", "tests/", "-q", "-p", "no:cacheprovider"], {}, cwd, _budget(4),
+        )
+        try:
+            assert decision.argv == (
+                "python3", "-m", "pytest", "-p", PLUGIN_MODULE, "tests/", "-q", "-p", "no:cacheprovider",
+            )
+            spec = json.loads(decision.env[ENV_WORKER_CAP_SPEC])
+            assert spec["default_workers"] == 4 and spec["budget"] == 4
+        finally:
+            decision.cleanup()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["-n", "2"], ["-n0"], ["--numprocesses=3"], ["--maxprocesses", "2"], ["--dist", "load"],
+        ["--dist=loadfile"], ["--tx", "popen"], ["-d"], ["-p", "no:xdist"], ["-pno:xdist"],
+        ["-p=no:xdist"], ["--pdb"], ["--trace"], ["--looponfail"], ["--dist", "no"],
+        ["--collect-only"], ["--co"],
+    ],
+)
+def test_explicit_worker_choice_gets_no_default(tmp_path, extra):
+    repo = _xdist_repo(tmp_path)
+    argv = ["pytest", "tests", *extra]
+    assert not parallel_default_applies(argv, repo, _budget(4))
+    decision = apply_worker_budget(argv, {}, repo, _budget(4))
+    try:
+        assert "default_workers" not in json.loads(decision.env[ENV_WORKER_CAP_SPEC])
+        assert decision.argv[-len(extra):] == tuple(extra)
+    finally:
+        decision.cleanup()
+
+
+def test_parallel_default_requires_budget_mode_shape_and_repo_support(tmp_path):
+    repo = _xdist_repo(tmp_path)
+    assert parallel_default_applies(["pytest"], repo, _budget(2))
+    assert parallel_default_applies(["pytest"], repo, _budget(2, "refuse"))
+    assert not parallel_default_applies(["pytest"], repo, _budget(1))
+    assert not parallel_default_applies(["pytest"], repo, _budget(4, "off"))
+    assert not parallel_default_applies(["make", "test"], repo, _budget(4))
+    # Arguments after ``--`` are not pytest options.
+    assert parallel_default_applies(["pytest", "--", "-n", "2"], repo, _budget(4))
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert not parallel_default_applies(["pytest"], plain, _budget(4))
+    assert parallel_default_applies(["pytest"], plain, _budget(4), parallel_supported=True)
+    assert not parallel_default_applies(["pytest"], repo, _budget(4), parallel_supported=False)
+
+
 def test_off_mode_injects_nothing(tmp_path):
     env = {"PYTEST_ADDOPTS": "-n 8", ENV_XDIST_AUTO: "6"}
     decision = apply_worker_budget(["pytest", "-n", "8"], env, tmp_path, _budget(2, "off"))
@@ -662,6 +725,12 @@ def test_expected_labels_for_lookup():
     assert expected_workers_label(["pytest", "-n", "auto"], budget=2, mode="clamp") == "unknown"
     assert expected_workers_label(["make"], budget=2, mode="clamp") == "unknown"
     assert expected_workers_label(["pytest", "-n", "4"], budget=2, mode="off") == "unknown"
+    assert expected_workers_label(["pytest"], budget=2, mode="clamp", parallel_default=True) == "2"
+    assert expected_workers_label(["pytest"], budget=1, mode="clamp", parallel_default=True) == "serial"
+    assert expected_workers_label(["pytest", "-n", "0"], budget=2, mode="clamp", parallel_default=True) == "serial"
+    assert expected_workers_label(
+        ["pytest", "-p", "no:xdist"], budget=2, mode="clamp", parallel_default=True,
+    ) == "serial"
 
 
 # ---------------------------------------------------------------------------

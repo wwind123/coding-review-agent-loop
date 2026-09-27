@@ -23,7 +23,9 @@ from coding_review_agent_loop.test_workers import (  # noqa: E402
     ENV_WORKER_CAP_SPEC,
     PLUGIN_MODULE,
     analyze_worker_report,
+    apply_worker_budget,
     plugin_directory,
+    WorkerBudget,
 )
 
 TESTS = textwrap.dedent(
@@ -78,6 +80,7 @@ def _run(
     report: Path | None = None,
     command: list[str] | None = None,
     timeout: float = 120,
+    default_workers: int | None = None,
 ):
     report = report or (project.parent / "report.jsonl")
     marker = project.parent / "ran.txt"
@@ -91,7 +94,10 @@ def _run(
     child_env["PYTEST_PLUGINS"] = PLUGIN_MODULE
     child_env["PYTEST_XDIST_AUTO_NUM_WORKERS"] = "8"
     child_env["RAN_MARKER"] = str(marker)
-    child_env[ENV_WORKER_CAP_SPEC] = json.dumps({"version": 1, "budget": budget, "mode": mode, "report": str(report)})
+    spec = {"version": 1, "budget": budget, "mode": mode, "report": str(report)}
+    if default_workers is not None:
+        spec["default_workers"] = default_workers
+    child_env[ENV_WORKER_CAP_SPEC] = json.dumps(spec)
     child_env.update(env or {})
     for key, value in list(child_env.items()):
         if value is None:
@@ -345,6 +351,85 @@ def test_worker_processes_write_nothing_and_executed_marker_once(tmp_path):
     assert {row["pid"] for row in rows} == {rows[0]["pid"]}
     assert len(_only(rows, "executed")) == 1
     assert not _only(rows, "nested")
+
+
+# ---------------------------------------------------------------------------
+# Budget default for a plain pytest (issue #1073)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+def test_plain_pytest_runs_with_the_default_workers(tmp_path, mode):
+    project = _project(tmp_path)
+    proc, rows, ran = _run(project, [], budget=3, mode=mode, default_workers=3)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    confirmed = _confirmed(rows)
+    assert confirmed["effective"] == 3 and confirmed["defaulted"] is True
+    assert sorted(ran) == ["four", "one", "three", "two"]
+    assert "running with -n 3" in proc.stdout + proc.stderr
+    analysis = analyze_worker_report(project.parent / "report.jsonl", command_class="direct-pytest", mode=mode)
+    assert analysis.workers_cohort == "3"
+
+
+@pytest.mark.parametrize(
+    "files, args, env, expected",
+    [
+        ({}, ["-n", "0"], {}, 0),
+        ({}, ["-n", "2"], {}, 2),
+        ({}, [], {"PYTEST_ADDOPTS": "-n 0"}, 0),
+        ({"pytest.ini": "[pytest]\naddopts = -n 2\n"}, [], {}, 2),
+        ({}, ["--collect-only"], {}, 0),
+        ({}, ["--tx", "popen"], {}, 0),
+        # An explicit ``--dist no`` resolves to the same value as the default;
+        # it must still win over the budget default (review item-1).
+        ({}, ["--dist", "no"], {}, 0),
+        ({}, [], {"PYTEST_ADDOPTS": "--dist no"}, 0),
+        ({}, [], {"PYTEST_ADDOPTS": "--dist=no"}, 0),
+        ({"pytest.ini": "[pytest]\naddopts = --dist no\n"}, [], {}, 0),
+        ({}, ["-o", "addopts=--dist no"], {}, 0),
+    ],
+)
+def test_resolved_worker_choice_wins_over_default(tmp_path, files, args, env, expected):
+    project = _project(tmp_path, files)
+    proc, rows, _ran = _run(project, args, budget=3, env=env, default_workers=3)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    confirmed = _confirmed(rows)
+    assert confirmed["effective"] == expected and confirmed["defaulted"] is False
+
+
+@pytest.mark.parametrize(
+    "files, args",
+    [({}, ["-p", "no:xdist"]), ({"pytest.ini": "[pytest]\naddopts = -p no:xdist\n"}, [])],
+)
+def test_default_fails_soft_when_xdist_is_not_active(tmp_path, files, args):
+    project = _project(tmp_path, files)
+    proc, rows, ran = _run(project, args, budget=3, default_workers=3)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _confirmed(rows)["effective"] == 0
+    assert sorted(ran) == ["four", "one", "three", "two"]
+    assert "pytest-xdist is not active" in proc.stdout + proc.stderr
+
+
+def test_wrapper_resolved_plain_pytest_runs_with_budget_workers(tmp_path):
+    """End to end: a plain pytest resolved by the wrapper in an xdist repo runs parallel."""
+    project = _project(tmp_path, {"requirements-dev.txt": "pytest-xdist\n"})
+    report_dir = tmp_path / "wrapper-report"
+    report_dir.mkdir()
+    budget = WorkerBudget(3, "inherited", "clamp", "cpu", {}, True)
+    base_env = {key: value for key, value in os.environ.items() if key not in _SCRUB}
+    base_env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    decision = apply_worker_budget(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q"],
+        base_env, project, budget,
+        report_location=(report_dir, report_dir / "report.jsonl"),
+    )
+    proc = subprocess.run(
+        list(decision.argv), cwd=project, env=decision.env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows = [json.loads(line) for line in decision.report_path.read_text().splitlines() if line.strip()]
+    confirmed = _confirmed(rows)
+    assert confirmed["effective"] == 3 and confirmed["defaulted"] is True
 
 
 def test_plugin_inert_without_xdist(tmp_path):

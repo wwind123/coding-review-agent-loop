@@ -58,7 +58,10 @@ def _load_spec():
         or not report
     ):
         return None
-    return {"budget": budget, "mode": mode, "report": report}
+    default = value.get("default_workers")
+    if isinstance(default, bool) or not isinstance(default, int) or not 1 < default <= budget:
+        default = None
+    return {"budget": budget, "mode": mode, "report": report, "default_workers": default}
 
 
 def _plugin_entries(raw):
@@ -152,6 +155,8 @@ class _Session:
         self.budget = spec["budget"]
         self.mode = spec["mode"]
         self.report = spec["report"]
+        self.default_workers = spec.get("default_workers")
+        self.defaulted = False
         self.config = config
         self.session = f"{os.getpid()}-{time.monotonic_ns()}"
         self.seq = 0
@@ -252,8 +257,98 @@ if _pluggy_supports_wrappers():
                 if state.env_entry:
                     _restore_env_entry()
 
+    # Options that state a worker or distribution choice, or that xdist cannot
+    # combine with distribution.  Mirrors the wrapper's lexical argv check,
+    # applied here to pytest's full resolved argument list.
+    _CHOICE_OPTIONS = (
+        "-n", "--numprocesses", "--maxprocesses", "--tx", "--dist", "--distload", "-d",
+        "--looponfail", "-f", "--pdb", "--trace", "--collect-only", "--co",
+    )
+    _RESOLVED_ARGS = "_agent_loop_worker_cap_resolved_args"
+
+    def names_worker_choice(tokens) -> bool:
+        """Whether pytest arguments state a worker, distribution or xdist choice."""
+        index = 0
+        while index < len(tokens):
+            token = str(tokens[index])
+            if token == "--":
+                return False
+            for option in _CHOICE_OPTIONS:
+                if token == option or token.startswith(option + "="):
+                    return True
+                if option == "-n" and token.startswith("-n") and len(token) > 2:
+                    return True
+            value = None
+            if token == "-p" and index + 1 < len(tokens):
+                value = str(tokens[index + 1])
+                index += 1
+            elif token.startswith("-p") and len(token) > 2:
+                value = token[2:].lstrip("=")
+            if value is not None and "xdist" in value:
+                return True
+            index += 1
+        return False
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_load_initial_conftests(early_config, parser, args):
+        # ``args`` is pytest's complete argument list at this point: argv with
+        # ``PYTEST_ADDOPTS`` and ini ``addopts`` (including ``-o addopts``)
+        # already prepended.  Keeping it preserves option provenance that the
+        # parsed namespace loses, e.g. an explicit ``--dist no`` (#1073).
+        if _ARMED is None or not _ARMED.get("default_workers"):
+            return
+        try:
+            setattr(early_config, _RESOLVED_ARGS, tuple(str(arg) for arg in args))
+        except Exception:
+            pass
+
+    def _apply_default_workers(state, config):
+        """Give a plain pytest the wrapper's default worker count (issue #1073).
+
+        Only when pytest-xdist is active and pytest's resolved arguments and
+        options (argv, ini ``addopts``, ``PYTEST_ADDOPTS``) name no worker or
+        distribution choice -- an explicit ``--dist no`` included -- otherwise
+        the run keeps its own choice or stays serial.
+        """
+        default = state.default_workers
+        if not default:
+            return
+        option = config.option
+        try:
+            xdist_active = config.pluginmanager.hasplugin("xdist")
+        except Exception:
+            xdist_active = False
+        if not xdist_active or not hasattr(option, "numprocesses"):
+            state.notices.append(
+                "agent-loop worker budget: pytest-xdist is not active in this interpreter; "
+                "running serially"
+            )
+            return
+        resolved = getattr(config, _RESOLVED_ARGS, None)
+        if resolved is not None and names_worker_choice(resolved):
+            return
+        if (
+            option.numprocesses is not None
+            or getattr(option, "maxprocesses", None)
+            or getattr(option, "tx", None)
+            or getattr(option, "dist", "no") != "no"
+            or getattr(option, "distload", False)
+            or getattr(option, "looponfail", False)
+            or getattr(option, "usepdb", False)
+            or getattr(option, "trace", False)
+            or getattr(option, "collectonly", False)
+        ):
+            return
+        option.numprocesses = default
+        state.defaulted = True
+        state.notices.append(
+            f"agent-loop worker budget: running with -n {default} (budget default for a plain "
+            "pytest; pass -n 0 or -p no:xdist to run serially)"
+        )
+
     def _option_gate(state, config):
         option = config.option
+        _apply_default_workers(state, config)
         numprocesses = getattr(option, "numprocesses", None)
         maxprocesses = getattr(option, "maxprocesses", None)
         state.requested = numprocesses
@@ -371,6 +466,7 @@ if _pluggy_supports_wrappers():
                 {
                     "kind": "confirmed",
                     "requested": requested,
+                    "defaulted": state.defaulted,
                     "auto_raw": state.auto_raw,
                     "planned": state.planned,
                     "effective": effective,

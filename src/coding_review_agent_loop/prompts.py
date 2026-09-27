@@ -302,14 +302,32 @@ def _memory_block(
             recommendations = {}
             for command in commands:
                 key = remembered_keys.get(command)
-                recommendations[command] = recommend_timeout(
-                    memory.memory_dir,
-                    argv=command,
-                    cwd=cwd,
-                    policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
-                    normalized_command_override=key[0] if key else None,
-                    fingerprint_override=key[1] if key else None,
-                    workers=key[2] if key else _expected_workers(config, command),
+                # The run may go parallel (budget default) or stay serial
+                # (no xdist in the interpreter, ``--dist no`` in addopts);
+                # the prompt cannot know which.  Whenever the remembered
+                # cohort and the expected ones differ, take the safest
+                # watchdog across all of them so a fast parallel sample
+                # never times out a serial run (#1073).
+                cohorts = list(dict.fromkeys(
+                    [*([key[2]] if key else []), *_expected_worker_cohorts(config, command)]
+                ))
+                if key:
+                    cohorts = [cohort for cohort in cohorts if cohort is not None]
+                candidates = [
+                    recommend_timeout(
+                        memory.memory_dir,
+                        argv=command,
+                        cwd=cwd,
+                        policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
+                        normalized_command_override=key[0] if key else None,
+                        fingerprint_override=key[1] if key else None,
+                        workers=cohort,
+                    )
+                    for cohort in cohorts
+                ]
+                recommendations[command] = max(
+                    candidates,
+                    key=lambda item: (item.recommended_timeout_seconds, item.successful_samples),
                 )
             runtime_text = render_runtime_context(
                 memory.memory_dir,
@@ -383,14 +401,35 @@ def _memory_block(
     return f"Agent memory context:\n{text}{runtime}\n"
 
 
-def _expected_workers(config: AgentLoopConfig, command: Sequence[str]) -> str | None:
+def _expected_worker_cohorts(config: AgentLoopConfig, command: Sequence[str]) -> list[str | None]:
+    """Cohort labels a command may run under, for a recommendation lookup.
+
+    In a repository that declares xdist support a plain pytest is expected to
+    run with the budget's default worker count (issue #1073), but it still
+    runs serially when xdist is not installed or resolved addopts say
+    ``--dist no``, so both labels are returned and the caller takes the
+    safest watchdog across them.
+    """
     try:
-        from .test_workers import expected_workers_label
+        from .test_workers import expected_workers_label, parallel_default_applies
 
         budget = preliminary_worker_budget(config)
-        return expected_workers_label(command, budget=budget.workers, mode=budget.enforcement)
+        workdir = agent_workdir(config, config.coder)
+        labels = [expected_workers_label(command, budget=budget.workers, mode=budget.enforcement)]
+        # Only a command the wrapper would give the default may use the
+        # parallel cohort; a serial-only invocation (``--collect-only``,
+        # ``--pdb``, ...) must never borrow a faster parallel timing.  The
+        # wrapper's own repository-root detection decides, so a subdirectory
+        # workdir sees the same answer as the run.
+        if parallel_default_applies(command, workdir, budget):
+            parallel = expected_workers_label(
+                command, budget=budget.workers, mode=budget.enforcement, parallel_default=True,
+            )
+            if parallel != labels[0]:
+                labels.insert(0, parallel)
+        return labels
     except Exception:  # pragma: no cover - guidance must never block a prompt
-        return None
+        return [None]
 
 
 def _scratch_file_guidance() -> str:
@@ -533,10 +572,10 @@ def parallel_test_worker_guidance(config: AgentLoopConfig | None) -> str:
     if config is None:
         return ""
     try:
-        from .test_workers import detect_parallel_support, render_worker_guidance
+        from .test_workers import detect_parallel_support, render_worker_guidance, repository_root
 
         budget = preliminary_worker_budget(config)
-        supported = detect_parallel_support(agent_workdir(config, config.coder))
+        supported = detect_parallel_support(repository_root(agent_workdir(config, config.coder)))
         return render_worker_guidance(budget, parallel_supported=supported)
     except Exception:  # pragma: no cover - guidance must never block a prompt
         return ""
