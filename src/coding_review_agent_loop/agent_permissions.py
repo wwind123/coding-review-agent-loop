@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping
 
 from .errors import AgentLoopError
+from .scratch import mkdir_private
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
@@ -413,9 +414,7 @@ def _check_component(
     """
     if create:
         try:
-            os.mkdir(path, 0o700)
-        except FileExistsError:
-            pass
+            mkdir_private(path)
         except OSError as exc:
             raise AgentLoopError(f"Could not create sandboxed response directory {path}: {exc}") from exc
     try:
@@ -527,12 +526,15 @@ def verify_response_boundary(config: AgentLoopConfig) -> SandboxState:
     """Re-verify components and every recorded checkout before a spawn."""
     state = _require_state(config)
     with _STATE_LOCK:
+        writable: list[tuple[str, int]] = []
         for component in state.components:
-            current = _check_component(component.path, create=False)
+            current = _check_component(component.path, create=False, writable=writable)
             if (current.dev, current.ino) != (component.dev, component.ino):
                 raise SandboxBoundaryError(
                     f"Sandboxed response directory {component.path} was replaced since startup."
                 )
+        if writable:
+            raise _writable_components_error(writable)
         current_checkouts = configured_checkouts(config)
         for stored in list(state.checkouts):
             if stored not in state.persistent and stored not in current_checkouts:

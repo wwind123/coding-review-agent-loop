@@ -26,12 +26,42 @@ def scratch_root() -> Path:
     return Path(tempfile.gettempdir()) / SCRATCH_DIR_NAME
 
 
+def mkdir_private(path: Path | str) -> bool:
+    """Create one directory with mode exactly ``0o700``; False if it exists.
+
+    ``os.mkdir``'s mode is masked by the umask, which can clear owner bits
+    too (``umask 0o700`` would yield mode ``000`` and an unusable
+    directory), so a newly created directory is explicitly re-moded.  The
+    ``fchmod`` goes through a no-follow descriptor so a component swapped
+    for a symlink after creation is never re-moded through the link.
+    """
+    try:
+        os.mkdir(path, PRIVATE_DIR_MODE)
+    except FileExistsError:
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if hasattr(os, "fchmod"):
+        try:
+            fd = os.open(path, flags)
+        except PermissionError:
+            # A umask that cleared the owner's read bit makes the directory
+            # unopenable; chmod by path is then the only way back.
+            os.chmod(path, PRIVATE_DIR_MODE)
+        else:
+            try:
+                os.fchmod(fd, PRIVATE_DIR_MODE)
+            finally:
+                os.close(fd)
+    else:
+        os.chmod(path, PRIVATE_DIR_MODE)
+    return True
+
+
 def make_private_dirs(path: Path | str) -> Path:
     """Create ``path`` and every missing ancestor with mode ``0o700``.
 
-    ``os.mkdir``'s mode argument is masked by the umask, which can only clear
-    bits, so the created directories are never group- or world-writable
-    whatever the caller's umask.  Components that already exist keep their
+    Created directories get exactly ``0o700`` whatever the caller's umask
+    (see :func:`mkdir_private`).  Components that already exist keep their
     mode.
     """
     target = Path(os.path.abspath(path))
@@ -44,10 +74,7 @@ def make_private_dirs(path: Path | str) -> Path:
             break
         current = parent
     for directory in reversed(missing):
-        try:
-            os.mkdir(directory, PRIVATE_DIR_MODE)
-        except FileExistsError:
-            pass
+        mkdir_private(directory)
     if not target.is_dir():
         raise NotADirectoryError(f"Not a directory: {target}")
     return target

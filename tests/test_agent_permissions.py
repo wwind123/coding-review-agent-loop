@@ -511,6 +511,39 @@ def test_make_private_dirs_ignores_umask_and_keeps_existing_modes(tmp_path, umas
     assert make_private_dirs(created) == created
 
 
+@pytest.mark.parametrize("mask", [0o077, 0o700, 0o777])
+def test_scratch_creation_restores_owner_access_under_restrictive_umask(tmp_path, sandbox, mask):
+    from coding_review_agent_loop.scratch import make_private_dirs
+
+    config = sandboxed_config(tmp_path)
+    previous = os.umask(mask)
+    try:
+        created = make_private_dirs(tmp_path / "scratch" / "a" / "b")
+        state = ap.establish_response_root_boundary(config)
+    finally:
+        os.umask(previous)
+    for path in (tmp_path / "scratch", tmp_path / "scratch" / "a", created):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
+    for component in state.components:
+        assert stat.S_IMODE(Path(component.path).stat().st_mode) == 0o700
+    ap.prepare_response_file(config, "claude")
+
+
+def test_every_writable_component_widened_between_turns_is_reported(tmp_path, sandbox):
+    config = sandboxed_config(tmp_path)
+    state = ap.establish_response_root_boundary(config)
+    responses = Path(state.components[1].path)
+    claude = state.resolved_root / "claude"
+    responses.chmod(0o775)
+    claude.chmod(0o777)
+    with pytest.raises(ap.SandboxBoundaryError) as excinfo:
+        ap.prepare_response_file(config, "claude")
+    message = str(excinfo.value)
+    assert f"{responses} (mode 775)" in message
+    assert f"{claude} (mode 777)" in message
+    assert f"`chmod go-w {responses} {claude}`" in message
+
+
 def test_every_writable_component_is_reported_with_one_fix(tmp_path, sandbox):
     config = sandboxed_config(tmp_path)
     top = sandbox["tmp"] / "coding-review-agent-loop"
