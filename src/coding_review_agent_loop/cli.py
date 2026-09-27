@@ -801,6 +801,55 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--plan-growth-gate",
+            choices=("enforce", "off"),
+            default="enforce",
+            help=(
+                "Plan-growth gate (#886). With enforce (default), a v1 one-shot plan that "
+                "crosses a plan-growth threshold cannot be approved until a revision either "
+                "restructures it as staged or carries a reviewed "
+                "`one_shot_growth_justification` naming exactly the crossed signals. off "
+                "disables the gate; scope-ledger preservation on one-shot-to-staged "
+                "conversions still applies."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-growth-max-chars",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "Canonical plan size (characters) at which the rendered-size growth signal "
+                "crosses (default: 120000, twice the 60000-character comment limit, because "
+                "canonical text also carries encoded recommendation and matrix records)."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-growth-max-revisions",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "Planner-authored plan candidates at which the revision-count signal crosses "
+                "(default: 6). It counts only while the plan is at least half the size "
+                "threshold; reviewer-only rounds never count."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-growth-max-scope-items",
+            type=int,
+            default=None,
+            metavar="N",
+            help="Distinct execution-recommendation scope items at which the scope-items signal crosses (default: 12).",
+        )
+        subparser.add_argument(
+            "--plan-growth-max-matrix-rows",
+            type=int,
+            default=None,
+            metavar="N",
+            help="Risk-matrix rows at which the matrix-rows signal crosses (default: 18).",
+        )
+        subparser.add_argument(
             "--pr-review-broad-rule",
             dest="pr_review_broad_rules",
             action="append",

@@ -42,6 +42,81 @@ typed stages remain legacy-undecided. A bounded repair can only reformat a
 complete recoverable v1 source; missing or partial strategy data requires a new
 planner turn.
 
+### Plan-growth gate
+
+`--plan-execution-mode auto` takes the one-shot or staged choice from the
+planner's recommendation. Reviewers can then drive detail into a one-shot plan
+round after round until it no longer fits a comment (#871). The plan-growth
+gate (#886) measures every generation-1 candidate plan deterministically and
+routes a grown one-shot plan back to a choice: restructure as staged, or carry
+a reviewed justification.
+
+**Signals.** A signal crosses when its measurement reaches its threshold:
+
+| Signal | Measurement | Flag (default) |
+| --- | --- | --- |
+| `rendered-size` | Characters of the candidate's canonical plan text (the text the approved-plan hash covers, before round metadata, the compact digest or sidecar spill) | `--plan-growth-max-chars` (120000, twice the 60000-character comment limit) |
+| `scope-items` | Distinct `execution_recommendation` scope item IDs | `--plan-growth-max-scope-items` (12) |
+| `matrix-rows` | Risk-matrix rows | `--plan-growth-max-matrix-rows` (18) |
+| `revision-count` | Authenticated planner-authored plan candidates, including this one | `--plan-growth-max-revisions` (6) |
+
+The size comparison is a heuristic for "this plan carries too much design
+detail", not a transport check; transport overflow is handled separately. The
+canonical text carries the recommendation and matrix both rendered and as
+encoded records, so it runs about twice the visible plan: approved plans in
+this repository measured about 21k characters for a three-scope-item plan and
+50-85k for ordinary five- or six-item plans, while plans that outgrew one
+delivery measured 120-195k.
+Revision count is only a combining signal: it crosses only while the plan is at
+least half the size threshold. Reviewer-only phase-advance rounds and resumed
+replays never count as revisions, and reviewer finding counts are never a
+signal. Non-positive thresholds are rejected. The defaults sit well above
+ordinary plans, so small work keeps the one-shot path unchanged.
+
+**Gate.** With `--plan-growth-gate enforce` (the default), a v1 one-shot plan
+that crosses any signal must carry `one_shot_growth_justification` with exactly
+`crossed_signals` (the signals it crosses, no more and no fewer) and a
+`rationale` of at most 2000 characters. The field is part of the canonical plan
+payload and therefore of the plan identity reviewers approve. Every candidate is
+self-checked against its own measurements before any reviewer turn: a missing
+or incomplete justification, a leftover justification on a plan that no longer
+crosses anything, or any justification on a staged plan is a correctable
+validation failure fed back to the planner. A revision may also answer the
+notice by shrinking below every threshold. A semantic patch writes the field
+with `replace`; `replace` with `null` removes it. When a candidate recovered from
+history fails the gate, an all-approved round (or, under primary-then-panel, a
+primary approval that would otherwise schedule the panel advance) starts a
+planner revision carrying an orchestrator growth notice instead of approving;
+the notice is not a reviewer item. Resume, carried approvals and managed-CI
+authorization re-apply the same check and fail closed. Legacy unversioned plans
+are never gated, and `--plan-growth-gate off` disables the gate while still
+logging measurements.
+
+**Reviewer lever.** Plan reviewers may block with a finding that says "this
+detail belongs in a child plan; restructure as staged" rather than pushing more
+detail into the parent. They evaluate any growth justification as a semantic
+claim like any other. The planner answers with a staged recommendation or a
+justification. When staging, the parent keeps scope, stage boundaries,
+interfaces between stages and acceptance criteria; per-stage design goes to
+`requires-child-planning` children.
+
+**Scope ledger.** A revision that converts a v1 one-shot plan to staged must
+keep every prior scope item's ID, requirement text and acceptance criteria
+(whitespace-normalized; added criteria and new items are allowed). Make
+intentional scope edits in a separate non-converting revision so reviewers see
+them as an ordinary scope change. This rule applies even with the gate off.
+
+**Rebind advisory.** When a signed re-plan rebinds an existing PR to a one-shot
+replacement plan that crosses a structural signal, the rebind comment carries an
+informational growth advisory, independent of the contract-expansion notice. It
+lists the crossed signals and the reviewed justification (or states that none
+exists) and never blocks the rebind.
+
+**Costs.** Staged work costs more: child issues, handoffs and a managed-CI
+cycle per child. A parent that is too thin under-specifies its children, and a
+child that itself recommends staging still stops for human handling (#720). The
+gate asks for a reviewed choice; it does not force staging.
+
 ### Child execution dispositions
 
 Every child in a fresh staged generation-1 recommendation has a reviewed

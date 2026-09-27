@@ -1118,6 +1118,22 @@ marginal findings, and escaped plan defects before any proposal to change the
 default. See
 [staged issue plan review](docs/local_agent_loop.md#staged-issue-plan-review).
 
+Planning also applies a plan-growth gate (#886). When a one-shot plan reaches a
+growth threshold, it cannot be approved until a revision restructures it as
+staged or carries a reviewed `one_shot_growth_justification` that names exactly
+the crossed signals:
+
+| Flag | Default | Signal |
+| --- | --- | --- |
+| `--plan-growth-gate {enforce,off}` | `enforce` | Turns the gate on or off; scope-ledger preservation still applies when it is off |
+| `--plan-growth-max-chars N` | `120000` | `rendered-size`: canonical plan characters (about twice the visible plan, since encoded records are included) |
+| `--plan-growth-max-scope-items N` | `12` | `scope-items`: distinct scope items |
+| `--plan-growth-max-matrix-rows N` | `18` | `matrix-rows`: risk-matrix rows |
+| `--plan-growth-max-revisions N` | `6` | `revision-count`: planner candidates, counted only while the plan is at least half the size threshold |
+
+Reviewers may block with "this detail belongs in a child plan; restructure as
+staged". See [plan-growth gate](docs/local_agent_loop.md#plan-growth-gate).
+
 ## Safety and Permissions
 
 Agents can run commands and change code. Keep their normal permission prompts

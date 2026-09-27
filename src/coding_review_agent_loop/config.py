@@ -175,6 +175,13 @@ class AgentLoopConfig:
     plan_review_policy: str = "all-reviewers"
     primary_plan_reviewer: AgentName | None = None
     plan_review_force_full: bool = False
+    # Plan-growth gate (#886): structural thresholds above which a one-shot
+    # plan needs a reviewed justification or a staged restructure.
+    plan_growth_gate: str = "enforce"
+    plan_growth_max_chars: int = 120_000
+    plan_growth_max_revisions: int = 6
+    plan_growth_max_scope_items: int = 12
+    plan_growth_max_matrix_rows: int = 18
     auto_agent_dirs: tuple[AgentName, ...] = ()
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
@@ -559,6 +566,16 @@ class AgentLoopConfig:
             raise AgentLoopError(
                 "--plan-review-force-full requires --plan-review-policy primary-then-panel."
             )
+        if self.plan_growth_gate not in {"enforce", "off"}:
+            raise AgentLoopError("--plan-growth-gate must be 'enforce' or 'off'.")
+        for flag, value in (
+            ("--plan-growth-max-chars", self.plan_growth_max_chars),
+            ("--plan-growth-max-revisions", self.plan_growth_max_revisions),
+            ("--plan-growth-max-scope-items", self.plan_growth_max_scope_items),
+            ("--plan-growth-max-matrix-rows", self.plan_growth_max_matrix_rows),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise AgentLoopError(f"{flag} must be a positive integer.")
         object.__setattr__(self, "pr_review_broad_rules", normalize_broad_rules(self.pr_review_broad_rules))
         if self.discuss_research not in DISCUSS_RESEARCH_MODES:
             rendered = ", ".join(f"'{mode}'" for mode in sorted(DISCUSS_RESEARCH_MODES))
@@ -1323,6 +1340,12 @@ def preflight_agent_commands(
         runner.remember_agent_command(command, resolved, override_flag)
 
 
+def _arg_or_default(args: argparse.Namespace, name: str, default: int) -> int:
+    """Keep an explicit value (even an invalid one) so validation can reject it."""
+    value = getattr(args, name, None)
+    return default if value is None else value
+
+
 def resolve_agent_permissions_mode(args: argparse.Namespace) -> str:
     """Resolve ``--agent-permissions`` and its ``--dangerous-agent-permissions`` alias."""
     explicit = getattr(args, "agent_permissions", None)
@@ -1599,6 +1622,11 @@ def config_from_args(
         plan_review_policy=getattr(args, "plan_review_policy", None) or "all-reviewers",
         primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
         plan_review_force_full=bool(getattr(args, "plan_review_force_full", False)),
+        plan_growth_gate=getattr(args, "plan_growth_gate", None) or "enforce",
+        plan_growth_max_chars=_arg_or_default(args, "plan_growth_max_chars", 120_000),
+        plan_growth_max_revisions=_arg_or_default(args, "plan_growth_max_revisions", 6),
+        plan_growth_max_scope_items=_arg_or_default(args, "plan_growth_max_scope_items", 12),
+        plan_growth_max_matrix_rows=_arg_or_default(args, "plan_growth_max_matrix_rows", 18),
         auto_agent_dirs=auto_agent_dirs,
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),

@@ -22,6 +22,8 @@ from .protocol import (
     DeferredStage,
     ExecutionStrategyRecommendation,
     HumanRequirementDisposition,
+    OneShotGrowthJustification,
+    PLAN_REVISION_PATCH_CLEARABLE_FIELDS,
     PlanRevisionPatch,
     PlanRevisionPatchOperation,
     RiskTestMatrix,
@@ -186,6 +188,10 @@ def structured_plan_revision_to_payload(
         payload["risk_test_matrix_changes"] = [
             change.to_payload() for change in plan.risk_test_matrix_changes
         ]
+    # Serialized only when present so identities of plans that never carry a
+    # growth justification stay byte-identical (#886).
+    if plan.one_shot_growth_justification is not None:
+        payload["one_shot_growth_justification"] = plan.one_shot_growth_justification.to_payload()
     return payload
 
 
@@ -435,6 +441,8 @@ def _field_payload(value: object) -> object:
             return _deferred_stage_payload(value)  # type: ignore[arg-type]
         return [_field_payload(item) for item in value]
     if isinstance(value, RiskTestMatrixMetadata):
+        return value.to_payload()
+    if isinstance(value, OneShotGrowthJustification):
         return value.to_payload()
     return value
 
@@ -715,6 +723,14 @@ def assemble_authenticated_plan_revision(
         candidate = _field_payload(operation.value)
         if operation.field in payload and payload[operation.field] == candidate:
             raise AgentLoopError(f"replace for `{operation.field}` is payload-identical and has no effect.")
+        if (
+            candidate is None
+            and operation.field in PLAN_REVISION_PATCH_CLEARABLE_FIELDS
+            and operation.field not in payload
+        ):
+            raise AgentLoopError(
+                f"replace for `{operation.field}` with null has no effect: the base carries no value."
+            )
 
     if matrix_operations:
         assert isinstance(matrix_payload, dict)
@@ -732,6 +748,9 @@ def assemble_authenticated_plan_revision(
         if operation.op != "replace":
             continue
         assert operation.field is not None
+        if operation.value is None and operation.field in PLAN_REVISION_PATCH_CLEARABLE_FIELDS:
+            payload.pop(operation.field, None)
+            continue
         payload[operation.field] = _field_payload(operation.value)
         if operation.field == "execution_recommendation":
             if "execution_strategy_contract_version" not in payload:

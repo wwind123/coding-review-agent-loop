@@ -46,6 +46,7 @@ from .protocol import (
     StructuredCoderFollowup,
     StructuredIssueImplementation,
     StructuredPlanState,
+    OneShotGrowthJustification,
     StructuredPlanRevision,
     RiskTestMatrix,
     RiskTestMatrixChange,
@@ -1177,6 +1178,28 @@ def decode_deferred_stages_marker(encoded: str) -> tuple[DeferredStage, ...]:
     return tuple(stages)
 
 
+ONE_SHOT_GROWTH_JUSTIFICATION_HEADING = "### One-shot growth justification"
+
+
+def render_one_shot_growth_justification_section(
+    justification: OneShotGrowthJustification | None,
+) -> str | None:
+    """Full rendering of a reviewed one-shot growth justification (#886)."""
+    if justification is None:
+        return None
+    rationale = sanitize_historical_text(justification.rationale).strip()
+    rationale_lines = rationale.splitlines() or [""]
+    return "\n".join(
+        [
+            ONE_SHOT_GROWTH_JUSTIFICATION_HEADING,
+            "- `crossed_signals`: "
+            + ", ".join(f"`{signal}`" for signal in justification.crossed_signals),
+            "- `rationale`: " + rationale_lines[0],
+            *(f"  {line}" if line.strip() else "" for line in rationale_lines[1:]),
+        ]
+    )
+
+
 def render_canonical_plan_revision(
     parsed_revision: StructuredPlanRevision,
     prior_items: Sequence[UnresolvedReviewItem],
@@ -1218,6 +1241,11 @@ def render_canonical_plan_revision(
     typed_section = render_typed_plan_stages_section(parsed_revision.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    growth_section = render_one_shot_growth_justification_section(
+        parsed_revision.one_shot_growth_justification
+    )
+    if growth_section:
+        sections.append(growth_section)
     if parsed_revision.execution_recommendation is not None:
         sections.append(render_execution_recommendation_section(parsed_revision.execution_recommendation))
     return "\n\n".join(sections)
@@ -1243,6 +1271,11 @@ def render_canonical_plan_state(
     typed_section = render_typed_plan_stages_section(parsed_plan.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    growth_section = render_one_shot_growth_justification_section(
+        parsed_plan.one_shot_growth_justification
+    )
+    if growth_section:
+        sections.append(growth_section)
     if parsed_plan.execution_recommendation is not None:
         sections.append(render_execution_recommendation_section(parsed_plan.execution_recommendation))
     return "\n\n".join(sections)
@@ -1662,6 +1695,12 @@ _COMPACT_PRIOR_DISPOSITIONS_SHARE = 1_400
 _COMPACT_CLOSING_SHARE = 500
 _COMPACT_DEFERRED_SHARE = 900
 _COMPACT_TYPED_CATEGORY_SHARE = 400
+# Carved out of the plan-steps share only when a justification is present, so
+# the digest's total budgeted text never grows (#886).
+_COMPACT_GROWTH_JUSTIFICATION_SHARE = 1_200
+_COMPACT_GROWTH_RATIONALE_CLIPPED_NOTE = (
+    "_Rationale clipped; the complete text is in the authenticated round metadata._"
+)
 _COMPACT_ENTRY_CHARS = 300
 _COMPACT_TITLE_CHARS = 120
 _COMPACT_HUMAN_EVIDENCE_CHARS = 300
@@ -1796,6 +1835,34 @@ def _compact_human_requirements_block(block: str) -> str:
     return compact
 
 
+def _compact_growth_justification_section(justification: OneShotGrowthJustification) -> str:
+    """Crossed signals verbatim; the rationale clipped to the dedicated share."""
+    heading = "### One-shot growth justification (digest)"
+    signals_line = "- Crossed signals: " + ", ".join(
+        f"`{signal}`" for signal in justification.crossed_signals
+    )
+    prefix = "- Rationale: "
+    # Room the shared helper keeps for its omission line; this section never
+    # needs it, but the helper's arithmetic reserves it before the last entry.
+    reserve = len(_COMPACT_OMITTED_LINE.format(omitted=3, total=3)) + 1
+    fixed = len(heading) + 1 + len(signals_line) + 1 + len(prefix) + reserve
+    full = re.sub(r"\s+", " ", sanitize_historical_text(justification.rationale).strip())
+    entries = [signals_line]
+    if fixed + len(full) <= _COMPACT_GROWTH_JUSTIFICATION_SHARE:
+        entries.append(prefix + full)
+    else:
+        note = _COMPACT_GROWTH_RATIONALE_CLIPPED_NOTE
+        limit = _COMPACT_GROWTH_JUSTIFICATION_SHARE - fixed - len(note) - 1
+        entries.append(prefix + _compact_clip(justification.rationale, limit))
+        entries.append(note)
+    return _compact_budgeted_section(
+        heading,
+        entries,
+        share=_COMPACT_GROWTH_JUSTIFICATION_SHARE,
+        entry_chars=_COMPACT_GROWTH_JUSTIFICATION_SHARE,
+    )
+
+
 def _render_compact_plan_digest(
     parsed: StructuredPlanState | StructuredPlanRevision,
     *,
@@ -1822,14 +1889,20 @@ def _render_compact_plan_digest(
                 entry_chars=_COMPACT_TITLE_CHARS,
             )
         )
+    justification = parsed.one_shot_growth_justification
     budgeted.append(
         _compact_budgeted_section(
             "### Plan steps (digest)",
             [f"{index}. {step}" for index, step in enumerate(parsed.plan_steps, start=1)],
-            share=_COMPACT_STEPS_SHARE,
+            share=(
+                _COMPACT_STEPS_SHARE
+                - (_COMPACT_GROWTH_JUSTIFICATION_SHARE if justification is not None else 0)
+            ),
             entry_chars=_COMPACT_ENTRY_CHARS,
         )
     )
+    if justification is not None:
+        budgeted.append(_compact_growth_justification_section(justification))
     if parsed.additional_closing_issue_ids is not None:
         budgeted.append(
             _compact_budgeted_section(
@@ -1961,6 +2034,11 @@ def _render_public_plan_state_comment(
     typed_section = render_typed_plan_stages_section(parsed_plan.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    growth_section = render_one_shot_growth_justification_section(
+        parsed_plan.one_shot_growth_justification
+    )
+    if growth_section:
+        sections.append(growth_section)
     if parsed_plan.execution_recommendation is not None:
         sections.append(render_execution_recommendation_section(parsed_plan.execution_recommendation))
     sections.append(f"<!-- AGENT_PLAN_STATE: {parsed_plan.state} -->")
