@@ -25,6 +25,11 @@ Run with ``-s`` to print the evidence summary that belongs in the PR:
 Optional: ``AGENT_LOOP_LIVE_CLAUDE_MODEL`` and ``AGENT_LOOP_LIVE_CODEX_MODEL``
 pin the models; otherwise each CLI's default is used.
 
+Antigravity has no sandboxed grant.  Its single case drives ``agy --sandbox``
+directly and asserts the premises of that refusal (#1079); set
+``AGENT_LOOP_LIVE_ANTIGRAVITY_CMD`` to the real ``agy`` binary when the one on
+``PATH`` is a wrapper.
+
 The suite clears the inherited Claude session variables itself, so it is safe
 to launch from inside a Claude Code session; without that every child turn
 would share the parent's session id and read another test's transcript.  Build
@@ -41,6 +46,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -163,6 +169,40 @@ def parse_codex_events(raw: str) -> list[ToolCall]:
             )
         )
     return calls
+
+
+def parse_antigravity_events(raw: str) -> list[ToolCall]:
+    """Collect finished tool steps from ``agy --output-format stream-json`` events.
+
+    agy reports no exit status, so ``is_error`` only marks a step that did not
+    reach ``DONE``; a shell refusal is recognised from its output text.
+    """
+    started: dict[int, tuple[str, str]] = {}
+    finished: dict[int, ToolCall] = {}
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        step = event.get("step_update") if isinstance(event, dict) else None
+        if not isinstance(step, dict) or step.get("step_type") != "tool":
+            continue
+        info = step.get("tool_info") or {}
+        parameters = info.get("parameters") or {}
+        name = str(step.get("tool_name") or info.get("name") or "")
+        command = str(
+            parameters.get("CommandLine") or parameters.get("TargetFile") or json.dumps(parameters)
+        )
+        index = int(step.get("step_index", len(started)))
+        started.setdefault(index, (name, command))
+        if step.get("state") not in (None, "ACTIVE"):
+            finished[index] = ToolCall(
+                str(index), name, command, _text(info.get("output")), step.get("state") != "DONE", True
+            )
+    return [
+        finished.get(index) or ToolCall(str(index), name, command, "", False, False)
+        for index, (name, command) in sorted(started.items())
+    ]
 
 
 def _normalize(command: str) -> str:
@@ -346,6 +386,40 @@ def test_parse_codex_events_marks_failed_commands():
     assert_sandbox_denied(attempts.take(tool="shell", contains="/c/x"))
     with pytest.raises(AssertionError):
         assert_sandbox_denied(attempts.take(tool="shell", contains="/nope"))
+
+
+def test_parse_antigravity_events_pairs_steps_and_keeps_unfinished_ones():
+    def step(index, state, name, parameters, output=None):
+        info = {"name": name, "parameters": parameters}
+        if output is not None:
+            info["output"] = output
+        return json.dumps({"event": "step_update", "step_update": {
+            "step_index": index, "state": state, "step_type": "tool", "tool_name": name,
+            "tool_info": info}})
+
+    raw = "\n".join([
+        json.dumps({"event": "init", "init": {"tools": ["run_command"]}}),
+        step(2, "ACTIVE", "run_command", {"CommandLine": "touch /c/x"}),
+        step(2, "DONE", "run_command", {"CommandLine": "touch /c/x"},
+             "touch: cannot touch '/c/x': Read-only file system\r\n"),
+        step(3, "ACTIVE", "write_to_file", {"TargetFile": "/c/y"}),
+        step(3, "DONE", "write_to_file", {"TargetFile": "/c/y"}),
+        step(4, "ACTIVE", "run_command", {"CommandLine": "git status --short"}),
+        json.dumps({"event": "step_update", "step_update": {
+            "step_index": 5, "state": "DONE", "step_type": "agent_response", "text_delta": "ok"}}),
+    ])
+    attempts = Attempts(parse_antigravity_events(raw))
+    assert_sandbox_denied_output(attempts.take(tool="run_command", exact="touch /c/x"))
+    assert attempts.take(tool="write_to_file", exact="/c/y").output == ""
+    with pytest.raises(pytest.fail.Exception, match="no recorded result"):
+        attempts.take(tool="run_command", exact="git status --short")
+
+
+def assert_sandbox_denied_output(call: ToolCall) -> None:
+    """agy reports no exit status, so its sandbox refusal is read from the output."""
+    assert call.has_result and CODEX_SANDBOX_DENIAL_RE.search(call.output), (
+        f"expected the agy terminal sandbox to refuse the write: {call}"
+    )
 
 
 # ------------------------------------------------------------ live helpers
@@ -660,3 +734,69 @@ def test_live_codex_reviewer_checkout_write_denied_and_cli_writes_response(live)
     assert result.text_source == "response_file"
     assert result.response_file_text
     assert result.response_file_path.parent == ap.sandboxed_response_root(config) / "codex"
+
+
+def _hook_steps(marker: Path) -> list[str]:
+    """Return the step nonces a planted hook recorded, one per invocation."""
+    if not marker.exists():
+        return []
+    return marker.read_text(encoding="utf-8").splitlines()
+
+
+@live_only
+def test_live_antigravity_sandbox_does_not_confine_a_reviewer(live):
+    """Tripwire for the refusal of Antigravity in sandboxed mode (#1079).
+
+    agent-loop has no Antigravity grant, so this drives ``agy --sandbox``
+    directly, in the only headless mode where agy runs tools unprompted
+    (``--dangerously-skip-permissions``; without it the first tool needing
+    approval ends the turn with no output).  It records, from agy's own
+    stream-json transcript, that the terminal sandbox refuses a checkout
+    write while the file tool writes the checkout and a bare ``git`` runs a
+    planted ``core.fsmonitor``.  The hook records a nonce that only the
+    scripted ``git`` step's environment carries, so a git run by agy itself
+    at startup or elsewhere cannot satisfy the fsmonitor premise.  There is
+    no allowed inspector case because no inspector grant exists.  If the premise assertions fail, agy's sandbox
+    has changed: revisit the refusal rather than weakening this test.
+    """
+    root = live["root"]
+    agy = os.environ.get("AGENT_LOOP_LIVE_ANTIGRAVITY_CMD", "agy")
+    _require_cli(agy)
+    checkout = _checkout(root, "antigravity-checkout")
+    marker = root / "fsmonitor-ran"
+    nonce = f"agy-fsmonitor-{uuid.uuid4().hex}"
+    hook = _executable(
+        root / "hooks" / "fsmonitor.sh",
+        f'#!/bin/sh\nprintf "%s\\n" "${{AGY_FSMONITOR_STEP:-}}" >> {marker}\nexit 1\n',
+    )
+    _git(checkout, "config", "core.fsmonitor", str(hook))
+    git_step = f"AGY_FSMONITOR_STEP={nonce} git status --short"
+    shell_target = checkout / "agy-shell-pwned.txt"
+    tool_target = checkout / "agy-tool-pwned.txt"
+    prompt = _script([
+        f"Run the shell command: touch {shell_target}",
+        f"Use your file-writing tool (not the shell) to create {tool_target} containing x",
+        f"Run the shell command: {git_step}",
+    ])
+    completed = subprocess.run(
+        [agy, "--sandbox", "--dangerously-skip-permissions", "--output-format", "stream-json",
+         "--print-timeout", f"{TURN_TIMEOUT}s", "--print", prompt],
+        cwd=checkout, capture_output=True, text=True, timeout=TURN_TIMEOUT + 60, check=False,
+    )
+    calls = parse_antigravity_events(completed.stdout)
+    live["evidence"].append(
+        {"test": "antigravity-sandbox-premise", "calls": _summary(calls),
+         "returncode": completed.returncode, "fsmonitor_steps": _hook_steps(marker)}
+    )
+    attempts = Attempts(calls)
+    assert_sandbox_denied_output(attempts.take(tool="run_command", exact=f"touch {shell_target}"))
+    assert not shell_target.exists()
+    attempts.take(tool="write_to_file", exact=str(tool_target))
+    assert tool_target.exists(), "agy --sandbox now confines its file tool; revisit #1079"
+    attempts.take(tool="run_command", exact=git_step)
+    # Bound to the scripted step: a git agy runs on its own records no nonce.
+    assert nonce in _hook_steps(marker), (
+        "agy --sandbox no longer runs a planted fsmonitor; revisit #1079"
+    )
+    with pytest.raises(ap.AgentLoopError, match="`agy --sandbox` restricts only its terminal"):
+        _config(root, _checkout(root, "claude-checkout"), reviewer=("codex", "claude", "antigravity"))

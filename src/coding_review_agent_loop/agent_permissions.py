@@ -190,12 +190,43 @@ def configured_agent_selections(config: AgentLoopConfig) -> tuple[AgentSelection
     return tuple(selections)
 
 
+# Why Antigravity (and Gemini) have no sandboxed grant (#1079).  Observed live
+# with agy 1.2.11: ``--sandbox`` confines only the terminal tool, making the
+# workspace read-only to shell commands, while its file-writing tool still
+# writes into the checkout and a bare ``git status`` in the checkout runs a
+# planted ``core.fsmonitor`` hook.  The remaining control, ``permissions.allow``
+# rules, lives only in the shared per-user settings file (there is no
+# per-invocation flag), and headless mode ends the whole turn with no output on
+# the first tool it cannot prompt for.  None of that is a per-invocation,
+# CLI-enforced read-only grant, so these providers stay refused.
+UNSANDBOXABLE_PROVIDER_REASONS = {
+    "antigravity": (
+        "Antigravity has no CLI-enforced read-only grant: `agy --sandbox` restricts only "
+        "its terminal, so its file-writing tool can still write the checkout and a bare "
+        "`git` there runs the checkout's .git/config, and its allow rules exist only in "
+        "the shared user settings file"
+    ),
+    "gemini": "Gemini has no CLI-enforced read-only grant",
+}
+
+
+def _unsupported_provider_reason(agent: str) -> str:
+    return UNSANDBOXABLE_PROVIDER_REASONS.get(agent, f"{agent!r} has no sandboxed grant")
+
+
 def validate_sandboxed_selections(config: AgentLoopConfig) -> None:
     for selection in configured_agent_selections(config):
         if selection.agent not in SANDBOXED_PROVIDERS:
+            trade = (
+                " A sandboxed review board is therefore limited to Claude and Codex "
+                "reviewers; to keep this reviewer, run without sandboxed permissions."
+                if selection.field in {"reviewer", "primary_reviewer", "primary_plan_reviewer"}
+                else ""
+            )
             raise AgentLoopError(
                 f"--agent-permissions sandboxed supports only Claude and Codex, but "
-                f"{selection.field} selects {selection.agent!r}. Use {selection.fix}, "
+                f"{selection.field} selects {selection.agent!r}. "
+                f"{_unsupported_provider_reason(selection.agent)}.{trade} Use {selection.fix}, "
                 "or choose --agent-permissions default|dangerous."
             )
 
@@ -958,7 +989,8 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
             )
         return ("--sandbox", "read-only", "-c", 'approval_policy="never"')
     raise AgentLoopError(
-        f"--agent-permissions sandboxed supports only Claude and Codex, not {provider!r}."
+        f"--agent-permissions sandboxed supports only Claude and Codex, not {provider!r}: "
+        f"{_unsupported_provider_reason(provider)}."
     )
 
 
