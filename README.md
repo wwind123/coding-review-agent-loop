@@ -460,7 +460,13 @@ agent-loop issue 123 \
   --reviewer codex
 ```
 
-Without `--plan-first`, issue mode asks the coder to implement immediately.
+Without `--plan-first`, issue mode asks the coder to implement immediately,
+unless planning already decided the issue. If the issue carries an approved
+planning review, a plan-approval announcement, a recorded execution decision, or
+an approved-plan implementation handoff, plain issue mode refuses before
+invoking any agent and names the resume command,
+`agent-loop issue <n> --plan-first`. Only records authored by the authenticated
+agent-loop GitHub actor count, read from the issue's complete comment history.
 
 Plan-first implementation carries the approved plan through a dedicated,
 lossless PR-bound context. The PR handoff binds reviewers and coder follow-ups

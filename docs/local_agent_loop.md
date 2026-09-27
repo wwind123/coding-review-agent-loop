@@ -1335,6 +1335,18 @@ handoff, or PR association; a mismatch fails closed. `--dry-run` resolves and
 reports `auto` using the same checks, but persists no decision and performs no
 approval-bound mutation.
 
+Direct `agent-loop issue <n>` mode (no `--plan-first`) first refuses an issue
+that planning already decided, the same way it refuses a decomposition child
+whose disposition requires child planning. The refusal fires on an approved
+planning review in the plan round records, a plan-approval announcement, an
+execution decision bound to the issue, or an approved-plan implementation
+handoff. The error names what it found and the resume command
+`agent-loop issue <n> --plan-first`, and no agent runs. Only records authored by
+the authenticated agent-loop actor count. When the capped `gh issue view`
+projection shows no planning record and is not full, the check stops there.
+Otherwise it reads the complete REST comment history, so older records are not
+missed and a foreign comment can neither fabricate nor hide a decision.
+
 Before invoking a coder for an issue — in direct `agent-loop issue <n>` mode or
 approved-plan implementation alike — the orchestrator resolves the canonical
 `AGENT_ISSUE_PR_HANDOFF` record: an authoritative, machine-readable comment

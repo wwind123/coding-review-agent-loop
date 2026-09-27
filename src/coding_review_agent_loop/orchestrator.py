@@ -54,6 +54,7 @@ from .board_amendment import (
 )
 from .decomposition import (
     _decode_json_payload,
+    EXECUTION_DECISION_MARKER_RE,
     issue_has_execution_decision,
     CreatedPhaseIssue,
     PlanDecomposition,
@@ -129,6 +130,7 @@ from .expected_closure import (
     resolve_issue_contract,
 )
 from .github import (
+    _REST_ISSUE_COMMENT_PAGE_SIZE,
     CiWatchOutcome,
     strip_bot_login_suffix,
     IssueContext,
@@ -158,6 +160,7 @@ from .github import (
     note_host_footer_observed,
     reset_authenticated_github_actor,
     reset_host_footer_log_latch,
+    read_rest_issue_comments,
     resolve_authenticated_github_actor,
     reject_forged_protocol_markers,
     search_issues,
@@ -509,6 +512,7 @@ from .comment_rendering import (
 )
 from .followups import (
     APPROVED_FOLLOWUP_MARKER_RE,
+    PLAN_APPROVED_FOLLOWUP_MARKER_RE,
     approved_plan_hashes_for_issue,
     GroupedApprovedFollowup,
     MAX_APPROVED_FOLLOWUP_ISSUES,
@@ -7390,25 +7394,85 @@ def _child_resume_hint(child_issue_number: int, disposition: str) -> str:
     return f"agent-loop issue {child_issue_number}"
 
 
+def _projection_may_carry_planning_record(comments: Sequence[object]) -> bool:
+    """Whether the issue-view projection could hide or show planning state.
+
+    A cheap, unauthenticated pre-check: it only decides whether the complete,
+    author-authenticated history must be read.  The ``gh issue view``
+    projection is capped, so a full projection may have dropped older
+    records and always triggers the authenticated read.
+    """
+    if len(comments) >= _REST_ISSUE_COMMENT_PAGE_SIZE:
+        return True
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        if PLAN_APPROVED_FOLLOWUP_MARKER_RE.search(body) or EXECUTION_DECISION_MARKER_RE.search(body):
+            return True
+        for match in ROUND_RESUME_MARKER_RE.finditer(body):
+            try:
+                flow = decode_mapping(match.group("payload")).get("flow")
+            except Exception:  # noqa: BLE001 - malformed text only widens the read
+                return True
+            if flow == "plan":
+                return True
+    return False
+
+
 def _refuse_plain_mode_over_planning(
+    runner: Runner,
     *,
+    config: AgentLoopConfig,
     issue_number: int,
-    comments: Sequence[object],
-    repo: str,
+    projection_comments: Sequence[object],
 ) -> None:
     """Refuse plain issue mode on an issue that planning already decided (#1088).
 
     Plain mode implements from the issue text and never consults an approved
     plan, so running it over one would silently discard the reviewed plan.
     This mirrors the decomposition-child guard for a top-level issue.
+
+    Only records authored by the authenticated agent-loop actor count, read
+    from the complete REST history so the projection's connection cap cannot
+    hide them; a foreign comment can neither fabricate nor mask a decision.
     """
+    if not _projection_may_carry_planning_record(projection_comments):
+        return
+    login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    comments = tuple(
+        comment
+        for comment in read_rest_issue_comments(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            purpose="plain issue mode cannot confirm the issue has no approved plan",
+        )
+        if comment.author_id == actor_id
+        and strip_bot_login_suffix(comment.author) == strip_bot_login_suffix(login)
+    )
     evidence: list[str] = []
+    try:
+        plan_records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError as exc:
+        raise AgentLoopError(
+            f"Issue #{issue_number} carries planning round records that cannot be read ({exc}); "
+            "plain issue mode will not implement over them. Repair the records, or rerun "
+            f"`agent-loop issue {issue_number} --plan-first`."
+        ) from exc
+    if any(
+        record.metadata.role == "reviewer" and record.metadata.state == "approved"
+        for record in plan_records
+    ):
+        evidence.append("an approved planning review")
     plan_hashes = approved_plan_hashes_for_issue(comments, issue_number=issue_number)
     if plan_hashes:
         evidence.append(f"an approved plan (hash {plan_hashes[-1]})")
+    # Our own decision records on this thread are posted to their parent
+    # issue, so an undecodable one still belongs here and fails closed.
     if issue_has_execution_decision(comments, issue_number=issue_number):
         evidence.append("a recorded execution decision")
-    handoff = find_latest_issue_pr_handoff(comments, issue_number=issue_number, repo=repo)
+    handoff = find_latest_issue_pr_handoff(comments, issue_number=issue_number, repo=config.repo)
     if handoff is not None and handoff.flow == "approved-plan-implementation":
         evidence.append(f"an approved-plan implementation handoff to PR #{handoff.pr_number}")
     if not evidence:
@@ -15403,9 +15467,10 @@ def run_issue_loop(
             # A decomposition child was routed above; this is the structurally
             # identical top-level case, which must fail closed too (#1088).
             _refuse_plain_mode_over_planning(
+                runner,
+                config=config,
                 issue_number=issue_number,
-                comments=issue_context.comments,
-                repo=config.repo,
+                projection_comments=issue_context.comments,
             )
 
         recovered_plan_hash: str | None = None
