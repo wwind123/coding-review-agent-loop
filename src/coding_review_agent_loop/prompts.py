@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
+from .agent_permissions import coder_sandbox_guidance, inspect_forms, is_sandboxed
 from .architecture_context import (
     ArchitecturePair,
     ArchitectureSnapshot,
@@ -705,6 +706,18 @@ def _review_command_policy(
             "`git diff <base>...HEAD` with that resolved branch name; do not run "
             "the placeholder literally or discover branches speculatively."
         )
+    if is_sandboxed(config):
+        # The sandboxed grant allows no raw git/rg/sed; the workdir guidance
+        # names the exact inspect forms (Claude) or the read-only sandbox (Codex).
+        return (
+            "Do not run tests, builds, compilation, source or worktree mutation, "
+            "commits, or unrelated discovery commands. Inspect the assigned checkout "
+            "only with the read-only forms named in the sandboxed permissions section "
+            "and direct file reads. "
+            + (f"{diff_guidance} " if diff_guidance else "")
+            + "Do not fetch, checkout, reset, clean, write files other than the "
+            f"public response, or change repository state during review. {QUOTED_COMMAND_REVIEW_RULE}\n"
+        )
     return (
         "Do not run tests, builds, compilation, source or worktree mutation, "
         "commits, or unrelated discovery commands. Read-only commands used to "
@@ -756,7 +769,25 @@ def _coder_workdir_guidance(
         "running tests or committing, run `pwd` and `git status --branch --short` "
         "and confirm the path is the assigned checkout."
         f"{dangerous_warning}\n"
+        f"{_sandboxed_permission_guidance(config, implementation=implementation, agent=active_agent)}"
     )
+
+
+def _sandboxed_permission_guidance(
+    config: AgentLoopConfig, *, implementation: bool, agent: AgentName
+) -> str:
+    """Name exactly what the sandboxed grant allows for this prompt's role."""
+    if not is_sandboxed(config):
+        return ""
+    if implementation:
+        return coder_sandbox_guidance(config, agent)
+    if agent == "codex":
+        return (
+            "Sandboxed permissions are active: your sandbox is read-only and has no "
+            "network access, so rely on the issue and PR context in this prompt and on "
+            "read-only inspection of the checkout.\n"
+        )
+    return inspect_forms(config, base_branch=(config.base or None))
 
 
 def _truncate_issue_text(text: str, *, max_chars: int, label: str) -> str:

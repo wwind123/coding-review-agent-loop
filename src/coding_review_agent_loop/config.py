@@ -373,6 +373,10 @@ class AgentLoopConfig:
     architecture_aggregate_max_chars: int = 24_000
     managed_context_max_chars: int = 80_000
     architecture_context: object | None = None
+    # Agent permission mode (#1035): ``default`` and ``dangerous`` keep the
+    # static per-provider args; ``sandboxed`` builds role-scoped grants per
+    # invocation (see agent_permissions.py).
+    agent_permissions: str = "default"
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -477,6 +481,26 @@ class AgentLoopConfig:
             "--implementation-claude-effort",
         )
         ensure_no_model_arg_conflicts(self)
+        from .agent_permissions import (
+            AGENT_PERMISSION_MODES,
+            validate_sandboxed_passthrough,
+            validate_sandboxed_selections,
+        )
+
+        if self.agent_permissions not in AGENT_PERMISSION_MODES:
+            raise AgentLoopError(
+                "--agent-permissions must be one of: " + ", ".join(AGENT_PERMISSION_MODES) + "."
+            )
+        if self.agent_permissions == "sandboxed":
+            validate_sandboxed_passthrough(
+                {
+                    "--claude-arg": self.claude_args,
+                    "--codex-arg": self.codex_args,
+                    "--gemini-arg": self.gemini_args,
+                    "--antigravity-arg": self.antigravity_args,
+                }
+            )
+            validate_sandboxed_selections(self)
         if self.planning_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--planning-context-mode must be either 'full' or 'compact'.")
         if self.plan_execution_mode not in PLAN_EXECUTION_MODES:
@@ -1065,6 +1089,11 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
         runner.run((config.gh_cmd, "repo", "clone", config.repo, str(path)), cwd=path.parent)
         if runner.dry_run:
             return
+        from .agent_permissions import register_checkout
+
+        # An intentional (re-)creation is re-registered so the sandboxed
+        # boundary re-checks it rather than treating it as tampering.
+        register_checkout(config, path)
         # Fresh clones still flow through validation and sync below so the
         # same remote, cleanliness, and base-branch checks apply to every run.
 
@@ -1294,6 +1323,30 @@ def preflight_agent_commands(
         runner.remember_agent_command(command, resolved, override_flag)
 
 
+def resolve_agent_permissions_mode(args: argparse.Namespace) -> str:
+    """Resolve ``--agent-permissions`` and its ``--dangerous-agent-permissions`` alias."""
+    explicit = getattr(args, "agent_permissions", None)
+    dangerous_flag = bool(getattr(args, "dangerous_agent_permissions", False))
+    if dangerous_flag and explicit not in (None, "dangerous"):
+        raise AgentLoopError(
+            f"--dangerous-agent-permissions conflicts with --agent-permissions {explicit}; "
+            "pass only one permission mode."
+        )
+    mode = explicit or ("dangerous" if dangerous_flag else "default")
+    if mode == "sandboxed":
+        from .agent_permissions import validate_sandboxed_passthrough
+
+        validate_sandboxed_passthrough(
+            {
+                "--claude-arg": getattr(args, "claude_arg", None),
+                "--codex-arg": getattr(args, "codex_arg", None),
+                "--gemini-arg": getattr(args, "gemini_arg", None),
+                "--antigravity-arg": getattr(args, "antigravity_arg", None),
+            }
+        )
+    return mode
+
+
 def config_from_args(
     args: argparse.Namespace,
     runner: Runner,
@@ -1303,6 +1356,28 @@ def config_from_args(
     configured_reviewers = tuple(args.reviewer or ["codex"])
     if len(set(configured_reviewers)) != len(configured_reviewers):
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")
+    if resolve_agent_permissions_mode(args) == "sandboxed":
+        # Name the unsupported selection before command preflight would
+        # report a missing default helper CLI such as agy.
+        from types import SimpleNamespace
+
+        from .agent_permissions import validate_sandboxed_selections
+
+        validate_sandboxed_selections(
+            SimpleNamespace(
+                coder=args.coder,
+                implementation_coder=getattr(args, "implementation_coder", None),
+                reviewer=configured_reviewers,
+                primary_reviewer=getattr(args, "primary_reviewer", None),
+                primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
+                discuss_analyzer=getattr(args, "discuss_analyzer", None),
+                repair_backend=getattr(args, "repair_backend", "antigravity"),
+                semantic_followup_dedupe=getattr(args, "semantic_followup_dedupe", True),
+                semantic_followup_backend=getattr(
+                    args, "semantic_followup_backend", DEFAULT_SEMANTIC_FOLLOWUP_BACKEND
+                ),
+            )
+        )
     preflight_agent_commands(args, runner, configured_reviewers)
 
     detect_dir = args.codex_dir.resolve() if args.codex_dir is not None else Path.cwd().resolve()
@@ -1364,6 +1439,14 @@ def config_from_args(
         raise AgentLoopError("--agent-max-retries must be zero or positive.")
     if any(delay <= 0 for delay in args.agent_retry_backoff_seconds):
         raise AgentLoopError("--agent-retry-backoff-seconds values must be greater than zero.")
+    permission_mode = resolve_agent_permissions_mode(args)
+    dangerous = permission_mode == "dangerous"
+
+    def static_args(agent: AgentName, supplied: list[str] | None) -> tuple[str, ...]:
+        if supplied is not None:
+            return tuple(supplied)
+        return default_agent_args(agent, dangerous=dangerous, mode=permission_mode)
+
     return AgentLoopConfig(
         repo=repo,
         claude_dir=claude_dir,
@@ -1381,28 +1464,13 @@ def config_from_args(
         codex_cmd=args.codex_cmd,
         gemini_cmd=args.gemini_cmd,
         gh_cmd=args.gh_cmd,
-        claude_args=tuple(
-            args.claude_arg
-            if args.claude_arg is not None
-            else default_agent_args("claude", dangerous=args.dangerous_agent_permissions)
-        ),
-        codex_args=tuple(
-            args.codex_arg
-            if args.codex_arg is not None
-            else default_agent_args("codex", dangerous=args.dangerous_agent_permissions)
-        ),
-        gemini_args=tuple(
-            args.gemini_arg
-            if args.gemini_arg is not None
-            else default_agent_args("gemini", dangerous=args.dangerous_agent_permissions)
-        ),
+        claude_args=static_args("claude", args.claude_arg),
+        codex_args=static_args("codex", args.codex_arg),
+        gemini_args=static_args("gemini", args.gemini_arg),
         antigravity_dir=antigravity_dir,
         antigravity_cmd=args.antigravity_cmd,
-        antigravity_args=tuple(
-            args.antigravity_arg
-            if args.antigravity_arg is not None
-            else default_agent_args("antigravity", dangerous=args.dangerous_agent_permissions)
-        ),
+        antigravity_args=static_args("antigravity", args.antigravity_arg),
+        agent_permissions=permission_mode,
         antigravity_model=args.antigravity_model,
         antigravity_models=tuple(args.antigravity_models) if getattr(args, "antigravity_models", None) is not None else (),
         antigravity_print_timeout_seconds=getattr(

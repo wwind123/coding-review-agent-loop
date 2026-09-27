@@ -41,9 +41,46 @@ flowchart LR
   a PR. The orchestrator validates the reported result and owns normal review
   publication, handoff, scheduling, and finalization.
 - Reviewers are instructed to inspect the verified checkout without modifying
-  code or running tests. This is a command policy, not a universal read-only
-  filesystem sandbox; actual enforcement depends on backend permissions and
-  the execution environment.
+  code or running tests. In `default` and `dangerous` permission modes this is
+  a command policy, not a universal read-only filesystem sandbox; actual
+  enforcement depends on backend permissions and the execution environment.
+- `--agent-permissions sandboxed` (`agent_permissions.py`) turns the role split
+  into CLI-enforced permission classes built per invocation: only the exact
+  `coder` role gets the coder grant (Claude only; a committing Codex coder is
+  rejected because its sandbox keeps `.git` read-only), and every other or
+  missing role fails closed to read-only. Claude non-coders run with
+  `--restricted`, writes limited to the response root, and a single shell
+  grant, `agent-loop inspect`; Codex non-coders run in the read-only sandbox,
+  with no network, and the Codex CLI writes their response. Gemini and
+  Antigravity, and every pass-through `--<agent>-arg`, are rejected at config
+  time, with a `run_agent_result` guard as backstop.
+- The sandboxed response root is a physically validated boundary: created as
+  private, non-symlink components, checked not to overlap any agent checkout in
+  either direction, and re-verified (components, checkout identities, overlap)
+  immediately before every sandboxed spawn; the per-invocation file is created
+  exclusively without following symlinks.
+- `agent-loop inspect` (`inspect_tool.py`, standard library only) is the
+  read-only git/gh boundary for Claude non-coders. Its argument allowlist,
+  forced git config, closed environment allowlist with a `PATH` built from the
+  startup-pinned git and gh directories, and repository-config gate stop
+  inherited environment, `PATH` entries, coder-controlled git config
+  (filters, diff drivers, gpg programs, includes, aliases, hooks, trace
+  targets), and `.gitattributes` from making an inspection run a program or
+  write a file. Submodule recursion is forced off (`--ignore-submodules=all`
+  plus `-c` overrides), because a populated submodule's own local config lies
+  outside the gate. agent-loop's own workdir snapshot around a sandboxed
+  Claude turn uses the same pinned, gated, hardened git, so it cannot run
+  coder-planted config either. Its interpreter (`-I`), package files, and the pinned git and
+  gh are fingerprinted at startup and re-verified before each read-only Claude
+  spawn; a mismatch is reported as agent-unavailable without spawning.
+- Residual: sandboxed coders run tests and `git` (including their own hooks,
+  aliases, and checkout-local binaries) as the same OS user. The mode prevents
+  accidental and prompt-driven checkout mutation by non-coders and detects or
+  refuses between-turn tampering with inspector code, pinned binaries, git
+  configuration, and the response root; it is not OS-level isolation from a
+  deliberately hostile coder, which could, for example, write to a
+  user-writable directory holding a pinned binary between the check and the
+  turn. In `default` mode command policy remains the only control.
 - Model responses propose verdicts and actions. They are not authoritative Git
   state, CI results, or permission grants.
 - The tool publishes reviews as PR conversation comments, not native GitHub
@@ -906,7 +943,10 @@ Key contracts to preserve when changing the implementation:
 - Do not equate missing required input, interrupted commands, or infrastructure
   failures with approval. Distinguish them from actionable code defects.
 - Permissions and resource containment are different controls. Permission bypass
-  flags do not make fetched content or agent commands trustworthy.
+  flags do not make fetched content or agent commands trustworthy. Sandboxed
+  role grants never widen with operator pass-through arguments, and a failed
+  pre-spawn boundary or provenance re-check is never retried with the same
+  grant.
 
 These are design contracts and validation responsibilities, not a claim that
 every integration path is bug-free. Use source inspection and regression tests

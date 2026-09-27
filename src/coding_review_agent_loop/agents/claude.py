@@ -196,17 +196,52 @@ class ClaudeBackend:
         timeout_seconds: float | None = None,
         attempt_suffix: str | None = None,
     ) -> AgentResult:
+        from ..agent_permissions import (
+            SandboxBoundaryError,
+            boundary_unavailable_text,
+            hardened_git_probe_runner,
+            is_sandboxed,
+            prepare_sandboxed_spawn,
+            role_permission_args,
+            role_permission_env,
+        )
         from ..config import resolve_invocation
 
-        response_path = public_response_path(config, "claude")
         invocation = resolve_invocation(config, provider="claude", role=role)
         assert invocation.resolved_effort is not None
+        sandboxed = is_sandboxed(config)
+        if sandboxed:
+            try:
+                # Re-verify the response root, the checkout set, and (for
+                # read-only turns) the pinned inspect provenance immediately
+                # before spawning; a mismatch is never retried with this grant.
+                response_path = prepare_sandboxed_spawn(config, "claude", role)
+                permission_args = role_permission_args(config, "claude", role)
+            except SandboxBoundaryError as exc:
+                log(config, f"Claude sandboxed spawn refused: {exc}")
+                text = boundary_unavailable_text(self.signature, exc)
+                return AgentResult(
+                    text=text,
+                    raw_output="",
+                    text_source="stdout",
+                    message_text=text,
+                    returncode=0,
+                    provider="claude",
+                    role=role,
+                    configured_model=invocation.configured_model,
+                    configured_effort=invocation.resolved_effort,
+                    effort_source=invocation.effort_source,
+                )
+        else:
+            response_path = public_response_path(config, "claude")
+            permission_args = ()
         args = [
             config.claude_cmd,
             "--print",
             "--output-format",
             "json",
             *config.claude_args,
+            *permission_args,
             "--effort",
             invocation.resolved_effort,
         ]
@@ -217,6 +252,11 @@ class ClaudeBackend:
         if session_id:
             args += ["--resume", session_id]
         prompt_with_response_instruction = with_public_response_file_instruction(prompt, response_path)
+        if sandboxed:
+            prompt_with_response_instruction += (
+                "The response file already exists and is empty (it was created for this "
+                "invocation); read it once, then overwrite it with your response.\n"
+            )
         # Always deliver the prompt on stdin (#870): argv is capped per argument
         # by exec and is visible to every local user through ps/proc cmdline.
         input_text = prompt_with_response_instruction
@@ -225,10 +265,14 @@ class ClaudeBackend:
         # This is deliberately before every Claude invocation, including an
         # ordinary retry and the dedicated replay. Snapshot failures are
         # diagnostic evidence for the replay gate, not backend failures.
+        # Sandboxed turns share a checkout with the coder, so the probe goes
+        # through inspect's pinned, config-gated git instead of a bare `git`.
+        probe_git = hardened_git_probe_runner(config) if sandboxed else None
         before_snapshot = capture_workdir_snapshot(
             runner,
             config.claude_dir,
             tolerate_exceptions=True,
+            git_runner=probe_git,
         )
         result = runner.run_with_log(
             args,
@@ -243,6 +287,7 @@ class ClaudeBackend:
                     config.coder_test_command_timeout_seconds
                 ),
                 "CLAUDE_CODE_EFFORT_LEVEL": invocation.resolved_effort,
+                **role_permission_env(config, "claude", role),
             },
             input_text=input_text,
             timeout_seconds=timeout_seconds,
@@ -264,6 +309,7 @@ class ClaudeBackend:
                 runner,
                 config.claude_dir,
                 tolerate_exceptions=True,
+                git_runner=probe_git,
             )
             candidate = classify_self_update_interruption(
                 result,

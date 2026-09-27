@@ -2202,6 +2202,98 @@ def verified_wrapper_prefix(**kwargs: object) -> tuple[str, ...] | None:
     return None
 
 
+_CODER_TEST_INVOCATIONS: dict[tuple[str, str], str | None] = {}
+_CODER_TEST_INVOCATIONS_LOCK = threading.Lock()
+
+
+def reset_coder_test_invocations() -> None:
+    with _CODER_TEST_INVOCATIONS_LOCK:
+        _CODER_TEST_INVOCATIONS.clear()
+
+
+def verified_profile_test_command(memory_dir: Path | None) -> tuple[str, ...] | None:
+    """Return the first command under "Verified test commands:" in the repo test profile."""
+    if memory_dir is None:
+        return None
+    try:
+        text = (Path(memory_dir) / "test-profile.md").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "Verified test commands:":
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if not stripped:
+            break
+        match = re.fullmatch(r"-\s+`([^`]+)`", stripped)
+        if match:
+            try:
+                command = tuple(shlex.split(match.group(1)))
+            except ValueError:
+                continue
+            if command:
+                return command
+    return None
+
+
+def resolve_coder_test_invocation(
+    config: object,
+    memory: object | None = None,
+    cwd: Path | None = None,
+    *,
+    agent: str | None = None,
+) -> str | None:
+    """The single sandboxed coder test invocation, shared by the grant and the prompt.
+
+    The command is ``--test-command`` or else the first verified profile
+    command; the wrapper is the preflight-verified, virtualenv-preserving
+    prefix (never ``resolve_wrapper_prefix()``, which resolves the virtualenv
+    interpreter away).  ``agent`` names the provider whose coder turn uses the
+    grant (for example the Claude implementation coder of a Codex-planned
+    run); its checkout is where the wrapper is verified.  The result is
+    memoized per process and checkout so the permission rule and the prompt
+    line are byte-identical.
+    """
+    from .workdirs import agent_workdir
+
+    selected = agent or config.coder  # type: ignore[attr-defined]
+    root = Path(cwd or agent_workdir(config, selected)).resolve()  # type: ignore[arg-type]
+    key = (str(root), str(getattr(config, "repo", "")))
+    with _CODER_TEST_INVOCATIONS_LOCK:
+        if key in _CODER_TEST_INVOCATIONS:
+            return _CODER_TEST_INVOCATIONS[key]
+    memory_dir = getattr(memory, "memory_dir", None)
+    if memory_dir is None and getattr(config, "agent_memory", False):
+        memory_dir = getattr(config, "agent_memory_dir", None)
+    configured = getattr(config, "test_command", None)
+    command = tuple(configured) if configured else verified_profile_test_command(memory_dir)
+    invocation: str | None = None
+    reason = "no --test-command or verified profile command"
+    if command:
+        prefix = verified_wrapper_prefix(
+            cwd=root, memory_dir=memory_dir, repository=getattr(config, "repo", None)
+        )
+        if prefix is None:
+            reason = "no agent-loop run-tests wrapper candidate verified"
+        else:
+            invocation = render_test_wrapper(command, memory_dir=memory_dir, prefix=prefix)
+    if invocation is None:
+        from .logging import log
+
+        log(
+            config,  # type: ignore[arg-type]
+            "Warning: sandboxed coder test grant omitted "
+            f"({reason}); the coder cannot run tests without approval.",
+        )
+    with _CODER_TEST_INVOCATIONS_LOCK:
+        _CODER_TEST_INVOCATIONS.setdefault(key, invocation)
+        return _CODER_TEST_INVOCATIONS[key]
+
+
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # Only the system ``env`` is trusted to exec the remaining argv unchanged.  A
 # lookalike reached through a caller-controlled PATH or an arbitrary absolute

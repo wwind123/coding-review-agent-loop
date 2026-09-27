@@ -9,11 +9,20 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "inspect":
+    # The sandboxed inspect grant runs `python -I -m coding_review_agent_loop.cli
+    # inspect ...`.  Dispatch before importing the rest of agent-loop so that
+    # code path loads only the standard library and inspect_tool.py.
+    from .inspect_tool import run_inspect
+
+    raise SystemExit(run_inspect(sys.argv[2:]))
+
 from .agents.base import normalize_agent_name
 from .agents.registry import (
     agent_display_name,
     agent_signature,
 )
+from .agent_permissions import establish_sandboxed_run
 from .config import (
     DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS,
     DEFAULT_MAX_ROUNDS,
@@ -360,7 +369,23 @@ def build_parser() -> argparse.ArgumentParser:
                 "local repositories: Claude gets --dangerously-skip-permissions and "
                 "Codex gets --dangerously-bypass-approvals-and-sandbox, Gemini "
                 "gets --yolo and --skip-trust, and Antigravity gets "
-                "--dangerously-skip-permissions."
+                "--dangerously-skip-permissions. Alias for --agent-permissions dangerous."
+            ),
+        )
+        subparser.add_argument(
+            "--agent-permissions",
+            choices=("default", "sandboxed", "dangerous"),
+            default=None,
+            help=(
+                "Agent permission mode (default: default). 'sandboxed' builds CLI-enforced, "
+                "role-scoped grants per invocation for Claude and Codex: coders (Claude only) "
+                "may edit their checkout and run git, the prompt-named gh subcommands, and the "
+                "exact resolved test invocation; every other role is read-only, writes only "
+                "its response file, and (Claude) inspects only through `agent-loop inspect`. "
+                "Sandboxed mode rejects every --<agent>-arg, Gemini/Antigravity on any "
+                "selection path (including the default repair and semantic-followup "
+                "backends), and a committing Codex coder. 'dangerous' equals "
+                "--dangerous-agent-permissions."
             ),
         )
         subparser.add_argument(
@@ -1182,6 +1207,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use `--` before the command to run.",
     )
 
+    inspect = subparsers.add_parser(
+        "inspect",
+        help=(
+            "Hardened read-only git/gh runner: the only shell grant for sandboxed Claude "
+            "non-coders. Usage: inspect --git=<abs git> [--gh=<abs gh>] git|gh ARGS."
+        ),
+        description=(
+            "Run an allowlisted read-only git (diff, log, show, status, rev-parse, "
+            "ls-files) or gh (issue view, pr view, pr diff, pr checks) command with the "
+            "pinned executables, a closed environment, forced safe git config, and a "
+            "repository-config gate. The leading --git=/--gh= options are accepted only "
+            "in the first positions."
+        ),
+    )
+    inspect.add_argument(
+        "inspect_argv",
+        nargs=argparse.REMAINDER,
+        help="--git=<path> [--gh=<path>] followed by git|gh and its arguments.",
+    )
+
     containment_preflight = subparsers.add_parser(
         "containment-preflight",
         help="Report resolved process-tree containment policy and host capabilities.",
@@ -1631,6 +1676,13 @@ def _resolve_task_text(args: argparse.Namespace) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    if tokens and tokens[0] == "inspect":
+        # Validate inspect arguments with its own exact allowlist; argparse
+        # would accept option abbreviations.
+        from .inspect_tool import run_inspect
+
+        return run_inspect(tokens[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command in {"review-evaluation", "evaluate-reviews", "evaluate-review"}:
@@ -1806,12 +1858,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "plan_execution_mode": plan_execution_mode,
                 }
             )
+            establish_sandboxed_run(config, command="issue", plan_first=args.plan_first)
             return run_issue_loop(
                 runner,
                 issue_number=args.issue_number,
                 config=config,
                 plan_first=args.plan_first,
             )
+        if args.command != "issue":
+            establish_sandboxed_run(config, command=args.command)
         if args.command == "pr":
             return run_pr_loop(runner, pr_number=args.pr_number, config=config)
         if args.command == "managed-pr":

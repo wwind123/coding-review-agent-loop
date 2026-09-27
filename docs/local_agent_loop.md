@@ -4211,6 +4211,66 @@ agent-loop issue 56 \
   --gemini-arg=--approval-mode --gemini-arg=auto_edit
 ```
 
+### Sandboxed role permissions
+
+`--agent-permissions {default,sandboxed,dangerous}` selects the mode;
+`--dangerous-agent-permissions` is an alias for `dangerous` and conflicts with
+any other mode. `default` and `dangerous` produce exactly the argv above.
+`sandboxed` builds CLI-enforced grants for each Claude and Codex invocation from
+its role (implemented in `agent_permissions.py`):
+
+- Only the exact `coder` role gets the coder grant. Every other role,
+  including role-less planner turns and unknown roles, fails closed to
+  read-only.
+- A Claude coder gets `--permission-mode acceptEdits`, `--setting-sources
+  user` (so checkout `.claude/settings*.json` cannot widen later grants),
+  `Bash(git *)`, the gh subcommands coder prompts use, the read-only inspector,
+  and one exact, wildcard-free rule for the resolved `agent-loop run-tests`
+  invocation, which is the same string the coder prompt shows. The invocation
+  uses `--test-command`, else the first verified test-profile command, and the
+  preflight-verified, virtualenv-preserving wrapper. When nothing resolves the
+  test rule is omitted and a warning is logged.
+- A Claude non-coder gets `--restricted`, `--tools
+  Read,Grep,Glob,Write,Edit,Bash`, an empty `--strict-mcp-config`,
+  `--permission-mode dontAsk`, `--permission-prompts none`, `Write`/`Edit`
+  rules for the validated response root only, and one Bash rule: the pinned
+  `agent-loop inspect` prefix. It also gets `--disallowedTools` for `git` and
+  `gh`: Claude Code auto-approves some read-only commands (`git status` among
+  them) whatever the allow list says, so omitting a program does not refuse it,
+  and a bare `git` in the shared checkout would run a planted `.git/config`.
+  The deny rules are declared before the allow rules so neither variadic option
+  absorbs the other, and they do not cover the inspector prefix. See the
+  README's [inspector reference](../README.md#sandboxed-role-permissions).
+- Every sandboxed invocation also has the inherited `GIT_TRACE*` variables,
+  `GIT_CONFIG_COUNT` and `GIT_EXTERNAL_DIFF` neutralized on the agent process
+  itself. `inspect` has an environment allowlist, but the CLI that calls it
+  does not, so an inherited `GIT_TRACE2_EVENT` otherwise reaches the CLI's own
+  git calls and writes `trace2.json` into the checkout.
+- A Codex non-coder gets `--sandbox read-only` and `approval_policy="never"`,
+  and `--output-last-message` points at the pre-created public response file,
+  so failed-exit salvage reads it as usual. It has no network.
+- A committing Codex coder (issue implementation, plan-first `auto` or
+  implementation modes, `pr`, `managed-pr`, `task`), any Gemini or Antigravity
+  selection (including the default repair and semantic-followup backends), and
+  every `--<agent>-arg` are rejected before any agent runs;
+  `run_agent_result` refuses an unsupported agent as a runtime backstop.
+- At startup the response root is created one private component at a time,
+  checked to be real directories owned by you that are not group- or
+  world-writable, and checked not to overlap any agent checkout or the
+  repository checkout agent-loop runs from, in either direction. Immediately
+  before every sandboxed spawn those components, every recorded checkout's
+  resolved target and device/inode (for a not-yet-created checkout, the
+  location its nearest existing ancestor resolves to), and the overlap are
+  re-verified, and the per-invocation file is
+  created with `O_CREAT|O_EXCL|O_NOFOLLOW`. Before every read-only Claude spawn
+  the inspector's interpreter, package files, and pinned git and gh are
+  re-fingerprinted. Any mismatch reports agent-unavailable (`environment`)
+  without spawning.
+
+The opt-in live enforcement suite `tests/test_sandboxed_permissions_live.py`
+runs the real Claude and Codex CLIs against these grants when
+`AGENT_LOOP_LIVE_PERMISSION_TESTS=1` is set; it is skipped by default.
+
 Providing any `--claude-arg`, `--codex-arg`, or `--gemini-arg` replaces that agent's default entirely. Claude and Gemini prompts include a tool-owned response-file path under `/tmp/coding-review-agent-loop/responses/`; when the file exists and is non-empty, the loop validates and posts that file instead of stdout so CLI diagnostics and tool narration do not leak into GitHub comments. Gemini still supports stdout marker filtering as a fallback. If you pass `--gemini-arg=--output-format --gemini-arg=json`, the loop extracts the JSON `response` field before parsing markers when no response file was written. Fallback stdout is never posted unless the required protocol marker validates.
 
 ## Protocol
