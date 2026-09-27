@@ -402,8 +402,9 @@ Reviewer board amendment:
   reused, and the removed reviewer is never invoked again.
 - **What stays immutable.** `policy` and `primary_reviewer` must match the
   persisted contract. The primary cannot be removed, and a `primary-then-panel`
-  board must keep at least one secondary. Re-adding a removed reviewer is
-  contract drift. Every scheduler record posted after the amendment carries the
+  board must keep at least one secondary. Re-adding a removed reviewer by
+  changing the reviewer flags alone is contract drift; restore it with a signed
+  record instead (see below). Every scheduler record posted after the amendment carries the
   amended board and the record's digest; any other contract fails closed, and
   at PR qualification it refuses the merge. Amendments can chain, with each
   record's `original_required_reviewers` equal to the previous amended board.
@@ -424,6 +425,41 @@ Reviewer board amendment:
   that contains only the record is not treated as a signed human requirement.
   All-reviewers PR runs and the non-staged plan path persist no contract, so
   there you change the reviewer flags directly and must not post a record.
+
+**Restoring a recovered reviewer (#984).** The same signed record can restore a
+reviewer through the optional `restored_reviewers` key (a non-empty list of
+unique names). A restoration-only record has an empty `removed_reviewers` list
+and `reason` `backend-recovered`; a removal-only record keeps `reason`
+`backend-unavailable`; a record that does both may use either. A name may not be
+both removed and restored. Records without `restored_reviewers` keep the exact
+#943 key set and digest. When a rerun's configured board adds reviewers back to
+the persisted board, the drift error prints a filled-in restoration template.
+
+- **Bounded by the chain.** Every restored name must appear in the
+  `removed_reviewers` of an earlier link in the validated chain and must not be
+  on the board being amended. A restoration therefore never exceeds the C0
+  board and cannot introduce a new reviewer mid-run. The amended board is
+  original − removed + restored, in C0 order.
+- **Same machinery.** A restoration uses the same signed fence, the same
+  `effective_from_round` activation rule, the same digest binding, and the same
+  fail-closed handling as a removal. Because a board can recur
+  (remove → restore → remove), two records may name the same
+  `original_required_reviewers` at different chain positions. Links must be
+  posted in chain order, so the earliest matching record is the next link. A
+  record that matched the same board and is not consumed later in the chain is
+  still a conflict that stops for a human decision.
+- **Obligations.** The restoration does not re-open anything. Findings reassigned
+  while the reviewer was off the board were persisted with explicit new owners,
+  and they stay with those owners, whether pending or cleared. The ledger view
+  only reassigns reviewers that are *still* removed. From the effective round
+  on, the restored reviewer owns the new findings it raises.
+- **Re-approval.** The restored reviewer is required from its effective round.
+  Its reviews from earlier rounds, including approvals of an identical plan key
+  or PR head, are not carried as qualifying approvals. That applies to the plan
+  scheduler, the canonical plan-approval gate, and the PR exact-head approval
+  set. It therefore has to approve the current artifact before completion. The
+  audit comment and scheduler summaries name each restored reviewer and its
+  round. A run whose board is back to C0 posts no reduced-board completion note.
 
 **Lineage rules.** Only scheduler records that carry a contract are compared:
 the plan `scheduler-prelaunch` checkpoint and PR scheduler records written under
