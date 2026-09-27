@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, Sequence
 from urllib.parse import urlsplit
@@ -615,6 +615,10 @@ class _Clause:
     tokens: list[str]
     mode: ClauseMode
     command_by_contract: bool
+    # Where a working-directory change stops applying: the nesting level of a
+    # shell -c script, and whether the text has a subshell or substitution.
+    shell_depth: int = 0
+    in_subshell: bool = False
 
 
 def _tokenize(text: str) -> list[str]:
@@ -632,6 +636,10 @@ def _tokenize(text: str) -> list[str]:
 
 def _split_into_clauses(text: str, mode: ClauseMode) -> list[_Clause]:
     tokens = _tokenize(text)
+    in_subshell = any(
+        token and set(token) <= _SHELL_PUNCTUATION_CHARS and ("(" in token or ")" in token)
+        for token in tokens
+    )
     clauses: list[_Clause] = []
     current: list[str] = []
     command_by_contract = True
@@ -644,6 +652,7 @@ def _split_into_clauses(text: str, mode: ClauseMode) -> list[_Clause]:
                     tokens=current,
                     mode=mode,
                     command_by_contract=command_by_contract if mode == "structured" else False,
+                    in_subshell=in_subshell,
                 )
             )
         current = []
@@ -752,9 +761,16 @@ def _expand_shell_clause(clause: _Clause, depth: int = 0) -> list[_Clause]:
         tokens=clause.tokens[:index] + clause.tokens[index + 1 :],
         mode=clause.mode,
         command_by_contract=clause.command_by_contract,
+        shell_depth=clause.shell_depth,
+        in_subshell=clause.in_subshell,
     )
     expanded = [outer]
     for inner in _split_into_clauses(script, "structured"):
+        inner = replace(
+            inner,
+            shell_depth=clause.shell_depth + 1,
+            in_subshell=inner.in_subshell or clause.in_subshell,
+        )
         expanded.extend(_expand_shell_clause(inner, depth + 1))
     return expanded
 
@@ -1187,6 +1203,12 @@ class _PathLog(list):
         self.inside_target = False
         self.outside_target = False
         self.cwd_outside = False
+        # The current directory can no longer be proven: a popd, ``cd -``, a
+        # relative or unresolvable cd, or a cd whose scope may have ended.
+        self.cwd_unknown = False
+        self.cwd_depth = 0
+        # A target whose location cannot be proven blocks the context label.
+        self.ambiguous_target = False
 
 
 # Options whose following operand is a value (config file, plugin, expression,
@@ -1217,7 +1239,7 @@ _CWD_FLAG_PREFIXES = ("--directory=", "--chdir=", "--cwd=")
 # because its -c script is expanded into separate clauses.
 _NON_TEST_HEADS = frozenset({
     "pwd", "echo", "printf", "true", "false", "ls", "cat", "export", "set",
-    "source", ".", "mkdir", "rm", "cp", "mv", "which", "git", "popd",
+    "source", ".", "mkdir", "rm", "cp", "mv", "which", "git",
     "sh", "bash", "zsh",
 })
 
@@ -1233,9 +1255,16 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
     in-checkout ``cwd`` unless a ``cd``/``pushd`` clause or a real
     working-directory option (``-C``, ``--chdir``, ...) moved it; ``--rootdir``
     does not.  A test clause with no positional operand tests its current
-    directory.  An absolute path after a value-taking or unknown option is not
+    directory.  An outside path after a value-taking or unknown option is not
     a target, so an unrecognized report or config path can never turn an
-    in-checkout run into context.
+    in-checkout run into context; an inside path there still counts, and
+    every token after ``--`` is an operand.
+
+    The directory is tracked only through resolvable absolute moves outside
+    any subshell.  After ``popd``, ``cd -``, a relative or unresolvable
+    target, a subshell or substitution, or the end of the ``sh -c`` script
+    that moved it, the directory is unknown and a relative or implicit target
+    is ambiguous, which keeps the run authoritative.
     """
 
     def outside(raw: str) -> bool | None:
@@ -1245,40 +1274,71 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
         return not (path == assigned or _is_inside(path, assigned))
 
     tokens = clause.tokens
+    if log.cwd_depth > clause.shell_depth:
+        # The shell -c script that moved the directory has exited.
+        log.cwd_unknown = True
     _, head = _program_position_indices(tokens)
     if head is None or head >= len(tokens):
         return
     head_name = _program_basename(tokens[head])
-    if head_name in {"cd", "pushd"}:
-        if head + 1 < len(tokens):
-            moved = outside(tokens[head + 1])
-            if moved is not None:
-                log.cwd_outside = moved
+    if head_name in {"cd", "pushd", "popd"}:
+        moved = outside(tokens[head + 1]) if head + 1 < len(tokens) else None
+        if moved is None or clause.in_subshell or head_name == "popd":
+            # Only one resolvable move outside any subshell is tracked; a
+            # restore or unresolvable target leaves the directory unknown.
+            log.cwd_unknown = True
+        else:
+            log.cwd_outside = moved
+            log.cwd_depth = max(log.cwd_depth, clause.shell_depth)
         return
     if head_name in _NON_TEST_HEADS:
         return
 
-    cwd_outside = log.cwd_outside
+    cwd_outside: bool | None = None if log.cwd_unknown else log.cwd_outside
     index = head + 1
     while index < len(tokens):
         token = tokens[index]
+        if token == "--":
+            break
         if token in _CWD_FLAGS and index + 1 < len(tokens):
-            moved = outside(tokens[index + 1])
-            if moved is not None:
-                cwd_outside = moved
+            cwd_outside = outside(tokens[index + 1])
             index += 2
             continue
         for prefix in _CWD_FLAG_PREFIXES:
             if token.startswith(prefix):
-                moved = outside(token[len(prefix) :])
-                if moved is not None:
-                    cwd_outside = moved
+                cwd_outside = outside(token[len(prefix) :])
         index += 1
 
+    def record_relative() -> None:
+        if cwd_outside is None:
+            log.ambiguous_target = True
+        elif cwd_outside:
+            log.outside_target = True
+        else:
+            log.inside_target = True
+
     saw_positional = False
+    terminated = False
     for index in range(head + 1, len(tokens)):
         token = tokens[index]
         previous = tokens[index - 1]
+        if terminated:
+            # After ``--`` every token is an operand, never an option value.
+            cleaned = _strip_wrap(token)
+            if not cleaned:
+                continue
+            saw_positional = True
+            if _is_path_shaped(cleaned):
+                if outside(cleaned):
+                    log.outside_target = True
+                else:
+                    log.inside_target = True
+            else:
+                record_relative()
+            continue
+        if token == "--":
+            terminated = True
+            continue
         if (
             token.startswith("-")
             or VAR_ASSIGNMENT_RE.match(token)
@@ -1297,24 +1357,20 @@ def _record_test_targets(clause: _Clause, *, assigned: Path, log: _PathLog) -> N
             _BOOLEAN_SHORT_FLAGS_RE.fullmatch(previous) or previous in _BOOLEAN_LONG_FLAGS
         )
         if _is_path_shaped(cleaned):
-            if after_unknown_option:
+            is_outside = outside(cleaned)
+            if after_unknown_option and is_outside:
+                # Possibly an option value; an inside path still counts.
                 continue
             saw_positional = True
-            if outside(cleaned):
+            if is_outside:
                 log.outside_target = True
             else:
                 log.inside_target = True
             continue
         saw_positional = True
-        if cwd_outside:
-            log.outside_target = True
-        else:
-            log.inside_target = True
+        record_relative()
     if not saw_positional:
-        if cwd_outside:
-            log.outside_target = True
-        else:
-            log.inside_target = True
+        record_relative()
 
 
 def _validate_command_contents(
@@ -1520,6 +1576,7 @@ def command_targets_outside_workdir(
         and bool(log)
         and log.outside_target
         and not log.inside_target
+        and not log.ambiguous_target
     )
 
 

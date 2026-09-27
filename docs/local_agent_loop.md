@@ -3252,11 +3252,15 @@ classification is fail-safe: only a run with positive evidence that every test
 target lies outside the checkout counts as context. Any other positional
 operand, such as a relative path, a bare directory like `tests`, or a node ID,
 is an in-checkout target, and so is the current directory of a test command
-with no operand. Relative operands resolve through `cd`/`pushd` and real
-working-directory options such as `-C`, but not through pytest's `--rootdir`.
-An absolute path after a value-taking or unknown option (a config, report, or
-ignore path) is never a target. A mixed run, or one whose only outside path is
-an option value, therefore keeps its failures authoritative. In
+with no operand. Relative operands resolve through a resolvable absolute
+`cd`/`pushd` and real working-directory options such as `-C`, but not through
+pytest's `--rootdir`. After `popd`, `cd -`, a relative or unresolvable `cd`, a
+subshell or command substitution, or the end of the `sh -c` script that moved
+it, the directory is unknown and a relative or implicit target keeps the run
+authoritative. An outside path after a value-taking or unknown option (a
+config, report, or ignore path) is never a target; an inside path there still
+is, and every token after `--` is an operand. A mixed run, or one whose only
+outside path is an option value, therefore keeps its failures authoritative. In
 the public local test journal a pure outside run carries an out-of-checkout
 context caveat that survives
 round metadata; it never counts as an authoritative failure, cannot supersede

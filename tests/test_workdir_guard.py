@@ -1537,6 +1537,22 @@ def test_command_is_admissible_evidence(tmp_path, argv, admissible):
     ("bash -c 'cd /tmp/scratch-main-991 && pytest; cd {checkout} && pytest tests/'", False),
     ("python3 -m pytest tests/ -q", False),
     ("pytest tests/ https://live.example", False),
+    # Everything after the -- terminator is an operand, never an option value.
+    ("python3 -m pytest -q -- {checkout}/tests/x.py /tmp/scratch-main-991/tests/x.py", False),
+    ("python3 -m pytest -q -- tests/x.py /tmp/scratch-main-991/tests/x.py", False),
+    ("python3 -m pytest -q -- /tmp/scratch-main-991/tests/x.py", True),
+    # An inside path after an unknown option may be an operand.
+    ("python3 -m pytest --weird {checkout}/tests/x.py /tmp/scratch-main-991/tests", False),
+    # The directory is unknown once a move's scope may have ended.
+    ("(cd /tmp/scratch-main-991 && pytest tests/); pytest tests/", False),
+    ("(cd /tmp/scratch-main-991 && pytest tests/)", False),
+    ("bash -c 'cd /tmp/scratch-main-991 && pytest tests/'; pytest tests/", False),
+    ("pushd /tmp/scratch-main-991 && pytest /tmp/scratch-main-991/tests; popd; pytest tests/", False),
+    ("cd /tmp/scratch-main-991 && pytest; cd - && pytest tests/", False),
+    ("cd /tmp/scratch-main-991 && pytest; cd .. && pytest tests/", False),
+    ("cd /tmp/scratch-main-991 && pytest; cd && pytest tests/", False),
+    ("cd /tmp/scratch-main-991 && pytest $(echo tests)", False),
+    ("cd /tmp/scratch-main-991 && pytest tests/", True),
 ])
 def test_command_targets_outside_workdir_only_for_pure_outside_runs(
     tmp_path, command, outside_only

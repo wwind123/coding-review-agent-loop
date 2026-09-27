@@ -651,6 +651,8 @@ def test_orchestrator_derivation_excludes_out_of_checkout_broker_runs(
     ("python3", "-m", "pytest", "tests", "/tmp/scratch-main-991/tests"),
     ("pytest", "--rootdir=/tmp/scratch-main-991", "tests/test_protocol.py"),
     ("python3", "-m", "pytest", "-q", "--junit-xml", "/tmp/scratch-main-991/r.xml"),
+    ("python3", "-m", "pytest", "-q", "--", "tests/x.py", "/tmp/scratch-main-991/tests/x.py"),
+    ("bash", "-c", "(cd /tmp/scratch-main-991 && pytest); pytest tests/"),
 ])
 def test_orchestrator_derivation_keeps_unvalidatable_failures_in_journal(
     monkeypatch, tmp_path, failure_command

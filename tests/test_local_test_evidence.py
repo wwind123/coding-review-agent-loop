@@ -1611,6 +1611,8 @@ def test_mixed_operand_broker_failure_stays_authoritative(tmp_path):
     ("pytest", "--rootdir=/tmp/scratch-main-991", "tests/test_foo.py"),
     ("python3", "-m", "pytest", "tests", "/tmp/scratch-main-991/tests"),
     ("python3", "-m", "pytest", "-q", "--junit-xml", "/tmp/scratch-main-991/r.xml"),
+    ("python3", "-m", "pytest", "-q", "--", "tests/x.py", "/tmp/scratch-main-991/tests/x.py"),
+    ("bash", "-c", "(cd /tmp/scratch-main-991 && pytest); pytest tests/"),
 ])
 def test_in_checkout_broker_failure_with_outside_path_stays_authoritative(tmp_path, command):
     """Issue #991: only positive evidence of an outside-only run makes context.
