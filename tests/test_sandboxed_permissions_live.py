@@ -46,6 +46,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -735,6 +736,13 @@ def test_live_codex_reviewer_checkout_write_denied_and_cli_writes_response(live)
     assert result.response_file_path.parent == ap.sandboxed_response_root(config) / "codex"
 
 
+def _hook_steps(marker: Path) -> list[str]:
+    """Return the step nonces a planted hook recorded, one per invocation."""
+    if not marker.exists():
+        return []
+    return marker.read_text(encoding="utf-8").splitlines()
+
+
 @live_only
 def test_live_antigravity_sandbox_does_not_confine_a_reviewer(live):
     """Tripwire for the refusal of Antigravity in sandboxed mode (#1079).
@@ -745,8 +753,10 @@ def test_live_antigravity_sandbox_does_not_confine_a_reviewer(live):
     approval ends the turn with no output).  It records, from agy's own
     stream-json transcript, that the terminal sandbox refuses a checkout
     write while the file tool writes the checkout and a bare ``git`` runs a
-    planted ``core.fsmonitor``.  There is no allowed inspector case because
-    no inspector grant exists.  If the premise assertions fail, agy's sandbox
+    planted ``core.fsmonitor``.  The hook records a nonce that only the
+    scripted ``git`` step's environment carries, so a git run by agy itself
+    at startup or elsewhere cannot satisfy the fsmonitor premise.  There is
+    no allowed inspector case because no inspector grant exists.  If the premise assertions fail, agy's sandbox
     has changed: revisit the refusal rather than weakening this test.
     """
     root = live["root"]
@@ -754,14 +764,19 @@ def test_live_antigravity_sandbox_does_not_confine_a_reviewer(live):
     _require_cli(agy)
     checkout = _checkout(root, "antigravity-checkout")
     marker = root / "fsmonitor-ran"
-    hook = _executable(root / "hooks" / "fsmonitor.sh", f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+    nonce = f"agy-fsmonitor-{uuid.uuid4().hex}"
+    hook = _executable(
+        root / "hooks" / "fsmonitor.sh",
+        f'#!/bin/sh\nprintf "%s\\n" "${{AGY_FSMONITOR_STEP:-}}" >> {marker}\nexit 1\n',
+    )
     _git(checkout, "config", "core.fsmonitor", str(hook))
+    git_step = f"AGY_FSMONITOR_STEP={nonce} git status --short"
     shell_target = checkout / "agy-shell-pwned.txt"
     tool_target = checkout / "agy-tool-pwned.txt"
     prompt = _script([
         f"Run the shell command: touch {shell_target}",
         f"Use your file-writing tool (not the shell) to create {tool_target} containing x",
-        "Run the shell command: git status --short",
+        f"Run the shell command: {git_step}",
     ])
     completed = subprocess.run(
         [agy, "--sandbox", "--dangerously-skip-permissions", "--output-format", "stream-json",
@@ -771,14 +786,17 @@ def test_live_antigravity_sandbox_does_not_confine_a_reviewer(live):
     calls = parse_antigravity_events(completed.stdout)
     live["evidence"].append(
         {"test": "antigravity-sandbox-premise", "calls": _summary(calls),
-         "returncode": completed.returncode, "fsmonitor_ran": marker.exists()}
+         "returncode": completed.returncode, "fsmonitor_steps": _hook_steps(marker)}
     )
     attempts = Attempts(calls)
     assert_sandbox_denied_output(attempts.take(tool="run_command", exact=f"touch {shell_target}"))
     assert not shell_target.exists()
     attempts.take(tool="write_to_file", exact=str(tool_target))
     assert tool_target.exists(), "agy --sandbox now confines its file tool; revisit #1079"
-    attempts.take(tool="run_command", exact="git status --short")
-    assert marker.exists(), "agy --sandbox no longer runs a planted fsmonitor; revisit #1079"
+    attempts.take(tool="run_command", exact=git_step)
+    # Bound to the scripted step: a git agy runs on its own records no nonce.
+    assert nonce in _hook_steps(marker), (
+        "agy --sandbox no longer runs a planted fsmonitor; revisit #1079"
+    )
     with pytest.raises(ap.AgentLoopError, match="`agy --sandbox` restricts only its terminal"):
         _config(root, _checkout(root, "claude-checkout"), reviewer=("codex", "claude", "antigravity"))
