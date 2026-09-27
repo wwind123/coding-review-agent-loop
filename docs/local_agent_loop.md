@@ -1980,9 +1980,36 @@ Execution model:
   plan/PR state (current plan or PR diff, prior unresolved items, PR checks
   snapshot), then all pending turns are submitted to a thread pool. Same-round
   reviewers never see each other's in-progress output.
-- A validated healthy review is posted by the main thread as soon as its worker
-  completes. Its provisional publication checkpoint is durable, so resume
-  avoids duplicate comments even if the next run is sequential.
+- Reviewer bodies are withheld until every reviewer in the round has
+  returned; the main thread then posts each validated healthy review in
+  completion order. Publishing a finished review while a peer is still running
+  would put it on the PR/issue the slower reviewer can read mid-turn (a
+  tool-enabled reviewer could echo it), so agreement across the panel would no
+  longer be independent (#1025). Each provisional publication checkpoint is
+  durable, so resume avoids duplicate comments even if the next run is
+  sequential. No reviewer is ever invoked while a same-round peer's body is
+  public:
+  - Before the first post, every settled outcome (validated response, or a
+    failure that settles the reviewer as unavailable) is written to a private
+    per-round spool under the repo cache
+    (`<agent-memory-dir>/../review-round-spool/`). If the run stops between two
+    posts, a rerun -- with or without `--review-parallel` -- replays the
+    unpublished outcomes through the same validator instead of re-invoking
+    those reviewers. The spool is deleted once every post succeeds.
+  - If a reviewer fails fatally or returns an incomplete review, so a rerun
+    must invoke it again, nothing is posted: the healthy reviews stay in the
+    spool, the failure is raised, and the rerun replays them while only the
+    failed reviewer runs, with no peer body visible.
+  - A round that still holds spooled outcomes is always finished through this
+    withhold-then-publish path, even when the rerun omits `--review-parallel`
+    (reviewers that need a fresh turn then run one at a time), so a sequential
+    rerun never posts a replayed review before a retried reviewer runs.
+  - If a same-round peer is already public -- including a posted review that
+    resume rejected, for example after the requirements changed -- and a
+    reviewer's spooled outcome is missing or no longer validates (for example,
+    a rerun on another host), the run stops before invoking it. Rerun from the host that holds the spool, or
+    delete the round's already-posted reviewer comments so the whole round runs
+    again.
 - The orchestrator still waits for every reviewer to settle before shared state
   changes: it aggregates outcomes, numbers unresolved items, and may begin
   coder work only in configured `--reviewer` order. It then posts a neutral
@@ -1990,10 +2017,11 @@ Execution model:
   excluded from reviewer/approval selection. On resume, settled `new_items`
   from that reconciliation checkpoint remain authoritative; provisional
   publication checkpoints do not cause those items to be numbered again.
-- Only after every healthy outcome is applied does the orchestrator raise a
-  fatal failure, if any: a quota-reset failure takes priority; otherwise the
-  first failure in configured `--reviewer` order. Because healthy reviewers
-  were already posted, a rerun resumes them instead of re-invoking them.
+- A fatal failure is raised -- a quota-reset failure takes priority; otherwise
+  the first failure in configured `--reviewer` order -- after the healthy
+  outcomes are spooled but before any is posted, so a rerun replays them
+  instead of re-invoking them. When every launched reviewer failed, there is
+  nothing to withhold and the round settles as before.
 - Existing per-reviewer policies are unchanged and isolated per turn: retry,
   structured repair, the unavailable-reviewer / incomplete-review
   distinction, and the PR flow's single-reviewer-fatal rule. One reviewer's
