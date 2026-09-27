@@ -5248,7 +5248,9 @@ def test_managed_manual_success_publishes_result_without_merge_even_with_pending
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert published == ["abc123"]
-    assert "approved and qualified; manual merge required" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "approved and qualified; manual merge required" in out
+    assert "line containing exactly `-- Human Reviewer`, then rerun `agent-loop pr 77`" in out
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
@@ -7696,6 +7698,30 @@ def test_pr_loop_logs_created_followup_issue_url(tmp_path, capsys):
 
     captured = capsys.readouterr()
     assert "Created GitHub issue: https://github.com/OWNER/REPO/issues/99" in captured.err
+
+
+def test_pr_loop_approval_names_the_signed_requirement_reopen_path(tmp_path, capsys):
+    # #1020: the approval line is where an operator learns there is no further
+    # move, so it must name the signed-requirement path for new instructions.
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="Codex approves.",
+                reviewer="OpenAI Codex",
+            )
+        ],
+    )
+    config = make_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    out = capsys.readouterr().out
+    assert "PR #77 approved by " in out
+    assert "line containing exactly `-- Human Reviewer`" in out
+    assert "rerun `agent-loop pr 77`" in out
+    assert "Unsigned comments are not read as requirements" in out
+
 
 @pytest.mark.parametrize("mode", ["summarize", "issue"])
 def test_pr_loop_treats_same_pr_followups_as_blocking_without_fix_mode(tmp_path, mode):

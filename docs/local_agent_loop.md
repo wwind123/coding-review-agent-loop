@@ -4646,7 +4646,34 @@ Signed human reviewer comments are requirements when the comment body ends with
 a standalone `-- Human Reviewer` signature. Issue comments become signed
 planning or implementation requirements; PR comments become signed PR-review
 requirements. They override AI reviewer preferences unless they are unsafe,
-impossible, or superseded by a later signed human instruction.
+impossible, or superseded by a later signed human instruction. Unsigned
+comments, issue acceptance criteria, reviewer item IDs, reviewer comments, and
+labels are never signed requirements, so a plain comment is silently not read
+as one by design.
+
+**Adding instructions to an approved PR.** Signed PR comments are not limited to answering a **Human decision required**
+(exit status `4`) boundary. They are also the operator path for adding
+instructions to a PR that every reviewer has already approved at its head.
+Without one, `agent-loop pr <number>` on that head finds no coder blocker,
+prints `PR #<number> approved by ...`, and exits without invoking an agent;
+`--pr-review-force-full` does not change that, because it selects reviewers and
+creates no coder obligation. To reopen the PR:
+
+1. Post a PR comment with the instructions, ending with a line containing
+   exactly `-- Human Reviewer`.
+2. Rerun `agent-loop pr <number>`.
+
+The new requirement ID is absent from every carried or resumed approval's
+recorded requirement coverage, so those approvals no longer count and each
+reviewer is re-invoked at the same head. A reviewer that finds the requirement
+unmet blocks, which dispatches the coder in the same PR; the coder must
+disposition the requirement and reviewers must mark it resolved before the loop
+approves again. The approval message and `agent-loop pr --help` name this path.
+
+Only a human may sign. The signature certifies human authorship and nothing
+verifies it, so an agent must never add it on its own initiative; when an
+operator instructs an agent to relay their decision, the comment must disclose
+the relay.
 
 When signed requirements are present, legacy coder markdown acknowledgement
 responses must include:

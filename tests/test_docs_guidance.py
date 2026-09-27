@@ -699,6 +699,27 @@ def test_cli_help_documents_agent_permissions_and_inspect():
     assert "inspect" in top and "Hardened read-only git/gh runner" in top
 
 
+def test_cli_help_and_docs_name_the_approved_pr_signed_requirement_path():
+    # #1020: an operator with new instructions for an approved PR must be able
+    # to find the signed-requirement path from the CLI and docs.
+    parser = build_parser()
+    # argparse may wrap inside hyphenated words, so compare without whitespace.
+    pr_help = "".join(parser._subparsers._group_actions[0].choices["pr"].format_help().split())
+    assert "alreadyapprovedatitshead" in pr_help
+    assert "linecontainingexactly`--HumanReviewer`" in pr_help
+    assert "Unsignedcommentsarenotreadasrequirements" in pr_help
+    top = "".join(parser.format_help().split())
+    assert "`--HumanReviewer`" in top and "agent-looppr--help" in top
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    assert "**already approved at its head**" in readme
+    assert "a plain PR comment is not read as a requirement" in readme
+    assert "the relay must be disclosed in the comment" in readme
+    docs = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
+    assert "**Adding instructions to an approved PR.**" in docs
+    assert "those approvals no longer count and each reviewer is re-invoked at the same head" in docs
+    assert "the comment must disclose the relay" in docs
+
+
 def test_docs_document_the_plan_growth_gate():
     readme = README.read_text(encoding="utf-8")
     for flag in (
