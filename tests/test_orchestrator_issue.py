@@ -13554,6 +13554,57 @@ def test_1088_plain_issue_mode_still_runs_directly_without_plan_for_this_issue(t
     _m1088_assert_ran_directly(runner, make_config(tmp_path))
 
 
+def test_1088_plain_issue_mode_refuses_handoff_only_planning_record(tmp_path):
+    # The approved-plan handoff is the only planning record in view.
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=approved_plan_hash("Plan:\n- Make the change."),
+    )
+    runner = _m1088_runner([_m1088_comment(handoff)], pr_payload={"body": "Fixes #56"})
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "an approved-plan implementation handoff to PR #77" in message
+
+
+class _M1088ApprovalAfterFirstSnapshotRunner(FakeRunner):
+    """Posts a plan approval right after the first issue snapshot is read."""
+
+    def __init__(self, approval, **kwargs):
+        super().__init__(**kwargs)
+        self._approval = approval
+        self.issue_view_calls = 0
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        result = super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+        if list(args[:3]) == ["gh", "issue", "view"]:
+            self.issue_view_calls += 1
+            if self.issue_view_calls == 1:
+                self.issue_comments.append(self._approval)
+        return result
+
+
+def test_1088_plain_issue_mode_rechecks_fresh_snapshot_before_dispatch(tmp_path):
+    plan_hash = approved_plan_hash("Plan:\n- Make the change.")
+    runner = _M1088ApprovalAfterFirstSnapshotRunner(
+        _m1088_comment(_m1088_approval_body(56, plan_hash)),
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        authenticated_actor=_M1088_ACTOR,
+        serve_rest_issue_comments=True,
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert f"an approved plan (hash {plan_hash})" in message
+    # The first snapshot was clean; only the fresh pre-dispatch one refused.
+    assert runner.issue_view_calls >= 2
+
+
 def test_1088_plain_issue_mode_without_planning_records_needs_no_rest_history(tmp_path):
     # No REST history or actor identity is served: an issue with no planning
     # record in its (uncapped) projection must not need either.

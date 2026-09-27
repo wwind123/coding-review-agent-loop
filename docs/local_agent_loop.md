@@ -1345,7 +1345,10 @@ handoff. The error names what it found and the resume command
 the authenticated agent-loop actor count. When the capped `gh issue view`
 projection shows no planning record and is not full, the check stops there.
 Otherwise it reads the complete REST comment history, so older records are not
-missed and a foreign comment can neither fabricate nor hide a decision.
+missed and a foreign comment can neither fabricate nor hide a decision. The
+check runs again on the fresh issue snapshot taken just before the coder is
+dispatched, so an approval posted by a concurrent plan-first run in between
+also refuses.
 
 Before invoking a coder for an issue — in direct `agent-loop issue <n>` mode or
 approved-plan implementation alike — the orchestrator resolves the canonical

@@ -173,6 +173,8 @@ from .github import (
     watch_pr_checks,
 )
 from .issue_pr_handoff import (
+    AGENT_ISSUE_PR_HANDOFF_RE,
+    _decode_issue_pr_handoff_metadata,
     find_latest_issue_pr_handoff,
     authenticate_canonical_issue_pr,
     format_issue_pr_handoff_comment,
@@ -7416,6 +7418,15 @@ def _projection_may_carry_planning_record(comments: Sequence[object]) -> bool:
             except Exception:  # noqa: BLE001 - malformed text only widens the read
                 return True
             if flow == "plan":
+                return True
+        # An approved-plan handoff can be the only planning record left in
+        # view; a direct-flow handoff is ordinary resume state and is not.
+        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(body):
+            try:
+                handoff = _decode_issue_pr_handoff_metadata(match.group("payload"))
+            except Exception:  # noqa: BLE001 - malformed text only widens the read
+                return True
+            if handoff.flow == "approved-plan-implementation":
                 return True
     return False
 
@@ -15876,6 +15887,14 @@ def run_issue_loop(
         # The first issue snapshot was used for validation and provenance; the
         # implementation handoff must use fresh target and parent snapshots.
         issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
+        # A concurrent plan-first run may have approved since the first
+        # snapshot; recheck the one the coder is dispatched from (#1088).
+        _refuse_plain_mode_over_planning(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            projection_comments=issue_context.comments,
+        )
         if parent_issue_context is not None:
             parent_issue_context = get_issue_context(
                 runner, config=config, issue_number=parent_issue_context.number
