@@ -302,9 +302,18 @@ def _memory_block(
             recommendations = {}
             for command in commands:
                 key = remembered_keys.get(command)
-                cohorts = [key[2]] if key else _expected_worker_cohorts(config, command)
-                for cohort in cohorts:
-                    recommendation = recommend_timeout(
+                expected = _expected_worker_cohorts(config, command)
+                if len(expected) > 1:
+                    # The run may go parallel (budget default) or stay
+                    # serial (no xdist in the interpreter, ``--dist no`` in
+                    # addopts); the prompt cannot know which.  Take the
+                    # safest watchdog across both cohorts so a fast parallel
+                    # sample never times out a serial run (#1073).
+                    cohorts = list(dict.fromkeys([*([key[2]] if key else []), *expected]))
+                else:
+                    cohorts = [key[2]] if key else expected
+                candidates = [
+                    recommend_timeout(
                         memory.memory_dir,
                         argv=command,
                         cwd=cwd,
@@ -313,9 +322,12 @@ def _memory_block(
                         fingerprint_override=key[1] if key else None,
                         workers=cohort,
                     )
-                    recommendations[command] = recommendation
-                    if recommendation.successful_samples or recommendation.unresolved_timeout_seconds:
-                        break
+                    for cohort in cohorts
+                ]
+                recommendations[command] = max(
+                    candidates,
+                    key=lambda item: (item.recommended_timeout_seconds, item.successful_samples),
+                )
             runtime_text = render_runtime_context(
                 memory.memory_dir,
                 commands=commands,
@@ -389,12 +401,13 @@ def _memory_block(
 
 
 def _expected_worker_cohorts(config: AgentLoopConfig, command: Sequence[str]) -> list[str | None]:
-    """Cohort labels to try, most likely first, for a recommendation lookup.
+    """Cohort labels a command may run under, for a recommendation lookup.
 
     In a repository that declares xdist support a plain pytest is expected to
     run with the budget's default worker count (issue #1073), but it still
-    runs serially when xdist is not installed, so the serial cohort remains a
-    fallback.  Serial timings are never shorter, so the fallback is safe.
+    runs serially when xdist is not installed or resolved addopts say
+    ``--dist no``, so both labels are returned and the caller takes the
+    safest watchdog across them.
     """
     try:
         from .test_workers import (

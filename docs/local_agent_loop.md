@@ -802,9 +802,11 @@ active and pytest's full resolved argument list (argv with `PYTEST_ADDOPTS`
 and ini or `-o` `addopts` prepended, captured in
 `pytest_load_initial_conftests`) and parsed options still name none of those
 choices; otherwise the run keeps its own choice. The argument list matters
-because an explicit `--dist no` parses to the same value as the default. The
-timeout-recommendation lookup uses the parallel cohort only for commands the
-wrapper would give the default. When xdist is not installed or is disabled, the
+because an explicit `--dist no` parses to the same value as the default. For a
+command the wrapper would give the default, the coder prompt's timeout
+recommendation takes the larger watchdog of the parallel and serial cohorts,
+because the run still goes serial when xdist is missing or addopts say
+`--dist no`; other commands use only their own cohort. When xdist is not installed or is disabled, the
 run stays serial and the plugin prints a one-line notice. The confirmation
 record carries `defaulted`. Pass `-n 0` or `-p no:xdist` to keep a focused run
 serial.
