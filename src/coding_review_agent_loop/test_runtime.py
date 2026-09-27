@@ -30,6 +30,7 @@ from statistics import median
 from typing import Iterable, Mapping, Sequence
 
 from .errors import AgentLoopError
+from .scratch import make_private_dirs, scratch_root
 
 DEFAULT_TEST_TIMEOUT_SECONDS = 1800
 RUNTIME_SCHEMA_VERSION = 1
@@ -153,9 +154,9 @@ class CommandLaneLock:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         root = Path(values.get("XDG_RUNTIME_DIR", "")) / "agent-loop" / COMMAND_LANE_LOCK_DIR
         if str(root) == f"agent-loop/{COMMAND_LANE_LOCK_DIR}":
-            root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / COMMAND_LANE_LOCK_DIR
+            root = scratch_root() / COMMAND_LANE_LOCK_DIR
         try:
-            root.mkdir(parents=True, exist_ok=True)
+            make_private_dirs(root)
             path = root / f"{digest}.lock"
             handle = path.open("a+")
             if os.name == "nt":
@@ -1386,6 +1387,39 @@ def _unlock_file(handle) -> None:
         handle.close()
 
 
+LAUNCH_INTEGRITY_STATES = frozenset({"verified", "unverified"})
+
+
+def launch_integrity_state(result: object, *, wrapper_boundary: bool = True) -> str:
+    """Classify a runner/broker result's launch boundary for runtime history.
+
+    Mirrors the evidence gate: only a verified wrapper bootstrap, a started
+    inner exec and a verified suite start are authoritative.  Anything else
+    (for example an unrecognized shell-script wrapper whose suite start is
+    ``unknown``) is refused as evidence and must not become a recommendation.
+
+    ``wrapper_boundary=False`` is for the parent-owned configured test gate,
+    which has no ``run-tests`` wrapper to bootstrap; its suite start must
+    still be verified.
+    """
+    authoritative = (
+        (not wrapper_boundary or getattr(result, "wrapper_bootstrap", "unknown") == "verified")
+        and getattr(result, "inner_exec", "not-attempted") == "started"
+        and getattr(result, "suite_start", "not-started") == "verified"
+    )
+    return "verified" if authoritative else "unverified"
+
+
+def runtime_row_is_evidence(row: Mapping[str, object]) -> bool:
+    """Whether a remembered row carries an authenticated launch.
+
+    Fail closed: rows written before ``launch_integrity`` existed carry no
+    launch state, and their argv alone cannot prove the suite start was
+    verified, so they are non-evidence just like an ``unverified`` row.
+    """
+    return row.get("launch_integrity") == "verified"
+
+
 def record_test_observation(
     memory_dir: Path | None,
     *,
@@ -1405,12 +1439,18 @@ def record_test_observation(
     executed_argv: Sequence[str] | None = None,
     worker_enforcement: str | None = None,
     caveats: Sequence[str] = (),
+    launch_integrity: str | None = None,
 ) -> bool:
     """Append a bounded observation; persistence failure never affects execution.
 
     ``workers`` is the cohort label (``serial``, a count or ``unknown``).  When
     omitted it is derived from ``argv`` with the proven-serial rule, so an
     unconfirmed run never gains a numeric cohort.
+
+    ``launch_integrity`` (``verified`` or ``unverified``) records whether the
+    wrapper, inner exec and suite start were all authenticated.  An
+    ``unverified`` row is kept only as non-evidence: it never feeds a timeout
+    recommendation and is never surfaced to coders as a remembered command.
     """
     if memory_dir is None:
         return False
@@ -1448,6 +1488,11 @@ def record_test_observation(
                 observation["worker_enforcement"] = worker_enforcement
             if caveats:
                 observation["caveats"] = [str(item) for item in caveats]
+            if launch_integrity is not None:
+                # Fail closed: an unrecognized state is never evidence.
+                observation["launch_integrity"] = (
+                    launch_integrity if launch_integrity in LAUNCH_INTEGRITY_STATES else "unverified"
+                )
             if containment is not None:
                 # Evidence is already bounded by the runner.  Keep only JSON
                 # values and expose unsupported telemetry explicitly.
@@ -2158,6 +2203,98 @@ def verified_wrapper_prefix(**kwargs: object) -> tuple[str, ...] | None:
     return None
 
 
+_CODER_TEST_INVOCATIONS: dict[tuple[str, str], str | None] = {}
+_CODER_TEST_INVOCATIONS_LOCK = threading.Lock()
+
+
+def reset_coder_test_invocations() -> None:
+    with _CODER_TEST_INVOCATIONS_LOCK:
+        _CODER_TEST_INVOCATIONS.clear()
+
+
+def verified_profile_test_command(memory_dir: Path | None) -> tuple[str, ...] | None:
+    """Return the first command under "Verified test commands:" in the repo test profile."""
+    if memory_dir is None:
+        return None
+    try:
+        text = (Path(memory_dir) / "test-profile.md").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "Verified test commands:":
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if not stripped:
+            break
+        match = re.fullmatch(r"-\s+`([^`]+)`", stripped)
+        if match:
+            try:
+                command = tuple(shlex.split(match.group(1)))
+            except ValueError:
+                continue
+            if command:
+                return command
+    return None
+
+
+def resolve_coder_test_invocation(
+    config: object,
+    memory: object | None = None,
+    cwd: Path | None = None,
+    *,
+    agent: str | None = None,
+) -> str | None:
+    """The single sandboxed coder test invocation, shared by the grant and the prompt.
+
+    The command is ``--test-command`` or else the first verified profile
+    command; the wrapper is the preflight-verified, virtualenv-preserving
+    prefix (never ``resolve_wrapper_prefix()``, which resolves the virtualenv
+    interpreter away).  ``agent`` names the provider whose coder turn uses the
+    grant (for example the Claude implementation coder of a Codex-planned
+    run); its checkout is where the wrapper is verified.  The result is
+    memoized per process and checkout so the permission rule and the prompt
+    line are byte-identical.
+    """
+    from .workdirs import agent_workdir
+
+    selected = agent or config.coder  # type: ignore[attr-defined]
+    root = Path(cwd or agent_workdir(config, selected)).resolve()  # type: ignore[arg-type]
+    key = (str(root), str(getattr(config, "repo", "")))
+    with _CODER_TEST_INVOCATIONS_LOCK:
+        if key in _CODER_TEST_INVOCATIONS:
+            return _CODER_TEST_INVOCATIONS[key]
+    memory_dir = getattr(memory, "memory_dir", None)
+    if memory_dir is None and getattr(config, "agent_memory", False):
+        memory_dir = getattr(config, "agent_memory_dir", None)
+    configured = getattr(config, "test_command", None)
+    command = tuple(configured) if configured else verified_profile_test_command(memory_dir)
+    invocation: str | None = None
+    reason = "no --test-command or verified profile command"
+    if command:
+        prefix = verified_wrapper_prefix(
+            cwd=root, memory_dir=memory_dir, repository=getattr(config, "repo", None)
+        )
+        if prefix is None:
+            reason = "no agent-loop run-tests wrapper candidate verified"
+        else:
+            invocation = render_test_wrapper(command, memory_dir=memory_dir, prefix=prefix)
+    if invocation is None:
+        from .logging import log
+
+        log(
+            config,  # type: ignore[arg-type]
+            "Warning: sandboxed coder test grant omitted "
+            f"({reason}); the coder cannot run tests without approval.",
+        )
+    with _CODER_TEST_INVOCATIONS_LOCK:
+        _CODER_TEST_INVOCATIONS.setdefault(key, invocation)
+        return _CODER_TEST_INVOCATIONS[key]
+
+
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # Only the system ``env`` is trusted to exec the remaining argv unchanged.  A
 # lookalike reached through a caller-controlled PATH or an arbitrary absolute
@@ -2289,6 +2426,94 @@ def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mappi
     return recognized[0] if recognized is not None else None
 
 
+def _direct_launcher_executable(token: str, *, cwd: Path, environment: Mapping[str, str]) -> str:
+    executable = token
+    if not Path(executable).is_absolute() and (token.startswith((".", "~")) or Path(token).parent != Path(".")):
+        executable = str((cwd / Path(token)).resolve(strict=False))
+    elif not Path(executable).is_absolute():
+        executable = shutil.which(executable, path=environment.get("PATH")) or executable
+    return executable
+
+
+# Node options accepted alongside ``--test``.  This is an allow-list because
+# Node has print-and-exit options (``--version``, ``--help``, ``--v8-options``,
+# ``--check``, ``--eval``, ``--run``, ``--experimental-sea-config``, ...) that
+# exit 0 without running a single test.  Options that take a value are only
+# accepted in ``--name=value`` form so a detached value can never hide one.
+_NODE_TEST_RUNNER_FLAGS = frozenset({
+    "--test",
+    "--test-only",
+    "--test-force-exit",
+    "--test-update-snapshots",
+    "--experimental-test-coverage",
+    "--experimental-test-module-mocks",
+    "--experimental-test-snapshots",
+    "--experimental-vm-modules",
+    "--experimental-strip-types",
+    "--experimental-transform-types",
+    "--enable-source-maps",
+    "--trace-warnings",
+    "--trace-uncaught",
+    "--no-warnings",
+    "--no-deprecation",
+})
+_NODE_TEST_RUNNER_VALUE_OPTIONS = frozenset({
+    "--test-reporter",
+    "--test-reporter-destination",
+    "--test-name-pattern",
+    "--test-skip-pattern",
+    "--test-concurrency",
+    "--test-timeout",
+    "--test-shard",
+    "--test-isolation",
+    "--test-coverage-include",
+    "--test-coverage-exclude",
+    "--test-coverage-lines",
+    "--test-coverage-branches",
+    "--test-coverage-functions",
+    "--conditions",
+    "--max-old-space-size",
+})
+# Only Node's built-in reporters: a custom reporter is a module loaded into the
+# runner process.  Startup-code options (``--import``, ``--require``,
+# ``--loader``, ``--test-global-setup``, ``--env-file`` which can set
+# ``NODE_OPTIONS``) are deliberately absent: a preload can exit 0 before any
+# test file runs, and the ``node --version`` probe cannot see that.
+_NODE_BUILTIN_TEST_REPORTERS = frozenset({"spec", "tap", "dot", "junit", "lcov"})
+
+
+def _is_node_test_runner(arguments: Sequence[str]) -> bool:
+    """Return whether ``node`` argv provably runs the built-in test runner.
+
+    ``--test`` must precede the first positional argument (after it, the flag
+    would belong to a script), and every option anywhere in argv must be on
+    the allow-list so no print-and-exit option can turn a zero exit into
+    citable evidence that ran no tests.
+    """
+    selected = False
+    positional_seen = False
+    for argument in arguments:
+        if argument == "--":
+            return False
+        if not argument.startswith("-"):
+            positional_seen = True
+            continue
+        if argument == "--test":
+            if positional_seen:
+                return False
+            selected = True
+            continue
+        name, has_value, value = argument.partition("=")
+        if has_value:
+            if name not in _NODE_TEST_RUNNER_VALUE_OPTIONS or not value:
+                return False
+            if name == "--test-reporter" and value not in _NODE_BUILTIN_TEST_REPORTERS:
+                return False
+        elif argument not in _NODE_TEST_RUNNER_FLAGS:
+            return False
+    return selected
+
+
 def _recognized_inner_probe_tokens(
     tokens: tuple[str, ...], *, cwd: Path, environment: Mapping[str, str]
 ) -> tuple[str, ...] | None:
@@ -2297,12 +2522,17 @@ def _recognized_inner_probe_tokens(
     values = environment
     first = Path(tokens[0]).name
     if first in {"pytest", "py.test"}:
-        executable = tokens[0]
-        if not Path(executable).is_absolute() and (tokens[0].startswith((".", "~")) or Path(tokens[0]).parent != Path(".")):
-            executable = str((cwd / Path(tokens[0])).resolve(strict=False))
-        elif not Path(executable).is_absolute():
-            executable = shutil.which(executable, path=values.get("PATH")) or executable
-        return (executable, "--version")
+        return (_direct_launcher_executable(tokens[0], cwd=cwd, environment=values), "--version")
+    if (
+        first in {"node", "nodejs"}
+        and _is_node_test_runner(tokens[1:])
+        # ``NODE_OPTIONS`` can inject the same preloads the allow-list refuses.
+        and not values.get("NODE_OPTIONS", "").strip()
+    ):
+        # Node's built-in test runner has the same safe bootstrap shape as
+        # pytest: ``node --version`` proves the runtime starts without running
+        # any test file.
+        return (_direct_launcher_executable(tokens[0], cwd=cwd, environment=values), "--version")
     if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
         interpreter = _python_interpreter_path(tokens[0], cwd=cwd, environment=values)
         if interpreter is not None:
@@ -2497,6 +2727,10 @@ def recommend_timeout(
         if stamp is None or stamp < cutoff:
             continue
         if row.get("input_manifest") != current_manifest:
+            continue
+        if not runtime_row_is_evidence(row):
+            # A run refused as evidence (or a legacy row with no launch
+            # state) is not trustworthy timing either (#989).
             continue
         matching.append(row)
     timestamped: list[tuple[datetime, int, dict]] = []

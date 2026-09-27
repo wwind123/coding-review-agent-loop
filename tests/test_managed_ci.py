@@ -3,7 +3,10 @@ import copy
 import json
 import re
 import shlex
+import subprocess
+import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +19,7 @@ from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import (
     PullRequestCheck,
     PullRequestChecks,
+    PullRequestMergeability,
     PullRequestMetadata,
     merge_pr,
 )
@@ -59,6 +63,7 @@ from coding_review_agent_loop.managed_ci import (
     publish_manual_v2_qualification,
     publish_round_readiness,
     release_adopted_managed_ci,
+    release_retained_managed_label,
     revalidate_adopted_managed_ci,
     OrdinaryRecoveryCapability,
     refresh_ordinary_recovery_capability,
@@ -83,9 +88,14 @@ from coding_review_agent_loop.runner import CommandResult
 from coding_review_agent_loop.cli import build_parser
 from coding_review_agent_loop.config import resolve_base_branch
 
-from fixtures.managed_ci import current_router, historical_router, local_router
+from fixtures.managed_ci import current_router, dispatch_validator, historical_router, local_router
 
-from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
+from agent_loop_helpers import (
+    FakeRunner,
+    make_config,
+    structured_coder_followup,
+    structured_pr_review,
+)
 
 
 WORKFLOW = """
@@ -203,9 +213,11 @@ class V2ManagedRunner(ManagedRunner):
         unreadable_issue_events_after_label=False,
         issue_timeline=None,
         compare_payload=None,
+        base_sha="base-sha",
         **kwargs,
     ):
         workflow = kwargs.pop("workflow", V2_WORKFLOW)
+        self.base_sha = base_sha
         super().__init__(workflow=workflow, **kwargs)
         self.rest_pr = {
             "head": {
@@ -354,7 +366,7 @@ class V2ManagedRunner(ManagedRunner):
             return CommandResult(cmd, cwd_path, "", "", 0)
         if endpoint == "repos/OWNER/REPO/commits/main":
             cmd, cwd_path = self._record_command(args, cwd)
-            return CommandResult(cmd, cwd_path, json.dumps({"sha": "base-sha"}), "", 0)
+            return CommandResult(cmd, cwd_path, json.dumps({"sha": self.base_sha}), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, json.dumps(self.intent_comments), "", 0)
@@ -1187,6 +1199,13 @@ def test_continuity_publication_rejects_different_head_fork(tmp_path):
         _round_comment(91, role="coder", subject="head-b", round_number=2),
     ])
     runner.rest_pr["head"]["sha"] = "head-b"
+    # head-a is still in head-b's history, so it is a live sibling rather
+    # than a discarded one (#1069 retires only the latter).
+    runner.compare_payload = {
+        "status": "ahead",
+        "base_commit": {"sha": "head-a"},
+        "merge_base_commit": {"sha": "head-a"},
+    }
     with pytest.raises(AgentLoopError, match="forked predecessor"):
         publish_issue_created_continuity_authorization(
             runner, config=config, handoff=initial, predecessor_head="abc123",
@@ -1421,6 +1440,358 @@ def test_continuity_publication_rejects_a_lone_coder_record_without_the_obligati
             new_head="merged-head",
             round_comment_ids=(61,),
         )
+
+
+# --- #1024: an exact-head CI repair round authorizes continuity on its own ---
+
+
+def _advanced_ci_obligation(*, failed="abc123", candidate="ci-fix-head", round_number=12):
+    """The CI obligation exactly as the orchestrator serializes it after a push."""
+    from coding_review_agent_loop.unresolved_items import (
+        MANAGED_CI_OBLIGATION_KIND,
+        _advance_machine_obligations_for_head,
+        _upsert_machine_obligation,
+    )
+
+    minted = _upsert_machine_obligation(
+        [],
+        item_number=1,
+        kind=MANAGED_CI_OBLIGATION_KIND,
+        source_round=round_number,
+        text="final-ci/exact-head failed.",
+        failed_head_sha=failed,
+    )
+    (advanced,) = _advance_machine_obligations_for_head(minted, current_head_sha=candidate)
+    assert advanced.lifecycle == "awaiting_current_head_review"
+    assert (advanced.failed_head_sha, advanced.candidate_head_sha) == (failed, candidate)
+    return advanced
+
+
+def _ci_repair_round_comment(comment_id, *, subject="ci-fix-head", round_number=13, item=None,
+                             login="agent-loop", actor_id=1):
+    item = item if item is not None else _advanced_ci_obligation(candidate=subject)
+    return {
+        "id": comment_id,
+        "user": {"login": login, "id": actor_id},
+        "body": _attach_round_metadata(
+            "coder round",
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="agent-loop",
+                round_number=round_number, subject=subject,
+                prior_items=(item,),
+            ),
+        ),
+    }
+
+
+def _ci_repair_continuity(comment_id=61, *, predecessor_comment_id=50):
+    return ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="ci-fix-head", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
+        label_event_id=101, predecessor_head="abc123",
+        predecessor_comment_id=predecessor_comment_id, round_comment_ids=(comment_id,),
+    )
+
+
+def test_ci_repair_round_grants_continuity_without_a_reviewer_pair(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.append(_ci_repair_round_comment(61))
+
+    selected = managed_ci.find_actor_round_metadata_comment_ids(
+        runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+        actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+        after_comment_id=50,
+    )
+
+    assert selected == (61,)
+    assert managed_ci._continuity_round_metadata_is_valid(
+        [_ci_repair_round_comment(61)], authorization=_ci_repair_continuity()
+    ) is True
+
+
+def test_ci_repair_round_continuity_grant_reauthenticates_on_resume(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    initial = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+    runner.intent_comments.append(_ci_repair_round_comment(61))
+    runner.rest_pr["head"]["sha"] = "ci-fix-head"
+    continued = publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=initial, predecessor_head="abc123",
+        new_head="ci-fix-head", round_comment_ids=(61,),
+    )
+
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="ci-fix-head",
+    )
+
+    assert continued.authorization_kind == "continuity"
+    assert audit is not None
+    assert audit[0] == continued.authorization_comment_id
+    assert audit[1]["head"] == "ci-fix-head"
+
+
+def _mismatched_ci_items():
+    advanced = _advanced_ci_obligation()
+    return {
+        "failed-head-mismatch": _advanced_ci_obligation(failed="other-head"),
+        "candidate-head-mismatch": replace(advanced, candidate_head_sha="another-head"),
+        "repair-required": replace(advanced, lifecycle="repair_required"),
+        "cleared": replace(advanced, lifecycle="cleared"),
+        "qualification-ready": replace(advanced, lifecycle="qualification_ready"),
+        "unknown-authority": replace(advanced, authority="unknown"),
+        "non-ci-kind": replace(advanced, obligation_kind="alembic-migration"),
+        "resolved-status": replace(advanced, status="resolved"),
+        "future-status": replace(advanced, status="future"),
+    }
+
+
+@pytest.mark.parametrize("case", sorted(_mismatched_ci_items()))
+def test_ci_repair_continuity_refuses_an_unbound_ci_obligation(tmp_path, case):
+    item = _mismatched_ci_items()[case]
+    comment = _ci_repair_round_comment(61, item=item)
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.append(comment)
+
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            after_comment_id=50,
+        )
+    assert managed_ci._continuity_round_metadata_is_valid(
+        [comment], authorization=_ci_repair_continuity()
+    ) is False
+
+
+def test_ci_repair_continuity_refuses_two_coder_records(tmp_path):
+    comments = [_ci_repair_round_comment(61), _ci_repair_round_comment(62)]
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.extend(comments)
+
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            after_comment_id=50,
+        )
+    two = replace(_ci_repair_continuity(), round_comment_ids=(61, 62))
+    assert managed_ci._continuity_round_metadata_is_valid(comments, authorization=two) is False
+
+
+def test_ci_repair_continuity_refuses_a_foreign_actor(tmp_path):
+    comment = _ci_repair_round_comment(61, login="someone-else", actor_id=2)
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.append(comment)
+
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            after_comment_id=50,
+        )
+    assert managed_ci._continuity_round_metadata_is_valid(
+        [comment], authorization=_ci_repair_continuity()
+    ) is False
+
+
+def test_ci_repair_continuity_refuses_a_record_older_than_the_predecessor(tmp_path):
+    comment = _ci_repair_round_comment(41)
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.append(comment)
+
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            after_comment_id=50,
+        )
+    assert managed_ci._continuity_round_metadata_is_valid(
+        [comment], authorization=_ci_repair_continuity(41)
+    ) is False
+
+
+def _authorization_records(runner):
+    return [
+        (comment["id"], record)
+        for comment in runner.intent_comments
+        if (record := parse_issue_created_authorization_comment(comment.get("body", "")))
+        is not None
+    ]
+
+
+def _invalid_ci_repair_publication_cases():
+    cases = {
+        name: [_ci_repair_round_comment(61, item=item)]
+        for name, item in _mismatched_ci_items().items()
+    }
+    cases["foreign-actor"] = [
+        _ci_repair_round_comment(61, login="someone-else", actor_id=2)
+    ]
+    cases["two-coders"] = [_ci_repair_round_comment(61), _ci_repair_round_comment(62)]
+    return cases
+
+
+@pytest.mark.parametrize("case", sorted(_invalid_ci_repair_publication_cases()))
+def test_ci_repair_continuity_publication_writes_nothing_for_an_invalid_record(tmp_path, case):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    initial = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+    comments = _invalid_ci_repair_publication_cases()[case]
+    runner.intent_comments.extend(comments)
+    runner.rest_pr["head"]["sha"] = "ci-fix-head"
+    before = _authorization_records(runner)
+
+    with pytest.raises(AgentLoopError, match="authenticated, correlated round metadata"):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=initial, predecessor_head="abc123",
+            new_head="ci-fix-head",
+            round_comment_ids=tuple(comment["id"] for comment in comments),
+        )
+
+    assert _authorization_records(runner) == before
+    assert [record.kind for _comment_id, record in before] == ["creation"]
+
+
+class _OrchestratorRoundCommentRunner(AuthorizationCommentRunner):
+    """Mirror orchestrator-posted PR comments into the actor's REST comment list.
+
+    The coder round metadata the orchestrator serializes is exactly what the
+    real continuity selection and publication then read back (#1024).
+    """
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(arg) for arg in args]
+        self.rest_pr["head"]["sha"] = self.pr_payload.get("headRefOid", self.rest_pr["head"]["sha"])
+        result = super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+        if cmd[:3] == ["gh", "pr", "comment"]:
+            comment_id = max(
+                (int(item.get("id", 0)) for item in self.intent_comments), default=16
+            ) + 1
+            self.intent_comments.append({
+                "id": comment_id,
+                "user": {"login": self.actor_login, "id": self.actor_id},
+                "body": self.pr_payload["comments"][-1]["body"],
+            })
+        return result
+
+
+def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
+    tmp_path, monkeypatch, capsys,
+):
+    """#1024: approve, CI fails, coder repairs, real continuity, re-approve, merge."""
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=("codex",), auto_merge=True,
+        max_rounds=1, quiet=False,
+    )
+    runner = _OrchestratorRoundCommentRunner(issue_events=[label_event()])
+    runner.pr_payload.update({
+        "headRefName": "agent-loop/managed-643", "headRefOid": "abc123",
+        "baseRefName": "main", "body": runner.rest_pr["body"],
+    })
+    root = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+    runner.codex_outputs = [
+        structured_pr_review(state="approved", summary="Approved."),
+        structured_pr_review(
+            state="approved", summary="Approved after managed CI fix.",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ),
+    ]
+    runner.claude_outputs = [
+        structured_coder_followup(
+            state="blocking", summary="Fixed managed CI.", addressed_items=["item-1"],
+        )
+    ]
+    failed_check = PullRequestCheck(
+        name="final-ci/exact-head", kind="check_run", status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/555",
+    )
+    outcomes = iter([
+        managed_ci.ManagedCiOutcome(
+            status="failed", head_sha="abc123",
+            checks=PullRequestChecks(
+                state="failing", required_checks=("final-ci/exact-head",),
+                passing=(), pending=(), failing=(failed_check,), missing_required=(),
+                branch_protection_status="configured", check_query_status="ok",
+            ),
+        ),
+        managed_ci.ManagedCiOutcome(status="passed", head_sha="abc123-coder-1"),
+    ])
+    qualified_heads = []
+    merges = []
+    handoffs = []
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: root)
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
+    )
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        orchestrator, "dispatch_final_qualification",
+        lambda *_a, **kwargs: qualified_heads.append(kwargs["expected_head_sha"]),
+    )
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
+    )
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
+    real_publish = orchestrator.publish_issue_created_continuity_authorization
+
+    def publish(*args, **kwargs):
+        continued = real_publish(*args, **kwargs)
+        handoffs.append((kwargs, continued))
+        return continued
+
+    monkeypatch.setattr(orchestrator, "publish_issue_created_continuity_authorization", publish)
+
+    assert orchestrator.run_pr_loop(
+        runner, pr_number=7, config=config, managed_ci_handoff=root,
+        managed_ci_issue_number=643,
+    ) == 0
+
+    # The real publisher wrote exactly one continuity grant, bound to the lone
+    # orchestrator-serialized coder record for the A->B transition.
+    records = _authorization_records(runner)
+    assert [record.kind for _comment_id, record in records] == ["creation", "continuity"]
+    grant_id, grant = records[1]
+    assert (grant.predecessor_head, grant.head_sha) == ("abc123", "abc123-coder-1")
+    assert grant.predecessor_comment_id == root.authorization_comment_id
+    assert len(grant.round_comment_ids) == 1
+    coder_comment = next(
+        comment for comment in runner.intent_comments
+        if comment["id"] == grant.round_comment_ids[0]
+    )
+    decoded = managed_ci._continuity_round_records([coder_comment])[0]
+    assert decoded["role"] == "coder"
+    assert decoded["ci_repair_transitions"] == frozenset({("abc123", "abc123-coder-1")})
+    assert handoffs[0][1].authorization_comment_id == grant_id
+    # Resume reauthenticates the same chain.
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123-coder-1",
+    )
+    assert audit is not None and audit[0] == grant_id
+    # Re-review, qualification and merge all target the repaired head only.
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
+    assert qualified_heads == ["abc123", "abc123-coder-1"]
+    assert merges == [{"expected_head_sha": "abc123-coder-1"}]
+    err = capsys.readouterr().err
+    assert "Round 1: Claude repairing failed CI" in err
+    assert "addressing reviewer feedback" not in err
 
 
 def test_round_metadata_selection_requires_current_ordered_transition(tmp_path):
@@ -2166,6 +2537,102 @@ def test_continuity_revalidation_never_uses_terminal_nonce_for_opening_body(
     assert validated.opening_override_nonce == "nonce-643"
 
 
+def _released_label_revalidation(tmp_path, issue_events, *, labels=()):
+    runner = AuthorizationCommentRunner(
+        issue_events=issue_events,
+        rest_pr={"labels": [{"name": name} for name in labels]},
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = replace(
+        _authorization_handoff(),
+        lifecycle="draft-unlabeled-reentry",
+        authorization_kind="creation",
+        opening_override_nonce=None,
+        active_label_event_id=101,
+        authorization_comment_id=42,
+    )
+    return revalidate_issue_created_handoff(
+        runner,
+        config=config,
+        handoff=handoff,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+    )
+
+
+def test_released_label_after_failed_activation_revalidates_for_reentry(tmp_path):
+    # #997: a failed activation removes the label, so the recorded event is
+    # historical rather than active.  That is the documented unlabeled
+    # re-entry state, not a provenance change.
+    validated = _released_label_revalidation(
+        tmp_path, [label_event(101), label_event(102, event="unlabeled")]
+    )
+
+    assert validated.lifecycle == "draft-unlabeled-reentry"
+    assert validated.active_label_event_id == 101
+
+
+@pytest.mark.parametrize(
+    ("applied_id", "login", "actor_id"),
+    [
+        # The recorded event does not exist in the timeline at all.
+        (103, "agent-loop", 1),
+        # The recorded event id was applied by a different actor.
+        (101, "intruder", 9),
+    ],
+)
+def test_released_label_reentry_still_rejects_foreign_label_event(
+    tmp_path, applied_id, login, actor_id
+):
+    issue_events = [
+        label_event(applied_id, login=login, actor_id=actor_id),
+        label_event(applied_id + 1, event="unlabeled"),
+    ]
+    with pytest.raises(AgentLoopError, match="label provenance changed"):
+        _released_label_revalidation(tmp_path, issue_events)
+
+
+def test_released_label_reentry_rejects_relabeled_pr(tmp_path):
+    with pytest.raises(AgentLoopError, match="opening tuple"):
+        _released_label_revalidation(
+            tmp_path, [label_event(101)], labels=(MANAGED_LABEL,)
+        )
+
+
+def test_labeled_revalidation_still_requires_the_active_label_event(tmp_path):
+    runner = AuthorizationCommentRunner(
+        issue_events=[label_event(101), label_event(102, event="unlabeled"), label_event(103)]
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = replace(
+        _authorization_handoff(),
+        lifecycle="draft-labeled",
+        authorization_kind="creation",
+        opening_override_nonce=None,
+        active_label_event_id=101,
+        authorization_comment_id=42,
+    )
+
+    with pytest.raises(AgentLoopError, match="label provenance changed"):
+        revalidate_issue_created_handoff(
+            runner,
+            config=config,
+            handoff=handoff,
+            metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+        )
+
+
 def test_public_pr_missing_authorization_reaches_parser_valid_fresh_remedy(tmp_path):
     recovered_metadata = replace(
         metadata(),
@@ -2232,13 +2699,15 @@ def test_public_pr_missing_authorization_reaches_parser_valid_fresh_remedy(tmp_p
     assert runner.dispatch_count == 0
 
 
-def test_fresh_authorization_rejects_unrelated_replacement_head(tmp_path):
+def test_fresh_authorization_supersedes_grant_on_unrelated_replacement_head(tmp_path):
+    # #1065: a grant GitHub cannot chain to the live head is unbound history;
+    # the explicit fresh grant retires it rather than chaining or refusing.
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
     )
-    authorize_fresh_issue_created_resume(
+    first = authorize_fresh_issue_created_resume(
         runner, config=config, pr_number=7, issue_number=643,
         metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
     )
@@ -2249,13 +2718,18 @@ def test_fresh_authorization_rejects_unrelated_replacement_head(tmp_path):
         "merge_base_commit": {"sha": "other"},
     }
 
-    with pytest.raises(AgentLoopError, match="did not prove.*descendant"):
-        authorize_fresh_issue_created_resume(
-            runner, config=config, pr_number=7, issue_number=643,
-            metadata=replace(
-                metadata(), head_branch="agent-loop/managed-643", head_sha="replacement"
-            ),
-        )
+    replacement = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(
+            metadata(), head_branch="agent-loop/managed-643", head_sha="replacement"
+        ),
+    )
+
+    assert replacement.head_sha == "replacement"
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.predecessor_head is None and record.predecessor_comment_id is None
+    assert record.superseded_comment_ids == (first.authorization_comment_id,)
 
 
 def test_fresh_authorization_rejects_missing_server_issue_association(tmp_path):
@@ -3250,6 +3724,49 @@ def test_override_activation_requires_the_preflight_nonce_and_releases_label_on_
     assert any(
         command[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
         for command, _ in mismatch.commands
+    )
+
+
+def test_source_managed_override_accepts_only_its_source_marker(tmp_path):
+    from coding_review_agent_loop.managed_pr import _compose_body
+
+    nonce = "nonce-from-preflight"
+    body = str(_compose_body(
+        "## Summary\n\nPrepared change.",
+        source_branch="fix/prepared-change",
+        source_sha="a" * 40,
+        override_nonce=nonce,
+    ))
+    source_runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"body": body},
+    )
+    source_config = replace(
+        make_config(
+            tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+            allow_unprotected_managed_ci=True,
+            managed_ci_expected_override_nonce=nonce,
+        ),
+        pr_origin_flow="managed-pr",
+    )
+
+    contract = activate_managed_ci(
+        source_runner, config=source_config, pr_number=7, metadata=metadata()
+    )
+    assert contract is not None
+    assert contract.audit_nonce == nonce
+
+    issue_runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"body": body},
+    )
+    issue_config = replace(source_config, pr_origin_flow="direct-pr")
+    assert activate_managed_ci(
+        issue_runner, config=issue_config, pr_number=7, metadata=metadata()
+    ) is None
+    assert any(
+        command[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for command, _ in issue_runner.commands
     )
 
 
@@ -4457,15 +4974,15 @@ def test_pr_mode_keeps_readable_non_owned_label_event_fail_closed(tmp_path):
 def test_resume_intent_generation_ignores_historical_same_head_ledger_and_run(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     historical = v2_intent_comment(run_id=100, run_attempt=1)
-    contract = v2_contract(intent_generation="fresh-generation")
-    runner = V2ManagedRunner(
+    contract = valid_v2_contract(intent_generation="fresh-generation")
+    runner = valid_v2_runner(
         intent_comments=[historical],
-        workflow_runs=[v2_run(run_id=100)],
+        workflow_runs=[valid_v2_run(run_id=100)],
     )
 
-    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
 
-    assert contract.nonce != "nonce-1"
+    assert contract.nonce != V2_NONCE
     assert contract.attached_run_id is None
     assert any("issues/7/comments" in " ".join(cmd) and "POST" in cmd for cmd, _ in runner.commands)
 
@@ -4475,10 +4992,13 @@ def test_intent_history_malformed_page_fails_closed_instead_of_minting_nonce(tmp
     contract = v2_contract(intent_generation="fresh-generation")
     runner = V2ManagedRunner(intent_comments=[{"id": 17}, "malformed-entry"])
 
-    with pytest.raises(AgentLoopError, match="Unable to inspect managed-CI v2 intent history"):
+    # The workflow fails every nonce on a malformed entry, so a fresh nonce
+    # is never minted while one is present (#1043).
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="malformed comment author"):
         _ensure_v2_intent(
             runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract,
         )
+    assert not any("issues/7/comments" in " ".join(cmd) and "POST" in cmd for cmd, _ in runner.commands)
 
 
 def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, monkeypatch):
@@ -4498,6 +5018,7 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
                 passing=(PullRequestCheck("test", "check_run", "success"),),
                 required=("test",),
             ),
+            mergeability=None,
             head_sha="abc123",
         ),
     )
@@ -4519,6 +5040,77 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
 
     assert any(command[:3] == ["gh", "pr", "ready"] for command, _ in runner.commands)
     assert merged == [(7, "abc123")]
+
+
+@pytest.mark.parametrize(
+    ("after_ready", "expect_merge"),
+    [
+        (["BLOCKED", "CLEAN"], True),
+        (["CLEAN"], True),
+        (["BLOCKED", "BLOCKED", "BLOCKED"], False),
+        (["UNSTABLE", "UNKNOWN", "UNSTABLE"], False),
+    ],
+)
+def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
+    tmp_path, monkeypatch, after_ready, expect_merge,
+):
+    # #1055: a draft reports DRAFT, so under a classic-protection 403 the
+    # recovery qualifies the green draft board, marks it ready, and merges
+    # only once GitHub reports CLEAN for the same exact head.
+    config = make_config(
+        tmp_path, auto_merge=True, ci_poll_interval_seconds=30, ci_startup_timeout_seconds=90,
+    )
+    runner = V2ManagedRunner(issue_events=[])
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
+    )
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: SimpleNamespace(
+            status="passed",
+            checks=checks(
+                passing=(PullRequestCheck("test", "check_run", "success"),),
+                required=(),
+                protection="forbidden",
+            ),
+            mergeability=PullRequestMergeability("mergeable", "MERGEABLE", "DRAFT", "abc123", "main"),
+            head_sha="abc123",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
+    )
+    events: list[str] = []
+    states = list(after_ready)
+
+    def fake_mergeability(*args, **kwargs):
+        assert any(command[:3] == ["gh", "pr", "ready"] for command, _ in runner.commands)
+        events.append("probe")
+        return PullRequestMergeability("mergeable", "MERGEABLE", states.pop(0), "abc123", "main")
+
+    monkeypatch.setattr(orchestrator, "get_pr_mergeability", fake_mergeability)
+    merged: list[tuple[int, str | None]] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda _runner, _config, number, *, expected_head_sha: merged.append((number, expected_head_sha)),
+    )
+
+    if expect_merge:
+        _finalize_ordinary_recovery_merge(runner, config=config, pr_number=7, capability=capability)
+        assert merged == [(7, "abc123")]
+    else:
+        with pytest.raises(AgentLoopError, match="merge state is not CLEAN after readiness"):
+            _finalize_ordinary_recovery_merge(runner, config=config, pr_number=7, capability=capability)
+        assert merged == []
+        # Bounded by the startup window (90s / 30s), not the CI timeout.
+        assert len(events) == 3
+    assert not states
 
 
 def test_fake_runner_models_gh_parser_failure_when_check_is_true(tmp_path):
@@ -4545,7 +5137,23 @@ def test_ordinary_recovery_rejects_green_checks_without_post_release_run(monkeyp
     assert outcome.status == "timeout"
 
 
-def test_ordinary_recovery_forbidden_branch_protection_never_reports_success(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("merge_state", "head", "expected"),
+    [
+        # DRAFT defers the CLEAN check to the finalizer after readiness.
+        ("DRAFT", "abc123", "passed"),
+        # The single poll is also the last one (1s budget, 120s startup
+        # window): a green board that cannot qualify reports the unreadable
+        # protection instead of a generic timeout (late-green deadline).
+        ("DRAFT", "other", "protection_unreadable"),
+        ("BLOCKED", "abc123", "protection_unreadable"),
+        ("CLEAN", "other", "protection_unreadable"),
+        ("CLEAN", "abc123", "passed"),
+    ],
+)
+def test_ordinary_recovery_forbidden_branch_protection_requires_clean_merge_state(
+    monkeypatch, tmp_path, merge_state, head, expected,
+):
     config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
     capability = OrdinaryRecoveryCapability(
         pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
@@ -4556,11 +5164,12 @@ def test_ordinary_recovery_forbidden_branch_protection_never_reports_success(mon
         required=("test",),
         protection="forbidden",
     )
+    mergeability = PullRequestMergeability("mergeable", "MERGEABLE", merge_state, head, "main")
     monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
     monkeypatch.setattr(
         managed_ci,
         "get_pr_mergeability",
-        lambda *args, **kwargs: type("M", (), {"state": "mergeable"})(),
+        lambda *args, **kwargs: mergeability,
     )
     monkeypatch.setattr(
         managed_ci,
@@ -4573,7 +5182,133 @@ def test_ordinary_recovery_forbidden_branch_protection_never_reports_success(mon
         runner=FakeRunner(), config=config, capability=capability, metadata=metadata(),
     )
 
-    assert outcome.status == "timeout"
+    assert outcome.status == expected
+    assert outcome.mergeability == mergeability
+
+
+@pytest.mark.parametrize(
+    "mergeability",
+    [
+        PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "abc123", "main"),
+        PullRequestMergeability("unknown", None, None, None, None),
+        PullRequestMergeability("mergeable", "MERGEABLE", "BLOCKED", "abc123", "main"),
+    ],
+)
+def test_ordinary_recovery_unqualifiable_merge_state_stops_within_startup_window(
+    monkeypatch, tmp_path, mergeability,
+):
+    # #1055 review: a green board under unreadable protection whose merge
+    # state is neither same-head DRAFT nor CLEAN must not poll to the timeout.
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1200, ci_poll_interval_seconds=30,
+        ci_startup_timeout_seconds=60,
+    )
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100, prior_run_ids=frozenset(),
+    )
+    passing = checks(
+        passing=(PullRequestCheck("test", "check_run", "success"),),
+        required=("test",),
+        protection="forbidden",
+    )
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: mergeability)
+    monkeypatch.setattr(
+        managed_ci,
+        "_workflow_runs_payload",
+        lambda *args, **kwargs: [{"id": 3, "status": "completed", "conclusion": "success"}],
+    )
+    probes: list[int] = []
+    monkeypatch.setattr(
+        managed_ci, "get_pr_checks", lambda *args, **kwargs: probes.append(1) or passing,
+    )
+    runner = FakeRunner()
+
+    outcome = wait_for_ordinary_recovery(
+        runner=runner, config=config, capability=capability, metadata=metadata(),
+    )
+
+    assert outcome.status == "protection_unreadable"
+    assert outcome.mergeability == mergeability
+    assert len(probes) == 2
+    assert len([cmd for cmd, _ in runner.commands if cmd[:1] == ["sleep"]]) == 1
+
+
+def test_ordinary_recovery_late_green_board_at_deadline_reports_unreadable_protection(
+    monkeypatch, tmp_path,
+):
+    # The board turns green only on the final poll, with fewer polls left
+    # than the startup window; the deadline must still name the cause.
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=90, ci_poll_interval_seconds=30,
+        ci_startup_timeout_seconds=300,
+    )
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100, prior_run_ids=frozenset(),
+    )
+    success = PullRequestCheck("test", "check_run", "success")
+    boards = [
+        checks(pending=(PullRequestCheck("test", "check_run", "in_progress"),), protection="forbidden"),
+        checks(pending=(PullRequestCheck("test", "check_run", "in_progress"),), protection="forbidden"),
+        checks(passing=(success,), required=("test",), protection="forbidden"),
+    ]
+    runs = [
+        [{"id": 3, "status": "in_progress"}],
+        [{"id": 3, "status": "in_progress"}],
+        [{"id": 3, "status": "completed", "conclusion": "success"}],
+    ]
+    blocked = PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "abc123", "main")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: blocked)
+    monkeypatch.setattr(managed_ci, "_workflow_runs_payload", lambda *args, **kwargs: runs.pop(0))
+    monkeypatch.setattr(managed_ci, "get_pr_checks", lambda *args, **kwargs: boards.pop(0))
+
+    outcome = wait_for_ordinary_recovery(
+        runner=FakeRunner(), config=config, capability=capability, metadata=metadata(),
+    )
+
+    assert outcome.status == "protection_unreadable"
+    assert outcome.mergeability == blocked
+    assert not boards
+
+
+def test_ordinary_fallback_protection_unreadable_stops_with_guidance(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path, auto_merge=True)
+    runner = V2ManagedRunner(issue_events=[])
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
+    )
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: SimpleNamespace(
+            status="protection_unreadable",
+            checks=checks(
+                passing=(PullRequestCheck("test", "check_run", "success"),),
+                protection="forbidden",
+            ),
+            mergeability=PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "abc123", "main"),
+            head_sha="abc123",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
+    )
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("must not merge"))
+
+    with pytest.raises(AgentLoopError, match="branch protection is unreadable"):
+        _finalize_ordinary_recovery_merge(runner, config=config, pr_number=7, capability=capability)
+
+    out = capsys.readouterr().out
+    assert "HTTP 403" in out
+    assert "merge state UNKNOWN" in out
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _ in runner.commands)
 
 
 def test_ordinary_recovery_accepts_current_head_run_without_local_clock_filter(monkeypatch, tmp_path):
@@ -4637,7 +5372,16 @@ def v2_contract(**overrides):
     return ManagedCiContract(**fields)
 
 
-def test_publish_manual_v2_qualification_releases_label_readies_and_audits_sha(tmp_path):
+MANAGED_LABEL_DELETE = [
+    "gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+]
+
+
+def _managed_label_deletes(runner):
+    return [command for command, _cwd in runner.commands if command[:5] == MANAGED_LABEL_DELETE]
+
+
+def test_publish_manual_v2_qualification_retains_label_readies_and_audits_sha(tmp_path):
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
     )
@@ -4663,15 +5407,24 @@ def test_publish_manual_v2_qualification_releases_label_readies_and_audits_sha(t
 
     assert qualified == "abc123"
     commands = [command for command, _cwd in runner.commands]
-    release_index = next(
+    # Retaining the label means no `unlabeled` event re-runs ordinary CI.
+    assert _managed_label_deletes(runner) == []
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+    assert runner.rest_pr["draft"] is False
+    event_reads = [
         index for index, command in enumerate(commands)
-        if command[:5] == [
-            "gh", "api", "--method", "DELETE",
-            f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
-        ]
-    )
+        if any(part.startswith("repos/OWNER/REPO/issues/7/events?") for part in command)
+    ]
     ready_index = next(index for index, command in enumerate(commands) if command[:4] == ["gh", "pr", "ready", "7"])
-    assert release_index < ready_index
+    audit_index = next(
+        index for index, command in enumerate(commands) if QUALIFICATION_MARKER in " ".join(command)
+    )
+    # Provenance is verified before readiness and again before the record.
+    assert len(event_reads) == 2
+    assert event_reads[0] < ready_index < event_reads[1] < audit_index
+    audit_body = next(iter(runner.audit_comments.values()))["body"]
+    assert "The managed label is retained so ordinary CI does not re-run" in audit_body
+    assert "was released" not in audit_body
     assert not any(
         command[:5] == [
             "gh", "api", "--method", "POST",
@@ -4730,7 +5483,10 @@ def test_publish_manual_v2_qualification_rejects_head_change_before_release(tmp_
         )
 
     assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
-    assert not any(command[:4] == ["gh", "api", "--method", "DELETE"] for command, _cwd in runner.commands)
+    assert not any(QUALIFICATION_MARKER in " ".join(command) for command, _cwd in runner.commands)
+    # A failed publication returns the owned label to ordinary CI.
+    assert len(_managed_label_deletes(runner)) == 1
+    assert runner.rest_pr["labels"] == []
 
 
 def test_publish_manual_v2_qualification_rejects_head_change_after_audit(tmp_path, monkeypatch):
@@ -4755,6 +5511,501 @@ def test_publish_manual_v2_qualification_rejects_head_change_after_audit(tmp_pat
 
     assert any(QUALIFICATION_MARKER in " ".join(command) for command, _cwd in runner.commands)
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+    # The final head check runs after the record on a ready PR; the owned
+    # label is still released so the drifted head gets ordinary CI.
+    assert len(_managed_label_deletes(runner)) == 1
+    assert runner.rest_pr["draft"] is False
+
+
+class PublicationRunner(ManualQualificationRunner):
+    """Script per-read PR/event responses and label DELETE outcomes.
+
+    ``pr_overrides`` and ``event_overrides`` map a zero-based read index to
+    either raw stdout (``str``), a ``(stdout, returncode)`` tuple, or a
+    callable taking the current payload and returning a replacement payload.
+    ``foreign_event_before_read`` replaces the active label event with one
+    applied by another actor before the given events read.
+    """
+
+    def __init__(
+        self,
+        *,
+        pr_overrides=None,
+        event_overrides=None,
+        delete_outcome=None,
+        ready_returncode=0,
+        foreign_event_before_read=None,
+        **kwargs,
+    ):
+        kwargs.setdefault("issue_events", [label_event()])
+        super().__init__(**kwargs)
+        self.pr_overrides = dict(pr_overrides or {})
+        self.event_overrides = dict(event_overrides or {})
+        self.delete_outcome = delete_outcome
+        self.ready_returncode = ready_returncode
+        self.foreign_event_before_read = foreign_event_before_read
+        self.pr_reads = 0
+        self.event_reads = 0
+
+    @staticmethod
+    def _scripted(override, payload):
+        if callable(override):
+            return json.dumps(override(copy.deepcopy(payload))), 0
+        if isinstance(override, tuple):
+            return override
+        return override, 0
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(arg) for arg in args]
+        endpoint = next((part for part in cmd if part.startswith("repos/")), "")
+        if cmd == ["gh", "api", "repos/OWNER/REPO/pulls/7"]:
+            index = self.pr_reads
+            self.pr_reads += 1
+            if index in self.pr_overrides:
+                cmd, cwd_path = self._record_command(args, cwd)
+                stdout, returncode = self._scripted(self.pr_overrides[index], self.rest_pr)
+                return CommandResult(cmd, cwd_path, stdout, "", returncode)
+        if endpoint.startswith("repos/OWNER/REPO/issues/7/events?"):
+            index = self.event_reads
+            self.event_reads += 1
+            if self.foreign_event_before_read == index:
+                self.issue_events.append(label_event(event="unlabeled"))
+                self.issue_events.append(label_event(202, login="someone-else", actor_id=9))
+            if index in self.event_overrides:
+                cmd, cwd_path = self._record_command(args, cwd)
+                stdout, returncode = self._scripted(self.event_overrides[index], self.issue_events)
+                return CommandResult(cmd, cwd_path, stdout, "", returncode)
+        if cmd[:5] == MANAGED_LABEL_DELETE and self.delete_outcome is not None:
+            if self.delete_outcome == "raise":
+                self._record_command(args, cwd)
+                raise RuntimeError("transport exploded")
+            cmd, cwd_path = self._record_command(args, cwd)
+            stderr, returncode = self.delete_outcome
+            if "404" in stderr:
+                self.rest_pr["labels"] = []
+            return CommandResult(cmd, cwd_path, "", stderr, returncode)
+        if cmd[:3] == ["gh", "pr", "ready"] and self.ready_returncode:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, "", "ready failed", self.ready_returncode)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def _publish(runner, tmp_path, **contract_overrides):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    fields = {
+        "issue_created_pr": True,
+        "active_label_event_id": 101,
+        "invocation_applied_label": True,
+        "protection_mode": "strict",
+    }
+    fields.update(contract_overrides)
+    contract = v2_contract(**fields)
+    return publish_manual_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123",
+        contract=contract, reviewers=("Codex",),
+    ), contract
+
+
+def _audit_posted(runner):
+    return any(QUALIFICATION_MARKER in " ".join(command) for command, _cwd in runner.commands)
+
+
+def _without_draft(payload):
+    payload.pop("draft", None)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "draft_value",
+    [True, "missing", None, "false", 0],
+    ids=["true", "missing", "none", "string", "zero"],
+)
+@pytest.mark.parametrize("stage", ["initial-guard", "pre-record-reread"])
+def test_publish_manual_rejects_adopted_pr_whose_draft_is_not_exactly_false(
+    tmp_path, draft_value, stage,
+):
+    def with_draft(payload):
+        if draft_value == "missing":
+            payload.pop("draft", None)
+        else:
+            payload["draft"] = draft_value
+        return payload
+
+    # PR reads: 0 stale-label cleanup, 1 initial guard, 2 pre-record re-read.
+    runner = PublicationRunner(
+        rest_pr={"draft": False},
+        pr_overrides={1 if stage == "initial-guard" else 2: with_draft},
+    )
+
+    with pytest.raises(AgentLoopError, match="changed before manual qualification publication"):
+        _publish(runner, tmp_path, issue_created_pr=False, adopted_existing_pr=True)
+
+    assert not _audit_posted(runner)
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+    # The owned label is released so the unproven PR returns to ordinary CI.
+    assert len(_managed_label_deletes(runner)) == 1
+
+
+def test_publish_manual_adopted_ready_pr_retains_label_without_readying(tmp_path):
+    runner = PublicationRunner(rest_pr={"draft": False})
+
+    qualified, _contract = _publish(runner, tmp_path, issue_created_pr=False, adopted_existing_pr=True)
+
+    assert qualified == "abc123"
+    assert _managed_label_deletes(runner) == []
+    assert runner.event_reads == 2
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("state", ["draft", "ready"])
+def test_publish_manual_unreadable_provenance_releases_label_fail_open(tmp_path, state):
+    # Event read 0 is the pre-readiness check (draft PR); read 1 is the
+    # pre-record check (ready PR).  Cleanup's own read (next index) also fails.
+    failing = 0 if state == "draft" else 1
+    runner = PublicationRunner(
+        event_overrides={failing: ("", 1), failing + 1: ("", 1)},
+    )
+
+    with pytest.raises(AgentLoopError, match="the head is not qualified") as raised:
+        _publish(runner, tmp_path)
+
+    assert not _audit_posted(runner)
+    assert len(_managed_label_deletes(runner)) == 1
+    assert runner.rest_pr["labels"] == []
+    assert runner.rest_pr["draft"] is (state == "draft")
+    assert "remove it manually" not in str(raised.value)
+
+
+@pytest.mark.parametrize("before_read", [0, 1], ids=["before-readiness", "before-record"])
+def test_publish_manual_replaced_label_event_fails_closed_and_is_left(tmp_path, before_read):
+    runner = PublicationRunner(foreign_event_before_read=before_read)
+
+    with pytest.raises(AgentLoopError, match="provenance changed") as raised:
+        _publish(runner, tmp_path)
+
+    assert not _audit_posted(runner)
+    assert _managed_label_deletes(runner) == []
+    assert "different `agent-loop-managed` label event is active" in str(raised.value)
+    assert type(raised.value) is AgentLoopError
+
+
+def test_publish_manual_readiness_failure_releases_owned_label(tmp_path):
+    runner = PublicationRunner(ready_returncode=1)
+
+    with pytest.raises(AgentLoopError, match="Unable to mark qualified PR #7 ready"):
+        _publish(runner, tmp_path)
+
+    assert runner.rest_pr["draft"] is True
+    assert len(_managed_label_deletes(runner)) == 1
+    assert not _audit_posted(runner)
+
+
+def test_publish_manual_post_ready_verification_failure_releases_owned_label(tmp_path):
+    # PR read 2 follows `gh pr ready`; a drifted head there fails verification.
+    def drifted(payload):
+        payload["head"] = dict(payload["head"], sha="other")
+        return payload
+
+    runner = PublicationRunner(pr_overrides={2: drifted})
+
+    with pytest.raises(AgentLoopError, match="changed while being made ready"):
+        _publish(runner, tmp_path)
+
+    assert len(_managed_label_deletes(runner)) == 1
+    assert not _audit_posted(runner)
+
+
+def test_publish_manual_record_failure_releases_owned_label(tmp_path, monkeypatch):
+    def failed_post(*args, **kwargs):
+        raise AgentLoopError("record write failed")
+
+    monkeypatch.setattr(managed_ci, "post_verified_trusted_pr_protocol_comment", failed_post)
+    runner = PublicationRunner()
+
+    with pytest.raises(AgentLoopError, match="record write failed"):
+        _publish(runner, tmp_path)
+
+    assert runner.rest_pr["draft"] is False
+    assert len(_managed_label_deletes(runner)) == 1
+
+
+def test_publish_manual_cleanup_confirmed_absent_label_makes_no_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    runner = PublicationRunner(rest_pr={"labels": [{"name": "bug"}]})
+
+    with pytest.raises(AgentLoopError, match="head changed before"):
+        _publish(runner, tmp_path)
+
+    assert _managed_label_deletes(runner) == []
+    assert runner.event_reads == 0
+
+
+@pytest.mark.parametrize(
+    "pr_read",
+    [
+        ("", 1),
+        ("", 0),
+        ("not json", 0),
+        ("[]", 0),
+        ("{}", 0),
+        (json.dumps({"labels": "agent-loop-managed"}), 0),
+        (json.dumps({"labels": [{"id": 3}]}), 0),
+        (json.dumps({"labels": ["agent-loop-managed"]}), 0),
+    ],
+    ids=[
+        "nonzero-exit", "empty-body", "invalid-json", "non-object", "missing-labels",
+        "non-list-labels", "entry-without-name", "string-entry",
+    ],
+)
+@pytest.mark.parametrize(
+    "delete_outcome,expect_fragment",
+    [(None, False), (("gh: Not Found (HTTP 404)", 1), False)],
+    ids=["deleted", "already-absent-404"],
+)
+def test_publish_manual_cleanup_unreadable_pr_attempts_delete(
+    tmp_path, monkeypatch, pr_read, delete_outcome, expect_fragment,
+):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    runner = PublicationRunner(pr_overrides={0: pr_read}, delete_outcome=delete_outcome)
+
+    with pytest.raises(AgentLoopError, match="head changed before") as raised:
+        _publish(runner, tmp_path)
+
+    assert len(_managed_label_deletes(runner)) == 1
+    assert ("remove it manually" in str(raised.value)) is expect_fragment
+
+
+def test_publish_manual_cleanup_never_masks_the_publication_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    # Invalid events JSON is unreadable provenance (fail-open DELETE), and the
+    # DELETE itself raises: the helper swallows both.
+    runner = PublicationRunner(event_overrides={0: "not json"}, delete_outcome="raise")
+
+    with pytest.raises(AgentLoopError) as raised:
+        _publish(runner, tmp_path)
+
+    assert type(raised.value) is AgentLoopError
+    message = str(raised.value)
+    assert message.startswith("PR #7 head changed before manual qualification publication")
+    assert "`agent-loop-managed` could not be removed and still suppresses ordinary CI" in message
+
+
+def test_publish_manual_cleanup_attaches_note_to_non_agent_loop_error(tmp_path, monkeypatch):
+    def exploding(*args, **kwargs):
+        raise KeyError("boom")
+
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", exploding)
+    runner = PublicationRunner(delete_outcome=("gh: Server Error (HTTP 500)", 1))
+
+    with pytest.raises(KeyError) as raised:
+        _publish(runner, tmp_path)
+
+    assert any("remove it manually" in note for note in raised.value.__notes__)
+
+
+def test_publish_manual_non_404_delete_failure_reports_manual_removal(tmp_path, monkeypatch):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    runner = PublicationRunner(delete_outcome=("gh: Server Error (HTTP 500)", 1))
+
+    with pytest.raises(AgentLoopError, match="remove it manually"):
+        _publish(runner, tmp_path)
+
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+
+
+class EntryNormalizationRunner(FakeRunner):
+    """Serve the live PR for entry normalization from a mutable payload."""
+
+    def __init__(
+        self, live_pr, *, delete_returncode=0, readback_labels=None, delete_stderr=None,
+        raise_on=None, clear_on_failed_delete=False, **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.clear_on_failed_delete = clear_on_failed_delete
+        self.live_pr = live_pr
+        self.delete_returncode = delete_returncode
+        self.readback_labels = readback_labels
+        self.delete_stderr = delete_stderr or "gh: Server Error (HTTP 500)"
+        # ``raise_on`` is "delete" or "readback": that runner call raises, as a
+        # transport or subprocess failure would.
+        self.raise_on = raise_on
+        self.pr_reads = 0
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(arg) for arg in args]
+        if cmd == ["gh", "api", "repos/OWNER/REPO/pulls/7"]:
+            cmd, cwd_path = self._record_command(args, cwd)
+            self.pr_reads += 1
+            if self.raise_on == "readback" and self.pr_reads == 2:
+                raise OSError("transport exploded during read-back")
+            if isinstance(self.live_pr, str):
+                return CommandResult(cmd, cwd_path, self.live_pr, "", 0)
+            return CommandResult(cmd, cwd_path, json.dumps(self.live_pr), "", 0)
+        if cmd[:5] == MANAGED_LABEL_DELETE:
+            cmd, cwd_path = self._record_command(args, cwd)
+            if self.raise_on == "delete":
+                raise OSError("transport exploded during DELETE")
+            if self.delete_returncode:
+                if self.clear_on_failed_delete:
+                    self.live_pr["labels"] = []
+                return CommandResult(cmd, cwd_path, "", self.delete_stderr, 1)
+            self.live_pr["labels"] = (
+                self.readback_labels if self.readback_labels is not None else [
+                    item for item in self.live_pr["labels"] if item.get("name") != MANAGED_LABEL
+                ]
+            )
+            return CommandResult(cmd, cwd_path, "", "", 0)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def _live_pr(*, state="open", draft=False, labels=(MANAGED_LABEL,)):
+    return {"state": state, "draft": draft, "labels": [{"name": name} for name in labels]}
+
+
+def test_release_retained_managed_label_releases_open_ready_labeled_pr(tmp_path):
+    runner = EntryNormalizationRunner(_live_pr(labels=(MANAGED_LABEL, "bug")))
+    config = make_config(tmp_path)
+
+    assert release_retained_managed_label(runner, config=config, pr_number=7, cwd=tmp_path) is True
+
+    assert len(_managed_label_deletes(runner)) == 1
+    assert runner.live_pr["labels"] == [{"name": "bug"}]
+    # Every command (read, DELETE, read-back) runs in the supplied cwd.
+    assert {cwd for _command, cwd in runner.commands} == {tmp_path}
+
+
+def test_entry_release_logs_operator_label_on_adopted_ready_pr(tmp_path, capsys):
+    live_pr = _live_pr()
+    live_pr["head"] = {"ref": "feature/operator-change"}
+    runner = EntryNormalizationRunner(live_pr)
+
+    assert release_retained_managed_label(
+        runner, config=make_config(tmp_path, quiet=False), pr_number=7, cwd=tmp_path,
+    ) is True
+
+    diagnostic = capsys.readouterr().err
+    assert "PR #7: removed `agent-loop-managed` from the ready PR at entry" in diagnostic
+    assert "label origin was not checked" in diagnostic
+    assert "ordinary CI resumes" in diagnostic
+    assert len(_managed_label_deletes(runner)) == 1
+    assert not any("events" in part for command, _cwd in runner.commands for part in command)
+
+
+@pytest.mark.parametrize(
+    "live_pr",
+    [
+        _live_pr(draft=True),
+        _live_pr(draft=True, labels=()),
+        _live_pr(labels=()),
+        _live_pr(state="closed"),
+        _live_pr(draft=None),
+        {"state": "open", "draft": False},
+        {"state": "open", "draft": False, "labels": "agent-loop-managed"},
+        "not json",
+        "",
+    ],
+    ids=[
+        "draft-labeled", "draft-unlabeled", "ready-unlabeled", "closed", "draft-none",
+        "missing-labels", "malformed-labels", "invalid-json", "empty",
+    ],
+)
+def test_release_retained_managed_label_leaves_other_states_untouched(tmp_path, live_pr, capsys):
+    runner = EntryNormalizationRunner(live_pr)
+
+    assert release_retained_managed_label(
+        runner, config=make_config(tmp_path, quiet=False), pr_number=7, cwd=tmp_path,
+    ) is False
+
+    assert _managed_label_deletes(runner) == []
+    assert len(runner.commands) == 1
+    assert "removed `agent-loop-managed`" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure", ["delete", "readback"])
+def test_release_retained_managed_label_failure_names_manual_remedy(tmp_path, failure):
+    runner = EntryNormalizationRunner(
+        _live_pr(),
+        delete_returncode=1 if failure == "delete" else 0,
+        readback_labels=[{"name": MANAGED_LABEL}] if failure == "readback" else None,
+    )
+
+    with pytest.raises(AgentLoopError, match="Remove the label manually, then rerun"):
+        release_retained_managed_label(
+            runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("raise_on", ["delete", "readback"])
+def test_release_retained_managed_label_runner_exception_names_manual_remedy(tmp_path, raise_on):
+    runner = EntryNormalizationRunner(_live_pr(), raise_on=raise_on)
+
+    with pytest.raises(AgentLoopError, match="Remove the label manually, then rerun") as raised:
+        release_retained_managed_label(
+            runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+        )
+
+    assert type(raised.value) is AgentLoopError
+    assert isinstance(raised.value.__cause__, OSError)
+    assert len(_managed_label_deletes(runner)) == 1
+    if raise_on == "readback":
+        # The DELETE succeeded but absence was never confirmed, so the run
+        # still stops rather than assuming the label is gone.
+        assert runner.live_pr["labels"] == []
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Forbidden (HTTP 403)\nupstream said HTTP 404 earlier\n",
+        "gh: Not Found (HTTP 404)\ngh: Forbidden (HTTP 403)\n",
+        "error: HTTP 404 mentioned mid-line (HTTP 403)\n",
+        "HTTP 404: Not Found",
+    ],
+    ids=["incidental-404-text", "conflicting-statuses", "mid-line-404", "unstructured-404"],
+)
+def test_release_retained_managed_label_ambiguous_404_is_not_absence(tmp_path, stderr):
+    runner = EntryNormalizationRunner(_live_pr(), delete_returncode=1, delete_stderr=stderr)
+
+    with pytest.raises(AgentLoopError, match="Remove the label manually, then rerun"):
+        release_retained_managed_label(
+            runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+        )
+
+    assert runner.live_pr["labels"] == [{"name": MANAGED_LABEL}]
+
+
+def test_release_retained_managed_label_strict_404_counts_as_absent(tmp_path):
+    # Someone else removed the label between the read and the DELETE: gh's
+    # strict 404 diagnostic is absence, and the read-back confirms it.
+    runner = EntryNormalizationRunner(
+        _live_pr(), delete_returncode=1, delete_stderr="gh: Not Found (HTTP 404)\n",
+        clear_on_failed_delete=True,
+    )
+
+    assert release_retained_managed_label(
+        runner, config=make_config(tmp_path), pr_number=7, cwd=tmp_path,
+    ) is True
+    assert runner.live_pr["labels"] == []
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Forbidden (HTTP 403)\nupstream said HTTP 404 earlier\n",
+        "gh: Not Found (HTTP 404)\ngh: Forbidden (HTTP 403)\n",
+        "HTTP 404: Not Found",
+    ],
+    ids=["incidental-404-text", "conflicting-statuses", "unstructured-404"],
+)
+def test_publish_manual_cleanup_ambiguous_404_reports_manual_removal(tmp_path, monkeypatch, stderr):
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    runner = PublicationRunner(delete_outcome=(stderr, 1))
+    # The scripted DELETE clears labels for any "404" text; an ambiguous
+    # diagnostic must still be reported as a failed removal.
+    with pytest.raises(AgentLoopError, match="remove it manually"):
+        _publish(runner, tmp_path)
+
+    assert len(_managed_label_deletes(runner)) == 1
 
 
 def v2_run(
@@ -4781,38 +6032,77 @@ def v2_run(
     }
 
 
-def v2_intent_comment(
-    *, nonce="nonce-1", run_id=None, run_attempt=None, state=None,
+# Workflow-valid identities for seeded intent ledgers.  Rediscovery adopts
+# only a record the base workflow would accept (#1043), so a seeded record
+# carries 40-hex SHAs, a 32-character nonce, and the full key set.
+V2_HEAD = "abc123" + "0" * 34
+V2_REVISION = "ba5e" + "0" * 36
+V2_NONCE = "nonce-1" + "x" * 25
+V2_GENERATION = "generation-1"
+
+
+def v2_intent_payload(
+    *, nonce=V2_NONCE, run_id=None, run_attempt=None, state=None,
     terminal_run_id=None, terminal_run_attempt=None,
-    terminal_attempts=None, terminal_outcome=None,
+    terminal_attempts=None, terminal_outcome=None, created_at=1,
+    generation=V2_GENERATION, expected_head_sha=V2_HEAD,
 ):
-    payload = {
+    if state is None:
+        state = "attached" if run_id is not None else "dispatch-requested"
+    return {
+        "version": 2,
         "repository": "OWNER/REPO",
         "pr": 7,
-        "expected_head_sha": "abc123",
+        "expected_head_sha": expected_head_sha,
+        "base_ref": "main",
+        "workflow_revision": V2_REVISION,
+        "generation": generation,
         "nonce": nonce,
-        "created_at": 1,
+        "created_at": created_at,
+        "state": state,
         "run_id": run_id,
         "run_attempt": run_attempt,
+        "terminal_run_id": terminal_run_id,
+        "terminal_run_attempt": terminal_run_attempt,
+        "terminal_outcome": terminal_outcome,
+        "terminal_attempts": [
+            {"run_id": item_id, "run_attempt": attempt}
+            for item_id, attempt in (terminal_attempts or ())
+        ],
     }
-    if state is not None:
-        payload["state"] = state
-    if terminal_run_id is not None:
-        payload["terminal_run_id"] = terminal_run_id
-    if terminal_run_attempt is not None:
-        payload["terminal_run_attempt"] = terminal_run_attempt
-    if terminal_outcome is not None:
-        payload["terminal_outcome"] = terminal_outcome
-    if terminal_attempts is not None:
-        payload["terminal_attempts"] = [
-            {"run_id": run_id, "run_attempt": attempt}
-            for run_id, attempt in terminal_attempts
-        ]
+
+
+def v2_intent_comment(*, comment_id=17, suffix="", **fields):
+    payload = v2_intent_payload(**fields)
     return {
-        "id": 17,
+        "id": comment_id,
         "user": {"login": "agent-loop", "id": 1},
-        "body": f"<!-- AGENT_MANAGED_CI_INTENT_V2 {json.dumps(payload)} -->",
+        "body": f"<!-- AGENT_MANAGED_CI_INTENT_V2 {json.dumps(payload)} -->{suffix}",
     }
+
+
+def valid_v2_contract(**overrides):
+    """A same-generation contract whose ledger the workflow would accept."""
+    fields = {
+        "workflow_revision": V2_REVISION,
+        "nonce": V2_NONCE,
+        "intent_generation": V2_GENERATION,
+    }
+    fields.update(overrides)
+    return v2_contract(**fields)
+
+
+def valid_v2_runner(**kwargs):
+    kwargs.setdefault("base_sha", V2_REVISION)
+    kwargs.setdefault("pr_payload", {"headRefOid": V2_HEAD})
+    return V2ManagedRunner(**kwargs)
+
+
+def valid_v2_run(**kwargs):
+    kwargs.setdefault("name", f"managed-ci-v2 nonce={V2_NONCE}")
+    run = v2_run(**kwargs)
+    run["head_sha"] = V2_REVISION
+    return run
 
 
 def checks(
@@ -4966,7 +6256,7 @@ def test_publish_round_readiness_posts_success_status(tmp_path):
     config = make_config(tmp_path, auto_merge=True)
     runner = FakeRunner()
 
-    publish_round_readiness(runner, config=config, head_sha="abc123")
+    assert publish_round_readiness(runner, config=config, head_sha="abc123") is True
 
     assert runner.commands[-1][0] == [
         "gh",
@@ -5297,20 +6587,20 @@ def test_v2_cancelled_run_during_candidate_jobs_stops_without_publishing_status(
 
 def test_v2_terminal_exclusion_does_not_attach_stale_cancelled_run(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
+    runner = valid_v2_runner(
         workflow_runs=[
-            v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
-            v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
+            valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
+            valid_v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
         ],
         intent_comments=[v2_intent_comment(
-            run_id=100, run_attempt=1, state="terminal-no-status",
-            terminal_run_id=100, terminal_run_attempt=1,
+            run_id=100, run_attempt=1, state="completed", terminal_outcome="no-status",
+            terminal_run_id=100, terminal_run_attempt=1, terminal_attempts=((100, 1),),
         )],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
@@ -5320,17 +6610,17 @@ def test_v2_terminal_exclusion_does_not_attach_stale_cancelled_run(tmp_path):
 
 def test_v2_terminal_ledger_clears_old_attachment_before_fresh_dispatch(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
-        workflow_runs=[v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled")],
+    runner = valid_v2_runner(
+        workflow_runs=[valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled")],
         intent_comments=[v2_intent_comment(
-            run_id=100, run_attempt=1, state="terminal-no-status",
-            terminal_run_id=100, terminal_run_attempt=1,
+            run_id=100, run_attempt=1, state="completed", terminal_outcome="no-status",
+            terminal_run_id=100, terminal_run_attempt=1, terminal_attempts=((100, 1),),
         )],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert contract.attached_run_id is None
@@ -5340,22 +6630,22 @@ def test_v2_terminal_ledger_clears_old_attachment_before_fresh_dispatch(tmp_path
 
 def test_v2_terminal_ledger_excludes_all_prior_cancelled_attempts(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
+    runner = valid_v2_runner(
         workflow_runs=[
-            v2_run(run_id=100, attempt=2, status="completed", conclusion="cancelled"),
-            v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
-            v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
+            valid_v2_run(run_id=100, attempt=2, status="completed", conclusion="cancelled"),
+            valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
+            valid_v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
         ],
         intent_comments=[v2_intent_comment(
-            run_id=100, run_attempt=2, state="terminal-no-status",
+            run_id=100, run_attempt=2, state="completed", terminal_outcome="no-status",
             terminal_run_id=100, terminal_run_attempt=2,
             terminal_attempts=((100, 1), (100, 2)),
         )],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
@@ -5364,31 +6654,32 @@ def test_v2_terminal_ledger_excludes_all_prior_cancelled_attempts(tmp_path):
 
 def test_v2_later_legitimate_rerun_attempt_is_accepted_after_terminal_stop(tmp_path):
     config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
-    runner = V2ManagedRunner(
+    runner = valid_v2_runner(
         workflow_runs=[
-            v2_run(run_id=100, attempt=2, status="completed", conclusion="success"),
-            v2_run(run_id=100, attempt=1, status="completed", conclusion="timed_out"),
+            valid_v2_run(run_id=100, attempt=2, status="completed", conclusion="success"),
+            valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="timed_out"),
         ],
         intent_comments=[v2_intent_comment(
-            run_id=100, run_attempt=1, state="terminal-no-status",
-            terminal_run_id=100, terminal_run_attempt=1,
+            run_id=100, run_attempt=1, state="completed", terminal_outcome="no-status",
+            terminal_run_id=100, terminal_run_attempt=1, terminal_attempts=((100, 1),),
         )],
         pr_status_payload={"statuses": [{
             "context": FINAL_CONTEXT,
             "state": "success",
-            "description": "nonce=nonce-1;run_id=100;attempt=2",
+            "description": f"nonce={V2_NONCE};run_id=100;attempt=2",
             "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
             "creator": {"login": "github-actions[bot]", "id": 41898282},
         }]},
         pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
     outcome = wait_for_final_qualification(
-        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+        runner, config=config, pr_number=7,
+        metadata=replace(metadata(), head_sha=V2_HEAD), contract=contract,
     )
 
     assert outcome.status == "passed"
@@ -5653,16 +6944,16 @@ def test_v2_intent_body_leads_with_fixed_visible_line_for_capable_workflow():
 
 def test_v2_visible_intent_body_round_trips_through_intent_rediscovery(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner()
-    contract = v2_contract(visible_intent_capable=True)
+    runner = valid_v2_runner()
+    contract = valid_v2_contract(visible_intent_capable=True)
 
-    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
     nonce = contract.nonce
     _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
 
     assert [snapshot["state"] for snapshot in runner.intent_snapshots] == ["prepared", "dispatch-requested"]
-    resumed = v2_contract(visible_intent_capable=True, nonce=None)
-    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=resumed)
+    resumed = valid_v2_contract(visible_intent_capable=True, nonce=None)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=resumed)
     assert resumed.nonce == nonce
     assert resumed.intent_state == "dispatch-requested"
 
@@ -5929,22 +7220,24 @@ def test_explicit_activation_release_is_terminal_and_unqualified(tmp_path):
 def test_v2_intent_resumes_matching_comment_and_rejects_competing_nonce(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     comment = v2_intent_comment(run_id=100, run_attempt=1)
-    runner = V2ManagedRunner(intent_comments=[comment])
-    contract = v2_contract()
+    runner = valid_v2_runner(intent_comments=[comment])
+    contract = valid_v2_contract()
 
     _ensure_v2_intent(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
-    assert (contract.intent_comment_id, contract.nonce, contract.attached_run_id) == (17, "nonce-1", 100)
+    assert (contract.intent_comment_id, contract.nonce, contract.attached_run_id) == (17, V2_NONCE, 100)
     competing = dict(comment)
     competing["id"] = 18
-    competing["body"] = v2_intent_comment(nonce="nonce-2")["body"]
-    runner = V2ManagedRunner(intent_comments=[comment, competing])
-    with pytest.raises(AgentLoopError, match="Competing managed-CI v2 intent"):
+    competing["body"] = v2_intent_comment(nonce="nonce-2" + "y" * 25)["body"]
+    runner = valid_v2_runner(intent_comments=[comment, competing])
+    with pytest.raises(AgentLoopError, match="Competing managed-CI v2 intent") as raised:
         _ensure_v2_intent(
-            runner, config=config, pr_number=7, expected_head_sha="abc123", contract=v2_contract()
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=valid_v2_contract()
         )
+    # Differing nonces keep the existing, recoverable competing-intents route.
+    assert not isinstance(raised.value, managed_ci.ManagedCiIntentLedgerError)
 
 
 def test_v2_fresh_generation_resets_attachment_terminal_history_and_early_fields(tmp_path):
@@ -5988,13 +7281,13 @@ def test_v2_fresh_generation_resets_attachment_terminal_history_and_early_fields
 
 def test_v2_same_nonce_non_excluded_attachment_survives_discovery_miss_without_redispatch(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(intent_comments=[v2_intent_comment(
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(
         run_id=100, run_attempt=1, state="attached"
     )])
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert (contract.attached_run_id, contract.run_attempt) == (100, 1)
@@ -6004,18 +7297,18 @@ def test_v2_same_nonce_non_excluded_attachment_survives_discovery_miss_without_r
 
 def test_v2_excluded_attachment_transitions_to_dispatch_requested_before_replacement(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
-        workflow_runs=[v2_run(run_id=101, status="in_progress", conclusion=None)],
+    runner = valid_v2_runner(
+        workflow_runs=[valid_v2_run(run_id=101, status="in_progress", conclusion=None)],
         intent_comments=[v2_intent_comment(
             run_id=100, run_attempt=1, state="completed",
             terminal_run_id=100, terminal_run_attempt=1,
             terminal_attempts=((100, 1),), terminal_outcome="no-status",
         )],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
@@ -6121,23 +7414,26 @@ def test_v2_current_pinned_consumer_scopes_lifecycle_validation_to_requested_non
         )
 
 
-def test_v2_legacy_no_status_restoration_preserves_missing_attempt_exclusion(tmp_path):
+def test_v2_legacy_no_status_record_is_refused_instead_of_restored(tmp_path):
+    """A legacy terminal-no-status state is one the base workflow fails.
+
+    Rediscovery mirrors the workflow's verdict (#1043), so such a record is
+    never adopted and no fresh intent is minted beside it.
+    """
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(intent_comments=[v2_intent_comment(
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(
         run_id=100, run_attempt=None, state="terminal-no-status",
         terminal_run_id=100, terminal_run_attempt=None,
     )])
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
-    _ensure_v2_intent(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
-    )
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="invalid state"):
+        _ensure_v2_intent(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
 
-    assert contract.intent_state == "terminal-no-status"
-    assert contract.terminal_outcome == "no-status"
-    assert contract.terminal_attempts == ((100, None),)
-    assert contract.attached_run_id is None
-    assert contract.run_attempt is None
+    assert contract.intent_comment_id is None
+    assert runner.intent_snapshots == []
 
 
 def test_v2_missing_terminal_attempt_excludes_same_run_but_allows_fresh_run():
@@ -6149,11 +7445,11 @@ def test_v2_missing_terminal_attempt_excludes_same_run_but_allows_fresh_run():
 
 def test_v2_dispatch_discovers_existing_run_before_dispatching(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(workflow_runs=[v2_run()], intent_comments=[v2_intent_comment()])
-    contract = v2_contract()
+    runner = valid_v2_runner(workflow_runs=[valid_v2_run()], intent_comments=[v2_intent_comment()])
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert contract.attached_run_id == 100
@@ -6192,20 +7488,20 @@ def test_v2_dispatch_ledger_failure_uses_authenticated_ordinary_recovery_capabil
 
 def test_v2_dispatch_discovers_run_with_display_title_and_qualified_path(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(
+    runner = valid_v2_runner(
         workflow_runs=[
-            v2_run(
+            valid_v2_run(
                 name="CI",
-                display_title="managed-ci-v2 nonce=nonce-1",
+                display_title=f"managed-ci-v2 nonce={V2_NONCE}",
                 path="OWNER/REPO/.github/workflows/ci.yml@refs/heads/main",
             )
         ],
         intent_comments=[v2_intent_comment()],
     )
-    contract = v2_contract()
+    contract = valid_v2_contract()
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
     assert contract.attached_run_id == 100
@@ -6522,27 +7818,33 @@ def test_intent_body_stays_marker_only_for_the_base_workflow_validator(tmp_path)
     assert envelope.match(second) is not None
 
 
-def test_labeled_intent_comment_is_rediscovered_like_a_marker_only_one(tmp_path):
+def test_labeled_intent_comment_is_skipped_like_the_base_workflow_skips_it(tmp_path):
+    """A free-form label ahead of the record is not a workflow envelope.
+
+    The base workflow skips such a comment, so rediscovery must not adopt it
+    either (#1043); a fresh intent is posted instead.
+    """
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     historical = v2_intent_comment(run_id=100, run_attempt=1)
     labeled = dict(historical)
     labeled["body"] = (
         protocol_record_label(
-            "managed_ci_intent", pr_number=7, head_sha="abc123", state="attached"
+            "managed_ci_intent", pr_number=7, head_sha=V2_HEAD, state="attached"
         )
         + "\n\n"
         + historical["body"]
     )
-    runner = V2ManagedRunner(intent_comments=[labeled])
-    contract = v2_contract()
+    runner = valid_v2_runner(intent_comments=[labeled])
+    contract = valid_v2_contract()
 
     _ensure_v2_intent(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
     )
 
-    assert (contract.intent_comment_id, contract.nonce, contract.attached_run_id) == (
-        17, "nonce-1", 100,
-    )
+    assert contract.intent_comment_id != 17
+    assert contract.nonce != V2_NONCE
+    assert contract.attached_run_id is None
+    assert [snapshot["state"] for snapshot in runner.intent_snapshots] == ["prepared"]
 
 
 class AlteredLabelIntentRunner(V2ManagedRunner):
@@ -6932,3 +8234,2926 @@ def test_m953_legacy_reader_declines_spilled_conflict_continuity(tmp_path, monke
             actor_id=1, predecessor_head="abc123", new_head="merged-head",
             round_number=12, after_comment_id=50,
         )
+
+
+def _spilled_ci_repair_continuity():
+    """#1024: a CI repair coder record whose prior_items spilled into sidecars."""
+    import base64 as _base64
+    import os as _os
+
+    import coding_review_agent_loop.round_transport as transport
+
+    item = replace(
+        _advanced_ci_obligation(),
+        text="final-ci/exact-head failed. "
+        + _base64.urlsafe_b64encode(_os.urandom(50_000)).decode("ascii"),
+    )
+    prepared = transport.prepare_round_comment(
+        _attach_round_metadata(
+            "coder round",
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="agent-loop",
+                round_number=13, subject="ci-fix-head", prior_items=(item,),
+            ),
+        )
+    )
+    anchor = transport.ROUND_RESUME_MARKER_RE.search(str(prepared[-1]))
+    reference = transport.decode_mapping(anchor.group("payload"))["prior_items"]
+    assert isinstance(reference, dict) and "$round_transport_spill" in reference
+    comments = [
+        {"id": 58 + index, "user": {"login": "agent-loop", "id": 1}, "body": str(body)}
+        for index, body in enumerate(prepared)
+    ]
+    anchor_id = comments[-1]["id"]
+    return comments, anchor_id, _ci_repair_continuity(anchor_id)
+
+
+def test_m1024_spilled_ci_obligation_grants_continuity(tmp_path):
+    comments, anchor_id, authorization = _spilled_ci_repair_continuity()
+
+    records = managed_ci._continuity_round_records(comments)
+    assert records[len(comments) - 1]["ci_repair_transitions"] == frozenset(
+        {("abc123", "ci-fix-head")}
+    )
+    assert managed_ci._continuity_round_metadata_is_valid(
+        comments, authorization=authorization
+    ) is True
+
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.extend(comments)
+    selected = managed_ci.find_actor_round_metadata_comment_ids(
+        runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+        actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+        after_comment_id=50,
+    )
+    assert selected == (anchor_id,)
+
+
+def test_m1024_legacy_reader_declines_spilled_ci_repair_continuity(tmp_path, monkeypatch):
+    """An older reader cannot see the spilled CI obligation and so denies, never grants."""
+    import coding_review_agent_loop.round_transport as transport
+
+    comments, _anchor_id, authorization = _spilled_ci_repair_continuity()
+    monkeypatch.setattr(
+        transport,
+        "_SPILL_FIELDS",
+        tuple(
+            field for field in transport._SPILL_FIELDS
+            if field not in transport._GROWTH_SPILL_FIELDS
+        ),
+    )
+
+    records = managed_ci._continuity_round_records(comments)
+    assert records[len(comments) - 1]["ci_repair_transitions"] == frozenset()
+    assert managed_ci._continuity_round_metadata_is_valid(
+        comments, authorization=authorization
+    ) is False
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.extend(comments)
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            after_comment_id=50,
+        )
+
+
+# --- #1040: refused Actions-variable and classic-protection reads -----------
+
+PROXY_403 = (
+    "gh: Access to this GitHub Actions path is not permitted through this proxy (HTTP 403)\n"
+)
+INTEGRATION_403 = "gh: Resource not accessible by integration (HTTP 403)\n"
+GH_404 = "gh: Not Found (HTTP 404)\n"
+GH_422 = "gh: Validation Failed (HTTP 422)\n"
+GH_500 = "gh: Server Error (HTTP 500)\n"
+PLAN_LIMITED = "HTTP 403: Upgrade to GitHub Pro or make this repository public"
+_VARIABLE = "/actions/variables/AGENT_LOOP_MANAGED_ACTOR"
+_CLASSIC = "/branches/main/protection/required_status_checks"
+_ADMINS = "/branches/main/protection/enforce_admins"
+_RULES = "/rules/branches/main"
+_BOTH_WAIVERS = "--allow-unprotected-managed-ci --allow-unreadable-protection"
+
+
+def _final_rules(context=FINAL_CONTEXT):
+    return [{
+        "type": "required_status_checks",
+        "parameters": {"required_status_checks": [{"context": context}]},
+    }]
+
+
+STRICT_RULESET = {"enforcement": "active", "bypass_actors": [], "rules": _final_rules()}
+
+
+class _ScriptedReadsMixin:
+    """Answer selected read-only endpoints with scripted gh results."""
+
+    scripted: dict = {}
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next(
+            (part for part in args if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if "--method" not in args:
+            for suffix, (stdout, stderr, returncode) in self.scripted.items():
+                if endpoint.endswith(suffix):
+                    cmd, cwd_path = self._record_command(args, cwd)
+                    return CommandResult(cmd, cwd_path, stdout, stderr, returncode)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+class CloudSessionRunner(_ScriptedReadsMixin, V2ManagedRunner):
+    def __init__(self, *, scripted=None, **kwargs):
+        kwargs.setdefault("workflow", SUPPRESSING_V2_WORKFLOW)
+        super().__init__(**kwargs)
+        self.scripted = dict(scripted or {})
+
+
+class CloudAuthorizationRunner(_ScriptedReadsMixin, AuthorizationCommentRunner):
+    def __init__(self, *, scripted=None, **kwargs):
+        kwargs.setdefault("workflow", SUPPRESSING_V2_WORKFLOW)
+        super().__init__(**kwargs)
+        self.scripted = dict(scripted or {})
+
+
+def _failed(stderr, stdout=""):
+    return (stdout, stderr, 1)
+
+
+def _cloud_scripts(*, variable=True, classic=True, rules=None):
+    scripted = {}
+    if variable:
+        scripted[_VARIABLE] = _failed(PROXY_403)
+    if classic:
+        scripted[_CLASSIC] = _failed(INTEGRATION_403)
+    if rules is not None:
+        scripted[_RULES] = rules
+    return scripted
+
+
+def _probe_context(tmp_path):
+    return ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path)
+
+
+def _mutations(runner):
+    return [command for command, _cwd in runner.commands if "--method" in command]
+
+
+def _cloud_config(tmp_path, *, companion=True, unreadable=True, **overrides):
+    overrides.setdefault("managed_ci", True)
+    return make_config(
+        tmp_path,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=companion,
+        allow_unreadable_protection=unreadable,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "returncode", "expected"),
+    [
+        ("", PROXY_403, 1, 403),
+        ("", INTEGRATION_403, 1, 403),
+        ("", PROXY_403, 0, None),
+        ('{"message": "upstream said HTTP 403 (HTTP 403)"}', GH_500, 1, 500),
+        ("", "gh: upstream said (HTTP 403) retry later (HTTP 500)\n", 1, 500),
+        ("", "error: HTTP 403 forbidden by upstream\n", 1, None),
+        ("", "gh: denied (HTTP 403) by policy\n", 1, None),
+        ("", PROXY_403 + GH_500, 1, None),
+        ("gh: Resource not accessible by integration (HTTP 403)", "", 1, None),
+        ("", GH_404, 1, 404),
+    ],
+)
+def test_http_status_reads_only_gh_trailing_stderr_status(
+    tmp_path, stdout, stderr, returncode, expected
+):
+    result = CommandResult(["gh", "api", "repos/OWNER/REPO"], tmp_path, stdout, stderr, returncode)
+
+    assert managed_ci._http_status(result) == expected
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "returncode", "status"),
+    [
+        ('{"value": "agent-loop"}', "", 0, "readable"),
+        ("", PROXY_403, 1, "unreadable"),
+        ("", INTEGRATION_403, 1, "unreadable"),
+        ('{"message": "Not Found", "status": "404"}', INTEGRATION_403, 1, "unreadable"),
+        ("", GH_404, 1, "absent"),
+        ("", "HTTP 404: Not Found", 1, "absent"),
+        ('{"message": "HTTP 403"}', GH_500, 1, "error"),
+        ("", "gh: upstream said (HTTP 403) retry later (HTTP 500)\n", 1, "error"),
+        ("", "dial tcp: connection reset by peer", 1, "error"),
+    ],
+)
+def test_actor_variable_read_is_asserted_only_for_a_strict_403(
+    tmp_path, stdout, stderr, returncode, status
+):
+    runner = CloudSessionRunner(scripted={_VARIABLE: (stdout, stderr, returncode)})
+
+    variable = managed_ci._read_managed_actor_variable(runner, "gh", "OWNER/REPO", tmp_path)
+
+    assert variable.status == status
+    expected = {
+        "readable": ("agent-loop", "variable"),
+        "unreadable": ("agent-loop", "asserted"),
+    }.get(status, (None, None))
+    assert managed_ci._resolve_advertised_actor(variable, " agent-loop ") == expected
+    # Without a trusted actor nothing can stand in for the refused read.
+    if status == "unreadable":
+        assert managed_ci._resolve_advertised_actor(variable, "") == (None, None)
+
+
+def test_readable_variable_is_never_replaced_by_the_trusted_actor(tmp_path):
+    runner = CloudSessionRunner(scripted={_VARIABLE: ('{"value": "someone-else"}', "", 0)})
+
+    variable = managed_ci._read_managed_actor_variable(runner, "gh", "OWNER/REPO", tmp_path)
+
+    assert managed_ci._resolve_advertised_actor(variable, "agent-loop") == (
+        "someone-else", "variable",
+    )
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        _failed(PROXY_403),
+        _failed(INTEGRATION_403),
+        _failed(INTEGRATION_403, stdout='{"message": "Not Found", "documentation": "404"}'),
+    ],
+)
+def test_variable_403_asserts_trusted_actor_in_readiness_and_creation(
+    tmp_path, monkeypatch, variable
+):
+    messages = []
+    monkeypatch.setattr(managed_ci, "_ASSERTED_ACTOR_LOGGED", set())
+    monkeypatch.setattr(managed_ci, "log", lambda _config, message: messages.append(message))
+    runner = CloudSessionRunner(
+        scripted={_VARIABLE: variable},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=_probe_context(tmp_path), base="main", trusted_actor="agent-loop",
+    )
+
+    assert readiness.state == "strict_ready"
+    assert readiness.advertised_actor == "agent-loop"
+    assert readiness.advertised_actor_source == "asserted"
+    rendered = managed_ci.render_managed_ci_preflight(
+        readiness, repo="OWNER/REPO", base="main", trusted_actor="agent-loop",
+    )
+    assert "variable=agent-loop (asserted; unverified locally, enforced by workflow)" in rendered
+
+    intent = preflight_managed_ci_creation(
+        runner, config=_cloud_config(tmp_path, companion=False, unreadable=False),
+        issue_number=643,
+    )
+
+    assert intent is not None
+    assert intent.protection_mode == "strict"
+    assert intent.audit_nonce is None
+    assert any("asserted and unverified locally" in message for message in messages)
+    assert any("enforces vars.AGENT_LOOP_MANAGED_ACTOR server-side" in message for message in messages)
+
+
+def test_genuine_variable_404_stays_absent_and_is_not_asserted(tmp_path):
+    runner = CloudSessionRunner(
+        scripted={_VARIABLE: _failed(GH_404)},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=_probe_context(tmp_path), base="main", trusted_actor="agent-loop",
+    )
+
+    assert readiness.state == "ordinary_fallback"
+    assert readiness.advertised_actor is None
+    assert readiness.advertised_actor_source is None
+
+
+@pytest.mark.parametrize("variable", [_failed(GH_500), _failed("connection reset by peer")])
+def test_non_403_variable_failure_stays_indeterminate_and_names_the_read(tmp_path, variable):
+    runner = CloudSessionRunner(
+        scripted={_VARIABLE: variable},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=_probe_context(tmp_path), base="main", trusted_actor="agent-loop",
+    )
+
+    assert readiness.state == "indeterminate"
+    assert readiness.advertised_actor is None
+    assert any("actions/variables/AGENT_LOOP_MANAGED_ACTOR" in reason for reason in readiness.reasons)
+    with pytest.raises(AgentLoopError, match="AGENT_LOOP_MANAGED_ACTOR could not be read") as exc_info:
+        preflight_managed_ci_creation(runner, config=_cloud_config(tmp_path), issue_number=643)
+    assert "no PR was created" in str(exc_info.value)
+    assert _mutations(runner) == []
+
+
+def test_asserted_actor_that_disagrees_with_login_fails_closed(tmp_path):
+    runner = CloudSessionRunner(
+        scripted=_cloud_scripts(),
+        actor_login="intruder",
+        actor_id=9,
+    )
+
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=_probe_context(tmp_path), base="main", trusted_actor="agent-loop",
+    )
+
+    assert readiness.state == "ordinary_fallback"
+    assert readiness.advertised_actor_source == "asserted"
+    with pytest.raises(AgentLoopError, match="no PR was created"):
+        preflight_managed_ci_creation(runner, config=_cloud_config(tmp_path), issue_number=643)
+    config = _cloud_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="must|match"):
+        managed_ci._authorization_actor(runner, config=config)
+    assert managed_ci._adoption_identity(runner, config=config) is None
+    assert _mutations(runner) == []
+
+
+def _override_metadata(body):
+    return PullRequestMetadata(
+        number=7,
+        repo="OWNER/REPO",
+        title="Managed CI",
+        head_branch="agent-loop/managed-643",
+        base_branch="main",
+        head_sha="abc123",
+        url="https://github.com/OWNER/REPO/pull/7",
+        body=body,
+    )
+
+
+def test_readable_differing_variable_fails_closed_at_every_identity_site(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
+    runner = CloudSessionRunner(
+        scripted={_CLASSIC: _failed(INTEGRATION_403)},
+        advertised_actor="someone-else",
+        rest_pr={"state": "open", "body": body},
+    )
+    config = _cloud_config(tmp_path)
+
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=_probe_context(tmp_path), base="main", trusted_actor="agent-loop",
+    )
+    assert readiness.state == "ordinary_fallback"
+    assert readiness.advertised_actor == "someone-else"
+    assert readiness.advertised_actor_source == "variable"
+    with pytest.raises(AgentLoopError, match="no PR was created"):
+        preflight_managed_ci_creation(runner, config=config, issue_number=643)
+    with pytest.raises(AgentLoopError, match="AGENT_LOOP_MANAGED_ACTOR"):
+        managed_ci._authorization_actor(runner, config=config)
+    assert managed_ci._adoption_identity(runner, config=config) is None
+    with pytest.raises(AgentLoopError, match="AGENT_LOOP_MANAGED_ACTOR=`someone-else`"):
+        authenticate_issue_created_handoff(
+            runner,
+            config=config,
+            intent=managed_ci.ManagedCiCreationIntent(
+                branch="agent-loop/managed-643", trusted_actor="agent-loop",
+                protection_mode="unreadable", audit_nonce="fresh",
+            ),
+            issue_number=643,
+            pr_number=7,
+            metadata=_override_metadata(body),
+        )
+    assert managed_ci._activate_v2_managed_ci(
+        runner, config=replace(config, managed_ci=False, auto_merge=True),
+        pr_number=7, metadata=metadata(),
+    ) is None
+    assert _mutations(runner) == []
+
+
+def test_asserted_actor_is_accepted_at_every_identity_site(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
+    runner = CloudSessionRunner(
+        scripted=_cloud_scripts(),
+        rest_pr={"state": "open", "body": body},
+    )
+    config = _cloud_config(tmp_path)
+
+    assert managed_ci._authorization_actor(runner, config=config) == ("agent-loop", 1)
+    assert managed_ci._adoption_identity(runner, config=config) == ("agent-loop", 1)
+    handoff = authenticate_issue_created_handoff(
+        runner,
+        config=config,
+        intent=managed_ci.ManagedCiCreationIntent(
+            branch="agent-loop/managed-643", trusted_actor="agent-loop",
+            protection_mode="unreadable", audit_nonce="fresh",
+        ),
+        issue_number=643,
+        pr_number=7,
+        metadata=_override_metadata(body),
+    )
+    assert handoff.trusted_actor_login == "agent-loop"
+    assert handoff.protection_mode == "unreadable"
+    assert _mutations(runner) == []
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [None, _failed(GH_404), _failed(GH_422)],
+    ids=["empty-list", "strict-404", "strict-422"],
+)
+def test_classic_403_with_no_strict_rules_is_unreadable_and_override_eligible(tmp_path, rules):
+    runner = CloudSessionRunner(scripted=_cloud_scripts(variable=False, rules=rules))
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection.state == "unreadable"
+    assert protection.source == "classic"
+    assert "not readable by this token (HTTP 403)" in protection.detail
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=_probe_context(tmp_path), base="main", trusted_actor="agent-loop",
+    )
+    assert readiness.state == "override_eligible"
+    assert any("--allow-unreadable-protection" in item for item in readiness.remediation)
+
+
+def test_enforce_admins_403_after_readable_required_context_is_unreadable(tmp_path):
+    runner = CloudSessionRunner(
+        scripted={_ADMINS: _failed(INTEGRATION_403)},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection.state == "unreadable"
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        _failed(INTEGRATION_403, stdout='{"message": "Not Found", "status": "404"}'),
+        _failed(INTEGRATION_403, stdout='{"message": "Unprocessable", "status": "422"}'),
+        _failed("HTTP 404: Not Found"),
+        _failed(GH_404 + GH_422),
+        _failed(GH_500),
+    ],
+    ids=["403-body-404", "403-body-422", "no-gh-status", "conflicting-status", "server-error"],
+)
+def test_classic_403_with_uninspectable_rules_is_indeterminate_even_with_both_waivers(
+    tmp_path, rules
+):
+    runner = CloudSessionRunner(scripted=_cloud_scripts(rules=rules))
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection.state == "indeterminate"
+    assert protection.detail == "effective branch rules could not be inspected"
+    with pytest.raises(AgentLoopError, match="effective branch rules could not be inspected") as exc_info:
+        preflight_managed_ci_creation(runner, config=_cloud_config(tmp_path), issue_number=643)
+    assert "No waiver applies" in str(exc_info.value)
+    assert "no PR was created" in str(exc_info.value)
+    assert _mutations(runner) == []
+
+
+def test_required_status_403_whose_body_mentions_404_is_never_voluntary(tmp_path):
+    runner = CloudSessionRunner(scripted={
+        _VARIABLE: _failed(PROXY_403),
+        _CLASSIC: _failed(INTEGRATION_403, stdout='{"message": "Branch not protected", "status": "404"}'),
+    })
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection.state == "unreadable"
+    with pytest.raises(AgentLoopError, match="--allow-unreadable-protection") as exc_info:
+        preflight_managed_ci_creation(
+            runner, config=_cloud_config(tmp_path, unreadable=False), issue_number=643,
+        )
+    assert "no PR was created" in str(exc_info.value)
+    assert _mutations(runner) == []
+
+
+@pytest.mark.parametrize("classic", [_failed(GH_404), _failed("HTTP 404: Not Found")])
+def test_genuine_required_status_404_stays_voluntary(tmp_path, classic):
+    runner = CloudSessionRunner(scripted={_CLASSIC: classic})
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection.state == "voluntary"
+
+
+@pytest.mark.parametrize("rules", [_failed(GH_404), _failed("HTTP 422: Unprocessable")])
+def test_readable_classic_no_rules_response_keeps_existing_classification(tmp_path, rules):
+    runner = CloudSessionRunner(scripted={_RULES: rules})
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection == managed_ci.ProtectionAssessment(
+        "voluntary", "none", "final-ci/exact-head is not independently required"
+    )
+
+
+def test_classic_403_with_visible_empty_bypass_strict_ruleset_is_strict(tmp_path):
+    runner = CloudSessionRunner(
+        scripted=_cloud_scripts(variable=False),
+        pr_effective_rules_payload=[{"ruleset_id": 8}],
+        pr_rulesets_payload={8: STRICT_RULESET},
+    )
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert (protection.state, protection.source) == ("strict", "ruleset")
+    intent = preflight_managed_ci_creation(
+        runner, config=_cloud_config(tmp_path, companion=False, unreadable=False),
+        issue_number=643,
+    )
+    assert intent is not None
+    assert intent.protection_mode == "strict"
+    assert intent.audit_nonce is None
+
+
+def test_classic_403_with_hidden_ruleset_bypass_actors_is_unreadable(tmp_path):
+    hidden = {"enforcement": "active", "rules": _final_rules()}
+    runner = CloudSessionRunner(
+        scripted=_cloud_scripts(),
+        pr_effective_rules_payload=[{"ruleset_id": 8}],
+        pr_rulesets_payload={8: hidden},
+    )
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection.state == "unreadable"
+    assert "does not expose its bypass actors to this token" in protection.detail
+    with pytest.raises(AgentLoopError, match="--allow-unreadable-protection"):
+        preflight_managed_ci_creation(
+            runner, config=_cloud_config(tmp_path, unreadable=False), issue_number=643,
+        )
+    assert _mutations(runner) == []
+    intent = preflight_managed_ci_creation(runner, config=_cloud_config(tmp_path), issue_number=643)
+    assert intent is not None
+    assert intent.protection_mode == "unreadable"
+    assert intent.audit_nonce
+
+
+def test_hidden_bypass_controls_keep_strict_classifications(tmp_path):
+    hidden = {"enforcement": "active", "rules": _final_rules()}
+    with_visible = CloudSessionRunner(
+        scripted=_cloud_scripts(variable=False),
+        pr_effective_rules_payload=[{"ruleset_id": 8}, {"ruleset_id": 9}],
+        pr_rulesets_payload={8: hidden, 9: STRICT_RULESET},
+    )
+    assert assess_exact_head_protection(
+        with_visible, context=_probe_context(tmp_path), base="main"
+    ).state == "strict"
+
+    readable_classic = CloudSessionRunner(
+        pr_effective_rules_payload=[{"ruleset_id": 8}],
+        pr_rulesets_payload={8: hidden},
+    )
+    assert assess_exact_head_protection(
+        readable_classic, context=_probe_context(tmp_path), base="main"
+    ).state == "strict"
+
+
+_VALID_TEAM_BYPASS = {"actor_type": "Team", "actor_id": 5, "bypass_mode": "always"}
+
+
+@pytest.mark.parametrize(
+    ("effective_rules", "ruleset"),
+    [
+        (["not-an-object"], None),
+        ([{"name": "no ruleset id"}], None),
+        ([{"ruleset_id": 8}], {"enforcement": "active", "bypass_actors": [], "rules": "rules"}),
+        ([{"ruleset_id": 8}], {"enforcement": "active", "bypass_actors": [], "rules": ["rule"]}),
+        ([{"ruleset_id": 8}], {"enforcement": "active", "bypass_actors": [], "rules": [{"parameters": {}}]}),
+        ([{"ruleset_id": 8}], {
+            "enforcement": "active", "bypass_actors": [],
+            "rules": [{"type": "required_status_checks", "parameters": {"required_status_checks": [{"name": "x"}]}}],
+        }),
+        ([{"ruleset_id": 8}], {"enforcement": "actve", "bypass_actors": [], "rules": _final_rules()}),
+        ([{"ruleset_id": 8}], {"enforcement": "", "bypass_actors": [], "rules": _final_rules()}),
+        # Unhashable JSON values must be malformed, never a TypeError.
+        ([{"ruleset_id": 8}], {"enforcement": [], "bypass_actors": [], "rules": _final_rules()}),
+        ([{"ruleset_id": 8}], {"enforcement": {"mode": "active"}, "bypass_actors": [], "rules": _final_rules()}),
+        ([{"ruleset_id": 8}], {
+            "enforcement": "active", "rules": _final_rules(),
+            "bypass_actors": [{"actor_type": ["Team"], "actor_id": 5}],
+        }),
+        ([{"ruleset_id": 8}], {
+            "enforcement": "active", "rules": _final_rules(),
+            "bypass_actors": [{"actor_type": "Team", "actor_id": 5, "bypass_mode": {"x": 1}}],
+        }),
+        ([{"ruleset_id": 8}], {"enforcement": "active", "bypass_actors": "all", "rules": _final_rules()}),
+        ([{"ruleset_id": 8}], {"enforcement": "active", "bypass_actors": ["team"], "rules": _final_rules()}),
+        ([{"ruleset_id": 8}], {"enforcement": "active", "bypass_actors": [{}], "rules": _final_rules()}),
+        ([{"ruleset_id": 8}], {
+            "enforcement": "active", "rules": _final_rules(),
+            "bypass_actors": [{"actor_type": "Team", "actor_id": "invalid"}],
+        }),
+        ([{"ruleset_id": 8}], {
+            "enforcement": "active", "rules": _final_rules(),
+            "bypass_actors": [{"actor_type": "Wizard", "actor_id": 1}],
+        }),
+        ([{"ruleset_id": 8}], {
+            "enforcement": "active", "rules": _final_rules(),
+            "bypass_actors": [{"actor_type": "Team", "actor_id": 5, "bypass_mode": "sometimes"}],
+        }),
+    ],
+)
+def test_classic_403_with_malformed_rules_stays_indeterminate(tmp_path, effective_rules, ruleset):
+    runner = CloudSessionRunner(
+        scripted=_cloud_scripts(),
+        pr_effective_rules_payload=effective_rules,
+        pr_rulesets_payload={8: ruleset} if ruleset is not None else {},
+    )
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection.state == "indeterminate"
+    assert protection.source == "rulesets"
+    assert "effective branch rules were malformed" in protection.detail
+    if ruleset is not None:
+        assert managed_ci._ruleset_detail_well_formed(ruleset) is False
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=_probe_context(tmp_path), base="main", trusted_actor="agent-loop",
+    )
+    assert readiness.state == "indeterminate"
+    with pytest.raises(AgentLoopError, match="no PR was created"):
+        preflight_managed_ci_creation(runner, config=_cloud_config(tmp_path), issue_number=643)
+    assert _mutations(runner) == []
+
+
+@pytest.mark.parametrize(
+    "ruleset",
+    [
+        {"enforcement": "evaluate", "bypass_actors": [], "rules": _final_rules()},
+        {"enforcement": "disabled", "bypass_actors": [], "rules": _final_rules()},
+        {"enforcement": "active", "bypass_actors": [_VALID_TEAM_BYPASS], "rules": _final_rules()},
+        {
+            "enforcement": "active", "rules": _final_rules(),
+            "bypass_actors": [{"actor_type": "OrganizationAdmin", "actor_id": None}],
+        },
+    ],
+)
+def test_classic_403_with_well_formed_non_enforcing_ruleset_is_unreadable(tmp_path, ruleset):
+    assert managed_ci._ruleset_detail_well_formed(ruleset) is True
+    runner = CloudSessionRunner(
+        scripted=_cloud_scripts(variable=False),
+        pr_effective_rules_payload=[{"ruleset_id": 8}],
+        pr_rulesets_payload={8: ruleset},
+    )
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection.state == "unreadable"
+
+
+def test_ruleset_bypass_state_distinguishes_hidden_empty_and_present():
+    assert managed_ci._ruleset_bypass_state({"rules": []}) == "unknown"
+    assert managed_ci._ruleset_bypass_state({"bypass_actors": []}) == "none"
+    assert managed_ci._ruleset_bypass_state({"bypass_actors": [_VALID_TEAM_BYPASS]}) == "present"
+
+
+def test_final_context_requires_exact_required_status_checks_match():
+    assert managed_ci._ruleset_requires_final_context(_final_rules()) is True
+    assert managed_ci._ruleset_requires_final_context(
+        _final_rules("final-ci/exact-head-extra")
+    ) is False
+    assert managed_ci._ruleset_requires_final_context(
+        [{"type": "pull_request", "parameters": {"note": FINAL_CONTEXT}}]
+    ) is False
+    assert managed_ci._ruleset_requires_final_context("rules") is False
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        _final_rules("final-ci/exact-head-extra"),
+        [{"type": "pull_request", "parameters": {"required_status_checks": [{"context": FINAL_CONTEXT}]}}],
+    ],
+    ids=["longer-context", "unrelated-rule-type"],
+)
+def test_near_miss_context_is_never_strict_enforcement(tmp_path, rules):
+    near_miss = {"enforcement": "active", "bypass_actors": [], "rules": rules}
+    readable = CloudSessionRunner(
+        pr_branch_protection_payload={"contexts": []},
+        pr_effective_rules_payload=[{"ruleset_id": 8}],
+        pr_rulesets_payload={8: near_miss},
+    )
+    assert assess_exact_head_protection(
+        readable, context=_probe_context(tmp_path), base="main"
+    ).state == "voluntary"
+
+    forbidden = CloudSessionRunner(
+        scripted=_cloud_scripts(),
+        pr_effective_rules_payload=[{"ruleset_id": 8}],
+        pr_rulesets_payload={8: near_miss},
+    )
+    assert assess_exact_head_protection(
+        forbidden, context=_probe_context(tmp_path), base="main"
+    ).state == "unreadable"
+    with pytest.raises(AgentLoopError, match="--allow-unreadable-protection"):
+        preflight_managed_ci_creation(
+            forbidden, config=_cloud_config(tmp_path, companion=False, unreadable=False),
+            issue_number=643,
+        )
+    intent = preflight_managed_ci_creation(forbidden, config=_cloud_config(tmp_path), issue_number=643)
+    assert intent is not None and intent.protection_mode == "unreadable"
+
+
+@pytest.mark.parametrize("classic_forbidden", [False, True])
+def test_exact_final_context_ruleset_is_strict_on_both_paths(tmp_path, classic_forbidden):
+    runner = CloudSessionRunner(
+        scripted=_cloud_scripts(variable=False) if classic_forbidden else {},
+        pr_branch_protection_payload={"contexts": []},
+        pr_effective_rules_payload=[{"ruleset_id": 8}],
+        pr_rulesets_payload={8: STRICT_RULESET},
+    )
+
+    assert assess_exact_head_protection(
+        runner, context=_probe_context(tmp_path), base="main"
+    ).state == "strict"
+
+
+@pytest.mark.parametrize(
+    ("scripted", "detail"),
+    [
+        ({_CLASSIC: _failed(GH_500)}, "required-status protection could not be inspected"),
+        ({_CLASSIC: _failed(INTEGRATION_403), "/rulesets/8": _failed(GH_500)},
+         "an applicable ruleset could not be inspected"),
+    ],
+)
+def test_other_protection_failures_stay_indeterminate_and_name_the_read(tmp_path, scripted, detail):
+    runner = CloudSessionRunner(scripted=scripted, pr_effective_rules_payload=[{"ruleset_id": 8}])
+
+    protection = assess_exact_head_protection(runner, context=_probe_context(tmp_path), base="main")
+
+    assert protection.state == "indeterminate"
+    assert protection.detail == detail
+    with pytest.raises(AgentLoopError, match=detail):
+        preflight_managed_ci_creation(runner, config=_cloud_config(tmp_path), issue_number=643)
+    assert _mutations(runner) == []
+
+
+def test_waivable_protection_states_require_each_explicit_flag(tmp_path):
+    neither = make_config(tmp_path)
+    companion = make_config(tmp_path, allow_unprotected_managed_ci=True)
+    both = make_config(
+        tmp_path, allow_unprotected_managed_ci=True, allow_unreadable_protection=True,
+    )
+    # The unreadable flag alone never waives anything.
+    unreadable_only = make_config(tmp_path, allow_unreadable_protection=True)
+
+    assert managed_ci.waivable_protection_states(neither) == frozenset()
+    assert managed_ci.waivable_protection_states(unreadable_only) == frozenset()
+    assert managed_ci.waivable_protection_states(companion) == {"voluntary", "plan_limited"}
+    assert managed_ci.waivable_protection_states(both) == {"voluntary", "plan_limited", "unreadable"}
+    assert managed_ci.waiver_flags_for_protection("voluntary") == "--allow-unprotected-managed-ci"
+    assert managed_ci.waiver_flags_for_protection("unreadable") == _BOTH_WAIVERS
+    assert managed_ci._waiver_for_protection("plan_limited") == "allow-unprotected-managed-ci"
+    assert managed_ci._waiver_for_protection("unreadable") == "allow-unreadable-protection"
+    assert managed_ci._waiver_for_protection("strict") is None
+
+
+@pytest.mark.parametrize(
+    ("companion", "unreadable"), [(False, False), (True, False), (False, True)],
+)
+def test_readiness_is_flag_independent_but_creation_gate_requires_both_waivers(
+    tmp_path, companion, unreadable
+):
+    runner = CloudSessionRunner(scripted=_cloud_scripts())
+
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=_probe_context(tmp_path), base="main", trusted_actor="agent-loop",
+    )
+    assert readiness.state == "override_eligible"
+    assert readiness.protection.state == "unreadable"
+    assert any(_BOTH_WAIVERS in item for item in readiness.remediation)
+
+    with pytest.raises(AgentLoopError, match=_BOTH_WAIVERS) as exc_info:
+        preflight_managed_ci_creation(
+            runner,
+            config=_cloud_config(tmp_path, companion=companion, unreadable=unreadable),
+            issue_number=643,
+        )
+    assert "no PR was created" in str(exc_info.value)
+    assert _mutations(runner) == []
+    # Implicit auto-merge falls back to ordinary CI instead of refusing.
+    assert preflight_managed_ci_creation(
+        runner,
+        config=_cloud_config(
+            tmp_path, companion=companion, unreadable=unreadable,
+            managed_ci=False, auto_merge=True,
+        ),
+        issue_number=643,
+    ) is None
+
+
+def test_cloud_session_shape_creates_reserved_managed_pr_only_with_both_waivers(
+    tmp_path, monkeypatch
+):
+    messages = []
+    monkeypatch.setattr(managed_ci, "_ASSERTED_ACTOR_LOGGED", set())
+    monkeypatch.setattr(managed_ci, "log", lambda _config, message: messages.append(message))
+    runner = CloudSessionRunner(scripted=_cloud_scripts())
+
+    with pytest.raises(AgentLoopError, match="--allow-unreadable-protection") as exc_info:
+        preflight_managed_ci_creation(
+            runner, config=_cloud_config(tmp_path, unreadable=False), issue_number=1040,
+        )
+    assert "no PR was created" in str(exc_info.value)
+    assert _mutations(runner) == []
+
+    intent = preflight_managed_ci_creation(runner, config=_cloud_config(tmp_path), issue_number=1040)
+
+    assert intent == managed_ci.ManagedCiCreationIntent(
+        branch="agent-loop/managed-1040",
+        trusted_actor="agent-loop",
+        protection_mode="unreadable",
+        audit_nonce=intent.audit_nonce,
+    )
+    assert intent.audit_nonce
+    assert any("asserted and unverified locally" in message for message in messages)
+    assert _mutations(runner) == []
+
+
+def test_voluntary_and_plan_limited_still_require_the_explicit_waiver(tmp_path):
+    voluntary = CloudSessionRunner()
+    with pytest.raises(AgentLoopError, match="--allow-unprotected-managed-ci") as exc_info:
+        preflight_managed_ci_creation(
+            voluntary, config=_cloud_config(tmp_path, companion=False, unreadable=False),
+            issue_number=643,
+        )
+    assert "--allow-unreadable-protection" not in str(exc_info.value)
+    intent = preflight_managed_ci_creation(
+        voluntary, config=_cloud_config(tmp_path, unreadable=False), issue_number=643,
+    )
+    assert intent is not None and intent.protection_mode == "voluntary" and intent.audit_nonce
+
+    plan_limited = CloudSessionRunner(
+        repo_payload={"private": True},
+        pr_branch_protection_returncode=1,
+        pr_branch_protection_stderr=PLAN_LIMITED,
+        pr_effective_rules_returncode=1,
+        pr_effective_rules_stderr=PLAN_LIMITED,
+    )
+    with pytest.raises(AgentLoopError, match="--allow-unprotected-managed-ci"):
+        preflight_managed_ci_creation(
+            plan_limited, config=_cloud_config(tmp_path, companion=False, unreadable=False),
+            issue_number=643,
+        )
+    assert _mutations(voluntary) == [] and _mutations(plan_limited) == []
+
+    # The legacy non-suppressing workflow exception is a separate clause.
+    legacy = CloudSessionRunner(workflow=V2_WORKFLOW)
+    legacy_intent = preflight_managed_ci_creation(
+        legacy, config=_cloud_config(tmp_path, companion=False, unreadable=False),
+        issue_number=643,
+    )
+    assert legacy_intent is not None
+    assert legacy_intent.audit_nonce is None
+
+
+def _unreadable_record(**overrides):
+    values = dict(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="unreadable", waiver="allow-unreadable-protection",
+        nonce="opening-nonce", label_event_id=101,
+    )
+    values.update(overrides)
+    return ManagedCiIssueAuthorization(**values)
+
+
+def _encoded_authorization(payload):
+    encoded = managed_ci._encode_issue_authorization_payload(payload)
+    return f"<!-- {managed_ci.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
+
+
+@pytest.mark.parametrize(
+    ("protection", "waiver", "valid"),
+    [
+        ("unreadable", "allow-unreadable-protection", True),
+        ("voluntary", "allow-unprotected-managed-ci", True),
+        ("plan_limited", "allow-unprotected-managed-ci", True),
+        ("unreadable", "allow-unprotected-managed-ci", False),
+        ("voluntary", "allow-unreadable-protection", False),
+        ("plan_limited", "allow-unreadable-protection", False),
+        ("strict", "allow-unprotected-managed-ci", False),
+    ],
+)
+def test_issue_authorization_parser_derives_waiver_from_protection(protection, waiver, valid):
+    payload = _unreadable_record(protection=protection, waiver=waiver).to_payload()
+    body = _encoded_authorization(payload)
+
+    if valid:
+        parsed = parse_issue_created_authorization_comment(body)
+        assert parsed is not None
+        assert (parsed.protection, parsed.waiver) == (protection, waiver)
+    else:
+        with pytest.raises(AgentLoopError, match="protection or waiver"):
+            parse_issue_created_authorization_comment(body)
+
+
+def test_unreadable_creation_authorization_round_trips_through_resume_audit(tmp_path):
+    runner = CloudAuthorizationRunner(scripted=_cloud_scripts(), issue_events=[label_event()])
+    both = _cloud_config(tmp_path, managed_ci_pr_mode=True)
+    handoff = publish_issue_created_authorization(
+        runner, config=both,
+        handoff=replace(_authorization_handoff(), protection_mode="unreadable"),
+        metadata=metadata(),
+    )
+
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert (record.protection, record.waiver) == ("unreadable", "allow-unreadable-protection")
+
+    def audit(config, expected_protection):
+        return _find_resume_audit(
+            runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+            base_ref="main", issue_number=643, live_head="abc123",
+            expected_handoff=handoff, expected_protection=expected_protection,
+            require_actor_owned_label_event=True,
+        )
+
+    found = audit(both, "unreadable")
+    assert found is not None
+    assert found[1]["protection"] == "unreadable"
+    # Without the explicit flag an unreadable record is never honored.
+    assert audit(_cloud_config(tmp_path, unreadable=False, managed_ci_pr_mode=True), "unreadable") is None
+    # A live state change is never silently accepted.
+    assert audit(both, "voluntary") is None
+
+
+def test_fresh_authorization_for_unreadable_protection_requires_both_waivers(tmp_path):
+    runner = CloudAuthorizationRunner(scripted=_cloud_scripts(), issue_events=[label_event()])
+    fresh_metadata = replace(metadata(), head_branch="agent-loop/managed-643", body="Fixes #643")
+
+    with pytest.raises(AgentLoopError, match=_BOTH_WAIVERS):
+        authorize_fresh_issue_created_resume(
+            runner, config=_cloud_config(tmp_path, unreadable=False),
+            pr_number=7, issue_number=643, metadata=fresh_metadata,
+        )
+    assert runner.intent_comments == []
+
+    config = _cloud_config(tmp_path)
+    first = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643, metadata=fresh_metadata,
+    )
+    second = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643, metadata=fresh_metadata,
+    )
+
+    assert first.protection_mode == "unreadable"
+    assert first.authorization_comment_id == second.authorization_comment_id
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert (record.kind, record.protection, record.waiver) == (
+        "fresh", "unreadable", "allow-unreadable-protection",
+    )
+
+
+def test_override_activation_audits_unreadable_protection_under_the_unchanged_schema(tmp_path):
+    nonce = "nonce-from-preflight"
+    runner = CloudSessionRunner(
+        scripted=_cloud_scripts(),
+        rest_pr={"body": f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}"},
+    )
+    config = _cloud_config(
+        tmp_path, managed_ci=False, auto_merge=True,
+        managed_ci_expected_override_nonce=nonce,
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.protection_mode == "unreadable"
+    assert contract.audit_nonce == nonce
+    audit_body = runner.audit_comments[contract.audit_comment_id]["body"]
+    parsed = managed_ci._parse_override_audit(audit_body)
+    assert parsed is not None
+    assert parsed["protection"] == "unreadable"
+    assert "waiver" not in parsed
+
+    refused = CloudSessionRunner(
+        scripted=_cloud_scripts(),
+        rest_pr={"body": f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}"},
+    )
+    assert activate_managed_ci(
+        refused, config=replace(config, allow_unreadable_protection=False),
+        pr_number=7, metadata=metadata(),
+    ) is None
+    assert any(
+        command[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for command, _ in refused.commands
+    )
+    assert refused.audit_comments == {}
+
+
+def test_resume_activation_refuses_unreadable_without_its_waiver(tmp_path):
+    runner = CloudSessionRunner(
+        scripted=_cloud_scripts(),
+        rest_pr={"state": "open", "draft": True, "labels": []},
+        issue_events=[label_event()],
+    )
+    config = _cloud_config(tmp_path, unreadable=False, managed_ci_pr_mode=True)
+
+    with pytest.raises(AgentLoopError, match=_BOTH_WAIVERS):
+        activate_managed_ci(
+            runner, config=config, pr_number=7,
+            metadata=replace(_ready_issue_metadata(), head_sha="abc123"),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created", lifecycle="draft-unlabeled-reentry",
+                issue_created_handoff=replace(
+                    _authorization_handoff(), protection_mode="unreadable",
+                ),
+            ),
+        )
+
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert _mutations(runner) == []
+
+
+@pytest.mark.parametrize(
+    ("protection_state", "unreadable", "fresh_expected"),
+    [
+        ("unreadable", False, False),
+        ("unreadable", True, True),
+        ("voluntary", False, True),
+    ],
+)
+def test_activation_fresh_advice_follows_the_state_specific_waiver(
+    tmp_path, protection_state, unreadable, fresh_expected
+):
+    runner = V2ManagedRunner(issue_events=[label_event()])
+    argv = [
+        "agent-loop", "pr", "7", "--managed-ci",
+        "--managed-ci-trusted-actor", "agent-loop", "--allow-unprotected-managed-ci",
+    ]
+    if unreadable:
+        argv.append("--allow-unreadable-protection")
+    config = _cloud_config(
+        tmp_path, unreadable=unreadable, managed_ci_pr_mode=True, invocation_argv=tuple(argv),
+    )
+
+    with pytest.raises(AgentLoopError) as exc_info:
+        _release_for_ordinary_recovery(
+            runner,
+            config=config,
+            pr_number=7,
+            base_ref="main",
+            expected_head_sha="abc123",
+            active_event=(101, "agent-loop", 1),
+            reason="no fully bound actor-owned issue-created authorization reaches the live head",
+            recovery_capable=True,
+            fresh_issue_number=643,
+            fresh_authorization_allowed=True,
+            protection_state=protection_state,
+        )
+
+    message = str(exc_info.value)
+    if fresh_expected:
+        command = message.split("`", 2)[1]
+        parsed = build_parser().parse_args(shlex.split(command)[1:])
+        assert parsed.managed_ci_fresh_authorization is True
+        assert parsed.allow_unprotected_managed_ci is True
+        assert parsed.allow_unreadable_protection is unreadable
+    else:
+        assert "--managed-ci-fresh" not in message
+        assert "fresh authorization is unavailable without" in message
+        assert _BOTH_WAIVERS in message
+
+
+def test_resume_rendering_keeps_or_strips_the_unreadable_waiver(tmp_path):
+    argv = (
+        "agent-loop", "issue", "1040", "--repo", "OWNER/REPO", "--managed-ci",
+        "--managed-ci-trusted-actor", "agent-loop", "--allow-unprotected-managed-ci",
+        "--allow-unreadable-protection",
+    )
+    config = _cloud_config(tmp_path, invocation_argv=argv)
+    parser = build_parser()
+
+    managed = render_managed_ci_resume_command(
+        config, pr_number=7, issue_number=1040, managed_ci=True,
+    )
+    managed_args = parser.parse_args(shlex.split(managed)[1:])
+    assert managed_args.allow_unprotected_managed_ci is True
+    assert managed_args.allow_unreadable_protection is True
+
+    fresh = render_managed_ci_resume_command(
+        config, pr_number=7, issue_number=1040, managed_ci=True, fresh_authorization=True,
+    )
+    fresh_args = parser.parse_args(shlex.split(fresh)[1:])
+    assert fresh_args.managed_ci_fresh_authorization is True
+    assert fresh_args.allow_unreadable_protection is True
+
+    ordinary = render_managed_ci_resume_command(
+        config, pr_number=7, issue_number=1040, managed_ci=False,
+    )
+    ordinary_args = parser.parse_args(shlex.split(ordinary)[1:])
+    assert ordinary_args.allow_unprotected_managed_ci is False
+    assert ordinary_args.allow_unreadable_protection is False
+
+    no_argv = render_managed_ci_resume_command(
+        replace(config, invocation_argv=()), pr_number=7, managed_ci=True,
+    )
+    assert _BOTH_WAIVERS in no_argv
+
+
+def _predicate_comment(**user):
+    return {"id": 41, "user": {"login": "agent-loop", "id": 1, **user}, "body": ""}
+
+
+def _predicate(record, comment=None, *, config, **overrides):
+    arguments = dict(
+        config=config,
+        handoff=None,
+        actor_login="agent-loop",
+        actor_id=1,
+        base_ref="main",
+        pr_number=7,
+        issue_number=643,
+        valid_label_event_ids=None,
+        check_protection=None,
+        plan_scope_authenticated=True,
+    )
+    arguments.update(overrides)
+    return managed_ci._authorization_record_valid_for_handoff(
+        record, comment or _predicate_comment(), **arguments
+    )
+
+
+def test_shared_record_predicate_without_a_handoff(tmp_path):
+    config = _cloud_config(tmp_path)
+    voluntary = _unreadable_record(protection="voluntary", waiver="allow-unprotected-managed-ci")
+
+    assert _predicate(voluntary, config=config) is True
+    assert _predicate(_unreadable_record(), config=config) is True
+    assert _predicate(replace(voluntary, actor_login="someone-else"), config=config) is False
+    assert _predicate(replace(voluntary, actor_id=2), config=config) is False
+    assert _predicate(replace(voluntary, waiver="allow-unreadable-protection"), config=config) is False
+    assert _predicate(voluntary, config=config, check_protection="plan_limited") is False
+    assert _predicate(voluntary, config=config, valid_label_event_ids={999}) is False
+    assert _predicate(voluntary, config=config, valid_label_event_ids={101}) is True
+    assert _predicate(voluntary, _predicate_comment(login="intruder"), config=config) is False
+    assert _predicate(replace(voluntary, repository="OTHER/REPO"), config=config) is False
+    assert _predicate(voluntary, config=config, base_ref="release") is False
+    assert _predicate(voluntary, config=config, pr_number=8) is False
+    assert _predicate(voluntary, config=config, issue_number=644) is False
+    # An unreadable record is honored only with its explicit waiver.
+    assert _predicate(
+        _unreadable_record(), config=_cloud_config(tmp_path, unreadable=False),
+    ) is False
+
+
+def test_handoff_less_resume_audit_rejects_foreign_tuple_records(tmp_path):
+    record = _unreadable_record(protection="voluntary", waiver="allow-unprotected-managed-ci")
+    config = _cloud_config(tmp_path)
+    for foreign in (
+        replace(record, repository="OTHER/REPO"),
+        replace(record, base_ref="release"),
+        replace(record, pr_number=8),
+        replace(record, issue_number=644),
+    ):
+        runner = CloudAuthorizationRunner(
+            issue_events=[label_event()],
+            intent_comments=[
+                {"id": 41, "user": {"login": "agent-loop", "id": 1},
+                 "body": str(format_issue_created_authorization_comment(record))},
+                {"id": 42, "user": {"login": "agent-loop", "id": 1},
+                 "body": str(format_issue_created_authorization_comment(foreign))},
+            ],
+        )
+        assert _find_resume_audit(
+            runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+            base_ref="main", issue_number=643,
+        ) is None
+
+
+_RECOVERY_BODY = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=opening-nonce"
+
+
+def _recovery_metadata():
+    return _override_metadata(_RECOVERY_BODY)
+
+
+def _recovery_runner(records, *, scripted=None, lifecycle="draft-labeled", **kwargs):
+    comments = [
+        {
+            "id": 41 + index,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": str(format_issue_created_authorization_comment(record)),
+        }
+        for index, record in enumerate(records)
+    ]
+    draft = lifecycle != "ready-unlabeled"
+    labeled = lifecycle == "draft-labeled"
+    kwargs.setdefault("issue_events", [label_event()])
+    return CloudAuthorizationRunner(
+        scripted=_cloud_scripts() if scripted is None else scripted,
+        issue_payload={"number": 643},
+        pr_payload={
+            "number": 7,
+            "state": "OPEN",
+            "url": "https://github.com/OWNER/REPO/pull/7",
+            "title": "Managed CI",
+            "body": _RECOVERY_BODY,
+            "headRefName": "agent-loop/managed-643",
+            "baseRefName": "main",
+            "headRefOid": "abc123",
+            "comments": [],
+            "reviews": [],
+        },
+        rest_pr={
+            "state": "open",
+            "draft": draft,
+            "labels": [{"name": MANAGED_LABEL}] if labeled else [],
+            "body": _RECOVERY_BODY,
+        },
+        intent_comments=comments,
+        **kwargs,
+    )
+
+
+def _recover(runner, config):
+    return recover_issue_created_handoff(
+        runner, config=config, pr_number=7, metadata=_recovery_metadata(), issue_number=643,
+    )
+
+
+def test_issue_created_recovery_restores_unreadable_protection(tmp_path):
+    runner = _recovery_runner([_unreadable_record()])
+
+    handoff = _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert handoff is not None
+    assert handoff.protection_mode == "unreadable"
+    assert _mutations(runner) == []
+
+
+def test_issue_created_recovery_restores_plan_limited_protection(tmp_path):
+    runner = _recovery_runner(
+        [_unreadable_record(protection="plan_limited", waiver="allow-unprotected-managed-ci")],
+        scripted={_CLASSIC: _failed(PLAN_LIMITED), _RULES: _failed(PLAN_LIMITED)},
+    )
+
+    handoff = _recover(runner, _cloud_config(tmp_path, unreadable=False, managed_ci_pr_mode=True))
+
+    assert handoff is not None
+    assert handoff.protection_mode == "plan_limited"
+
+
+def test_issue_created_recovery_without_creation_record_uses_live_waivable_state(tmp_path):
+    runner = _recovery_runner([])
+
+    handoff = _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert handoff is not None
+    assert handoff.protection_mode == "unreadable"
+
+
+@pytest.mark.parametrize(
+    ("records", "scripted", "config_overrides", "match"),
+    [
+        ([_unreadable_record()], None, {"unreadable": False}, _BOTH_WAIVERS),
+        (
+            [_unreadable_record()],
+            {_CLASSIC: _failed(PLAN_LIMITED), _RULES: _failed(PLAN_LIMITED)},
+            {},
+            "live assessment is plan_limited",
+        ),
+        (
+            [
+                _unreadable_record(),
+                _unreadable_record(protection="plan_limited", waiver="allow-unprotected-managed-ci"),
+            ],
+            None, {}, "disagree",
+        ),
+        (
+            [
+                _unreadable_record(),
+                _unreadable_record(
+                    kind="fresh", protection="voluntary",
+                    waiver="allow-unprotected-managed-ci", nonce="fresh-nonce",
+                ),
+            ],
+            None, {}, "authorization comment 42",
+        ),
+        (
+            [
+                _unreadable_record(),
+                _unreadable_record(
+                    kind="fresh", protection="voluntary",
+                    waiver="allow-unprotected-managed-ci", nonce="fresh-nonce",
+                ),
+            ],
+            None, {"unreadable": False}, r"records disagree on protection \(unreadable, voluntary\)",
+        ),
+    ],
+    ids=[
+        "missing-flag", "live-disagrees", "creation-records-disagree",
+        "fresh-record-disagrees", "unwaived-records-disagree",
+    ],
+)
+def test_issue_created_recovery_refuses_without_mutation(
+    tmp_path, records, scripted, config_overrides, match
+):
+    runner = _recovery_runner(records, scripted=scripted)
+
+    with pytest.raises(AgentLoopError, match=match) as exc_info:
+        _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True, **config_overrides))
+
+    assert "The PR was left unchanged" in str(exc_info.value)
+    if match != _BOTH_WAIVERS:
+        # #1063: no flag resolves these, so no command is offered as a remedy.
+        assert _resume_command(exc_info.value) is None
+        assert "No resume flag reconciles" in str(exc_info.value)
+    assert _mutations(runner) == []
+
+
+_FAILED_ARGV = (
+    "agent-loop", "pr", "7", "--managed-ci",
+    "--managed-ci-trusted-actor", "agent-loop", "--allow-unprotected-managed-ci",
+)
+
+
+def _resume_command(error):
+    match = re.search(r"Resume with `([^`]+)`", str(error))
+    return None if match is None else match.group(1)
+
+
+def test_issue_created_recovery_missing_waiver_remedy_is_not_the_failing_command(tmp_path):
+    # #1063: the printed remedy must add the missing flag, not replay argv.
+    runner = _recovery_runner([_unreadable_record()])
+    config = _cloud_config(
+        tmp_path, unreadable=False, managed_ci_pr_mode=True, invocation_argv=_FAILED_ARGV,
+    )
+
+    with pytest.raises(AgentLoopError, match=_BOTH_WAIVERS) as exc_info:
+        _recover(runner, config)
+
+    resume = _resume_command(exc_info.value)
+    assert resume is not None
+    assert resume != shlex.join(_FAILED_ARGV)
+    assert "--allow-unreadable-protection" in shlex.split(resume)
+    assert _mutations(runner) == []
+
+
+def test_issue_created_recovery_reconciles_persisted_unreadable_with_live_voluntary(tmp_path):
+    # #1063: a PR authorized where protection was unreadable resumes on a host
+    # that reads voluntary; the persisted state is kept for every record.
+    runner = _recovery_runner([_unreadable_record()], scripted={})
+
+    handoff = _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert handoff is not None
+    assert handoff.protection_mode == "unreadable"
+    assert _mutations(runner) == []
+
+
+def test_issue_created_recovery_irreconcilable_mismatch_prints_no_identical_command(tmp_path):
+    argv = _FAILED_ARGV + ("--allow-unreadable-protection",)
+    runner = _recovery_runner(
+        [_unreadable_record()],
+        scripted={_CLASSIC: _failed(PLAN_LIMITED), _RULES: _failed(PLAN_LIMITED)},
+    )
+    config = _cloud_config(tmp_path, managed_ci_pr_mode=True, invocation_argv=argv)
+
+    with pytest.raises(AgentLoopError, match="live assessment is plan_limited") as exc_info:
+        _recover(runner, config)
+
+    assert _resume_command(exc_info.value) is None
+    assert "No resume flag reconciles" in str(exc_info.value)
+    assert _mutations(runner) == []
+
+
+def test_run_pr_loop_resumes_unreadable_pr_where_protection_reads_voluntary(
+    tmp_path, monkeypatch,
+):
+    runner = _recovery_runner([_unreadable_record()], scripted={})
+    config = _cloud_config(
+        tmp_path,
+        managed_ci_pr_mode=True,
+        invocation_argv=_FAILED_ARGV + ("--allow-unreadable-protection",),
+    )
+    captured = {}
+    _stop_after_real_activation(monkeypatch, captured)
+
+    with pytest.raises(_ActivationReached) as exc_info:
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    contract = exc_info.value.args[0]
+    assert contract is not None
+    assert contract.activation_path == "managed"
+    assert contract.protection_mode == "unreadable"
+    assert captured["managed_resume"].issue_created_handoff.protection_mode == "unreadable"
+    assert runner.dispatch_count == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"repository": "OTHER/REPO"},
+        {"pr_number": 8},
+        {"issue_number": 644},
+        {"base_ref": "release"},
+        {"actor_login": "someone-else"},
+        {"actor_id": 2},
+        {"label_event_id": 999},
+    ],
+)
+def test_issue_created_recovery_rejects_invalid_records_without_selecting_protection(
+    tmp_path, overrides
+):
+    runner = _recovery_runner([
+        _unreadable_record(),
+        _unreadable_record(**overrides),
+    ])
+
+    with pytest.raises(AgentLoopError, match="authorization comment 42") as exc_info:
+        _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert _resume_command(exc_info.value) is None
+    assert _mutations(runner) == []
+
+
+@pytest.mark.parametrize("lifecycle", ["draft-labeled", "draft-unlabeled", "ready-unlabeled"])
+def test_issue_created_recovery_rejects_foreign_label_events_in_every_lifecycle(tmp_path, lifecycle):
+    runner = _recovery_runner(
+        [_unreadable_record(label_event_id=999)], lifecycle=lifecycle,
+    )
+
+    with pytest.raises(AgentLoopError, match="authorization comment 41"):
+        _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert _mutations(runner) == []
+
+
+def test_issue_created_recovery_refuses_unreadable_label_history(tmp_path):
+    scripted = _cloud_scripts()
+    scripted["/issues/7/events?per_page=100"] = _failed(GH_500)
+    runner = _recovery_runner(
+        [_unreadable_record()], scripted=scripted, lifecycle="draft-unlabeled",
+    )
+
+    with pytest.raises(AgentLoopError, match="event history could not be inspected") as exc_info:
+        _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert "may be transient; retry" in str(exc_info.value)
+
+    assert _mutations(runner) == []
+
+
+def test_run_pr_loop_recovers_unreadable_pr_and_activates_with_both_waivers(
+    tmp_path, monkeypatch,
+):
+    runner = _recovery_runner([_unreadable_record()])
+    config = _cloud_config(
+        tmp_path,
+        managed_ci_pr_mode=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci", "--allow-unreadable-protection",
+        ),
+    )
+    captured = {}
+    _stop_after_real_activation(monkeypatch, captured)
+
+    with pytest.raises(_ActivationReached) as exc_info:
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    contract = exc_info.value.args[0]
+    assert contract is not None
+    assert contract.activation_path == "managed"
+    assert contract.protection_mode == "unreadable"
+    resumed = captured["managed_resume"]
+    assert resumed.issue_created_handoff.protection_mode == "unreadable"
+    assert any(
+        UNPROTECTED_OVERRIDE_TRAILER in " ".join(command)
+        and "protection=unreadable" in " ".join(command)
+        for command, _cwd in runner.commands
+    )
+    assert runner.dispatch_count == 0
+
+
+def _no_lifecycle_writes(runner):
+    commands = [command for command, _cwd in runner.commands]
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert _mutations(runner) == []
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command in commands)
+
+
+@pytest.mark.parametrize("lifecycle", ["draft-labeled", "draft-unlabeled", "ready-unlabeled"])
+def test_recovery_refuses_a_base_that_became_strict_before_any_mutation(tmp_path, lifecycle):
+    # A foreign plan hash passes recovery's deferred plan check; the strict
+    # activation path would never run the resume-audit gate that checks it.
+    runner = _recovery_runner(
+        [_unreadable_record(approved_plan_hash="b" * 64)],
+        scripted={_VARIABLE: _failed(PROXY_403)},
+        lifecycle=lifecycle,
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    with pytest.raises(AgentLoopError, match="live assessment is strict") as exc_info:
+        _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert "The PR was left unchanged" in str(exc_info.value)
+    _no_lifecycle_writes(runner)
+
+
+def test_run_pr_loop_refuses_strict_transition_with_foreign_plan_hash(tmp_path, monkeypatch):
+    runner = _recovery_runner(
+        [_unreadable_record(approved_plan_hash="b" * 64)],
+        scripted={_VARIABLE: _failed(PROXY_403)},
+        lifecycle="draft-unlabeled",
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+    config = _cloud_config(
+        tmp_path,
+        managed_ci_pr_mode=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci", "--allow-unreadable-protection",
+        ),
+    )
+    _stop_after_real_activation(monkeypatch)
+
+    with pytest.raises(AgentLoopError, match="live assessment is strict"):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    _no_lifecycle_writes(runner)
+
+
+def test_recovered_record_with_foreign_plan_hash_fails_the_activation_gate(tmp_path):
+    runner = _recovery_runner(
+        [_unreadable_record(approved_plan_hash="b" * 64)], lifecycle="draft-unlabeled",
+    )
+    config = _cloud_config(tmp_path, managed_ci_pr_mode=True)
+    handoff = _recover(runner, config)
+    assert handoff is not None and handoff.protection_mode == "unreadable"
+
+    with pytest.raises(AgentLoopError, match="no fully bound actor-owned issue-created authorization"):
+        activate_managed_ci(
+            runner, config=config, pr_number=7, metadata=_recovery_metadata(),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created", lifecycle=handoff.lifecycle,
+                issue_created_handoff=handoff,
+            ),
+        )
+
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert _mutations(runner) == []
+
+
+# --- known host comment footer (#1043) ---------------------------------------
+
+HOST_FOOTER = managed_ci.KNOWN_HOST_COMMENT_FOOTER
+_NEAR_MISS_SUFFIXES = (
+    HOST_FOOTER + HOST_FOOTER,
+    HOST_FOOTER + "\n",
+    "\n\n---\n_Generated by [Claude Code](http://claude.ai/code)_",
+    "\n\nextra prose",
+)
+
+
+def _footer_authorization_comment(body, *, comment_id=31):
+    return {"id": comment_id, "user": {"login": "agent-loop", "id": 1}, "body": body}
+
+
+def _read_authorization_records(tmp_path, comments):
+    runner = V2ManagedRunner(intent_comments=comments)
+    return managed_ci._authorization_comment_records(
+        runner, config=make_config(tmp_path, managed_ci_trusted_actor="agent-loop"),
+        pr_number=7, actor_login="agent-loop", actor_id=1,
+    )
+
+
+@pytest.mark.parametrize("kind", ["creation", "fresh", "continuity"])
+def test_footered_authorization_authenticates_like_a_clean_record(tmp_path, kind):
+    record = _authorization_record(kind)
+    body = str(format_issue_created_authorization_comment(record))
+
+    clean = _read_authorization_records(tmp_path, [_footer_authorization_comment(body)])
+    footered = _read_authorization_records(
+        tmp_path, [_footer_authorization_comment(body + HOST_FOOTER)]
+    )
+
+    assert clean == footered == [(31, record)]
+
+
+@pytest.mark.parametrize("suffix", _NEAR_MISS_SUFFIXES)
+def test_authorization_readers_reject_doubled_or_variant_footers(tmp_path, suffix):
+    body = str(format_issue_created_authorization_comment(_authorization_record("creation")))
+
+    with pytest.raises(AgentLoopError, match="authorization comment is malformed"):
+        _read_authorization_records(tmp_path, [_footer_authorization_comment(body + suffix)])
+
+
+def test_authorization_reader_rejects_footer_before_the_marker(tmp_path):
+    record = _authorization_record("creation")
+    label, _, marker = str(format_issue_created_authorization_comment(record)).partition("\n\n")
+    misplaced = label + HOST_FOOTER + "\n\n" + marker
+
+    with pytest.raises(AgentLoopError, match="authorization comment is malformed"):
+        _read_authorization_records(tmp_path, [_footer_authorization_comment(misplaced)])
+
+
+def test_authorization_parser_authenticates_the_whole_body_and_never_strips():
+    record = _authorization_record("fresh")
+    body = str(format_issue_created_authorization_comment(record))
+
+    assert parse_issue_created_authorization_comment(body) == record
+    # The pre-#878 marker-only rendering is still accepted, byte for byte.
+    assert parse_issue_created_authorization_comment(_authorization_marker(record)) == record
+    for tampered in (body + HOST_FOOTER, "Extra prose\n\n" + body, body + "\n", " " + body):
+        with pytest.raises(AgentLoopError, match="malformed"):
+            parse_issue_created_authorization_comment(tampered)
+
+
+def test_authenticated_comment_ingestion_strips_one_footer_before_authorization_parse(tmp_path):
+    import coding_review_agent_loop.github as github_module
+
+    record = _authorization_record("creation")
+    body = str(format_issue_created_authorization_comment(record))
+    config = make_config(tmp_path)
+
+    def envelope(text):
+        return github_module._authenticated_comment_from_rest(
+            {
+                "id": 31, "body": text, "user": {"login": "agent-loop", "id": 1},
+                "created_at": "2026-09-25T00:00:00Z", "updated_at": "2026-09-25T00:00:00Z",
+            },
+            surface="pr#7",
+            config=config,
+        )
+
+    assert parse_issue_created_authorization_comment(envelope(body + HOST_FOOTER).body) == record
+    doubled = envelope(body + HOST_FOOTER + HOST_FOOTER)
+    assert doubled.body == body + HOST_FOOTER
+    with pytest.raises(AgentLoopError, match="malformed"):
+        parse_issue_created_authorization_comment(doubled.body)
+
+
+class HostFooterRunner(V2ManagedRunner):
+    """A host that appends the known footer to chosen intent writes.
+
+    ``footer_states`` names the intent lifecycle states whose write the host
+    footers.  ``server_clock`` adds an ``updated_at`` to each write response;
+    ``envelope_created_at`` adds the comment's own creation time.
+    """
+
+    def __init__(
+        self, *, footer_states=(), server_clock=None, envelope_created_at=None,
+        after_write=None, **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.footer_states = set(footer_states)
+        self.server_clock = server_clock
+        self.envelope_created_at = envelope_created_at
+        self.after_write = after_write
+        self.release_calls = []
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        result = super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+        cmd = list(args)
+        endpoint = next((part for part in cmd if isinstance(part, str) and part.startswith("repos/")), "")
+        body = self._form_value(cmd, "body")
+        writing = body is not None and (
+            endpoint == "repos/OWNER/REPO/issues/7/comments"
+            or endpoint.startswith("repos/OWNER/REPO/issues/comments/")
+        )
+        if not writing or "AGENT_MANAGED_CI_INTENT_V2" not in body:
+            return result
+        envelope = json.loads(result.stdout)
+        state = json.loads(body.split("AGENT_MANAGED_CI_INTENT_V2 ", 1)[1].rsplit(" -->", 1)[0])["state"]
+        if state in self.footer_states:
+            envelope["body"] = body + HOST_FOOTER
+            for comment in self.intent_comments:
+                if comment.get("id") == envelope["id"]:
+                    comment["body"] = body + HOST_FOOTER
+        if self.server_clock is not None:
+            stamp = datetime.fromtimestamp(self.server_clock(), tz=timezone.utc)
+            envelope["updated_at"] = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if self.envelope_created_at is not None:
+            stamp = datetime.fromtimestamp(self.envelope_created_at, tz=timezone.utc)
+            envelope["created_at"] = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if self.after_write is not None:
+            self.after_write(self, state)
+        return CommandResult(result.args, result.cwd, json.dumps(envelope), "", 0)
+
+
+def _spy_release(monkeypatch):
+    calls = []
+
+    def release(*args, **kwargs):
+        calls.append(kwargs)
+        raise AssertionError("terminal managed-CI errors must not reach ordinary recovery")
+
+    monkeypatch.setattr(managed_ci, "_release_for_ordinary_recovery", release)
+    return calls
+
+
+def _intent_posts(runner):
+    return [
+        cmd for cmd, _cwd in runner.commands
+        if "repos/OWNER/REPO/issues/7/comments" in cmd and "POST" in cmd
+    ]
+
+
+def _authorized_resume():
+    return AuthenticatedManagedResume(
+        origin="issue-created", lifecycle="draft-labeled",
+        issue_created_handoff=_authorization_handoff(head=V2_HEAD),
+    )
+
+
+def test_rediscovery_adopts_a_footered_intent_only_when_the_workflow_admits_it(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    comment = v2_intent_comment(suffix=HOST_FOOTER)
+
+    capable = valid_v2_contract(host_footer_capable=True)
+    _ensure_v2_intent(
+        valid_v2_runner(intent_comments=[dict(comment)]), config=config, pr_number=7,
+        expected_head_sha=V2_HEAD, contract=capable,
+    )
+    assert (capable.intent_comment_id, capable.nonce) == (17, V2_NONCE)
+
+    older = valid_v2_contract()
+    runner = valid_v2_runner(intent_comments=[dict(comment)])
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=older)
+    # An older workflow would skip the footered comment, so it is not adopted.
+    assert older.intent_comment_id != 17 and older.nonce != V2_NONCE
+    assert len(_intent_posts(runner)) == 1
+
+
+@pytest.mark.parametrize("suffix", [HOST_FOOTER + HOST_FOOTER, HOST_FOOTER + "\n", HOST_FOOTER + " "])
+def test_rediscovery_skips_doubled_and_whitespace_footers(tmp_path, suffix):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(suffix=suffix)])
+    contract = valid_v2_contract(host_footer_capable=True)
+
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+
+    assert contract.intent_comment_id != 17 and contract.nonce != V2_NONCE
+
+
+@pytest.mark.parametrize(
+    ("comments", "reason"),
+    [
+        (
+            [v2_intent_comment(comment_id=17), v2_intent_comment(comment_id=18)],
+            "expected exactly one fresh intent",
+        ),
+        (
+            [
+                v2_intent_comment(comment_id=17),
+                {**v2_intent_comment(comment_id=18), "body": v2_intent_comment()["body"].replace(
+                    '"version": 2', '"version": 2, "extra": 1'
+                )},
+            ],
+            "invalid schema",
+        ),
+        (
+            [{**v2_intent_comment(), "body": (
+                f"Managed CI authorization for exact head {'c' * 40}.\n\n" + v2_intent_comment()["body"]
+            )}],
+            "visible intent line disagrees",
+        ),
+        ([v2_intent_comment(nonce="short")], "invalid nonce"),
+    ],
+)
+def test_rediscovery_fails_closed_on_a_candidate_the_workflow_fails(tmp_path, monkeypatch, comments, reason):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+    runner = valid_v2_runner(intent_comments=comments)
+    contract = valid_v2_contract(visible_intent_capable=True)
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match=reason):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert _intent_posts(runner) == []
+    assert runner.dispatch_count == 0
+    assert releases == []
+
+
+@pytest.mark.parametrize(
+    ("entry", "reason"),
+    [
+        ({"id": 40, "user": {"id": 5}, "body": "hello"}, "malformed comment author"),
+        ({"id": 40, "user": "someone", "body": "hello"}, "malformed comment author"),
+        ({"id": 40, "user": {"login": "agent-loop", "id": 99}, "body": "hello"}, "author ID drifted"),
+        ({"id": 40, "user": {"login": "agent-loop", "id": 1}, "body": None}, "body is not text"),
+        (
+            {"id": 40, "user": {"login": "agent-loop", "id": 1},
+             "body": "<!-- AGENT_MANAGED_CI_INTENT_V2 {not json} -->"},
+            "malformed JSON",
+        ),
+        (
+            {"id": 40, "user": {"login": "agent-loop", "id": 1},
+             "body": "<!-- AGENT_MANAGED_CI_INTENT_V2 [1] -->"},
+            "not an object",
+        ),
+        (
+            {"id": 40, "user": {"login": "agent-loop", "id": 1},
+             "body": "<!-- AGENT_MANAGED_CI_INTENT_V2 {\"version\": 1} -->"},
+            "unsupported intent version",
+        ),
+    ],
+)
+def test_nonce_independent_fatal_page_posts_nothing(tmp_path, entry, reason):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(intent_comments=[entry])
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match=reason):
+        _ensure_v2_intent(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD,
+            contract=valid_v2_contract(),
+        )
+    assert _intent_posts(runner) == []
+
+
+def test_restore_rejects_a_malformed_nonce():
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="malformed nonce"):
+        managed_ci._restore_v2_intent_fields(valid_v2_contract(), {"nonce": "nonce-1"})
+
+
+@pytest.mark.parametrize("mode", ["managed-pr", "issue-created-resume"])
+def test_non_dict_page_entry_reaches_rediscovery_through_the_api_seam(tmp_path, monkeypatch, mode):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_pr_mode=mode == "managed-pr",
+    )
+    releases = _spy_release(monkeypatch)
+    runner = valid_v2_runner(intent_comments=["not a comment", v2_intent_comment()])
+    contract = valid_v2_contract(
+        authenticated_resume=_authorized_resume() if mode == "issue-created-resume" else None,
+    )
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="malformed comment object"):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert _intent_posts(runner) == []
+    assert runner.dispatch_count == 0
+    assert releases == []
+
+
+def test_non_dict_entry_appearing_before_the_gate_blocks_dispatch(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+
+    def inject(runner, state):
+        if state == "dispatch-requested":
+            runner.intent_comments.append(None)
+
+    runner = HostFooterRunner(after_write=inject, base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD})
+    contract = valid_v2_contract(nonce=None)
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="malformed comment object"):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert runner.dispatch_count == 0
+    assert releases == []
+
+
+def test_zero_exit_empty_intent_page_is_uninspectable_not_an_empty_ledger(tmp_path, monkeypatch):
+    class EmptyBody(V2ManagedRunner):
+        def _run_locked(self, args, *, cwd, check, input_text=None):
+            endpoint = next((part for part in args if isinstance(part, str) and part.startswith("repos/")), "")
+            if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
+                cmd, cwd_path = self._record_command(args, cwd)
+                return CommandResult(cmd, cwd_path, "", "", 0)
+            return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = EmptyBody(base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD})
+    with pytest.raises(AgentLoopError, match="Unable to inspect managed-CI v2 intent history") as raised:
+        _ensure_v2_intent(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=valid_v2_contract(),
+        )
+    assert not isinstance(raised.value, managed_ci.ManagedCiIntentLedgerError)
+    assert _intent_posts(runner) == []
+
+    # At the gate, the same response is the generic inspection error, never a
+    # ledger verdict, and nothing is dispatched.
+    with pytest.raises(AgentLoopError, match="Unable to inspect managed-CI v2 intent history") as raised:
+        managed_ci._require_workflow_dispatch_authorization(
+            runner, config=config,
+            contract=valid_v2_contract(pr_number=7, intent_comment_id=17), patch_result=None,
+        )
+    assert not isinstance(raised.value, managed_ci.ManagedCiIntentLedgerError)
+    assert runner.dispatch_count == 0
+
+
+def test_footer_seen_only_on_intent_rediscovery_is_logged_once(tmp_path, monkeypatch):
+    import coding_review_agent_loop.github as github_module
+
+    lines = []
+    monkeypatch.setattr(github_module, "log", lambda _config, message: lines.append(message))
+    github_module.reset_host_footer_log_latch()
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(suffix=HOST_FOOTER)])
+    contract = valid_v2_contract(host_footer_capable=True)
+
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+
+    assert contract.intent_comment_id == 17
+    assert _intent_posts(runner) == []
+    assert len(lines) == 1 and "intent re-read" in lines[0]
+    # The raw page keeps its footer: the envelope mirror owns that form.
+    assert runner.intent_comments[0]["body"].endswith(HOST_FOOTER)
+
+    lines.clear()
+    github_module.reset_host_footer_log_latch()
+    _ensure_v2_intent(
+        valid_v2_runner(intent_comments=[v2_intent_comment()]), config=config, pr_number=7,
+        expected_head_sha=V2_HEAD, contract=valid_v2_contract(),
+    )
+    assert lines == []
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode"), [("", 1), (json.dumps({"message": "rate limited"}), 0), ("{not json", 0)]
+)
+def test_uninspectable_intent_page_keeps_the_generic_inspection_error(tmp_path, stdout, returncode):
+    class Unreadable(V2ManagedRunner):
+        def _run_locked(self, args, *, cwd, check, input_text=None):
+            endpoint = next((part for part in args if isinstance(part, str) and part.startswith("repos/")), "")
+            if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
+                cmd, cwd_path = self._record_command(args, cwd)
+                return CommandResult(cmd, cwd_path, stdout, "", returncode)
+            return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    with pytest.raises(AgentLoopError, match="Unable to inspect managed-CI v2 intent history") as raised:
+        _ensure_v2_intent(
+            Unreadable(), config=config, pr_number=7, expected_head_sha=V2_HEAD,
+            contract=valid_v2_contract(),
+        )
+    assert not isinstance(raised.value, managed_ci.ManagedCiIntentLedgerError)
+    # _api_list keeps its contract for every other caller.
+    runner = V2ManagedRunner(intent_comments=["not a comment"])
+    assert _api_list(runner, config, "repos/OWNER/REPO/issues/7/comments?per_page=100") is None
+
+
+def _page_for_router(runner):
+    return [[comment for comment in runner.intent_comments]]
+
+
+def _router_pr():
+    return {
+        "state": "open", "draft": True, "number": 7, "base": {"ref": "main"},
+        "head": {"sha": V2_HEAD, "ref": "agent-loop/managed-7", "repo": {"full_name": "OWNER/REPO"}},
+        "user": {"login": "agent-loop", "id": 1}, "labels": [{"name": MANAGED_LABEL}],
+    }
+
+
+def _route(runner, nonce):
+    return local_router.validate(
+        _router_pr(), _page_for_router(runner), "OWNER/REPO", "7", V2_HEAD, nonce,
+        "agent-loop", V2_REVISION, 1,
+    )
+
+
+def test_prepared_intent_is_recovered_in_place_then_authorized_at_the_gate(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+    runner = HostFooterRunner(base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD})
+    contract = valid_v2_contract(nonce=None)
+    # The first attempt posted its prepared intent and was interrupted before
+    # the dispatch-requested PATCH.
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+    prepared_id, nonce = contract.intent_comment_id, contract.nonce
+    with pytest.raises(ValueError, match="prepared intent is not a dispatch authorization"):
+        _route(runner, nonce)
+    verdict = managed_ci.classify_intent_page(
+        list(runner.intent_comments), requested_nonce=nonce, trusted_login="agent-loop",
+        trusted_id=1, visible_capable=False, host_footer_capable=False,
+        binding=managed_ci._intent_binding(contract, nonce=nonce),
+    )
+    assert verdict.outcome == "recoverable"
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+
+    assert contract.intent_comment_id == prepared_id and contract.nonce == nonce
+    assert len(_intent_posts(runner)) == 1
+    assert runner.dispatch_count == 1
+    assert contract.dispatch_issued is True
+    assert _route(runner, nonce)["state"] == "dispatch-requested"
+    assert releases == []
+
+
+def test_same_nonce_sibling_before_the_gate_blocks_dispatch(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+
+    def sibling(runner, state):
+        if state == "dispatch-requested":
+            original = runner.intent_comments[-1]
+            runner.intent_comments.append({**original, "id": original["id"] + 100})
+
+    runner = HostFooterRunner(after_write=sibling, base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD})
+
+    with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="exactly one fresh intent"):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD,
+            contract=valid_v2_contract(nonce=None),
+        )
+
+    assert runner.dispatch_count == 0
+    assert releases == []
+
+
+def test_adopted_contract_without_generation_recovers_prepared_intent_of_its_ledger(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(intent_comments=[v2_intent_comment(state="prepared", created_at=int(time.time()))])
+    contract = valid_v2_contract(intent_generation=None)
+
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract)
+
+    assert (contract.intent_comment_id, contract.intent_state) == (17, "prepared")
+    assert _intent_posts(runner) == []
+
+
+def test_fresh_generation_supersedes_an_earlier_prepared_intent(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = HostFooterRunner(
+        intent_comments=[v2_intent_comment(state="prepared", generation="earlier-generation")],
+        base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract(nonce=None, intent_generation="later-generation")
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+
+    assert contract.intent_comment_id != 17 and contract.nonce != V2_NONCE
+    assert runner.dispatch_count == 1
+    # The superseded intent is only a nonce mismatch for the new request.
+    assert _route(runner, contract.nonce)["generation"] == "later-generation"
+
+
+NOW = 1_800_000_000
+
+
+def _dispatch_validate(runner, *, current_time, nonce):
+    return dispatch_validator.validate_dispatch(
+        protocol="2", pr_number_text="7", expected_head=V2_HEAD, nonce=nonce,
+        repo="OWNER/REPO", ref="refs/heads/main", configured_actor="agent-loop",
+        initiating_actor="agent-loop", rerun_actor="agent-loop", current_run_id="200",
+        current_run_attempt="1", current_time=current_time,
+        api_json=lambda path: {
+            "users/agent-loop": {"login": "agent-loop", "id": 1},
+            "repos/OWNER/REPO": {"full_name": "OWNER/REPO"},
+            "repos/OWNER/REPO/pulls/7": _router_pr(),
+            "repos/OWNER/REPO/commits/main": {"sha": V2_REVISION},
+        }[path],
+        api_pages=lambda path: _page_for_router(runner),
+        validate=local_router.validate,
+    )
+
+
+def _freshness_run(tmp_path, monkeypatch, *, created_at, local, server, envelope_created_at=None):
+    monkeypatch.setattr(managed_ci.time, "time", lambda: local)
+    runner = HostFooterRunner(
+        intent_comments=[v2_intent_comment(state="prepared", created_at=created_at)],
+        server_clock=None if server is None else (lambda: server),
+        envelope_created_at=envelope_created_at,
+        base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract(nonce=None)
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    return runner, contract, config
+
+
+@pytest.mark.parametrize(
+    ("created_at", "control"),
+    [(NOW - 1200, "managed intent record is stale"), (NOW + 1200, "too far in the future")],
+)
+def test_recovered_intent_is_renewed_in_place_before_dispatch(tmp_path, monkeypatch, created_at, control):
+    releases = _spy_release(monkeypatch)
+    runner, contract, config = _freshness_run(
+        tmp_path, monkeypatch, created_at=created_at, local=NOW, server=NOW
+    )
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+
+    assert contract.intent_comment_id == 17 and contract.nonce == V2_NONCE
+    assert _intent_posts(runner) == []
+    assert runner.dispatch_count == 1
+    assert runner.intent_snapshots[-1]["created_at"] == NOW
+    assert _dispatch_validate(runner, current_time=NOW + 60, nonce=V2_NONCE)["record"]["created_at"] == NOW
+    # Without the renewal the workflow's dispatch validator rejects the record.
+    stale = json.loads(json.dumps(runner.intent_comments))
+    stale[0]["body"] = stale[0]["body"].replace(f'"created_at":{NOW}', f'"created_at":{created_at}')
+    runner.intent_comments = stale
+    with pytest.raises(ValueError, match=control):
+        _dispatch_validate(runner, current_time=NOW + 60, nonce=V2_NONCE)
+    assert releases == []
+
+
+@pytest.mark.parametrize("skew", [600, -720])
+def test_skewed_local_clock_fails_the_freshness_gate_without_dispatch(tmp_path, monkeypatch, skew):
+    releases = _spy_release(monkeypatch)
+    runner, contract, config = _freshness_run(
+        tmp_path, monkeypatch, created_at=NOW, local=NOW + skew, server=NOW
+    )
+
+    with pytest.raises(managed_ci.ManagedCiIntentFreshnessError, match="server updated_at"):
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert runner.dispatch_count == 0
+    assert releases == []
+    if skew > 0:
+        with pytest.raises(ValueError, match="too far in the future"):
+            _dispatch_validate(runner, current_time=NOW, nonce=V2_NONCE)
+
+
+def test_patch_without_updated_at_uses_local_time_not_the_comment_creation_time(tmp_path, monkeypatch):
+    releases = _spy_release(monkeypatch)
+    runner, contract, config = _freshness_run(
+        tmp_path, monkeypatch, created_at=NOW - 1200, local=NOW, server=None,
+        envelope_created_at=NOW - 1200,
+    )
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+
+    assert runner.dispatch_count == 1
+    assert runner.intent_snapshots[-1]["created_at"] == NOW
+    assert _dispatch_validate(runner, current_time=NOW + 60, nonce=V2_NONCE)["record"]["state"] == "dispatch-requested"
+    # Control: the comment's own creation time would place the renewed record
+    # 20 minutes in the future and fail the gate, so it is never used as T.
+    assert (NOW - 1200) - NOW < -managed_ci.INTENT_MAX_FUTURE_SKEW_SECONDS
+    assert releases == []
+
+
+def test_attach_path_patch_keeps_created_at(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = valid_v2_runner(
+        workflow_runs=[valid_v2_run(run_id=101, status="in_progress", conclusion=None)],
+        intent_comments=[v2_intent_comment(
+            run_id=100, run_attempt=1, state="completed", created_at=5,
+            terminal_run_id=100, terminal_run_attempt=1,
+            terminal_attempts=((100, 1),), terminal_outcome="no-status",
+        )],
+    )
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=valid_v2_contract()
+    )
+
+    assert runner.dispatch_count == 0
+    assert [snapshot["created_at"] for snapshot in runner.intent_snapshots] == [5, 5]
+
+
+@pytest.mark.parametrize("footered_state", ["prepared", "dispatch-requested"])
+def test_older_workflow_guard_stops_before_dispatch(tmp_path, monkeypatch, footered_state):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+    runner = HostFooterRunner(
+        footer_states={footered_state}, base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract(nonce=None, authenticated_resume=_authorized_resume())
+
+    with pytest.raises(managed_ci.ManagedCiHostFooterIncompatibleError) as raised:
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert raised.value.phase == "pre-dispatch"
+    assert managed_ci.HOST_FOOTER_INTENT_MARKER in str(raised.value)
+    assert "No managed-CI run was dispatched" in str(raised.value)
+    assert runner.dispatch_count == 0
+    assert contract.dispatch_issued is False
+    assert contract.intent_state == ("prepared" if footered_state == "dispatch-requested" else None)
+    assert releases == []
+
+
+def test_older_workflow_guard_after_dispatch_on_the_attached_patch(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+    releases = _spy_release(monkeypatch)
+
+    def run_appears(runner, state):
+        if state == "dispatch-requested":
+            runner.workflow_runs = [valid_v2_run(
+                run_id=300, status="in_progress", conclusion=None,
+                name=f"managed-ci-v2 nonce={runner.intent_snapshots[-1]['nonce']}",
+            )]
+
+    runner = HostFooterRunner(
+        footer_states={"attached"}, after_write=run_appears,
+        base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract(nonce=None)
+
+    with pytest.raises(managed_ci.ManagedCiHostFooterIncompatibleError) as raised:
+        _dispatch_v2_qualification(
+            runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+        )
+
+    assert raised.value.phase == "post-dispatch"
+    assert "is not cancelled" in str(raised.value)
+    assert runner.dispatch_count == 1
+    assert contract.intent_state == "dispatch-requested"
+    assert not any("cancel" in " ".join(cmd) for cmd, _cwd in runner.commands)
+    assert releases == []
+
+
+def test_older_workflow_guard_after_dispatch_claims_no_qualification(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    runner = HostFooterRunner(
+        footer_states={"completed"},
+        workflow_runs=[valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="success")],
+        intent_comments=[v2_intent_comment(run_id=100, run_attempt=1, state="attached")],
+        pr_status_payload={"statuses": [{
+            "context": FINAL_CONTEXT,
+            "state": "success",
+            "description": f"nonce={V2_NONCE};run_id=100;attempt=1",
+            "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
+            "creator": {"login": "github-actions[bot]", "id": 41898282},
+        }]},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+        base_sha=V2_REVISION, pr_payload={"headRefOid": V2_HEAD},
+    )
+    contract = valid_v2_contract()
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha=V2_HEAD, contract=contract
+    )
+    assert runner.dispatch_count == 0 and contract.attached_run_id == 100
+
+    with pytest.raises(managed_ci.ManagedCiHostFooterIncompatibleError) as raised:
+        wait_for_final_qualification(
+            runner, config=config, pr_number=7,
+            metadata=replace(metadata(), head_sha=V2_HEAD), contract=contract,
+        )
+
+    assert raised.value.phase == "post-dispatch"
+    assert contract.intent_state != "completed"
+    assert runner.dispatch_count == 0
+
+
+# --- #1047: qualified ready/labeled PR through real recovery and activation ---
+
+
+def _qualified_ready_labeled_runner(origin="issue-created", **kwargs):
+    """A strict managed PR left ready and labeled by manual qualification.
+
+    An issue-created PR carries the canonical closing reference; a
+    source-managed PR carries the loop-created source record instead.
+    """
+    if origin == "source-managed":
+        from coding_review_agent_loop.managed_pr import _source_marker
+
+        body = str(_source_marker(source_branch="feature/source", source_sha="source-sha"))
+    else:
+        body = "Fixes #643"
+    return ManualQualificationRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        issue_payload={"number": 643},
+        pr_payload={
+            "number": 7,
+            "state": "OPEN",
+            "url": "https://github.com/OWNER/REPO/pull/7",
+            "title": "Managed CI",
+            "body": body,
+            "headRefName": "agent-loop/managed-643",
+            "baseRefName": "main",
+            "headRefOid": "abc123",
+            "comments": [],
+            "reviews": [],
+        },
+        rest_pr={
+            "state": "open",
+            "draft": False,
+            "labels": [{"name": MANAGED_LABEL}],
+            "body": body,
+        },
+        issue_events=[label_event()],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        **kwargs,
+    )
+
+
+def _lifecycle_writes(runner):
+    """Every label, readiness, dispatch and merge write, in command order."""
+    writes = []
+    for command, _cwd in runner.commands:
+        if command[:5] == [
+            "gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+        ]:
+            writes.append("label-delete")
+        elif command[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]:
+            writes.append("label-post")
+        elif command[:3] == ["gh", "pr", "ready"]:
+            writes.append("ready-undo" if "--undo" in command else "ready")
+        elif command[:3] == ["gh", "pr", "merge"]:
+            writes.append("merge")
+        elif any(str(part).endswith("/actions/workflows/ci.yml/dispatches") for part in command):
+            writes.append("dispatch")
+    return writes
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_abort(
+    tmp_path, monkeypatch, origin,
+):
+    runner = _qualified_ready_labeled_runner(
+        origin,
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    )
+    captured = {}
+    real_activate = orchestrator.activate_managed_ci
+    real_source_auth = orchestrator.authenticate_source_managed_resume
+    source_auth_calls = []
+
+    def source_auth(*args, **kwargs):
+        # Record the live state the real source-managed classifier observed.
+        source_auth_calls.append(
+            (_lifecycle_writes(runner), runner.rest_pr["draft"], list(runner.rest_pr["labels"]))
+        )
+        return real_source_auth(*args, **kwargs)
+
+    def activate(*args, **kwargs):
+        captured["resume"] = kwargs.get("managed_resume")
+        captured["writes_before"] = _lifecycle_writes(runner)
+        captured["contract"] = real_activate(*args, **kwargs)
+        return captured["contract"]
+
+    def abort_dispatch(*args, **kwargs):
+        # The run fails after review and before publication.
+        raise AgentLoopError("dispatch aborted")
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate)
+    monkeypatch.setattr(orchestrator, "authenticate_source_managed_resume", source_auth)
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", abort_dispatch)
+    monkeypatch.setattr(
+        orchestrator, "publish_manual_v2_qualification",
+        lambda *a, **k: pytest.fail("publication must not run"),
+    )
+
+    with pytest.raises(AgentLoopError, match="dispatch aborted"):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    # Entry released the retained label before recovery classified the PR,
+    # so the real classifier saw ready/unlabeled.
+    assert captured["writes_before"] == ["label-delete"]
+    assert captured["resume"].lifecycle == "ready-unlabeled-reentry"
+    contract = captured["contract"]
+    assert contract is not None and contract.activation_path == "managed"
+    assert captured["resume"].origin == origin
+    assert contract.origin == origin
+    if origin == "source-managed":
+        # Real source-managed authentication ran once, after the entry
+        # release, and saw the ready/unlabeled state.
+        assert source_auth_calls == [(["label-delete"], False, [])]
+        assert captured["resume"].source_branch == "feature/source"
+    else:
+        assert source_auth_calls == []
+    assert orchestrator._preserve_issue_created_managed_suppression(
+        contract, active_exception=AgentLoopError("dispatch aborted"),
+    )
+    # Exactly one release, then the existing re-entry: undo readiness first,
+    # then reapply the label; the aborted run keeps it for exact resume.
+    assert _lifecycle_writes(runner) == ["label-delete", "ready-undo", "label-post"]
+    assert runner.rest_pr["draft"] is True
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+
+    # The next invocation resumes through draft/labeled; normalization leaves
+    # the preserved draft untouched.
+    def stop_at_activation(*args, **kwargs):
+        raise _ActivationReached(kwargs.get("managed_resume"))
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", stop_at_activation)
+    before = len(runner.commands)
+    with pytest.raises(_ActivationReached) as reached:
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    assert reached.value.args[0].lifecycle == "draft-labeled"
+    assert reached.value.args[0].origin == origin
+    later = [command for command, _cwd in runner.commands[before:]]
+    assert not any(command[:4] == ["gh", "api", "--method", "DELETE"] for command in later)
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+
+
+def test_m1047_real_implicit_invocation_releases_then_stops_with_retry_command(
+    tmp_path, monkeypatch,
+):
+    runner = _qualified_ready_labeled_runner()
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    monkeypatch.setattr(
+        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    )
+
+    with pytest.raises(AgentLoopError, match="ready/unlabeled re-entry state") as raised:
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    assert "It was left unchanged; rerun with explicit `--managed-ci`" in str(raised.value)
+    # One entry release, then the implicit path stops with the PR ready and
+    # unlabeled: no undo, relabel, dispatch or merge.
+    assert _lifecycle_writes(runner) == ["label-delete"]
+    assert runner.rest_pr["draft"] is False
+    assert runner.rest_pr["labels"] == []
+
+
+class _RefusingStatusRunner:
+    """A runner whose commit-status write is refused, as by a host proxy (#1052)."""
+
+    def __init__(self, stderr):
+        self.stderr = stderr
+        self.commands = []
+
+    def run(self, args, *, cwd=None, check=True, **kwargs):
+        self.commands.append(list(args))
+        return subprocess.CompletedProcess(args, 1, "", self.stderr)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Write access to this GitHub API path is not permitted through this proxy. (HTTP 403)\n",
+        "",
+    ],
+)
+def test_refused_round_readiness_is_logged_and_does_not_abort(tmp_path, capsys, stderr):
+    config = replace(make_config(tmp_path, auto_merge=True), quiet=False)
+    runner = _RefusingStatusRunner(stderr)
+
+    assert publish_round_readiness(runner, config=config, head_sha="abc123") is False
+
+    assert runner.commands[-1][4] == "repos/OWNER/REPO/statuses/abc123"
+    err = capsys.readouterr().err
+    assert f"could not publish the non-required `{READINESS_CONTEXT}` status for abc123" in err
+    assert ("not permitted through this proxy" in err) if stderr else ("exit 1" in err)
+
+
+# --- #1065: a fresh grant supersedes accumulated unbound authorization records ---
+
+_PLAN_1065 = "a" * 64
+
+
+def _stale_unreadable_records():
+    """Two actor-owned grants from an unreadable-protection host, neither at the live head."""
+    return [
+        _unreadable_record(head_sha="old-1", approved_plan_hash=_PLAN_1065),
+        _unreadable_record(
+            kind="fresh", head_sha="old-2", nonce="second", approved_plan_hash=_PLAN_1065,
+        ),
+    ]
+
+
+def _stale_record_comments(records, *, first_id=41):
+    return [
+        {
+            "id": first_id + index,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": str(format_issue_created_authorization_comment(record)),
+        }
+        for index, record in enumerate(records)
+    ]
+
+
+def _fresh_1065(runner, config):
+    return authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643", body="Fixes #643"),
+        approved_plan_hash=_PLAN_1065,
+    )
+
+
+def test_m1065_fresh_authorization_supersedes_stale_conflicting_records(tmp_path):
+    # Live protection now reads voluntary; both prior grants recorded unreadable
+    # and neither reaches the live head.  Previously this refused outright.
+    runner = CloudAuthorizationRunner(
+        scripted={},
+        issue_events=[label_event()],
+        intent_comments=_stale_record_comments(_stale_unreadable_records()),
+    )
+    config = _cloud_config(tmp_path)
+
+    handoff = _fresh_1065(runner, config)
+
+    assert handoff.authorization_kind == "fresh"
+    assert handoff.protection_mode == "voluntary"
+    assert handoff.head_sha == "abc123"
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.superseded_comment_ids == (41, 42)
+    assert record.predecessor_head is None and record.predecessor_comment_id is None
+    # The superseded records are retired, not deleted.
+    assert [item["id"] for item in runner.intent_comments[:2]] == [41, 42]
+
+    # A rerun reuses the superseding grant instead of appending another record.
+    posted = len(runner.intent_comments)
+    again = _fresh_1065(runner, config)
+    assert again.authorization_comment_id == handoff.authorization_comment_id
+    assert len(runner.intent_comments) == posted
+
+    # The resume audit and the plan binding both see one live-head terminal.
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123",
+        expected_handoff=handoff, expected_protection="voluntary",
+        require_actor_owned_label_event=True,
+    )
+    assert audit is not None
+    assert audit[0] == handoff.authorization_comment_id
+    managed_ci.verify_managed_pr_plan_binding(
+        runner, config=config, pr_number=7, issue_number=643,
+        live_head="abc123", approved_plan_hash=_PLAN_1065,
+    )
+
+
+def test_m1065_fresh_authorization_still_refuses_non_protection_conflicts(tmp_path):
+    stale = _stale_unreadable_records()
+    stale[1] = replace(stale[1], label_event_id=999)
+    runner = CloudAuthorizationRunner(
+        scripted={},
+        issue_events=[label_event()],
+        intent_comments=_stale_record_comments(stale),
+    )
+
+    with pytest.raises(AgentLoopError, match="conflicting actor-owned record"):
+        _fresh_1065(runner, _cloud_config(tmp_path))
+
+    assert len(runner.intent_comments) == 2
+
+
+def test_m1065_recovery_after_supersession_uses_the_superseding_grant(tmp_path):
+    superseding = ManagedCiIssueAuthorization(
+        kind="fresh", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="fresh",
+        label_event_id=101, approved_plan_hash=_PLAN_1065, superseded_comment_ids=(41, 42),
+    )
+    runner = _recovery_runner(_stale_unreadable_records() + [superseding], scripted={})
+
+    handoff = _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert handoff is not None
+    assert handoff.protection_mode == "voluntary"
+    assert _mutations(runner) == []
+
+
+def test_m1065_supersession_is_scoped_to_earlier_same_scope_records():
+    base = _unreadable_record(approved_plan_hash=_PLAN_1065)
+    foreign = replace(base, issue_number=644)
+    later = replace(base, head_sha="later")
+    fresh = replace(
+        base, kind="fresh", nonce="fresh", superseded_comment_ids=(41, 42, 44),
+    )
+    ids = managed_ci._superseded_authorization_ids(
+        [(41, base), (42, foreign), (43, fresh), (44, later)]
+    )
+    assert ids == frozenset({41})
+    # A creation checkpoint never supersedes.
+    assert managed_ci._superseded_authorization_ids(
+        [(41, base), (43, replace(fresh, kind="creation"))]
+    ) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("kind", "superseded", "extra"),
+    [
+        ("creation", [41], {}),
+        ("fresh", [42, 41], {}),
+        ("fresh", [41, 41], {}),
+        ("fresh", [], {}),
+        ("fresh", [0], {}),
+        ("fresh", [True], {}),
+    ],
+)
+def test_m1065_parser_rejects_invalid_supersession_fields(kind, superseded, extra):
+    payload = _unreadable_record(kind=kind).to_payload()
+    payload["superseded_comment_ids"] = superseded
+    payload.update(extra)
+    with pytest.raises(AgentLoopError):
+        parse_issue_created_authorization_comment(_encoded_authorization(payload))
+
+
+def test_m1065_superseding_record_round_trips():
+    record = _unreadable_record(kind="fresh", superseded_comment_ids=(41, 42))
+    parsed = parse_issue_created_authorization_comment(
+        str(format_issue_created_authorization_comment(record))
+    )
+    assert parsed == record
+
+
+def test_m1065_fresh_authorization_supersedes_same_protection_unbound_records(tmp_path):
+    # Both prior grants match the live protection, base, actor, label event and
+    # plan, but neither head is an ancestor of the live head.
+    stale = [
+        replace(
+            record, protection="voluntary", waiver="allow-unprotected-managed-ci",
+        )
+        for record in _stale_unreadable_records()
+    ]
+    runner = CloudAuthorizationRunner(
+        scripted={},
+        issue_events=[label_event()],
+        intent_comments=_stale_record_comments(stale),
+    )
+    runner.compare_payload = {
+        "status": "diverged",
+        "base_commit": {"sha": "old"},
+        "merge_base_commit": {"sha": "other"},
+    }
+    config = _cloud_config(tmp_path)
+
+    handoff = _fresh_1065(runner, config)
+
+    assert handoff.authorization_kind == "fresh"
+    assert handoff.protection_mode == "voluntary"
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.superseded_comment_ids == (41, 42)
+    assert record.predecessor_head is None
+
+    posted = len(runner.intent_comments)
+    again = _fresh_1065(runner, config)
+    assert again.authorization_comment_id == handoff.authorization_comment_id
+    assert len(runner.intent_comments) == posted
+
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123",
+        expected_handoff=handoff, expected_protection="voluntary",
+        require_actor_owned_label_event=True,
+    )
+    assert audit is not None
+    assert audit[0] == handoff.authorization_comment_id
+    managed_ci.verify_managed_pr_plan_binding(
+        runner, config=config, pr_number=7, issue_number=643,
+        live_head="abc123", approved_plan_hash=_PLAN_1065,
+    )
+
+
+# --- #1069: ordinary continuity supersedes this actor's unbound records ---
+
+
+def _continuity_1069_runner(extra_records):
+    root = _unreadable_record(
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="nonce-643",
+    )
+    comments = [
+        {"id": 41, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(root))},
+    ]
+    comments.extend(_stale_record_comments(extra_records, first_id=42))
+    comments.extend([
+        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="next-head", round_number=2),
+    ])
+    runner = AuthorizationCommentRunner(issue_events=[label_event()], intent_comments=comments)
+    runner.rest_pr["head"]["sha"] = "next-head"
+    return runner
+
+
+def _continue_1069(runner, config, handoff, *, predecessor, new_head, rounds):
+    return publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=handoff, predecessor_head=predecessor,
+        new_head=new_head, round_comment_ids=rounds,
+    )
+
+
+def _ancestors_1069(monkeypatch, ancestors):
+    monkeypatch.setattr(
+        managed_ci, "_github_proves_descendant",
+        lambda _runner, *, config, predecessor_head, live_head: predecessor_head in ancestors,
+    )
+
+
+def test_m1069_resume_across_head_advance_supersedes_stranded_record(tmp_path, monkeypatch):
+    # An interrupted earlier attempt left a compatible grant at a head that the
+    # live history no longer contains.
+    stray = _unreadable_record(
+        kind="fresh", head_sha="stray-head", nonce="stray",
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+    )
+    runner = _continuity_1069_runner([stray])
+    _ancestors_1069(monkeypatch, {"abc123", "next-head"})
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = replace(_authorization_handoff(), authorization_comment_id=41)
+
+    first = _continue_1069(
+        runner, config, handoff, predecessor="abc123", new_head="next-head", rounds=(88, 89),
+    )
+    first_record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert first_record is not None
+    assert first_record.kind == "continuity"
+    assert first_record.predecessor_comment_id == 41
+    assert first_record.superseded_comment_ids == (42,)
+    # Nothing is deleted: the stranded record stays as history.
+    assert 42 in [item["id"] for item in runner.intent_comments]
+
+    # A second resume after another head advance extends the live chain and
+    # has nothing left to retire; it does not append a competing record.
+    runner.intent_comments.extend([
+        _round_comment(200, role="reviewer", subject="next-head", round_number=2, state="blocking"),
+        _round_comment(201, role="coder", subject="third-head", round_number=3),
+    ])
+    runner.rest_pr["head"]["sha"] = "third-head"
+    second = _continue_1069(
+        runner, config, first, predecessor="next-head", new_head="third-head", rounds=(200, 201),
+    )
+    second_record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert second_record is not None
+    assert second_record.predecessor_comment_id == first.authorization_comment_id
+    assert second_record.superseded_comment_ids == ()
+
+    live = managed_ci._authorization_comment_records(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+    )
+    assert [comment_id for comment_id, _record in live] == [
+        41, first.authorization_comment_id, second.authorization_comment_id,
+    ]
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="third-head",
+    )
+    assert audit is not None
+    assert audit[0] == second.authorization_comment_id
+
+
+def test_m1069_continuity_supersedes_only_compatible_unbound_records(tmp_path, monkeypatch):
+    voluntary = dict(protection="voluntary", waiver="allow-unprotected-managed-ci")
+    extra = [
+        # 42: compatible, cannot chain to the new head -> retired.
+        _unreadable_record(kind="fresh", head_sha="stray-head", nonce="a", **voluntary),
+        # 43: recorded a different protection -> kept; recovery adjudicates it.
+        _unreadable_record(kind="fresh", head_sha="old-unreadable", nonce="b"),
+        # 44: foreign managed-label provenance -> not merely stranded; kept.
+        _unreadable_record(
+            kind="fresh", head_sha="foreign-label", nonce="c", label_event_id=999, **voluntary,
+        ),
+        # 45: a different approved plan -> kept.
+        _unreadable_record(
+            kind="fresh", head_sha="other-plan", nonce="d", approved_plan_hash="b" * 64,
+            **voluntary,
+        ),
+        # 46: compatible and its head is an ancestor of the new head -> kept.
+        _unreadable_record(kind="fresh", head_sha="ancestor-head", nonce="e", **voluntary),
+    ]
+    runner = _continuity_1069_runner(extra)
+    _ancestors_1069(monkeypatch, {"abc123", "ancestor-head"})
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = replace(_authorization_handoff(), authorization_comment_id=41)
+
+    _continue_1069(
+        runner, config, handoff, predecessor="abc123", new_head="next-head", rounds=(88, 89),
+    )
+
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.superseded_comment_ids == (42,)
+
+
+def _discarded_child_1069(head):
+    return _unreadable_record(
+        kind="continuity", head_sha=head, nonce="child",
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        predecessor_head="abc123", predecessor_comment_id=41, round_comment_ids=(88, 89),
+    )
+
+
+def test_m1069_discarded_continuity_child_is_retired_not_a_fork(tmp_path, monkeypatch):
+    # An interrupted attempt authorized abc123 -> discarded-head; the branch
+    # then returned to abc123 and the next coder turn produced next-head.
+    runner = _continuity_1069_runner([_discarded_child_1069("discarded-head")])
+    _ancestors_1069(monkeypatch, {"abc123"})
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    continued = _continue_1069(
+        runner, config, replace(_authorization_handoff(), authorization_comment_id=41),
+        predecessor="abc123", new_head="next-head", rounds=(88, 89),
+    )
+
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.predecessor_comment_id == 41
+    assert record.superseded_comment_ids == (42,)
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="next-head",
+    )
+    assert audit is not None
+    assert audit[0] == continued.authorization_comment_id
+
+
+def test_m1069_child_that_reaches_the_new_head_still_refuses_as_fork(tmp_path, monkeypatch):
+    runner = _continuity_1069_runner([_discarded_child_1069("middle-head")])
+    _ancestors_1069(monkeypatch, {"abc123", "middle-head"})
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    posted = len(runner.intent_comments)
+
+    with pytest.raises(AgentLoopError, match="forked predecessor"):
+        _continue_1069(
+            runner, config, replace(_authorization_handoff(), authorization_comment_id=41),
+            predecessor="abc123", new_head="next-head", rounds=(88, 89),
+        )
+    assert len(runner.intent_comments) == posted
+
+
+def test_m1069_ordinary_recovery_admits_same_protection_stranded_record(tmp_path):
+    # The ordinary resume must get past recovery for a continuity round to
+    # retire the stranded record at all.
+    stray = _unreadable_record(kind="fresh", head_sha="stray-head", nonce="stray")
+    runner = _recovery_runner([_unreadable_record(), stray])
+
+    handoff = _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+
+    assert handoff is not None
+    assert handoff.protection_mode == "unreadable"
+    assert _mutations(runner) == []
+
+
+def test_m1069_protection_disagreement_is_left_to_recovery_refusal(tmp_path):
+    # A record whose protection differs is not ordinary-path history: recovery
+    # refuses before any continuity round, and fresh adjudicates the state.
+    stray = _unreadable_record(
+        kind="fresh", head_sha="stray-head", nonce="stray",
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+    )
+    runner = _recovery_runner([_unreadable_record(), stray])
+
+    with pytest.raises(AgentLoopError, match="refused"):
+        _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
+    assert _mutations(runner) == []
+
+
+def test_m1069_failed_comparison_keeps_the_record(tmp_path, monkeypatch):
+    stray = _unreadable_record(
+        kind="fresh", head_sha="stray-head", nonce="stray",
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+    )
+    runner = _continuity_1069_runner([stray])
+
+    def unavailable(_runner, *, config, predecessor_head, live_head):
+        raise AgentLoopError("Managed-CI API request failed: compare.")
+
+    monkeypatch.setattr(managed_ci, "_github_proves_descendant", unavailable)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    _continue_1069(
+        runner, config, replace(_authorization_handoff(), authorization_comment_id=41),
+        predecessor="abc123", new_head="next-head", rounds=(88, 89),
+    )
+
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.superseded_comment_ids == ()
+
+
+def test_m1069_continuity_supersession_is_honored_and_round_trips():
+    base = _unreadable_record()
+    continuity = replace(
+        base, kind="continuity", head_sha="next", nonce="c", predecessor_head="abc123",
+        predecessor_comment_id=40, round_comment_ids=(88, 89), superseded_comment_ids=(41,),
+    )
+    assert parse_issue_created_authorization_comment(
+        str(format_issue_created_authorization_comment(continuity))
+    ) == continuity
+    assert managed_ci._superseded_authorization_ids(
+        [(40, base), (41, replace(base, head_sha="stray")), (43, continuity)]
+    ) == frozenset({41})

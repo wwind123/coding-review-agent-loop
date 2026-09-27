@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping, Sequence, TypeVar
@@ -46,6 +46,10 @@ from .test_workers import (
     WorkerDecision,
     analyze_worker_report,
     apply_worker_budget,
+    host_capacity_busy_message,
+    host_sharing_enabled,
+    ENV_WORKER_RESERVATION,
+    host_capacity,
     terminate_process_group_descendants,
     worker_budget_busy_message,
     worker_lane_identity,
@@ -301,6 +305,10 @@ class _HeldTestLocks:
         self._worker_lock = worker_lock
         self._decision = decision
 
+    def record_process_group(self, pgid: int) -> None:
+        if self._worker_lock is not None:
+            self._worker_lock.record_process_group(pgid)
+
     def retain_worker_lock_until_group_exits(self, pgid: int) -> None:
         if self._worker_lock is not None:
             self._worker_lock.hold_until_group_exits(pgid)
@@ -396,10 +404,11 @@ def run_foreground_test(
                 except BaseException:
                     handle.close()
                     raise
+        base_environment = spawn_environment if spawn_environment is not None else dict(os.environ)
         try:
             decision = apply_worker_budget(
                 cmd,
-                spawn_environment if spawn_environment is not None else dict(os.environ),
+                base_environment,
                 cwd,
                 worker_budget,
             )
@@ -460,6 +469,63 @@ def run_foreground_test(
                 wrapper_bootstrap, "not-attempted", "not-started", message,
                 health_provenance,
             )
+        if host_sharing_enabled(invocation_values):
+            # Issue #987: other loops on this host share one worker pool.
+            capacity = host_capacity(worker_budget)
+            try:
+                granted = worker_lock.reserve_host_workers(worker_budget.workers, capacity)
+            except BaseException:
+                worker_lock.close()
+                lane_lock.close()
+                if handle is not None:
+                    handle.close()
+                if decision is not None:
+                    decision.cleanup()
+                raise
+            if granted == 0:
+                worker_lock.close()
+                lane_lock.close()
+                if handle is not None:
+                    handle.close()
+                if decision is not None:
+                    decision.cleanup()
+                message = host_capacity_busy_message(worker_budget, capacity)
+                notify(message)
+                return ForegroundTestResult(
+                    cmd, cwd, "worker-budget-busy", WORKER_BUDGET_BUSY_EXIT_CODE,
+                    0.0, timeout_seconds, message, None, True,
+                    wrapper_bootstrap, "not-attempted", "not-started", message,
+                    health_provenance,
+                )
+            if granted < worker_budget.workers:
+                notify(
+                    f"agent-loop worker budget: other agent-loop runs on this host hold part of "
+                    f"the shared test-worker capacity ({capacity.describe()}); this command is "
+                    f"limited to {granted} "
+                    f"worker(s) instead of {worker_budget.workers}"
+                )
+                shared_budget = replace(worker_budget, workers=granted, limiting_factor="host-shared")
+                assert decision is not None
+                decision.cleanup()
+                try:
+                    decision = apply_worker_budget(
+                        requested_cmd,
+                        base_environment,
+                        cwd,
+                        shared_budget,
+                    )
+                except BaseException:
+                    worker_lock.close()
+                    lane_lock.close()
+                    if handle is not None:
+                        handle.close()
+                    raise
+                cmd = list(decision.argv)
+                spawn_environment = decision.env
+            if worker_lock.reservation_token is not None and spawn_environment is not None:
+                spawn_environment = {
+                    **spawn_environment, ENV_WORKER_RESERVATION: worker_lock.reservation_token,
+                }
     # Command lane first, worker-budget lock second; every later release
     # path closes both in reverse order.
     lane_lock = _HeldTestLocks(lane_lock, worker_lock, decision)
@@ -556,6 +622,18 @@ def run_foreground_test(
             # directory handle is still private to this parent process.
             spawn_cwd = "/"
             spawn_preexec = lambda fd=cwd_fd: os.fchdir(fd)
+        anchor = worker_lock.launch_anchor() if worker_lock is not None else None
+        if anchor is not None:
+            # Issue #987: the child keeps the reservation live from fork
+            # until it has recorded its own process group.
+            anchor_fd, anchor_preexec = anchor
+            pass_fds = (*pass_fds, anchor_fd)
+            chdir_preexec = spawn_preexec
+
+            def spawn_preexec(chdir=chdir_preexec, anchor=anchor_preexec) -> None:
+                if chdir is not None:
+                    chdir()
+                anchor()
         try:
             proc = subprocess.Popen(
                 spawn_cmd,
@@ -580,6 +658,7 @@ def run_foreground_test(
                 timeout_seconds, str(exc), None, False,
                 wrapper_bootstrap, "failed", "not-started", str(exc), health_provenance,
             )
+        lane_lock.record_process_group(proc.pid)
         if process_started is not None:
             process_started(proc)
         if held_fds is not None:

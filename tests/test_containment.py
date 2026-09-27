@@ -441,6 +441,51 @@ def test_gate_launch_failure_is_health_only_and_suite_failure_clears_health(tmp_
     assert [row["state"] for row in load_launcher_health(memory)] == ["verified"]
 
 
+def test_gate_records_launch_integrity_so_unverified_wrappers_are_non_evidence(tmp_path):
+    """#989: a passing gate wrapper with an unknown suite start never recommends."""
+    from coding_review_agent_loop.test_runtime import recommend_timeout, runtime_row_is_evidence
+
+    memory = tmp_path / "memory"
+    config = SimpleNamespace(
+        dry_run=False,
+        agent_memory=True,
+        agent_memory_dir=memory,
+        repo="owner/repo",
+        coder_test_command_timeout_seconds=1800,
+    )
+    wrapper = tmp_path / "run_suite.sh"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    wrapped = SimpleNamespace(
+        cwd=tmp_path,
+        args=[str(wrapper)],
+        outcome="passed",
+        wrapper_bootstrap="unknown",
+        inner_exec="started",
+        suite_start="unknown",
+        diagnostic="",
+        output_tail="",
+        elapsed_seconds=42.0,
+        returncode=0,
+        containment=None,
+        overlap_rejected=False,
+    )
+    _record_gate_observation(config, wrapped)
+    [row] = load_runtime_memory(memory)
+    assert row["launch_integrity"] == "unverified"
+    assert not runtime_row_is_evidence(row)
+    assert recommend_timeout(
+        memory, argv=[str(wrapper)], cwd=tmp_path, policy_ceiling_seconds=1800
+    ).successful_samples == 0
+
+    # The parent-owned gate has no run-tests wrapper to bootstrap; a verified
+    # suite start alone makes its row evidence.
+    suite = SimpleNamespace(**{**vars(wrapped), "args": [sys.executable, "-m", "pytest"], "suite_start": "verified"})
+    _record_gate_observation(config, suite)
+    states = sorted(row["launch_integrity"] for row in load_runtime_memory(memory))
+    assert states == ["unverified", "verified"]
+
+
 def test_gate_overlap_is_neither_health_nor_timing(tmp_path):
     memory = tmp_path / "memory"
     config = SimpleNamespace(

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import collections
 import datetime
 import dataclasses
+import functools
 import hashlib
 import json
 import re
@@ -108,6 +110,8 @@ from .errors import (
     FreshContractIntegrityError,
     HumanDecisionRequiredError,
     IssueImplementationConflictError,
+    PreservedUnsatisfiedResponse,
+    NonRepairableEvidenceRejection,
     QuotaResetExceededError,
     ReviewSubstanceIntegrityError,
     SemanticPatchPayloadRejection,
@@ -122,12 +126,15 @@ from .expected_closure import (
 )
 from .github import (
     CiWatchOutcome,
+    strip_bot_login_suffix,
     IssueContext,
     PullRequestMetadata,
     PullRequestChecks,
     PullRequestMergeability,
     PullRequestReviewContext,
     HumanReviewRequirement,
+    board_protection_is_reliable,
+    protection_awaits_readiness,
     deduplicate_human_requirements,
     get_pr_head_sha,
     get_issue_context,
@@ -144,7 +151,9 @@ from .github import (
     post_trusted_pr_comment,
     post_verified_trusted_issue_round_comment,
     post_verified_trusted_issue_protocol_comment,
+    note_host_footer_observed,
     reset_authenticated_github_actor,
+    reset_host_footer_log_latch,
     resolve_authenticated_github_actor,
     reject_forged_protocol_markers,
     search_issues,
@@ -170,6 +179,7 @@ from .phase_progress import (
     STATUS_HUMAN_PENDING,
     PhaseProgress,
     StagedTopologyOutcome,
+    record_staged_completion,
     render_phase_status_line,
     resolve_staged_phase_progress,
     select_current_phase,
@@ -231,6 +241,7 @@ from .managed_ci import (
     publish_round_readiness,
     refresh_ordinary_recovery_capability,
     release_adopted_managed_ci,
+    release_retained_managed_label,
     revalidate_adopted_managed_ci,
     revalidate_issue_created_handoff,
     recover_issue_created_handoff,
@@ -239,6 +250,8 @@ from .managed_ci import (
     verify_managed_pr_plan_binding,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
+    waivable_protection_states,
+    waiver_flags_for_protection,
 )
 from .managed_pr import recover_managed_pr_origin, validate_managed_pr_body
 from .migrations import validate_pr_migration_topology
@@ -313,6 +326,9 @@ from .protocol import (
     StructuredIssueImplementation,
     DerivedRiskEvidenceResult,
     PostAuthClaimDiagnostic,
+    SemanticRiskCoverageClaims,
+    DEGRADED_ROW_CLAIM_DIAGNOSTIC,
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     StructuredPlanState,
     StructuredPlanRevision,
     PlanRevisionPatch,
@@ -361,9 +377,14 @@ from .protocol import (
     serialize_discuss_final_synthesis,
     parse_architecture_impact,
     sanitize_architecture_impact,
+    ARCHITECTURE_IMPACT_DECLARED_STATUSES,
+    ARCHITECTURE_IMPACT_UNDETERMINED,
+    ArchitectureImpact,
+    ParseDegradation,
 )
 from .protocol import parse_review
 from .repair import (
+    CandidateDecision,
     RepairAttemptResult,
     attempt_envelope_normalization,
     attempt_semantic_patch_disposition_normalization,
@@ -376,8 +397,11 @@ from .repair import (
     require_recoverable_review_substance,
 )
 from .repair_preservation import (
+    canonicalize_architecture_near_miss_text,
+    normalize_architecture_impact_near_miss,
     recover_payload,
     require_recoverable_semantic_patch,
+    require_repair_architecture_impact_absent,
     validate_repair_preservation,
 )
 from .runner import Runner
@@ -431,6 +455,7 @@ from .checks import (
     _pending_ci_stop_message,
     _pr_check_blocking_review,
     _pr_check_details,
+    _unreadable_protection_stop_message,
     run_optional_tests,
     run_pre_review_tests,
 )
@@ -444,6 +469,8 @@ from .ci_health import (
 from .comment_rendering import (
     _extract_plan_human_requirements_block,
     DEFERRED_STAGES_MARKER_RE,
+    render_decomposition_degradation_comment,
+    render_refused_decomposition_comment,
     render_plan_phase_advance,
     render_plan_scheduling_audit,
     EXECUTION_RECOMMENDATION_MARKER_RE,
@@ -460,6 +487,7 @@ from .comment_rendering import (
     _render_public_review_comment,
     _replace_structured_section,
     _review_freeform_summary_text,
+    add_coder_followup_head_unchanged_notice,
     decode_deferred_stages_marker,
     decode_execution_recommendation_marker,
     decode_risk_test_matrix_marker,
@@ -499,6 +527,9 @@ from .round_state import (
     ApprovedPlanContext,
     QualificationCheckpoint,
     PostedRoundMetadata,
+    _is_followup_dispatch_head,
+    followup_head_unchanged_sha,
+    rebuild_resumed_coder_carrier,
     PostedRoundRecord,
     ROUND_RESUME_MARKER_RE,
     ResumedRoundSelection,
@@ -534,7 +565,12 @@ from .round_state import (
     recover_plan_validation_diagnostic,
     sanitize_plan_validation_diagnostic,
 )
-from .round_transport import decode_mapping, is_round_transport_sidecar, round_comment_fits
+from .round_transport import (
+    decode_mapping,
+    is_round_transport_sidecar,
+    prepare_round_comment,
+    round_comment_fits,
+)
 from .plan_assembly import (
     AssembledPlanSidecar,
     AuthenticatedPlanState,
@@ -542,6 +578,20 @@ from .plan_assembly import (
     decode_assembled_plan_sidecar,
     hydrate_authenticated_plan_state,
     make_assembled_plan_sidecar,
+)
+from .plan_growth import (
+    STRUCTURAL_SIGNALS,
+    PlanGrowthAssessment,
+    PlanGrowthThresholds,
+    assess_plan_growth,
+    check_growth_justification,
+    check_scope_ledger_preservation,
+    growth_justification_violation,
+    plan_growth_gate_enforced,
+    plan_justification,
+    plan_strategy,
+    render_growth_measurements,
+    render_growth_notice,
 )
 from .plan_review_scheduling import (
     PLAN_HISTORY_CONTRADICTORY_KEY,
@@ -584,6 +634,7 @@ from .review_scheduling import (
     select_reviewers,
     undecodable_history_message,
 )
+from .review_spool import ReviewRoundSpool, review_spool_root
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
     CODER_DISPUTE_NOTE_PREFIX,
@@ -592,6 +643,7 @@ from .unresolved_items import (
     _apply_dispute_evidence,
     _apply_unresolved_item_dispositions,
     _collect_prior_compact_summaries,
+    bound_compact_prior_summaries,
     _clear_human_requirements_ack_item,
     _clear_merge_conflict_item,
     _format_same_pr_unresolved_items,
@@ -612,6 +664,7 @@ from .unresolved_items import (
     _reconcile_human_requirements_ack_item,
     _raise_if_maintained_disputed_items,
     select_coder_followup_items,
+    coder_followup_is_ci_repair,
     _upsert_human_requirements_ack_item,
     _validate_coder_followup_response,
     _validate_plan_review_response,
@@ -729,20 +782,42 @@ def _freeze_prompt_architecture(
 
 
 def _architecture_metadata_fields(
-    config: AgentLoopConfig, *, impact: object | None = None
+    config: AgentLoopConfig, *, result: object | None = None
 ) -> dict[str, object]:
-    """Persist the complete acquisition identity, including unavailable states."""
+    """Persist the complete acquisition identity, including unavailable states.
+
+    Writers pass the whole parsed ``result`` rather than a bare assessment so
+    an assessment can never be persisted without its degradation records.
+    """
     context = config.architecture_context
     identity = context.identity() if hasattr(context, "identity") else None
+    impact, degradations = _architecture_result_fields(result)
+    if impact is not None and getattr(impact, "status", None) not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+        # Durable metadata never holds the parser-only degraded status, which
+        # strict rehydration would reject; the record explains the absence.
+        impact = None
     return {
         "architecture_identity": identity,
         "architecture_impact": sanitize_architecture_impact(impact),
+        "architecture_impact_degradations": degradations,
         # This records the response-contract generation, not document
         # availability. A fresh turn must remain distinguishable from a
         # legacy record even when architecture acquisition is opted out or
         # unavailable.
         "architecture_contract_version": 1,
     }
+
+
+def _test_observation_degradation_fields(result: object | None) -> dict[str, object]:
+    """Persist dropped-citation records beside the coder's raw response (#927).
+
+    Only coder follow-ups and issue implementations carry them; every other
+    result contributes nothing, so its metadata encoding is unchanged.
+    """
+    result = _unwrap_architecture_result(result)
+    if isinstance(result, (StructuredCoderFollowup, StructuredIssueImplementation)):
+        return {"test_observation_degradations": tuple(result.test_observation_degradations)}
+    return {}
 
 
 def _latest_pr_approval_architecture_identity(
@@ -932,10 +1007,26 @@ def _render_ci_rerun_command(config: AgentLoopConfig, *, pr_number: int) -> str:
             config.managed_ci
             or config.managed_ci_trusted_actor is not None
             or config.allow_unprotected_managed_ci
+            or config.allow_unreadable_protection
             or config.managed_ci_adopt_existing_pr
         ),
         include_context=False,
     )
+
+
+def _print_unprotected_managed_ci_warning(protection_mode: str) -> None:
+    message = (
+        "WARNING: --allow-unprotected-managed-ci is active for this invocation. GitHub cannot "
+        "prevent a manual merge, other automation, a compromised credential, or an agent-loop "
+        "defect from bypassing the voluntary final-ci/exact-head gate."
+    )
+    if protection_mode == "unreadable":
+        message += (
+            " --allow-unreadable-protection is also active: classic branch protection could not "
+            "be read by this token, so the exact-head gate is treated as voluntary for this "
+            "invocation."
+        )
+    print(message)
 
 
 def _merge_with_exact_head_proof(
@@ -1394,6 +1485,13 @@ _STRUCTURED_SCHEMA_REJECTION_RE = re.compile(
 )
 
 
+# Classification text for a semantic evidence rejection that skipped repair
+# (#990). The terminal category names this rejection, not a repair symptom.
+_SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION = (
+    "structured response failed semantic evidence validation"
+)
+
+
 def _is_structured_schema_rejection(classification_text: str) -> bool:
     """True when a recognized structured envelope failed schema validation (#957).
 
@@ -1691,7 +1789,7 @@ def _recover_plan_revision_human_requirements_acknowledgement(
                     surfaced_requirement_ids=context.surfaced_requirement_ids,
                     requires_direct_discussion_ack=context.requires_direct_discussion_ack,
                 )
-                source_plan = validate_structured_plan_revision(source_text)
+                source_plan = validate_structured_plan_revision(source_text, architecture_status_mode="legacy")
                 if source_plan is None:
                     raise AgentLoopError("captured response was not a structured plan revision")
                 validate_human_requirement_dispositions(
@@ -2084,6 +2182,15 @@ def _format_invalid_agent_response_error(
         category_hint = " Failure category: transient (rerun may succeed)."
     elif category == "non-retryable":
         category_hint = " Failure category: non-retryable (check credentials or billing)."
+    elif (
+        category == "deterministic"
+        and classification_text == _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
+    ):
+        category_hint = (
+            " Failure category: semantic-evidence-rejection (a risk-matrix claim selected a "
+            "test observation that cannot carry authority; repair was skipped because "
+            "reformatting cannot change it)."
+        )
     elif category == "deterministic" and _is_structured_schema_rejection(classification_text):
         category_hint = (
             " Failure category: schema-validation (the agent's structured response did not "
@@ -2446,6 +2553,11 @@ def _agent_failure_classification_text(
 
 
 def _new_usage_context(config: AgentLoopConfig) -> RunUsageContext:
+    # Invariant: only the run entries that own a usage context call this
+    # (run_issue_loop, run_task_loop, run_pr_loop, run_discuss_loop), so each
+    # owning invocation starts a fresh host-footer log latch, while a nested
+    # run that received a usage context shares the outer latch (#1043).
+    reset_host_footer_log_latch()
     run_id = new_run_id()
     return RunUsageContext(run_id=run_id, summary_path=run_usage_summary_path(config, run_id))
 
@@ -2486,8 +2598,24 @@ def _run_structured_repair(
     usage_context: RunUsageContext | None,
     validate: Callable[[str], object],
     repair_kwargs: dict[str, object],
+    require_architecture_impact_contract: bool = False,
+    degrade_architecture_impact: bool = False,
+    forbid_architecture_impact: bool = False,
+    parse_response: Callable[[str], object] | None = None,
+    contract_refusal: Callable[[object, str, tuple[ParseDegradation, ...]], str | None] | None = None,
 ) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
-    """Run configured repair, retaining compatibility with patched legacy test hooks."""
+    """Run configured repair, retaining compatibility with patched legacy test hooks.
+
+    Every new parameter is an optional control keyword, never a repair-prompt
+    keyword, and defaults to today's behavior.  For an invocation that enabled
+    degradation, a near miss is normalized in the raw payload before the
+    repair prompt is built; its record travels out of band.  Each candidate is
+    parsed with the non-refusing ``parse_response``, checked by preservation
+    (including the absence pin), given the merged records, and only then
+    offered to ``contract_refusal`` -- all before it can be accepted (#925).
+    """
+    if parse_response is None:
+        parse_response = validate
     if repair_kwargs.get("expected_kind") == "plan_revision_patch":
         try:
             require_recoverable_semantic_patch(raw)
@@ -2567,6 +2695,33 @@ def _run_structured_repair(
                         integrity_contract="risk_test_matrix",
                     )
                 ]
+    degradation_records: tuple[ParseDegradation, ...] = ()
+    forbid = forbid_architecture_impact
+    if degrade_architecture_impact:
+        near_miss = normalize_architecture_impact_near_miss(
+            raw,
+            required_contract=require_architecture_impact_contract,
+            expected_kind=(
+                repair_kwargs.get("expected_kind")
+                if isinstance(repair_kwargs.get("expected_kind"), str) else None
+            ),
+        )
+        raw = near_miss.raw
+        degradation_records = (near_miss.record,) if near_miss.record is not None else ()
+        forbid = forbid or near_miss.forbid_architecture_impact
+
+    def candidate_refusal(output: str, parsed: object) -> CandidateDecision:
+        # Merge, never replace: source records first, then any record the
+        # candidate's own degradable parse produced.
+        record_bearing = _attach_architecture_degradations(parsed, degradation_records)
+        payload = _carrier_payload(record_bearing)
+        records = tuple(payload.architecture_impact_degradations) if payload is not None else ()
+        refusal = (
+            contract_refusal(record_bearing, output, records)
+            if contract_refusal is not None else None
+        )
+        return CandidateDecision(parsed=record_bearing, refusal=refusal)
+
     if attempt_repair is not _ORIGINAL_ATTEMPT_REPAIR:
         try:
             repaired = attempt_repair(raw, config.gemini_cmd, **repair_kwargs)
@@ -2592,6 +2747,7 @@ def _run_structured_repair(
         if repaired is None:
             return None, None, []
         try:
+            parsed = parse_response(repaired)
             if repair_kwargs.get("expected_kind") in {
                 "plan_revision_patch", "plan_review", "pr_review",
             }:
@@ -2599,8 +2755,10 @@ def _run_structured_repair(
                     raw,
                     repaired,
                     allowed_prior_item_ids=repair_kwargs.get("allowed_prior_item_ids"),
+                    forbid_architecture_impact=forbid,
                 )
-            parsed = validate(repaired)
+            elif forbid:
+                require_repair_architecture_impact_absent(repaired)
         except AgentLoopError as exc:
             return repaired, None, [
                 RepairAttemptResult(
@@ -2615,14 +2773,36 @@ def _run_structured_repair(
                     fallback_planned=False,
                 )
             ]
-        return repaired, parsed, []
+        decision = candidate_refusal(repaired, parsed)
+        if decision.refusal is None:
+            return repaired, decision.parsed, []
+        payload = _carrier_payload(decision.parsed)
+        return repaired, None, [
+            RepairAttemptResult(
+                backend="gemini",
+                model="legacy-test-hook",
+                prompt="",
+                output=repaired,
+                returncode=0,
+                outcome="architecture_contract_unsatisfied",
+                diagnostic=decision.refusal,
+                log_path=None,
+                fallback_planned=False,
+                validation_result=decision.parsed,
+                architecture_impact_degradations=(
+                    tuple(payload.architecture_impact_degradations) if payload is not None else ()
+                ),
+            )
+        ]
     return execute_repair(
         raw,
         runner=runner,
         config=config,
         run_id=usage_context.run_id if usage_context is not None else None,
         usage_context=usage_context,
-        validate=validate,
+        validate=parse_response,
+        forbid_architecture_impact=forbid,
+        candidate_refusal=candidate_refusal,
         **repair_kwargs,
     )
 
@@ -2657,6 +2837,12 @@ class _CompletionRecoveryOutcome:
     # response file and posted to the GitHub issue; set only when validated
     # is None.
     terminal_public_response: str | None
+    # The resumed response's only defect is the required architecture-impact
+    # contract: the caller takes the ordinary deterministic retry (#925).
+    contract_unsatisfied: bool = False
+    # An otherwise valid response whose accepted text could not be
+    # canonicalized; never reported as an unsatisfied contract.
+    canonicalization_failed: bool = False
 
 
 def _post_completion_recovery_terminal_comment(
@@ -2708,6 +2894,7 @@ def _attempt_claude_completion_recovery(
     label: str | None,
     timeout_seconds: float | None,
     acquisition_result: AgentResult | None = None,
+    accept: Callable[[str, object], _AcceptedCandidate] | None = None,
 ) -> _CompletionRecoveryOutcome:
     """One bounded ``claude --resume`` completion-recovery pass (#588).
 
@@ -2731,7 +2918,28 @@ def _attempt_claude_completion_recovery(
       unavailability.
 
     In every terminal case there is exactly one ``--resume`` call total.
+    An unsatisfied required architecture-impact contract is not terminal: it
+    returns a deterministic ``contract_unsatisfied`` outcome for the caller's
+    ordinary retry, with no comment and no synthesized unavailability.
     """
+    if accept is None:
+        def accept(text: str, marker_value: object) -> _AcceptedCandidate:
+            return _AcceptedCandidate(text, marker_value)
+
+    def _contract_unsatisfied(exc: AgentLoopError, candidate: str) -> _CompletionRecoveryOutcome:
+        return _CompletionRecoveryOutcome(
+            validated=None, result=recovery_result, error=str(exc),
+            classification_text=candidate, failure_category="deterministic",
+            terminal_public_response=None, contract_unsatisfied=True,
+        )
+
+    def _canonicalization_failed(exc: AgentLoopError, candidate: str) -> _CompletionRecoveryOutcome:
+        return _CompletionRecoveryOutcome(
+            validated=None, result=recovery_result, error=str(exc),
+            classification_text=candidate, failure_category="deterministic",
+            terminal_public_response=None, canonicalization_failed=True,
+        )
+
     recovery_prompt = build_completion_recovery_prompt(
         config,
         issue_context=completion_recovery.issue_context,
@@ -2819,6 +3027,13 @@ def _attempt_claude_completion_recovery(
             )
         try:
             marker_value = validate(recovery_artifact)
+            accepted_artifact = accept(recovery_artifact, marker_value)
+        except _ArchitectureImpactContractUnsatisfied as exc:
+            # The artifact is authoritative for this invocation; do not fall
+            # through to the transport checks.
+            return _contract_unsatisfied(exc, recovery_artifact)
+        except _AcceptedTextCanonicalizationError as exc:
+            return _canonicalization_failed(exc, recovery_artifact)
         except AgentLoopError:
             pass
         else:
@@ -2833,9 +3048,9 @@ def _attempt_claude_completion_recovery(
                 log(config, "claude completion-recovery accepted a valid response-file artifact "
                     f"despite returncode={recovery_result.returncode!r}")
             return _CompletionRecoveryOutcome(
-                validated=ValidatedAgentResponse(
-                    text=recovery_artifact, session_id=recovery_result.session_id,
-                    marker_value=marker_value, usage=recovery_usage,
+                validated=_accepted_validated_response(
+                    accepted_artifact, session_id=recovery_result.session_id,
+                    usage=recovery_usage,
                     model_used=recovery_result.model_used,
                     **_response_identity_fields(
                         recovery_result, acquisition_result=acquisition_result
@@ -2895,6 +3110,11 @@ def _attempt_claude_completion_recovery(
 
     try:
         marker_value = validate(recovery_text)
+        accepted_text = accept(recovery_text, marker_value)
+    except _ArchitectureImpactContractUnsatisfied as exc:
+        return _contract_unsatisfied(exc, recovery_text)
+    except _AcceptedTextCanonicalizationError as exc:
+        return _canonicalization_failed(exc, recovery_text)
     except AgentLoopError as exc:
         if looks_like_backgrounded_completion(recovery_text):
             # A completed CLI turn that again says it is waiting for
@@ -2938,10 +3158,9 @@ def _attempt_claude_completion_recovery(
         )
 
     return _CompletionRecoveryOutcome(
-        validated=ValidatedAgentResponse(
-            text=recovery_text,
+        validated=_accepted_validated_response(
+            accepted_text,
             session_id=recovery_result.session_id,
-            marker_value=marker_value,
             usage=recovery_usage,
             model_used=recovery_result.model_used,
             **_response_identity_fields(
@@ -2954,6 +3173,16 @@ def _attempt_claude_completion_recovery(
         failure_category="",
         terminal_public_response=None,
     )
+
+
+def _refused_contract_attempt(
+    attempts: Sequence[RepairAttemptResult],
+) -> RepairAttemptResult | None:
+    """The last repair candidate refused for an unsatisfied contract, if any."""
+    for attempt in reversed(attempts):
+        if attempt.outcome == "architecture_contract_unsatisfied":
+            return attempt
+    return None
 
 
 def _log_repair_attempts(config: AgentLoopConfig, prefix: str, attempts: Sequence[RepairAttemptResult]) -> None:
@@ -2974,6 +3203,7 @@ def _capture_terminal_plan_repair_rejection(
     *,
     repair_expected_kind: str | None,
     validate: Callable[[str], object],
+    contract_diagnostic: Callable[[object], str | None] | None = None,
 ) -> DeterministicPlanValidationExhaustion | None:
     """Capture a deterministically rejected final planning repair candidate.
 
@@ -2990,7 +3220,7 @@ def _capture_terminal_plan_repair_rejection(
     ):
         return None
     try:
-        validate(candidate)
+        parsed = validate(candidate)
     except AgentLoopError as exc:
         if "Current untrusted GitHub text contains reserved protocol marker(s):" in str(exc):
             return None
@@ -2998,6 +3228,16 @@ def _capture_terminal_plan_repair_rejection(
             candidate_kind=repair_expected_kind,
             candidate_text=candidate,
             diagnostic=str(exc),
+            candidate_digest=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+        )
+    # ``validate`` is the non-refusing parse on required-contract sites; the
+    # pure diagnostic check never mutates the retained unsatisfied candidate.
+    diagnostic = contract_diagnostic(parsed) if contract_diagnostic is not None else None
+    if diagnostic is not None:
+        return DeterministicPlanValidationExhaustion(
+            candidate_kind=repair_expected_kind,
+            candidate_text=candidate,
+            diagnostic=diagnostic,
             candidate_digest=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
         )
     return None
@@ -3101,33 +3341,82 @@ def _run_validated_agent(
     plan_validation_failure_handler: Callable[
         [DeterministicPlanValidationExhaustion, AgentInvocationError], None
     ] | None = None,
+    require_architecture_impact_contract: bool = False,
     semantic_patch_payload_validator: Callable[[dict], object] | None = None,
+    degrade_architecture_impact: bool = False,
+    strict_revalidate: Callable[[str], object] | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
     # the same provenance check before it can be accepted.
     response_validator = validate
+    if degrade_architecture_impact and strict_revalidate is None:
+        raise AgentLoopError(
+            "Internal error: an invocation that enables architecture-impact degradation "
+            "must supply its strict re-parse."
+        )
     validation_acquisition: AgentResult | None = None
+    # The last response refused for an unsatisfied architecture-impact
+    # contract.  It is retained and surfaced, never silently discarded.
+    preserved_unsatisfied: PreservedUnsatisfiedResponse | None = None
+
+    def contract_refusal(
+        result: object, text: str, records: tuple[ParseDegradation, ...] = ()
+    ) -> str | None:
+        """Store an unsatisfied result as the preserved candidate; return its diagnostic."""
+        nonlocal preserved_unsatisfied
+        if not require_architecture_impact_contract:
+            return None
+        diagnostic = _architecture_contract_diagnostic(result)
+        if diagnostic is None:
+            return None
+        carrier = _unwrap_architecture_result(result)
+        preserved_unsatisfied = PreservedUnsatisfiedResponse(
+            text=text,
+            diagnostic=diagnostic,
+            architecture_impact_degradations=tuple(
+                getattr(carrier, "architecture_impact_degradations", ()) or records
+            ),
+        )
+        log(
+            config,
+            f"{agent_display_name(agent)}: retained a response refused for an unsatisfied "
+            f"architecture_impact contract ({len(text)} chars; "
+            f"{len(preserved_unsatisfied.architecture_impact_degradations)} degradation record(s))",
+        )
+        return diagnostic
 
     def validate(text: str) -> object:
-        TrustedBody.current_untrusted_visible(text)
-        token = None
-        if (
-            validation_acquisition is not None
-            and validation_acquisition.test_turn_id is not None
-        ):
-            token = _VALIDATION_TEST_TURN_CONTEXT.set(
-                (
-                    runner,
-                    validation_acquisition.test_turn_id,
-                    validation_acquisition.test_turn_observations,
-                )
-            )
-        try:
-            return response_validator(text)
-        finally:
-            if token is not None:
-                _VALIDATION_TEST_TURN_CONTEXT.reset(token)
+        # The refusing validator: parse, then refuse an unsatisfied contract
+        # uniformly for every call site that requires one (#925).  Every
+        # accepting branch treats an AgentLoopError here as not accepted, so a
+        # candidate whose accepted text cannot be canonicalized is refused on
+        # the same path, with its own diagnostic.
+        result = parse_response(text)
+        refusal = contract_refusal(result, text)
+        if refusal is not None:
+            raise _ArchitectureImpactContractUnsatisfied(refusal)
+        accept_candidate(text, result)
+        return result
+
+    def parse_response(text: str) -> object:
+        return _with_validation_context(
+            response_validator, runner=runner, acquisition=validation_acquisition
+        )(text)
+
+    def accept_candidate(
+        text: str, marker_value: object, acquisition: AgentResult | None = None
+    ) -> _AcceptedCandidate:
+        # The acquisition is captured when the candidate is accepted, never
+        # read later from the mutable closure, so a repair turn cannot change
+        # the catalog the strict re-parse sees.
+        return _accept_candidate(
+            text,
+            marker_value,
+            strict_revalidate=strict_revalidate,
+            runner=runner,
+            acquisition=acquisition if acquisition is not None else validation_acquisition,
+        )
 
     agent_name = agent_display_name(agent)
     operation_description = operation_description or _operation_description_from_context(
@@ -3181,6 +3470,9 @@ def _run_validated_agent(
     latest_replay_refusal_detail: str | None = None
     next_timeout_seconds = timeout_seconds
     marker_safety_repair_attempted = False
+    # A field-naming diagnostic for the next attempt's prompt, set only by an
+    # unsatisfied architecture-impact contract and consumed by one attempt.
+    pending_contract_reprompt: str | None = None
     executable_replacement_policies: dict[AgentName, tuple[str, str, str, bool]] = {
         "claude": (
             config.claude_cmd,
@@ -3225,11 +3517,17 @@ def _run_validated_agent(
             )
         elif is_executable_replacement_replay:
             invocation_kwargs["attempt_suffix"] = executable_replacement_policies[agent][2]
+        attempt_prompt = (
+            _architecture_contract_retry_prompt(prompt, pending_contract_reprompt)
+            if pending_contract_reprompt is not None
+            else prompt
+        )
+        pending_contract_reprompt = None
         result = run_agent_result(
             runner,
             agent=agent,
             config=attempt_config,
-            prompt=prompt,
+            prompt=attempt_prompt,
             session_id=session_id,
             run_id=usage_context.run_id if usage_context is not None else None,
             role=role,
@@ -3256,7 +3554,7 @@ def _run_validated_agent(
         if result.log_path is not None:
             log_paths.append(result.log_path)
         text = _neutralize_untrusted_markers(result.text, config=config, agent_name=agent_name)
-        usage = _resolve_usage_metadata(config=config, prompt=prompt, result=result)
+        usage = _resolve_usage_metadata(config=config, prompt=attempt_prompt, result=result)
         usage_record = None
         if usage_context is not None and usage is not None:
             usage_record = usage_context.add_record(
@@ -3281,6 +3579,13 @@ def _run_validated_agent(
         # response; stdout is diagnostics only and must never be salvaged.
         artifact = result.response_file_text
         artifact_unavailable = None
+        # An authoritative artifact whose only defect is the architecture
+        # contract is a deterministic field refusal, never a transport failure.
+        artifact_contract_refusal: _ArchitectureImpactContractUnsatisfied | None = None
+        # An artifact that parses but whose accepted text cannot be
+        # canonicalized keeps its own deterministic diagnostic; it is never
+        # reclassified as a timeout or command failure.
+        artifact_canonicalization_failure: _AcceptedTextCanonicalizationError | None = None
         # Preserve the normal zero-exit path below, including its marker
         # recovery diagnostic. Failed exits alone may be salvaged from the
         # per-invocation response-file artifact.
@@ -3303,6 +3608,10 @@ def _run_validated_agent(
             if artifact_unavailable is None:
                 try:
                     artifact_marker_value = validate(artifact)
+                except _ArchitectureImpactContractUnsatisfied as exc:
+                    artifact_contract_refusal = exc
+                except _AcceptedTextCanonicalizationError as exc:
+                    artifact_canonicalization_failure = exc
                 except AgentLoopError:
                     pass
                 else:
@@ -3319,10 +3628,9 @@ def _run_validated_agent(
                             f"{agent_name}: accepted valid response-file artifact despite "
                             f"returncode={result.returncode!r}",
                         )
-                    return ValidatedAgentResponse(
-                        text=artifact,
+                    return _accepted_validated_response(
+                        accept_candidate(artifact, artifact_marker_value),
                         session_id=result.session_id,
-                        marker_value=artifact_marker_value,
                         usage=usage,
                         model_used=result.model_used,
                         **_response_identity_fields(result),
@@ -3496,7 +3804,35 @@ def _run_validated_agent(
                 continue
         should_retry = False
         provider_capacity = False
-        if result.returncode is None and artifact_unavailable is None:
+        if artifact_contract_refusal is not None:
+            # The artifact stays authoritative for this invocation: skip the
+            # timeout and nonzero-exit transport branches, make no repair
+            # invocation, and retry with the field-naming re-prompt.
+            last_error = str(artifact_contract_refusal)
+            classification_text = "response-file artifact failed the architecture_impact contract"
+            last_classification_text = artifact
+            last_failure_category = "deterministic"
+            if usage_record is not None:
+                usage_record.validation_status = "invalid"
+            should_retry = True
+            pending_contract_reprompt = last_error
+        elif artifact_canonicalization_failure is not None:
+            # The authoritative artifact was otherwise valid but its accepted
+            # text failed the strict canonical comparison.  Report that
+            # diagnostic as a deterministic failure, never as transport, and
+            # never as an unsatisfied architecture contract.
+            last_error = str(artifact_canonicalization_failure)
+            last_classification_text = artifact
+            last_failure_category = "deterministic"
+            if usage_record is not None:
+                usage_record.validation_status = "invalid"
+            log(
+                config,
+                f"{agent_name}: response-file artifact not accepted "
+                f"({artifact_canonicalization_failure})"[:600],
+            )
+            break
+        elif result.returncode is None and artifact_unavailable is None:
             # Timed out (returncode=None from Runner.run_with_log). Detected
             # before transient classification: a kill deadline is not a
             # provider hiccup, so retrying or repairing would only waste the
@@ -3506,7 +3842,7 @@ def _run_validated_agent(
             last_classification_text = ""
             last_failure_category = "timeout"
             break
-        if result.returncode != 0 and artifact_unavailable is None:
+        elif result.returncode != 0 and artifact_unavailable is None:
             last_error = f"agent command exited with {result.returncode}"
             classification_text = _agent_failure_classification_text(result, phase="command")
             if target_exec_retryable:
@@ -3566,6 +3902,7 @@ def _run_validated_agent(
                 if result.response_file_text
                 else None
             )
+            recovery_contract_retry = False
             try:
                 unavailable = parse_agent_unavailable(text)
                 if unavailable is not None:
@@ -3596,7 +3933,14 @@ def _run_validated_agent(
                 last_error = str(exc)
                 marker_safety_failure = "Current untrusted GitHub text contains reserved protocol marker(s):" in str(exc)
                 structured_kind = _recognized_structured_public_response_kind(result.text)
-                if structured_kind is not None:
+                contract_unsatisfied = isinstance(exc, _ArchitectureImpactContractUnsatisfied)
+                if contract_unsatisfied and structured_kind is None:
+                    # A parsed-but-unsatisfied response is a deterministic
+                    # field-scope defect, whatever its envelope kind.
+                    classification_text = "structured response failed the architecture_impact contract"
+                    public_text_is_transient = False
+                    last_failure_category = "deterministic"
+                elif structured_kind is not None:
                     # Keep validation context authoritative. The structured
                     # payload's prose is untrusted content and must not be
                     # treated as evidence of provider auth, billing, credit,
@@ -3658,6 +4002,10 @@ def _run_validated_agent(
                         label=label,
                         timeout_seconds=timeout_seconds,
                         acquisition_result=validation_acquisition,
+                        accept=(
+                            lambda text, marker, acquisition=validation_acquisition:
+                            accept_candidate(text, marker, acquisition)
+                        ),
                     )
                     if recovery_outcome.validated is not None:
                         return recovery_outcome.validated
@@ -3666,613 +4014,705 @@ def _run_validated_agent(
                     last_classification_text = recovery_outcome.classification_text
                     last_failure_category = recovery_outcome.failure_category
                     terminal_public_response = recovery_outcome.terminal_public_response
-                    should_retry = False
-                    break
-                response_failure_is_unsupported = last_failure_category == "unsupported_model"
-                # Marker near-misses are a separate first-attempt nudge for common footer typos;
-                # structured JSON protocol drift still remains repairable when retries are exhausted.
-                should_retry = replacement_stability_failed or public_text_is_transient or (
-                    not response_failure_is_unsupported
-                    and attempt == 1
-                    and _is_retryable_marker_near_miss(classification_text)
-                )
-                if (
-                    result.raw_output
-                    and result.raw_output != classification_text
-                    and _is_transient_agent_output(result.raw_output)
-                    and not public_text_is_transient
-                ):
-                    log(
-                        config,
-                        f"{agent_name}: transient diagnostics were present outside the public response",
+                    if recovery_outcome.contract_unsatisfied:
+                        recovery_contract_retry = True
+                        # No repair, no terminal comment: one ordinary retry
+                        # with the field-naming re-prompt.  The resume stays
+                        # attempted, so there is never a second one.
+                        should_retry = True
+                        pending_contract_reprompt = recovery_outcome.error
+                    else:
+                        should_retry = False
+                        break
+                if not recovery_contract_retry:
+                    response_failure_is_unsupported = last_failure_category == "unsupported_model"
+                    # Marker near-misses are a separate first-attempt nudge for common footer typos;
+                    # structured JSON protocol drift still remains repairable when retries are exhausted.
+                    should_retry = replacement_stability_failed or public_text_is_transient or (
+                        not response_failure_is_unsupported
+                        and attempt == 1
+                        and _is_retryable_marker_near_miss(classification_text)
                     )
-                response_file_status = None
-                if result.response_file_text:
-                    response_file_status = response_file_pre_status
-                    if response_file_status == "leading-public-response-marker-not-recoverable":
+                    if contract_unsatisfied:
+                        # A contract-only failure skips the futile repair pass and
+                        # takes one ordinary retry with a field-naming re-prompt,
+                        # within the existing budget and attempt bound.
+                        should_retry = True
+                        pending_contract_reprompt = str(exc)
+                    if (
+                        result.raw_output
+                        and result.raw_output != classification_text
+                        and _is_transient_agent_output(result.raw_output)
+                        and not public_text_is_transient
+                    ):
                         log(
                             config,
-                            f"{agent_name}: response file contained stdout filtering marker but "
-                            "the remainder was not recoverable",
+                            f"{agent_name}: transient diagnostics were present outside the public response",
                         )
-                    elif response_file_status in {"markdown-or-prose", "fenced-or-markdown"}:
-                        log(
-                            config,
-                            f"{agent_name}: public response file was not structured "
-                            f"({response_file_status})",
-                        )
-                response_file_not_structured = response_file_status in {
-                    "leading-public-response-marker-not-recoverable",
-                    "markdown-or-prose",
-                    "fenced-or-markdown",
-                }
-                if (
-                    result.response_file_text
-                    and response_file_not_structured
-                    and not response_failure_is_unsupported
-                ):
-                    recovered = _recover_valid_structured_candidate(
-                        result,
-                        validate=validate,
-                        expected_kind=repair_expected_kind,
-                        config=config,
-                        agent_name=agent_name,
-                    )
-                    if recovered is not None:
-                        recovered_text, marker_value = recovered
-                        if usage_record is not None:
-                            usage_record.validation_status = "validated"
-                        return ValidatedAgentResponse(
-                            text=recovered_text,
-                            session_id=result.session_id,
-                            marker_value=marker_value,
-                            usage=usage,
-                            model_used=result.model_used,
-                            **_response_identity_fields(result),
-                        )
-                if (
-                    not response_failure_is_unsupported
-                    and repair_expected_kind == "plan_revision"
-                    and result.response_file_text
-                    and not isinstance(exc, UnknownPriorItemDispositionError)
-                    and _plan_revision_missing_human_acknowledgement(
-                        result.text,
-                        context=_HumanRequirementsRecoveryContext(
-                            surfaced_requirement_ids=tuple(
-                                repair_surfaced_requirement_ids or ()
-                            ),
-                            requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                        ),
-                    )
-                ):
-                    recovered = _recover_plan_revision_human_requirements_acknowledgement(
-                        result,
-                        validate=validate,
-                        context=_HumanRequirementsRecoveryContext(
-                            surfaced_requirement_ids=tuple(
-                                repair_surfaced_requirement_ids or ()
-                            ),
-                            requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                        ),
-                        config=config,
-                        agent_name=agent_name,
-                    )
-                    if recovered is not None:
-                        recovered_text, marker_value = recovered
-                        if usage_record is not None:
-                            usage_record.validation_status = "validated"
-                        return ValidatedAgentResponse(
-                            text=recovered_text,
-                            session_id=result.session_id,
-                            marker_value=marker_value,
-                            usage=usage,
-                            model_used=result.model_used,
-                            **_response_identity_fields(result),
-                        )
-                if (
-                    use_repair
-                    and not public_text_is_transient
-                    and not response_failure_is_unsupported
-                    and repair_expected_kind == "plan_revision_patch"
-                ):
-                    disposition_normalized = attempt_semantic_patch_disposition_normalization(text)
-                    if disposition_normalized is not None:
-                        try:
-                            marker_value = validate(disposition_normalized)
-                        except AgentLoopError:
-                            pass
-                        else:
+                    response_file_status = None
+                    if result.response_file_text:
+                        response_file_status = response_file_pre_status
+                        if response_file_status == "leading-public-response-marker-not-recoverable":
                             log(
                                 config,
-                                f"{agent_name}: deterministic semantic-patch disposition "
-                                "normalization recovered malformed response",
+                                f"{agent_name}: response file contained stdout filtering marker but "
+                                "the remainder was not recoverable",
                             )
+                        elif response_file_status in {"markdown-or-prose", "fenced-or-markdown"}:
+                            log(
+                                config,
+                                f"{agent_name}: public response file was not structured "
+                                f"({response_file_status})",
+                            )
+                    response_file_not_structured = response_file_status in {
+                        "leading-public-response-marker-not-recoverable",
+                        "markdown-or-prose",
+                        "fenced-or-markdown",
+                    }
+                    if (
+                        result.response_file_text
+                        and response_file_not_structured
+                        and not response_failure_is_unsupported
+                    ):
+                        recovered = _recover_valid_structured_candidate(
+                            result,
+                            validate=validate,
+                            expected_kind=repair_expected_kind,
+                            config=config,
+                            agent_name=agent_name,
+                        )
+                        if recovered is not None:
+                            recovered_text, marker_value = recovered
                             if usage_record is not None:
                                 usage_record.validation_status = "validated"
-                            return ValidatedAgentResponse(
-                                text=disposition_normalized,
+                            return _accepted_validated_response(
+                                accept_candidate(recovered_text, marker_value),
                                 session_id=result.session_id,
-                                marker_value=marker_value,
                                 usage=usage,
                                 model_used=result.model_used,
                                 **_response_identity_fields(result),
                             )
-                # A semantic patch can only ever be recovered by the deterministic
-                # strip (repair must preserve it byte-for-byte), so it always has to
-                # prove that every removed ID is canonically resolved history (#872).
-                # An incomplete ledger demands the same proof for every kind (#862).
-                strip_requires_history_proof = (
-                    ledger_incomplete or repair_expected_kind == "plan_revision_patch"
-                )
-                normalized: str | None = None
-                if (
-                    use_repair
-                    and not public_text_is_transient
-                    and not response_failure_is_unsupported
-                    and repair_expected_kind in STRUCTURED_PUBLIC_RESPONSE_KINDS
-                    and not (
-                        isinstance(exc, UnknownPriorItemDispositionError)
-                        and ledger_incomplete
-                    )
-                ):
-                    normalized = attempt_envelope_normalization(
-                        text,
-                        expected_kind=repair_expected_kind,
-                    )
-                    if normalized is not None:
-                        try:
-                            marker_value = validate(normalized)
-                        except UnknownPriorItemDispositionError as norm_exc:
-                            # Combined fix (issue #274): envelope normalization removed the
-                            # trailing defect but the normalized candidate still has unknown
-                            # prior dispositions. Try stripping them from the normalized text
-                            # so both defects are resolved in one deterministic pass.
-                            # Only apply when the original error was structural; when it was
-                            # already UnknownPriorItemDispositionError, block 2 handles it.
-                            normalized_history_strip = (
-                                strip_requires_history_proof
-                                and _history_strip_allowed(
-                                    normalized,
-                                    norm_exc,
-                                    resolved_history_item_ids=repair_resolved_history_item_ids,
-                                    expected_kind=repair_expected_kind,
-                                )
+                    if (
+                        not response_failure_is_unsupported
+                        and repair_expected_kind == "plan_revision"
+                        and result.response_file_text
+                        and not isinstance(exc, UnknownPriorItemDispositionError)
+                        and _plan_revision_missing_human_acknowledgement(
+                            result.text,
+                            context=_HumanRequirementsRecoveryContext(
+                                surfaced_requirement_ids=tuple(
+                                    repair_surfaced_requirement_ids or ()
+                                ),
+                                requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                            ),
+                        )
+                    ):
+                        recovered = _recover_plan_revision_human_requirements_acknowledgement(
+                            result,
+                            validate=validate,
+                            context=_HumanRequirementsRecoveryContext(
+                                surfaced_requirement_ids=tuple(
+                                    repair_surfaced_requirement_ids or ()
+                                ),
+                                requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                            ),
+                            config=config,
+                            agent_name=agent_name,
+                        )
+                        if recovered is not None:
+                            recovered_text, marker_value = recovered
+                            if usage_record is not None:
+                                usage_record.validation_status = "validated"
+                            return _accepted_validated_response(
+                                accept_candidate(recovered_text, marker_value),
+                                session_id=result.session_id,
+                                usage=usage,
+                                model_used=result.model_used,
+                                **_response_identity_fields(result),
                             )
-                            if (
-                                not isinstance(exc, UnknownPriorItemDispositionError)
-                                and (
-                                    not strip_requires_history_proof
-                                    or normalized_history_strip
+                    if (
+                        use_repair
+                        and not public_text_is_transient
+                        and not response_failure_is_unsupported
+                        and repair_expected_kind == "plan_revision_patch"
+                    ):
+                        disposition_normalized = attempt_semantic_patch_disposition_normalization(text)
+                        if disposition_normalized is not None:
+                            try:
+                                marker_value = validate(disposition_normalized)
+                            except AgentLoopError:
+                                pass
+                            else:
+                                log(
+                                    config,
+                                    f"{agent_name}: deterministic semantic-patch disposition "
+                                    "normalization recovered malformed response",
                                 )
-                                and repair_expected_kind in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}
-                            ):
-                                stripped_from_normalized = strip_unknown_prior_item_dispositions(
-                                    normalized,
-                                    allowed_ids=frozenset(norm_exc.allowed_ids),
-                                    expected_kind=repair_expected_kind,
+                                if usage_record is not None:
+                                    usage_record.validation_status = "validated"
+                                return _accepted_validated_response(
+                                    accept_candidate(disposition_normalized, marker_value),
+                                    session_id=result.session_id,
+                                    usage=usage,
+                                    model_used=result.model_used,
+                                    **_response_identity_fields(result),
                                 )
-                                if stripped_from_normalized is not None:
-                                    try:
-                                        marker_value = validate(stripped_from_normalized)
-                                    except AgentLoopError:
-                                        if (
-                                            repair_expected_kind == "plan_revision"
-                                            and result.response_file_text
-                                            and _plan_revision_missing_human_acknowledgement(
-                                                stripped_from_normalized,
-                                                context=_HumanRequirementsRecoveryContext(
-                                                    surfaced_requirement_ids=tuple(
-                                                        repair_surfaced_requirement_ids or ()
+                    # A semantic patch can only ever be recovered by the deterministic
+                    # strip (repair must preserve it byte-for-byte), so it always has to
+                    # prove that every removed ID is canonically resolved history (#872).
+                    # An incomplete ledger demands the same proof for every kind (#862).
+                    strip_requires_history_proof = (
+                        ledger_incomplete or repair_expected_kind == "plan_revision_patch"
+                    )
+                    normalized: str | None = None
+                    # An authority rejection exposed only once the envelope is
+                    # normalized is as unrepairable as one on the raw text (#990).
+                    normalized_evidence_rejection: NonRepairableEvidenceRejection | None = None
+                    if (
+                        use_repair
+                        and not public_text_is_transient
+                        and not response_failure_is_unsupported
+                        and repair_expected_kind in STRUCTURED_PUBLIC_RESPONSE_KINDS
+                        and not (
+                            isinstance(exc, UnknownPriorItemDispositionError)
+                            and ledger_incomplete
+                        )
+                    ):
+                        normalized = attempt_envelope_normalization(
+                            text,
+                            expected_kind=repair_expected_kind,
+                        )
+                        if normalized is not None:
+                            try:
+                                marker_value = validate(normalized)
+                            except UnknownPriorItemDispositionError as norm_exc:
+                                # Combined fix (issue #274): envelope normalization removed the
+                                # trailing defect but the normalized candidate still has unknown
+                                # prior dispositions. Try stripping them from the normalized text
+                                # so both defects are resolved in one deterministic pass.
+                                # Only apply when the original error was structural; when it was
+                                # already UnknownPriorItemDispositionError, block 2 handles it.
+                                normalized_history_strip = (
+                                    strip_requires_history_proof
+                                    and _history_strip_allowed(
+                                        normalized,
+                                        norm_exc,
+                                        resolved_history_item_ids=repair_resolved_history_item_ids,
+                                        expected_kind=repair_expected_kind,
+                                    )
+                                )
+                                if (
+                                    not isinstance(exc, UnknownPriorItemDispositionError)
+                                    and (
+                                        not strip_requires_history_proof
+                                        or normalized_history_strip
+                                    )
+                                    and repair_expected_kind in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}
+                                ):
+                                    stripped_from_normalized = strip_unknown_prior_item_dispositions(
+                                        normalized,
+                                        allowed_ids=frozenset(norm_exc.allowed_ids),
+                                        expected_kind=repair_expected_kind,
+                                    )
+                                    if stripped_from_normalized is not None:
+                                        try:
+                                            marker_value = validate(stripped_from_normalized)
+                                        except AgentLoopError:
+                                            if (
+                                                repair_expected_kind == "plan_revision"
+                                                and result.response_file_text
+                                                and _plan_revision_missing_human_acknowledgement(
+                                                    stripped_from_normalized,
+                                                    context=_HumanRequirementsRecoveryContext(
+                                                        surfaced_requirement_ids=tuple(
+                                                            repair_surfaced_requirement_ids or ()
+                                                        ),
+                                                        requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
                                                     ),
-                                                    requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                                                ),
-                                            )
-                                        ):
-                                            recovered = _recover_plan_revision_human_requirements_acknowledgement(
-                                                result,
-                                                text=stripped_from_normalized,
-                                                validate=validate,
-                                                context=_HumanRequirementsRecoveryContext(
-                                                    surfaced_requirement_ids=tuple(
-                                                        repair_surfaced_requirement_ids or ()
-                                                    ),
-                                                    requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                                                ),
-                                                config=config,
-                                                agent_name=agent_name,
-                                            )
-                                            if recovered is not None:
-                                                recovered_text, marker_value = recovered
-                                                if usage_record is not None:
-                                                    usage_record.validation_status = "validated"
-                                                return ValidatedAgentResponse(
-                                                    text=recovered_text,
-                                                    session_id=result.session_id,
-                                                    marker_value=marker_value,
-                                                    usage=usage,
-                                                    model_used=result.model_used,
-                                                    **_response_identity_fields(result),
                                                 )
-                                    else:
-                                        removed = ", ".join(sorted(norm_exc.unknown_ids))
-                                        allowed_str = ", ".join(sorted(norm_exc.allowed_ids)) or "(none)"
-                                        if normalized_history_strip:
-                                            log(
-                                                config,
-                                                f"{agent_name}: combined envelope normalization and "
-                                                f"deterministic strip removed canonically resolved "
-                                                f"historical prior-item disposition ID(s) {removed} "
-                                                f"{_history_strip_reason(ledger_incomplete)}; "
-                                                f"allowed carried prior IDs: {allowed_str}",
-                                            )
+                                            ):
+                                                recovered = _recover_plan_revision_human_requirements_acknowledgement(
+                                                    result,
+                                                    text=stripped_from_normalized,
+                                                    validate=validate,
+                                                    context=_HumanRequirementsRecoveryContext(
+                                                        surfaced_requirement_ids=tuple(
+                                                            repair_surfaced_requirement_ids or ()
+                                                        ),
+                                                        requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                                                    ),
+                                                    config=config,
+                                                    agent_name=agent_name,
+                                                )
+                                                if recovered is not None:
+                                                    recovered_text, marker_value = recovered
+                                                    if usage_record is not None:
+                                                        usage_record.validation_status = "validated"
+                                                    return _accepted_validated_response(
+                                                        accept_candidate(recovered_text, marker_value),
+                                                        session_id=result.session_id,
+                                                        usage=usage,
+                                                        model_used=result.model_used,
+                                                        **_response_identity_fields(result),
+                                                    )
                                         else:
-                                            log(
-                                                config,
-                                                f"{agent_name}: combined envelope normalization and "
-                                                f"deterministic strip recovered malformed response; "
-                                                f"removed prior-item ID(s) {removed}; "
-                                                f"allowed carried prior IDs: {allowed_str}",
+                                            removed = ", ".join(sorted(norm_exc.unknown_ids))
+                                            allowed_str = ", ".join(sorted(norm_exc.allowed_ids)) or "(none)"
+                                            if normalized_history_strip:
+                                                log(
+                                                    config,
+                                                    f"{agent_name}: combined envelope normalization and "
+                                                    f"deterministic strip removed canonically resolved "
+                                                    f"historical prior-item disposition ID(s) {removed} "
+                                                    f"{_history_strip_reason(ledger_incomplete)}; "
+                                                    f"allowed carried prior IDs: {allowed_str}",
+                                                )
+                                            else:
+                                                log(
+                                                    config,
+                                                    f"{agent_name}: combined envelope normalization and "
+                                                    f"deterministic strip recovered malformed response; "
+                                                    f"removed prior-item ID(s) {removed}; "
+                                                    f"allowed carried prior IDs: {allowed_str}",
+                                                )
+                                            if usage_record is not None:
+                                                usage_record.validation_status = "validated"
+                                            return _accepted_validated_response(
+                                                accept_candidate(stripped_from_normalized, marker_value),
+                                                session_id=result.session_id,
+                                                usage=usage,
+                                                model_used=result.model_used,
+                                                **_response_identity_fields(result),
                                             )
+                            except NonRepairableEvidenceRejection as norm_exc:
+                                normalized_evidence_rejection = norm_exc
+                            except AgentLoopError:
+                                pass
+                            else:
+                                log(
+                                    config,
+                                    f"{agent_name}: envelope normalization recovered malformed response",
+                                )
+                                if usage_record is not None:
+                                    usage_record.validation_status = "validated"
+                                return _accepted_validated_response(
+                                    accept_candidate(normalized, marker_value),
+                                    session_id=result.session_id,
+                                    usage=usage,
+                                    model_used=result.model_used,
+                                    **_response_identity_fields(result),
+                                )
+                    history_strip = (
+                        strip_requires_history_proof
+                        and isinstance(exc, UnknownPriorItemDispositionError)
+                        and _history_strip_allowed(
+                            text,
+                            exc,
+                            resolved_history_item_ids=repair_resolved_history_item_ids,
+                            expected_kind=repair_expected_kind,
+                        )
+                    )
+                    if (
+                        use_repair
+                        and not public_text_is_transient
+                        and not response_failure_is_unsupported
+                        and isinstance(exc, UnknownPriorItemDispositionError)
+                        and (not strip_requires_history_proof or history_strip)
+                        and repair_expected_kind in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}
+                    ):
+                        stripped_text = strip_unknown_prior_item_dispositions(
+                            text,
+                            allowed_ids=frozenset(exc.allowed_ids),
+                            expected_kind=repair_expected_kind,
+                        )
+                        if stripped_text is not None:
+                            try:
+                                marker_value = validate(stripped_text)
+                            except AgentLoopError:
+                                if (
+                                    repair_expected_kind == "plan_revision"
+                                    and result.response_file_text
+                                    and _plan_revision_missing_human_acknowledgement(
+                                        stripped_text,
+                                        context=_HumanRequirementsRecoveryContext(
+                                            surfaced_requirement_ids=tuple(
+                                                repair_surfaced_requirement_ids or ()
+                                            ),
+                                            requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                                        ),
+                                    )
+                                ):
+                                    recovered = _recover_plan_revision_human_requirements_acknowledgement(
+                                        result,
+                                        text=stripped_text,
+                                        validate=validate,
+                                        context=_HumanRequirementsRecoveryContext(
+                                            surfaced_requirement_ids=tuple(
+                                                repair_surfaced_requirement_ids or ()
+                                            ),
+                                            requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                                        ),
+                                        config=config,
+                                        agent_name=agent_name,
+                                    )
+                                    if recovered is not None:
+                                        recovered_text, marker_value = recovered
                                         if usage_record is not None:
                                             usage_record.validation_status = "validated"
-                                        return ValidatedAgentResponse(
-                                            text=stripped_from_normalized,
+                                        return _accepted_validated_response(
+                                            accept_candidate(recovered_text, marker_value),
                                             session_id=result.session_id,
-                                            marker_value=marker_value,
                                             usage=usage,
                                             model_used=result.model_used,
                                             **_response_identity_fields(result),
                                         )
-                        except AgentLoopError:
-                            pass
-                        else:
-                            log(
-                                config,
-                                f"{agent_name}: envelope normalization recovered malformed response",
-                            )
-                            if usage_record is not None:
-                                usage_record.validation_status = "validated"
-                            return ValidatedAgentResponse(
-                                text=normalized,
-                                session_id=result.session_id,
-                                marker_value=marker_value,
-                                usage=usage,
-                                model_used=result.model_used,
-                                **_response_identity_fields(result),
-                            )
-                history_strip = (
-                    strip_requires_history_proof
-                    and isinstance(exc, UnknownPriorItemDispositionError)
-                    and _history_strip_allowed(
-                        text,
-                        exc,
-                        resolved_history_item_ids=repair_resolved_history_item_ids,
-                        expected_kind=repair_expected_kind,
-                    )
-                )
-                if (
-                    use_repair
-                    and not public_text_is_transient
-                    and not response_failure_is_unsupported
-                    and isinstance(exc, UnknownPriorItemDispositionError)
-                    and (not strip_requires_history_proof or history_strip)
-                    and repair_expected_kind in {"pr_review", "plan_review", "plan_revision", "plan_revision_patch"}
-                ):
-                    stripped_text = strip_unknown_prior_item_dispositions(
-                        text,
-                        allowed_ids=frozenset(exc.allowed_ids),
-                        expected_kind=repair_expected_kind,
-                    )
-                    if stripped_text is not None:
-                        try:
-                            marker_value = validate(stripped_text)
-                        except AgentLoopError:
-                            if (
-                                repair_expected_kind == "plan_revision"
-                                and result.response_file_text
-                                and _plan_revision_missing_human_acknowledgement(
-                                    stripped_text,
-                                    context=_HumanRequirementsRecoveryContext(
-                                        surfaced_requirement_ids=tuple(
-                                            repair_surfaced_requirement_ids or ()
-                                        ),
-                                        requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                                    ),
-                                )
-                            ):
-                                recovered = _recover_plan_revision_human_requirements_acknowledgement(
-                                    result,
-                                    text=stripped_text,
-                                    validate=validate,
-                                    context=_HumanRequirementsRecoveryContext(
-                                        surfaced_requirement_ids=tuple(
-                                            repair_surfaced_requirement_ids or ()
-                                        ),
-                                        requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
-                                    ),
-                                    config=config,
-                                    agent_name=agent_name,
-                                )
-                                if recovered is not None:
-                                    recovered_text, marker_value = recovered
-                                    if usage_record is not None:
-                                        usage_record.validation_status = "validated"
-                                    return ValidatedAgentResponse(
-                                        text=recovered_text,
-                                        session_id=result.session_id,
-                                        marker_value=marker_value,
-                                        usage=usage,
-                                        model_used=result.model_used,
-                                        **_response_identity_fields(result),
-                                    )
-                        else:
-                            removed = ", ".join(sorted(exc.unknown_ids))
-                            allowed_str = ", ".join(sorted(exc.allowed_ids)) or "(none)"
-                            if history_strip:
-                                log(
-                                    config,
-                                    f"{agent_name}: removed canonically resolved historical "
-                                    f"prior-item disposition ID(s) {removed} "
-                                    f"{_history_strip_reason(ledger_incomplete)}; "
-                                    f"allowed carried prior IDs: {allowed_str}",
-                                )
                             else:
-                                log(
-                                    config,
-                                    f"{agent_name}: deterministically removed unknown prior-item "
-                                    f"disposition ID(s) {removed}; allowed carried prior IDs: {allowed_str}",
+                                removed = ", ".join(sorted(exc.unknown_ids))
+                                allowed_str = ", ".join(sorted(exc.allowed_ids)) or "(none)"
+                                if history_strip:
+                                    log(
+                                        config,
+                                        f"{agent_name}: removed canonically resolved historical "
+                                        f"prior-item disposition ID(s) {removed} "
+                                        f"{_history_strip_reason(ledger_incomplete)}; "
+                                        f"allowed carried prior IDs: {allowed_str}",
+                                    )
+                                else:
+                                    log(
+                                        config,
+                                        f"{agent_name}: deterministically removed unknown prior-item "
+                                        f"disposition ID(s) {removed}; allowed carried prior IDs: {allowed_str}",
+                                    )
+                                if usage_record is not None:
+                                    usage_record.validation_status = "validated"
+                                return _accepted_validated_response(
+                                    accept_candidate(stripped_text, marker_value),
+                                    session_id=result.session_id,
+                                    usage=usage,
+                                    model_used=result.model_used,
+                                    **_response_identity_fields(result),
                                 )
-                            if usage_record is not None:
-                                usage_record.validation_status = "validated"
-                            return ValidatedAgentResponse(
-                                text=stripped_text,
-                                session_id=result.session_id,
-                                marker_value=marker_value,
-                                usage=usage,
-                                model_used=result.model_used,
-                                **_response_identity_fields(result),
-                            )
-                payload_rejection = (
-                    _semantic_patch_payload_rejection(
-                        exc,
-                        text=text,
-                        normalized=normalized,
-                        payload_validator=semantic_patch_payload_validator,
+                    payload_rejection = (
+                        _semantic_patch_payload_rejection(
+                            exc,
+                            text=text,
+                            normalized=normalized,
+                            payload_validator=semantic_patch_payload_validator,
+                        )
+                        if (
+                            repair_expected_kind == "plan_revision_patch"
+                            and not public_text_is_transient
+                            and not response_failure_is_unsupported
+                        )
+                        else None
                     )
-                    if (
-                        repair_expected_kind == "plan_revision_patch"
+                    if payload_rejection is not None:
+                        # Repair may change only a semantic patch's envelope, and
+                        # this rejection names its payload: no repair output can
+                        # satisfy both. Hand it to the bounded replan (#979).
+                        candidate_text, rejection_diagnostic = payload_rejection
+                        log(
+                            config,
+                            f"{agent_name}: semantic patch payload rejected ({rejection_diagnostic}); "
+                            "repair may change only the envelope, routing to bounded replan",
+                        )
+                        bounded_replan_rejection = DeterministicPlanValidationExhaustion(
+                            candidate_kind="plan_revision",
+                            candidate_text=candidate_text,
+                            diagnostic=rejection_diagnostic,
+                            candidate_digest=hashlib.sha256(
+                                candidate_text.encode("utf-8")
+                            ).hexdigest(),
+                        )
+                        should_retry = False
+                        last_failure_category = "deterministic"
+                    elif (
+                        evidence_rejection := (
+                            exc
+                            if isinstance(exc, NonRepairableEvidenceRejection)
+                            else normalized_evidence_rejection
+                        )
+                    ) is not None:
+                        # Selecting a real broker handle that is not an
+                        # authoritative passing observation is an authority
+                        # decision. Repair may only reshape the envelope around
+                        # the coder's claims, so it cannot satisfy this; running
+                        # it (and its fallback chain) only burns its timeout and
+                        # then misreports the stop as that timeout (#990).
+                        log(
+                            config,
+                            f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
+                            "not repairable by reformatting, skipping repair pass",
+                        )
+                        last_error = (
+                            f"{evidence_rejection} (semantic evidence rejection; "
+                            "repair skipped because reformatting cannot change it)"
+                        )
+                        last_classification_text = _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
+                        should_retry = False
+                        last_failure_category = "deterministic"
+                    elif (
+                        use_repair
                         and not public_text_is_transient
                         and not response_failure_is_unsupported
-                    )
-                    else None
-                )
-                if payload_rejection is not None:
-                    # Repair may change only a semantic patch's envelope, and
-                    # this rejection names its payload: no repair output can
-                    # satisfy both. Hand it to the bounded replan (#979).
-                    candidate_text, rejection_diagnostic = payload_rejection
-                    log(
-                        config,
-                        f"{agent_name}: semantic patch payload rejected ({rejection_diagnostic}); "
-                        "repair may change only the envelope, routing to bounded replan",
-                    )
-                    bounded_replan_rejection = DeterministicPlanValidationExhaustion(
-                        candidate_kind="plan_revision",
-                        candidate_text=candidate_text,
-                        diagnostic=rejection_diagnostic,
-                        candidate_digest=hashlib.sha256(
-                            candidate_text.encode("utf-8")
-                        ).hexdigest(),
-                    )
-                    should_retry = False
-                    last_failure_category = "deterministic"
-                elif (
-                    use_repair
-                    and not public_text_is_transient
-                    and not response_failure_is_unsupported
-                    and (not marker_safety_failure or not marker_safety_repair_attempted)
-                    and not (
-                        isinstance(exc, UnknownPriorItemDispositionError)
-                        and ledger_incomplete
-                    )
-                ):
-                    log(config, f"{agent_name}: schema validation failed ({exc}); attempting repair pass")
-                    repair_kwargs: dict[str, object] = {"expected_kind": repair_expected_kind}
-                    if repair_unresolved_item_ids is not None:
-                        repair_kwargs["unresolved_item_ids"] = tuple(repair_unresolved_item_ids)
-                    if repair_expected_kind in {"issue_implementation", "plan_state", "plan_revision"}:
-                        repair_kwargs["surfaced_requirement_ids"] = tuple(
-                            repair_surfaced_requirement_ids or ()
+                        and (not marker_safety_failure or not marker_safety_repair_attempted)
+                        and not (
+                            isinstance(exc, UnknownPriorItemDispositionError)
+                            and ledger_incomplete
                         )
-                        repair_kwargs["requires_direct_discussion_ack"] = (
-                            repair_requires_direct_discussion_ack
-                        )
-                        if (
-                            require_execution_strategy_contract
-                            and repair_expected_kind in {"plan_state", "plan_revision"}
-                        ):
-                            repair_kwargs["require_execution_strategy_contract"] = True
-                        if (
-                            require_risk_test_matrix_contract
-                            and repair_expected_kind in {"plan_state", "plan_revision"}
-                        ):
-                            repair_kwargs["require_risk_test_matrix_contract"] = True
-                        if (
-                            reject_unsolicited_risk_test_matrix_contract
-                            and repair_expected_kind == "plan_revision"
-                        ):
-                            repair_kwargs["reject_unsolicited_risk_test_matrix_contract"] = True
-                    elif (
-                        repair_expected_kind == "coder_followup"
-                        and (
-                            repair_surfaced_requirement_ids is not None
-                            or repair_requires_direct_discussion_ack
-                        )
+                        # Repair may not supply an assessment the response lacks,
+                        # so a response whose only defect is the unsatisfied
+                        # contract has nothing left for a repair model to fix.
+                        and not contract_unsatisfied
                     ):
-                        repair_kwargs["surfaced_requirement_ids"] = tuple(repair_surfaced_requirement_ids or ())
-                        repair_kwargs["requires_direct_discussion_ack"] = repair_requires_direct_discussion_ack
-                    elif (
-                        repair_expected_kind in {"plan_review", "pr_review"}
-                        and repair_reviewer_requirement_ids is not None
-                    ):
-                        repair_kwargs["reviewer_requirement_ids"] = tuple(
-                            repair_reviewer_requirement_ids
-                        )
-                    if isinstance(exc, UnknownPriorItemDispositionError):
-                        repair_kwargs["allowed_prior_item_ids"] = exc.allowed_ids
-                        repair_kwargs["unknown_prior_item_ids"] = exc.unknown_ids
-                        repair_kwargs["same_round_context"] = exc.same_round_description
-                    elif repair_allowed_prior_item_ids is not None:
-                        repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
-                    original_validation_error = str(exc)
-                    if marker_safety_failure:
-                        marker_safety_repair_attempted = True
-                    repaired, repaired_marker, repair_attempts = _run_structured_repair(
-                        normalized if normalized is not None else text,
-                        runner=runner,
-                        config=config,
-                        usage_context=usage_context,
-                        validate=validate,
-                        repair_kwargs=repair_kwargs,
-                    )
-                    _log_repair_attempts(config, agent_name, repair_attempts)
-                    terminal_repair = repair_attempts[-1] if repair_attempts else None
-                    if (
-                        terminal_repair is not None
-                        and terminal_repair.outcome == "fresh_contract_integrity"
-                    ):
-                        # A fresh planning response with no mechanically
-                        # recoverable contract must not be repaired by
-                        # synthesis. Execution-recommendation integrity keeps
-                        # its established planner replay, while a risk-matrix
-                        # integrity failure is deterministic and fail-fast.
-                        # The original structured validator rejection remains
-                        # authoritative for terminal diagnostic persistence.
-                        should_retry = terminal_repair.integrity_contract == "execution_recommendation"
-                        last_failure_category = "fresh-contract-integrity"
-                        last_classification_text = (
-                            "fresh planning execution recommendation requires a new planner turn"
-                            if terminal_repair.integrity_contract == "execution_recommendation"
-                            else "fresh planning risk-test-matrix contract is not mechanically recoverable"
-                        )
-                    elif (
-                        terminal_repair is not None
-                        and terminal_repair.outcome == "review_substance_integrity"
-                    ):
-                        # The reviewer's own turn produced no review, usually
-                        # because its tooling cut the turn short. That is a
-                        # reviewer availability failure, not a verdict: retry
-                        # within the configured policy and never let repair
-                        # synthesize a blocking item on the reviewer's behalf.
-                        plan_validation_exhaustion = None
-                        plan_validation_capture_eligible = False
-                        if (
-                            last_failure_category
-                            not in _PROVIDER_DEFINITIVE_FAILURE_CATEGORIES
-                        ):
-                            # A provider/credential diagnostic the reviewer's own
-                            # output already named stays authoritative: refusing
-                            # its repair says nothing about availability, and a
-                            # rerun cannot fix an auth or billing failure.
-                            should_retry = True
-                            last_failure_category = "agent-unavailable"
-                            last_classification_text = (
-                                "reviewer response carried no recoverable review substance; "
-                                "repair refused"
+                        log(config, f"{agent_name}: schema validation failed ({exc}); attempting repair pass")
+                        repair_kwargs: dict[str, object] = {"expected_kind": repair_expected_kind}
+                        if repair_unresolved_item_ids is not None:
+                            repair_kwargs["unresolved_item_ids"] = tuple(repair_unresolved_item_ids)
+                        if repair_expected_kind in {"issue_implementation", "plan_state", "plan_revision"}:
+                            repair_kwargs["surfaced_requirement_ids"] = tuple(
+                                repair_surfaced_requirement_ids or ()
                             )
-                    elif (
-                        terminal_repair is not None
-                        and terminal_repair.outcome == "semantic_patch_integrity"
-                    ):
-                        # A malformed semantic payload has no authenticated
-                        # decision set for an envelope-only repair to retain.
-                        # Give the planner a fresh attempt; never let a repair
-                        # model synthesize operations, rationales, or bindings.
-                        should_retry = True
-                        last_failure_category = "semantic-patch-integrity"
-                        last_classification_text = (
-                            "semantic patch is not mechanically recoverable; planner retry required"
-                        )
-                    elif terminal_repair is not None:
-                        repaired_exhaustion = _capture_terminal_plan_repair_rejection(
-                            terminal_repair,
-                            repair_expected_kind=repair_expected_kind,
+                            repair_kwargs["requires_direct_discussion_ack"] = (
+                                repair_requires_direct_discussion_ack
+                            )
+                            if (
+                                require_execution_strategy_contract
+                                and repair_expected_kind in {"plan_state", "plan_revision"}
+                            ):
+                                repair_kwargs["require_execution_strategy_contract"] = True
+                            if (
+                                require_risk_test_matrix_contract
+                                and repair_expected_kind in {"plan_state", "plan_revision"}
+                            ):
+                                repair_kwargs["require_risk_test_matrix_contract"] = True
+                            if (
+                                reject_unsolicited_risk_test_matrix_contract
+                                and repair_expected_kind == "plan_revision"
+                            ):
+                                repair_kwargs["reject_unsolicited_risk_test_matrix_contract"] = True
+                        elif (
+                            repair_expected_kind == "coder_followup"
+                            and (
+                                repair_surfaced_requirement_ids is not None
+                                or repair_requires_direct_discussion_ack
+                            )
+                        ):
+                            repair_kwargs["surfaced_requirement_ids"] = tuple(repair_surfaced_requirement_ids or ())
+                            repair_kwargs["requires_direct_discussion_ack"] = repair_requires_direct_discussion_ack
+                        elif (
+                            repair_expected_kind in {"plan_review", "pr_review"}
+                            and repair_reviewer_requirement_ids is not None
+                        ):
+                            repair_kwargs["reviewer_requirement_ids"] = tuple(
+                                repair_reviewer_requirement_ids
+                            )
+                        if isinstance(exc, UnknownPriorItemDispositionError):
+                            repair_kwargs["allowed_prior_item_ids"] = exc.allowed_ids
+                            repair_kwargs["unknown_prior_item_ids"] = exc.unknown_ids
+                            repair_kwargs["same_round_context"] = exc.same_round_description
+                        elif repair_allowed_prior_item_ids is not None:
+                            repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
+                        original_validation_error = str(exc)
+                        if marker_safety_failure:
+                            marker_safety_repair_attempted = True
+                        repaired, repaired_marker, repair_attempts = _run_structured_repair(
+                            normalized if normalized is not None else text,
+                            runner=runner,
+                            config=config,
+                            usage_context=usage_context,
                             validate=validate,
+                            repair_kwargs=repair_kwargs,
+                            require_architecture_impact_contract=require_architecture_impact_contract,
+                            degrade_architecture_impact=degrade_architecture_impact,
+                            parse_response=parse_response,
+                            contract_refusal=(
+                                contract_refusal if require_architecture_impact_contract else None
+                            ),
                         )
-                        if repaired_exhaustion is not None:
-                            # The repair candidate, rather than the source
-                            # candidate, is the final deterministic rejection.
-                            plan_validation_exhaustion = repaired_exhaustion
-                            plan_validation_capture_eligible = True
+                        _log_repair_attempts(config, agent_name, repair_attempts)
+                        terminal_repair = repair_attempts[-1] if repair_attempts else None
+                        # A refused contract candidate outranks every later
+                        # non-accepting failure in the same chain: it is a complete
+                        # response whose only defect is the contract.
+                        refused_contract = (
+                            _refused_contract_attempt(repair_attempts)
+                            if repaired_marker is None else None
+                        )
+                        if refused_contract is not None:
+                            # Deterministic, never a repair-provider failure; the
+                            # planning capture is built from the refused candidate
+                            # itself so the retained candidate and records are kept.
                             last_failure_category = "deterministic"
                             last_classification_text = (
-                                f"structured {repair_expected_kind} repair failed trusted validation"
+                                f"structured {repair_expected_kind} repair failed the "
+                                "architecture_impact contract"
                             )
-                        else:
-                            # A terminal repair transport/provider failure (or
-                            # non-matching/unsafe output) cannot persist stale
-                            # source-candidate provenance.
+                            should_retry = True
+                            pending_contract_reprompt = refused_contract.diagnostic
+                            if repair_expected_kind in {"plan_state", "plan_revision"}:
+                                plan_validation_exhaustion = DeterministicPlanValidationExhaustion(
+                                    candidate_kind=repair_expected_kind,
+                                    candidate_text=refused_contract.output,
+                                    diagnostic=refused_contract.diagnostic,
+                                    candidate_digest=hashlib.sha256(
+                                        refused_contract.output.encode("utf-8")
+                                    ).hexdigest(),
+                                )
+                                plan_validation_capture_eligible = True
+                        elif (
+                            terminal_repair is not None
+                            and terminal_repair.outcome == "fresh_contract_integrity"
+                        ):
+                            # A fresh planning response with no mechanically
+                            # recoverable contract must not be repaired by
+                            # synthesis. Execution-recommendation integrity keeps
+                            # its established planner replay, while a risk-matrix
+                            # integrity failure is deterministic and fail-fast.
+                            # The original structured validator rejection remains
+                            # authoritative for terminal diagnostic persistence.
+                            should_retry = terminal_repair.integrity_contract == "execution_recommendation"
+                            last_failure_category = "fresh-contract-integrity"
+                            last_classification_text = (
+                                "fresh planning execution recommendation requires a new planner turn"
+                                if terminal_repair.integrity_contract == "execution_recommendation"
+                                else "fresh planning risk-test-matrix contract is not mechanically recoverable"
+                            )
+                        elif (
+                            terminal_repair is not None
+                            and terminal_repair.outcome == "review_substance_integrity"
+                        ):
+                            # The reviewer's own turn produced no review, usually
+                            # because its tooling cut the turn short. That is a
+                            # reviewer availability failure, not a verdict: retry
+                            # within the configured policy and never let repair
+                            # synthesize a blocking item on the reviewer's behalf.
                             plan_validation_exhaustion = None
                             plan_validation_capture_eligible = False
-                            if terminal_repair.outcome == "timeout":
-                                last_failure_category = "timeout"
-                            elif terminal_repair.outcome != "invalid_output":
-                                # Includes a terminal transient_provider_error
-                                # (agy model-access failure), even after
-                                # earlier invalid_output attempts: it is a
-                                # resumable provider failure, not a
-                                # deterministic plan-validation rejection.
-                                last_failure_category = "repair-provider-failure"
-                    if repaired is not None:
-                        if repaired_marker is None:
-                            repair_detail = (
-                                repair_attempts[-1].diagnostic
-                                if repair_attempts
-                                else "repair output failed validation"
+                            if (
+                                last_failure_category
+                                not in _PROVIDER_DEFINITIVE_FAILURE_CATEGORIES
+                            ):
+                                # A provider/credential diagnostic the reviewer's own
+                                # output already named stays authoritative: refusing
+                                # its repair says nothing about availability, and a
+                                # rerun cannot fix an auth or billing failure.
+                                should_retry = True
+                                last_failure_category = "agent-unavailable"
+                                last_classification_text = (
+                                    "reviewer response carried no recoverable review substance; "
+                                    "repair refused"
+                                )
+                        elif (
+                            terminal_repair is not None
+                            and terminal_repair.outcome == "semantic_patch_integrity"
+                        ):
+                            # A malformed semantic payload has no authenticated
+                            # decision set for an envelope-only repair to retain.
+                            # Give the planner a fresh attempt; never let a repair
+                            # model synthesize operations, rationales, or bindings.
+                            should_retry = True
+                            last_failure_category = "semantic-patch-integrity"
+                            last_classification_text = (
+                                "semantic patch is not mechanically recoverable; planner retry required"
                             )
-                            last_error = (
-                                f"{original_validation_error}; repair failure: {repair_detail}"
+                        elif terminal_repair is not None:
+                            repaired_exhaustion = _capture_terminal_plan_repair_rejection(
+                                terminal_repair,
+                                repair_expected_kind=repair_expected_kind,
+                                validate=(
+                                    parse_response if require_architecture_impact_contract else validate
+                                ),
+                                contract_diagnostic=(
+                                    _architecture_contract_diagnostic
+                                    if require_architecture_impact_contract else None
+                                ),
                             )
-                            log(
-                                config,
-                                f"{agent_name}: repair pass produced invalid output ({repair_detail})",
-                            )
-                        else:
-                            marker_value = repaired_marker
-                            if isinstance(exc, UnknownPriorItemDispositionError):
-                                removed = ", ".join(sorted(exc.unknown_ids))
-                                allowed = ", ".join(sorted(exc.allowed_ids)) or "(none)"
-                                log(
-                                    config,
-                                    f"{agent_name}: repair pass removed unknown prior-item "
-                                    f"disposition ID(s) {removed}; allowed carried prior IDs: {allowed}",
+                            if repaired_exhaustion is not None:
+                                # The repair candidate, rather than the source
+                                # candidate, is the final deterministic rejection.
+                                plan_validation_exhaustion = repaired_exhaustion
+                                plan_validation_capture_eligible = True
+                                last_failure_category = "deterministic"
+                                last_classification_text = (
+                                    f"structured {repair_expected_kind} repair failed trusted validation"
                                 )
                             else:
-                                log(config, f"{agent_name}: repair pass recovered malformed response")
-                            if usage_record is not None:
-                                usage_record.validation_status = "validated"
-                            return ValidatedAgentResponse(
-                                text=repaired,
-                                session_id=result.session_id,
-                                marker_value=marker_value,
-                                usage=usage,
-                                model_used=result.model_used,
-                                **_response_identity_fields(result),
+                                # A terminal repair transport/provider failure (or
+                                # non-matching/unsafe output) cannot persist stale
+                                # source-candidate provenance.
+                                plan_validation_exhaustion = None
+                                plan_validation_capture_eligible = False
+                                if terminal_repair.outcome == "timeout":
+                                    last_failure_category = "timeout"
+                                elif terminal_repair.outcome != "invalid_output":
+                                    # Includes a terminal transient_provider_error
+                                    # (agy model-access failure), even after
+                                    # earlier invalid_output attempts: it is a
+                                    # resumable provider failure, not a
+                                    # deterministic plan-validation rejection.
+                                    last_failure_category = "repair-provider-failure"
+                        if repaired is not None:
+                            if repaired_marker is None:
+                                repair_detail = (
+                                    repair_attempts[-1].diagnostic
+                                    if repair_attempts
+                                    else "repair output failed validation"
+                                )
+                                last_error = (
+                                    f"{original_validation_error}; repair failure: {repair_detail}"
+                                )
+                                log(
+                                    config,
+                                    f"{agent_name}: repair pass produced invalid output ({repair_detail})",
+                                )
+                            else:
+                                marker_value = repaired_marker
+                                try:
+                                    # The repaired candidate was parsed under
+                                    # the primary attempt's acquisition, never
+                                    # the repair turn's.
+                                    accepted_repair = accept_candidate(
+                                        repaired, marker_value, validation_acquisition
+                                    )
+                                except _AcceptedTextCanonicalizationError as canon_exc:
+                                    accepted_repair = None
+                                    last_error = f"{original_validation_error}; repair failure: {canon_exc}"
+                                    last_failure_category = "deterministic"
+                                    log(config, f"{agent_name}: repaired response not accepted ({canon_exc})")
+                            if repaired_marker is not None and accepted_repair is not None:
+                                if isinstance(exc, UnknownPriorItemDispositionError):
+                                    removed = ", ".join(sorted(exc.unknown_ids))
+                                    allowed = ", ".join(sorted(exc.allowed_ids)) or "(none)"
+                                    log(
+                                        config,
+                                        f"{agent_name}: repair pass removed unknown prior-item "
+                                        f"disposition ID(s) {removed}; allowed carried prior IDs: {allowed}",
+                                    )
+                                else:
+                                    log(config, f"{agent_name}: repair pass recovered malformed response")
+                                if usage_record is not None:
+                                    usage_record.validation_status = "validated"
+                                return _accepted_validated_response(
+                                    accepted_repair,
+                                    session_id=result.session_id,
+                                    usage=usage,
+                                    model_used=result.model_used,
+                                    **_response_identity_fields(result),
+                                )
+                        elif repair_attempts:
+                            details = "; ".join(
+                                f"{attempt.backend}/{attempt.model}: {attempt.outcome}"
+                                + (f" ({attempt.diagnostic})" if attempt.diagnostic else "")
+                                for attempt in repair_attempts
                             )
-                    elif repair_attempts:
-                        details = "; ".join(
-                            f"{attempt.backend}/{attempt.model}: {attempt.outcome}"
-                            + (f" ({attempt.diagnostic})" if attempt.diagnostic else "")
-                            for attempt in repair_attempts
-                        )
-                        last_error = f"{original_validation_error}; repair invocation failure: {details}"
+                            last_error = f"{original_validation_error}; repair invocation failure: {details}"
             else:
                 if usage_record is not None:
                     usage_record.validation_status = "validated"
-                return ValidatedAgentResponse(
-                    text=text,
+                return _accepted_validated_response(
+                    accept_candidate(text, marker_value),
                     session_id=result.session_id,
-                    marker_value=marker_value,
                     usage=usage,
                     model_used=result.model_used,
                     **_response_identity_fields(result),
@@ -4411,14 +4851,24 @@ def _run_validated_agent(
     )
     if repair_expected_kind == "issue_implementation" and config.managed_ci:
         message += " The implementation response was rejected before a PR number was accepted."
-        if (
-            config.allow_unprotected_managed_ci
-            and managed_ci_recovery_protection in {"voluntary", "plan_limited"}
-        ):
+        if managed_ci_recovery_protection in waivable_protection_states(config):
             message += (
                 " If the coder opened a PR before that rejection, discover and resume that same PR "
-                "with explicit --managed-ci-fresh authorization (including the unprotected waiver); "
-                "do not rerun implementation to recreate it."
+                "with explicit --managed-ci-fresh authorization (including the unprotected waiver"
+                + (
+                    ": --allow-unprotected-managed-ci --allow-unreadable-protection"
+                    if managed_ci_recovery_protection == "unreadable"
+                    else ""
+                )
+                + "); do not rerun implementation to recreate it."
+            )
+        elif managed_ci_recovery_protection == "unreadable":
+            message += (
+                " If the coder opened a PR before that rejection, use the ordinary managed-CI "
+                "issue/PR discovery and resume path for that same PR. Fresh authorization is "
+                "unavailable because unreadable branch protection also requires "
+                f"{waiver_flags_for_protection('unreadable')}; do not rerun implementation "
+                "to recreate the PR."
             )
         else:
             message += (
@@ -4439,6 +4889,7 @@ def _run_validated_agent(
         terminal_public_response=terminal_public_response,
         containment=last_result.containment if last_result is not None else None,
         plan_validation_exhaustion=plan_validation_exhaustion,
+        preserved_unsatisfied_response=preserved_unsatisfied,
         bounded_replan_rejection=bounded_replan_rejection,
     )
     if (
@@ -4452,6 +4903,9 @@ def _run_validated_agent(
 @dataclass(frozen=True)
 class _TerminalNoPrImplementation:
     state: str
+    # A satisfied blocking task result keeps its structured payload (#925);
+    # clarification and legacy markers carry none.
+    parsed: StructuredTaskResult | None = None
 
 
 @dataclass(frozen=True)
@@ -4459,6 +4913,424 @@ class _TerminalIssueImplementationConflict:
     """A valid implementation payload rejected from handoff by semantics."""
 
     parsed: StructuredIssueImplementation
+
+
+# Every parsed result type that carries an architecture-impact contract.  The
+# unsatisfied check enumerates these explicitly rather than defaulting through
+# ``getattr``, so a new result wrapper cannot silently bypass the contract.
+_ARCHITECTURE_CONTRACT_CARRIERS = (
+    StructuredCoderFollowup,
+    StructuredIssueImplementation,
+    StructuredTaskResult,
+    StructuredPlanRevision,
+    StructuredPlanState,
+    PlanDecomposition,
+)
+# Review carriers hold records but never a required contract.
+_ARCHITECTURE_RECORD_CARRIERS = (*_ARCHITECTURE_CONTRACT_CARRIERS, ParsedReview, ParsedPlanReview)
+
+
+_TERMINAL_PAYLOAD_WRAPPERS = (_TerminalNoPrImplementation, _TerminalIssueImplementationConflict)
+
+
+def _carrier_payload(result: object) -> object | None:
+    """Return the structured payload a result carries, looking inside wrappers.
+
+    Both terminal wrappers expose ``parsed``; a carrier is its own payload;
+    clarification, legacy PR numbers and payload-less wrappers carry none.
+    """
+    if isinstance(result, _TERMINAL_PAYLOAD_WRAPPERS):
+        return result.parsed
+    if isinstance(result, _ARCHITECTURE_RECORD_CARRIERS):
+        return result
+    return None
+
+
+def _with_carrier_payload(result: object, payload: object) -> object:
+    """Rebuild ``result`` around ``payload`` without ever dropping a wrapper."""
+    if isinstance(result, _TERMINAL_PAYLOAD_WRAPPERS):
+        return dataclasses_replace(result, parsed=payload)
+    return payload
+
+
+def _is_contract_free_result(result: object) -> bool:
+    """Results that carry no structured payload: clarification, legacy PR, no-PR."""
+    if isinstance(result, _TerminalNoPrImplementation):
+        return result.parsed is None
+    return isinstance(result, (str, int))
+
+
+def _unwrap_architecture_result(result: object) -> object:
+    if isinstance(result, _TERMINAL_PAYLOAD_WRAPPERS) and result.parsed is not None:
+        return result.parsed
+    return result
+
+
+def _architecture_result_fields(
+    result: object | None,
+) -> tuple[object | None, tuple[ParseDegradation, ...]]:
+    """Return the assessment and its degradation records for a metadata writer.
+
+    The input list is enumerated: ``None``, clarification strings, legacy PR
+    numbers and payload-less wrappers yield nothing; wrappers holding a
+    payload are unwrapped; carriers yield their own fields; any other type
+    raises rather than defaulting.
+    """
+    result = _unwrap_architecture_result(result)
+    if result is None or _is_contract_free_result(result):
+        return None, ()
+    if isinstance(result, _ARCHITECTURE_RECORD_CARRIERS):
+        return result.architecture_impact, tuple(result.architecture_impact_degradations)
+    # An assembled semantic-patch plan is a StructuredPlanRevision, already
+    # enumerated above; no duck-typed fallback may silently drop records.
+    raise AgentLoopError(
+        f"Internal error: {type(result).__name__} is not an enumerated architecture-impact "
+        "result type for round metadata."
+    )
+
+
+def architecture_impact_contract_unsatisfied(result: object) -> bool:
+    """Whether a validated result fails a required architecture-impact contract.
+
+    Fails closed: an unknown result type raises rather than defaulting to
+    satisfied.
+    """
+    result = _unwrap_architecture_result(result)
+    if _is_contract_free_result(result):
+        return False
+    if isinstance(result, _ARCHITECTURE_CONTRACT_CARRIERS):
+        contract = result.architecture_impact_contract
+        return contract.required and not contract.satisfied
+    raise AgentLoopError(
+        f"Internal error: {type(result).__name__} is not an enumerated architecture-impact "
+        "contract result type."
+    )
+
+
+def _architecture_contract_diagnostic(result: object) -> str | None:
+    """Pure field-naming diagnostic for an unsatisfied contract, else None."""
+    if not architecture_impact_contract_unsatisfied(result):
+        return None
+    carrier = _unwrap_architecture_result(result)
+    kind = "plan_decomposition" if isinstance(carrier, PlanDecomposition) else carrier.kind
+    parts = [
+        f"{kind} must include architecture_impact for this fresh contract turn.",
+        "architecture_impact.status must be `changed` or `unchanged`; an omitted or "
+        "undetermined assessment does not satisfy the contract.",
+    ]
+    for record in carrier.architecture_impact_degradations:
+        parts.append(
+            f"Degraded element {record.element_path}: rule {record.rule}; observed "
+            f"'{record.observed_preview}'; outcome {record.outcome}."
+        )
+    return " ".join(parts)
+
+
+def _attach_architecture_degradations(result: object, records: Sequence[ParseDegradation]) -> object:
+    """Merge out-of-band records onto the payload a result carries.
+
+    Existing parser-derived records are kept; exact duplicates are dropped.
+    """
+    if not records:
+        return result
+    payload = _carrier_payload(result)
+    if payload is None:
+        return result
+    merged = _merge_degradation_records(records, payload.architecture_impact_degradations)
+    return _with_carrier_payload(
+        result, dataclasses_replace(payload, architecture_impact_degradations=merged)
+    )
+
+
+def _merge_degradation_records(
+    first: Sequence[ParseDegradation], second: Sequence[ParseDegradation]
+) -> tuple[ParseDegradation, ...]:
+    """Order-preserving union: ``first`` leads, exact duplicates dropped."""
+    merged: list[ParseDegradation] = []
+    for record in (*first, *second):
+        if record not in merged:
+            merged.append(record)
+    return tuple(merged)
+
+
+def _architecture_mode_validators(
+    factory: Callable[[str], Callable[[str], object]],
+) -> dict[str, object]:
+    """Build an opt-in invocation's degradable validate and strict re-parse.
+
+    Both callables come from one factory, so they are identical -- same
+    helper, wrapper, parser and invocation context -- except for the mode.
+    """
+    return {
+        "validate": factory("degradable"),
+        "strict_revalidate": factory("strict"),
+        "degrade_architecture_impact": True,
+    }
+
+
+def _canonical_comparison_projection(result: object) -> object:
+    """Project a result for the degradable-versus-strict equality check.
+
+    Records are cleared, an `undetermined` assessment maps to absence, and raw
+    source-text echo fields are ignored; every other field is compared.
+    """
+    payload = _carrier_payload(result)
+    if payload is None:
+        return result
+    changes: dict[str, object] = {"architecture_impact_degradations": ()}
+    impact = payload.architecture_impact
+    if impact is not None and impact.status == ARCHITECTURE_IMPACT_UNDETERMINED:
+        changes["architecture_impact"] = None
+    if hasattr(payload, "raw_dispositions_text"):
+        changes["raw_dispositions_text"] = ""
+    projected = dataclasses_replace(payload, **changes)
+    return (type(result).__name__, getattr(result, "state", None), projected)
+
+
+@dataclass(frozen=True)
+class _AcceptedCandidate:
+    text: str
+    marker_value: object
+
+
+class _AcceptedTextCanonicalizationError(AgentLoopError):
+    """An otherwise valid candidate whose accepted text could not be canonicalized.
+
+    Never an unsatisfied architecture contract: it names the canonicalization
+    failure and is handled as a not-accepted candidate.
+    """
+
+
+def _with_validation_context(
+    fn: Callable[[str], object], *, runner: Runner, acquisition: AgentResult | None
+) -> Callable[[str], object]:
+    """Wrap a parse in the TrustedBody guard and the acquisition's test turn."""
+
+    def run(text: str) -> object:
+        TrustedBody.current_untrusted_visible(text)
+        token = None
+        if acquisition is not None and acquisition.test_turn_id is not None:
+            token = _VALIDATION_TEST_TURN_CONTEXT.set(
+                (runner, acquisition.test_turn_id, acquisition.test_turn_observations)
+            )
+        try:
+            return fn(text)
+        finally:
+            if token is not None:
+                _VALIDATION_TEST_TURN_CONTEXT.reset(token)
+
+    return run
+
+
+def _accept_candidate(
+    text: str,
+    marker_value: object,
+    *,
+    strict_revalidate: Callable[[str], object] | None,
+    runner: Runner,
+    acquisition: AgentResult | None,
+) -> _AcceptedCandidate:
+    """The single acceptance boundary for a validated candidate (#925).
+
+    A record-free candidate passes through byte-identical.  Otherwise the text
+    is rewritten to its wire-valid form, re-parsed strictly by the
+    invocation's own validate chain under the candidate's own acquisition,
+    checked against the degradable result under the comparison projection,
+    and the records are reattached inside any terminal wrapper.
+    """
+    payload = _carrier_payload(marker_value)
+    records = tuple(payload.architecture_impact_degradations) if payload is not None else ()
+    if not records:
+        return _AcceptedCandidate(text, marker_value)
+    if strict_revalidate is None:
+        raise _AcceptedTextCanonicalizationError(
+            "Accepted-text canonicalization failed: no strict re-parse was supplied."
+        )
+    rewritten = canonicalize_architecture_near_miss_text(text)
+    try:
+        reparsed = _with_validation_context(
+            strict_revalidate, runner=runner, acquisition=acquisition
+        )(rewritten)
+    except AgentLoopError as exc:
+        raise _AcceptedTextCanonicalizationError(
+            f"Accepted-text canonicalization failed: the rewritten text did not re-parse strictly ({exc})."
+        ) from exc
+    if _canonical_comparison_projection(reparsed) != _canonical_comparison_projection(marker_value):
+        raise _AcceptedTextCanonicalizationError(
+            "Accepted-text canonicalization failed: the strict re-parse differs from the accepted result."
+        )
+    reparsed_payload = _carrier_payload(reparsed)
+    if reparsed_payload is None:
+        raise _AcceptedTextCanonicalizationError(
+            "Accepted-text canonicalization failed: the strict re-parse carries no structured payload."
+        )
+    return _AcceptedCandidate(
+        rewritten,
+        _with_carrier_payload(
+            reparsed,
+            dataclasses_replace(reparsed_payload, architecture_impact_degradations=records),
+        ),
+    )
+
+
+def _accepted_validated_response(
+    candidate: _AcceptedCandidate, **fields: object
+) -> ValidatedAgentResponse:
+    """The only constructor of an accepted response; text comes from the boundary."""
+    return ValidatedAgentResponse(
+        text=candidate.text, marker_value=candidate.marker_value, **fields
+    )
+
+
+_ARCHITECTURE_CONTRACT_RETRY_SECTION_CHARS = 1200
+
+
+def _architecture_contract_retry_prompt(prompt: str, diagnostic: str) -> str:
+    """Append one bounded, marker-free section naming the unmet contract."""
+    detail = " ".join(sanitize_historical_text(diagnostic).replace("<", "(").replace(">", ")").split())
+    if len(detail) > _ARCHITECTURE_CONTRACT_RETRY_SECTION_CHARS:
+        detail = detail[:_ARCHITECTURE_CONTRACT_RETRY_SECTION_CHARS] + "..."
+    return (
+        f"{prompt}\n\n## Previous response not accepted: architecture_impact\n\n"
+        "The previous response was not accepted because its required `architecture_impact` "
+        "assessment was absent or not determinable. Include `architecture_impact` with "
+        "`status` set to exactly `changed` or `unchanged` and a non-empty rationale.\n"
+        f"Diagnostic: {detail}\n"
+    )
+
+
+def _surface_decomposition_degradations(
+    runner: Runner, *, config: AgentLoopConfig, issue_number: int, decomposition: object
+) -> None:
+    """Make an accepted decomposition's degradation records operator-visible.
+
+    PlanDecomposition has no round metadata, and its topology checkpoint must
+    stay byte-identical, so records surface through a bounded log line and one
+    plain, marker-free parent-issue comment instead.
+    """
+    records = tuple(getattr(decomposition, "architecture_impact_degradations", ()) or ())
+    body = render_decomposition_degradation_comment(records)
+    if body is None:
+        return
+    summary = "; ".join(
+        f"{record.element_path} {record.outcome} (observed '{record.observed_preview}')"
+        for record in records[:4]
+    )
+    log(config, f"Plan decomposition for issue #{issue_number} parse degradations: {summary}"[:600])
+    post_issue_comment(runner, config=config, issue_number=issue_number, body=body)
+
+
+def _architecture_impact_from_metadata(value: object) -> ArchitectureImpact | None:
+    """Rebuild an accepted assessment from its durable round-metadata shape.
+
+    Metadata stores ``sanitize_architecture_impact`` of the accepted carrier's
+    assessment.  It is used only when its keys are exactly the dataclass
+    fields and its status is declared; anything else yields None, so an
+    assessment is never fabricated.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    names = {field.name for field in dataclasses.fields(ArchitectureImpact)}
+    if set(value) != names or value.get("status") not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+        return None
+    kwargs: dict[str, object] = {}
+    for name in names:
+        item = value[name]
+        kwargs[name] = tuple(item) if isinstance(item, list) else item
+    try:
+        return ArchitectureImpact(**kwargs)
+    except TypeError:
+        return None
+
+
+def _resumed_review_architecture(
+    metadata: object, legacy_reparse: ArchitectureImpact | None
+) -> tuple[ArchitectureImpact | None, tuple[ParseDegradation, ...]]:
+    """The accepted assessment and records of a resumed review record.
+
+    A record written with the architecture contract takes both from its round
+    metadata, whatever its phase, so a rendered-prose post and a publication
+    post rebuild the same carrier.  Only a record older than architecture
+    metadata falls back to the legacy re-parse of its text, with no records.
+    """
+    if getattr(metadata, "architecture_contract_version", None) is None:
+        return legacy_reparse, ()
+    impact = _architecture_impact_from_metadata(getattr(metadata, "architecture_impact", None))
+    return impact, tuple(getattr(metadata, "architecture_impact_degradations", ()) or ())
+
+
+def _acknowledgement_repair_forbids_assessment(review_output: str) -> bool:
+    """An acknowledgement repair may not add an assessment the source lacks.
+
+    It exists only to add the acknowledgement, so absence is pinned whether
+    the review omitted the assessment or a degraded one was removed.
+    """
+    payload = recover_payload(review_output)
+    return isinstance(payload, dict) and "architecture_impact" not in payload
+
+
+def _pin_acknowledgement_repair(
+    accepted: object | None,
+    repaired: object | None,
+    *,
+    config: AgentLoopConfig,
+    reviewer_name: str,
+) -> object | None:
+    """Keep the accepted assessment and records through an acknowledgement repair.
+
+    A repair whose assessment differs, in its durable shape, from the accepted
+    one is a failed repair; otherwise the accepted records are reattached.
+    """
+    if repaired is None or accepted is None:
+        return repaired
+    if sanitize_architecture_impact(repaired.architecture_impact) != sanitize_architecture_impact(
+        accepted.architecture_impact
+    ):
+        log(
+            config,
+            f"{reviewer_name}: acknowledgement repair changed the accepted architecture_impact; "
+            "treating the repair as failed",
+        )
+        return None
+    return dataclasses_replace(
+        repaired, architecture_impact_degradations=accepted.architecture_impact_degradations
+    )
+
+
+def _surface_refused_decomposition(
+    runner: Runner, *, config: AgentLoopConfig, issue_number: int, error: AgentInvocationError
+) -> None:
+    """Post one degradation comment for a decomposition refused by its contract.
+
+    Runs before the exhaustion error propagates.  Nothing was checkpointed or
+    created; a failure to post is logged and never masks the original error.
+    """
+    preserved = getattr(error, "preserved_unsatisfied_response", None)
+    if preserved is None:
+        return
+    records = tuple(preserved.architecture_impact_degradations)
+    summary = "; ".join(
+        f"{record.element_path} {record.outcome}" for record in records[:4]
+    ) or "architecture_impact omitted"
+    log(config, f"Plan decomposition for issue #{issue_number} refused: {summary}"[:600])
+    try:
+        post_issue_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=render_refused_decomposition_comment(records, diagnostic=preserved.diagnostic),
+        )
+    except Exception as post_exc:  # noqa: BLE001 - never mask the exhaustion error
+        log(config, f"Could not post the decomposition degradation comment: {post_exc}"[:600])
+
+
+class _ArchitectureImpactContractUnsatisfied(AgentLoopError):
+    """Private attempt bookkeeping confined to ``_run_validated_agent``.
+
+    Validators never raise this; the seam raises it so every normalization,
+    stripping, recovery and repair branch treats an unsatisfied result as
+    not accepted.
+    """
 
 
 @dataclass(frozen=True)
@@ -4515,6 +5387,7 @@ def _validate_issue_implementation_response(
     authoritative_test_observations=None,
     delivered_risk_test_matrix_row_ids=None,
     execution_catalog=None,
+    architecture_status_mode: str,
 ) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
@@ -4529,6 +5402,7 @@ def _validate_issue_implementation_response(
             authoritative_test_observations=authoritative_test_observations,
             delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
             execution_catalog=execution_catalog,
+            architecture_status_mode=architecture_status_mode,
         )
     except IssueImplementationConflictError as exc:
         parsed = exc.payload
@@ -4676,12 +5550,14 @@ def _parse_fresh_correction_claims(
     if isinstance(original, StructuredIssueImplementation):
         candidate = validate_structured_issue_implementation(
             text,
+            architecture_status_mode="legacy",
             delivered_risk_test_matrix_row_ids=row_ids,
             execution_catalog=execution_catalog,
         )
     else:
         candidate = validate_structured_coder_followup(
             text,
+            architecture_status_mode="legacy",
             delivered_risk_test_matrix_row_ids=row_ids,
             execution_catalog=execution_catalog,
         )
@@ -4689,13 +5565,56 @@ def _parse_fresh_correction_claims(
         return None
     # The correction continuation is not a second coder handoff. Preserve all
     # coder-owned facts from the authenticated response and accept only its
-    # newly validated semantic claim set.
+    # newly validated semantic claim set.  Claims the original response lost
+    # to an unapproved row (#920) or any other row-ID defect (#926) stay on
+    # the audit record even when the correction omits them.
+    claims = candidate.risk_test_matrix_claims
+    original_claims = original.risk_test_matrix_claims
+    original_dropped = original_claims.dropped_row_ids if original_claims is not None else ()
+    original_degradations = original_claims.degradations if original_claims is not None else ()
+    original_exact_ids = (
+        original_claims.unapproved_claim_row_ids if original_claims is not None else ()
+    )
+    if original_dropped or original_degradations:
+        claims = claims or SemanticRiskCoverageClaims()
+        # Each drop is its own audit record, so records are concatenated, not
+        # deduplicated; the correction's records are relabeled so a drop at
+        # the same index in both responses keeps a distinct position.
+        relabeled = {
+            record: dataclasses_replace(
+                record, element_path=f"correction.{record.element_path}"
+            )
+            for record in claims.degradations
+        }
+        claims = dataclasses_replace(
+            claims,
+            dropped_row_ids=tuple(dict.fromkeys((*original_dropped, *claims.dropped_row_ids))),
+            degradations=(
+                *original_degradations,
+                *(relabeled[record] for record in claims.degradations),
+            ),
+            unapproved_claim_row_ids=(
+                *original_exact_ids,
+                *(
+                    (relabeled.get(record, record), row_id)
+                    for record, row_id in claims.unapproved_claim_row_ids
+                ),
+            ),
+        )
     return dataclasses_replace(
         original,
-        risk_test_matrix_claims=candidate.risk_test_matrix_claims,
+        risk_test_matrix_claims=claims,
         risk_test_matrix_evidence=None,
         risk_test_matrix_diagnostics=(),
     )
+
+
+_NON_ACTIONABLE_RISK_DIAGNOSTICS = frozenset({
+    "missing-claim",
+    "unsuperseded-journal-failure",
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
+    DEGRADED_ROW_CLAIM_DIAGNOSTIC,
+})
 
 
 def _derive_authenticated_risk_evidence_for_coder(
@@ -4801,11 +5720,14 @@ def _derive_authenticated_risk_evidence_for_coder(
         authenticated_tree_clean=authenticated_tree_clean,
         predecessor_head=predecessor_head,
         expected_identity=identity,
+        execution_owner=approved_plan_context.risk_test_matrix_execution_owner,
     )
+    # A dropped unapproved-row claim (#920) is an audit record, not something
+    # a correction may relabel onto another row, so it never triggers or
+    # fails the bounded correction.
     actionable = tuple(
         diagnostic for diagnostic in result.diagnostics
-        if diagnostic.code != "missing-claim"
-        and diagnostic.code != "unsuperseded-journal-failure"
+        if diagnostic.code not in _NON_ACTIONABLE_RISK_DIAGNOSTICS
     )
     if (
         actionable
@@ -4863,7 +5785,7 @@ def _derive_authenticated_risk_evidence_for_coder(
                     _correction_attempted=True,
                 )
                 if corrected_result is not None and any(
-                    diagnostic.code not in {"missing-claim", "unsuperseded-journal-failure"}
+                    diagnostic.code not in _NON_ACTIONABLE_RISK_DIAGNOSTICS
                     for diagnostic in corrected_result.diagnostics
                 ):
                     exhausted = PostAuthClaimDiagnostic(
@@ -5016,18 +5938,26 @@ def _require_task_implementation_result(
     text: str,
     *,
     required_architecture_impact_contract: int = 0,
+    architecture_status_mode: str,
 ) -> int | str | StructuredTaskResult | _TerminalNoPrImplementation:
     """Validate the fresh structured task envelope, with legacy recovery opt-in."""
     structured = validate_structured_task_result(
         text,
         required_architecture_impact_contract=required_architecture_impact_contract,
+        architecture_status_mode=architecture_status_mode,
     )
     if structured is not None:
         if structured.outcome == "opened_pr":
             return structured
         if structured.outcome == "clarification":
             return structured
-        return _TerminalNoPrImplementation("blocking")
+        if architecture_impact_contract_unsatisfied(structured):
+            # A blocking wrapper must never hide an unsatisfied contract;
+            # return the parsed result so the seam refuses it.
+            return structured
+        # Keep the satisfied payload inside the terminal wrapper so its
+        # assessment and degradation records still reach round metadata.
+        return _TerminalNoPrImplementation("blocking", parsed=structured)
     if required_architecture_impact_contract == 1:
         raise AgentLoopError(
             "Fresh task implementation responses must use the structured "
@@ -5054,6 +5984,7 @@ def _require_plan_state_or_clarification(
     text: str, *, required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
     require_risk_test_matrix_contract: int = 0,
+    architecture_status_mode: str,
 ) -> StructuredPlanState | str:
     if is_clarification_request(text):
         return "clarification"
@@ -5065,6 +5996,7 @@ def _require_plan_state_or_clarification(
         # Fresh planner turns must declare every child's execution
         # disposition (#808); recovery parsing elsewhere tolerates absence.
         require_child_dispositions=require_execution_strategy_contract == 1,
+        architecture_status_mode=architecture_status_mode,
     )
     if structured_plan is None:
         raise AgentLoopError(
@@ -5114,10 +6046,10 @@ def _current_plan_has_complete_human_requirement_dispositions(
         return False
     try:
         try:
-            parsed = validate_structured_plan_state(coder_output)
+            parsed = validate_structured_plan_state(coder_output, architecture_status_mode="legacy")
         except AgentLoopError:
             try:
-                parsed = validate_structured_plan_revision(coder_output)
+                parsed = validate_structured_plan_revision(coder_output, architecture_status_mode="legacy")
             except AgentLoopError:
                 patch = validate_structured_plan_revision_patch(coder_output)
                 if patch is None:
@@ -5301,9 +6233,11 @@ def _validate_plan_revision_response(
     require_execution_strategy_contract: bool = False,
     require_risk_test_matrix_contract: bool = False,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
+    architecture_status_mode: str,
 ) -> StructuredPlanRevision | str:
     parsed = validate_structured_plan_revision(
         text,
+        architecture_status_mode=architecture_status_mode,
         required_architecture_impact_contract=(1 if require_architecture_impact else 0),
         require_execution_strategy_contract=(1 if require_execution_strategy_contract else 0),
         require_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
@@ -5796,7 +6730,7 @@ def _extract_current_deferred_stages(current_plan: str) -> tuple[DeferredStage, 
     `plan_revision` round), so both forms are checked.
     """
     try:
-        structured = validate_structured_plan_state(current_plan)
+        structured = validate_structured_plan_state(current_plan, architecture_status_mode="legacy")
     except AgentLoopError:
         structured = None
     if structured is not None:
@@ -5855,7 +6789,7 @@ def _extract_current_child_stages(current_plan: str) -> tuple[ChildStage, ...]:
     plans can return legacy two-field child stages here.
     """
     try:
-        structured = validate_structured_plan_state(current_plan)
+        structured = validate_structured_plan_state(current_plan, architecture_status_mode="legacy")
     except AgentLoopError:
         structured = None
     if structured is not None:
@@ -5884,7 +6818,7 @@ def _extract_current_child_stages(current_plan: str) -> tuple[ChildStage, ...]:
 def _log_typed_plan_stage_dispositions(current_plan: str, *, config: AgentLoopConfig) -> None:
     """Make the record-only typed categories visible in CLI output (#585)."""
     try:
-        structured = validate_structured_plan_state(current_plan)
+        structured = validate_structured_plan_state(current_plan, architecture_status_mode="legacy")
     except AgentLoopError:
         structured = None
     if structured is not None:
@@ -5970,7 +6904,7 @@ def _plan_first_line(plan_text: str) -> str:
     "title" is the structured `summary` field, not its literal first line.
     """
     try:
-        structured = validate_structured_plan_state(plan_text)
+        structured = validate_structured_plan_state(plan_text, architecture_status_mode="legacy")
     except AgentLoopError:
         structured = None
     if structured is not None:
@@ -5995,7 +6929,7 @@ def _current_execution_recommendation(
     marker = EXECUTION_RECOMMENDATION_MARKER_RE.search(current_plan)
     if marker is None:
         try:
-            parsed = validate_structured_plan_state(current_plan)
+            parsed = validate_structured_plan_state(current_plan, architecture_status_mode="legacy")
         except AgentLoopError:
             parsed = None
         if parsed is not None and parsed.execution_recommendation is not None:
@@ -6500,15 +7434,23 @@ def _run_child_planning_cycle(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
 ) -> int:
     """Run the child's own plan/review cycle (policy ``auto``) after its handoff."""
-    # Child plan review always runs the full board: staged planning scheduling
-    # is a parent-run decision and is never inherited (#905, from #841).
+    # The child inherits the operator's run-wide plan-review policy and primary
+    # plan reviewer (#929), but no parent scheduling state crosses the
+    # boundary: the child plan is a fresh artifact, so the force-full latch is
+    # reset and the execution mode is ``auto`` (#905, from #841).
     child_config = dataclasses_replace(
         config,
         plan_execution_mode="auto",
-        plan_review_policy="all-reviewers",
-        primary_plan_reviewer=None,
         plan_review_force_full=False,
     )
+    if config.plan_review_force_full:
+        log(
+            config,
+            f"Issue #{parent_issue}: child #{child_issue_number} plan review does not "
+            "inherit --plan-review-force-full; the child plan starts under "
+            f"--plan-review-policy {config.plan_review_policy} without the "
+            "parent's full-board override",
+        )
     child_issue_context = get_issue_context(
         runner, config=child_config, issue_number=child_issue_number
     )
@@ -6723,6 +7665,122 @@ def _print_staged_terminal_report(
         )
 
 
+def _recorded_staged_outcome_for_child(
+    parent_comments: Sequence[object],
+    *,
+    parent_issue: int,
+    child_issue: int,
+) -> StagedTopologyOutcome | None:
+    """Rebuild a parent's staged topology from its records, seen from one child.
+
+    Returns ``None`` when the parent holds no phase handoff for ``child_issue``
+    or no decomposition summary for that handoff's plan identity: the child
+    then is not a dispatched phase of a recorded staged topology.
+    """
+    identities = {
+        (handoff.plan_hash, handoff.mode)
+        for handoff in find_phase_implementation_handoffs_for_parent(
+            parent_comments, parent_issue=parent_issue
+        )
+        if handoff.child_issue_number == child_issue
+    }
+    if not identities:
+        return None
+    if len(identities) > 1:
+        raise AgentLoopError(
+            f"Issue #{parent_issue} records phase handoffs for child issue #{child_issue} "
+            "under more than one plan identity."
+        )
+    plan_hash, mode = identities.pop()
+    existing = find_existing_decomposition(
+        parent_comments, parent_issue=parent_issue, plan_hash=plan_hash, mode=mode
+    )
+    if existing is None:
+        return None
+    adopted = tuple(
+        CreatedPhaseIssue(
+            phase=RecordedPhase(title=title, automation=automation),
+            issue_url=url,
+            issue_number=number,
+        )
+        for (title, url, number), automation in zip(
+            existing.children, existing.automation, strict=False
+        )
+    )
+    return StagedTopologyOutcome(
+        created=adopted,
+        stage_ids=_resolved_stage_ids(adopted, recorded_stage_ids=existing.stage_ids),
+        automations=tuple(item.phase.automation for item in adopted),
+        plan_hash=plan_hash,
+        mode=mode,
+        topology_source=existing.topology_source,
+        retained_parent_scope=existing.retained_parent_scope,
+        final_integration_work=existing.final_integration_work,
+    )
+
+
+def _record_staged_parent_completion_after_merge(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_context: IssueContext | None,
+    pr_number: int,
+) -> None:
+    """Write the parent's completion record when this merge delivered its last phase.
+
+    The child run that merges the final stage is the one run that knows the
+    decomposition just finished (#1018).  It is best effort: the PR is already
+    merged, so a parent that cannot be authenticated here is reported with the
+    rerun that records it, never raised.
+    """
+    if issue_context is None or config.dry_run:
+        return
+    parent_issue: int | None = None
+    try:
+        parent_issue = _infer_staged_parent_issue(issue_context)
+        if parent_issue is None:
+            return
+        parent_context = get_issue_context(runner, config=config, issue_number=parent_issue)
+        outcome = _recorded_staged_outcome_for_child(
+            parent_context.comments,
+            parent_issue=parent_issue,
+            child_issue=issue_context.number,
+        )
+        if outcome is None:
+            return
+        progress = resolve_staged_phase_progress(
+            runner,
+            config=config,
+            parent_issue=parent_issue,
+            parent_comments=parent_context.comments,
+            outcome=outcome,
+            just_merged=(issue_context.number, pr_number),
+        )
+        if select_current_phase(progress) is not None:
+            return
+        if record_staged_completion(
+            runner,
+            config=config,
+            parent_issue=parent_issue,
+            progress=progress,
+            outcome=outcome,
+        ):
+            print(
+                f"PR #{pr_number} delivered the last staged phase of issue #{parent_issue}; "
+                "recorded the staged completion on the parent."
+            )
+    except AgentLoopError as exc:
+        if parent_issue is None:
+            log(config, f"Staged parent completion check skipped: {exc}")
+            return
+        log(config, f"Staged parent #{parent_issue} completion record not written: {exc}")
+        print(
+            f"Staged parent issue #{parent_issue}: no completion record was written ({exc}). "
+            "Rerunning the parent's staged plan records it once every phase is delivered "
+            "and its evidence is readable."
+        )
+
+
 def _dispatch_current_decomposition_phase(
     runner: Runner,
     *,
@@ -6789,6 +7847,25 @@ def _dispatch_current_decomposition_phase(
         _print_staged_terminal_report(
             issue_number=issue_number, progress=progress, outcome=outcome
         )
+        try:
+            recorded = record_staged_completion(
+                runner,
+                config=config,
+                parent_issue=issue_number,
+                progress=progress,
+                outcome=outcome,
+            )
+        except AgentLoopError as exc:
+            # The delivery report above stands; only the write-back is
+            # withheld, and nothing incomplete was published.
+            log(config, f"Issue #{issue_number} completion record not written: {exc}")
+            print(
+                f"No completion record was written to issue #{issue_number} ({exc}). "
+                "Rerun the parent once that is resolved to record it."
+            )
+            return 0
+        if recorded:
+            print(f"Recorded the staged completion on issue #{issue_number}.")
         return 0
 
     phase_index = selected.phase_index
@@ -8365,11 +9442,7 @@ def _implement_approved_issue(
         runner, config=implementation_config, issue_number=issue_number
     )
     if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
-        print(
-            "WARNING: --allow-unprotected-managed-ci is active for this invocation. GitHub cannot "
-            "prevent a manual merge, other automation, a compromised credential, or an agent-loop "
-            "defect from bypassing the voluntary final-ci/exact-head gate."
-        )
+        _print_unprotected_managed_ci_warning(managed_ci_creation_intent.protection_mode)
     log(config, f"Planning approved; invoking {coder_name} to implement issue #{issue_number}")
     assigned_head_before = _read_assigned_workdir_head(runner, implementation_config)
     coder_response = _run_validated_agent(
@@ -8390,7 +9463,8 @@ def _implement_approved_issue(
         ),
         session_id=implementation_session_id,
         marker_description="structured issue_implementation result, blocking, or clarification",
-        validate=lambda text: _validate_issue_implementation_response(
+        require_architecture_impact_contract=True,
+        **_architecture_mode_validators(lambda mode: lambda text: _validate_issue_implementation_response(
             text,
             human_requirements=implementation_requirements,
             require_architecture_impact=True,
@@ -8413,8 +9487,8 @@ def _implement_approved_issue(
                 approved_plan_context.risk_test_matrix_expected_row_ids
                 if approved_plan_context is not None and approved_plan_context.matrix_available
                 else None
-            ),
-        ),
+            ), architecture_status_mode=mode,
+        )),
         usage_context=usage_context,
         role="coder",
         use_repair=True,
@@ -8674,9 +9748,10 @@ def _implement_approved_issue(
             ),
             model_used=coder_response.model_used,
             **_metadata_identity_fields(coder_response),
+            **_test_observation_degradation_fields(implementation_result),
             **_architecture_metadata_fields(
                 implementation_config,
-                impact=getattr(implementation_result, "architecture_impact", None),
+                result=implementation_result,
             ),
             acquisition_outcome=coder_response.acquisition_outcome,
             acquisition_returncode=coder_response.acquisition_returncode,
@@ -8860,8 +9935,12 @@ def _decompose_approved_plan(
             phases=checkpoint.phases,
             architecture_impact=(
                 parse_architecture_impact(
-                    checkpoint.architecture_impact,
+                    # The checkpoint decoder restores lists as tuples; give the
+                    # parser its JSON-array wire shape back.  Stored text keeps
+                    # the explicit legacy decode, exactly as before #925.
+                    sanitize_architecture_impact(checkpoint.architecture_impact),
                     context="checkpoint.architecture_impact",
+                    architecture_status_mode="legacy",
                 )
                 if checkpoint.architecture_impact is not None else None
             ),
@@ -8881,26 +9960,36 @@ def _decompose_approved_plan(
     if normalized_topology is None and checkpoint is None and topology_source == "model":
         coder_name = agent_display_name(config.coder)
         log(config, f"Planning approved; invoking {coder_name} to decompose issue #{issue_number}")
-        decomposition_response = _run_validated_agent(
-            runner,
-            agent=config.coder,
-            config=config,
-            prompt=build_plan_decomposition_prompt(
-                issue_number,
-                approved_plan,
-                config,
-                memory,
-                issue_context=issue_context,
-            ),
-            session_id=coder_session_id,
-            marker_description="plan decomposition JSON",
-            validate=lambda text: parse_plan_decomposition(
-                text, required_architecture_impact_contract=1
-            ),
-            usage_context=usage_context,
-            operation_description="plan decomposition",
-        )
+        try:
+            decomposition_response = _run_validated_agent(
+                runner,
+                agent=config.coder,
+                config=config,
+                prompt=build_plan_decomposition_prompt(
+                    issue_number,
+                    approved_plan,
+                    config,
+                    memory,
+                    issue_context=issue_context,
+                ),
+                session_id=coder_session_id,
+                marker_description="plan decomposition JSON",
+                **_architecture_mode_validators(lambda mode: lambda text: parse_plan_decomposition(
+                    text, required_architecture_impact_contract=1, architecture_status_mode=mode
+                )),
+                usage_context=usage_context,
+                operation_description="plan decomposition",
+                require_architecture_impact_contract=True,
+            )
+        except AgentInvocationError as exc:
+            _surface_refused_decomposition(
+                runner, config=config, issue_number=issue_number, error=exc
+            )
+            raise
         decomposition = decomposition_response.marker_value
+        _surface_decomposition_degradations(
+            runner, config=config, issue_number=issue_number, decomposition=decomposition
+        )
     if topology_source == EXECUTION_TOPOLOGY_SOURCE and risk_matrix_payload is None:
         recovered_matrix_context = make_approved_plan_context(
             approved_plan,
@@ -8969,10 +10058,10 @@ class _ReviewerTurnResult:
     """Outcome of one plan/PR reviewer turn: a validated response or a captured failure.
 
     Worker threads in the --review-parallel path return these instead of
-    raising, so exceptions never cross the thread boundary; the main thread
-    delivers completed turns to the main thread in completion order.  The
-    caller may publish an individual validated review immediately, but must
-    retain configured-order aggregation until every launched turn settles.
+    raising, so exceptions never cross the thread boundary; once every launched
+    turn has returned, the main thread publishes each validated review in
+    completion order (never mid-round, #1025) and then performs
+    configured-order aggregation.
     """
 
     reviewer_name: str
@@ -9071,6 +10160,34 @@ class _UnchangedHeadTracker:
         else:
             self.head_sha, self.count = reviewed_head, 1
         return self.count
+
+
+def _coder_followup_head_log(
+    round_number: int,
+    coder_name: str,
+    dispatch_head: str | None,
+    observed_head: str | None,
+    unchanged_count: int,
+) -> str:
+    """Describe a PR coder follow-up by its observed head change (#1034).
+
+    The refetch cannot prove who moved the head, so an advance is reported
+    actor-neutrally, and an unknown head makes no push or unchanged claim.
+    """
+    if not dispatch_head or not observed_head:
+        return (
+            f"Round {round_number}: {coder_name} follow-up complete; "
+            "PR head change could not be determined"
+        )
+    if dispatch_head != observed_head:
+        return (
+            f"Round {round_number}: PR head advanced {dispatch_head[:12]}..{observed_head[:12]} "
+            f"during {coder_name} follow-up; re-reviewing"
+        )
+    return (
+        f"Round {round_number}: {coder_name} follow-up left PR head {observed_head[:12]} "
+        f"unchanged ({unchanged_count}/{MAX_UNCHANGED_HEAD_CODER_TURNS}); re-reviewing"
+    )
 
 
 def _child_plan_admissibility_failure(
@@ -9409,6 +10526,467 @@ def _require_authorized_replan_state(
     )
 
 
+@dataclass(frozen=True)
+class _PlanContractShape:
+    """The structural contract a plan asks a PR to satisfy (#1013)."""
+
+    steps: tuple[str, ...]
+    matrix_row_ids: tuple[str, ...]
+    strategy: str | None
+    # Every execution-recommendation field value, path-labelled: work or
+    # topology the PR must satisfy even when steps and rows hold.
+    commitments: tuple[str, ...] = ()
+    # Each matrix row's path-labelled field values, keyed by row ID, so a
+    # row strengthened under an unchanged ID is still visible.
+    matrix_row_values: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+
+# Bounds on the rebind expansion notice so a large re-plan cannot flood it.
+_REBIND_EXPANSION_LIST_LIMIT = 5
+_REBIND_EXPANSION_ITEM_CHARS = 160
+_REBIND_EXPANSION_HEADING = "### Rebound PR contract expanded"
+
+
+# Keys that name an element of a contract list; they become part of the
+# element's path instead of a separate value.
+_CONTRACT_ELEMENT_ID_KEYS = ("scope_item_id", "constraint_id", "stage_id", "row_id")
+
+
+def _flatten_contract_values(value: object, path: str, *, skip: frozenset[str] = frozenset()) -> tuple[str, ...]:
+    """Flatten a contract payload into path-labelled leaf values.
+
+    Elements of object lists are addressed by their ID, so an added or
+    changed value is a new label.  ``skip`` names top-level keys left out.
+    """
+    labels: list[str] = []
+
+    def walk(node: object, node_path: str, top: bool) -> None:
+        if isinstance(node, Mapping):
+            for key in sorted(node):
+                if key in _CONTRACT_ELEMENT_ID_KEYS or (top and key in skip):
+                    continue
+                walk(node[key], f"{node_path}.{key}" if node_path else str(key), False)
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                if isinstance(item, Mapping):
+                    element = next(
+                        (str(item[key]) for key in _CONTRACT_ELEMENT_ID_KEYS if key in item),
+                        str(index),
+                    )
+                    walk(item, f"{node_path}[{element}]", False)
+                else:
+                    walk(item, node_path, False)
+        else:
+            labels.append(f"`{node_path}`: {node}")
+
+    walk(value, path, True)
+    return tuple(labels)
+
+
+def _recommendation_commitments(recommendation: Mapping[str, object]) -> tuple[str, ...]:
+    """Flatten every field of a recommendation into path-labelled values.
+
+    The whole reviewed recommendation is the execution contract, so no field
+    is singled out: scope, coupling, allocations, and every stage field
+    (summary, order, dependencies, notes, risk, disposition and its
+    rationale, ...) each become a label such as
+    ``child_stages[stage-one].summary: ...``.  The strategy is reported on
+    its own and is left out here.
+    """
+    return _flatten_contract_values(recommendation, "", skip=frozenset({"strategy"}))
+
+
+def _matrix_row_values(rows: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return tuple(
+        (
+            str(row["row_id"]),
+            _flatten_contract_values(row, f"risk_test_matrix[{row['row_id']}]"),
+        )
+        for row in (rows if isinstance(rows, list) else ())
+        if isinstance(row, Mapping) and "row_id" in row
+    )
+
+
+def _plan_contract_shape(comments: Sequence[object], plan_hash: str) -> _PlanContractShape | None:
+    """Recover a plan's structural contract from its plan round.
+
+    Reads the authenticated assembled-state sidecar of the latest plan coder
+    round whose canonical plan has ``plan_hash``.  ``None`` when no such round
+    carries one; the caller treats that as "not comparable", never as a gap.
+    """
+    for record in reversed(_extract_round_metadata_records(comments, flow="plan")):
+        metadata = record.metadata
+        if (
+            metadata.role != "coder"
+            or metadata.canonical_plan is None
+            or metadata.assembled_plan_sidecar is None
+            or approved_plan_hash(metadata.canonical_plan) != plan_hash
+        ):
+            continue
+        payload = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar).canonical_json
+        steps = payload.get("plan_steps")
+        matrix = payload.get("risk_test_matrix")
+        row_values = _matrix_row_values(matrix.get("rows") if isinstance(matrix, Mapping) else None)
+        recommendation = payload.get("execution_recommendation")
+        if not isinstance(recommendation, Mapping):
+            recommendation = {}
+        strategy = recommendation.get("strategy")
+        return _PlanContractShape(
+            steps=tuple(str(step) for step in steps) if isinstance(steps, list) else (),
+            matrix_row_ids=tuple(row_id for row_id, _values in row_values),
+            strategy=strategy if isinstance(strategy, str) else None,
+            commitments=_recommendation_commitments(recommendation),
+            matrix_row_values=row_values,
+        )
+    return None
+
+
+# Leading characters kept before an elision when the change sits deep in a
+# long item, and characters of shared text kept just before the divergence.
+_REBIND_EXPANSION_HEAD_CHARS = 60
+_REBIND_EXPANSION_LEAD_CHARS = 30
+
+
+def _flatten_contract_text(text: str) -> str:
+    """Join non-empty lines so later lines of a multi-line item stay visible."""
+    return " ⏎ ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
+def _common_prefix_length(left: str, right: str) -> int:
+    length = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        length += 1
+    return length
+
+
+def _clip_contract_item(text: str, prior: Sequence[str] = ()) -> str:
+    """Render one changed item within the bound, keeping the change visible.
+
+    ``prior`` holds the superseded plan's items.  When the item shares a long
+    prefix with its closest superseded counterpart, so that plain clipping
+    would show only unchanged text, the rendering keeps a short head, elides
+    the shared middle, and shows the text from just before the divergence.
+    """
+    line = _flatten_contract_text(text)
+    limit = _REBIND_EXPANSION_ITEM_CHARS
+    if len(line) > limit:
+        divergence = max(
+            (_common_prefix_length(line, _flatten_contract_text(item)) for item in prior),
+            default=0,
+        )
+        head = _REBIND_EXPANSION_HEAD_CHARS
+        if divergence >= limit - 1 - _REBIND_EXPANSION_LEAD_CHARS:
+            tail = line[max(head, divergence - _REBIND_EXPANSION_LEAD_CHARS):]
+            budget = limit - head - 3
+            if len(tail) > budget:
+                tail = tail[: budget - 1].rstrip() + "…"
+            line = line[:head].rstrip() + " … " + tail
+        else:
+            line = line[: limit - 1].rstrip() + "…"
+    # Plan text is quoted, never interpreted: an HTML comment opener would
+    # otherwise let a quoted step pose as a record in the rebind comment.
+    return line.replace("<!--", "&lt;!--")
+
+
+def _added_contract_items(before: Sequence[str], after: Sequence[str]) -> list[str]:
+    """Items of ``after`` beyond ``before``, compared on full normalized text."""
+    remaining = collections.Counter(item.strip() for item in before)
+    added: list[str] = []
+    for item in after:
+        key = item.strip()
+        if remaining[key] > 0:
+            remaining[key] -= 1
+        else:
+            added.append(item)
+    return added
+
+
+def _plan_contract_expansion(
+    superseded: _PlanContractShape, replacement: _PlanContractShape
+) -> list[tuple[str, list[str]]]:
+    """Describe how the replacement plan materially expands the contract.
+
+    Structural, not numeric on review findings: plan steps whose text is not
+    in the superseded plan (even when another step was removed), new matrix
+    rows, new or changed values in rows that keep their ID, new or changed
+    execution-recommendation values, or a changed strategy.  Each entry is a
+    summary line and the (unclipped) items it names.  An empty list means
+    equivalent or narrower.  Detection compares full text; clipping is only
+    for rendering.
+    """
+    expansion: list[tuple[str, list[str]]] = []
+    new_steps = _added_contract_items(superseded.steps, replacement.steps)
+    if new_steps:
+        expansion.append(
+            (
+                f"{len(new_steps)} plan step(s) not in the superseded plan "
+                f"(steps: {len(superseded.steps)} before, {len(replacement.steps)} after):",
+                new_steps,
+            )
+        )
+    known_rows = set(superseded.matrix_row_ids)
+    new_rows = [row_id for row_id in replacement.matrix_row_ids if row_id not in known_rows]
+    if new_rows:
+        expansion.append(
+            (
+                f"{len(new_rows)} new risk/test matrix row(s):",
+                [f"`{row_id}`" for row_id in new_rows],
+            )
+        )
+    superseded_row_values = dict(superseded.matrix_row_values)
+    changed_row_values = [
+        label
+        for row_id, values in replacement.matrix_row_values
+        if row_id in superseded_row_values
+        for label in _added_contract_items(superseded_row_values[row_id], values)
+    ]
+    if changed_row_values:
+        expansion.append(
+            (
+                f"{len(changed_row_values)} new or changed value(s) in existing risk/test "
+                "matrix rows:",
+                changed_row_values,
+            )
+        )
+    new_commitments = _added_contract_items(superseded.commitments, replacement.commitments)
+    if new_commitments:
+        expansion.append(
+            (
+                f"{len(new_commitments)} new or changed execution-recommendation value(s):",
+                new_commitments,
+            )
+        )
+    if superseded.strategy != replacement.strategy:
+        expansion.append(
+            (
+                f"The execution recommendation changed from "
+                f"`{superseded.strategy or 'none'}` to `{replacement.strategy or 'none'}`.",
+                [],
+            )
+        )
+    return expansion
+
+
+def _render_contract_expansion_notice(
+    expansion: Sequence[tuple[str, Sequence[str]]],
+    *,
+    pr_number: int,
+    superseded_hash: str,
+    plan_hash: str,
+    include_items: bool,
+    prior: Sequence[str] = (),
+) -> str:
+    lines = [
+        _REBIND_EXPANSION_HEADING,
+        "",
+        f"PR #{pr_number} is rebound from approved plan `{superseded_hash}` to replacement "
+        f"plan `{plan_hash}`. The replacement materially expands the contract the PR must "
+        "satisfy, and the PR's implementation predates it:",
+        "",
+    ]
+    for summary, items in expansion:
+        lines.append(f"- {summary}")
+        if not include_items:
+            continue
+        lines.extend(
+            f"  - {_clip_contract_item(item, prior)}"
+            for item in items[:_REBIND_EXPANSION_LIST_LIMIT]
+        )
+        if len(items) > _REBIND_EXPANSION_LIST_LIMIT:
+            lines.append(f"  - …and {len(items) - _REBIND_EXPANSION_LIST_LIMIT} more")
+    lines.extend(
+        [
+            "",
+            "Review will now judge the existing diff against the replacement plan. If the "
+            "remaining work no longer suits a single PR, consider decomposing it before "
+            "continuing. This notice is informational and does not stop the run.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _rebind_contract_expansion_notice(
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    comments: Sequence[object],
+    pr_number: int,
+    superseded_hash: str,
+    plan_hash: str,
+) -> str | None:
+    """Informational notice text when a rebind materially expands the PR's contract (#1013).
+
+    The PR's code was written against the superseded plan, so a larger
+    replacement plan is a divergence reviewers would otherwise discover one
+    finding at a time.  The text rides in the rebind comment itself, so an
+    interruption can never leave a rebind without its notice.  This never
+    blocks: any failure to compare is logged and ``None`` is returned, and
+    the notice never carries a reserved record span.  Whether to decompose
+    is left to the operator or the next planning cycle.
+    """
+    try:
+        superseded = _plan_contract_shape(comments, superseded_hash)
+        replacement = _plan_contract_shape(comments, plan_hash)
+        if superseded is None or replacement is None:
+            log(
+                config,
+                f"Issue #{issue_number}: rebind contract comparison skipped; the structured "
+                f"state of plan {superseded_hash if superseded is None else plan_hash} is not "
+                "recoverable from its plan round",
+            )
+            return None
+        expansion = _plan_contract_expansion(superseded, replacement)
+        if not expansion:
+            return None
+        log(
+            config,
+            f"Issue #{issue_number}: replacement plan {plan_hash} materially expands the "
+            f"contract PR #{pr_number} must satisfy relative to superseded plan "
+            f"{superseded_hash}: " + "; ".join(summary for summary, _items in expansion),
+        )
+        render = functools.partial(
+            _render_contract_expansion_notice,
+            expansion,
+            pr_number=pr_number,
+            superseded_hash=superseded_hash,
+            plan_hash=plan_hash,
+            prior=(
+                *superseded.steps,
+                *superseded.commitments,
+                *(label for _row_id, values in superseded.matrix_row_values for label in values),
+            ),
+        )
+        notice = render(include_items=True)
+        if scan_reserved_markers(notice):
+            # Plan text quoting a reserved record must not reach the trusted
+            # rebind comment; the counts alone still name what grew.
+            notice = render(include_items=False)
+        return notice
+    except Exception as exc:  # noqa: BLE001 - the notice must never block the rebind
+        log(
+            config,
+            f"Issue #{issue_number}: rebind contract-expansion comparison failed: {exc}",
+        )
+        return None
+
+
+_REBIND_GROWTH_HEADING = "### Rebound plan crossed plan-growth thresholds"
+_REBIND_GROWTH_RATIONALE_CHARS = 400
+
+
+def _render_rebind_growth_advisory(
+    assessment: PlanGrowthAssessment,
+    justification: Mapping[str, object] | None,
+    *,
+    pr_number: int,
+    plan_hash: str,
+    include_rationale: bool,
+) -> str:
+    lines = [
+        _REBIND_GROWTH_HEADING,
+        "",
+        f"PR #{pr_number}'s code predates replacement plan `{plan_hash}`, a one-shot plan that "
+        "crosses plan-growth threshold(s) "
+        + ", ".join(f"`{signal}`" for signal in assessment.crossed)
+        + f" ({assessment.describe()}). Check the remaining work against the one-shot choice.",
+        "",
+    ]
+    if justification is None:
+        lines.append(
+            # Only the absence is authenticated: approval-time gate mode and
+            # thresholds are not recorded, so no reason is asserted.
+            "- No reviewed one-shot growth justification exists for this plan."
+        )
+    else:
+        named = justification.get("crossed_signals")
+        lines.append(
+            "- Reviewed justification signals: "
+            + ", ".join(f"`{signal}`" for signal in (named if isinstance(named, list) else []))
+        )
+        if include_rationale:
+            rationale = _flatten_contract_text(str(justification.get("rationale", "")))
+            if len(rationale) > _REBIND_GROWTH_RATIONALE_CHARS:
+                rationale = (
+                    rationale[: _REBIND_GROWTH_RATIONALE_CHARS - 1].rstrip()
+                    + "… (complete rationale in the authenticated plan round)"
+                )
+            lines.append(f"- Rationale excerpt: {rationale.replace('<!--', '&lt;!--')}")
+    lines.extend(
+        [
+            "",
+            "This advisory is informational and does not stop the run.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _rebind_growth_advisory(
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    comments: Sequence[object],
+    pr_number: int,
+    plan_hash: str,
+) -> str | None:
+    """Growth advisory for a rebound replacement plan (#886).
+
+    Independent of contract expansion and of justification: a grown v1
+    one-shot replacement gets the advisory whether it is justified (the
+    normal case under the enforced gate) or not.  Size is taken from the
+    authenticated coder round's stored canonical text, never a re-render.
+    Revision count is not used.  Never blocks: failures are logged.
+    """
+    try:
+        for record in reversed(_extract_round_metadata_records(comments, flow="plan")):
+            metadata = record.metadata
+            if (
+                metadata.role != "coder"
+                or metadata.canonical_plan is None
+                or metadata.assembled_plan_sidecar is None
+                or approved_plan_hash(metadata.canonical_plan) != plan_hash
+            ):
+                continue
+            payload = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar).canonical_json
+            if plan_strategy(payload) != "one-shot":
+                return None
+            assessment = assess_plan_growth(
+                payload,
+                rendered_chars=len(metadata.canonical_plan),
+                revision_count=None,
+                thresholds=PlanGrowthThresholds.from_config(config),
+            )
+            if not any(signal in STRUCTURAL_SIGNALS for signal in assessment.crossed):
+                return None
+            justification = plan_justification(payload)
+            log(
+                config,
+                f"Issue #{issue_number}: rebound replacement plan {plan_hash} is one-shot and "
+                f"crosses plan-growth signal(s) {', '.join(assessment.crossed)}",
+            )
+            render = functools.partial(
+                _render_rebind_growth_advisory,
+                assessment,
+                justification,
+                pr_number=pr_number,
+                plan_hash=plan_hash,
+            )
+            advisory = render(include_rationale=True)
+            if scan_reserved_markers(advisory):
+                advisory = render(include_rationale=False)
+            return advisory
+        log(
+            config,
+            f"Issue #{issue_number}: rebind growth advisory skipped; the structured state of "
+            f"plan {plan_hash} is not recoverable from its plan round",
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 - the advisory must never block the rebind
+        log(config, f"Issue #{issue_number}: rebind growth advisory failed: {exc}")
+        return None
+
+
 def _rebind_superseded_child_plan(
     runner: Runner,
     *,
@@ -9422,7 +11000,9 @@ def _rebind_superseded_child_plan(
 
     The superseding handoff record and the rebind audit record share one
     comment, and no PR-side record is written, so an interruption leaves
-    either the fully old or the fully new binding.  Idempotent: an existing
+    either the fully old or the fully new binding.  A contract-expansion
+    notice (#1013), when the replacement plan grows the PR's contract, rides
+    in the same comment so it can never be lost between two writes.  Idempotent: an existing
     verified rebind to ``plan_hash`` posts nothing.
     """
     replan = _require_authorized_replan_state(
@@ -9510,8 +11090,29 @@ def _rebind_superseded_child_plan(
             approved_round=replan.latest_round,
         )
     )
+    expansion_notice = _rebind_contract_expansion_notice(
+        config=config,
+        issue_number=issue_number,
+        comments=issue_context.comments,
+        pr_number=current.pr_number,
+        superseded_hash=plan_supersession.superseded_hash,
+        plan_hash=plan_hash,
+    )
+    growth_advisory = _rebind_growth_advisory(
+        config=config,
+        issue_number=issue_number,
+        comments=issue_context.comments,
+        pr_number=current.pr_number,
+        plan_hash=plan_hash,
+    )
     body = "\n".join(
-        [*handoff_lines[:marker_position], rebind_section, *handoff_lines[marker_position:]]
+        [
+            *handoff_lines[:marker_position],
+            *([expansion_notice, ""] if expansion_notice is not None else []),
+            *([growth_advisory, ""] if growth_advisory is not None else []),
+            rebind_section,
+            *handoff_lines[marker_position:],
+        ]
     )
     post_trusted_issue_comment(
         runner,
@@ -9793,6 +11394,7 @@ def _recover_current_plan_validation_diagnostic(
         architecture_contract_version=architecture_version,
         execution_strategy_contract_version=execution_version,
         risk_test_matrix_contract_version=matrix_version,
+        on_host_footer=lambda ctx: note_host_footer_observed(config, ctx),
     )
 
 
@@ -9830,6 +11432,7 @@ def _persist_exhausted_plan_validation_diagnostic(
             architecture_contract_version=architecture_version,
             execution_strategy_contract_version=execution_version,
             risk_test_matrix_contract_version=matrix_version,
+            on_host_footer=lambda ctx: note_host_footer_observed(config, ctx),
         )
         payload = PlanValidationDiagnosticPayload(
             repository=config.repo,
@@ -9929,7 +11532,11 @@ def _assemble_structured_plan_round_body(
         f"Planning issue #{issue_number}: full plan comment exceeds the comment budget; "
         "posting the bounded visible digest (complete plan stays in authenticated round metadata)",
     )
-    return _attach_round_metadata(compact_comment, metadata)
+    compact_body = _attach_round_metadata(compact_comment, metadata)
+    # Final fit check (#886): a digest that still cannot be carried is
+    # refused here with the transport's own overflow error, before posting.
+    prepare_round_comment(compact_body)
+    return compact_body
 
 
 _COMPACT_DIGEST_DISPOSITION_LINE_RE = re.compile(r"^- \*\*(?P<id>[^*]+)\*\* — `")
@@ -10025,46 +11632,366 @@ def _post_plan_coder_round_comment(
     return True
 
 
+def _review_round_spool(
+    config: AgentLoopConfig, *, surface: str, number: int, round_number: int, subject: str
+) -> ReviewRoundSpool:
+    return ReviewRoundSpool(
+        root=review_spool_root(config.agent_memory_dir),
+        repo=config.repo,
+        surface=surface,
+        number=number,
+        round_number=round_number,
+        subject=subject,
+    )
+
+
+def _replay_spooled_review(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    reviewer: AgentName,
+    fields: dict[str, object],
+    validators: dict[str, object],
+) -> _ReviewerTurnResult | None:
+    """Rebuild a spooled reviewer response through its round's own validator.
+
+    The spooled text is the accepted text of the original invocation, so the
+    same validate/strict re-parse chain yields the same accepted response.
+    ``None`` means the text no longer validates in this run's context and
+    the caller must fall back to a fresh reviewer turn.
+    """
+    reviewer_name = agent_display_name(reviewer)
+    text = fields.get("text")
+    validate = validators["validate"]
+    strict_revalidate = validators.get("strict_revalidate")
+    assert isinstance(text, str) and callable(validate)
+    try:
+        marker_value = _with_validation_context(validate, runner=runner, acquisition=None)(text)
+        candidate = _accept_candidate(
+            text,
+            marker_value,
+            strict_revalidate=strict_revalidate,  # type: ignore[arg-type]
+            runner=runner,
+            acquisition=None,
+        )
+    except AgentLoopError as exc:
+        log(
+            config,
+            f"{reviewer_name}: withheld same-round review no longer validates ({exc}); "
+            "invoking a fresh review turn instead",
+        )
+        return None
+    identity = {
+        name: fields.get(name)
+        for name in (
+            "session_id", "model_used", "provider", "role", "configured_model",
+            "configured_effort", "effort_source", "observed_model", "observed_effort",
+            "observation_provenance", "acquisition_returncode",
+        )
+    }
+    acquisition_outcome = fields.get("acquisition_outcome")
+    if acquisition_outcome not in {"success", "accepted_nonzero_exit", "accepted_timeout"}:
+        acquisition_outcome = "success"
+    log(config, f"{reviewer_name}: replaying its withheld same-round review instead of re-invoking it")
+    return _ReviewerTurnResult(
+        reviewer_name=reviewer_name,
+        response=_accepted_validated_response(
+            candidate, acquisition_outcome=acquisition_outcome, **identity
+        ),
+    )
+
+
+def _spooled_response_fields(response: ValidatedAgentResponse) -> dict[str, object]:
+    return {
+        "text": response.text,
+        "session_id": response.session_id,
+        "model_used": response.model_used,
+        "provider": response.provider,
+        "role": response.role,
+        "configured_model": response.configured_model,
+        "configured_effort": response.configured_effort,
+        "effort_source": response.effort_source,
+        "observed_model": response.observed_model,
+        "observed_effort": response.observed_effort,
+        "observation_provenance": response.observation_provenance,
+        "acquisition_outcome": response.acquisition_outcome,
+        "acquisition_returncode": response.acquisition_returncode,
+    }
+
+
+def _incomplete_plan_review_error(reviewer_name: str) -> AgentLoopError:
+    return AgentLoopError(
+        f"{reviewer_name} did not complete plan review and reported no actionable "
+        "blocking plan issues or Same-Plan follow-ups. This is a reviewer-internal error; "
+        "agent-loop stopped before a coder follow-up. Rerun or switch the reviewer/model "
+        "after resolving the reviewer environment."
+    )
+
+
+def _incomplete_pr_review_error(reviewer_name: str) -> AgentLoopError:
+    return AgentLoopError(
+        f"{reviewer_name} did not complete PR review and reported no actionable "
+        "blocking items or Same-PR follow-ups. This is a reviewer-internal error; "
+        "agent-loop stopped before a coder follow-up. Rerun or switch the reviewer/model "
+        "after resolving the reviewer environment."
+    )
+
+
+class PartialReviewRoundError(AgentLoopError):
+    """A reviewer would have to run while a same-round peer's body is public (#1025)."""
+
+
+def _partial_round_refusal(
+    *, surface: str, number: int, round_number: int, reviewer_name: str, public_peers: Sequence[str]
+) -> PartialReviewRoundError:
+    target = f"PR #{number}" if surface == "pr" else f"issue #{number}"
+    return PartialReviewRoundError(
+        f"Review round {round_number} on {target} is partially published "
+        f"({', '.join(public_peers)} already posted) but {reviewer_name}'s withheld "
+        "same-round outcome is missing or no longer validates, so invoking it now would "
+        "let it read its peers' findings. Rerun from the host whose agent-loop cache "
+        "holds the round's review spool, or delete the round's already-posted reviewer "
+        "comments so the whole round runs again independently."
+    )
+
+
+def _replay_spooled_failure(fields: dict[str, object], reviewer_name: str) -> AgentInvocationError | None:
+    failure = fields.get("failure")
+    if not isinstance(failure, dict):
+        return None
+    return AgentInvocationError(
+        f"{reviewer_name} (replayed from its withheld same-round outcome): {failure.get('message')}",
+        failure_category=failure.get("failure_category"),  # type: ignore[arg-type]
+    )
+
+
+def _refuse_partial_round_before_sequential_turns(
+    *,
+    spool: ReviewRoundSpool,
+    fresh_turn_reviewers: Sequence[AgentName],
+    public_peers: Sequence[AgentName],
+) -> None:
+    """Stop before any sequential turn when one of them would face a public peer.
+
+    A sequential round only reaches this with no spooled outcomes (a round
+    holding them is finished by the withhold-then-publish launcher), so a
+    reviewer needing a fresh turn beside a public same-batch peer could never
+    be replayed.  Checking the whole round first avoids re-running one
+    reviewer and then stopping at the next.
+    """
+    for reviewer in fresh_turn_reviewers:
+        peers = sorted(agent_display_name(peer) for peer in public_peers if peer != reviewer)
+        if peers:
+            raise _partial_round_refusal(
+                surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                reviewer_name=agent_display_name(reviewer), public_peers=peers,
+            )
+
+
+def _same_round_replay_or_invoke(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    reviewer: AgentName,
+    spool: ReviewRoundSpool,
+    public_peers: Sequence[AgentName],
+    validators: dict[str, object],
+    invoke: Callable[[], ValidatedAgentResponse],
+    already_posted: bool = False,
+) -> ValidatedAgentResponse:
+    """Sequential-mode seam: never invoke a reviewer against public same-round peers.
+
+    A parallel round interrupted between publications may be resumed without
+    ``--review-parallel``.  The unpublished reviewer's withheld outcome is then
+    replayed exactly as in parallel mode; without a valid one the run stops
+    instead of invoking the reviewer.
+    """
+    reviewer_name = agent_display_name(reviewer)
+    peers = [agent_display_name(peer) for peer in public_peers if peer != reviewer]
+    if not peers:
+        return invoke()
+    fields = None if already_posted else spool.load(reviewer_name)
+    if fields is not None:
+        failure = _replay_spooled_failure(fields, reviewer_name)
+        if failure is not None:
+            raise failure
+        replayed = _replay_spooled_review(
+            runner, config=config, reviewer=reviewer, fields=fields, validators=validators
+        )
+        if replayed is not None and replayed.response is not None:
+            return replayed.response
+    raise _partial_round_refusal(
+        surface=spool.surface, number=spool.number, round_number=spool.round_number,
+        reviewer_name=reviewer_name, public_peers=sorted(peers),
+    )
+
+
 def _launch_reviewer_turns(
     runner: Runner,
     pending: Sequence[AgentName],
     *,
     thread_name_prefix: str,
     run_turn: Callable[[AgentName], _ReviewerTurnResult],
-    on_completion: Callable[[AgentName, _ReviewerTurnResult], None] | None = None,
+    on_completion: Callable[[AgentName, _ReviewerTurnResult], bool | None] | None = None,
+    spool: ReviewRoundSpool | None = None,
+    replay_turn: Callable[[AgentName, dict[str, object]], _ReviewerTurnResult | None] | None = None,
+    public_peers: Sequence[AgentName] = (),
+    retry_bound: Callable[[AgentName, _ReviewerTurnResult], AgentLoopError | None] | None = None,
+    prelaunch_failures: dict[AgentName, _ReviewerTurnResult] | None = None,
+    configured_order: Sequence[AgentName] = (),
+    config: AgentLoopConfig | None = None,
+    already_posted: Sequence[AgentName] = (),
+    max_workers: int | None = None,
+    prepare_fallback: Callable[[AgentName], None] | None = None,
 ) -> dict[AgentName, _ReviewerTurnResult]:
-    """Run workers concurrently, delivering completion-order results before settlement.
+    """Run workers concurrently, then deliver results in completion order.
 
     ``run_turn`` must never let an exception escape; it is responsible for
     capturing any failure into the returned ``_ReviewerTurnResult`` so the
     thread pool never needs to propagate a worker exception. On
     KeyboardInterrupt, active agent processes are killed so worker wait loops
     return promptly before the interrupt is re-raised.
+
+    ``on_completion`` (publication) runs only after every worker has returned
+    (#1025).  Publishing a finished reviewer's body while a peer is still
+    running would put that body on the PR/issue the peer can read mid-turn,
+    so a late reviewer could echo it and panel agreement would stop being
+    independent corroboration.  Completion order is still preserved for the
+    publications themselves.
+
+    With a ``spool``, no reviewer is ever invoked while a same-round peer's
+    body is public:
+
+    * every settled outcome (validated response, or a failure that settles the
+      reviewer as unavailable) is persisted privately before the first post,
+      and a rerun replays it instead of re-invoking the reviewer, so an
+      interruption between posts is harmless;
+    * when ``retry_bound`` reports that some reviewer must be re-invoked (a
+      fatal failure or an incomplete review), nothing is published: the
+      healthy outcomes stay in the spool and that failure is raised, so the
+      retried reviewer later runs with no same-round peer body visible;
+    * a reviewer still needing a fresh turn while ``public_peers`` is
+      non-empty -- a lost or invalid spool record -- stops the run.
+
+    A reviewer in ``already_posted`` has its own same-round record on the
+    surface that resume rejected; it is re-invoked, never replayed.
+
+    Callers may skip per-reviewer launch preparation for reviewers expected to
+    replay.  ``prepare_fallback`` runs for any of them whose replay fell back
+    to a fresh turn; an ``AgentLoopError`` it raises becomes that reviewer's
+    turn failure instead of a launch.
+
+    The round's spool is discarded only after every publication succeeded.
     """
-    executor = ThreadPoolExecutor(max_workers=len(pending), thread_name_prefix=thread_name_prefix)
-    try:
-        futures = {executor.submit(run_turn, reviewer): reviewer for reviewer in pending}
-        results: dict[AgentName, _ReviewerTurnResult] = {}
-        for future in as_completed(futures):
-            reviewer = futures[future]
-            result = future.result()
-            results[reviewer] = result
-            if on_completion is not None:
-                try:
-                    on_completion(reviewer, result)
-                except BaseException:
-                    # A publication failure must not leave reviewer subprocesses
-                    # running or allow a later reconciliation/coder turn.
-                    for other in futures:
-                        other.cancel()
-                    runner.terminate_active_processes()
-                    raise
+    results: dict[AgentName, _ReviewerTurnResult] = {}
+    replayed: set[AgentName] = set()
+    replay_fallbacks: list[AgentName] = []
+    if spool is not None and replay_turn is not None:
+        for reviewer in pending:
+            reviewer_name = agent_display_name(reviewer)
+            if reviewer in already_posted:
+                spool.remove(reviewer_name)
+                continue
+            fields = spool.load(reviewer_name)
+            if fields is None:
+                continue
+            replay_fallbacks.append(reviewer)
+            failure = _replay_spooled_failure(fields, reviewer_name)
+            result = (
+                _ReviewerTurnResult(reviewer_name=reviewer_name, error=failure)
+                if failure is not None
+                else replay_turn(reviewer, fields)
+            )
+            if result is not None:
+                results[reviewer] = result
+                replayed.add(reviewer)
+    to_launch = [reviewer for reviewer in pending if reviewer not in replayed]
+    if spool is not None:
+        for reviewer in to_launch:
+            peers = sorted(agent_display_name(peer) for peer in public_peers if peer != reviewer)
+            if peers:
+                raise _partial_round_refusal(
+                    surface=spool.surface, number=spool.number, round_number=spool.round_number,
+                    reviewer_name=agent_display_name(reviewer), public_peers=peers,
+                )
+    if prepare_fallback is not None:
+        for reviewer in [r for r in replay_fallbacks if r in to_launch]:
+            try:
+                prepare_fallback(reviewer)
+            except AgentLoopError as exc:
+                results[reviewer] = _ReviewerTurnResult(
+                    reviewer_name=agent_display_name(reviewer), error=exc
+                )
+                to_launch.remove(reviewer)
+    if to_launch:
+        # A sequential run finishing a held round launches one reviewer at a
+        # time (reviewer workdirs may be shared); publication is still withheld
+        # until all of them return.
+        executor = ThreadPoolExecutor(
+            max_workers=min(len(to_launch), max_workers or len(to_launch)),
+            thread_name_prefix=thread_name_prefix,
+        )
+        try:
+            futures = {executor.submit(run_turn, reviewer): reviewer for reviewer in to_launch}
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        except KeyboardInterrupt:
+            runner.terminate_active_processes()
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+    if spool is None:
+        if on_completion is not None:
+            for reviewer, result in results.items():
+                on_completion(reviewer, result)
         return results
-    except KeyboardInterrupt:
-        runner.terminate_active_processes()
-        raise
-    finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+
+    settled: dict[AgentName, _ReviewerTurnResult] = {**(prelaunch_failures or {}), **results}
+    retry_errors: dict[AgentName, AgentLoopError] = {}
+    if retry_bound is not None:
+        for reviewer, result in settled.items():
+            error = retry_bound(reviewer, result)
+            if error is not None:
+                retry_errors[reviewer] = error
+    for reviewer, result in settled.items():
+        if reviewer in replayed or reviewer in retry_errors:
+            continue
+        reviewer_name = agent_display_name(reviewer)
+        if result.error is not None:
+            spool.store_failure(
+                reviewer_name,
+                message=str(result.error),
+                failure_category=getattr(result.error, "failure_category", None),
+            )
+        elif result.response is not None:
+            spool.store(reviewer_name, _spooled_response_fields(result.response))
+    withheld = [
+        reviewer for reviewer, result in results.items()
+        if reviewer not in retry_errors and result.error is None and result.response is not None
+    ]
+    if retry_errors and withheld:
+        order = {reviewer: index for index, reviewer in enumerate(configured_order or pending)}
+        failed = sorted(retry_errors, key=lambda reviewer: order.get(reviewer, len(order)))
+        if config is not None:
+            log(
+                config,
+                "Withholding the same-round review(s) of "
+                f"{', '.join(agent_display_name(r) for r in withheld)} until "
+                f"{', '.join(agent_display_name(r) for r in failed)} completes an independent "
+                "turn; rerun to retry",
+            )
+        for reviewer in failed:
+            if isinstance(retry_errors[reviewer], QuotaResetExceededError):
+                raise retry_errors[reviewer]
+        raise retry_errors[failed[0]]
+    if on_completion is not None:
+        for reviewer, result in results.items():
+            if on_completion(reviewer, result):
+                # Published now: a rerun resumes (or, if the posted record is
+                # rejected, re-invokes) it rather than replaying a stale outcome.
+                spool.remove(agent_display_name(reviewer))
+    spool.discard()
+    return results
 
 
 def _run_plan_first_loop(
@@ -10500,6 +12427,39 @@ def _run_plan_first_loop(
     # Set by the approval guard when an approved plan fails the inherited
     # check; the revision turn then runs with no reviewer item.
     inherited_guard_revision: str | None = None
+    # Plan-growth gate (#886): authenticated planner candidates by round, and
+    # the orchestrator growth notice that replaces an approval of a
+    # non-compliant candidate with a planner revision.
+    planner_candidate_rounds = _planner_candidate_rounds(issue_context.comments)
+    growth_guard_revision: str | None = None
+
+    def check_candidate_growth(
+        candidate: StructuredPlanState | StructuredPlanRevision,
+        *,
+        canonical_text: str,
+        prior_payload: Mapping[str, object] | None,
+        target_round: int,
+    ) -> None:
+        """Post-assembly self-check of an unpublished candidate (#886).
+
+        Measures the candidate itself: its own canonical text and the
+        planner-candidate count including it.  Every failure is a correctable
+        deterministic validation failure, fed back before any reviewer turn.
+        """
+        check_scope_ledger_preservation(prior_payload, candidate)
+        if not plan_growth_gate_enforced(config):
+            return
+        check_growth_justification(
+            candidate,
+            assess_plan_growth(
+                candidate,
+                rendered_chars=len(canonical_text),
+                revision_count=_plan_growth_candidate_count(
+                    planner_candidate_rounds, target_round
+                ),
+                thresholds=PlanGrowthThresholds.from_config(config),
+            ),
+        )
     plan_validation_diagnostic: PlanValidationDiagnosticTransport | None = None
     if resume_state is None:
         plan_validation_diagnostic = _recover_current_plan_validation_diagnostic(
@@ -10533,7 +12493,8 @@ def _run_plan_first_loop(
                     inherited_matrix_binding=inherited_matrix_binding,
                 ),
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking --> or <!-- AGENT_CLARIFY -->",
-                validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
+                require_architecture_impact_contract=True,
+                **_architecture_mode_validators(lambda mode: lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
                     text,
                     marker_validator=lambda text: _require_plan_state_or_clarification(
                         text,
@@ -10546,12 +12507,12 @@ def _run_plan_first_loop(
                         ),
                         require_risk_test_matrix_contract=(
                             1 if require_fresh_matrix_contract else 0
-                        ),
+                        ), architecture_status_mode=mode,
                     ),
                     human_requirements=human_requirements,
                     requirement_scope="planning requirements",
                     full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
-                ),
+                )),
                 usage_context=usage_context,
                 use_repair=True,
                 repair_expected_kind="plan_state",
@@ -10578,6 +12539,7 @@ def _run_plan_first_loop(
         def fresh_candidate_matrix(response: ValidatedAgentResponse) -> object:
             candidate = validate_structured_plan_state(
                 response.text,
+                architecture_status_mode="legacy",
                 require_execution_strategy_contract=(
                     1 if require_fresh_execution_contract else 0
                 ),
@@ -10585,6 +12547,17 @@ def _run_plan_first_loop(
                     1 if require_fresh_matrix_contract else 0
                 ),
             )
+            if isinstance(candidate, StructuredPlanState):
+                check_candidate_growth(
+                    candidate,
+                    canonical_text=(
+                        render_canonical_plan_state(candidate, config)
+                        if candidate.execution_recommendation is not None
+                        else response.text
+                    ),
+                    prior_payload=None,
+                    target_round=1,
+                )
             return getattr(candidate, "risk_test_matrix", None)
 
         plan_response = run_inherited_checked_planner_turn(
@@ -10608,6 +12581,7 @@ def _run_plan_first_loop(
         canonical_plan: str | None = None
         structured_plan = validate_structured_plan_state(
             plan_output,
+            architecture_status_mode="legacy",
             require_execution_strategy_contract=(
                 1 if require_fresh_execution_contract else 0
             ),
@@ -10665,7 +12639,7 @@ def _run_plan_first_loop(
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
                     **_architecture_metadata_fields(
-                        config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
+                        config, result=plan_response.marker_value
                     ),
                     execution_strategy_contract_version=(
                         1
@@ -10758,6 +12732,8 @@ def _run_plan_first_loop(
             require_risk_test_matrix_contract=require_fresh_matrix_contract,
         ):
             plan_validation_diagnostic = None
+        if current_plan_sidecar is not None:
+            planner_candidate_rounds.add(1)
         start_round_number = 1
         resumed_round: ResumedReviewRound | None = None
         current_coder_output = plan_output
@@ -10765,7 +12741,9 @@ def _run_plan_first_loop(
         current_plan, resumed_round = resume_state
         current_coder_output = resumed_round.coder_output
         unresolved_items = list(resumed_round.prior_items)
-        compact_prior_summaries = list(resumed_round.compact_prior_summaries)
+        compact_prior_summaries = list(
+            bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
+        )
         next_unresolved_item_number = resumed_round.next_unresolved_item_number
         start_round_number = resumed_round.round_number
         if resumed_round.coder_metadata is not None and resumed_round.coder_metadata.assembled_plan_sidecar is not None:
@@ -10860,12 +12838,86 @@ def _run_plan_first_loop(
             sidecar=current_plan_sidecar,
             surfaced_requirement_ids=plan_hr_ids,
         )
+        plan_growth_assessment, plan_growth_violation = _plan_growth_gate_violation(
+            config,
+            plan_payload=(
+                current_plan_sidecar.canonical_json if current_plan_sidecar is not None else None
+            ),
+            plan_text=current_plan,
+            # Counted up to the round that published this candidate, never the
+            # loop round: a reviewer-only phase-advance round keeps the count.
+            revision_count=_plan_growth_candidate_count(
+                planner_candidate_rounds,
+                current_plan_sidecar.round_number
+                if current_plan_sidecar is not None
+                else round_number,
+            ),
+        )
+        if plan_growth_assessment is not None:
+            log(
+                config,
+                f"Planning round {round_number}: plan growth measurements: "
+                f"{plan_growth_assessment.describe()}; crossed="
+                f"{', '.join(plan_growth_assessment.crossed) or 'none'}; gate="
+                f"{config.plan_growth_gate}",
+            )
+        # Only a candidate recovered from history can reach reviewers in this
+        # state: fresh candidates are rejected by the self-check.
+        plan_growth_notice = (
+            render_growth_notice(
+                plan_growth_assessment,
+                violation=plan_growth_violation,
+                strategy=(
+                    plan_strategy(current_plan_sidecar.canonical_json)
+                    if current_plan_sidecar is not None
+                    else None
+                ),
+            )
+            if plan_growth_violation is not None and plan_growth_assessment is not None
+            else None
+        )
+        # Reviewers see the measurements of every crossed one-shot candidate,
+        # justified or not; the corrective notice is only for non-compliant ones.
+        plan_growth_measurements = (
+            render_growth_measurements(plan_growth_assessment)
+            if plan_growth_assessment is not None
+            and plan_growth_assessment.crossed
+            and current_plan_sidecar is not None
+            and plan_strategy(current_plan_sidecar.canonical_json) == "one-shot"
+            else None
+        )
         plan_scheduler_decision = None
         plan_panel_evidence = PlanPanelEvidence()
         plan_qualifying_approvals: tuple[str, ...] = ()
         plan_previous_key: PlanCandidateKey | None = None
         round_reviewers = tuple(configured_reviewers)
-        if staged_planning:
+        # Under primary-then-panel, a non-compliant candidate the primary has
+        # already approved can never pass, so the panel is not scheduled on it:
+        # this round invokes no reviewer and the gate below starts a planner
+        # revision instead of a reviewer-only phase advance (#886).
+        growth_skip_panel = False
+        if staged_planning and plan_growth_notice is not None and plan_primary_name is not None:
+            plan_records = plan_history_records(refresh=True, round_number=round_number)
+            growth_skip_panel = plan_primary_name in _carried_plan_approvals(
+                plan_records,
+                current_key=current_plan_key,
+                required_reviewers=plan_reviewer_names,
+                surfaced_requirement_ids=plan_hr_ids,
+                panel_evidence=_derive_plan_panel_evidence(
+                    plan_records,
+                    primary_reviewer=plan_primary_name,
+                    required_reviewers=plan_reviewer_names,
+                ),
+                primary_reviewer=plan_primary_name,
+            )
+        if growth_skip_panel:
+            round_reviewers = ()
+            log(
+                config,
+                f"Planning round {round_number}: the primary approved a candidate that fails "
+                "the plan-growth gate; no panel review is scheduled on it",
+            )
+        if staged_planning and not growth_skip_panel:
             assert plan_scheduler_contract is not None
             incomplete_key = current_plan_key.incompleteness_reason()
             if incomplete_key is not None:
@@ -11059,6 +13111,9 @@ def _run_plan_first_loop(
         ) else ""
         blocking_reviews: list[tuple[str, str]] = []
         approved_review_outputs: list[tuple[str, str]] = []
+        # The accepted carrier beside each approved text, keyed by reviewer, so
+        # an acknowledgement repair can pin its assessment and records (#925).
+        accepted_review_carriers: dict[str, ParsedPlanReview | ParsedReview] = {}
         all_approved = True
         resumed_by_name = {
             record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
@@ -11190,6 +13245,8 @@ def _run_plan_first_loop(
                 inherited_matrix_binding=inherited_matrix_binding,
                 inherited_reviewed_deltas=inherited_review_deltas,
                 inherited_check_failure=inherited_review_failure,
+                plan_growth_notice=plan_growth_notice,
+                plan_growth_measurements=plan_growth_measurements,
             )
 
         plan_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -11249,13 +13306,37 @@ def _run_plan_first_loop(
                         **(_metadata_identity_fields(identity) if identity is not None else {}),
                         acquisition_outcome=acquisition_outcome,
                         acquisition_returncode=acquisition_returncode,
-                        **_architecture_metadata_fields(config, impact=parsed.architecture_impact),
+                        **_architecture_metadata_fields(config, result=parsed),
                         canonical_reviewer_response=(review_output if phase == "publication" else None),
                     ),
                 ),
             )
 
-        if config.review_parallel:
+        # One private spool per round, shared by the parallel launcher and the
+        # sequential resume seam (#1025).
+        plan_round_spool = _review_round_spool(
+            config, surface="plan", number=issue_number,
+            round_number=round_number, subject=current_plan_subject,
+        )
+        # A round that holds withheld outcomes began as a parallel round; finish
+        # it through the same withhold-then-publish launcher even when this run
+        # is sequential, so no retried reviewer sees a same-round peer's body.
+        plan_round_parallel = config.review_parallel or plan_round_spool.has_records()
+        plan_round_public_peers = tuple(
+            reviewer for reviewer in round_reviewers
+            if (record := resumed_by_name.get(agent_display_name(reviewer))) is not None
+            and record.metadata.phase == "publication"
+        )
+        if not plan_round_parallel:
+            _refuse_partial_round_before_sequential_turns(
+                spool=plan_round_spool,
+                fresh_turn_reviewers=[
+                    reviewer for reviewer in round_reviewers
+                    if resumed_by_name.get(agent_display_name(reviewer)) is None
+                ],
+                public_peers=plan_round_public_peers,
+            )
+        if plan_round_parallel:
             pending_plan_reviewers = [
                 reviewer for reviewer in round_reviewers
                 if resumed_by_name.get(agent_display_name(reviewer)) is None
@@ -11271,6 +13352,22 @@ def _run_plan_first_loop(
                     f"in parallel on issue #{issue_number}",
                 )
 
+                def _plan_review_validators(reviewer_name: str) -> dict[str, object]:
+                    return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_plan_review_response(
+                        text,
+                        reviewer=reviewer_name,
+                        unresolved_items=prior_unresolved_items,
+                        # Never share the mutable round_new_unresolved_items list
+                        # with concurrent workers (#594): it only enriches the
+                        # UnknownPriorItemDispositionError message, so an empty
+                        # tuple here changes no validation outcome.
+                        current_round_items=(),
+                        surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
+                            issue_context.human_requirements,
+                            requirement_scope="planning requirements",
+                        ), architecture_status_mode=mode,
+                    ))
+
                 def _plan_reviewer_worker(reviewer: AgentName) -> _ReviewerTurnResult:
                     reviewer_name = agent_display_name(reviewer)
                     try:
@@ -11281,20 +13378,7 @@ def _run_plan_first_loop(
                             prompt=plan_prompts[reviewer],
                             session_id=reviewer_session_ids.get(reviewer),
                             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                            validate=lambda text, reviewer_name=reviewer_name: _validate_plan_review_response(
-                                text,
-                                reviewer=reviewer_name,
-                                unresolved_items=prior_unresolved_items,
-                                # Never share the mutable round_new_unresolved_items list
-                                # with concurrent workers (#594): it only enriches the
-                                # UnknownPriorItemDispositionError message, so an empty
-                                # tuple here changes no validation outcome.
-                                current_round_items=(),
-                                surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
-                                    issue_context.human_requirements,
-                                    requirement_scope="planning requirements",
-                                ),
-                            ),
+                            **_plan_review_validators(reviewer_name),
                             usage_context=usage_context,
                             use_repair=True,
                             repair_expected_kind="plan_review",
@@ -11316,27 +13400,40 @@ def _run_plan_first_loop(
                         return _ReviewerTurnResult(reviewer_name=reviewer_name, error=exc)
                     return _ReviewerTurnResult(reviewer_name=reviewer_name, response=response)
 
-                def _publish_plan_completion(reviewer: AgentName, turn: _ReviewerTurnResult) -> None:
-                    """Publish a validated reviewer response without mutating round state.
-
-                    Numbering and ledger mutations stay below the settlement barrier.
-                    The raw validated response in metadata makes this checkpoint
-                    resumable even though its ``new_items`` are provisional.
-                    """
+                def _plan_publication_parsed(turn: _ReviewerTurnResult) -> ParsedPlanReview | None:
                     if turn.error is not None or turn.response is None:
-                        return
-                    reviewer_name = agent_display_name(reviewer)
+                        return None
                     parsed = turn.response.marker_value
                     assert isinstance(parsed, ParsedPlanReview)
-                    parsed = dataclasses_replace(
+                    return dataclasses_replace(
                         parsed,
                         items=_drop_repeated_carried_plan_future_followups(
                             parsed.items, prior_items=prior_unresolved_items,
                             dispositions=parsed.dispositions,
                         ),
                     )
-                    if _is_incomplete_plan_review(parsed):
-                        return
+
+                def _plan_retry_bound(reviewer: AgentName, turn: _ReviewerTurnResult) -> AgentLoopError | None:
+                    """Every plan-review failure or incomplete review is retried by a rerun."""
+                    if turn.error is not None:
+                        return turn.error
+                    parsed = _plan_publication_parsed(turn)
+                    if parsed is not None and _is_incomplete_plan_review(parsed):
+                        return _incomplete_plan_review_error(agent_display_name(reviewer))
+                    return None
+
+                def _publish_plan_completion(reviewer: AgentName, turn: _ReviewerTurnResult) -> bool:
+                    """Publish a validated reviewer response without mutating round state.
+
+                    Numbering and ledger mutations stay below the settlement barrier.
+                    The raw validated response in metadata makes this checkpoint
+                    resumable even though its ``new_items`` are provisional.
+                    """
+                    parsed = _plan_publication_parsed(turn)
+                    if parsed is None or _is_incomplete_plan_review(parsed):
+                        return False
+                    assert turn.response is not None
+                    reviewer_name = agent_display_name(reviewer)
                     _post_plan_reviewer_comment(
                         reviewer_name, parsed, review_output=turn.response.text,
                         model_used=turn.response.model_used,
@@ -11346,6 +13443,7 @@ def _run_plan_first_loop(
                         phase="publication",
                     )
                     early_published_plan_reviewers.add(reviewer)
+                    return True
 
                 plan_turn_results = _launch_reviewer_turns(
                     runner,
@@ -11353,6 +13451,16 @@ def _run_plan_first_loop(
                     thread_name_prefix=f"plan-review-r{round_number}",
                     run_turn=_plan_reviewer_worker,
                     on_completion=_publish_plan_completion,
+                    spool=plan_round_spool,
+                    replay_turn=lambda reviewer, fields: _replay_spooled_review(
+                        runner, config=config, reviewer=reviewer, fields=fields,
+                        validators=_plan_review_validators(agent_display_name(reviewer)),
+                    ),
+                    public_peers=plan_round_public_peers,
+                    retry_bound=_plan_retry_bound,
+                    max_workers=None if config.review_parallel else 1,
+                    configured_order=round_reviewers,
+                    config=config,
                 )
 
         for reviewer in round_reviewers:
@@ -11365,7 +13473,12 @@ def _run_plan_first_loop(
                 review_acquisition_returncode = resumed_record.metadata.acquisition_returncode
                 structured_review = parse_structured_plan_review(
                     review_output,
+                    architecture_status_mode="legacy",
                     reviewer=reviewer_name,
+                )
+                resumed_impact, resumed_records = _resumed_review_architecture(
+                    resumed_record.metadata,
+                    structured_review.architecture_impact if structured_review is not None else None,
                 )
                 parsed_review = ParsedPlanReview(
                     state=resumed_record.metadata.state or parse_plan_state(review_output),
@@ -11380,11 +13493,13 @@ def _run_plan_first_loop(
                         else parse_plan_review_items(review_output, reviewer=reviewer_name)
                     ),
                     dispositions=resumed_record.metadata.dispositions,
+                    architecture_impact=resumed_impact,
+                    architecture_impact_degradations=resumed_records,
                 )
                 review_state = parsed_review.state
                 log(config, f"Planning round {round_number}: resuming {reviewer_name}'s completed review")
                 reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)
-            elif config.review_parallel:
+            elif plan_round_parallel:
                 turn = plan_turn_results[reviewer]
                 if turn.error is not None:
                     category = getattr(turn.error, "failure_category", None) or "error"
@@ -11420,35 +13535,44 @@ def _run_plan_first_loop(
                     f"Planning round {round_number}: {reviewer_name} reviewing issue #{issue_number} "
                     f"(context mode: {context_mode}{context_reason})",
                 )
-                review_response = _run_validated_agent(
+                sequential_plan_validators = _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name, items=prior_unresolved_items: _validate_plan_review_response(
+                    text,
+                    reviewer=reviewer_name,
+                    unresolved_items=items,
+                    current_round_items=round_new_unresolved_items,
+                    surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
+                        issue_context.human_requirements,
+                        requirement_scope="planning requirements",
+                    ), architecture_status_mode=mode,
+                ))
+                review_response = _same_round_replay_or_invoke(
                     runner,
-                    agent=reviewer,
                     config=config,
-                    prompt=_build_plan_review_prompt(reviewer),
-                    session_id=reviewer_session_ids.get(reviewer),
-                    marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                    validate=lambda text, reviewer_name=reviewer_name, items=prior_unresolved_items: _validate_plan_review_response(
-                        text,
-                        reviewer=reviewer_name,
-                        unresolved_items=items,
-                        current_round_items=round_new_unresolved_items,
-                        surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
+                    reviewer=reviewer,
+                    spool=plan_round_spool,
+                    public_peers=plan_round_public_peers,
+                    validators=sequential_plan_validators,
+                    invoke=lambda reviewer=reviewer, validators=sequential_plan_validators: _run_validated_agent(
+                        runner,
+                        agent=reviewer,
+                        config=config,
+                        prompt=_build_plan_review_prompt(reviewer),
+                        session_id=reviewer_session_ids.get(reviewer),
+                        marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+                        **validators,
+                        usage_context=usage_context,
+                        use_repair=True,
+                        repair_expected_kind="plan_review",
+                        repair_reviewer_requirement_ids=_surfaced_reviewer_requirement_ids(
                             issue_context.human_requirements,
                             requirement_scope="planning requirements",
                         ),
+                        repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
+                        ledger_incomplete=round_ledger_incomplete,
+                        repair_resolved_history_item_ids=round_resolved_history_item_ids,
+                        role="reviewer",
+                        operation_description="plan review",
                     ),
-                    usage_context=usage_context,
-                    use_repair=True,
-                    repair_expected_kind="plan_review",
-                    repair_reviewer_requirement_ids=_surfaced_reviewer_requirement_ids(
-                        issue_context.human_requirements,
-                        requirement_scope="planning requirements",
-                    ),
-                    repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
-                    ledger_incomplete=round_ledger_incomplete,
-                    repair_resolved_history_item_ids=round_resolved_history_item_ids,
-                    role="reviewer",
-                    operation_description="plan review",
                 )
                 review_output = review_response.text
                 review_model_used = review_response.model_used
@@ -11475,13 +13599,8 @@ def _run_plan_first_loop(
                     "and reported no actionable blocking plan issues or Same-Plan follow-ups; "
                     "stopping without a coder follow-up",
                 )
-                incomplete_review_error = AgentLoopError(
-                    f"{reviewer_name} did not complete plan review and reported no actionable "
-                    "blocking plan issues or Same-Plan follow-ups. This is a reviewer-internal error; "
-                    "agent-loop stopped before a coder follow-up. Rerun or switch the reviewer/model "
-                    "after resolving the reviewer environment."
-                )
-                if config.review_parallel:
+                incomplete_review_error = _incomplete_plan_review_error(reviewer_name)
+                if plan_round_parallel:
                     plan_fatal_errors.append((reviewer_name, incomplete_review_error))
                     continue
                 raise incomplete_review_error
@@ -11505,6 +13624,7 @@ def _run_plan_first_loop(
                 blocking_reviews.append((reviewer_name, review_output))
             else:
                 approved_review_outputs.append((reviewer_name, review_output))
+                accepted_review_carriers[reviewer_name] = parsed_review
             if resumed_record is None or (
                 resumed_record.metadata.phase == "publication"
                 and not (current_resume is not None and current_resume.reconciled)
@@ -11554,7 +13674,11 @@ def _run_plan_first_loop(
             else:
                 round_new_unresolved_items.extend(reviewer_new_unresolved_items)
 
-        if config.review_parallel and not (current_resume is not None and current_resume.reconciled):
+        if not plan_fatal_errors:
+            # Every same-round outcome is now published; a sequential resume
+            # that replayed withheld reviews no longer needs them.
+            plan_round_spool.discard()
+        if plan_round_parallel and not (current_resume is not None and current_resume.reconciled):
             settled = ", ".join(agent_display_name(reviewer) for reviewer in round_reviewers)
             post_issue_comment(
                 runner, config=config, issue_number=issue_number,
@@ -11588,11 +13712,16 @@ def _run_plan_first_loop(
             same_status="same-plan",
             retain_future=True,
         )
-        compact_prior_summaries.extend(
-            _collect_prior_compact_summaries(
-                plan_ledger_view(prior_unresolved_items),
-                unresolved_items,
-                prior_dispositions,
+        compact_prior_summaries = list(
+            bound_compact_prior_summaries(
+                [
+                    *compact_prior_summaries,
+                    *_collect_prior_compact_summaries(
+                        plan_ledger_view(prior_unresolved_items),
+                        unresolved_items,
+                        prior_dispositions,
+                    ),
+                ]
             )
         )
         # The ledger handed to the next round is built from the amended view,
@@ -11689,7 +13818,7 @@ def _run_plan_first_loop(
                             reviewer=reviewer_name,
                             unresolved_items=prior_unresolved_items,
                             current_round_items=round_new_unresolved_items,
-                            surfaced_requirement_ids=hr_ids,
+                            surfaced_requirement_ids=hr_ids, architecture_status_mode="strict",
                         ),
                         repair_kwargs={
                             "expected_kind": "plan_review",
@@ -11698,6 +13827,15 @@ def _run_plan_first_loop(
                                 item.item_id for item in prior_unresolved_items
                             ),
                         },
+                        forbid_architecture_impact=_acknowledgement_repair_forbids_assessment(
+                            review_output
+                        ),
+                    )
+                    repaired_validated = _pin_acknowledgement_repair(
+                        accepted_review_carriers.get(reviewer_name),
+                        repaired_validated,
+                        config=config,
+                        reviewer_name=reviewer_name,
                     )
                     _log_repair_attempts(
                         config, f"Planning round {round_number}: {reviewer_name}", repair_attempts
@@ -11815,6 +13953,25 @@ def _run_plan_first_loop(
                         for name, output in approved_review_outputs
                     ]
 
+        # A machine obligation has no planning clearance path: reviewer
+        # dispositions are evidence only, so after a unanimous approval it
+        # would drive another revision every round forever (#1005).  Recovery
+        # demotes only the recognized legacy promotion; a malformed or
+        # unrecognized machine record stays fail-closed here, stopping with a
+        # diagnostic naming the items instead of revising again.
+        unclearable_plan_items = [item for item in must_fix_items if item.is_machine_obligation]
+        if all_approved and unclearable_plan_items:
+            raise AgentLoopError(
+                f"Planning round {round_number}: every reviewer approved, but plan item(s) "
+                + ", ".join(
+                    f"{item.item_id} (owner {item.reviewer or 'unknown'}, kind "
+                    f"{item.obligation_kind or 'unknown'})"
+                    for item in unclearable_plan_items
+                )
+                + " are machine obligations that no planning participant can clear. "
+                "Stopping instead of revising an approved plan indefinitely; inspect the "
+                "item's round metadata and rerun."
+            )
         # The final gate evaluates every required plan reviewer, carried and
         # current alike.  A paused reviewer counts only through a qualifying
         # exact-key carried approval; a reviewer that blocked this round loses
@@ -11835,6 +13992,19 @@ def _run_plan_first_loop(
             and not must_fix_items
             and plan_missing_approvals
         )
+        growth_guard_revision = None
+        if plan_growth_notice is not None and all_approved and not must_fix_items:
+            # A non-compliant candidate can never pass, so neither a
+            # reviewer-only panel advance nor an approval is spent on it: the
+            # next round is a planner revision carrying the growth notice.
+            if plan_phase_advance_pending:
+                log(
+                    config,
+                    f"Planning round {round_number}: skipping the reviewer-only plan phase "
+                    "advance; the candidate fails the plan-growth gate",
+                )
+            plan_phase_advance_pending = False
+            growth_guard_revision = plan_growth_notice
         # The outstanding phase, not the one that just ran: both the durable
         # phase-advance record and the round-budget diagnostic must name the
         # round that is still pending.
@@ -11928,6 +14098,12 @@ def _run_plan_first_loop(
                     "--max-rounds and rerun; re-planning continues the existing round "
                     "numbering."
                 )
+        elif growth_guard_revision is not None:
+            log(
+                config,
+                f"Planning round {round_number}: reviewers approved, but the plan fails the "
+                f"plan-growth gate ({plan_growth_violation}); starting a planner revision",
+            )
         elif all_approved and not must_fix_items and not plan_missing_approvals:
             if plan_amendment_note:
                 log(
@@ -12518,6 +14694,15 @@ def _run_plan_first_loop(
             raise AgentLoopError(f"Unknown plan execution mode: {mode}")
 
         if round_number == config.max_rounds:
+            if growth_guard_revision is not None:
+                raise AgentLoopError(
+                    f"Reached max planning rounds ({config.max_rounds}) for issue #{issue_number} "
+                    "while the plan-growth gate still blocked approval: the one-shot plan "
+                    f"crosses plan-growth threshold(s) without a covering justification "
+                    f"({plan_growth_violation}). Raise --max-rounds and rerun so a revision "
+                    "restructures the plan as staged or justifies one-shot, or rerun with "
+                    "--plan-growth-gate off."
+                )
             if plan_phase_advance_pending:
                 # Distinct from the blocking-plan-issues message: no reviewer
                 # reported a blocker, the run simply ran out of rounds while a
@@ -12589,6 +14774,13 @@ def _run_plan_first_loop(
             # The revised subject gets the complete board and carries no
             # approval from the superseded one.
             plan_automatic_force_full = True
+        if growth_guard_revision is not None:
+            # Attributed to the orchestrator; no reviewer item ID is minted.
+            combined_review = (
+                f"{combined_review}\n\n{growth_guard_revision}"
+                if combined_review
+                else growth_guard_revision
+            )
         if supersession_revision_pending:
             # The signed authorization is the revision's instruction; the
             # planner must actually replace the plan, not return it (#985).
@@ -12649,10 +14841,14 @@ def _run_plan_first_loop(
                     response_form=("semantic-patch-v1" if semantic_revision else None),
                     base_round_number=(semantic_base.round_number if semantic_base is not None else None),
                     base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
+                    plan_growth_notice=plan_growth_notice,
                 ),
                 session_id=coder_session_id,
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                validate=(
+                # A semantic patch carries no assessment of its own; the assembled
+                # plan inherits the base or a strict patch replace.
+                require_architecture_impact_contract=not semantic_revision,
+                **_architecture_mode_validators(lambda mode: (
                     (lambda text, human_requirements=issue_context.human_requirements, items=tuple(must_fix_items): _validate_plan_revision_patch_response(
                         text,
                         unresolved_items=items,
@@ -12673,13 +14869,13 @@ def _run_plan_first_loop(
                             require_risk_test_matrix_contract=require_fresh_matrix_contract,
                             reject_unsolicited_risk_test_matrix_contract=(
                                 not require_fresh_matrix_contract
-                            ),
+                            ), architecture_status_mode=mode,
                         ),
                         human_requirements=human_requirements,
                         requirement_scope="planning requirements",
                         full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
                     ))
-                ),
+                )),
                 usage_context=usage_context,
                 use_repair=True,
                 repair_expected_kind=("plan_revision_patch" if semantic_revision else "plan_revision"),
@@ -12759,7 +14955,28 @@ def _run_plan_first_loop(
                     response.marker_value,
                     result_round_number=round_number + 1,
                 )
+                check_candidate_growth(
+                    assembled_candidate,
+                    canonical_text=render_canonical_plan_revision(
+                        assembled_candidate, must_fix_items, config
+                    ),
+                    prior_payload=semantic_base.canonical_payload,
+                    target_round=round_number + 1,
+                )
                 return assembled_candidate.risk_test_matrix
+            if isinstance(response.marker_value, StructuredPlanRevision):
+                check_candidate_growth(
+                    response.marker_value,
+                    canonical_text=render_canonical_plan_revision(
+                        response.marker_value, must_fix_items, config
+                    ),
+                    prior_payload=(
+                        current_plan_sidecar.canonical_json
+                        if current_plan_sidecar is not None
+                        else None
+                    ),
+                    target_round=round_number + 1,
+                )
             return getattr(response.marker_value, "risk_test_matrix", None)
 
         plan_response = run_inherited_checked_planner_turn(
@@ -12955,7 +15172,7 @@ def _run_plan_first_loop(
                         if current_plan_sidecar is not None else None
                     ),
                     **_architecture_metadata_fields(
-                        config, impact=getattr(metadata_plan, "architecture_impact", None)
+                        config, result=metadata_plan
                     ),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
@@ -13010,6 +15227,8 @@ def _run_plan_first_loop(
             require_risk_test_matrix_contract=require_fresh_matrix_contract,
         ):
             plan_validation_diagnostic = None
+        if current_plan_sidecar is not None:
+            planner_candidate_rounds.add(round_number + 1)
         resumed_round = None
 
     raise AgentLoopError(
@@ -13570,11 +15789,7 @@ def run_issue_loop(
                 runner, config=config, issue_number=issue_number
             )
             if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
-                print(
-                    "WARNING: --allow-unprotected-managed-ci is active for this invocation. GitHub cannot "
-                    "prevent a manual merge, other automation, a compromised credential, or an agent-loop "
-                    "defect from bypassing the voluntary final-ci/exact-head gate."
-                )
+                _print_unprotected_managed_ci_warning(managed_ci_creation_intent.protection_mode)
         assigned_head_before = _read_assigned_workdir_head(runner, config)
         salvage_summary = latest_salvage_context(
             config.log_dir,
@@ -13598,12 +15813,16 @@ def run_issue_loop(
                 parent_issue_context=parent_issue_context,
             ),
             marker_description="structured issue_implementation result, blocking, or clarification",
-            validate=lambda text: _validate_issue_implementation_response(
+            require_architecture_impact_contract=True,
+            **_architecture_mode_validators(lambda mode: lambda text: _validate_issue_implementation_response(
                 text,
                 human_requirements=implementation_requirements,
-                require_architecture_impact=True,
-            ),
+                require_architecture_impact=True, architecture_status_mode=mode,
+            )),
             usage_context=usage_context,
+            # Without the exact coder role a sandboxed run hands this committing
+            # turn the fail-closed read-only grant (#1077).
+            role="coder",
             use_repair=True,
             repair_expected_kind="issue_implementation",
             repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,
@@ -13843,7 +16062,8 @@ def run_issue_loop(
                 **_metadata_identity_fields(coder_response),
                 acquisition_outcome=coder_response.acquisition_outcome,
                 acquisition_returncode=coder_response.acquisition_returncode,
-                **_architecture_metadata_fields(config, impact=getattr(implementation_result, "architecture_impact", None)),
+                **_test_observation_degradation_fields(implementation_result),
+                **_architecture_metadata_fields(config, result=implementation_result),
             ),
         )
         post_trusted_pr_comment(
@@ -13926,13 +16146,15 @@ def run_task_loop(
                 prompt=prompt,
                 session_id=session_id,
                 marker_description="structured task_result JSON, blocking, or clarification outcome",
-                validate=lambda text: _require_task_implementation_result(
+                require_architecture_impact_contract=True,
+                **_architecture_mode_validators(lambda mode: lambda text: _require_task_implementation_result(
                     text,
                     # This is a fresh task turn even when architecture context
                     # is disabled or unavailable; legacy decoding is resume-only.
-                    required_architecture_impact_contract=1,
-                ),
+                    required_architecture_impact_contract=1, architecture_status_mode=mode,
+                )),
                 usage_context=usage_context,
+                role="coder",
                 salvage_context=SalvageContext(
                     repo=config.repo,
                     issue_number=None,
@@ -13997,7 +16219,7 @@ def run_task_loop(
                             **_metadata_identity_fields(coder_response),
                             acquisition_outcome=coder_response.acquisition_outcome,
                             acquisition_returncode=coder_response.acquisition_returncode,
-                            **_architecture_metadata_fields(config, impact=getattr(structured_task, "architecture_impact", None)),
+                            **_architecture_metadata_fields(config, result=structured_task),
                         ),
                     ),
                 )
@@ -14074,10 +16296,8 @@ def _coder_followup_review_context(
             tests, out_of_checkout_tests = (), tuple(tests)
         else:
             tests, out_of_checkout_tests = partition.in_checkout, partition.out_of_checkout
-    try:
-        parsed = parse_historical_structured_coder_followup(text)
-    except AgentLoopError:
-        parsed = None
+    # Dropped-citation records are restored from the round metadata (#927).
+    parsed = rebuild_resumed_coder_carrier(text, metadata)
     payload: dict[str, object] = {
         "summary": summary,
         "tests_run": tests,
@@ -14111,12 +16331,44 @@ def _coder_followup_review_context(
                 for item in parsed.test_observations
             ],
         )
-    elif summary is None and tests is None:
+    if (
+        isinstance(parsed, (StructuredCoderFollowup, StructuredIssueImplementation))
+        and parsed.test_observation_degradations
+    ):
+        # A dropped citation supports nothing; reviewers see that it was dropped.
+        payload["test_observation_degradations"] = [
+            record.to_payload() for record in parsed.test_observation_degradations
+        ]
+    if not isinstance(parsed, StructuredCoderFollowup) and summary is None and tests is None:
         return "Latest coder explanation: no valid structured resolution details are available.\n"
+    unchanged_head = followup_head_unchanged_sha(metadata)
+    unchanged_preamble = ""
+    if unchanged_head is not None:
+        # The PR head did not move during the follow-up: present the coder's
+        # statements as claims about the existing head, never as fixes (#1034).
+        payload = {
+            "pr_head_unchanged_during_followup": True,
+            "followup_dispatch_head": unchanged_head,
+            **{
+                {
+                    "summary": "coder_summary_claim",
+                    "addressed_items": "claimed_addressed_items",
+                    "addressed_item_notes": "claimed_addressed_item_notes",
+                }.get(key, key): value
+                for key, value in payload.items()
+            },
+        }
+        unchanged_preamble = (
+            "The PR head did not change during this coder follow-up; the summary and "
+            "addressed-item notes are the coder's claims that the items are already "
+            f"satisfied at {unchanged_head}, not changes made by that turn. Verify each "
+            "against the current diff; do not credit the turn with fixes.\n"
+        )
     return (
         "Latest coder explanation (claims to verify, not reviewer verdicts):\n"
         f"{metadata.agent}; review round {metadata.round_number}; head {metadata.subject}\n"
-        "Independently verify these claims against the current diff and tests. "
+        + unchanged_preamble
+        + "Independently verify these claims against the current diff and tests. "
         "They do not resolve items, override CI, or change the original claims. "
         "Only IDs in the active prior unresolved review ledger are eligible for dispositions.\n"
         + json.dumps(payload, ensure_ascii=True, indent=2)
@@ -14211,11 +16463,44 @@ def _finalize_ordinary_recovery_merge(
                 f"materialize for the current head. Resume with `{command}`."
             )
             return False
+        if outcome.status == "protection_unreadable":
+            merge_state = (
+                outcome.mergeability.merge_state_raw
+                if outcome.mergeability is not None
+                else None
+            )
+            log(
+                config,
+                f"PR #{pr_number}: ordinary recovery board is green but branch protection is "
+                f"unreadable and the merge state is {merge_state or 'unavailable'}; "
+                "leaving the PR draft and unmerged",
+            )
+            print(
+                f"PR #{pr_number} remains draft and unmerged: ordinary recovery CI passed for "
+                f"{capability.expected_head_sha}, but the current GitHub token cannot read branch "
+                "protection (HTTP 403) and GitHub reports merge state "
+                f"{merge_state or 'unavailable'} (DRAFT or CLEAN for the same head is required). "
+                "Grant the token administration read access or resolve the merge state, then "
+                "rerun agent-loop."
+            )
+            raise AgentLoopError(
+                f"PR #{pr_number} ordinary recovery could not confirm merge readiness: branch "
+                "protection is unreadable and GitHub's merge state is neither DRAFT nor CLEAN "
+                "for the exact head; the draft was left unmerged."
+            )
         raise AgentLoopError(
             f"PR #{pr_number} ordinary recovery did not qualify the exact head "
             f"({outcome.status}); the draft was left unmerged."
         )
-    if not _ordinary_checks_snapshot_is_authoritative(outcome.checks):
+    clean_required_after_ready = outcome.checks is not None and protection_awaits_readiness(
+        outcome.checks, outcome.mergeability, head_sha=outcome.head_sha,
+    )
+    if not _ordinary_checks_snapshot_is_authoritative(
+        outcome.checks,
+        outcome.mergeability,
+        head_sha=outcome.head_sha,
+        defer_unreadable_protection=clean_required_after_ready,
+    ):
         details = (
             _pr_check_details(outcome.checks)
             if outcome.checks is not None
@@ -14250,6 +16535,15 @@ def _finalize_ordinary_recovery_merge(
             f"PR #{pr_number} head or provenance changed after `gh pr ready`; "
             "the PR remains ready and was not merged."
         )
+    if clean_required_after_ready:
+        assert outcome.checks is not None
+        _require_clean_merge_state_after_ready(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            checks=outcome.checks,
+            head_sha=capability.expected_head_sha,
+        )
     try:
         _merge_with_exact_head_proof(
             runner,
@@ -14266,6 +16560,56 @@ def _finalize_ordinary_recovery_merge(
         log(config, f"PR #{pr_number}: merge failed after ordinary recovery readiness; PR remains ready")
         raise
     return True
+
+
+def _require_clean_merge_state_after_ready(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    checks: PullRequestChecks,
+    head_sha: str,
+) -> None:
+    """Require GitHub's CLEAN merge state after a draft recovery is readied.
+
+    Under unreadable (403) classic protection, the draft could only report
+    ``DRAFT``.  Once ready, GitHub recomputes the merge state from the real
+    protection; poll it for the bounded startup window and refuse to merge
+    unless it is ``CLEAN`` for the same exact head.
+    """
+    attempts = max(
+        1,
+        (config.ci_startup_timeout_seconds + config.ci_poll_interval_seconds - 1)
+        // config.ci_poll_interval_seconds,
+    )
+    mergeability: PullRequestMergeability | None = None
+    for attempt in range(attempts):
+        mergeability = get_pr_mergeability(runner, config=config, pr_number=pr_number)
+        if board_protection_is_reliable(checks, mergeability, head_sha=head_sha):
+            return
+        if mergeability.state == "conflicted" or (
+            mergeability.head_sha is not None and mergeability.head_sha != head_sha
+        ):
+            break
+        if attempt < attempts - 1:
+            runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
+    merge_state = mergeability.merge_state_raw if mergeability is not None else None
+    log(
+        config,
+        f"PR #{pr_number}: branch protection is unreadable and the readied PR's merge state "
+        f"is {merge_state or 'unavailable'}, not CLEAN; PR remains ready and unmerged",
+    )
+    print(
+        f"PR #{pr_number} was marked ready after ordinary recovery CI passed, but the current "
+        "GitHub token cannot read branch protection (HTTP 403) and GitHub reports merge state "
+        f"{merge_state or 'unavailable'} (CLEAN is required) for {head_sha}. Satisfy the remaining "
+        "protection rules or grant the token administration read access, then merge manually "
+        f"with `--match-head-commit {head_sha}` or rerun agent-loop."
+    )
+    raise AgentLoopError(
+        f"PR #{pr_number} branch protection is unreadable and GitHub's merge state is not CLEAN "
+        "after readiness; the PR remains ready and was not merged."
+    )
 
 
 def _stop_on_terminal_without_status(
@@ -14345,7 +16689,7 @@ def _stop_after_ci_watch_timeout(
     pr_comments: Sequence[object],
     followups: list[ApprovedFollowup],
     details: list[str],
-    reason: Literal["budget_exhausted", "timeout", "non_authoritative"],
+    reason: Literal["budget_exhausted", "timeout", "non_authoritative", "protection_unreadable"],
     source_context: FollowupSourceContext,
     usage_context: RunUsageContext | None = None,
 ) -> int:
@@ -14364,7 +16708,11 @@ def _stop_after_ci_watch_timeout(
         runner,
         config=config,
         pr_number=pr_number,
-        body=_pending_ci_stop_message(pr_number, "pending", details),
+        body=(
+            _unreadable_protection_stop_message(pr_number, details)
+            if reason == "protection_unreadable"
+            else _pending_ci_stop_message(pr_number, "pending", details)
+        ),
     )
     rerun = _render_ci_rerun_command(config, pr_number=pr_number)
     note = (
@@ -14397,6 +16745,24 @@ def _stop_after_ci_watch_timeout(
             raise AgentLoopError(
                 f"PR #{pr_number} full-board CI watch did not pass within "
                 f"{config.ci_timeout_seconds}s; no merge attempted."
+            )
+    elif reason == "protection_unreadable":
+        log(
+            config,
+            f"Round {round_number}: PR #{pr_number} branch protection is unreadable and "
+            "GitHub did not report a CLEAN merge state for the green board; no merge attempted",
+        )
+        print(
+            f"PR #{pr_number} CI watch stopped: every observed check passed, but the current "
+            "GitHub token cannot read branch protection (HTTP 403) and GitHub did not report "
+            f"a CLEAN merge state for the current head: {'; '.join(details)}. "
+            "Grant the token administration read access, or satisfy the remaining protection "
+            f"rules (for example required reviews), then rerun: {rerun}{note}"
+        )
+        if config.auto_merge:
+            raise AgentLoopError(
+                f"PR #{pr_number} branch protection is unreadable and GitHub's merge state "
+                "is not CLEAN; no merge attempted."
             )
     else:
         log(
@@ -14502,6 +16868,19 @@ def _partition_unresolved_items(
         "finalization_blockers": tuple(finalization_blockers),
         "coder_blockers": tuple(coder_blockers),
     }
+
+
+def _log_coder_followup_dispatch(
+    config: AgentLoopConfig,
+    round_number: int,
+    coder_name: str,
+    coder_followup_items: Sequence[UnresolvedReviewItem],
+) -> None:
+    """Announce a coder round by what actually routed it (#1024)."""
+    if coder_followup_is_ci_repair(coder_followup_items):
+        log(config, f"Round {round_number}: {coder_name} repairing failed CI")
+    else:
+        log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
 
 
 def _machine_obligation_checkpoint(
@@ -14628,6 +17007,21 @@ def _qualification_checkpoint_review_identity_matches(
     )
 
 
+def approved_pr_reopen_hint(pr_number: int) -> str:
+    """Name the operator path for new instructions on an approved PR (#1020).
+
+    An ordinary PR comment is not a requirement, so an approved head exits
+    without dispatching an agent. A signed human requirement invalidates the
+    carried approvals and re-invokes reviewers against it at the same head.
+    """
+    return (
+        f" To add instructions this PR must still satisfy, post a PR comment that ends "
+        f"with a line containing exactly `-- Human Reviewer`, then rerun `agent-loop pr "
+        f"{pr_number}`. Unsigned comments are not read as requirements. Only a human may "
+        "sign; an agent relaying an operator decision must disclose the relay in the body."
+    )
+
+
 def _round_limit_diagnostic(
     *,
     pr_number: int,
@@ -14742,15 +17136,35 @@ def _finalize_ordinary_recovery_checked(
     )
 
 
+def _mergeability_for_unreadable_protection(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    checks: PullRequestChecks | None,
+) -> PullRequestMergeability | None:
+    """Fetch GitHub's merge state only when classic protection returned 403."""
+    if checks is None or checks.branch_protection_status != "forbidden":
+        return None
+    return get_pr_mergeability(runner, config=config, pr_number=pr_number)
+
+
 def _ordinary_checks_snapshot_is_authoritative(
     checks: PullRequestChecks | None,
+    mergeability: PullRequestMergeability | None = None,
+    *,
+    head_sha: str | None = None,
+    defer_unreadable_protection: bool = False,
 ) -> bool:
     """Return whether a fresh ordinary-check snapshot can clear its ledger.
 
     ``get_pr_checks`` is queried against the current PR head immediately before
     this decision. Requiring both API surfaces and a known branch-protection
     result keeps a passing-looking partial, absent, or unavailable snapshot
-    from becoming a final gate.
+    from becoming a final gate. An unreadable (403) classic protection is
+    accepted only with GitHub's ``CLEAN`` merge state for ``head_sha``, unless
+    ``defer_unreadable_protection`` says the caller checks ``CLEAN`` itself
+    after readiness and before merging (a draft reports ``DRAFT``).
     """
     # ``PullRequestChecks.state`` deliberately treats neutral and skipped
     # conclusions as passing for ordinary status reporting.  That aggregate is
@@ -14774,7 +17188,13 @@ def _ordinary_checks_snapshot_is_authoritative(
         checks is not None
         and checks.state == "passing"
         and checks.check_query_status == "ok"
-        and checks.branch_protection_status in {"configured", "not_found"}
+        and (
+            board_protection_is_reliable(checks, mergeability, head_sha=head_sha)
+            or (
+                defer_unreadable_protection
+                and checks.branch_protection_status == "forbidden"
+            )
+        )
         and not checks.pending
         and not checks.missing_required
         and successful_checks
@@ -14958,7 +17378,7 @@ def _superseded_prepanel_review(record: PostedRoundRecord | None) -> SupersededP
         parsed: ParsedReview | None = None
         try:
             if metadata.canonical_reviewer_response is not None:
-                parsed = parse_structured_pr_review(source_text, reviewer=reviewer)
+                parsed = parse_structured_pr_review(source_text, reviewer=reviewer, architecture_status_mode="legacy")
             if parsed is None:
                 parsed = parse_review(source_text, reviewer=reviewer)
         except AgentLoopError:
@@ -14995,7 +17415,7 @@ def _superseded_prepanel_plan_review(
     if not claims:
         source_text = metadata.canonical_reviewer_response or record.body
         try:
-            parsed = parse_plan_review(source_text, reviewer=reviewer)
+            parsed = parse_plan_review(source_text, reviewer=reviewer, architecture_status_mode="legacy")
         except AgentLoopError:
             parsed = None
         if parsed is not None:
@@ -15510,6 +17930,92 @@ def _classify_staged_plan_history(
     )
 
 
+def _planner_candidate_rounds(comments: Sequence[object]) -> set[int]:
+    """Round numbers of authenticated planner-authored plan candidates (#886).
+
+    Only coder plan rounds that carry an assembled plan state count, so
+    reviewer-only phase-advance rounds never do, and a resumed replay of the
+    same round number counts once.  ``round_number`` is never used as a
+    count directly.
+    """
+    try:
+        records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError:
+        return set()
+    return {
+        record.metadata.round_number
+        for record in records
+        if record.metadata.role == "coder"
+        and record.metadata.canonical_plan is not None
+        and record.metadata.assembled_plan_sidecar is not None
+    }
+
+
+def _plan_growth_candidate_count(candidate_rounds: set[int], round_number: int) -> int:
+    """Planner candidates up to and including the one published at ``round_number``.
+
+    ``round_number`` must be the round that published (or, for the
+    pre-publication self-check, will publish) the candidate; callers never
+    pass a reviewer-only round.
+    """
+    return len({item for item in candidate_rounds if item < round_number} | {round_number})
+
+
+def _plan_growth_gate_violation(
+    config: AgentLoopConfig,
+    *,
+    plan_payload: Mapping[str, object] | None,
+    plan_text: str,
+    revision_count: int,
+) -> tuple[PlanGrowthAssessment | None, str | None]:
+    """Assessment and gate violation of one authenticated plan candidate.
+
+    ``None`` violation for legacy unversioned plans, free-form plans and when
+    ``--plan-growth-gate off``.
+    """
+    if plan_payload is None or plan_strategy(plan_payload) is None:
+        return None, None
+    assessment = assess_plan_growth(
+        plan_payload,
+        rendered_chars=len(plan_text),
+        revision_count=revision_count,
+        thresholds=PlanGrowthThresholds.from_config(config),
+    )
+    if not plan_growth_gate_enforced(config):
+        return assessment, None
+    return assessment, growth_justification_violation(plan_payload, assessment)
+
+
+def _require_plan_growth_compliance(
+    comments: Sequence[object],
+    *,
+    config: AgentLoopConfig,
+    plan_text: str,
+    plan_round: ResumedReviewRound,
+    error_message: str,
+) -> None:
+    """Fail closed when carried approvals would approve a non-compliant plan (#886)."""
+    coder_metadata = plan_round.coder_metadata
+    if coder_metadata is None or coder_metadata.assembled_plan_sidecar is None:
+        return
+    sidecar = decode_assembled_plan_sidecar(coder_metadata.assembled_plan_sidecar)
+    _assessment, violation = _plan_growth_gate_violation(
+        config,
+        plan_payload=sidecar.canonical_json,
+        plan_text=plan_text,
+        # The coder round that published the candidate, not the resumed
+        # anchor round (which may be a later reviewer-only round).
+        revision_count=_plan_growth_candidate_count(
+            _planner_candidate_rounds(comments), sidecar.round_number
+        ),
+    )
+    if violation is not None:
+        raise AgentLoopError(
+            f"{error_message} Plan growth gate: {violation} Re-run planning so a revision "
+            "restructures the plan as staged or carries a reviewed justification."
+        )
+
+
 def _require_complete_canonical_plan_approval(
     comments: Sequence[object],
     *,
@@ -15529,8 +18035,16 @@ def _require_complete_canonical_plan_approval(
     union of qualifying exact-key approvals carried from the whole planning
     history is always consulted instead — the same carry the final planning gate
     uses.  A reviewer whose latest record for the exact plan is not an
-    approval still leaves the set incomplete (#962).
+    approval still leaves the set incomplete (#962).  Carried approvals of a
+    plan that fails the plan-growth gate never count (#886).
     """
+    _require_plan_growth_compliance(
+        comments,
+        config=config,
+        plan_text=plan_text,
+        plan_round=plan_round,
+        error_message=error_message,
+    )
     configured_names = {agent_display_name(reviewer) for reviewer in reviewers(config)}
     if not plan_policy_capabilities(config.plan_review_policy).scheduler_enabled:
         round_approved = {
@@ -16646,6 +19160,18 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
+        # A successful manual qualification retains the managed label on the
+        # ready PR.  Release it before any managed-CI authentication so every
+        # downstream path sees the ready/unlabeled state it already handles.
+        if release_retained_managed_label(
+            runner, config=config, pr_number=pr_number, cwd=bootstrap_cwd,
+        ):
+            initial_pr_context = get_pr_review_context(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                cwd=bootstrap_cwd,
+            )
         issue_context_refreshed = False
         parent_issue_context_refreshed = False
         # A caller-provided issue snapshot may predate plan approval. Refresh
@@ -18119,7 +20645,9 @@ def run_pr_loop(
 
         if resumed_round is not None:
             unresolved_items = list(resumed_round.prior_items)
-            pr_compact_prior_summaries = list(resumed_round.compact_prior_summaries)
+            pr_compact_prior_summaries = list(
+                bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
+            )
             latest_coder_output = resumed_round.coder_output
             latest_coder_metadata = resumed_round.coder_metadata
             qualification_checkpoint = resumed_round.qualification_checkpoint
@@ -18421,6 +20949,9 @@ def run_pr_loop(
                 human_requirements
             )
             approved_review_outputs: list[tuple[str, str]] = []
+            # The accepted carrier beside each approved text, keyed by reviewer, so
+            # an acknowledgement repair can pin its assessment and records (#925).
+            accepted_review_carriers: dict[str, ParsedPlanReview | ParsedReview] = {}
             completed_by_name = {
                 record.metadata.agent: record
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
@@ -19141,7 +21672,7 @@ def run_pr_loop(
                             acquisition_outcome=acquisition_outcome,
                             acquisition_returncode=acquisition_returncode,
                             surfaced_reviewer_requirement_ids=surfaced_reviewer_requirement_ids,
-                            **_architecture_metadata_fields(config, impact=parsed.architecture_impact),
+                            **_architecture_metadata_fields(config, result=parsed),
                             approved_plan_hash=(
                                 approved_plan_context.plan_hash
                                 if approved_plan_context is not None
@@ -19239,7 +21770,40 @@ def run_pr_loop(
                 for reviewer in configured_reviewers
             }
 
-            if config.review_parallel and not skip_reviewers_this_round:
+            # One private spool per round, shared by the parallel launcher and
+            # the sequential resume seam (#1025).
+            pr_round_spool = _review_round_spool(
+                config, surface="pr", number=pr_number,
+                round_number=round_number, subject=current_pr_subject,
+            )
+            # Only peers published by the same launch batch count: under
+            # primary-then-panel the panel is meant to see the primary's
+            # earlier review, which carries a different scheduler phase.
+            pr_launch_phase = (
+                scheduler_decision.phase if selective_policy and scheduler_decision is not None else None
+            )
+            # Built from every posted same-round record, including records
+            # resume rejected: their bodies are just as public.
+            pr_same_batch_public_peers = tuple(
+                reviewer for reviewer in configured_reviewers
+                if (record := completed_by_name.get(agent_display_name(reviewer))) is not None
+                and record.metadata.phase == "publication"
+                and record.metadata.scheduler_phase == pr_launch_phase
+            )
+            # A round that holds withheld outcomes began as a parallel round;
+            # finish it through the same withhold-then-publish launcher even
+            # when this run is sequential (#1025).
+            pr_round_parallel = config.review_parallel or pr_round_spool.has_records()
+            if not pr_round_parallel and not skip_reviewers_this_round:
+                _refuse_partial_round_before_sequential_turns(
+                    spool=pr_round_spool,
+                    fresh_turn_reviewers=[
+                        reviewer for reviewer in configured_reviewers
+                        if _pr_reviewer_prelaunch_kind(reviewer) == "turn"
+                    ],
+                    public_peers=pr_same_batch_public_peers,
+                )
+            if pr_round_parallel and not skip_reviewers_this_round:
                 pending_pr_reviewers = [
                     reviewer for reviewer in configured_reviewers
                     if _pr_reviewer_prelaunch_kind(reviewer) == "turn"
@@ -19248,6 +21812,13 @@ def run_pr_loop(
                     launchable_pr_reviewers: list[AgentName] = []
                     for reviewer in pending_pr_reviewers:
                         reviewer_name = agent_display_name(reviewer)
+                        if (
+                            reviewer_name not in completed_by_name
+                            and pr_round_spool.load(reviewer_name) is not None
+                        ):
+                            # A withheld same-round outcome is replayed, not re-run.
+                            launchable_pr_reviewers.append(reviewer)
+                            continue
                         try:
                             sync_reviewer_pr_before_review(config, runner, reviewer, pr_number, pr_metadata)
                         except AgentLoopError as exc:
@@ -19324,6 +21895,18 @@ def run_pr_loop(
                             f"in parallel on PR #{pr_number}",
                         )
 
+                        def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
+                            return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_review_response(
+                                text,
+                                reviewer=reviewer_name,
+                                unresolved_items=prior_unresolved_items,
+                                # Never share the mutable round_new_unresolved_items
+                                # list with concurrent workers (#594): it only
+                                # enriches the UnknownPriorItemDispositionError
+                                # message, so an empty tuple changes no outcome.
+                                current_round_items=(), architecture_status_mode=mode,
+                            ))
+
                         def _pr_reviewer_worker(reviewer: AgentName) -> _ReviewerTurnResult:
                             reviewer_name = agent_display_name(reviewer)
                             try:
@@ -19338,16 +21921,7 @@ def run_pr_loop(
                                         else reviewer_session_ids.get(reviewer)
                                     ),
                                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                                    validate=lambda text, reviewer_name=reviewer_name: _validate_review_response(
-                                        text,
-                                        reviewer=reviewer_name,
-                                        unresolved_items=prior_unresolved_items,
-                                        # Never share the mutable round_new_unresolved_items
-                                        # list with concurrent workers (#594): it only
-                                        # enriches the UnknownPriorItemDispositionError
-                                        # message, so an empty tuple changes no outcome.
-                                        current_round_items=(),
-                                    ),
+                                    **_pr_review_validators(reviewer_name),
                                     usage_context=usage_context,
                                     use_repair=True,
                                     repair_expected_kind="pr_review",
@@ -19369,11 +21943,9 @@ def run_pr_loop(
                                 return _ReviewerTurnResult(reviewer_name=reviewer_name, error=exc)
                             return _ReviewerTurnResult(reviewer_name=reviewer_name, response=response)
 
-                        def _publish_pr_completion(reviewer: AgentName, turn: _ReviewerTurnResult) -> None:
-                            """Publish a completion-order PR review; settlement remains below."""
+                        def _pr_publication_parsed(turn: _ReviewerTurnResult) -> ParsedReview | None:
                             if turn.error is not None or turn.response is None:
-                                return
-                            reviewer_name = agent_display_name(reviewer)
+                                return None
                             parsed = turn.response.marker_value
                             assert isinstance(parsed, ParsedReview)
                             parsed = dataclasses_replace(
@@ -19394,8 +21966,35 @@ def run_pr_loop(
                                     pr_checks=shared_reviewer_pr_checks,
                                     current_head_sha=current_pr_subject,
                                 )
-                            if _is_incomplete_pr_review(parsed):
-                                return
+                            return parsed
+
+                        def _pr_failure_is_fatal(error: AgentLoopError) -> bool:
+                            # Mirrors the settlement below: fatal failures stop the
+                            # round and are re-invoked by a rerun; others settle
+                            # the reviewer as unavailable for this round.
+                            return len(configured_reviewers) == 1 or getattr(
+                                error, "failure_category", None
+                            ) in {None, "deterministic"}
+
+                        def _pr_retry_bound(reviewer: AgentName, turn: _ReviewerTurnResult) -> AgentLoopError | None:
+                            if turn.error is not None:
+                                return turn.error if _pr_failure_is_fatal(turn.error) else None
+                            parsed = _pr_publication_parsed(turn)
+                            if (
+                                parsed is not None
+                                and _is_incomplete_pr_review(parsed)
+                                and len(configured_reviewers) == 1
+                            ):
+                                return _incomplete_pr_review_error(agent_display_name(reviewer))
+                            return None
+
+                        def _publish_pr_completion(reviewer: AgentName, turn: _ReviewerTurnResult) -> bool:
+                            """Publish a PR review after the round's workers return; settlement remains below."""
+                            parsed = _pr_publication_parsed(turn)
+                            if parsed is None or _is_incomplete_pr_review(parsed):
+                                return False
+                            assert turn.response is not None
+                            reviewer_name = agent_display_name(reviewer)
                             _post_pr_reviewer_comment(
                                 reviewer_name, parsed, review_output=turn.response.text,
                                 model_used=turn.response.model_used,
@@ -19405,6 +22004,7 @@ def run_pr_loop(
                                 phase="publication",
                             )
                             early_published_pr_reviewers.add(reviewer)
+                            return True
 
                         pr_turn_results = _launch_reviewer_turns(
                             runner,
@@ -19412,6 +22012,31 @@ def run_pr_loop(
                             thread_name_prefix=f"pr-review-r{round_number}",
                             run_turn=_pr_reviewer_worker,
                             on_completion=_publish_pr_completion,
+                            spool=pr_round_spool,
+                            replay_turn=lambda reviewer, fields: _replay_spooled_review(
+                                runner, config=config, reviewer=reviewer, fields=fields,
+                                validators=_pr_review_validators(agent_display_name(reviewer)),
+                            ),
+                            public_peers=pr_same_batch_public_peers,
+                            retry_bound=_pr_retry_bound,
+                            max_workers=None if config.review_parallel else 1,
+                            # A spooled reviewer skipped the pre-review sync
+                            # above; sync it if its replay falls back to a turn.
+                            prepare_fallback=lambda reviewer: sync_reviewer_pr_before_review(
+                                config, runner, reviewer, pr_number, pr_metadata
+                            ),
+                            already_posted=tuple(
+                                reviewer for reviewer in configured_reviewers
+                                if agent_display_name(reviewer) in completed_by_name
+                            ),
+                            prelaunch_failures={
+                                reviewer: _ReviewerTurnResult(
+                                    reviewer_name=agent_display_name(reviewer), error=error
+                                )
+                                for reviewer, error in pr_prep_failures.items()
+                            },
+                            configured_order=configured_reviewers,
+                            config=config,
                         )
                     else:
                         log(
@@ -19450,12 +22075,16 @@ def run_pr_loop(
                     review_acquisition_outcome = resumed_record.metadata.acquisition_outcome
                     review_acquisition_returncode = resumed_record.metadata.acquisition_returncode
                     structured_review = (
-                        parse_structured_pr_review(review_output, reviewer=reviewer_name)
+                        parse_structured_pr_review(review_output, reviewer=reviewer_name, architecture_status_mode="legacy")
                         if canonical_review_output is not None
                         else None
                     )
                     reparsed_review = structured_review or parse_review(
                         review_output, reviewer=reviewer_name
+                    )
+                    resumed_impact, resumed_records = _resumed_review_architecture(
+                        resumed_record.metadata,
+                        structured_review.architecture_impact if structured_review is not None else None,
                     )
                     parsed_review = ParsedReview(
                         state=resumed_record.metadata.state or parse_agent_state(review_output),
@@ -19463,6 +22092,8 @@ def run_pr_loop(
                         blocking_items=reparsed_review.blocking_items,
                         followups=reparsed_review.followups,
                         dispositions=resumed_record.metadata.dispositions,
+                        architecture_impact=resumed_impact,
+                        architecture_impact_degradations=resumed_records,
                     )
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)
@@ -19501,7 +22132,7 @@ def run_pr_loop(
                         f"Round {round_number}: skipping {reviewer_name}; it approved unchanged "
                         f"PR head {current_pr_subject} in round {prior_approval.metadata.round_number}",
                     )
-                elif config.review_parallel:
+                elif pr_round_parallel:
                     review_failure: AgentInvocationError | AgentLoopError | None = (
                         pr_prep_failures.get(reviewer)
                     )
@@ -19566,8 +22197,22 @@ def run_pr_loop(
                         if use_compact_pr_context
                         else None
                     )
+                    sequential_pr_validators = _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name, items=prior_unresolved_items: _validate_review_response(
+                        text,
+                        reviewer=reviewer_name,
+                        unresolved_items=items,
+                        current_round_items=round_new_unresolved_items, architecture_status_mode=mode,
+                    ))
                     review_response, review_failure = _capture_agent_invocation(
-                        lambda: _run_validated_agent(
+                        lambda: _same_round_replay_or_invoke(
+                            runner,
+                            config=config,
+                            reviewer=reviewer,
+                            spool=pr_round_spool,
+                            public_peers=pr_same_batch_public_peers,
+                            validators=sequential_pr_validators,
+                            already_posted=reviewer_name in completed_by_name,
+                            invoke=lambda: _run_validated_agent(
                             runner,
                             agent=reviewer,
                             config=config,
@@ -19606,12 +22251,7 @@ def run_pr_loop(
                                 else reviewer_session_ids.get(reviewer)
                             ),
                             marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                            validate=lambda text, reviewer_name=reviewer_name, items=prior_unresolved_items: _validate_review_response(
-                                text,
-                                reviewer=reviewer_name,
-                                unresolved_items=items,
-                                current_round_items=round_new_unresolved_items,
-                            ),
+                            **sequential_pr_validators,
                             usage_context=usage_context,
                             use_repair=True,
                             repair_expected_kind="pr_review",
@@ -19626,6 +22266,7 @@ def run_pr_loop(
                             repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
                             operation_description="PR review",
+                            ),
                         )
                     )
                     if review_failure is not None:
@@ -19720,13 +22361,8 @@ def run_pr_loop(
 
                 if _is_incomplete_pr_review(parsed_review):
                     if len(configured_reviewers) == 1:
-                        incomplete_pr_review_error = AgentLoopError(
-                            f"{reviewer_name} did not complete PR review and reported no actionable "
-                            "blocking items or Same-PR follow-ups. This is a reviewer-internal error; "
-                            "agent-loop stopped before a coder follow-up. Rerun or switch the reviewer/model "
-                            "after resolving the reviewer environment."
-                        )
-                        if config.review_parallel:
+                        incomplete_pr_review_error = _incomplete_pr_review_error(reviewer_name)
+                        if pr_round_parallel:
                             pr_fatal_errors.append((reviewer_name, incomplete_pr_review_error))
                             continue
                         raise incomplete_pr_review_error
@@ -19843,6 +22479,7 @@ def run_pr_loop(
                     continue
 
                 approved_review_outputs.append((reviewer_name, review_output))
+                accepted_review_carriers[reviewer_name] = parsed_review
                 if (
                     (resumed_record is None or resumed_record.metadata.phase == "publication")
                     and carried_approval_record is None
@@ -19872,8 +22509,12 @@ def run_pr_loop(
                     if resumed_record is not None:
                         round_new_unresolved_items.extend(reviewer_new_unresolved_items)
 
+            if not pr_fatal_errors and not skip_reviewers_this_round:
+                # Every same-round outcome is now published; a sequential
+                # resume that replayed withheld reviews no longer needs them.
+                pr_round_spool.discard()
             if (
-                (config.review_parallel or selective_policy)
+                (pr_round_parallel or selective_policy)
                 and not skip_reviewers_this_round
                 and not (current_resume is not None and current_resume.reconciled)
             ):
@@ -19960,11 +22601,16 @@ def run_pr_loop(
                         else "aggregate"
                     ),
                 )
-                pr_compact_prior_summaries.extend(
-                    _collect_prior_compact_summaries(
-                        prior_unresolved_items,
-                        unresolved_items,
-                        prior_dispositions,
+                pr_compact_prior_summaries = list(
+                    bound_compact_prior_summaries(
+                        [
+                            *pr_compact_prior_summaries,
+                            *_collect_prior_compact_summaries(
+                                prior_unresolved_items,
+                                unresolved_items,
+                                prior_dispositions,
+                            ),
+                        ]
                     )
                 )
             else:
@@ -20126,7 +22772,7 @@ def run_pr_loop(
                                     candidate,
                                     reviewer=reviewer_name,
                                     unresolved_items=prior_unresolved_items,
-                                    current_round_items=round_new_unresolved_items,
+                                    current_round_items=round_new_unresolved_items, architecture_status_mode="strict",
                                 ),
                                 repair_kwargs={
                                     "expected_kind": "pr_review",
@@ -20135,6 +22781,15 @@ def run_pr_loop(
                                         item.item_id for item in prior_unresolved_items
                                     ),
                                 },
+                                forbid_architecture_impact=_acknowledgement_repair_forbids_assessment(
+                                    review_output
+                                ),
+                            )
+                            repaired_validated = _pin_acknowledgement_repair(
+                                accepted_review_carriers.get(reviewer_name),
+                                repaired_validated,
+                                config=config,
+                                reviewer_name=reviewer_name,
                             )
                             _log_repair_attempts(
                                 config, f"Round {round_number}: {reviewer_name}", repair_attempts
@@ -20479,6 +23134,10 @@ def run_pr_loop(
                         unresolved_items = _clear_machine_obligations(
                             unresolved_items, kind="github-pr-checks"
                         )
+                        _record_staged_parent_completion_after_merge(
+                            runner, config=config, issue_context=issue_context,
+                            pr_number=pr_number,
+                        )
                     return 0
                 if (
                     not must_fix_items
@@ -20666,7 +23325,9 @@ def run_pr_loop(
                         # source-specific proof predicate used by the review-only
                         # snapshot path before clearing or merging.
                         if not _ordinary_checks_snapshot_is_authoritative(
-                            watch_outcome.pr_checks
+                            watch_outcome.pr_checks,
+                            watch_outcome.mergeability,
+                            head_sha=watch_outcome.head_sha,
                         ):
                             details = (
                                 _pr_check_details(watch_outcome.pr_checks)
@@ -20714,6 +23375,10 @@ def run_pr_loop(
                             print(
                                 f"PR #{pr_number} merged after CI watch completed."
                                 + announce_reduced_board_completion()
+                            )
+                            _record_staged_parent_completion_after_merge(
+                                runner, config=config, issue_context=issue_context,
+                                pr_number=pr_number,
                             )
                         else:
                             print(
@@ -20788,6 +23453,34 @@ def run_pr_loop(
                             usage_context=usage_context,
                             details=details,
                             reason="timeout",
+                        )
+                    if watch_outcome.status == "protection_unreadable":
+                        details = (
+                            _pr_check_details(watch_outcome.pr_checks)
+                            if watch_outcome.pr_checks
+                            else ["No reliable check snapshot was available."]
+                        )
+                        merge_state = (
+                            watch_outcome.mergeability.merge_state_raw
+                            if watch_outcome.mergeability is not None
+                            else None
+                        )
+                        details.append(
+                            f"GitHub merge state for the current head: {merge_state or 'unavailable'} "
+                            "(CLEAN is required when branch protection is unreadable)."
+                        )
+                        return _stop_after_ci_watch_timeout(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            round_number=round_number,
+                            head_sha=pr_metadata.head_sha,
+                            pr_comments=pr_comments,
+                            followups=future_followups,
+                            source_context=followup_source_context,
+                            usage_context=usage_context,
+                            details=details,
+                            reason="protection_unreadable",
                         )
                     if watch_outcome.status == "head_changed":
                         log(config, f"PR #{pr_number} head changed while watching; re-review is required")
@@ -20956,11 +23649,17 @@ def run_pr_loop(
                     elif (
                         not managed_ci_active(pr_metadata)
                         and not ordinary_recovery_selected
-                        and _ordinary_checks_snapshot_is_authoritative(pr_checks)
                         and any(
                             _is_machine_obligation(item)
                             and item.obligation_kind == "github-pr-checks"
                             for item in unresolved_items
+                        )
+                        and _ordinary_checks_snapshot_is_authoritative(
+                            pr_checks,
+                            _mergeability_for_unreadable_protection(
+                                runner, config=config, pr_number=pr_number, checks=pr_checks,
+                            ),
+                            head_sha=pr_metadata.head_sha,
                         )
                     ):
                         # In review-only mode the foreground watcher is
@@ -21213,6 +23912,10 @@ def run_pr_loop(
                                     unresolved_items = _clear_machine_obligations(
                                         unresolved_items, kind="github-pr-checks"
                                     )
+                                    _record_staged_parent_completion_after_merge(
+                                        runner, config=config, issue_context=issue_context,
+                                        pr_number=pr_number,
+                                    )
                                 return 0
                             managed_outcome = wait_for_final_qualification(
                                 runner,
@@ -21320,6 +24023,10 @@ def run_pr_loop(
                                         f"{format_agent_list(configured_reviewers)}."
                                         + announce_reduced_board_completion()
                                     )
+                                    _record_staged_parent_completion_after_merge(
+                                        runner, config=config, issue_context=issue_context,
+                                        pr_number=pr_number,
+                                    )
                                 else:
                                     qualified_head = publish_manual_v2_qualification(
                                         runner,
@@ -21344,6 +24051,7 @@ def run_pr_loop(
                                         f"Qualified head: {qualified_head}. Run `{merge_command}` after "
                                         f"confirming the live head.{risk}"
                                         + announce_reduced_board_completion()
+                                        + approved_pr_reopen_hint(pr_number)
                                     )
                                 return 0
                             if managed_outcome.status == "head_changed":
@@ -21496,6 +24204,10 @@ def run_pr_loop(
                                 unresolved_items = _clear_machine_obligations(
                                     unresolved_items, kind="github-pr-checks"
                                 )
+                                _record_staged_parent_completion_after_merge(
+                                    runner, config=config, issue_context=issue_context,
+                                    pr_number=pr_number,
+                                )
                             return 0
                         elif config.auto_merge:
                             raise AgentLoopError(
@@ -21519,6 +24231,7 @@ def run_pr_loop(
                         print(
                             f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}."
                             + announce_reduced_board_completion()
+                            + approved_pr_reopen_hint(pr_number)
                         )
                         return 0
             if round_number == allowed_rounds:
@@ -21645,6 +24358,21 @@ def run_pr_loop(
                 + "\n\n".join(reviewer_summaries.values()) + "\n\n"
                 if reviewer_summaries else ""
             )
+            if current_resume is not None and current_resume.unrecorded_head_advance:
+                # The external head may or may not contain the fixes; the
+                # coder must check each recovered item against it (#1034).
+                summary_context = (
+                    f"Recovery context: the PR head `{pr_metadata.head_sha or 'unknown'}` was "
+                    "advanced by a commit that carries no coder metadata (for example a manual "
+                    "push). That commit may or may not satisfy the recovered items below. Check "
+                    "each recovered item against the current head. List an item in "
+                    "addressed_items only after confirming the current head satisfies it; keep "
+                    "any unsatisfied item in remaining_items and fix it with a commit if "
+                    "possible. Your notes must describe what the current head actually "
+                    "contains, not restate the reviewer's suggestion or assume the external "
+                    "commit's intent.\n\n"
+                    + summary_context
+                )
             if has_merge_conflict_item:
                 other_items = [
                     item for item in unresolved_items if item.item_id != MERGE_CONFLICT_ITEM_ID
@@ -21706,7 +24434,7 @@ def run_pr_loop(
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
                 )
-                log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
+                _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             else:
                 coder_followup_items = select_coder_followup_items(unresolved_items)
                 combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items)
@@ -21725,7 +24453,7 @@ def run_pr_loop(
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
                 )
-                log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
+                _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             repair_unresolved_item_ids = tuple(
                 item.item_id for item in coder_followup_items
             )
@@ -21778,7 +24506,8 @@ def run_pr_loop(
                 prompt=followup_prompt,
                 session_id=coder_session_id,
                 marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                validate=lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements: _validate_coder_followup_response(
+                require_architecture_impact_contract=True,
+                **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements: _validate_coder_followup_response(
                     text,
                     unresolved_items=items,
                     human_requirements=human_requirements,
@@ -21805,8 +24534,8 @@ def run_pr_loop(
                         approved_plan_context.risk_test_matrix_expected_row_ids
                         if approved_plan_context is not None and approved_plan_context.matrix_available
                         else None
-                    ),
-                ),
+                    ), architecture_status_mode=mode,
+                )),
                 usage_context=usage_context,
                 role="coder",
                 use_repair=True,
@@ -21938,6 +24667,19 @@ def run_pr_loop(
                     latest_coder_metadata,
                     coder_record_round,
                 )
+            # The head this follow-up was dispatched against; persisted so the
+            # head-unchanged framing below survives resume (#1034).
+            followup_dispatch_head = (
+                pr_metadata.head_sha
+                if _is_followup_dispatch_head(pr_metadata.head_sha)
+                else None
+            )
+            head_unchanged_sha = (
+                followup_dispatch_head
+                if followup_dispatch_head is not None
+                and updated_pr_context.metadata.head_sha == followup_dispatch_head
+                else None
+            )
             if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                 public_comment = render_public_agent_comment(
                     kind="coder_followup",
@@ -21949,6 +24691,11 @@ def run_pr_loop(
                     local_test_evidence=local_test_evidence,
                     current_test_turn_id=coder_response.acquisition_test_turn_id,
                     matrix_evidence_render_decision=matrix_evidence_render_decision,
+                    head_unchanged_sha=head_unchanged_sha,
+                )
+            elif head_unchanged_sha is not None:
+                public_comment = add_coder_followup_head_unchanged_notice(
+                    public_comment, head_unchanged_sha
                 )
 
             qualification_checkpoint = _machine_obligation_checkpoint(
@@ -22047,8 +24794,10 @@ def run_pr_loop(
                 scheduler_active_owners=(scheduler_decision.active_owners if selective_policy and scheduler_decision is not None else ()),
                 scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                 qualification_checkpoint=qualification_checkpoint,
+                followup_dispatch_head=followup_dispatch_head,
+                **_test_observation_degradation_fields(coder_response.marker_value),
                 **_architecture_metadata_fields(
-                    config, impact=getattr(coder_response.marker_value, "architecture_impact", None)
+                    config, result=coder_response.marker_value
                 ),
             )
             post_pr_comment(
@@ -22114,7 +24863,16 @@ def run_pr_loop(
                     "review of the same diff cannot change the verdict. Stopping before round "
                     f"{round_number + 1}; human review required.{route}"
                 )
-            log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")
+            log(
+                config,
+                _coder_followup_head_log(
+                    round_number,
+                    coder_name,
+                    previous_head,
+                    updated_pr_context.metadata.head_sha,
+                    unchanged_head_coder_turns,
+                ),
+            )
             pre_review_test_pending = True
             if external_recovery_full_board:
                 # The recovered external head was not reviewed by this run;
@@ -22522,7 +25280,8 @@ def _build_discuss_agenda_support_corpus(
     add(issue_context.title, phrase_support=True)
     add(issue_context.body, phrase_support=True)
     for comment in issue_context.comments:
-        add(comment.author)
+        # Token parity across transports: REST spells app logins with `[bot]`.
+        add(strip_bot_login_suffix(comment.author))
         add(comment.created_at)
         add(comment.body, phrase_support=True)
     for reviewer in configured_reviewers:

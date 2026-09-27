@@ -379,11 +379,12 @@ def test_cli_help_documents_ci_queued_grace_seconds():
 
 
 def test_architecture_states_cross_row_selector_reuse_policy():
-    # #865: only repetition within one row is fatal; cross-row reuse is valid.
+    # #865: cross-row reuse is valid; #927: repetition within one claim drops
+    # that claim instead of rejecting the response.
     text = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
     assert "duplicate admissible selectors" not in text
     assert "One admissible selector may be cited by several rows" in text
-    assert "an admissible selector repeated within one row" in text
+    assert "an admissible selector repeated within one claim" in text
 
 
 def test_docs_list_tool_owned_machine_readable_record_types():
@@ -485,9 +486,14 @@ def test_docs_describe_conflict_round_continuity_exception():
     assert "tool-owned merge-conflict obligation" in arch_text
     assert "outside the coder's classifiable item namespace" in arch_text
     assert "resume reauthenticates the same shape" in arch_text
-    assert "merge-conflict resolution round is the single exception" in doc_text
+    assert "Two reviewer-less rounds are the only exceptions" in doc_text
     assert "tool-owned merge-conflict obligation instead of a review pair" in doc_text
+    # #1024: the exact-head CI repair round is the second reviewer-less transition.
+    assert "exact-head CI repair round (#1024) is the second such transition" in arch_text
+    assert "An exact-head CI repair round is the second exception" in doc_text
+    assert "tool-minted CI obligation instead of a review pair" in doc_text
     for text in (arch_text, doc_text):
+        assert "awaiting_current_head_review" in text
         assert "still fails closed" in text
         assert "approve the exact final head before qualification or merge" in text
 
@@ -547,7 +553,8 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     assert "never recover class D" in text
     # Carried approvals and the exclusions.
     assert "HUMAN_REQUIREMENTS_RESOLVED" in text
-    assert "Discussion-mode scheduling and the child-planning cycle always invoke the full" in text
+    assert "Discussion-mode scheduling always invokes the full board" in text
+    assert "A child-planning cycle inherits the operator's `--plan-review-policy`" in text
 
 
 def test_docs_document_the_flow_aware_planning_policy_evaluation():
@@ -613,3 +620,131 @@ def test_docs_document_the_review_contract_dimension_and_freezing_procedure():
         assert "review_contract_runs.json" in document
     assert "no per-flow or cross-policy contract rollup" in architecture
     assert "never pooled across policies" in readme
+
+
+def _readme_sandboxed_example() -> list[str]:
+    import shlex
+
+    text = README.read_text(encoding="utf-8")
+    section = text.split("### Running where GitHub GraphQL is refused", 1)[1].split("\n### ", 1)[0]
+    blocks = re.findall(r"```bash\n(.*?)```", section, re.S)
+    examples = [block for block in blocks if "--agent-permissions sandboxed" in block]
+    assert len(examples) == 1
+    return shlex.split(examples[0].replace("\\\n", " "))
+
+
+def test_readme_sandboxed_example_passes_sandboxed_validation(tmp_path):
+    from coding_review_agent_loop import agent_permissions
+    from coding_review_agent_loop.config import config_from_args
+
+    from agent_loop_helpers import FakeRunner
+
+    tokens = _readme_sandboxed_example()
+    assert tokens[0] == "agent-loop"
+    args = build_parser().parse_args([
+        *tokens[1:],
+        "--claude-dir", str(tmp_path / "claude"),
+        "--codex-dir", str(tmp_path / "codex"),
+        "--subprocess-log-dir", str(tmp_path / "logs"),
+        "--dry-run",
+    ])
+    config = config_from_args(args, FakeRunner())
+    config = type(config)(**{**config.__dict__, "plan_execution_mode": args.plan_execution_mode})
+    assert config.agent_permissions == "sandboxed"
+    assert config.repair_backend == "claude" and config.repair_models == ("MODEL",)
+    assert config.semantic_followup_backend == "claude"
+    agent_permissions.validate_sandboxed_selections(config)
+    agent_permissions.validate_sandboxed_flow(config, command=args.command, plan_first=args.plan_first)
+
+
+def test_readme_sandboxed_step_documents_requirements_and_limits():
+    text = README.read_text(encoding="utf-8")
+    step = text.split("**6. Give each agent only the access its role needs.**", 1)[1].split(
+        "**These settings do not persist.**", 1
+    )[0]
+    for phrase in (
+        "--no-semantic-followup-dedupe",
+        "default repair backend\n(`antigravity`)",
+        "Install agent-loop outside the agent checkouts",
+        "`git` and `gh` found first on `PATH` must also live outside every\n  checkout",
+        "`TMPDIR` must resolve outside every checkout",
+        "Pass-through agent arguments are rejected",
+        "A committing Codex coder is rejected",
+        "Codex non-coders have no network",
+        "closed environment\n  allowlist",
+        "refuses to run when the checkout's\n  local, worktree, or included config has a key outside its allowlist",
+        "same OS user",
+        "`agy --sandbox` restricts only its terminal",
+        "trade of review depth for\n  containment",
+    ):
+        assert phrase in step, phrase
+    assert "need\n`--dangerous-agent-permissions`" not in step
+    assert "therefore need" not in step
+    reference = text.split("### Sandboxed role permissions", 1)[1].split("\n### ", 1)[0]
+    for phrase in ("GIT_CONFIG_GLOBAL=/dev/null", "%G", "remote.<name>.{url,pushurl,fetch,gh-resolved}", "--git=", "--gh="):
+        assert phrase in reference, phrase
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    for phrase in ("agent_permissions.py", "inspect_tool.py", "same OS user", "no network"):
+        assert phrase in architecture, phrase
+
+
+def test_cli_help_documents_agent_permissions_and_inspect():
+    parser = build_parser()
+    # argparse may wrap inside hyphenated words, so compare without whitespace.
+    help_text = "".join(parser._subparsers._group_actions[0].choices["pr"].format_help().split())
+    assert "--agent-permissions{default,sandboxed,dangerous}" in help_text
+    assert "Aliasfor--agent-permissionsdangerous" in help_text
+    assert "exactresolvedtestinvocation" in help_text
+    top = " ".join(parser.format_help().split())
+    assert "inspect" in top and "Hardened read-only git/gh runner" in top
+
+
+def test_cli_help_and_docs_name_the_approved_pr_signed_requirement_path():
+    # #1020: an operator with new instructions for an approved PR must be able
+    # to find the signed-requirement path from the CLI and docs.
+    parser = build_parser()
+    # argparse may wrap inside hyphenated words, so compare without whitespace.
+    pr_help = "".join(parser._subparsers._group_actions[0].choices["pr"].format_help().split())
+    assert "alreadyapprovedatitshead" in pr_help
+    assert "linecontainingexactly`--HumanReviewer`" in pr_help
+    assert "Unsignedcommentsarenotreadasrequirements" in pr_help
+    top = "".join(parser.format_help().split())
+    assert "`--HumanReviewer`" in top and "agent-looppr--help" in top
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    assert "**already approved at its head**" in readme
+    assert "a plain PR comment is not read as a requirement" in readme
+    assert "the relay must be disclosed in the comment" in readme
+    docs = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
+    assert "**Adding instructions to an approved PR.**" in docs
+    assert "those approvals no longer count and each reviewer is re-invoked at the same head" in docs
+    assert "the comment must disclose the relay" in docs
+
+
+def test_docs_document_the_plan_growth_gate():
+    readme = README.read_text(encoding="utf-8")
+    for flag in (
+        "--plan-growth-gate",
+        "--plan-growth-max-chars",
+        "--plan-growth-max-scope-items",
+        "--plan-growth-max-matrix-rows",
+        "--plan-growth-max-revisions",
+    ):
+        assert flag in readme, flag
+    assert "this detail belongs in a child plan; restructure as\nstaged" in readme
+    docs = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    section = docs.split("### Plan-growth gate", 1)[1].split("\n### ", 1)[0]
+    for phrase in (
+        "`rendered-size`",
+        "`scope-items`",
+        "`matrix-rows`",
+        "`revision-count`",
+        "`one_shot_growth_justification`",
+        "not a transport check",
+        "reviewer finding counts are never a\nsignal",
+        "restructure as staged",
+        "`requires-child-planning` children",
+        "This rule applies even with the gate off.",
+        "Rebind advisory.",
+        "a managed-CI\ncycle per child",
+    ):
+        assert phrase in section, phrase

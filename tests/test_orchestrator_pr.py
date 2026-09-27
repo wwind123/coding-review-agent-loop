@@ -4731,6 +4731,267 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
     assert merges == [{"expected_head_sha": "abc123-coder-1"}]
 
 
+def _spy_coder_followup_dispatch(monkeypatch):
+    """Record the item set each real coder dispatch labels, then log it (#1024)."""
+    dispatched = []
+    real = orchestrator._log_coder_followup_dispatch
+
+    def spy(config, round_number, coder_name, coder_followup_items):
+        dispatched.append((round_number, tuple(coder_followup_items)))
+        return real(config, round_number, coder_name, coder_followup_items)
+
+    monkeypatch.setattr(orchestrator, "_log_coder_followup_dispatch", spy)
+    return dispatched
+
+
+def _round_label_lines(err):
+    return [
+        line.split("] ", 1)[-1] for line in err.splitlines()
+        if "addressing reviewer feedback" in line or "repairing failed CI" in line
+    ]
+
+
+def test_run_pr_loop_labels_reviewer_and_acknowledgement_rounds_as_reviewer_feedback(
+    tmp_path, monkeypatch, capsys,
+):
+    """Round 1 is reviewer-driven; round 2 is the acknowledgement re-injection."""
+    requirement = HumanReviewRequirement(
+        source_type="PR comment", author="maintainer", created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the audit trail.",
+    )
+    ack_markdown = (
+        "Implemented the fix.\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n- Requirement 1: kept the audit trail.\n"
+        "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Fix.", blocking_items=["Fix the bug."],
+                human_requirements_resolved=True,
+            ),
+            # Approves without the acknowledgement, so the run re-injects it.
+            structured_pr_review(
+                state="approved", summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+            structured_pr_review(
+                state="approved", summary="Acknowledged.", human_requirements_resolved=True,
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[ack_markdown, ack_markdown],
+    )
+    metadata = PullRequestMetadata(
+        number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
+        base_branch="main", head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_pr_review_context",
+        lambda *_a, **_k: PullRequestReviewContext(
+            metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
+            comments=(), human_requirements=(requirement,),
+        ),
+    )
+    dispatched = _spy_coder_followup_dispatch(monkeypatch)
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3, quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert [round_number for round_number, _items in dispatched] == [1, 2]
+    for _round_number, items in dispatched:
+        assert items and not any(item.is_machine_obligation for item in items)
+    assert [item.item_id for item in dispatched[1][1]] == ["item-2"]
+    err = capsys.readouterr().err
+    assert "re-injecting as blocking item" in err
+    assert _round_label_lines(err) == [
+        "Round 1: Claude addressing reviewer feedback",
+        "Round 2: Claude addressing reviewer feedback",
+    ]
+
+
+class _AcknowledgementDispatchReached(Exception):
+    """Stop right after the acknowledgement-only coder dispatch is labelled."""
+
+
+def test_run_pr_loop_labels_an_acknowledgement_only_round_as_reviewer_feedback(
+    tmp_path, monkeypatch, capsys,
+):
+    """The dedicated acknowledgement obligation alone selects an empty coder set.
+
+    A signed requirement that appears after the coder's last acknowledgement
+    mints the acknowledgement obligation; once the reviewer resolves every
+    other item and keeps only that obligation blocking, the next coder
+    dispatch carries it alone and must not be labelled a CI repair (#1024).
+    """
+    ack_item_id = HUMAN_REQUIREMENTS_ACK_ITEM_ID
+    first = HumanReviewRequirement(
+        source_type="PR comment", author="maintainer", created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the audit trail.",
+    )
+    second = HumanReviewRequirement(
+        source_type="PR comment", author="maintainer", created_at="2026-05-18T11:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-2",
+        body="Also log every audit write.",
+    )
+    ack_markdown = (
+        "Implemented the fix.\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n- Requirement 1: kept the audit trail.\n"
+        "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    note = (
+        "src/audit.py still lacks the acknowledged logging requirement; acknowledge "
+        "requirement 2 and add tests/test_audit.py coverage for the audit log."
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Fix.", blocking_items=["Fix the bug."],
+                human_requirements_resolved=True,
+            ),
+            # Approves without the acknowledgement: the run re-injects it as item-2.
+            structured_pr_review(
+                state="approved", summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+            # Resolves item-2 and keeps only the acknowledgement obligation open.
+            structured_pr_review(
+                state="blocking", summary="The new requirement is unacknowledged.",
+                prior_item_dispositions=[
+                    {"item_id": "item-2", "disposition": "resolved"},
+                    {"item_id": ack_item_id, "disposition": "blocking", "note": note},
+                ],
+            ),
+        ],
+        claude_outputs=[ack_markdown, ack_markdown],
+    )
+    metadata = PullRequestMetadata(
+        number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
+        base_branch="main", head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+    )
+    fetches = []
+
+    def review_context(*_args, **_kwargs):
+        fetches.append(True)
+        # The second signed requirement arrives after the first coder turn.
+        requirements = (first,) if len(fetches) <= 2 else (first, second)
+        return PullRequestReviewContext(
+            metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
+            comments=(), human_requirements=requirements,
+        )
+
+    monkeypatch.setattr(orchestrator, "get_pr_review_context", review_context)
+    selections = []
+    real_select = orchestrator.select_coder_followup_items
+
+    def select(items):
+        selected = real_select(items)
+        selections.append(([item.item_id for item in items], selected))
+        return selected
+
+    monkeypatch.setattr(orchestrator, "select_coder_followup_items", select)
+    dispatched = []
+    real_log = orchestrator._log_coder_followup_dispatch
+
+    def log_dispatch(config, round_number, coder_name, coder_followup_items):
+        dispatched.append((round_number, tuple(coder_followup_items)))
+        real_log(config, round_number, coder_name, coder_followup_items)
+        if round_number == 3:
+            raise _AcknowledgementDispatchReached
+
+    monkeypatch.setattr(orchestrator, "_log_coder_followup_dispatch", log_dispatch)
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=4, quiet=False)
+
+    with pytest.raises(_AcknowledgementDispatchReached):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    # Round 3's real dispatch carried only the acknowledgement obligation,
+    # which selects an empty classifiable follow-up set.
+    assert selections[-1] == ([ack_item_id], ())
+    assert dispatched[-1] == (3, ())
+    labels = _round_label_lines(capsys.readouterr().err)
+    assert labels[-1] == "Round 3: Claude addressing reviewer feedback"
+    assert not any("repairing failed CI" in label for label in labels)
+
+
+def test_run_pr_loop_labels_a_mixed_reviewer_and_ci_round_as_reviewer_feedback(
+    tmp_path, monkeypatch, capsys,
+):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Fix the application bug.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Both fixes verified."
+            + prior_item_dispositions("[item-1] resolved", "[item-2] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=["Fixed the application and CI.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+    )
+    failed = PullRequestCheck(name="test", kind="check_run", status="failure", url="https://example.test/555")
+    snapshots = iter([
+        _watch_check_board("pending"),
+        _watch_check_board("failing", failing=(failed,)),
+        _watch_check_board("passing"),
+        _watch_check_board("passing"),
+    ])
+    monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: next(snapshots))
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    dispatched = _spy_coder_followup_dispatch(monkeypatch)
+
+    assert run_pr_loop(
+        runner, pr_number=77,
+        config=make_config(tmp_path, watch_pending_ci=True, quiet=False),
+    ) == 0
+
+    ((round_number, items),) = dispatched
+    assert round_number == 1
+    kinds = sorted(item.obligation_kind or "reviewer" for item in items)
+    assert kinds == ["github-pr-checks", "reviewer"]
+    assert _round_label_lines(capsys.readouterr().err) == [
+        "Round 1: Claude addressing reviewer feedback"
+    ]
+
+
+def test_ci_repair_log_label_requires_a_nonempty_ci_only_followup_set(tmp_path, capsys):
+    config = make_config(tmp_path, quiet=False)
+    ci_item = UnresolvedReviewItem(
+        item_id="item-1", reviewer="GitHub managed exact-head CI", source_round=1,
+        text="Managed CI failed.", status="blocking", authority="machine",
+        obligation_kind="managed-exact-head-ci", lifecycle="repair_required",
+        failed_head_sha="abc123",
+    )
+    reviewer_item = UnresolvedReviewItem(
+        item_id="item-2", reviewer="Codex", source_round=1, text="Fix it.", status="blocking",
+    )
+    ack_item = UnresolvedReviewItem(
+        item_id=orchestrator.HUMAN_REQUIREMENTS_ACK_ITEM_ID, reviewer="Orchestrator",
+        source_round=1, text="Acknowledge.", status="blocking", authority="machine",
+        obligation_kind="human-requirements-acknowledgement", lifecycle="repair_required",
+    )
+    cases = {
+        "ci-only": (ci_item,),
+        "acknowledgement-only": (ack_item,),
+        "mixed": (ci_item, reviewer_item),
+        "reviewer-only": (reviewer_item,),
+    }
+    labels = {}
+    for name, items in cases.items():
+        orchestrator._log_coder_followup_dispatch(
+            config, 4, "Claude", orchestrator.select_coder_followup_items(items)
+        )
+        labels[name] = capsys.readouterr().err
+
+    assert "Round 4: Claude repairing failed CI" in labels["ci-only"]
+    for name in ("acknowledgement-only", "mixed", "reviewer-only"):
+        assert "Round 4: Claude addressing reviewer feedback" in labels[name]
+        assert "repairing failed CI" not in labels[name]
+
+
 def test_managed_qualification_resume_attaches_without_redispatch(
     tmp_path, monkeypatch
 ):
@@ -4987,7 +5248,9 @@ def test_managed_manual_success_publishes_result_without_merge_even_with_pending
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert published == ["abc123"]
-    assert "approved and qualified; manual merge required" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "approved and qualified; manual merge required" in out
+    assert "line containing exactly `-- Human Reviewer`, then rerun `agent-loop pr 77`" in out
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
@@ -6386,6 +6649,92 @@ def test_pr_loop_auto_merge_stall_plus_partial_query_keeps_waiting(tmp_path):
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
 
 
+def _forbidden_protection_runner(merge_state):
+    return FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="LGTM.")],
+        pr_payload={"mergeable": "MERGEABLE", "mergeStateStatus": merge_state},
+        pr_check_runs_payload={
+            "check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]
+        },
+        pr_status_payload={"state": "success", "statuses": []},
+        pr_branch_protection_returncode=1,
+        pr_branch_protection_stderr="gh: Resource not accessible by integration (HTTP 403)",
+    )
+
+
+def test_pr_loop_auto_merge_unreadable_protection_with_clean_merge_state_merges(tmp_path):
+    # #1055: the classic protection endpoint returns 403, but GitHub reports
+    # CLEAN for the green current head, so the head-pinned merge proceeds.
+    runner = _forbidden_protection_runner("CLEAN")
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1200, ci_poll_interval_seconds=30)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    merges = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "merge"]]
+    assert len(merges) == 1
+    assert merges[0][-2:] == ["--match-head-commit", "abc123"]
+
+
+@pytest.mark.parametrize("merge_state", ["BLOCKED", "UNSTABLE", "UNKNOWN"])
+def test_pr_loop_auto_merge_unreadable_protection_without_clean_stops_fast(tmp_path, merge_state):
+    runner = _forbidden_protection_runner(merge_state)
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1200, ci_poll_interval_seconds=30,
+        ci_startup_timeout_seconds=60,
+    )
+
+    with pytest.raises(AgentLoopError, match="merge state is not CLEAN; no merge attempted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+    stop_comments = [c for c in runner.comments if "merge readiness cannot be confirmed" in c]
+    assert len(stop_comments) == 1
+    assert "every observed GitHub check passed" in stop_comments[0]
+    assert "HTTP 403" in stop_comments[0]
+    assert f"GitHub merge state for the current head: {merge_state}" in stop_comments[0]
+    assert not any("GitHub checks are still pending" in c for c in runner.comments)
+    # Bounded by the startup window, not the 1200s watch timeout.
+    sleep_commands = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["sleep"]]
+    assert len(sleep_commands) < 1200 // 30 - 1
+
+
+def test_ordinary_checks_authority_accepts_forbidden_protection_with_clean_head():
+    checks = _watch_check_board("passing", protection="forbidden")
+    clean = PullRequestMergeability("mergeable", "MERGEABLE", "CLEAN", "abc123", "main")
+
+    assert orchestrator._ordinary_checks_snapshot_is_authoritative(
+        checks, clean, head_sha="abc123"
+    )
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+        checks, clean, head_sha="other"
+    )
+    for merge_state in ("BLOCKED", "UNSTABLE", "BEHIND", "DRAFT", None):
+        assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+            checks,
+            PullRequestMergeability("mergeable", "MERGEABLE", merge_state, "abc123", "main"),
+            head_sha="abc123",
+        )
+    # Deferral (the recovery finalizer re-checks CLEAN after readiness) only
+    # relaxes an unreadable protection; the board conditions still apply.
+    draft = PullRequestMergeability("mergeable", "MERGEABLE", "DRAFT", "abc123", "main")
+    assert orchestrator._ordinary_checks_snapshot_is_authoritative(
+        checks, draft, head_sha="abc123", defer_unreadable_protection=True,
+    )
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+        _watch_check_board("passing", protection="unavailable"),
+        draft,
+        head_sha="abc123",
+        defer_unreadable_protection=True,
+    )
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+        _watch_check_board("pending", pending=(PullRequestCheck("x", "check_run", "queued"),),
+                           protection="forbidden"),
+        draft,
+        head_sha="abc123",
+        defer_unreadable_protection=True,
+    )
+
+
 def test_pr_loop_summarizes_approved_followups_before_pending_check_stop(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
@@ -7350,6 +7699,30 @@ def test_pr_loop_logs_created_followup_issue_url(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "Created GitHub issue: https://github.com/OWNER/REPO/issues/99" in captured.err
 
+
+def test_pr_loop_approval_names_the_signed_requirement_reopen_path(tmp_path, capsys):
+    # #1020: the approval line is where an operator learns there is no further
+    # move, so it must name the signed-requirement path for new instructions.
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="Codex approves.",
+                reviewer="OpenAI Codex",
+            )
+        ],
+    )
+    config = make_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    out = capsys.readouterr().out
+    assert "PR #77 approved by " in out
+    assert "line containing exactly `-- Human Reviewer`" in out
+    assert "rerun `agent-loop pr 77`" in out
+    assert "Unsigned comments are not read as requirements" in out
+
+
 @pytest.mark.parametrize("mode", ["summarize", "issue"])
 def test_pr_loop_treats_same_pr_followups_as_blocking_without_fix_mode(tmp_path, mode):
     runner = FakeRunner(
@@ -7487,6 +7860,11 @@ def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_ite
                 "checked_discussion_directly": False,
             },
             "human_requirement_dispositions": [],
+            # The source carries its own assessment: repair may fix the
+            # envelope but may not supply an omitted one (#925).
+            "architecture_impact": json.loads(
+                structured_coder_followup().split("\n<!--", 1)[0]
+            )["architecture_impact"],
         }
     )
     repaired_coder_response = structured_coder_followup(
@@ -13277,3 +13655,750 @@ def test_m985_unchanged_head_count_resets_after_an_external_head_advance():
     assert tracker.observe("C", "C") == 1
     # An unknown reviewed head never counts.
     assert tracker.observe(None, None) == 0
+
+
+# --- #925 round 5: the PR acknowledgement repair through the real flow -------
+
+_ACK_UNCORROBORATED = {"status": "modified", "rationale": "Something changed."}
+
+
+def _ack_with_impact(rendered, impact):
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    if impact is None:
+        payload.pop("architecture_impact", None)
+    else:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload) + rendered[split:]
+
+
+def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the current audit trail.",
+    )
+    metadata = PullRequestMetadata(
+        number=77, repo="OWNER/REPO", title="Acknowledgement repair",
+        head_branch="feature/review-context", base_branch="main",
+        head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: PullRequestReviewContext(
+            metadata=metadata, comments=(), human_requirements=(requirement,)
+        ),
+    )
+    # The reviewer approves with an uncorroborated near miss and no
+    # acknowledgement; acceptance removes the assessment and records it.
+    unacknowledged = _ack_with_impact(
+        structured_pr_review(summary="Codex approves.", reviewer="OpenAI Codex"),
+        _ACK_UNCORROBORATED,
+    )
+    repaired = _ack_with_impact(
+        structured_pr_review(
+            summary="Codex approves.", reviewer="OpenAI Codex",
+            human_requirements_resolved=True,
+        ),
+        None if repaired_status is None
+        else {"status": repaired_status, "rationale": "No architectural change."},
+    )
+    runner = FakeRunner(codex_outputs=[unacknowledged] * 3)
+    repair_calls = []
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    config = make_config(
+        tmp_path, reviewer="codex", max_rounds=1,
+        agent_max_retries=0, agent_retry_backoff_seconds=0,
+    )
+    repair_results = []
+    real_structured_repair = orchestrator._run_structured_repair
+
+    def spy_repair(*args, **kwargs):
+        result = real_structured_repair(*args, **kwargs)
+        repair_results.append(result)
+        return result
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator, "_run_structured_repair", spy_repair
+    ):
+        try:
+            outcome = run_pr_loop(runner, pr_number=77, config=config)
+        except AgentLoopError as exc:
+            outcome = exc
+    _ack_pr_run.repair_results = repair_results
+    records = []
+    for comment in runner.pr_payload["comments"]:
+        match = re.search(
+            r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", comment["body"]
+        )
+        if match:
+            decoded = _decode_round_metadata(match.group("payload"))
+            if decoded.role == "reviewer":
+                records.append(decoded)
+    return outcome, records, repair_calls
+
+
+def test_pr_acknowledgement_repair_keeps_the_accepted_assessment_and_record(
+    tmp_path, monkeypatch
+):
+    outcome, records, repair_calls = _ack_pr_run(tmp_path, monkeypatch)
+    assert repair_calls, "the acknowledgement repair must run through the flow"
+    assert '"modified"' not in repair_calls[0]
+    # Exactly one reviewer publication, made from the accepted carrier before
+    # the gate; the successful repair posts nothing new.
+    assert len(records) == 1
+    assert records[0].architecture_impact is None
+    assert [r.outcome for r in records[0].architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+    assert outcome == 0, outcome
+
+
+@pytest.mark.parametrize("status", ["unchanged", "none"])
+def test_pr_acknowledgement_repair_cannot_add_an_assessment(tmp_path, monkeypatch, status):
+    outcome, records, repair_calls = _ack_pr_run(tmp_path, monkeypatch, repaired_status=status)
+    assert repair_calls
+    refusal = {"unchanged": "must not introduce one", "none": "must be `changed` or `unchanged`"}
+    assert _ack_pr_run.repair_results
+    for _text, validated, attempts in _ack_pr_run.repair_results:
+        assert validated is None
+        assert refusal[status] in attempts[-1].diagnostic
+    # The refused repair leaves the approval unacknowledged: nothing merges.
+    assert outcome != 0
+    assert all(record.architecture_impact is None for record in records)
+
+
+
+def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
+    """Interrupt right after Codex's review is posted, then resume the round."""
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the current audit trail.",
+    )
+    real_context = orchestrator.get_pr_review_context
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: dataclasses.replace(
+            real_context(*args, **kwargs), human_requirements=(requirement,)
+        ),
+    )
+    review = _ack_with_impact(
+        structured_pr_review(
+            summary="Codex approves.", reviewer="OpenAI Codex",
+            human_requirements_resolved=acknowledged,
+        ),
+        _ACK_UNCORROBORATED,
+    )
+    repaired = structured_pr_review(
+        summary="Codex approves.", reviewer="OpenAI Codex", human_requirements_resolved=True
+    )
+    runner = FakeRunner(codex_outputs=[review] * 3)
+    config = make_config(
+        tmp_path, reviewer="codex", max_rounds=1, review_parallel=parallel,
+        agent_max_retries=0, agent_retry_backoff_seconds=0,
+    )
+
+    def codex_records():
+        found = []
+        for comment in runner.pr_payload["comments"]:
+            match = re.search(
+                r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", comment["body"]
+            )
+            if match:
+                decoded = _decode_round_metadata(match.group("payload"))
+                if decoded.role == "reviewer" and decoded.agent == "Codex":
+                    found.append(decoded)
+        return found
+
+    real_post = orchestrator.post_pr_comment
+    interrupted = []
+
+    def interrupt_after_review(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        if not interrupted and codex_records():
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        return result
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", lambda raw, cmd, **kw: repaired), \
+            patch.object(orchestrator, "post_pr_comment", side_effect=interrupt_after_review):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    codex_before = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["codex"])
+
+    resumed, carriers, repair_calls = [], [], []
+    real_resumed = orchestrator._resumed_review_architecture
+    real_pin = orchestrator._pin_acknowledgement_repair
+
+    def spy_resumed(*args, **kwargs):
+        result = real_resumed(*args, **kwargs)
+        resumed.append(result)
+        return result
+
+    def spy_pin(accepted, repaired_value, **kwargs):
+        carriers.append(accepted)
+        return real_pin(accepted, repaired_value, **kwargs)
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator, "_resumed_review_architecture", spy_resumed
+    ), patch.object(orchestrator, "_pin_acknowledgement_repair", spy_pin):
+        try:
+            outcome = run_pr_loop(runner, pr_number=77, config=config)
+        except AgentLoopError as exc:
+            outcome = exc
+    codex_after = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["codex"])
+    return SimpleNamespace(
+        outcome=outcome, resumed=resumed, carriers=carriers, repair_calls=repair_calls,
+        records=codex_records(), reinvoked=codex_after - codex_before,
+    )
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["authoritative", "publication"])
+def test_resumed_acknowledged_pr_review_is_rebuilt_from_round_metadata(
+    tmp_path, monkeypatch, parallel
+):
+    run = _ack_pr_resume_run(tmp_path, monkeypatch, acknowledged=True, parallel=parallel)
+    # The posted review resumes without re-invoking the reviewer, and its
+    # carrier's assessment and records come from round metadata, whatever the
+    # record's phase: a null assessment plus the original degradation record.
+    assert run.reinvoked == 0
+    ((impact, records),) = run.resumed
+    assert impact is None
+    assert [r.outcome for r in records] == ["degraded-to-undetermined"]
+    assert run.repair_calls == []
+    for record in run.records:
+        assert record.architecture_impact is None
+        assert [r.outcome for r in record.architecture_impact_degradations] == [
+            "degraded-to-undetermined"
+        ]
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["authoritative", "publication"])
+def test_resumed_unacknowledged_pr_review_is_reinvoked_not_repaired_from_a_stale_source(
+    tmp_path, monkeypatch, parallel
+):
+    # In the PR flow a same-head review resumes only when its record already
+    # carries the acknowledgement (_resumed_pr_reviewer_matches_requirements),
+    # so an unacknowledged posted review is re-run instead of resumed. The
+    # acknowledgement repair then sees the fresh accepted carrier, which keeps
+    # the null assessment and its record.
+    run = _ack_pr_resume_run(tmp_path, monkeypatch, acknowledged=False, parallel=parallel)
+    assert run.reinvoked == 1
+    assert run.resumed == []
+    assert run.carriers
+    for carrier in run.carriers:
+        assert carrier.architecture_impact is None
+        assert [r.outcome for r in carrier.architecture_impact_degradations] == [
+            "degraded-to-undetermined"
+        ]
+
+
+# --- #1034: head-aware PR coder follow-up reporting -------------------------
+
+_M1034_META_RE = re.compile(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->")
+_M1034_VERIFY_INSTRUCTION = "do not credit the turn with fixes"
+
+
+def _m1034_coder_comments(runner):
+    return [
+        comment["body"]
+        for comment in runner.pr_payload["comments"]
+        if "## Coder follow-up" in comment["body"]
+    ]
+
+
+def _m1034_metadata(body):
+    match = _M1034_META_RE.search(body)
+    assert match is not None
+    return _decode_round_metadata(match.group("payload"))
+
+
+def _m1034_reviewer_prompts(runner):
+    return [cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+
+
+def test_m1034_followup_head_log_wording():
+    from coding_review_agent_loop.orchestrator import _coder_followup_head_log
+
+    advanced = _coder_followup_head_log(3, "Claude", "a" * 40, "b" * 40, 0)
+    assert advanced == (
+        f"Round 3: PR head advanced {'a' * 12}..{'b' * 12} during Claude follow-up; re-reviewing"
+    )
+    unchanged = _coder_followup_head_log(3, "Codex", "c" * 40, "c" * 40, 1)
+    assert unchanged == f"Round 3: Codex follow-up left PR head {'c' * 12} unchanged (1/2); re-reviewing"
+    for dispatch, observed in ((None, "d" * 40), ("d" * 40, None), (None, None)):
+        unknown = _coder_followup_head_log(3, "Claude", dispatch, observed, 0)
+        assert unknown == "Round 3: Claude follow-up complete; PR head change could not be determined"
+    for message in (advanced, unchanged, unknown):
+        assert "pushed" not in message
+        assert "unchanged" not in unknown
+
+
+def test_m1034_followup_dispatch_head_round_trips_and_legacy_records_stay_byte_stable():
+    from coding_review_agent_loop.round_state import (
+        _encode_round_metadata,
+        followup_head_unchanged_sha,
+    )
+
+    recorded = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2,
+        subject="abc123", followup_dispatch_head="abc123",
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(recorded))
+    assert decoded.followup_dispatch_head == "abc123"
+    assert followup_head_unchanged_sha(decoded) == "abc123"
+    # An advanced head never yields the signal.
+    assert followup_head_unchanged_sha(dataclasses.replace(recorded, subject="def456")) is None
+    assert followup_head_unchanged_sha(dataclasses.replace(recorded, subject="unknown")) is None
+    assert followup_head_unchanged_sha(dataclasses.replace(recorded, role="reviewer")) is None
+    assert followup_head_unchanged_sha(None) is None
+
+    legacy = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2, subject="abc123",
+    )
+    encoded = _encode_round_metadata(legacy)
+    legacy_decoded = _decode_round_metadata(encoded)
+    assert legacy_decoded.followup_dispatch_head is None
+    assert _encode_round_metadata(legacy_decoded) == encoded
+    # Legacy records never infer the head-unchanged signal from other fields.
+    assert followup_head_unchanged_sha(legacy_decoded) is None
+
+
+def test_m1034_malformed_followup_dispatch_head_is_rejected():
+    from coding_review_agent_loop.round_state import (
+        _decode_round_metadata_mapping,
+        _encode_round_metadata,
+        decode_mapping,
+    )
+
+    with pytest.raises(ValueError):
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=2,
+            subject="abc123", followup_dispatch_head="not a sha!",
+        )
+    # Placeholders and non-hex names are not Git commit SHAs.
+    for bad in ("unknown", "new-sha", "arbitrary.word"):
+        with pytest.raises(ValueError, match="followup_dispatch_head"):
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="Claude", round_number=2,
+                subject=bad, followup_dispatch_head=bad,
+            )
+    valid = dict(decode_mapping(_encode_round_metadata(PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2,
+        subject="abc123", followup_dispatch_head="abc123",
+    ))))
+    assert _decode_round_metadata_mapping(valid).followup_dispatch_head == "abc123"
+    for bad in (
+        "", 7, "x" * 200, "bad sha", None, "unknown", "new-sha", "arbitrary.word",
+        "ABC123", "abc", "a" * 65,
+    ):
+        with pytest.raises(AgentLoopError, match="followup_dispatch_head"):
+            _decode_round_metadata_mapping({**valid, "followup_dispatch_head": bad})
+
+
+def _m1034_parsed_followup():
+    raw = structured_coder_followup(
+        summary="Fixed both items.",
+        addressed_items=["item-1"],
+        remaining_items=["item-2"],
+        addressed_item_notes={"item-1": "Qualified the network advice."},
+        remaining_item_notes={"item-2": "Needs a design call."},
+    )
+    parsed = validate_structured_coder_followup(raw)
+    assert parsed is not None
+    return parsed
+
+
+def test_m1034_renderer_frames_unchanged_head_follow_up_as_claims():
+    from coding_review_agent_loop.comment_rendering import render_public_agent_comment
+
+    parsed = _m1034_parsed_followup()
+    baseline = _render_public_coder_followup_comment(parsed, agent="Claude")
+    assert _render_public_coder_followup_comment(
+        parsed, agent="Claude", head_unchanged_sha=None
+    ) == baseline
+    assert render_public_agent_comment(
+        kind="coder_followup", parsed=parsed, agent="Claude"
+    ) == baseline
+    assert "### Addressed items" in baseline
+    assert "Orchestrator note" not in baseline
+
+    framed = render_public_agent_comment(
+        kind="coder_followup", parsed=parsed, agent="Claude", head_unchanged_sha="abc123"
+    )
+    assert framed.startswith(
+        "## Coder follow-up\n\n> Orchestrator note: the PR head was unchanged at `abc123` "
+        "after this follow-up; no new commit is visible on the PR branch."
+    )
+    assert "no commit was made" not in framed
+    assert "Coder summary (claim, unverified): Fixed both items." in framed
+    assert "### Claimed already present at `abc123` (PR head unchanged)" in framed
+    assert "### Addressed items" not in framed
+    assert "  - Coder claim: Qualified the network advice." in framed
+    assert "Resolution:" not in framed
+    # Remaining items keep their labels; the coder's prose is framed, not rewritten.
+    assert "### Remaining items" in framed
+    assert "  - Reason: Needs a design call." in framed
+
+
+def test_m1034_freeform_notice_prefixes_body():
+    from coding_review_agent_loop.comment_rendering import (
+        add_coder_followup_head_unchanged_notice,
+    )
+
+    framed = add_coder_followup_head_unchanged_notice("Fixed it.\n-- Claude", "abc123")
+    assert framed.startswith("> Orchestrator note: the PR head was unchanged at `abc123`")
+    assert framed.endswith("\n\nFixed it.\n-- Claude")
+
+
+def test_m1034_reviewer_context_flags_unchanged_head_and_keeps_other_bytes():
+    raw = structured_coder_followup(
+        summary="Fixed both items.",
+        addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "Qualified the network advice."},
+    )
+    legacy = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2, subject="abc123",
+    )
+    advanced = dataclasses.replace(legacy, followup_dispatch_head="0dd000")
+    unchanged = dataclasses.replace(legacy, followup_dispatch_head="abc123")
+
+    legacy_text = orchestrator._coder_followup_review_context(raw, legacy, head_sha="abc123")
+    assert '"summary": "Fixed both items."' in legacy_text
+    assert "pr_head_unchanged_during_followup" not in legacy_text
+    # Changed-head records render exactly like historical records.
+    assert orchestrator._coder_followup_review_context(raw, advanced, head_sha="abc123") == legacy_text
+
+    framed = orchestrator._coder_followup_review_context(raw, unchanged, head_sha="abc123")
+    assert '"pr_head_unchanged_during_followup": true' in framed
+    assert '"followup_dispatch_head": "abc123"' in framed
+    assert '"coder_summary_claim": "Fixed both items."' in framed
+    assert '"claimed_addressed_items"' in framed
+    assert '"claimed_addressed_item_notes"' in framed
+    assert '"addressed_items"' not in framed
+    assert '"summary"' not in framed
+    assert _M1034_VERIFY_INSTRUCTION in framed
+
+
+def test_m1034_unchanged_head_follow_up_is_logged_and_recorded_as_claims(tmp_path, capsys):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Two fixes needed.",
+                blocking_items=["Fix the README.", "Fix the docs."],
+            ),
+            structured_pr_review(
+                state="approved", summary="Already present.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                summary="Fixed both items.",
+                addressed_items=["item-1", "item-2"],
+                addressed_item_notes={"item-1": "Qualified the network advice."},
+            ),
+        ],
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    err = capsys.readouterr().err
+    assert "Round 1: Claude follow-up left PR head abc123 unchanged (1/2); re-reviewing" in err
+    assert "pushed updates" not in err
+    (coder_comment,) = _m1034_coder_comments(runner)
+    assert "> Orchestrator note: the PR head was unchanged at `abc123`" in coder_comment
+    assert "Coder summary (claim, unverified): Fixed both items." in coder_comment
+    assert "### Claimed already present at `abc123` (PR head unchanged)" in coder_comment
+    assert "  - Coder claim: Qualified the network advice." in coder_comment
+    assert "### Addressed items" not in coder_comment
+    metadata = _m1034_metadata(coder_comment)
+    assert metadata.followup_dispatch_head == metadata.subject == "abc123"
+    # The ledger meaning of addressed_items and the raw response are unchanged.
+    raw = validate_structured_coder_followup(metadata.raw_structured_coder_response)
+    assert raw is not None and tuple(raw.addressed_items) == ("item-1", "item-2")
+    assert raw.summary == "Fixed both items."
+    second_review = _m1034_reviewer_prompts(runner)[1]
+    assert '"pr_head_unchanged_during_followup": true' in second_review
+    assert '"coder_summary_claim": "Fixed both items."' in second_review
+    assert _M1034_VERIFY_INSTRUCTION in second_review
+
+
+def test_m1034_advanced_head_follow_up_keeps_legacy_framing(tmp_path, capsys):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="One fix needed.", blocking_items=["Fix the README."],
+            ),
+            structured_pr_review(
+                state="approved", summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                summary="Fixed the README.",
+                addressed_items=["item-1"],
+                addressed_item_notes={"item-1": "Rewrote the section."},
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    err = capsys.readouterr().err
+    assert "Round 1: PR head advanced abc123..abc123-coder during Claude follow-up; re-reviewing" in err
+    assert "pushed updates" not in err
+    (coder_comment,) = _m1034_coder_comments(runner)
+    assert "### Addressed items" in coder_comment
+    assert "  - Resolution: Rewrote the section." in coder_comment
+    assert "Orchestrator note" not in coder_comment
+    assert "Claimed already present" not in coder_comment
+    metadata = _m1034_metadata(coder_comment)
+    assert metadata.followup_dispatch_head == "abc123"
+    assert metadata.subject == "abc123-coder-1"
+    second_review = _m1034_reviewer_prompts(runner)[1]
+    assert "pr_head_unchanged_during_followup" not in second_review
+    assert '"summary": "Fixed the README."' in second_review
+    assert _M1034_VERIFY_INSTRUCTION not in second_review
+
+
+def test_m1034_unchanged_head_limit_still_stops_without_push_log(tmp_path, capsys):
+    blocking = structured_pr_review(
+        state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            blocking,
+            structured_pr_review(
+                state="blocking",
+                summary="Still needs a re-plan.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
+                ],
+            ),
+            structured_pr_review(state="approved"),
+        ],
+        claude_outputs=[
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+        ],
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6, quiet=False)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "unchanged in 2 consecutive follow-up rounds" in str(excinfo.value)
+    assert len(_m1034_reviewer_prompts(runner)) == 2
+    err = capsys.readouterr().err
+    assert "pushed updates for re-review" not in err
+    assert "left PR head abc123 unchanged (1/2)" in err
+    assert "unchanged (2/2)" not in err
+    coder_comments = _m1034_coder_comments(runner)
+    assert len(coder_comments) == 2
+    for comment in coder_comments:
+        assert "### Claimed already present at `abc123` (PR head unchanged)" in comment
+
+
+def _m1034_recovery_runner(head_sha="c0ffee42"):
+    old_item = UnresolvedReviewItem(
+        item_id="item-2",
+        reviewer="Google Gemini",
+        source_round=1,
+        text="Preserve the metadata-backed unresolved item on rerun.",
+        status="blocking",
+    )
+    old_coder_comment = _attach_round_metadata(
+        "Opened the PR.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=1,
+            subject="old-sha", prior_items=(),
+        ),
+    )
+    old_review_comment = _attach_round_metadata(
+        "Blocked.\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Gemini", round_number=1,
+            subject="old-sha", prior_items=(), new_items=(old_item,), state="blocking",
+        ),
+    )
+    return FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(
+                summary="Fixed the recovered item.",
+                addressed_items=["item-2"],
+                addressed_item_notes={"item-2": "The metadata-backed item is preserved."},
+            )
+        ],
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="Recovered item is resolved.",
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            )
+        ],
+        pr_payload={
+            "headRefOid": head_sha,
+            "comments": [
+                {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": old_coder_comment},
+                {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:01:00Z", "body": old_review_comment},
+            ],
+        },
+        advance_pr_head_on_coder_followup=False,
+    )
+
+
+def test_m1034_recovery_round_without_commit_records_claims(tmp_path, capsys):
+    runner = _m1034_recovery_runner()
+    config = make_config(tmp_path, reviewer="codex", quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Recovery context: the PR head `c0ffee42` was advanced by a commit" in coder_prompt
+    assert "may or may not satisfy the recovered items" in coder_prompt
+    assert "Check each recovered item against the current head." in coder_prompt
+    assert "keep any unsatisfied item in remaining_items" in coder_prompt
+    assert "already contains" not in coder_prompt
+    # The full-board recovery review still follows the coder turn.
+    assert command_index(runner.commands, ["claude"]) < command_index(
+        runner.commands, ["codex", "exec"]
+    )
+    err = capsys.readouterr().err
+    assert "Claude follow-up left PR head c0ffee42 unchanged (1/2)" in err
+    assert "pushed updates" not in err
+    (coder_comment,) = _m1034_coder_comments(runner)
+    assert "> Orchestrator note: the PR head was unchanged at `c0ffee42`" in coder_comment
+    assert "### Claimed already present at `c0ffee42` (PR head unchanged)" in coder_comment
+    metadata = _m1034_metadata(coder_comment)
+    assert metadata.followup_dispatch_head == metadata.subject == "c0ffee42"
+    reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
+    assert '"pr_head_unchanged_during_followup": true' in reviewer_prompt
+    assert _M1034_VERIFY_INSTRUCTION in reviewer_prompt
+
+
+@pytest.mark.parametrize("head_sha", ["new-sha", "arbitrary.word"])
+def test_m1034_non_sha_head_is_not_persisted_or_claimed_unchanged(tmp_path, head_sha):
+    runner = _m1034_recovery_runner(head_sha=head_sha)
+    config = make_config(tmp_path, reviewer="codex")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    (coder_comment,) = _m1034_coder_comments(runner)
+    assert "Orchestrator note" not in coder_comment
+    assert "Claimed already present" not in coder_comment
+    assert "### Addressed items" in coder_comment
+    metadata = _m1034_metadata(coder_comment)
+    assert metadata.followup_dispatch_head is None
+    reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
+    assert "pr_head_unchanged_during_followup" not in reviewer_prompt
+    assert _M1034_VERIFY_INSTRUCTION not in reviewer_prompt
+
+
+def test_m1034_non_recovery_follow_up_prompt_has_no_recovery_context(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="blocking", summary="Fix.", blocking_items=["Fix it."]),
+            structured_pr_review(
+                state="approved", summary="Ok.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex")) == 0
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Recovery context:" not in coder_prompt
+
+
+def _m1034_resume_runner(*, dispatch_head):
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="OpenAI Codex",
+        source_round=1,
+        text="Fix the README.",
+        status="blocking",
+    )
+    review_comment = _attach_round_metadata(
+        structured_pr_review(state="blocking", summary="Fix it.", blocking_items=["Fix the README."]),
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=1,
+            subject="abc123", prior_items=(), new_items=(item,), state="blocking",
+        ),
+    )
+    raw = structured_coder_followup(
+        summary="Fixed both items.",
+        addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "Qualified the network advice."},
+    )
+    coder_comment = _attach_round_metadata(
+        raw,
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=2,
+            subject="abc123", prior_items=(item,),
+            raw_structured_coder_response=raw,
+            followup_dispatch_head=dispatch_head,
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved", summary="Verified.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+        pr_payload={"comments": [
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": review_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:01:00Z", "body": coder_comment},
+        ]},
+    )
+    return runner, raw, coder_comment
+
+
+def test_m1034_resume_rebuilds_unchanged_head_reviewer_context(tmp_path):
+    runner, raw, coder_comment = _m1034_resume_runner(dispatch_head="abc123")
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex")) == 0
+    reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
+    assert '"pr_head_unchanged_during_followup": true' in reviewer_prompt
+    assert '"coder_summary_claim": "Fixed both items."' in reviewer_prompt
+    assert '"claimed_addressed_item_notes"' in reviewer_prompt
+    assert _M1034_VERIFY_INSTRUCTION in reviewer_prompt
+    # The stored raw structured response is untouched.
+    assert _m1034_metadata(coder_comment).raw_structured_coder_response == raw
+
+
+def test_m1034_resume_from_historical_coder_record_keeps_legacy_context(tmp_path):
+    runner, raw, _coder_comment = _m1034_resume_runner(dispatch_head=None)
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex")) == 0
+    reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
+    legacy_metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2,
+        subject="abc123", raw_structured_coder_response=raw,
+    )
+    expected = orchestrator._coder_followup_review_context(raw, legacy_metadata, head_sha="abc123")
+    assert "pr_head_unchanged_during_followup" not in expected
+    assert expected.splitlines()[1] in reviewer_prompt
+    assert '"summary": "Fixed both items."' in reviewer_prompt
+    assert "pr_head_unchanged_during_followup" not in reviewer_prompt
+    assert _M1034_VERIFY_INSTRUCTION not in reviewer_prompt

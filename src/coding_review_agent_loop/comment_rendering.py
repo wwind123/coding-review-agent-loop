@@ -15,6 +15,9 @@ from .errors import AgentLoopError
 from .expected_closure import normalize_issue_ids
 from .agents.registry import agent_display_name, agent_signature
 from .protocol import (
+    DEGRADED_ROW_CLAIM_DIAGNOSTIC,
+    PARSE_DEGRADATION_RENDER_LIMIT,
+    UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     ANY_HEADING_RE,
     HTML_COMMENT_RE,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
@@ -43,6 +46,7 @@ from .protocol import (
     StructuredCoderFollowup,
     StructuredIssueImplementation,
     StructuredPlanState,
+    OneShotGrowthJustification,
     StructuredPlanRevision,
     RiskTestMatrix,
     RiskTestMatrixChange,
@@ -668,6 +672,7 @@ def _render_risk_test_matrix_evidence(
     evidence: RiskTestMatrixEvidence | None,
     *,
     render_decision: MatrixEvidenceRenderDecision | None = None,
+    diagnostics: Sequence[object] = (),
 ) -> str | None:
     if evidence is None:
         return None
@@ -677,6 +682,14 @@ def _render_risk_test_matrix_evidence(
         "### Risk-based mode and transition test matrix evidence",
         f"- Matrix identity: `{safe(evidence.matrix_identity)}`",
     ]
+    # Outside the collapsed block, so an operator sees that coverage was
+    # dropped rather than silently reduced (#920, #926).
+    lines.extend(
+        f"- Dropped claim: {safe(getattr(diagnostic, 'message', ''))}"
+        for diagnostic in diagnostics
+        if getattr(diagnostic, "code", None)
+        in {UNAPPROVED_ROW_CLAIM_DIAGNOSTIC, DEGRADED_ROW_CLAIM_DIAGNOSTIC}
+    )
     unchanged_line: str | None = None
     if render_decision is not None and render_decision.mode == "delta":
         assert render_decision.previous_evidence is not None
@@ -774,6 +787,88 @@ def render_human_requirement_dispositions(
             for item in dispositions
         ]
     )
+
+
+# ``PARSE_DEGRADATION_RENDER_LIMIT`` is defined in protocol.py, beside the
+# citation drop bound that must never exceed it, and re-exported here (#927).
+TEST_OBSERVATION_DEGRADATIONS_HEADING = "### Test observation parse degradations"
+
+
+def render_test_observation_degradations_section(records: Sequence[object]) -> str | None:
+    """Render dropped follow-up citation records in full (#927)."""
+    return render_parse_degradations_section(
+        records, heading=TEST_OBSERVATION_DEGRADATIONS_HEADING
+    )
+
+
+def _degradation_cell(text: object) -> str:
+    return " ".join(
+        sanitize_historical_text(str(text))
+        .replace("`", "'")
+        .replace("<", "\u2039")
+        .replace(">", "\u203a")
+        .split()
+    )[:200]
+
+
+def render_parse_degradations_section(
+    records: Sequence[object], *, heading: str = "### Parse degradations"
+) -> str | None:
+    """Render bounded, sanitized parse degradation records (#924).
+
+    An operator sees reduced coverage rather than silent loss.  Renders
+    nothing when there are no records.
+    """
+    if not records:
+        return None
+    lines = [
+        heading,
+        "The orchestrator degraded these elements instead of rejecting the response:",
+    ]
+    for record in list(records)[:PARSE_DEGRADATION_RENDER_LIMIT]:
+        lines.append(
+            f"- `{_degradation_cell(getattr(record, 'element_path', ''))}` — rule "
+            f"`{_degradation_cell(getattr(record, 'rule', ''))}`; observed "
+            f"`{_degradation_cell(getattr(record, 'observed_preview', ''))}`; outcome "
+            f"`{_degradation_cell(getattr(record, 'outcome', ''))}`"
+        )
+    omitted = len(records) - PARSE_DEGRADATION_RENDER_LIMIT
+    if omitted > 0:
+        lines.append(f"- {omitted} more record(s) omitted.")
+    return "\n".join(lines)
+
+
+def render_decomposition_degradation_comment(records: Sequence[object]) -> str | None:
+    """Plain parent-issue comment for an accepted decomposition's records."""
+    section = render_parse_degradations_section(
+        records, heading="### Decomposition parse degradations"
+    )
+    if section is None:
+        return None
+    return section + "\n\n-- coding-review-agent-loop"
+
+
+def render_refused_decomposition_comment(
+    records: Sequence[object], *, diagnostic: str
+) -> str:
+    """Plain parent-issue comment for a decomposition refused by its contract.
+
+    Posted once before the exhaustion error propagates; it carries no managed
+    record, and nothing was checkpointed or created.
+    """
+    section = render_parse_degradations_section(
+        records, heading="### Decomposition parse degradations"
+    )
+    lines = [section] if section is not None else [
+        "### Decomposition parse degradations",
+        "The required `architecture_impact` assessment was omitted.",
+    ]
+    lines.append(
+        "The decomposition was refused: no child issue was created and no topology "
+        "checkpoint was published."
+    )
+    lines.append(f"Diagnostic: {_degradation_cell(diagnostic)}")
+    return "\n".join(lines) + "\n\n-- coding-review-agent-loop"
 
 
 def render_deferred_stages_section(deferred_stages: Sequence[DeferredStage]) -> str | None:
@@ -1102,6 +1197,28 @@ def decode_deferred_stages_marker(encoded: str) -> tuple[DeferredStage, ...]:
     return tuple(stages)
 
 
+ONE_SHOT_GROWTH_JUSTIFICATION_HEADING = "### One-shot growth justification"
+
+
+def render_one_shot_growth_justification_section(
+    justification: OneShotGrowthJustification | None,
+) -> str | None:
+    """Full rendering of a reviewed one-shot growth justification (#886)."""
+    if justification is None:
+        return None
+    rationale = sanitize_historical_text(justification.rationale).strip()
+    rationale_lines = rationale.splitlines() or [""]
+    return "\n".join(
+        [
+            ONE_SHOT_GROWTH_JUSTIFICATION_HEADING,
+            "- `crossed_signals`: "
+            + ", ".join(f"`{signal}`" for signal in justification.crossed_signals),
+            "- `rationale`: " + rationale_lines[0],
+            *(f"  {line}" if line.strip() else "" for line in rationale_lines[1:]),
+        ]
+    )
+
+
 def render_canonical_plan_revision(
     parsed_revision: StructuredPlanRevision,
     prior_items: Sequence[UnresolvedReviewItem],
@@ -1143,6 +1260,11 @@ def render_canonical_plan_revision(
     typed_section = render_typed_plan_stages_section(parsed_revision.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    growth_section = render_one_shot_growth_justification_section(
+        parsed_revision.one_shot_growth_justification
+    )
+    if growth_section:
+        sections.append(growth_section)
     if parsed_revision.execution_recommendation is not None:
         sections.append(render_execution_recommendation_section(parsed_revision.execution_recommendation))
     return "\n\n".join(sections)
@@ -1168,6 +1290,11 @@ def render_canonical_plan_state(
     typed_section = render_typed_plan_stages_section(parsed_plan.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    growth_section = render_one_shot_growth_justification_section(
+        parsed_plan.one_shot_growth_justification
+    )
+    if growth_section:
+        sections.append(growth_section)
     if parsed_plan.execution_recommendation is not None:
         sections.append(render_execution_recommendation_section(parsed_plan.execution_recommendation))
     return "\n\n".join(sections)
@@ -1329,6 +1456,24 @@ def _render_public_plan_review_comment(
     )
 
 
+def coder_followup_head_unchanged_notice(head_sha: str) -> str:
+    """Orchestrator note for a coder follow-up that left the PR head unchanged.
+
+    Limited to observable state: an equal PR head cannot rule out an
+    unpushed local commit, only that no new commit is visible (#1034).
+    """
+    return (
+        f"> Orchestrator note: the PR head was unchanged at `{head_sha}` after this "
+        "follow-up; no new commit is visible on the PR branch. The coder statements "
+        "below are claims about the existing head, not changes attributed to this turn."
+    )
+
+
+def add_coder_followup_head_unchanged_notice(body: str, head_sha: str) -> str:
+    """Frame a freeform coder follow-up body with the head-unchanged note."""
+    return coder_followup_head_unchanged_notice(head_sha) + "\n\n" + body
+
+
 def _render_public_coder_followup_comment(
     parsed_followup: StructuredCoderFollowup,
     *,
@@ -1339,6 +1484,7 @@ def _render_public_coder_followup_comment(
     local_test_evidence: str | None = None,
     current_test_turn_id: str | None = None,
     matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
+    head_unchanged_sha: str | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
 
@@ -1359,7 +1505,7 @@ def _render_public_coder_followup_comment(
         addressed_items.extend(
             render_item(
                 item_id,
-                note_label="Resolution",
+                note_label="Coder claim" if head_unchanged_sha else "Resolution",
                 note=parsed_followup.addressed_item_notes.get(item_id),
                 placeholder=None,
             )
@@ -1391,12 +1537,28 @@ def _render_public_coder_followup_comment(
             )
         )
 
-    sections = [
-        "## Coder follow-up",
-        parsed_followup.summary.strip(),
-        "\n".join(["### Addressed items", *addressed_items]),
-        "\n".join(["### Remaining items", *remaining_items]),
-    ]
+    if head_unchanged_sha:
+        # The PR head did not move, so the coder's statements are claims about
+        # the existing head, not changes attributed to this turn (#1034).
+        sections = [
+            "## Coder follow-up",
+            coder_followup_head_unchanged_notice(head_unchanged_sha),
+            f"Coder summary (claim, unverified): {parsed_followup.summary.strip()}",
+            "\n".join(
+                [
+                    f"### Claimed already present at `{head_unchanged_sha}` (PR head unchanged)",
+                    *addressed_items,
+                ]
+            ),
+            "\n".join(["### Remaining items", *remaining_items]),
+        ]
+    else:
+        sections = [
+            "## Coder follow-up",
+            parsed_followup.summary.strip(),
+            "\n".join(["### Addressed items", *addressed_items]),
+            "\n".join(["### Remaining items", *remaining_items]),
+        ]
     if disputed_items:
         sections.append("\n".join(["### Disputed items", *disputed_items]))
     if parsed_followup.tests_run:
@@ -1421,9 +1583,15 @@ def _render_public_coder_followup_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
+    citation_degradations = render_test_observation_degradations_section(
+        parsed_followup.test_observation_degradations
+    )
+    if citation_degradations:
+        sections.append(citation_degradations)
     matrix_evidence = _render_risk_test_matrix_evidence(
         parsed_followup.risk_test_matrix_evidence,
         render_decision=matrix_evidence_render_decision,
+        diagnostics=parsed_followup.risk_test_matrix_diagnostics,
     )
     if matrix_evidence:
         sections.append(matrix_evidence)
@@ -1490,7 +1658,15 @@ def _render_public_issue_implementation_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
-    matrix_evidence = _render_risk_test_matrix_evidence(parsed.risk_test_matrix_evidence)
+    citation_degradations = render_test_observation_degradations_section(
+        parsed.test_observation_degradations
+    )
+    if citation_degradations:
+        sections.append(citation_degradations)
+    matrix_evidence = _render_risk_test_matrix_evidence(
+        parsed.risk_test_matrix_evidence,
+        diagnostics=parsed.risk_test_matrix_diagnostics,
+    )
     if matrix_evidence:
         sections.append(matrix_evidence)
     human_section = render_human_requirement_dispositions(
@@ -1548,6 +1724,12 @@ _COMPACT_PRIOR_DISPOSITIONS_SHARE = 1_400
 _COMPACT_CLOSING_SHARE = 500
 _COMPACT_DEFERRED_SHARE = 900
 _COMPACT_TYPED_CATEGORY_SHARE = 400
+# Carved out of the plan-steps share only when a justification is present, so
+# the digest's total budgeted text never grows (#886).
+_COMPACT_GROWTH_JUSTIFICATION_SHARE = 1_200
+_COMPACT_GROWTH_RATIONALE_CLIPPED_NOTE = (
+    "_Rationale clipped; the complete text is in the authenticated round metadata._"
+)
 _COMPACT_ENTRY_CHARS = 300
 _COMPACT_TITLE_CHARS = 120
 _COMPACT_HUMAN_EVIDENCE_CHARS = 300
@@ -1682,6 +1864,34 @@ def _compact_human_requirements_block(block: str) -> str:
     return compact
 
 
+def _compact_growth_justification_section(justification: OneShotGrowthJustification) -> str:
+    """Crossed signals verbatim; the rationale clipped to the dedicated share."""
+    heading = "### One-shot growth justification (digest)"
+    signals_line = "- Crossed signals: " + ", ".join(
+        f"`{signal}`" for signal in justification.crossed_signals
+    )
+    prefix = "- Rationale: "
+    # Room the shared helper keeps for its omission line; this section never
+    # needs it, but the helper's arithmetic reserves it before the last entry.
+    reserve = len(_COMPACT_OMITTED_LINE.format(omitted=3, total=3)) + 1
+    fixed = len(heading) + 1 + len(signals_line) + 1 + len(prefix) + reserve
+    full = re.sub(r"\s+", " ", sanitize_historical_text(justification.rationale).strip())
+    entries = [signals_line]
+    if fixed + len(full) <= _COMPACT_GROWTH_JUSTIFICATION_SHARE:
+        entries.append(prefix + full)
+    else:
+        note = _COMPACT_GROWTH_RATIONALE_CLIPPED_NOTE
+        limit = _COMPACT_GROWTH_JUSTIFICATION_SHARE - fixed - len(note) - 1
+        entries.append(prefix + _compact_clip(justification.rationale, limit))
+        entries.append(note)
+    return _compact_budgeted_section(
+        heading,
+        entries,
+        share=_COMPACT_GROWTH_JUSTIFICATION_SHARE,
+        entry_chars=_COMPACT_GROWTH_JUSTIFICATION_SHARE,
+    )
+
+
 def _render_compact_plan_digest(
     parsed: StructuredPlanState | StructuredPlanRevision,
     *,
@@ -1708,14 +1918,20 @@ def _render_compact_plan_digest(
                 entry_chars=_COMPACT_TITLE_CHARS,
             )
         )
+    justification = parsed.one_shot_growth_justification
     budgeted.append(
         _compact_budgeted_section(
             "### Plan steps (digest)",
             [f"{index}. {step}" for index, step in enumerate(parsed.plan_steps, start=1)],
-            share=_COMPACT_STEPS_SHARE,
+            share=(
+                _COMPACT_STEPS_SHARE
+                - (_COMPACT_GROWTH_JUSTIFICATION_SHARE if justification is not None else 0)
+            ),
             entry_chars=_COMPACT_ENTRY_CHARS,
         )
     )
+    if justification is not None:
+        budgeted.append(_compact_growth_justification_section(justification))
     if parsed.additional_closing_issue_ids is not None:
         budgeted.append(
             _compact_budgeted_section(
@@ -1847,6 +2063,11 @@ def _render_public_plan_state_comment(
     typed_section = render_typed_plan_stages_section(parsed_plan.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    growth_section = render_one_shot_growth_justification_section(
+        parsed_plan.one_shot_growth_justification
+    )
+    if growth_section:
+        sections.append(growth_section)
     if parsed_plan.execution_recommendation is not None:
         sections.append(render_execution_recommendation_section(parsed_plan.execution_recommendation))
     sections.append(f"<!-- AGENT_PLAN_STATE: {parsed_plan.state} -->")
@@ -1905,6 +2126,7 @@ def render_public_agent_comment(
     current_test_turn_id: str | None = None,
     compact: bool = False,
     matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
+    head_unchanged_sha: str | None = None,
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -1948,6 +2170,7 @@ def render_public_agent_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
             matrix_evidence_render_decision=matrix_evidence_render_decision,
+            head_unchanged_sha=head_unchanged_sha,
         )
     if kind == "issue_implementation":
         if not isinstance(parsed, StructuredIssueImplementation):

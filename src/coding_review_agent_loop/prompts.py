@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
+from .agent_permissions import coder_sandbox_guidance, inspect_forms, is_sandboxed
 from .architecture_context import (
     ArchitecturePair,
     ArchitectureSnapshot,
@@ -65,6 +66,7 @@ from .test_runtime import (
     relevant_launcher_health,
     render_runtime_context,
     render_test_wrapper,
+    runtime_row_is_evidence,
 )
 
 if TYPE_CHECKING:
@@ -247,6 +249,11 @@ def _memory_block(
                 command = tuple(shlex.split(normalized))
             except ValueError:
                 continue
+            if not runtime_row_is_evidence(observation):
+                # Runs refused as evidence (e.g. an unauthenticated wrapper
+                # script) and legacy rows without launch state are never
+                # surfaced as remembered commands (#989).
+                continue
             if command and command not in seen:
                 commands.append(command)
                 seen.add(command)
@@ -295,14 +302,32 @@ def _memory_block(
             recommendations = {}
             for command in commands:
                 key = remembered_keys.get(command)
-                recommendations[command] = recommend_timeout(
-                    memory.memory_dir,
-                    argv=command,
-                    cwd=cwd,
-                    policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
-                    normalized_command_override=key[0] if key else None,
-                    fingerprint_override=key[1] if key else None,
-                    workers=key[2] if key else _expected_workers(config, command),
+                # The run may go parallel (budget default) or stay serial
+                # (no xdist in the interpreter, ``--dist no`` in addopts);
+                # the prompt cannot know which.  Whenever the remembered
+                # cohort and the expected ones differ, take the safest
+                # watchdog across all of them so a fast parallel sample
+                # never times out a serial run (#1073).
+                cohorts = list(dict.fromkeys(
+                    [*([key[2]] if key else []), *_expected_worker_cohorts(config, command)]
+                ))
+                if key:
+                    cohorts = [cohort for cohort in cohorts if cohort is not None]
+                candidates = [
+                    recommend_timeout(
+                        memory.memory_dir,
+                        argv=command,
+                        cwd=cwd,
+                        policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
+                        normalized_command_override=key[0] if key else None,
+                        fingerprint_override=key[1] if key else None,
+                        workers=cohort,
+                    )
+                    for cohort in cohorts
+                ]
+                recommendations[command] = max(
+                    candidates,
+                    key=lambda item: (item.recommended_timeout_seconds, item.successful_samples),
                 )
             runtime_text = render_runtime_context(
                 memory.memory_dir,
@@ -376,14 +401,35 @@ def _memory_block(
     return f"Agent memory context:\n{text}{runtime}\n"
 
 
-def _expected_workers(config: AgentLoopConfig, command: Sequence[str]) -> str | None:
+def _expected_worker_cohorts(config: AgentLoopConfig, command: Sequence[str]) -> list[str | None]:
+    """Cohort labels a command may run under, for a recommendation lookup.
+
+    In a repository that declares xdist support a plain pytest is expected to
+    run with the budget's default worker count (issue #1073), but it still
+    runs serially when xdist is not installed or resolved addopts say
+    ``--dist no``, so both labels are returned and the caller takes the
+    safest watchdog across them.
+    """
     try:
-        from .test_workers import expected_workers_label
+        from .test_workers import expected_workers_label, parallel_default_applies
 
         budget = preliminary_worker_budget(config)
-        return expected_workers_label(command, budget=budget.workers, mode=budget.enforcement)
+        workdir = agent_workdir(config, config.coder)
+        labels = [expected_workers_label(command, budget=budget.workers, mode=budget.enforcement)]
+        # Only a command the wrapper would give the default may use the
+        # parallel cohort; a serial-only invocation (``--collect-only``,
+        # ``--pdb``, ...) must never borrow a faster parallel timing.  The
+        # wrapper's own repository-root detection decides, so a subdirectory
+        # workdir sees the same answer as the run.
+        if parallel_default_applies(command, workdir, budget):
+            parallel = expected_workers_label(
+                command, budget=budget.workers, mode=budget.enforcement, parallel_default=True,
+            )
+            if parallel != labels[0]:
+                labels.insert(0, parallel)
+        return labels
     except Exception:  # pragma: no cover - guidance must never block a prompt
-        return None
+        return [None]
 
 
 def _scratch_file_guidance() -> str:
@@ -526,10 +572,10 @@ def parallel_test_worker_guidance(config: AgentLoopConfig | None) -> str:
     if config is None:
         return ""
     try:
-        from .test_workers import detect_parallel_support, render_worker_guidance
+        from .test_workers import detect_parallel_support, render_worker_guidance, repository_root
 
         budget = preliminary_worker_budget(config)
-        supported = detect_parallel_support(agent_workdir(config, config.coder))
+        supported = detect_parallel_support(repository_root(agent_workdir(config, config.coder)))
         return render_worker_guidance(budget, parallel_supported=supported)
     except Exception:  # pragma: no cover - guidance must never block a prompt
         return ""
@@ -699,6 +745,18 @@ def _review_command_policy(
             "`git diff <base>...HEAD` with that resolved branch name; do not run "
             "the placeholder literally or discover branches speculatively."
         )
+    if is_sandboxed(config):
+        # The sandboxed grant allows no raw git/rg/sed; the workdir guidance
+        # names the exact inspect forms (Claude) or the read-only sandbox (Codex).
+        return (
+            "Do not run tests, builds, compilation, source or worktree mutation, "
+            "commits, or unrelated discovery commands. Inspect the assigned checkout "
+            "only with the read-only forms named in the sandboxed permissions section "
+            "and direct file reads. "
+            + (f"{diff_guidance} " if diff_guidance else "")
+            + "Do not fetch, checkout, reset, clean, write files other than the "
+            f"public response, or change repository state during review. {QUOTED_COMMAND_REVIEW_RULE}\n"
+        )
     return (
         "Do not run tests, builds, compilation, source or worktree mutation, "
         "commits, or unrelated discovery commands. Read-only commands used to "
@@ -750,7 +808,25 @@ def _coder_workdir_guidance(
         "running tests or committing, run `pwd` and `git status --branch --short` "
         "and confirm the path is the assigned checkout."
         f"{dangerous_warning}\n"
+        f"{_sandboxed_permission_guidance(config, implementation=implementation, agent=active_agent)}"
     )
+
+
+def _sandboxed_permission_guidance(
+    config: AgentLoopConfig, *, implementation: bool, agent: AgentName
+) -> str:
+    """Name exactly what the sandboxed grant allows for this prompt's role."""
+    if not is_sandboxed(config):
+        return ""
+    if implementation:
+        return coder_sandbox_guidance(config, agent)
+    if agent == "codex":
+        return (
+            "Sandboxed permissions are active: your sandbox is read-only and has no "
+            "network access, so rely on the issue and PR context in this prompt and on "
+            "read-only inspection of the checkout.\n"
+        )
+    return inspect_forms(config, base_branch=(config.base or None))
 
 
 def _truncate_issue_text(text: str, *, max_chars: int, label: str) -> str:
@@ -1856,7 +1932,7 @@ def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
             "Body:",
             body,
             "",
-            "Raw prior issue comments are omitted in compact planning context. Durable reviewer findings must appear in the active unresolved ledger or the append-only compact prior ledger below.",
+            "Raw prior issue comments are omitted in compact planning context. Open reviewer findings appear in the active unresolved ledger; findings that left it are summarized in the bounded compact prior ledger below, where older entries may be reduced to headers or folded into an omission notice.",
             "",
         ]
     )
@@ -1865,9 +1941,9 @@ def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
 def _compact_prior_ledger_block(compact_prior: CompactPriorContext | None) -> str:
     summaries = compact_prior.prior_item_summaries if compact_prior is not None else ()
     if not summaries:
-        return "Append-only compact prior item ledger\n\n(none)\n"
+        return "Compact prior item ledger (bounded)\n\n(none)\n"
     return (
-        "Append-only compact prior item ledger\n\n"
+        "Compact prior item ledger (bounded)\n\n"
         + "\n\n".join(summaries)
         + "\n"
     )
@@ -1893,8 +1969,8 @@ def _canonical_plan_ledger_rules() -> str:
     return """Canonical compact planning ledger rules
 
 - Treat active prior unresolved plan items as approval-critical until explicitly dispositioned.
-- Treat append-only compact prior ledger entries as the canonical history for prior blocking and same-plan concerns that left the active ledger.
-- Do not reinterpret, reorder, or rewrite prior compact ledger entries; append only new resolved or future-follow-up summaries after later review rounds.
+- Treat compact prior ledger entries as the history for prior blocking and same-plan concerns that left the active ledger. The ledger is size-bounded and lossy: the newest entries are verbatim, older entries may be reduced to their header line marked "(details compacted)", and the oldest may be folded into a single "[compacted] N earlier prior item summaries omitted" notice. Those items were already dispositioned; do not reopen them merely because their details are compacted or omitted.
+- Do not reinterpret or reorder compact ledger entries; new resolved or future-follow-up summaries are appended after later review rounds.
 - Future follow-ups are relevant in compact mode only when elevated, referenced, or preserved in the compact prior ledger.
 """
 
@@ -2610,6 +2686,98 @@ def render_inherited_coverage_delta(
     )
 
 
+PLAN_GROWTH_REVIEWER_LEVER = (
+    "this detail belongs in a child plan; restructure as staged"
+)
+
+
+def _plan_growth_thresholds_text(config: AgentLoopConfig) -> str:
+    from .plan_growth import PlanGrowthThresholds
+
+    thresholds = PlanGrowthThresholds.from_config(config)
+    return (
+        f"`rendered-size` at {thresholds.max_chars} characters of canonical plan text; "
+        f"`scope-items` at {thresholds.max_scope_items} distinct execution-recommendation "
+        f"scope items; `matrix-rows` at {thresholds.max_matrix_rows} risk-matrix rows; "
+        f"`revision-count` at {thresholds.max_revisions} planner-authored candidates, "
+        f"counted only while the plan is at least {thresholds.max_chars // 2} characters"
+    )
+
+
+def _plan_growth_planner_guidance(
+    config: AgentLoopConfig,
+    growth_notice: str | None = None,
+    *,
+    semantic_patch: bool = False,
+) -> str:
+    """Planner-facing plan-growth rules (#886)."""
+    ledger_rule = (
+        "Converting a one-shot plan to staged must preserve the scope ledger: every prior "
+        "scope item keeps its `scope_item_id`, its `requirement` text and all of its "
+        "`acceptance_criteria` verbatim (adding criteria or new scope items is allowed); make "
+        "intentional scope edits in a separate non-converting revision."
+    )
+    if getattr(config, "plan_growth_gate", "enforce") != "enforce":
+        return f"Plan-growth gate is off for this run. {ledger_rule}\n"
+    if semantic_patch:
+        write_rule = (
+            "Write it with `{\"op\": \"replace\", \"field\": \"one_shot_growth_justification\", "
+            "\"value\": {\"crossed_signals\": [\"rendered-size\"], \"rationale\": \"...\"}}`; "
+            "`value` null removes it."
+        )
+    else:
+        write_rule = (
+            "Add it as a top-level `\"one_shot_growth_justification\": "
+            "{\"crossed_signals\": [\"rendered-size\"], \"rationale\": \"...\"}` object."
+        )
+    lines = [
+        "Plan-growth gate: a signal crosses when its measurement reaches its threshold: "
+        f"{_plan_growth_thresholds_text(config)}. A one-shot plan that crosses any signal "
+        "cannot be approved unless it carries `one_shot_growth_justification` whose "
+        "`crossed_signals` names exactly the signals it crosses, with a `rationale` (at most "
+        "2000 characters) that reviewers evaluate as a semantic claim. A one-shot plan that "
+        "crosses nothing, and every staged plan, must not carry one. "
+        f"{write_rule} {ledger_rule}",
+    ]
+    if growth_notice:
+        lines.append(
+            f"{growth_notice} While a one-shot plan crosses signals, the revision must either "
+            "restructure it as a staged execution_recommendation or justify one-shot for "
+            "exactly the signals it still crosses (shrinking below every threshold is also "
+            "acceptable, and then no justification may remain). When staging, the "
+            "parent keeps scope, stage boundaries, interfaces between stages and acceptance "
+            "criteria; per-stage design goes to `requires-child-planning` children. Weigh the "
+            "cost: staged work adds child issues, handoffs and a managed-CI cycle per child, a "
+            "too-thin parent under-specifies its children, and a child that itself recommends "
+            "staging stops for human handling (#720)."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _plan_growth_review_guidance(
+    config: AgentLoopConfig,
+    growth_notice: str | None = None,
+    growth_measurements: str | None = None,
+) -> str:
+    """Reviewer-facing plan-growth lever (#886)."""
+    lever = (
+        "Plan-growth lever: when a one-shot plan is accumulating per-stage design detail, you "
+        f"may block with a finding that says \"{PLAN_GROWTH_REVIEWER_LEVER}\" instead of "
+        "asking for more detail in the parent plan. Evaluate any "
+        "`one_shot_growth_justification` in the plan as a semantic claim like any other: "
+        "block it when the rationale does not show why one-shot remains correct."
+    )
+    if growth_measurements:
+        lever += f"\n{growth_measurements}"
+    if growth_notice:
+        lever += (
+            f"\n{growth_notice} The orchestrator will not approve this plan until a revision "
+            "satisfies the plan-growth gate: a one-shot plan justifies exactly the signals it "
+            "crosses, and a plan that crosses nothing, or is staged, carries no justification."
+        )
+    return lever + "\n"
+
+
 def build_issue_plan_prompt(
     issue_number: int,
     config: AgentLoopConfig,
@@ -2638,6 +2806,7 @@ For a plan (rather than a clarification), respond with exactly one structured JS
 
 {_execution_strategy_contract_guidance()}
 
+{_plan_growth_planner_guidance(config)}
 {{
   "schema_version": 1,
   "kind": "plan_state",
@@ -2736,6 +2905,8 @@ def build_plan_review_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
     inherited_check_failure: str | None = None,
+    plan_growth_notice: str | None = None,
+    plan_growth_measurements: str | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2754,6 +2925,8 @@ def build_plan_review_prompt(
             inherited_matrix_binding=inherited_matrix_binding,
             inherited_reviewed_deltas=inherited_reviewed_deltas,
             inherited_check_failure=inherited_check_failure,
+            plan_growth_notice=plan_growth_notice,
+            plan_growth_measurements=plan_growth_measurements,
         )
         return compact_prompt
     coder_name = agent_display_name(config.coder)
@@ -2791,6 +2964,7 @@ Plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
+{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}
 Review the plan for correctness, architecture fit, missing edge cases, test
 strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -2875,6 +3049,8 @@ def _build_compact_plan_review_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
     inherited_check_failure: str | None = None,
+    plan_growth_notice: str | None = None,
+    plan_growth_measurements: str | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_name = agent_display_name(reviewer)
@@ -2912,7 +3088,10 @@ def _build_compact_plan_review_prompt(
                 config, protected_context=(human_requirements_block,)
             ),
         review_command_policy=_review_command_policy(config),
-        response_protocol=_plan_review_schema_and_rules() + "\n" + unresolved_items_guidance + _phased_plan_guard(config),
+        response_protocol=(
+            _plan_review_schema_and_rules() + "\n" + unresolved_items_guidance
+            + _phased_plan_guard(config) + _plan_growth_review_guidance(config)
+        ),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
     action = (
@@ -2935,7 +3114,7 @@ Current implementation plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{_agent_unavailable_guidance(reviewer_signature)}
+{(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{_agent_unavailable_guidance(reviewer_signature)}
 {_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
 items left active for this planning round. Do not place your signature before
@@ -3041,6 +3220,7 @@ def _build_semantic_plan_revision_prompt(
     base_state_identity: str,
     plan_validation_diagnostic: object | None,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    plan_growth_notice: str | None = None,
 ) -> str:
     """Prompt for the revision-only semantic contract.
 
@@ -3114,6 +3294,30 @@ text; do not use `rationale` or omit `disposition`.
 <!-- AGENT_PLAN_STATE: blocking -->
 -- {coder_signature}
 
+Whole-field `replace` accepts only these fields: `summary`, `plan_steps`,
+`architecture_impact`, `additional_closing_issue_ids`,
+`human_requirement_dispositions`, `execution_recommendation`,
+`external_dependencies`, `deferred_work`, `plan_actions`, `deferred_stages`,
+`one_shot_growth_justification` (value null removes it).
+Never `replace` `risk_test_matrix` and never re-emit the whole matrix; revise it
+with these per-row operations (each object uses exactly the keys shown, and
+every `row`/`target_row`/`target_rows` entry is a complete matrix row):
+- `{{"op": "matrix_add", "row": {{...}}, "final_position": 0, "rationale": "..."}}`
+  adds a new row at a zero-based position in the revised matrix.
+- `{{"op": "matrix_edit", "row_id": "existing-row", "row": {{...}}, "rationale": "..."}}`
+  replaces one existing row, for example to correct its `expected_outcome`.
+- `{{"op": "matrix_retire", "row_id": "existing-row", "rationale": "..."}}`
+  removes one existing row.
+- `{{"op": "matrix_split", "source_row_id": "existing-row", "target_rows": [{{...}}, {{...}}], "rationale": "..."}}`
+  replaces one row with two or more rows.
+- `{{"op": "matrix_merge", "source_row_ids": ["row-a", "row-b"], "target_row": {{...}}, "rationale": "..."}}`
+  consolidates two or more rows into one.
+- `{{"op": "matrix_metadata_replace", "value": {{"applicability": "applicable", "important_exclusions": ["..."]}}, "audit_operation": "change", "rationale": "..."}}`
+  replaces matrix-level metadata; `audit_operation` is `change`, `split`, or
+  `merge`, and `value` may add `not_applicable_rationale`.
+No other operation names exist.
+
+{_plan_growth_planner_guidance(config, plan_growth_notice, semantic_patch=True)}
 Operations are applied atomically and simultaneously. The patch must contain
 at least one real change, and its binding must match the authenticated values
 above exactly. Repair may fix only response-envelope presentation; it cannot
@@ -3140,6 +3344,7 @@ def build_plan_revision_prompt(
     base_round_number: int | None = None,
     base_state_identity: str | None = None,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    plan_growth_notice: str | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if response_form == "semantic-patch-v1":
@@ -3158,6 +3363,7 @@ def build_plan_revision_prompt(
             base_state_identity=base_state_identity,
             plan_validation_diagnostic=plan_validation_diagnostic,
             inherited_matrix_binding=inherited_matrix_binding,
+            plan_growth_notice=plan_growth_notice,
         )
     if compact_context:
         return _build_compact_plan_revision_prompt(
@@ -3174,6 +3380,7 @@ def build_plan_revision_prompt(
             require_risk_test_matrix_contract=require_risk_test_matrix_contract,
             plan_validation_diagnostic=plan_validation_diagnostic,
             inherited_matrix_binding=inherited_matrix_binding,
+            plan_growth_notice=plan_growth_notice,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3234,6 +3441,7 @@ Use this mandatory structured JSON response format:
     include_risk_test_matrix_contract=require_risk_test_matrix_contract
 )}
 
+{_plan_growth_planner_guidance(config, plan_growth_notice)}
 {{
   "schema_version": 1,
   "kind": "plan_revision",
@@ -3305,6 +3513,7 @@ def _build_compact_plan_revision_prompt(
     require_risk_test_matrix_contract: bool,
     plan_validation_diagnostic: object | None,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    plan_growth_notice: str | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3336,7 +3545,7 @@ def _build_compact_plan_revision_prompt(
         ),
         response_protocol=_plan_revision_schema_and_rules(
             include_risk_test_matrix_contract=require_risk_test_matrix_contract
-        ),
+        ) + "\n" + _plan_growth_planner_guidance(config),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
     action = (
@@ -3356,7 +3565,7 @@ Reviewers: {reviewer_name}
 Action for this call: {action}
 
 {format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
-
+{_plan_growth_planner_guidance(config, plan_growth_notice) if plan_growth_notice else ""}
 Previous implementation plan:
 
 {previous_plan}
@@ -3690,8 +3899,10 @@ def _compact_pr_review_issue_context_block(
         [
             "",
             "Raw prior PR-review comments are omitted in compact PR review context. "
-            "Durable reviewer findings must appear in the active unresolved ledger or "
-            "the append-only compact prior ledger below.",
+            "Open reviewer findings appear in the active unresolved ledger; findings "
+            "that left it are summarized in the bounded compact prior ledger below, "
+            "where older entries may be reduced to headers or folded into an "
+            "omission notice.",
             "",
         ]
     )
@@ -3702,8 +3913,8 @@ def _canonical_pr_review_ledger_rules() -> str:
     return """Canonical compact PR review ledger rules
 
 - Treat active prior unresolved review items as approval-critical until explicitly dispositioned.
-- Treat append-only compact prior ledger entries as the canonical history for prior blocking and same-PR concerns that left the active ledger.
-- Do not reinterpret, reorder, or rewrite prior compact ledger entries; append only new resolved or future-follow-up summaries after later review rounds.
+- Treat compact prior ledger entries as the history for prior blocking and same-PR concerns that left the active ledger. The ledger is size-bounded and lossy: the newest entries are verbatim, older entries may be reduced to their header line marked "(details compacted)", and the oldest may be folded into a single "[compacted] N earlier prior item summaries omitted" notice. Those items were already dispositioned; do not reopen them merely because their details are compacted or omitted.
+- Do not reinterpret or reorder compact ledger entries; new resolved or future-follow-up summaries are appended after later review rounds.
 - Future follow-ups are relevant in compact mode only when elevated, referenced, or preserved in the compact prior ledger.
 """
 

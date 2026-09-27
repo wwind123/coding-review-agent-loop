@@ -171,14 +171,14 @@ def validate_response_text(
             text,
             reviewer=reviewer,
             unresolved_items=deserialized_prior,
-            current_round_items=deserialized_current,
+            current_round_items=deserialized_current, architecture_status_mode="legacy",
         )
     if kind == "pr_review":
         parsed = _validate_review_response(
             text,
             reviewer=reviewer,
             unresolved_items=deserialized_prior,
-            current_round_items=deserialized_current,
+            current_round_items=deserialized_current, architecture_status_mode="legacy",
         )
         marker_present = HUMAN_REQUIREMENTS_RESOLVED_RE.search(text) is not None
         if deserialized_requirements and parsed.state == "approved" and not marker_present:
@@ -203,7 +203,7 @@ def validate_response_text(
             delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
             required_risk_test_matrix_contract=require_risk_test_matrix_contract,
             authoritative_test_observations=authoritative_test_observations,
-            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
+            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids, architecture_status_mode="legacy",
         )
     if kind == "issue_implementation":
         from coding_review_agent_loop.orchestrator import _validate_issue_implementation_response
@@ -216,7 +216,7 @@ def validate_response_text(
             delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
             require_risk_test_matrix_contract=(require_risk_test_matrix_contract == 1),
             authoritative_test_observations=authoritative_test_observations,
-            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
+            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids, architecture_status_mode="legacy",
         )
 
     parsed = validate_structured_plan_revision(

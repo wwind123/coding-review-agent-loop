@@ -9,11 +9,20 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "inspect":
+    # The sandboxed inspect grant runs `python -I -m coding_review_agent_loop.cli
+    # inspect ...`.  Dispatch before importing the rest of agent-loop so that
+    # code path loads only the standard library and inspect_tool.py.
+    from .inspect_tool import run_inspect
+
+    raise SystemExit(run_inspect(sys.argv[2:]))
+
 from .agents.base import normalize_agent_name
 from .agents.registry import (
     agent_display_name,
     agent_signature,
 )
+from .agent_permissions import establish_sandboxed_run
 from .config import (
     DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS,
     DEFAULT_MAX_ROUNDS,
@@ -80,6 +89,7 @@ from .test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     TestRuntimeConfigurationError,
     inherited_timeout_ceiling,
+    launch_integrity_state,
     record_launcher_health,
     record_test_observation,
     resolve_timeout_seconds,
@@ -92,9 +102,33 @@ from .review_evaluation import (
 )
 
 
+_ALLOW_UNREADABLE_PROTECTION_HELP = (
+    "Per-invocation waiver for managed CI when classic branch protection is not readable "
+    "by this token (HTTP 403) and the readable effective rules show no strict "
+    "final-ci/exact-head enforcement. The exact-head gate is then treated as voluntary. "
+    "Requires --allow-unprotected-managed-ci."
+)
+
+
+_PR_SIGNED_REQUIREMENT_EPILOG = (
+    "Adding instructions to a PR, including one already approved at its head: post a "
+    "PR comment that ends with a line containing exactly `-- Human Reviewer`, then "
+    "rerun `agent-loop pr <number>`. The signed comment becomes a requirement that "
+    "invalidates carried approvals, so reviewers re-check the PR against it and any "
+    "unmet part is sent to the coder. Unsigned comments are not read as requirements, "
+    "and --pr-review-force-full changes who reviews, not what must be fixed. Only a "
+    "human may sign; an agent relaying an operator decision must disclose the relay."
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a local coder -> reviewer PR review loop."
+        description="Run a local coder -> reviewer PR review loop.",
+        epilog=(
+            "To give a PR new instructions, including after it is approved, post a PR "
+            "comment ending with a line containing exactly `-- Human Reviewer` and "
+            "rerun `agent-loop pr <number>`; see `agent-loop pr --help`."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -351,7 +385,23 @@ def build_parser() -> argparse.ArgumentParser:
                 "local repositories: Claude gets --dangerously-skip-permissions and "
                 "Codex gets --dangerously-bypass-approvals-and-sandbox, Gemini "
                 "gets --yolo and --skip-trust, and Antigravity gets "
-                "--dangerously-skip-permissions."
+                "--dangerously-skip-permissions. Alias for --agent-permissions dangerous."
+            ),
+        )
+        subparser.add_argument(
+            "--agent-permissions",
+            choices=("default", "sandboxed", "dangerous"),
+            default=None,
+            help=(
+                "Agent permission mode (default: default). 'sandboxed' builds CLI-enforced, "
+                "role-scoped grants per invocation for Claude and Codex: coders (Claude only) "
+                "may edit their checkout and run git, the prompt-named gh subcommands, and the "
+                "exact resolved test invocation; every other role is read-only, writes only "
+                "its response file, and (Claude) inspects only through `agent-loop inspect`. "
+                "Sandboxed mode rejects every --<agent>-arg, Gemini/Antigravity on any "
+                "selection path (including the default repair and semantic-followup "
+                "backends), and a committing Codex coder. 'dangerous' equals "
+                "--dangerous-agent-permissions."
             ),
         )
         subparser.add_argument(
@@ -767,6 +817,55 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--plan-growth-gate",
+            choices=("enforce", "off"),
+            default="enforce",
+            help=(
+                "Plan-growth gate (#886). With enforce (default), a v1 one-shot plan that "
+                "crosses a plan-growth threshold cannot be approved until a revision either "
+                "restructures it as staged or carries a reviewed "
+                "`one_shot_growth_justification` naming exactly the crossed signals. off "
+                "disables the gate; scope-ledger preservation on one-shot-to-staged "
+                "conversions still applies."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-growth-max-chars",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "Canonical plan size (characters) at which the rendered-size growth signal "
+                "crosses (default: 120000, twice the 60000-character comment limit, because "
+                "canonical text also carries encoded recommendation and matrix records)."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-growth-max-revisions",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "Planner-authored plan candidates at which the revision-count signal crosses "
+                "(default: 6). It counts only while the plan is at least half the size "
+                "threshold; reviewer-only rounds never count."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-growth-max-scope-items",
+            type=int,
+            default=None,
+            metavar="N",
+            help="Distinct execution-recommendation scope items at which the scope-items signal crosses (default: 12).",
+        )
+        subparser.add_argument(
+            "--plan-growth-max-matrix-rows",
+            type=int,
+            default=None,
+            metavar="N",
+            help="Risk-matrix rows at which the matrix-rows signal crosses (default: 18).",
+        )
+        subparser.add_argument(
             "--pr-review-broad-rule",
             dest="pr_review_broad_rules",
             action="append",
@@ -887,6 +986,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     issue.add_argument(
+        "--allow-unreadable-protection", action="store_true",
+        help=_ALLOW_UNREADABLE_PROTECTION_HELP,
+    )
+    issue.add_argument(
         "--managed-ci-fresh",
         "--managed-ci-fresh-authorization",
         dest="managed_ci_fresh_authorization",
@@ -899,7 +1002,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_review_parallel(issue)
 
-    pr = subparsers.add_parser("pr", help="Run the reviewer/coder loop on an existing PR.")
+    pr = subparsers.add_parser(
+        "pr",
+        help="Run the reviewer/coder loop on an existing PR.",
+        description="Run the reviewer/coder loop on an existing PR.",
+        epilog=_PR_SIGNED_REQUIREMENT_EPILOG,
+    )
     pr.add_argument("pr_number", type=int)
     pr.add_argument(
         "--expected-closing-issue",
@@ -931,6 +1039,10 @@ def build_parser() -> argparse.ArgumentParser:
             "request and "
             "--managed-ci-trusted-actor; never authorizes arbitrary PR adoption."
         ),
+    )
+    pr.add_argument(
+        "--allow-unreadable-protection", action="store_true",
+        help=_ALLOW_UNREADABLE_PROTECTION_HELP,
     )
     pr.add_argument(
         "--managed-ci-fresh",
@@ -1002,6 +1114,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Per-invocation waiver when GitHub cannot independently enforce final-ci/exact-head. "
             "Requires --managed-ci or --auto-merge and --managed-ci-trusted-actor."
         ),
+    )
+    managed_pr.add_argument(
+        "--allow-unreadable-protection", action="store_true",
+        help=_ALLOW_UNREADABLE_PROTECTION_HELP,
     )
     add_review_parallel(managed_pr)
 
@@ -1159,6 +1275,26 @@ def build_parser() -> argparse.ArgumentParser:
         "inner_argv",
         nargs=argparse.REMAINDER,
         help="Use `--` before the command to run.",
+    )
+
+    inspect = subparsers.add_parser(
+        "inspect",
+        help=(
+            "Hardened read-only git/gh runner: the only shell grant for sandboxed Claude "
+            "non-coders. Usage: inspect --git=<abs git> [--gh=<abs gh>] git|gh ARGS."
+        ),
+        description=(
+            "Run an allowlisted read-only git (diff, log, show, status, rev-parse, "
+            "ls-files) or gh (issue view, pr view, pr diff, pr checks) command with the "
+            "pinned executables, a closed environment, forced safe git config, and a "
+            "repository-config gate. The leading --git=/--gh= options are accepted only "
+            "in the first positions."
+        ),
+    )
+    inspect.add_argument(
+        "inspect_argv",
+        nargs=argparse.REMAINDER,
+        help="--git=<path> [--gh=<path>] followed by git|gh and its arguments.",
     )
 
     containment_preflight = subparsers.add_parser(
@@ -1374,6 +1510,7 @@ def _record_run_tests_result(
     executed_argv: Sequence[str] | None,
     worker_enforcement: str | None,
     caveats: Sequence[str],
+    launch_integrity: str,
 ) -> None:
     record_test_observation(
         args.memory_dir,
@@ -1390,6 +1527,7 @@ def _record_run_tests_result(
         executed_argv=executed_argv,
         worker_enforcement=worker_enforcement,
         caveats=caveats,
+        launch_integrity=launch_integrity,
     )
 
 
@@ -1501,6 +1639,9 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                         executed_argv=broker_result.executed_argv or None,
                         worker_enforcement=broker_result.worker_enforcement,
                         caveats=broker_result.worker_caveats,
+                        # A launch the evidence gate refuses stays non-evidence
+                        # here too, so it is never recommended back (#989).
+                        launch_integrity=launch_integrity_state(broker_result),
                     )
                 return int(broker_result.returncode if broker_result.returncode is not None else 1)
         else:
@@ -1579,6 +1720,7 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                 executed_argv=result.args,
                 worker_enforcement=result.worker_enforcement,
                 caveats=result.worker_caveats,
+                launch_integrity=launch_integrity_state(result),
             )
         return int(result.returncode if result.returncode is not None else 1)
     except (AgentLoopError, OSError, ValueError) as exc:
@@ -1604,6 +1746,13 @@ def _resolve_task_text(args: argparse.Namespace) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    if tokens and tokens[0] == "inspect":
+        # Validate inspect arguments with its own exact allowlist; argparse
+        # would accept option abbreviations.
+        from .inspect_tool import run_inspect
+
+        return run_inspect(tokens[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command in {"review-evaluation", "evaluate-reviews", "evaluate-review"}:
@@ -1711,6 +1860,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError("--allow-unprotected-managed-ci requires --managed-ci-trusted-actor.")
             if getattr(args, "managed_ci_adopt_existing_pr", False):
                 raise AgentLoopError("--allow-unprotected-managed-ci cannot be used with --managed-ci-adopt-existing-pr.")
+        if getattr(args, "allow_unreadable_protection", False) and not getattr(
+            args, "allow_unprotected_managed_ci", False
+        ):
+            raise AgentLoopError(
+                "--allow-unreadable-protection requires --allow-unprotected-managed-ci; "
+                "unreadable branch protection is waived only together with the unprotected waiver."
+            )
         if getattr(args, "managed_ci_fresh_authorization", False):
             if args.command not in {"issue", "pr"}:
                 raise AgentLoopError(
@@ -1772,12 +1928,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "plan_execution_mode": plan_execution_mode,
                 }
             )
+            establish_sandboxed_run(config, command="issue", plan_first=args.plan_first)
             return run_issue_loop(
                 runner,
                 issue_number=args.issue_number,
                 config=config,
                 plan_first=args.plan_first,
             )
+        if args.command != "issue":
+            establish_sandboxed_run(config, command=args.command)
         if args.command == "pr":
             return run_pr_loop(runner, pr_number=args.pr_number, config=config)
         if args.command == "managed-pr":

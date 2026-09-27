@@ -8,7 +8,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from datetime import datetime
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -26,12 +26,17 @@ from .errors import AgentLoopError
 from .github import (
     PullRequestMergeability,
     PullRequestMetadata,
+    board_protection_is_reliable,
     get_pr_checks,
+    protection_awaits_readiness,
     get_pr_head_sha,
     get_pr_mergeability,
+    note_host_footer_observed,
     parse_strong_issue_reference_evidence,
-    patch_verified_trusted_protocol_comment,
+    patch_verified_trusted_protocol_comment_observed,
     post_verified_trusted_pr_protocol_comment,
+    post_verified_trusted_pr_protocol_comment_observed,
+    WrittenProtocolComment,
 )
 from .logging import log
 from .runner import Runner
@@ -41,9 +46,12 @@ from .protocol_markers import (
     PR_BODY_SURFACE,
     PR_COMMENT_SURFACE,
     TrustedBody,
+    KNOWN_HOST_COMMENT_FOOTER,
     protocol_record_label,
     scan_reserved_markers,
+    strip_known_host_footer,
 )
+from .protocol import CI_MACHINE_OBLIGATION_KINDS, MACHINE_AUTHORITY
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
 
 
@@ -67,6 +75,10 @@ RECOVERY_MARKER = "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1"
 # Advertised by a base workflow whose intent validator admits the fixed
 # visible authorization line ahead of the record (#935).
 VISIBLE_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1"
+# Advertised by a base workflow whose intent validator admits the record
+# followed by exactly the known host comment footer, matched against the raw
+# comment body (#1043).
+HOST_FOOTER_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1"
 UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
 ISSUE_AUTHORIZATION_MARKER = "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1"
 _TERMINAL_CI_STATUSES = frozenset({
@@ -88,7 +100,7 @@ class ManagedCiProbeContext:
 class ProtectionAssessment:
     """Whether GitHub, rather than this process, enforces the final context."""
 
-    state: Literal["strict", "voluntary", "plan_limited", "indeterminate"]
+    state: Literal["strict", "voluntary", "plan_limited", "unreadable", "indeterminate"]
     source: str
     detail: str
 
@@ -109,6 +121,83 @@ class ManagedCiReadiness:
     # The evaluator resolves the repository default before it probes the
     # workflow.  Keep that value so preflight reports the branch it assessed.
     base: str | None = None
+    # ``asserted`` means the Actions variable read was refused with HTTP 403
+    # and ``--managed-ci-trusted-actor`` stood in for it.  The value is then
+    # unverified locally; the workflow still enforces the real variable.
+    advertised_actor_source: Literal["variable", "asserted"] | None = None
+
+
+@dataclass(frozen=True)
+class ManagedActorVariable:
+    """One classified read of the ``AGENT_LOOP_MANAGED_ACTOR`` variable."""
+
+    value: str | None
+    status: Literal["readable", "absent", "unreadable", "error"]
+    detail: str
+
+
+# The explicit per-invocation waivers.  ``unreadable`` protection is never
+# implied by --allow-unprotected-managed-ci alone (#1040).
+_UNPROTECTED_WAIVER = "allow-unprotected-managed-ci"
+_UNREADABLE_WAIVER = "allow-unreadable-protection"
+_OVERRIDE_PROTECTION_STATES = frozenset({"voluntary", "plan_limited", "unreadable"})
+_UNREADABLE_PROTECTION_DETAIL = (
+    "classic branch protection is not readable by this token (HTTP 403); "
+    "effective rules show no strict final-ci/exact-head enforcement"
+)
+_HIDDEN_BYPASS_DETAIL = (
+    "; a ruleset requiring final-ci/exact-head does not expose its bypass actors to this token"
+)
+
+
+def waivable_protection_states(config: AgentLoopConfig) -> frozenset[str]:
+    """Return the non-strict protection states this invocation explicitly waives."""
+    if not config.allow_unprotected_managed_ci:
+        return frozenset()
+    if config.allow_unreadable_protection:
+        return _OVERRIDE_PROTECTION_STATES
+    return frozenset({"voluntary", "plan_limited"})
+
+
+def waiver_flags_for_protection(state: str) -> str:
+    """Render the CLI flags needed to waive ``state`` explicitly."""
+    if state == "unreadable":
+        return "--allow-unprotected-managed-ci --allow-unreadable-protection"
+    return "--allow-unprotected-managed-ci"
+
+
+def _waiver_for_protection(state: str) -> str | None:
+    """Map a persisted protection state to its persisted waiver value."""
+    if state in {"voluntary", "plan_limited"}:
+        return _UNPROTECTED_WAIVER
+    if state == "unreadable":
+        return _UNREADABLE_WAIVER
+    return None
+
+
+def reconcile_live_protection(
+    persisted: str | None, live: ProtectionAssessment, *, config: AgentLoopConfig
+) -> ProtectionAssessment:
+    """Continue a persisted ``unreadable`` PR on a host that reads ``voluntary`` (#1063).
+
+    ``unreadable`` already waives an unknown, non-strict base, so a live
+    ``voluntary`` reading (this host can see more, and it is still not strict)
+    is covered by the same explicit waivers.  The PR keeps its persisted
+    state so every authorization and resume record stays consistent.  Every
+    other disagreement, notably a base that became strict, is returned as-is
+    and still refuses.
+    """
+    if (
+        persisted == "unreadable"
+        and live.state == "voluntary"
+        and "unreadable" in waivable_protection_states(config)
+    ):
+        return replace(
+            live,
+            state="unreadable",
+            detail=f"persisted unreadable; live assessment is voluntary ({live.detail})",
+        )
+    return live
 
 
 PREFLIGHT_STRICT_READY = 0
@@ -161,6 +250,13 @@ class ManagedCiContract:
     # Derived from the same base workflow. Only a workflow that advertises
     # the visible-intent envelope may receive the prefixed intent body.
     visible_intent_capable: bool = False
+    # Derived from the same base workflow. Only a workflow that advertises
+    # the host-footer envelope can find an intent a footering host stored.
+    host_footer_capable: bool = False
+    # True once this generation issued a workflow dispatch or attached an
+    # existing run.  The ``dispatch-requested`` lifecycle state is never
+    # evidence of a dispatch.
+    dispatch_issued: bool = False
     # Explicit lifecycle provenance.  These fields are intentionally not
     # inferred from public mode flags after activation.
     origin: Literal["issue-created", "source-managed"] | None = None
@@ -247,6 +343,11 @@ class ManagedCiIssueAuthorization:
     predecessor_comment_id: int | None = None
     round_comment_ids: tuple[int, ...] = ()
     approved_plan_hash: str | None = None
+    # Earlier actor-owned records this fresh grant (#1065) or continuity
+    # record (#1069) retires.  A superseded record is history: it is neither
+    # a competing grant nor a predecessor, so accumulated unbound records
+    # cannot wedge a PR.
+    superseded_comment_ids: tuple[int, ...] = ()
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -272,6 +373,8 @@ class ManagedCiIssueAuthorization:
             payload["round_comment_ids"] = list(self.round_comment_ids)
         if self.approved_plan_hash is not None:
             payload["approved_plan_hash"] = self.approved_plan_hash
+        if self.superseded_comment_ids:
+            payload["superseded_comment_ids"] = list(self.superseded_comment_ids)
         return payload
 
 
@@ -293,6 +396,12 @@ class AuthenticatedManagedResume:
     source_sha: str | None = None
     managed_branch: str | None = None
     override_nonce: str | None = None
+
+
+# Record kinds that may retire earlier records: the explicit fresh grant
+# (#1065) and the ordinary path's continuity record (#1069).  A creation
+# checkpoint is the PR's first record and never supersedes.
+_SUPERSEDING_AUTHORIZATION_KINDS = frozenset({"fresh", "continuity"})
 
 
 def _encode_issue_authorization_payload(payload: dict[str, object]) -> str:
@@ -378,11 +487,29 @@ def parse_issue_created_authorization_comment(
     plan_hash = payload.get("approved_plan_hash")
     if plan_hash is not None and (not isinstance(plan_hash, str) or not plan_hash):
         raise AgentLoopError("Managed-CI issue authorization record has an invalid plan hash.")
+    superseded_comment_ids = payload.get("superseded_comment_ids", [])
+    if (
+        not isinstance(superseded_comment_ids, list)
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in superseded_comment_ids
+        )
+        or superseded_comment_ids != sorted(set(superseded_comment_ids))
+        or ("superseded_comment_ids" in payload and not superseded_comment_ids)
+    ):
+        raise AgentLoopError(
+            "Managed-CI issue authorization record has invalid superseded record IDs."
+        )
+    if superseded_comment_ids and kind not in _SUPERSEDING_AUTHORIZATION_KINDS:
+        raise AgentLoopError(
+            "Only a fresh or continuity managed-CI authorization may supersede "
+            "earlier records."
+        )
     allowed_fields = {
         "version", "kind", "repository", "issue", "pr", "base", "head", "actor",
         "actor_id", "protection", "waiver", "nonce", "label_event_id",
         "predecessor_head", "predecessor_comment_id", "round_comment_ids",
-        "approved_plan_hash",
+        "approved_plan_hash", "superseded_comment_ids",
     }
     if set(payload) - allowed_fields:
         raise AgentLoopError("Managed-CI issue authorization record has unknown fields.")
@@ -395,8 +522,8 @@ def parse_issue_created_authorization_comment(
             "Managed-CI creation authorization cannot contain continuity fields."
         )
     if kind in {"creation", "fresh", "continuity"} and (
-        payload["protection"] not in {"voluntary", "plan_limited"}
-        or payload["waiver"] != "allow-unprotected-managed-ci"
+        payload["protection"] not in _OVERRIDE_PROTECTION_STATES
+        or payload["waiver"] != _waiver_for_protection(payload["protection"])
     ):
         raise AgentLoopError(
             "Managed-CI issue authorization has an invalid protection or waiver context."
@@ -417,7 +544,7 @@ def parse_issue_created_authorization_comment(
         raise AgentLoopError(
             "Managed-CI continuity authorization requires predecessor and round metadata."
         )
-    return ManagedCiIssueAuthorization(
+    parsed = ManagedCiIssueAuthorization(
         kind=kind,
         repository=payload["repository"],
         issue_number=payload["issue"],
@@ -434,7 +561,21 @@ def parse_issue_created_authorization_comment(
         predecessor_comment_id=predecessor_comment_id,
         round_comment_ids=tuple(round_comment_ids),
         approved_plan_hash=plan_hash,
+        superseded_comment_ids=tuple(superseded_comment_ids),
     )
+    # Full-body authentication (#1043): the whole body must equal the canonical
+    # rendering of the parsed record, or exactly the historical marker-only
+    # rendering that predates the visible label (#878).  Callers remove the
+    # known host footer once at their ingestion boundary; this parser never
+    # strips, so a doubled, misplaced, or variant footer, or any other prose,
+    # is rejected here.
+    historical = (
+        f"<!-- {ISSUE_AUTHORIZATION_MARKER}: "
+        f"{_encode_issue_authorization_payload(parsed.to_payload())} -->"
+    )
+    if body not in {str(format_issue_created_authorization_comment(parsed)), historical}:
+        raise AgentLoopError("Managed-CI issue authorization record is malformed.")
+    return parsed
 
 
 def parse_managed_ci_override_record(
@@ -559,6 +700,7 @@ class ManagedCiOutcome:
         "infrastructure_stall",
         "terminal_without_status",
         "not_started",
+        "protection_unreadable",
     ]
     checks: PullRequestChecks | None = None
     mergeability: PullRequestMergeability | None = None
@@ -823,6 +965,107 @@ def _is_plan_limited_error(result: object) -> bool:
     return "upgrade to github pro" in combined or "make this repository public" in combined
 
 
+_GH_HTTP_STATUS_LINE = re.compile(r"^gh: .*\(HTTP (\d{3})\)[ \t\r]*$", re.MULTILINE)
+
+
+def _http_status(result: object) -> int | None:
+    """Return the HTTP status from gh's own stderr diagnostic, strictly.
+
+    ``gh api`` writes the API response body to stdout, and that body may quote
+    arbitrary text, so stdout is never inspected.  Only stderr lines shaped
+    like ``gh: <message> (HTTP 403)`` count, and every such line must agree.
+    A missing, mid-line, or conflicting status yields ``None`` so no
+    status-specific fallback applies.
+    """
+    if getattr(result, "returncode", 0) == 0:
+        return None
+    stderr = str(getattr(result, "stderr", "") or "")
+    statuses = {int(match) for match in _GH_HTTP_STATUS_LINE.findall(stderr)}
+    if len(statuses) != 1:
+        return None
+    return next(iter(statuses))
+
+
+def _read_managed_actor_variable(
+    runner: Runner, gh_cmd: str, repo: str, cwd: Path
+) -> ManagedActorVariable:
+    """Classify the ``AGENT_LOOP_MANAGED_ACTOR`` read for every identity check.
+
+    A strict HTTP 403 is checked before the legacy 404 text match, so a
+    refused read whose body happens to mention 404 is never "absent".
+    """
+    endpoint = f"repos/{repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR"
+    result = runner.run([gh_cmd, "api", endpoint], cwd=cwd, check=False)
+    if result.returncode == 0:
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            payload = None
+        value = payload.get("value") if isinstance(payload, dict) else None
+        if isinstance(value, str):
+            return ManagedActorVariable(value, "readable", f"{endpoint} is readable")
+        if isinstance(payload, dict):
+            # Historically a readable response without a value advertises no
+            # actor (an identity mismatch), not an unreadable probe.
+            return ManagedActorVariable(None, "absent", f"{endpoint} has no string value")
+        return ManagedActorVariable(None, "error", f"{endpoint} returned a malformed response")
+    if _http_status(result) == 403:
+        return ManagedActorVariable(
+            None, "unreadable", f"{endpoint} is not readable by this token (HTTP 403)"
+        )
+    if _is_http_error(result, 404):
+        return ManagedActorVariable(None, "absent", f"{endpoint} is not configured")
+    status = _http_status(result)
+    return ManagedActorVariable(
+        None, "error",
+        f"{endpoint} could not be read" + (f" (HTTP {status})" if status is not None else ""),
+    )
+
+
+def _resolve_advertised_actor(
+    variable: ManagedActorVariable, configured: str | None
+) -> tuple[str | None, Literal["variable", "asserted"] | None]:
+    """Return the advertised actor and where it came from.
+
+    Only a strict 403 lets the operator's trusted actor stand in.  A readable
+    variable always wins, and absence or any other error yields no actor.
+    """
+    if variable.status == "readable":
+        return variable.value, "variable"
+    configured = (configured or "").strip()
+    if variable.status == "unreadable" and configured:
+        return configured, "asserted"
+    return None, None
+
+
+_ASSERTED_ACTOR_LOGGED: set[tuple[str, str]] = set()
+
+
+def _log_asserted_actor(config: AgentLoopConfig, actor: str) -> None:
+    key = (config.repo.casefold(), actor.casefold())
+    if key in _ASSERTED_ACTOR_LOGGED:
+        return
+    _ASSERTED_ACTOR_LOGGED.add(key)
+    log(
+        config,
+        "AGENT_LOOP_MANAGED_ACTOR is not readable by this token (HTTP 403); "
+        f"--managed-ci-trusted-actor={actor} is asserted and unverified locally. "
+        "The workflow enforces vars.AGENT_LOOP_MANAGED_ACTOR server-side: a mismatch leaves "
+        "ordinary PR CI unsuppressed and fails managed dispatch validation.",
+    )
+
+
+def _advertised_managed_actor(runner: Runner, config: AgentLoopConfig) -> str | None:
+    """Resolve the advertised actor for a config-bearing identity check."""
+    variable = _read_managed_actor_variable(
+        runner, config.gh_cmd, config.repo, active_workdir(config)
+    )
+    advertised, source = _resolve_advertised_actor(variable, config.managed_ci_trusted_actor)
+    if source == "asserted" and advertised is not None:
+        _log_asserted_actor(config, advertised)
+    return advertised
+
+
 def _probe_raw_workflow(
     runner: Runner, context: ManagedCiProbeContext, base: str
 ) -> tuple[str | None, object]:
@@ -844,6 +1087,97 @@ def _has_final_context(payload: dict[str, object]) -> bool:
     )
 
 
+_RULESET_ENFORCEMENT_VALUES = frozenset({"active", "evaluate", "disabled"})
+_BYPASS_ACTOR_TYPES = frozenset({
+    "Integration", "OrganizationAdmin", "RepositoryRole", "Team", "DeployKey",
+})
+_BYPASS_ACTOR_TYPES_WITHOUT_ID = frozenset({"OrganizationAdmin", "DeployKey"})
+_BYPASS_MODES = frozenset({"always", "pull_request"})
+
+
+def _ruleset_detail_problem(ruleset: Mapping[str, object]) -> str | None:
+    """Return why a decoded ruleset detail is malformed, or ``None``.
+
+    This is an allowlist: anything it does not recognize is malformed, so an
+    unexpected shape can never be read as "no enforcement".
+    """
+    rules = ruleset.get("rules")
+    if not isinstance(rules, list):
+        return "'rules' is not a list"
+    for rule in rules:
+        if not isinstance(rule, dict) or not isinstance(rule.get("type"), str):
+            return "a rule entry has no string 'type'"
+        if rule["type"] == "required_status_checks":
+            parameters = rule.get("parameters")
+            checks = parameters.get("required_status_checks") if isinstance(parameters, dict) else None
+            if not isinstance(checks, list) or any(
+                not isinstance(check, dict) or not isinstance(check.get("context"), str)
+                for check in checks
+            ):
+                return "a required_status_checks rule has malformed 'required_status_checks'"
+    # Every set membership test first requires a string: JSON lists and
+    # objects are unhashable and must be reported as malformed, not raise.
+    enforcement = ruleset.get("enforcement")
+    if not isinstance(enforcement, str) or enforcement not in _RULESET_ENFORCEMENT_VALUES:
+        return "'enforcement' is not a known value"
+    if "bypass_actors" in ruleset:
+        actors = ruleset["bypass_actors"]
+        if not isinstance(actors, list):
+            return "'bypass_actors' is not a list"
+        for actor in actors:
+            if not isinstance(actor, dict):
+                return "a bypass actor is not an object"
+            actor_type = actor.get("actor_type")
+            actor_id = actor.get("actor_id")
+            if not isinstance(actor_type, str) or actor_type not in _BYPASS_ACTOR_TYPES:
+                return "a bypass actor has an unknown 'actor_type'"
+            id_valid = (
+                isinstance(actor_id, int) and not isinstance(actor_id, bool) and actor_id > 0
+            ) or (actor_id is None and actor_type in _BYPASS_ACTOR_TYPES_WITHOUT_ID)
+            if not id_valid:
+                return "a bypass actor has an invalid 'actor_id'"
+            if "bypass_mode" in actor and (
+                not isinstance(actor["bypass_mode"], str)
+                or actor["bypass_mode"] not in _BYPASS_MODES
+            ):
+                return "a bypass actor has an unknown 'bypass_mode'"
+    return None
+
+
+def _ruleset_detail_well_formed(ruleset: Mapping[str, object]) -> bool:
+    return _ruleset_detail_problem(ruleset) is None
+
+
+def _ruleset_bypass_state(ruleset: Mapping[str, object]) -> Literal["none", "present", "unknown"]:
+    """Whether the ruleset's bypass actors are visibly empty, present, or hidden.
+
+    GitHub returns ``bypass_actors`` only to callers with write/admin access to
+    the ruleset, so an absent key does not prove the ruleset is unbypassable.
+    """
+    if "bypass_actors" not in ruleset:
+        return "unknown"
+    actors = ruleset["bypass_actors"]
+    if isinstance(actors, list) and not actors:
+        return "none"
+    return "present"
+
+
+def _ruleset_requires_final_context(rules: object) -> bool:
+    """Exact match on a required_status_checks context; no substring search."""
+    if not isinstance(rules, list):
+        return False
+    for rule in rules:
+        if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+            continue
+        parameters = rule.get("parameters")
+        checks = parameters.get("required_status_checks") if isinstance(parameters, dict) else None
+        if isinstance(checks, list) and any(
+            isinstance(check, dict) and check.get("context") == FINAL_CONTEXT for check in checks
+        ):
+            return True
+    return False
+
+
 def assess_exact_head_protection(
     runner: Runner, *, context: ManagedCiProbeContext, base: str
 ) -> ProtectionAssessment:
@@ -852,16 +1186,33 @@ def assess_exact_head_protection(
     A required context alone is voluntary when administrators can bypass it.
     Rulesets are inspected as an additional independent enforcement source;
     evaluate-mode and bypass actors are deliberately not strict.
+
+    When the classic protection endpoint refuses this token with a strict
+    HTTP 403 (#1040), protection is indeterminate rather than absent.  It is
+    classified as the distinct ``unreadable`` state only when the effective
+    rules were fully inspected and show no strict enforcement; after such a
+    403 a ruleset proves strict only when its bypass actors are visible and
+    empty.  Every other failure on that path stays ``indeterminate``.
     """
     required, required_result = _probe_json(
         runner, context, f"repos/{context.repo}/branches/{base}/protection/required_status_checks"
     )
     classic_state: Literal["voluntary", "plan_limited", "indeterminate"] | None = None
     classic_detail = "final-ci/exact-head is not independently required"
+    classic_forbidden = False
     if required is None:
         if _is_plan_limited_error(required_result):
             classic_state = "plan_limited"
             classic_detail = "GitHub plan/API does not permit branch protection"
+        elif _http_status(required_result) == 403:
+            # Checked before the legacy 404 text match, so a refused read
+            # whose body mentions 404 is never mistaken for "not configured".
+            classic_forbidden = True
+            classic_state = "indeterminate"
+            classic_detail = (
+                "required-status protection could not be inspected "
+                f"(repos/{context.repo}/branches/{base}/protection/required_status_checks: HTTP 403)"
+            )
         elif _is_http_error(required_result, 404):
             classic_state = "voluntary"
             classic_detail = "required status protection is not configured"
@@ -880,6 +1231,8 @@ def assess_exact_head_protection(
         elif admins_result.returncode != 0:
             classic_state = "indeterminate"
             classic_detail = "admin enforcement could not be inspected"
+            if _http_status(admins_result) == 403:
+                classic_forbidden = True
         else:
             classic_state = "indeterminate"
             classic_detail = "admin enforcement response was malformed"
@@ -891,26 +1244,62 @@ def assess_exact_head_protection(
         # unknown result, so retain the actionable classification.
         if classic_state == "plan_limited":
             return ProtectionAssessment("plan_limited", "classic", classic_detail)
+        if classic_forbidden:
+            # Only gh's own strict 404/422 status proves "no rules" here.
+            if _http_status(rules_result) in {404, 422}:
+                return ProtectionAssessment("unreadable", "classic", _UNREADABLE_PROTECTION_DETAIL)
+            return ProtectionAssessment("indeterminate", "rulesets", "effective branch rules could not be inspected")
         if _is_http_error(rules_result, 404, 422):
             return ProtectionAssessment(classic_state or "voluntary", "classic" if classic_state else "none", classic_detail)
         return ProtectionAssessment("indeterminate", "rulesets", "effective branch rules could not be inspected")
     voluntary = False
+    hidden_bypass = False
+    rules_fully_inspected = True
+    malformed_detail: str | None = None
     for entry in rules:
         if not isinstance(entry, dict):
+            rules_fully_inspected = False
+            malformed_detail = malformed_detail or "an effective rule entry is not an object"
             continue
         ruleset_id = entry.get("ruleset_id") or entry.get("id")
         if not isinstance(ruleset_id, int):
+            rules_fully_inspected = False
+            malformed_detail = malformed_detail or "an effective rule entry has no integer ruleset id"
             continue
         ruleset, ignored = _probe_json(runner, context, f"repos/{context.repo}/rulesets/{ruleset_id}")
         if ruleset is None:
             return ProtectionAssessment("indeterminate", "rulesets", "an applicable ruleset could not be inspected")
-        contexts = json.dumps(ruleset.get("rules") or [])
-        if FINAL_CONTEXT not in contexts:
+        problem = _ruleset_detail_problem(ruleset)
+        if problem is not None:
+            rules_fully_inspected = False
+            malformed_detail = malformed_detail or f"ruleset {ruleset_id}: {problem}"
+            if classic_forbidden:
+                continue
+        if not _ruleset_requires_final_context(ruleset.get("rules")):
             continue
-        if ruleset.get("enforcement") != "active" or ruleset.get("bypass_actors"):
+        if classic_forbidden:
+            bypass_state = _ruleset_bypass_state(ruleset)
+            non_bypassable = bypass_state == "none"
+        else:
+            bypass_state = None
+            non_bypassable = not ruleset.get("bypass_actors")
+        if ruleset.get("enforcement") != "active" or not non_bypassable:
             voluntary = True
+            if ruleset.get("enforcement") == "active" and bypass_state == "unknown":
+                hidden_bypass = True
             continue
         return ProtectionAssessment("strict", "ruleset", "active ruleset requires final-ci/exact-head without bypass actors")
+    if classic_forbidden:
+        if not rules_fully_inspected:
+            return ProtectionAssessment(
+                "indeterminate", "rulesets",
+                f"effective branch rules were malformed ({malformed_detail}); "
+                "applicable enforcement could not be inspected",
+            )
+        return ProtectionAssessment(
+            "unreadable", "classic",
+            _UNREADABLE_PROTECTION_DETAIL + (_HIDDEN_BYPASS_DETAIL if hidden_bypass else ""),
+        )
     if classic_state == "indeterminate":
         return ProtectionAssessment("indeterminate", "classic", classic_detail)
     if classic_state == "plan_limited":
@@ -951,13 +1340,20 @@ def evaluate_managed_ci_readiness(
             ("a required read-only GitHub probe failed",), (), resolved_base,
         )
     who, _ = _probe_json(runner, context, "user")
-    variable, variable_result = _probe_json(runner, context, f"repos/{context.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR")
+    variable = _read_managed_actor_variable(runner, context.gh_cmd, context.repo, context.cwd)
     actor = who.get("login") if who and isinstance(who.get("login"), str) else None
-    advertised = variable.get("value") if variable and isinstance(variable.get("value"), str) else None
+    advertised, advertised_source = _resolve_advertised_actor(variable, trusted_actor)
     protection = assess_exact_head_protection(runner, context=context, base=resolved_base)
-    if who is None or (variable is None and not _is_http_error(variable_result, 404)):
+    if who is None:
         return ManagedCiReadiness("indeterminate", visibility, actor, advertised, False, False, protection,
-            ("a required read-only GitHub probe failed",), ())
+            ("a required read-only GitHub probe failed: the authenticated user could not be read",), ())
+    if variable.status == "error" or (variable.status == "unreadable" and advertised is None):
+        return ManagedCiReadiness("indeterminate", visibility, actor, advertised, False, False, protection,
+            (f"a required read-only GitHub probe failed: {variable.detail}",),
+            (
+                ("pass --managed-ci-trusted-actor so it can stand in for the unreadable variable",)
+                if variable.status == "unreadable" else ()
+            ))
     core = V2_MARKER in workflow
     complete = core and all(marker in workflow for marker in V2_FEATURE_MARKERS)
     # Pre-marker v2 fixtures/workflows that contain no pull_request trigger at
@@ -967,32 +1363,53 @@ def evaluate_managed_ci_readiness(
     recovery = (RECOVERY_MARKER in workflow and "unlabeled" in workflow) or "pull_request" not in workflow
     expected_actor = trusted_actor.strip()
     identity_ok = bool(actor and advertised and expected_actor and actor.casefold() == expected_actor.casefold() == advertised.casefold())
+    source = advertised_source
     if not core:
         return ManagedCiReadiness("ordinary_fallback", visibility, actor, advertised, False, recovery, protection,
-            ("base workflow does not advertise managed-CI v2",), ("deploy the documented managed-CI v2 workflow",), resolved_base)
+            ("base workflow does not advertise managed-CI v2",), ("deploy the documented managed-CI v2 workflow",), resolved_base,
+            advertised_actor_source=source)
     if not complete or not recovery:
         missing = "complete v2 contract" if not complete else "unlabeled recovery contract"
         return ManagedCiReadiness("invalid", visibility, actor, advertised, complete, recovery, protection,
-            (f"workflow lacks the {missing}",), ("add the documented workflow markers and pull_request unlabeled trigger",), resolved_base)
+            (f"workflow lacks the {missing}",), ("add the documented workflow markers and pull_request unlabeled trigger",), resolved_base,
+            advertised_actor_source=source)
     if not identity_ok:
         return ManagedCiReadiness("ordinary_fallback", visibility, actor, advertised, complete, recovery, protection,
             ("authenticated login, trusted actor, and AGENT_LOOP_MANAGED_ACTOR do not match",),
-            (f"gh variable set AGENT_LOOP_MANAGED_ACTOR --repo {shlex.quote(context.repo)} --body {shlex.quote(expected_actor)}",), resolved_base)
+            (f"gh variable set AGENT_LOOP_MANAGED_ACTOR --repo {shlex.quote(context.repo)} --body {shlex.quote(expected_actor)}",), resolved_base,
+            advertised_actor_source=source)
     if protection.state == "strict":
-        return ManagedCiReadiness("strict_ready", visibility, actor, advertised, complete, recovery, protection, (), (), resolved_base)
-    if protection.state in {"voluntary", "plan_limited"}:
+        return ManagedCiReadiness("strict_ready", visibility, actor, advertised, complete, recovery, protection, (), (), resolved_base,
+            advertised_actor_source=source)
+    # Readiness is independent of this invocation's waiver flags; only the
+    # authorization gates consult waivable_protection_states(config).
+    if protection.state in _OVERRIDE_PROTECTION_STATES:
+        if protection.state == "unreadable":
+            remediation = (
+                "grant administration read, or configure a readable non-bypassable "
+                "final-ci/exact-head ruleset",
+                "or use --allow-unprotected-managed-ci --allow-unreadable-protection for this invocation",
+            )
+        else:
+            remediation = (
+                "configure non-bypassable final-ci/exact-head protection, or use "
+                "--allow-unprotected-managed-ci for this invocation",
+            )
         return ManagedCiReadiness("override_eligible", visibility, actor, advertised, complete, recovery, protection,
-            (protection.detail,), ("configure non-bypassable final-ci/exact-head protection, or use --allow-unprotected-managed-ci for this invocation",), resolved_base)
+            (protection.detail,), remediation, resolved_base, advertised_actor_source=source)
     return ManagedCiReadiness("indeterminate", visibility, actor, advertised, complete, recovery, protection,
-        (protection.detail,), (), resolved_base)
+        (protection.detail,), (), resolved_base, advertised_actor_source=source)
 
 
 def render_managed_ci_preflight(result: ManagedCiReadiness, *, repo: str, base: str, trusted_actor: str) -> str:
+    variable = result.advertised_actor or "missing"
+    if result.advertised_actor_source == "asserted":
+        variable += " (asserted; unverified locally, enforced by workflow)"
     lines = [
         f"repository: {repo}", f"base: {result.base or base}", f"visibility: {result.repo_visibility or 'unknown'}",
         f"workflow: {'v2 complete' if result.workflow_v2 else 'ordinary/absent'}",
         f"recovery: {'unlabeled capable' if result.recovery_capable else 'missing'}",
-        f"actor: authenticated={result.actor or 'unknown'} trusted={trusted_actor} variable={result.advertised_actor or 'missing'}",
+        f"actor: authenticated={result.actor or 'unknown'} trusted={trusted_actor} variable={variable}",
         f"protection: {result.protection.state} ({result.protection.source}; {result.protection.detail})",
         f"result: {result.state}",
     ]
@@ -1038,19 +1455,26 @@ def preflight_managed_ci_creation(
         base=config.base,
         trusted_actor=config.managed_ci_trusted_actor,
     )
+    if readiness.advertised_actor_source == "asserted" and readiness.advertised_actor:
+        _log_asserted_actor(config, readiness.advertised_actor)
     if readiness.state == "indeterminate" and not legacy_non_suppressing:
+        failed_reads = "; ".join(
+            dict.fromkeys((readiness.protection.detail, *readiness.reasons))
+        )
         if config.managed_ci:
             raise AgentLoopError(
-                "--managed-ci could not determine the repository's exact-head protection; "
+                "--managed-ci could not determine the repository's exact-head protection "
+                f"({failed_reads}). No waiver applies to an indeterminate result; "
                 "no PR was created."
             )
-        log(config, "Managed-CI readiness could not be determined; continuing with ordinary CI.")
+        log(
+            config,
+            f"Managed-CI readiness could not be determined ({failed_reads}); continuing with ordinary CI.",
+        )
         return None
     if readiness.state == "indeterminate":
         who = _api_json(runner, config, "user", quiet=True)
-        advertised = _api_json(
-            runner, config, f"repos/{config.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR", quiet=True
-        ).get("value")
+        advertised = _advertised_managed_actor(runner, config)
         actor = who.get("login") if isinstance(who.get("login"), str) else None
         if not isinstance(actor, str) or not isinstance(advertised, str) or (
             actor.casefold() != config.managed_ci_trusted_actor.casefold()
@@ -1065,32 +1489,32 @@ def preflight_managed_ci_creation(
             "override_eligible", None, actor, advertised, True, True,
             ProtectionAssessment("voluntary", "legacy", "legacy non-suppressing workflow"), (), (),
         )
-    if readiness.state == "override_eligible" and not (config.allow_unprotected_managed_ci or legacy_non_suppressing):
+    explicit_waiver = readiness.protection.state in waivable_protection_states(config)
+    if readiness.state == "override_eligible" and not (explicit_waiver or legacy_non_suppressing):
         if config.managed_ci:
             raise AgentLoopError(
                 "--managed-ci requires protected final-ci/exact-head or "
-                "--allow-unprotected-managed-ci; no PR was created."
+                f"{waiver_flags_for_protection(readiness.protection.state)} "
+                f"(protection is {readiness.protection.state}: {readiness.protection.detail}); "
+                "no PR was created."
             )
         return None
     if readiness.state != "strict_ready" and not (
-        readiness.state == "override_eligible" and (config.allow_unprotected_managed_ci or legacy_non_suppressing)
+        readiness.state == "override_eligible" and (explicit_waiver or legacy_non_suppressing)
     ):
         if config.managed_ci:
+            reasons = "; ".join(readiness.reasons)
             raise AgentLoopError(
-                "--managed-ci repository readiness is not sufficient for suppression and exact-head qualification; "
-                "no PR was created."
+                "--managed-ci repository readiness is not sufficient for suppression and exact-head qualification"
+                + (f" ({reasons})" if reasons else "")
+                + "; no PR was created."
             )
         return None
     return ManagedCiCreationIntent(
         branch=branch or f"agent-loop/managed-{issue_number}",
         trusted_actor=readiness.actor or config.managed_ci_trusted_actor,
         protection_mode=readiness.protection.state,
-        audit_nonce=(
-            secrets.token_urlsafe(18)
-            if config.allow_unprotected_managed_ci
-            and readiness.protection.state in {"voluntary", "plan_limited"}
-            else None
-        ),
+        audit_nonce=(secrets.token_urlsafe(18) if explicit_waiver else None),
     )
 
 
@@ -1131,12 +1555,7 @@ def _issue_created_tuple(
     who = _api_json(runner, config, "user", quiet=True)
     actor_login = who.get("login") if isinstance(who.get("login"), str) else None
     actor_id = who.get("id") if isinstance(who.get("id"), int) else None
-    variable = _api_json(
-        runner, config,
-        f"repos/{config.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR",
-        quiet=True,
-    )
-    advertised = variable.get("value") if isinstance(variable.get("value"), str) else None
+    advertised = _advertised_managed_actor(runner, config)
     configured = (config.managed_ci_trusted_actor or "").strip()
     if (
         not configured or not actor_login or actor_id is None or not advertised
@@ -1275,12 +1694,7 @@ def _authorization_actor(
     who = _api_json(runner, config, "user", quiet=True)
     login = who.get("login") if isinstance(who.get("login"), str) else None
     actor_id = who.get("id") if isinstance(who.get("id"), int) else None
-    advertised = _api_json(
-        runner,
-        config,
-        f"repos/{config.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR",
-        quiet=True,
-    ).get("value")
+    advertised = _advertised_managed_actor(runner, config)
     configured = (config.managed_ci_trusted_actor or "").strip()
     if (
         not configured
@@ -1312,7 +1726,7 @@ def _authorization_comment_records(
         raise AgentLoopError("Managed-CI authorization comments could not be inspected.")
     records: list[tuple[int, ManagedCiIssueAuthorization]] = []
     for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        body = _normalized_comment_body(comment, config=config)
         if ISSUE_AUTHORIZATION_MARKER not in body:
             continue
         try:
@@ -1332,7 +1746,71 @@ def _authorization_comment_records(
         if not isinstance(comment_id, int):
             raise AgentLoopError("Managed-CI authorization comment has no stable identity.")
         records.append((comment_id, parsed))
-    return records
+    superseded = _superseded_authorization_ids(records)
+    return [item for item in records if item[0] not in superseded]
+
+
+def _superseded_authorization_ids(
+    records: Iterable[tuple[int, ManagedCiIssueAuthorization]],
+) -> frozenset[int]:
+    """Return the comment IDs retired by a later superseding record.
+
+    Only a fresh (#1065) or continuity (#1069) record may supersede, only
+    records published before it, and only records in its own
+    repository/issue/PR scope.  Supersession is
+    transitive by construction: a retired record stays retired even after
+    the grant that retired it is itself superseded.
+    """
+    records = list(records)
+    by_comment_id = dict(records)
+    superseded: set[int] = set()
+    for comment_id, record in records:
+        if record.kind not in _SUPERSEDING_AUTHORIZATION_KINDS:
+            continue
+        for retired_id in record.superseded_comment_ids:
+            retired = by_comment_id.get(retired_id)
+            if (
+                retired_id < comment_id
+                and retired is not None
+                and retired.repository.casefold() == record.repository.casefold()
+                and retired.issue_number == record.issue_number
+                and retired.pr_number == record.pr_number
+            ):
+                superseded.add(retired_id)
+    return frozenset(superseded)
+
+
+def _superseded_authorization_comment_ids(
+    comments: Iterable[Mapping[str, object]],
+    *,
+    config: AgentLoopConfig,
+    actor_login: str,
+    actor_id: int,
+) -> frozenset[int]:
+    """Return superseded IDs among the actor's parseable authorization comments.
+
+    Malformed and foreign records are ignored here; each caller's own pass
+    still fails closed on them.
+    """
+    records: list[tuple[int, ManagedCiIssueAuthorization]] = []
+    for comment in comments:
+        body = _normalized_comment_body(comment, config=config)
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        comment_id = comment.get("id")
+        if (
+            ISSUE_AUTHORIZATION_MARKER not in body
+            or user.get("login") != actor_login
+            or user.get("id") != actor_id
+            or not isinstance(comment_id, int)
+        ):
+            continue
+        try:
+            parsed = parse_issue_created_authorization_comment(body)
+        except AgentLoopError:
+            continue
+        if parsed is not None:
+            records.append((comment_id, parsed))
+    return _superseded_authorization_ids(records)
 
 
 def _github_proves_descendant(
@@ -1388,6 +1866,7 @@ def find_actor_round_metadata_comment_ids(
     reviewers: list[int] = []
     coders: list[int] = []
     conflict_coders: list[int] = []
+    ci_repair_coders: list[int] = []
     for index, comment in enumerate(comments):
         metadata = by_index.get(index)
         user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
@@ -1415,6 +1894,8 @@ def find_actor_round_metadata_comment_ids(
             coders.append(comment_id)
             if metadata.get("resolves_merge_conflict"):
                 conflict_coders.append(comment_id)
+            if (predecessor_head, new_head) in metadata["ci_repair_transitions"]:
+                ci_repair_coders.append(comment_id)
     # A conflict-resolution round advances the head with no reviewer pair by
     # construction: the orchestrator skips reviewers and routes the round to
     # the coder (#829).  Accept that transition on the tool-owned merge-conflict
@@ -1422,6 +1903,12 @@ def find_actor_round_metadata_comment_ids(
     # still approve the exact final head before qualification or merge.
     if not reviewers and len(conflict_coders) == 1 and len(coders) == 1:
         return (conflict_coders[0],)
+    # A managed exact-head CI repair round on an approved head has no blocking
+    # review either: the failure came from CI, not a reviewer (#1024).  Accept
+    # it only when the tool-minted CI obligation, already advanced to the
+    # pushed head, binds both the failed predecessor head and the new head.
+    if not reviewers and len(ci_repair_coders) == 1 and len(coders) == 1:
+        return (ci_repair_coders[0],)
     if (
         not reviewers
         or len(coders) != 1
@@ -1470,6 +1957,10 @@ def _continuity_round_records(
             # reviewers by construction (#829); the machine obligation on the
             # coder record is the durable evidence of that routing.
             "resolves_merge_conflict": _records_merge_conflict_obligation(payload),
+            # A CI repair round is routed by the orchestrator-minted CI
+            # obligation (#1024); the (failed, candidate) head pairs it binds
+            # are the durable evidence of that routing.
+            "ci_repair_transitions": _records_ci_repair_transitions(payload),
         }
     return result
 
@@ -1484,6 +1975,40 @@ def _records_merge_conflict_obligation(payload: Mapping[str, object]) -> bool:
             if isinstance(item, Mapping) and item.get("obligation_kind") == "merge-conflict":
                 return True
     return False
+
+
+def _records_ci_repair_transitions(
+    payload: Mapping[str, object],
+) -> frozenset[tuple[str, str]]:
+    """Return the (failed, candidate) heads bound by tool-owned CI obligations.
+
+    Only the post-push shape counts: a machine-authority CI obligation that the
+    orchestrator advanced to ``awaiting_current_head_review`` for a candidate
+    head distinct from the head that failed.
+    """
+    transitions: set[tuple[str, str]] = set()
+    for key in ("prior_items", "new_items"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            failed = item.get("failed_head_sha")
+            candidate = item.get("candidate_head_sha")
+            if (
+                item.get("authority") == MACHINE_AUTHORITY
+                and item.get("obligation_kind") in CI_MACHINE_OBLIGATION_KINDS
+                and item.get("lifecycle") == "awaiting_current_head_review"
+                and item.get("status") in {"blocking", "same-pr"}
+                and isinstance(failed, str)
+                and isinstance(candidate, str)
+                and failed
+                and candidate
+                and failed != candidate
+            ):
+                transitions.add((failed, candidate))
+    return frozenset(transitions)
 
 
 def _continuity_round_metadata_is_valid(
@@ -1540,8 +2065,14 @@ def _continuity_round_metadata_is_valid(
     if not reviewers:
         # The conflict-resolution transition is recorded by the coder record
         # alone, so reauthenticate that shape rather than demanding a reviewer
-        # pair that never existed (#829).
-        return len(selected) == 1 and bool(coder_metadata.get("resolves_merge_conflict"))
+        # pair that never existed (#829).  A CI repair round is likewise
+        # recorded by the coder record alone, bound to this exact transition
+        # by its advanced CI obligation (#1024).
+        return len(selected) == 1 and (
+            bool(coder_metadata.get("resolves_merge_conflict"))
+            or (authorization.predecessor_head, authorization.head_sha)
+            in coder_metadata["ci_repair_transitions"]
+        )
     return len(reviewers) + 1 == len(selected)
 
 
@@ -1561,6 +2092,12 @@ def publish_issue_created_authorization(
         raise AgentLoopError(
             "Managed-CI issue-created authorization requires an actor-owned managed-label event."
         )
+    waiver = _waiver_for_protection(handoff.protection_mode)
+    if waiver is None:
+        raise AgentLoopError(
+            "Managed-CI issue-created authorization requires an explicitly waived protection state; "
+            f"the handoff carries {handoff.protection_mode}."
+        )
     expected = ManagedCiIssueAuthorization(
         kind="creation",
         repository=config.repo,
@@ -1571,7 +2108,7 @@ def publish_issue_created_authorization(
         actor_login=handoff.trusted_actor_login,
         actor_id=handoff.trusted_actor_id,
         protection=handoff.protection_mode,
-        waiver="allow-unprotected-managed-ci",
+        waiver=waiver,
         nonce=handoff.override_nonce,
         label_event_id=event[0],
         approved_plan_hash=approved_plan_hash,
@@ -1689,6 +2226,88 @@ def _continuity_live_pr_tuple(
     )
 
 
+def _stranded_continuity_comment_ids(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    records: Collection[tuple[int, ManagedCiIssueAuthorization]],
+    predecessor: ManagedCiIssueAuthorization,
+    predecessor_comment_ids: Collection[int],
+    new_head: str,
+) -> tuple[int, ...]:
+    """Return this actor's unbound records a continuity record retires (#1069).
+
+    A record is retired when GitHub cannot prove its head is an ancestor of
+    the new head, so it can never reach it.  Only records that are otherwise
+    compatible are in scope: same repository/issue/PR, base, actor, an
+    actor-owned managed-label event, the handoff's approved plan, and the
+    protection and waiver of the chain this record extends.  A record whose
+    recorded protection differs is not retired here: ordinary recovery and
+    the resume audit refuse on it before any continuity round can run, because
+    which protection state governs the PR is an operator decision that the
+    explicit fresh grant adjudicates (#1065).  The predecessor's own ancestry
+    is never retired, and any record that differs in base, actor, label
+    provenance, or plan is left in place for the existing readers to refuse on.
+    """
+    by_comment_id = dict(records)
+    chain_ids: set[int] = set(predecessor_comment_ids)
+    pending = list(predecessor_comment_ids)
+    while pending:
+        current = by_comment_id.get(pending.pop())
+        parent_id = current.predecessor_comment_id if current is not None else None
+        if parent_id is not None and parent_id not in chain_ids:
+            chain_ids.add(parent_id)
+            pending.append(parent_id)
+    candidates = [
+        (comment_id, record)
+        for comment_id, record in records
+        if comment_id not in chain_ids
+        and record.repository.casefold() == config.repo.casefold()
+        and record.issue_number == handoff.issue_number
+        and record.pr_number == handoff.pr_number
+        and record.base_ref == handoff.base_ref
+        and record.actor_login.casefold() == handoff.trusted_actor_login.casefold()
+        and record.actor_id == handoff.trusted_actor_id
+        and (record.approved_plan_hash or None) == (handoff.approved_plan_hash or None)
+        and record.protection == predecessor.protection
+        and record.waiver == predecessor.waiver
+        and record.head_sha != new_head
+    ]
+    if not candidates:
+        return ()
+    label_events = _managed_label_event_history(
+        runner,
+        config=config,
+        pr_number=handoff.pr_number,
+        actor_login=handoff.trusted_actor_login,
+        actor_id=handoff.trusted_actor_id,
+    )
+    if label_events is None:
+        # Without label provenance no record can be proven compatible, so
+        # none is retired; publication proceeds exactly as before.
+        return ()
+    valid_label_event_ids = {event_id for event_id, _login, _actor_id in label_events}
+    stranded: set[int] = set()
+    for comment_id, record in candidates:
+        if record.label_event_id not in valid_label_event_ids:
+            continue
+        try:
+            reaches = _github_proves_descendant(
+                runner,
+                config=config,
+                predecessor_head=record.head_sha,
+                live_head=new_head,
+            )
+        except AgentLoopError:
+            # A failed comparison proves nothing either way: keep the record
+            # rather than retire it or block the continuity write.
+            continue
+        if not reaches:
+            stranded.add(comment_id)
+    return tuple(sorted(stranded))
+
+
 def publish_issue_created_continuity_authorization(
     runner: Runner,
     *,
@@ -1753,7 +2372,7 @@ def publish_issue_created_continuity_authorization(
         record.actor_login.casefold() != handoff.trusted_actor_login.casefold()
         or record.actor_id != handoff.trusted_actor_id
         or record.protection != handoff.protection_mode
-        or record.waiver != "allow-unprotected-managed-ci"
+        or record.waiver != _waiver_for_protection(record.protection)
         for record in retired_history
     ):
         raise AgentLoopError(
@@ -1778,16 +2397,43 @@ def publish_issue_created_continuity_authorization(
         for comment_id, record in predecessor_records
         if record == predecessor
     }
+    # Classify stranded records first (#1069): a child left by an interrupted
+    # attempt whose head the branch has since discarded cannot reach the new
+    # head, so the new record retires it rather than treating it as a
+    # competing fork.  A child that can still reach the new head remains a
+    # fork and refuses.
+    superseded_comment_ids = _stranded_continuity_comment_ids(
+        runner,
+        config=config,
+        handoff=handoff,
+        records=records,
+        predecessor=predecessor,
+        predecessor_comment_ids=predecessor_comment_ids,
+        new_head=new_head,
+    )
     predecessor_children = [
-        record
-        for _comment_id, record in records
+        (comment_id, record)
+        for comment_id, record in records
         if (
             record.kind == "continuity"
             and record.predecessor_head == predecessor_head
             and record.predecessor_comment_id in predecessor_comment_ids
         )
     ]
-    if any(record.head_sha != new_head for record in predecessor_children):
+    # The exemption holds only when this call will publish the superseding
+    # record.  An existing child at the new head is reused or refused below,
+    # never re-published, so the fork it forms with a stranded sibling is
+    # still on record and must refuse.
+    fork_exempt = (
+        frozenset(superseded_comment_ids)
+        if not any(record.head_sha == new_head for _cid, record in predecessor_children)
+        else frozenset()
+    )
+    if any(
+        record.head_sha != new_head
+        for comment_id, record in predecessor_children
+        if comment_id not in fork_exempt
+    ):
         raise AgentLoopError(
             "Managed-CI head continuity found a forked predecessor authorization; refusing to proceed."
         )
@@ -1882,7 +2528,15 @@ def publish_issue_created_continuity_authorization(
         predecessor_comment_id=predecessor_comment_id,
         round_comment_ids=normalized_round_comment_ids,
         approved_plan_hash=handoff.approved_plan_hash,
+        superseded_comment_ids=superseded_comment_ids,
     )
+    if superseded_comment_ids:
+        log(
+            config,
+            f"PR #{handoff.pr_number}: continuity authorization supersedes "
+            f"{len(superseded_comment_ids)} earlier unbound actor-owned authorization "
+            f"record(s) ({', '.join(str(value) for value in superseded_comment_ids)})",
+        )
     round_comments = _api_list(
         runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
     )
@@ -2040,11 +2694,17 @@ def authorize_fresh_issue_created_resume(
         ),
         base=config.base,
     )
-    if protection.state not in {"voluntary", "plan_limited"}:
+    if protection.state not in waivable_protection_states(config):
+        if protection.state in _OVERRIDE_PROTECTION_STATES:
+            raise AgentLoopError(
+                "Managed-CI fresh authorization for a base whose protection is "
+                f"{protection.state} requires {waiver_flags_for_protection(protection.state)}; "
+                "no authorization record was written."
+            )
         raise AgentLoopError(
             "Managed-CI fresh authorization is only available for an authenticated "
-            "unprotected or plan-limited base; the current protection assessment is "
-            f"{protection.state}."
+            "unprotected, plan-limited, or explicitly waived unreadable base; the current "
+            f"protection assessment is {protection.state}."
         )
     branch = metadata.head_branch or ""
     expected_branch = f"agent-loop/managed-{issue_number}"
@@ -2151,11 +2811,53 @@ def authorize_fresh_issue_created_resume(
         and record.actor_login.casefold() == actor_login.casefold()
         and record.actor_id == actor_id
         and record.protection == protection.state
-        and record.waiver == "allow-unprotected-managed-ci"
+        and record.protection in waivable_protection_states(config)
+        and record.waiver == _waiver_for_protection(record.protection)
         and record.label_event_id in valid_label_event_ids
         and (record.approved_plan_hash or None) == (approved_plan_hash or None)
     ]
-    if existing:
+    scoped_records = [
+        (comment_id, record)
+        for comment_id, record in records
+        if record.repository.casefold() == config.repo.casefold()
+        and record.issue_number == issue_number
+        and record.pr_number == pr_number
+    ]
+
+    def conflicts_beyond_protection(record: ManagedCiIssueAuthorization) -> bool:
+        return (
+            record.base_ref != config.base
+            or record.actor_login.casefold() != actor_login.casefold()
+            or record.actor_id != actor_id
+            or record.label_event_id not in valid_label_event_ids
+            or (
+                (record.approved_plan_hash or None) != (approved_plan_hash or None)
+                and record.approved_plan_hash not in retired
+            )
+        )
+
+    def protection_conflicts(record: ManagedCiIssueAuthorization) -> bool:
+        return (
+            record.protection != protection.state
+            or record.protection not in waivable_protection_states(config)
+            or record.waiver != _waiver_for_protection(record.protection)
+        )
+
+    incompatible_records = [
+        record
+        for _comment_id, record in scoped_records
+        if conflicts_beyond_protection(record) or protection_conflicts(record)
+    ]
+    # Records that differ from this grant only in their recorded protection
+    # are stale history from an earlier host or assessment (#1065).  The
+    # explicit fresh grant retires every prior scoped record by publishing a
+    # superseding record instead of refusing on the conflict it exists to
+    # clear.  Any other divergence (base, actor, label provenance, or an
+    # unretired plan) is not supersedable and still refuses.
+    supersede = bool(incompatible_records) and not any(
+        conflicts_beyond_protection(record) for record in incompatible_records
+    )
+    if existing and not supersede:
         revalidate_live_authorization_tuple()
         distinct_existing = {record for _comment_id, record in existing}
         if len(distinct_existing) > 1:
@@ -2229,33 +2931,17 @@ def authorize_fresh_issue_created_resume(
             "Managed-CI fresh authorization requires a server-observed issue-to-PR "
             "association for the explicit issue scope."
         )
-    scoped_records = [
-        (comment_id, record)
-        for comment_id, record in records
-        if record.repository.casefold() == config.repo.casefold()
-        and record.issue_number == issue_number
-        and record.pr_number == pr_number
-    ]
-    incompatible_records = [
-        record
-        for _comment_id, record in scoped_records
-        if record.base_ref != config.base
-        or record.actor_login.casefold() != actor_login.casefold()
-        or record.actor_id != actor_id
-        or record.protection != protection.state
-        or record.waiver != "allow-unprotected-managed-ci"
-        or record.label_event_id not in valid_label_event_ids
-        or (
-            (record.approved_plan_hash or None) != (approved_plan_hash or None)
-            and record.approved_plan_hash not in retired
-        )
-    ]
-    if incompatible_records:
+    if incompatible_records and not supersede:
         raise AgentLoopError(
-            "Managed-CI fresh authorization found a conflicting actor-owned record; refusing to proceed."
+            "Managed-CI fresh authorization found a conflicting actor-owned record whose base, "
+            "actor, label provenance, or approved plan differs; only records that differ in "
+            "recorded protection can be superseded. Refusing to proceed."
         )
     predecessor: tuple[int, ManagedCiIssueAuthorization] | None = None
-    for candidate in sorted(scoped_records, key=lambda item: item[0], reverse=True):
+    for candidate in (
+        () if supersede
+        else sorted(scoped_records, key=lambda item: item[0], reverse=True)
+    ):
         # A signed rebind changes only the plan, not the PR head (#993).  A
         # grant at the live head under a verified retired plan is therefore
         # the predecessor of this plan transition; any other same-head record
@@ -2275,10 +2961,16 @@ def authorize_fresh_issue_created_resume(
             predecessor = candidate
             break
     if scoped_records and predecessor is None:
-        raise AgentLoopError(
-            "Managed-CI fresh authorization found prior actor-owned authorization, but GitHub "
-            "did not prove that the live head is its descendant; refusing to proceed."
-        )
+        # Compatible grants that GitHub cannot chain to the live head are
+        # unbound history too (#1065): none reaches the live head, so none is
+        # evidence for it.  The explicit fresh grant, issued only after the
+        # live tuple and server-observed issue association checks above,
+        # retires them instead of refusing.
+        supersede = True
+    superseded_comment_ids = (
+        tuple(sorted({comment_id for comment_id, _record in scoped_records}))
+        if supersede else ()
+    )
     authorization = ManagedCiIssueAuthorization(
         kind="fresh",
         repository=config.repo,
@@ -2289,13 +2981,21 @@ def authorize_fresh_issue_created_resume(
         actor_login=actor_login,
         actor_id=actor_id,
         protection=protection.state,
-        waiver="allow-unprotected-managed-ci",
+        waiver=_waiver_for_protection(protection.state),
         nonce=secrets.token_urlsafe(24),
         label_event_id=label_event[0],
         predecessor_head=(predecessor[1].head_sha if predecessor is not None else None),
         predecessor_comment_id=(predecessor[0] if predecessor is not None else None),
         approved_plan_hash=approved_plan_hash,
+        superseded_comment_ids=superseded_comment_ids,
     )
+    if supersede:
+        log(
+            config,
+            f"PR #{pr_number}: fresh managed-CI authorization supersedes "
+            f"{len(superseded_comment_ids)} earlier actor-owned authorization record(s) "
+            f"({', '.join(str(value) for value in superseded_comment_ids)})",
+        )
     revalidate_live_authorization_tuple()
     latest_records = _authorization_comment_records(
         runner,
@@ -2401,7 +3101,27 @@ def revalidate_issue_created_handoff(
             else "draft-labeled"
         ),
     )
-    if handoff.active_label_event_id is not None:
+    if handoff.active_label_event_id is not None and validated.lifecycle != "draft-labeled":
+        # A failed activation deliberately releases the suppression label, so
+        # an unlabeled re-entry has no active label event by design (#997).
+        # `_issue_created_tuple` has already proved the PR is unlabeled; the
+        # recorded event must still be one of the trusted actor's own
+        # historical applications, and activation will re-apply the label.
+        history = _managed_label_event_history(
+            runner,
+            config=config,
+            pr_number=handoff.pr_number,
+            actor_login=handoff.trusted_actor_login,
+            actor_id=handoff.trusted_actor_id,
+        )
+        if history is None or handoff.active_label_event_id not in {
+            event_id for event_id, _login, _actor_id in history
+        }:
+            raise AgentLoopError(
+                "Managed-CI direct-resume label provenance changed before activation."
+            )
+        validated = replace(validated, active_label_event_id=handoff.active_label_event_id)
+    elif handoff.active_label_event_id is not None:
         event = _active_managed_label_event(runner, config=config, pr_number=handoff.pr_number)
         if (
             event is None
@@ -2524,7 +3244,199 @@ def recover_issue_created_handoff(
                 "Managed-CI issue-created resume requires an actor-owned active managed-label event."
             )
         handoff = replace(handoff, active_label_event_id=event[0])
+    if record is not None and config.effective_managed_ci:
+        # Only an invocation that will activate managed CI consumes the
+        # protection state; a plain review rerun keeps its historical path.
+        handoff = _recover_issue_created_protection(
+            runner, config=config, handoff=handoff, issue_number=issue_number,
+        )
     return handoff
+
+
+def _recover_issue_created_protection(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    issue_number: int,
+) -> AuthenticatedIssueCreatedHandoff:
+    """Restore an override-bearing PR's persisted protection state, read-only.
+
+    The tuple helper seeds ``voluntary``.  A selection pass validates every
+    actor-authored authorization record without comparing protection or plan
+    scope, and the creation record(s) supply the state.  A confirmation pass
+    then requires every record, and the live assessment, to agree with it.
+    Plan-scope checks run later at the activation resume-audit gate, after the
+    canonical plan is bound and before any mutation.
+    """
+    pr_number = handoff.pr_number
+    command = render_managed_ci_resume_command(
+        config, pr_number=pr_number, issue_number=issue_number, managed_ci=True,
+    )
+
+    # A remedy must never be the invocation that just failed (#1063): only a
+    # transient read failure offers a retry of it, and only a missing waiver
+    # offers a (different) resume command.  Everything else is irreconcilable.
+    irreconcilable = (
+        "No resume flag reconciles this state, so rerunning this command will "
+        "refuse again."
+    )
+    retry = f"This read may be transient; retry `{command}` once it succeeds."
+
+    def refuse(reason: str, *, remedy: str | None = None) -> AgentLoopError:
+        return AgentLoopError(
+            f"Managed-CI issue-created recovery for PR #{pr_number} refused: {reason}. "
+            f"The PR was left unchanged. " + (remedy or irreconcilable)
+        )
+
+    def waiver_remedy(state: str) -> str:
+        # The remedy must differ from the invocation that just failed (#1063).
+        waived = replace(
+            config,
+            allow_unprotected_managed_ci=True,
+            allow_unreadable_protection=(
+                config.allow_unreadable_protection or state == "unreadable"
+            ),
+        )
+        resume = render_managed_ci_resume_command(
+            waived, pr_number=pr_number, issue_number=issue_number, managed_ci=True,
+        )
+        return f"Resume with `{resume}`."
+
+    valid_label_event_ids = _actor_owned_label_event_ids(
+        runner, config=config, pr_number=pr_number,
+        actor_login=handoff.trusted_actor_login, actor_id=handoff.trusted_actor_id,
+    )
+    if valid_label_event_ids is None:
+        raise refuse("the managed-label event history could not be inspected", remedy=retry)
+    comments = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+    )
+    if comments is None:
+        raise refuse("the authorization comments could not be inspected", remedy=retry)
+    records: list[tuple[Mapping[str, object], ManagedCiIssueAuthorization]] = []
+    for comment in comments:
+        body = _normalized_comment_body(comment, config=config)
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        if (
+            ISSUE_AUTHORIZATION_MARKER not in body
+            or user.get("login") != handoff.trusted_actor_login
+            or user.get("id") != handoff.trusted_actor_id
+        ):
+            continue
+        try:
+            parsed = parse_issue_created_authorization_comment(body)
+        except AgentLoopError as error:
+            raise refuse(f"authorization comment {comment.get('id')} is malformed ({error})") from error
+        if parsed is None:
+            raise refuse(f"authorization comment {comment.get('id')} is malformed")
+        records.append((comment, parsed))
+    # Superseded records are retired history (#1065, #1069).
+    superseded = _superseded_authorization_ids(
+        (comment["id"], parsed)
+        for comment, parsed in records
+        if isinstance(comment.get("id"), int)
+    )
+    records = [
+        (comment, parsed) for comment, parsed in records
+        if comment.get("id") not in superseded
+    ]
+
+    def validate(check_protection: str | None, candidate: AuthenticatedIssueCreatedHandoff) -> None:
+        for comment, authorization in records:
+            if not _authorization_record_valid_for_handoff(
+                authorization,
+                comment,
+                config=config,
+                handoff=candidate,
+                actor_login=handoff.trusted_actor_login,
+                actor_id=handoff.trusted_actor_id,
+                base_ref=handoff.base_ref,
+                pr_number=pr_number,
+                issue_number=handoff.issue_number,
+                valid_label_event_ids=valid_label_event_ids,
+                check_protection=check_protection,
+                plan_scope_authenticated=False,
+            ):
+                raise refuse(
+                    f"authorization comment {comment.get('id')} does not match this PR's "
+                    f"authenticated tuple, actor, label provenance, or waiver"
+                    + (f" for protection {check_protection}" if check_protection else "")
+                )
+
+    unwaived = {
+        authorization.protection
+        for _comment, authorization in records
+        if authorization.protection in _OVERRIDE_PROTECTION_STATES
+        and authorization.protection not in waivable_protection_states(config)
+    }
+    if unwaived:
+        needed = "unreadable" if "unreadable" in unwaived else next(iter(unwaived))
+        record_states = {authorization.protection for _comment, authorization in records}
+        if len(record_states) > 1:
+            # Every record must later equal one recovered state, so adding
+            # waiver flags would only reach an irreconcilable refusal.
+            raise refuse(
+                "its authorization records disagree on protection ("
+                + ", ".join(sorted(record_states)) + ")"
+            )
+        raise refuse(
+            f"its authorization records carry protection {', '.join(sorted(unwaived))}, "
+            f"which requires {waiver_flags_for_protection(needed)}",
+            remedy=waiver_remedy(needed),
+        )
+    # Selection pass: protection and plan scope are deliberately deferred.
+    validate(None, handoff)
+    creation_states = {
+        authorization.protection
+        for _comment, authorization in records
+        if authorization.kind == "creation"
+    }
+    if not any(authorization.kind == "creation" for _comment, authorization in records):
+        # A superseding fresh grant retired the creation root (#1065); the
+        # surviving fresh root(s) record the state that grant authorized.
+        creation_states = {
+            authorization.protection
+            for _comment, authorization in records
+            if authorization.kind == "fresh"
+        }
+    context = ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config))
+    live = assess_exact_head_protection(runner, context=context, base=handoff.base_ref)
+    if len(creation_states) > 1:
+        raise refuse(
+            "creation authorization records disagree on protection ("
+            + ", ".join(sorted(creation_states)) + ")"
+        )
+    if creation_states:
+        recovered = next(iter(creation_states))
+    elif live.state in _OVERRIDE_PROTECTION_STATES:
+        # A legacy PR, or a crash before authorization publication.
+        recovered = live.state
+    else:
+        raise refuse(
+            f"no creation authorization records the protection state and the live assessment is "
+            f"{live.state} ({live.detail})"
+        )
+    if recovered not in waivable_protection_states(config):
+        raise refuse(
+            f"its persisted protection is {recovered}, which requires "
+            f"{waiver_flags_for_protection(recovered)}",
+            remedy=waiver_remedy(recovered),
+        )
+    # Confirmation pass against the recovered state and the live assessment.
+    confirmed = replace(handoff, protection_mode=recovered)
+    validate(recovered, confirmed)
+    # Any other live/persisted disagreement refuses, including a base that
+    # became strict: activation's strict path skips the resume-audit
+    # plan-scope gate, so a deferred plan check must never be carried onto it.
+    live = reconcile_live_protection(recovered, live, config=config)
+    if live.state != recovered:
+        raise refuse(
+            f"its persisted protection is {recovered}, but the live assessment is "
+            f"{live.state} ({live.detail})",
+            remedy=f"{irreconcilable} Restore the base's original protection before retrying.",
+        )
+    return confirmed
 
 
 def authenticate_source_managed_resume(
@@ -2590,7 +3502,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--codex-model", "--codex-reasoning-effort", "--gemini-model", "--claude-model",
     "--reviewer-codex-model", "--reviewer-codex-reasoning-effort",
     "--reviewer-claude-model", "--reviewer-claude-effort",
-    "--gh-cmd",
+    "--gh-cmd", "--agent-permissions",
     "--claude-arg", "--codex-arg", "--gemini-arg", "--antigravity-arg",
     "--test-command", "--coder-test-command-timeout-seconds", "--ci-timeout-seconds",
     "--ci-poll-interval-seconds", "--ci-startup-timeout-seconds",
@@ -2608,6 +3520,8 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--containment-memory-max", "--containment-memory-swap-max", "--containment-tasks-max",
     "--primary-reviewer",
     "--plan-review-policy", "--primary-plan-reviewer",
+    "--plan-growth-gate", "--plan-growth-max-chars", "--plan-growth-max-revisions",
+    "--plan-growth-max-scope-items", "--plan-growth-max-matrix-rows",
     "--containment-aggregate-memory-high", "--containment-aggregate-memory-max",
     "--containment-aggregate-memory-swap-max", "--containment-aggregate-tasks-max",
     "--containment-os-headroom-percent", "--containment-slice", "--containment-cache-dir",
@@ -2634,7 +3548,7 @@ _PR_ONLY_RECOVERY_OPTIONS = frozenset({"--managed-ci-adopt-existing-pr"})
 _MANAGED_PR_ONLY_RECOVERY_OPTIONS = frozenset({"--head", "--title", "--body-file"})
 _MANAGED_RECOVERY_OPTIONS = frozenset({
     "--managed-ci", "--managed-ci-trusted-actor", "--allow-unprotected-managed-ci",
-    "--managed-ci-adopt-existing-pr", "--managed-ci-fresh", "--managed-ci-fresh-authorization",
+    "--allow-unreadable-protection", "--managed-ci-adopt-existing-pr", "--managed-ci-fresh", "--managed-ci-fresh-authorization",
 })
 def _option_name(token: str) -> str:
     return token.split("=", 1)[0]
@@ -2749,6 +3663,8 @@ def _render_recovery_command(
                 command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
             if config.allow_unprotected_managed_ci:
                 command.append("--allow-unprotected-managed-ci")
+                if config.allow_unreadable_protection:
+                    command.append("--allow-unreadable-protection")
             if fresh_authorization and (target != "pr" or fresh_issue_number is not None):
                 command.append("--managed-ci-fresh")
                 if target == "pr" and fresh_issue_number is not None:
@@ -2806,6 +3722,12 @@ def _render_recovery_command(
             command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
         if config.allow_unprotected_managed_ci and not _has_option(command, "--allow-unprotected-managed-ci"):
             command.append("--allow-unprotected-managed-ci")
+        if (
+            config.allow_unprotected_managed_ci
+            and config.allow_unreadable_protection
+            and not _has_option(command, "--allow-unreadable-protection")
+        ):
+            command.append("--allow-unreadable-protection")
         if fresh_authorization and (target != "pr" or fresh_issue_number is not None):
             command = _strip_recovery_options(
                 command,
@@ -2910,6 +3832,7 @@ def _release_for_ordinary_recovery(
     recovery_capable: bool,
     fresh_issue_number: int | None = None,
     fresh_authorization_allowed: bool = False,
+    protection_state: str | None = None,
 ) -> OrdinaryRecoveryCapability | None:
     """Release the exact active label and return a narrowly scoped capability.
 
@@ -2957,9 +3880,16 @@ def _release_for_ordinary_recovery(
     log(config, f"PR #{pr_number}: selected ordinary unlabeled recovery ({reason})")
     if config.managed_ci:
         fresh = None
+        # With a known state, the fresh command must pass that state's own
+        # waiver gate.  Before assessment, the fresh command re-runs its gate.
+        waiver_allows_fresh = (
+            protection_state in waivable_protection_states(config)
+            if protection_state is not None
+            else config.allow_unprotected_managed_ci
+        )
         if (
             fresh_authorization_allowed
-            and config.allow_unprotected_managed_ci
+            and waiver_allows_fresh
             and fresh_issue_number is not None
             and _reason_allows_fresh_issue_created_authorization(reason)
         ):
@@ -2977,6 +3907,7 @@ def _release_for_ordinary_recovery(
             if fresh is not None
             else "Restore the stated managed-CI prerequisite before retrying; no "
             "issue-created authorization grant was inferred for this failure."
+            + (_missing_waiver_note(config, protection_state) if protection_state else "")
         )
         raise AgentLoopError(
             f"--managed-ci requested qualification, but activation failed ({reason}). "
@@ -2991,6 +3922,19 @@ def _release_for_ordinary_recovery(
         released_label_event_id=active_event[0] if active_event is not None else None,
         released_at=int(time.time()),
         prior_run_ids=frozenset(prior_run_ids),
+    )
+
+
+def _missing_waiver_note(config: AgentLoopConfig, protection_state: str) -> str:
+    """Name the waiver flag(s) a known non-strict state still needs, if any."""
+    if (
+        protection_state not in _OVERRIDE_PROTECTION_STATES
+        or protection_state in waivable_protection_states(config)
+    ):
+        return ""
+    return (
+        f" Protection is {protection_state}; fresh authorization is unavailable without "
+        f"{waiver_flags_for_protection(protection_state)}."
     )
 
 
@@ -3109,7 +4053,7 @@ def verify_managed_pr_plan_binding(
         raise fail("the PR authorization comments could not be inspected")
     records: list[tuple[int, ManagedCiIssueAuthorization]] = []
     for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        body = _normalized_comment_body(comment, config=config)
         if ISSUE_AUTHORIZATION_MARKER not in body:
             continue
         try:
@@ -3137,6 +4081,8 @@ def verify_managed_pr_plan_binding(
         ):
             raise fail("an authorization record names a different repository, issue, PR, or base")
         records.append((comment_id, authorization))
+    superseded = _superseded_authorization_ids(records)
+    records = [item for item in records if item[0] not in superseded]
     if not records:
         raise fail("no authorization record exists")
     by_comment_id = dict(records)
@@ -3207,6 +4153,206 @@ def _is_retired_plan_history(
     )
 
 
+def _actor_owned_label_event_ids(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    actor_login: str,
+    actor_id: int,
+) -> set[int] | None:
+    """Return every managed-label application by the trusted actor, or None."""
+    events = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
+    )
+    if events is None:
+        return None
+    valid_label_event_ids: set[int] = set()
+    for event in events:
+        label = event.get("label") if isinstance(event.get("label"), dict) else {}
+        event_actor = event.get("actor") if isinstance(event.get("actor"), dict) else {}
+        event_id = event.get("id")
+        if (
+            event.get("event") == "labeled"
+            and label.get("name") == MANAGED_LABEL
+            and isinstance(event_id, int)
+            and event_actor.get("login", "").casefold() == actor_login.casefold()
+            and event_actor.get("id") == actor_id
+        ):
+            valid_label_event_ids.add(event_id)
+    return valid_label_event_ids
+
+
+def _authorization_matches(
+    authorization: ManagedCiIssueAuthorization,
+    comment_id: int,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff | None,
+    actor_login: str,
+    actor_id: int,
+    valid_label_event_ids: set[int] | None,
+    check_protection: str | None,
+    plan_scope_authenticated: bool,
+    history: bool = False,
+) -> bool:
+    if (
+        authorization.actor_login.casefold() != actor_login.casefold()
+        or authorization.actor_id != actor_id
+        or authorization.waiver != _waiver_for_protection(authorization.protection)
+        or (
+            # ``unreadable`` is honored only when this invocation waives it.
+            authorization.protection == "unreadable"
+            and "unreadable" not in waivable_protection_states(config)
+        )
+        or (
+            check_protection is not None
+            and authorization.protection != check_protection
+        )
+        or (
+            valid_label_event_ids is not None
+            and authorization.label_event_id not in valid_label_event_ids
+        )
+    ):
+        return False
+    if handoff is None:
+        return True
+    if (
+        authorization.repository.casefold() != handoff.repository.casefold()
+        or authorization.pr_number != handoff.pr_number
+        or authorization.issue_number != handoff.issue_number
+        or authorization.base_ref != handoff.base_ref
+        or authorization.actor_login.casefold()
+        != handoff.trusted_actor_login.casefold()
+        or authorization.actor_id != handoff.trusted_actor_id
+        or (
+            plan_scope_authenticated
+            and (authorization.approved_plan_hash or None)
+            != (handoff.approved_plan_hash or None)
+        )
+    ):
+        return False
+    # The opening nonce belongs to the authenticated PR body.  Validate it
+    # on the creation root even when a later fresh/continuity record is the
+    # selected terminal, so a trusted comment cannot launder a mismatched
+    # historical root into resume authority.
+    if authorization.kind == "creation":
+        expected_nonce = handoff.opening_override_nonce
+        if (
+            expected_nonce is None
+            and handoff.authorization_kind == "creation"
+            and authorization.head_sha == handoff.head_sha
+        ):
+            expected_nonce = handoff.override_nonce
+        if expected_nonce is not None and authorization.nonce != expected_nonce:
+            return False
+    if history:
+        # A retired-plan record is never the terminal, so the terminal
+        # identity checks below do not apply to it (#993).
+        return True
+    if (
+        authorization.kind == "fresh"
+        and handoff.authorization_kind == "fresh"
+        and authorization.head_sha == handoff.head_sha
+        and authorization.nonce != handoff.override_nonce
+    ):
+        return False
+    # The handoff's comment identity is the authenticated terminal record.
+    # Historical roots and continuity ancestors remain eligible for chain
+    # traversal, but the terminal record may not be replaced by another
+    # actor-authored record with the same public tuple.
+    if handoff.authorization_comment_id is not None:
+        if comment_id == handoff.authorization_comment_id:
+            if authorization.kind != handoff.authorization_kind:
+                return False
+            if authorization.kind == "creation":
+                expected_nonce = handoff.opening_override_nonce
+                if expected_nonce is None:
+                    expected_nonce = handoff.override_nonce
+                return expected_nonce is None or authorization.nonce == expected_nonce
+            if authorization.kind == "fresh":
+                return authorization.nonce == handoff.override_nonce
+            # Continuity nonces are minted for the new exact head. The
+            # trusted comment identity and validated predecessor chain,
+            # rather than the opening-body nonce, bind that terminal.
+            return True
+        return True
+    if authorization.head_sha != handoff.head_sha:
+        return True
+    # A recovered handoff initially describes the PR-opening body, so its
+    # default kind is ``creation`` even when a later continuity record is
+    # the terminal authority for the live head. Creation and fresh records
+    # must match the nonce for the checkpoint that authenticated them;
+    # continuity records carry a new nonce and are validated by their
+    # predecessor/round chain instead.
+    if authorization.kind == "creation":
+        expected_nonce = handoff.opening_override_nonce
+        if expected_nonce is None and handoff.authorization_kind == "creation":
+            expected_nonce = handoff.override_nonce
+        return expected_nonce is None or authorization.nonce == expected_nonce
+    if authorization.kind == "fresh":
+        if handoff.authorization_kind == "fresh":
+            return authorization.nonce == handoff.override_nonce
+        return True
+    return True
+
+
+def _authorization_record_valid_for_handoff(
+    authorization: ManagedCiIssueAuthorization,
+    comment: Mapping[str, object],
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff | None,
+    actor_login: str,
+    actor_id: int,
+    base_ref: str,
+    pr_number: int,
+    issue_number: int | None,
+    valid_label_event_ids: set[int] | None,
+    check_protection: str | None,
+    plan_scope_authenticated: bool,
+) -> bool:
+    """Shared per-record validity for resume audits and issue-created recovery.
+
+    The outer comment-author and tuple checks never touch ``handoff``.  With
+    no handoff the predicate stops after the actor, waiver, protection and
+    label-event checks.  ``plan_scope_authenticated=False`` skips only the
+    plan-hash comparisons, for callers that have not yet bound the canonical
+    approved plan; those comparisons run later at the activation gate.
+    """
+    user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+    cid = comment.get("id")
+    if (
+        user.get("login") != actor_login
+        or user.get("id") != actor_id
+        or authorization.repository.casefold() != config.repo.casefold()
+        or authorization.base_ref != base_ref
+        or authorization.pr_number != pr_number
+        or (issue_number is not None and authorization.issue_number != issue_number)
+        or not isinstance(cid, int)
+    ):
+        return False
+    common = dict(
+        config=config,
+        actor_login=actor_login,
+        actor_id=actor_id,
+        valid_label_event_ids=valid_label_event_ids,
+        check_protection=check_protection,
+        plan_scope_authenticated=plan_scope_authenticated,
+    )
+    if plan_scope_authenticated and _is_retired_plan_history(authorization, handoff):
+        # Only the plan hash is retired; every other field must still match.
+        assert handoff is not None
+        return _authorization_matches(
+            replace(authorization, approved_plan_hash=handoff.approved_plan_hash),
+            cid,
+            handoff=handoff,
+            history=True,
+            **common,
+        )
+    return _authorization_matches(authorization, cid, handoff=handoff, **common)
+
+
 def _find_resume_audit(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, actor_login: str, actor_id: int,
     base_ref: str, issue_number: int | None = None, live_head: str | None = None,
@@ -3218,167 +4364,65 @@ def _find_resume_audit(
     comments = _api_list(runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100")
     if comments is None:
         return None
+    if (
+        expected_handoff is not None
+        and expected_protection is not None
+        and expected_handoff.protection_mode != expected_protection
+    ):
+        # Every record would have to equal both values, so none can match.
+        return None
     valid_label_event_ids: set[int] | None = None
     if expected_handoff is not None or require_actor_owned_label_event:
-        events = _api_list(
-            runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
+        valid_label_event_ids = _actor_owned_label_event_ids(
+            runner, config=config, pr_number=pr_number,
+            actor_login=actor_login, actor_id=actor_id,
         )
-        if events is None:
+        if valid_label_event_ids is None:
             return None
-        valid_label_event_ids = set()
-        for event in events:
-            label = event.get("label") if isinstance(event.get("label"), dict) else {}
-            event_actor = event.get("actor") if isinstance(event.get("actor"), dict) else {}
-            event_id = event.get("id")
-            if (
-                event.get("event") == "labeled"
-                and label.get("name") == MANAGED_LABEL
-                and isinstance(event_id, int)
-                and event_actor.get("login", "").casefold() == actor_login.casefold()
-                and event_actor.get("id") == actor_id
-            ):
-                valid_label_event_ids.add(event_id)
-
-    def authorization_matches(
-        authorization: ManagedCiIssueAuthorization,
-        comment_id: int,
-        *,
-        history: bool = False,
-    ) -> bool:
-        if (
-            authorization.actor_login.casefold() != actor_login.casefold()
-            or authorization.actor_id != actor_id
-            or authorization.waiver != "allow-unprotected-managed-ci"
-            or (
-                expected_protection is not None
-                and authorization.protection != expected_protection
-            )
-            or (
-                valid_label_event_ids is not None
-                and authorization.label_event_id not in valid_label_event_ids
-            )
-        ):
-            return False
-        if expected_handoff is None:
-            return True
-        if (
-            authorization.repository.casefold() != expected_handoff.repository.casefold()
-            or authorization.pr_number != expected_handoff.pr_number
-            or authorization.issue_number != expected_handoff.issue_number
-            or authorization.base_ref != expected_handoff.base_ref
-            or authorization.actor_login.casefold()
-            != expected_handoff.trusted_actor_login.casefold()
-            or authorization.actor_id != expected_handoff.trusted_actor_id
-            or authorization.protection != expected_handoff.protection_mode
-            or (authorization.approved_plan_hash or None)
-            != (expected_handoff.approved_plan_hash or None)
-        ):
-            return False
-        # The opening nonce belongs to the authenticated PR body.  Validate it
-        # on the creation root even when a later fresh/continuity record is the
-        # selected terminal, so a trusted comment cannot launder a mismatched
-        # historical root into resume authority.
-        if authorization.kind == "creation":
-            expected_nonce = expected_handoff.opening_override_nonce
-            if (
-                expected_nonce is None
-                and expected_handoff.authorization_kind == "creation"
-                and authorization.head_sha == expected_handoff.head_sha
-            ):
-                expected_nonce = expected_handoff.override_nonce
-            if expected_nonce is not None and authorization.nonce != expected_nonce:
-                return False
-        if history:
-            # A retired-plan record is never the terminal, so the terminal
-            # identity checks below do not apply to it (#993).
-            return True
-        if (
-            authorization.kind == "fresh"
-            and expected_handoff.authorization_kind == "fresh"
-            and authorization.head_sha == expected_handoff.head_sha
-            and authorization.nonce != expected_handoff.override_nonce
-        ):
-            return False
-        # The handoff's comment identity is the authenticated terminal record.
-        # Historical roots and continuity ancestors remain eligible for chain
-        # traversal, but the terminal record may not be replaced by another
-        # actor-authored record with the same public tuple.
-        if expected_handoff.authorization_comment_id is not None:
-            if comment_id == expected_handoff.authorization_comment_id:
-                if authorization.kind != expected_handoff.authorization_kind:
-                    return False
-                if authorization.kind == "creation":
-                    expected_nonce = expected_handoff.opening_override_nonce
-                    if expected_nonce is None:
-                        expected_nonce = expected_handoff.override_nonce
-                    return expected_nonce is None or authorization.nonce == expected_nonce
-                if authorization.kind == "fresh":
-                    return authorization.nonce == expected_handoff.override_nonce
-                # Continuity nonces are minted for the new exact head. The
-                # trusted comment identity and validated predecessor chain,
-                # rather than the opening-body nonce, bind that terminal.
-                return True
-            return True
-        if authorization.head_sha != expected_handoff.head_sha:
-            return True
-        # A recovered handoff initially describes the PR-opening body, so its
-        # default kind is ``creation`` even when a later continuity record is
-        # the terminal authority for the live head. Creation and fresh records
-        # must match the nonce for the checkpoint that authenticated them;
-        # continuity records carry a new nonce and are validated by their
-        # predecessor/round chain instead.
-        if authorization.kind == "creation":
-            expected_nonce = expected_handoff.opening_override_nonce
-            if expected_nonce is None and expected_handoff.authorization_kind == "creation":
-                expected_nonce = expected_handoff.override_nonce
-            return expected_nonce is None or authorization.nonce == expected_nonce
-        if authorization.kind == "fresh":
-            if expected_handoff.authorization_kind == "fresh":
-                return authorization.nonce == expected_handoff.override_nonce
-            return True
-        return True
+    if expected_protection is not None:
+        check_protection: str | None = expected_protection
+    elif expected_handoff is not None:
+        check_protection = expected_handoff.protection_mode
+    else:
+        check_protection = None
     candidates: list[tuple[int, dict[str, str]]] = []
     authorization_candidates: list[tuple[int, ManagedCiIssueAuthorization]] = []
     malformed = False
+    superseded = _superseded_authorization_comment_ids(
+        comments, config=config, actor_login=actor_login, actor_id=actor_id,
+    )
     for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        body = _normalized_comment_body(comment, config=config)
         if ISSUE_AUTHORIZATION_MARKER in body:
+            if comment.get("id") in superseded:
+                # Retired by a later fresh grant (#1065): history only.
+                continue
             try:
                 authorization = parse_issue_created_authorization_comment(body)
             except AgentLoopError:
                 malformed = True
                 continue
-            user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
-            cid = comment.get("id")
-            if (
-                authorization is None
-                or user.get("login") != actor_login
-                or user.get("id") != actor_id
-                or authorization.repository.casefold() != config.repo.casefold()
-                or authorization.base_ref != base_ref
-                or authorization.pr_number != pr_number
-                or (issue_number is not None and authorization.issue_number != issue_number)
-                or not isinstance(cid, int)
+            if authorization is None or not _authorization_record_valid_for_handoff(
+                authorization,
+                comment,
+                config=config,
+                handoff=expected_handoff,
+                actor_login=actor_login,
+                actor_id=actor_id,
+                base_ref=base_ref,
+                pr_number=pr_number,
+                issue_number=issue_number,
+                valid_label_event_ids=valid_label_event_ids,
+                check_protection=check_protection,
+                plan_scope_authenticated=True,
             ):
                 malformed = True
                 continue
             if _is_retired_plan_history(authorization, expected_handoff):
                 # History under a plan a verified signed rebind replaced (#993):
-                # neither a competing grant nor part of the live chain.  Only
-                # the plan hash is retired; every other field must still match.
-                if not authorization_matches(
-                    replace(
-                        authorization,
-                        approved_plan_hash=expected_handoff.approved_plan_hash,
-                    ),
-                    cid,
-                    history=True,
-                ):
-                    malformed = True
+                # neither a competing grant nor part of the live chain.
                 continue
-            if not authorization_matches(authorization, cid):
-                malformed = True
-                continue
+            cid = comment["id"]
             candidates.append(
                 (
                     cid,
@@ -3575,10 +4619,7 @@ def _activate_v2_managed_ci(
     actor_id = who.get("id") if isinstance(who.get("id"), int) else None
     if not actor_login or actor_id is None or actor_login.casefold() != configured.casefold():
         return None
-    variable = _api_json(
-        runner, config, f"repos/{config.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR", quiet=True
-    )
-    advertised = variable.get("value") if isinstance(variable.get("value"), str) else None
+    advertised = _advertised_managed_actor(runner, config)
     if not advertised or advertised.casefold() != actor_login.casefold():
         return None
 
@@ -3607,6 +4648,7 @@ def _activate_v2_managed_ci(
         RECOVERY_MARKER in workflow_text and "pull_request" in workflow_text and "unlabeled" in workflow_text
     )
     visible_intent_capable = VISIBLE_INTENT_MARKER in workflow_text
+    host_footer_capable = HOST_FOOTER_INTENT_MARKER in workflow_text
 
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -3722,10 +4764,11 @@ def _activate_v2_managed_ci(
         )
         if protection.state != "strict" and managed_resume is not None:
             handoff = managed_resume.issue_created_handoff
-            if (
-                not config.allow_unprotected_managed_ci
-                or protection.state not in {"voluntary", "plan_limited"}
-            ):
+            if handoff is not None:
+                protection = reconcile_live_protection(
+                    handoff.protection_mode, protection, config=config,
+                )
+            if protection.state not in waivable_protection_states(config):
                 reason = "strict protection is unavailable and the explicit waiver is absent"
                 if MANAGED_LABEL in labels:
                     existing_event = _active_managed_label_event(
@@ -3737,14 +4780,21 @@ def _activate_v2_managed_ci(
                         recovery_capable=ordinary_recovery_capable,
                         fresh_issue_number=issue_hint,
                         fresh_authorization_allowed=origin == "issue-created",
+                        protection_state=protection.state,
                     )
                     return ManagedCiContract(
                         activation_path="ordinary_fallback", ordinary_recovery=recovery,
                     )
+                waiver_hint = (
+                    f" Protection is {protection.state} ({protection.detail}); it requires "
+                    f"{waiver_flags_for_protection(protection.state)}."
+                    if protection.state in _OVERRIDE_PROTECTION_STATES
+                    else ""
+                )
                 raise AgentLoopError(
                     f"--managed-ci requested qualification, but activation failed ({reason}). "
-                    f"PR #{pr_number} was left unchanged and this run did NOT qualify its head. "
-                    "Restore the stated managed-CI prerequisite before retrying."
+                    f"PR #{pr_number} was left unchanged and this run did NOT qualify its head."
+                    f"{waiver_hint} Restore the stated managed-CI prerequisite before retrying."
                 )
             prior_audit = (
                 _find_resume_audit(
@@ -3769,6 +4819,7 @@ def _activate_v2_managed_ci(
                         recovery_capable=ordinary_recovery_capable,
                         fresh_issue_number=issue_hint,
                         fresh_authorization_allowed=origin == "issue-created",
+                        protection_state=protection.state,
                     )
                     return ManagedCiContract(
                         activation_path="ordinary_fallback", ordinary_recovery=recovery,
@@ -3807,13 +4858,14 @@ def _activate_v2_managed_ci(
                         reason=reason, recovery_capable=ordinary_recovery_capable,
                         fresh_issue_number=issue_hint,
                         fresh_authorization_allowed=origin == "issue-created",
+                        protection_state=protection.state,
                     )
                     return ManagedCiContract(
                         activation_path="ordinary_fallback", ordinary_recovery=recovery,
                     )
                 if (
                     origin == "issue-created"
-                    and config.allow_unprotected_managed_ci
+                    and protection.state in waivable_protection_states(config)
                     and issue_hint is not None
                 ):
                     fresh = render_managed_ci_resume_command(
@@ -3829,6 +4881,7 @@ def _activate_v2_managed_ci(
                     remedy = (
                         "Restore the issue-created authorization prerequisite before retrying; "
                         "the live head is not qualified."
+                        + _missing_waiver_note(config, protection.state)
                     )
                 raise AgentLoopError(
                     f"--managed-ci requested qualification, but activation failed ({reason}). "
@@ -4029,7 +5082,7 @@ def _activate_v2_managed_ci(
     if "pull_request" in workflow_text:
         if protection.state != "strict" and managed_resume is None:
             body = pr.get("body") if isinstance(pr.get("body"), str) else ""
-            if not config.allow_unprotected_managed_ci or protection.state not in {"voluntary", "plan_limited"}:
+            if protection.state not in waivable_protection_states(config):
                 _restore_ordinary_ci_after_v2_fallback(
                     runner, config=config, pr_number=pr_number,
                     reason="strict protection or the explicit override is unavailable",
@@ -4042,6 +5095,10 @@ def _activate_v2_managed_ci(
                     schema="body",
                     required=True,
                     expected_nonce=config.managed_ci_expected_override_nonce,
+                    additional_allowed_tokens=(
+                        frozenset({"AGENT_MANAGED_PR_SOURCE_V1"})
+                        if origin == "source-managed" else frozenset()
+                    ),
                 )
             except AgentLoopError as error:
                 _restore_ordinary_ci_after_v2_fallback(
@@ -4186,6 +5243,7 @@ def _activate_v2_managed_ci(
         invocation_applied_label=label_applied,
         ordinary_recovery_capable=ordinary_recovery_capable,
         visible_intent_capable=visible_intent_capable,
+        host_footer_capable=host_footer_capable,
         origin=origin,
         lifecycle=lifecycle,
         authenticated_resume=managed_resume,
@@ -4211,6 +5269,24 @@ def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[di
     if not all(isinstance(item, dict) for item in payload):
         return None
     return payload
+
+
+def _normalized_comment_body(
+    comment: Mapping[str, object], *, config: AgentLoopConfig | None
+) -> str:
+    """Return one raw ``_api_list`` comment body with the host footer removed once.
+
+    This is the managed-CI comment-ingestion boundary (#1043).  Strict record
+    parsers downstream never strip, so exactly one known host footer is
+    tolerated along any path and a doubled footer still reaches the parser.
+    """
+    raw = comment.get("body")
+    if not isinstance(raw, str):
+        return ""
+    body, footered = strip_known_host_footer(raw)
+    if footered:
+        note_host_footer_observed(config, "managed-CI record re-read")
+    return body
 
 
 def _active_managed_label_event(
@@ -4289,9 +5365,7 @@ def _adoption_identity(
         return None
     who = _api_json(runner, config, "user", quiet=True)
     login, actor_id = who.get("login"), who.get("id")
-    advertised = _api_json(
-        runner, config, f"repos/{config.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR", quiet=True
-    ).get("value")
+    advertised = _advertised_managed_actor(runner, config)
     if (
         not isinstance(login, str) or not isinstance(actor_id, int)
         or not isinstance(advertised, str)
@@ -4387,6 +5461,7 @@ def _activate_v2_existing_pr_adoption(
         adopted_existing_pr=True, guard_head_sha=live_sha, active_label_event_id=existing[0],
         invocation_applied_label=applied,
         visible_intent_capable=VISIBLE_INTENT_MARKER in source,
+        host_footer_capable=HOST_FOOTER_INTENT_MARKER in source,
         intent_generation=(
             secrets.token_urlsafe(16)
             if config.managed_ci
@@ -4459,37 +5534,160 @@ def release_adopted_managed_ci(
     return result.returncode == 0
 
 
-def _release_managed_label_for_manual_qualification(
+def _label_names_or_none(payload: object) -> set[str] | None:
+    """Return label names only for a well-formed PR payload, else None.
+
+    Only a JSON object whose ``labels`` is a list of objects with string
+    ``name`` fields proves label state; anything else is unreadable.
+    """
+    if not isinstance(payload, dict):
+        return None
+    labels = payload.get("labels")
+    if not isinstance(labels, list):
+        return None
+    names: set[str] = set()
+    for item in labels:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            return None
+        names.add(item["name"])
+    return names
+
+
+def _read_pr_payload(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path
+) -> dict[str, object] | None:
+    """Read the live PR in ``cwd``; None for any failed or malformed read."""
+    result = runner.run(
+        [config.gh_cmd, "api", f"repos/{config.repo}/pulls/{pr_number}"],
+        cwd=cwd, check=False,
+    )
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _delete_managed_label(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path
+) -> bool:
+    """DELETE the managed label; success or a strict HTTP 404 means it is absent.
+
+    Only gh's own unambiguous status diagnostic proves a 404, so incidental
+    or conflicting ``HTTP 404`` text never counts as absence.
+    """
+    result = runner.run(
+        [
+            config.gh_cmd, "api", "--method", "DELETE",
+            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
+        ], cwd=cwd, check=False,
+    )
+    if result.returncode == 0:
+        return True
+    return _http_status(result) == 404
+
+
+def _label_event_owned_by_contract(
+    event: tuple[int, str, int] | None, contract: ManagedCiContract
+) -> bool:
+    return bool(
+        event is not None
+        and contract.active_label_event_id is not None
+        and event[0] == contract.active_label_event_id
+        and event[1].casefold() == (contract.trusted_actor_login or "").casefold()
+        and event[2] == contract.trusted_actor_id
+    )
+
+
+def _verify_manual_qualification_label_provenance(
     runner: Runner,
     *,
     config: AgentLoopConfig,
     pr_number: int,
     contract: ManagedCiContract,
 ) -> None:
-    """Release only the authenticated active suppression before manual exit."""
+    """Require the contract's authenticated label event to still be active.
+
+    This never removes the label: a successful manual qualification retains it
+    so no ``unlabeled`` event re-runs ordinary CI on the qualified head.
+    """
     event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
-    if (
-        event is None
-        or contract.active_label_event_id is None
-        or event[0] != contract.active_label_event_id
-        or event[1].casefold() != (contract.trusted_actor_login or "").casefold()
-        or event[2] != contract.trusted_actor_id
-    ):
+    if not _label_event_owned_by_contract(event, contract):
         raise AgentLoopError(
             f"PR #{pr_number} managed-label provenance changed before manual qualification; "
             "the head is not qualified and no manual merge command is safe."
         )
-    result = runner.run(
-        [
-            config.gh_cmd, "api", "--method", "DELETE",
-            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
-        ], cwd=active_workdir(config), check=False,
+
+
+def _release_label_after_failed_publication(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    contract: ManagedCiContract,
+) -> str | None:
+    """Return a failed publication to ordinary CI; never raises.
+
+    A confirmed-absent label needs no write.  A contract-owned label, a label
+    whose provenance is unreadable (fail-open, as in
+    ``release_adopted_managed_ci``) and a label on an unreadable PR are
+    removed.  A readable foreign label event is left in place and reported.
+    Returns a message fragment when the label may still suppress ordinary CI.
+    """
+    manual = (
+        f"`{MANAGED_LABEL}` could not be removed and still suppresses ordinary CI; "
+        "remove it manually"
     )
-    if result.returncode != 0:
-        raise AgentLoopError(
-            f"PR #{pr_number} qualified CI passed, but `{MANAGED_LABEL}` could not be removed; "
-            "the PR remains suppressed and must not be manually merged until the label is removed."
-        )
+    try:
+        cwd = active_workdir(config)
+        try:
+            payload = _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
+        except Exception:
+            payload = None
+        labels = _label_names_or_none(payload)
+        if labels is not None:
+            if MANAGED_LABEL not in labels:
+                return None
+            try:
+                event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+            except Exception:
+                event = None
+            if event is None:
+                log(
+                    config,
+                    f"PR #{pr_number}: managed-label provenance is unreadable after a failed "
+                    f"qualification publication; removing `{MANAGED_LABEL}` fail-open",
+                )
+            elif not _label_event_owned_by_contract(event, contract):
+                return (
+                    f"a different `{MANAGED_LABEL}` label event is active and was left untouched; "
+                    "ordinary CI may still be suppressed; remove it manually if it is stale"
+                )
+        try:
+            removed = _delete_managed_label(runner, config=config, pr_number=pr_number, cwd=cwd)
+        except Exception:
+            removed = False
+        if removed:
+            log(
+                config,
+                f"PR #{pr_number}: released `{MANAGED_LABEL}` after a failed qualification "
+                "publication; ordinary CI resumes",
+            )
+            return None
+        return manual
+    except Exception:
+        return manual
+
+
+def _attach_cleanup_fragment(original: BaseException, fragment: str) -> None:
+    """Attach a cleanup fragment without changing the original error type."""
+    sentence = f"{fragment[0].upper()}{fragment[1:]}."
+    if isinstance(original, AgentLoopError) and original.args and isinstance(original.args[0], str):
+        original.args = (f"{original.args[0]} {sentence}", *original.args[1:])
+    else:
+        original.add_note(sentence)
 
 
 def publish_manual_v2_qualification(
@@ -4501,7 +5699,41 @@ def publish_manual_v2_qualification(
     contract: ManagedCiContract,
     reviewers: tuple[str, ...],
 ) -> str:
-    """Publish a SHA-bound manual result, release suppression, and ready the PR."""
+    """Publish a SHA-bound manual result on a ready PR that keeps its label.
+
+    The managed label is retained on success, so no ``unlabeled`` event
+    re-runs ordinary CI on the qualified head; it has no effect once the PR
+    is ready.  Any failure releases an owned or unprovable label before the
+    original error propagates, independent of the orchestrator's
+    interrupted-run preservation.
+    """
+    try:
+        return _publish_manual_v2_qualification(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            expected_head_sha=expected_head_sha,
+            contract=contract,
+            reviewers=reviewers,
+        )
+    except BaseException as original:
+        fragment = _release_label_after_failed_publication(
+            runner, config=config, pr_number=pr_number, contract=contract,
+        )
+        if fragment:
+            _attach_cleanup_fragment(original, fragment)
+        raise original
+
+
+def _publish_manual_v2_qualification(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    expected_head_sha: str,
+    contract: ManagedCiContract,
+    reviewers: tuple[str, ...],
+) -> str:
     if contract.protocol_version != 2:
         raise AgentLoopError("Explicit managed-CI manual qualification requires protocol v2.")
     if get_pr_head_sha(runner, config, pr_number) != expected_head_sha:
@@ -4526,24 +5758,24 @@ def publish_manual_v2_qualification(
         if removed.returncode != 0:
             raise AgentLoopError(f"Unable to clear stale `{QUALIFIED_LABEL}` from PR #{pr_number}.")
 
-    _release_managed_label_for_manual_qualification(
+    not_published = (
+        f"PR #{pr_number} changed before manual qualification publication; "
+        "its exact head is not safely published."
+    )
+    guard = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    guard_head = guard.get("head") if isinstance(guard.get("head"), dict) else {}
+    if (
+        guard_head.get("sha") != expected_head_sha
+        # An adopted PR is never readied here, so it must already be exactly
+        # non-draft; a missing or non-boolean value is not proof.
+        or (contract.adopted_existing_pr and guard.get("draft") is not False)
+    ):
+        raise AgentLoopError(not_published)
+    _verify_manual_qualification_label_provenance(
         runner, config=config, pr_number=pr_number, contract=contract,
     )
-    after_release = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
-    after_head = after_release.get("head") if isinstance(after_release.get("head"), dict) else {}
-    after_labels = {
-        item.get("name") for item in (after_release.get("labels") or [])
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
-    if (
-        after_head.get("sha") != expected_head_sha
-        or MANAGED_LABEL in after_labels
-        or (contract.adopted_existing_pr and after_release.get("draft") is True)
-    ):
-        raise AgentLoopError(
-            f"PR #{pr_number} changed while releasing managed CI; its exact head is not safely published."
-        )
 
+    changed = not_published
     if not contract.adopted_existing_pr:
         ready = runner.run(
             [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
@@ -4551,16 +5783,22 @@ def publish_manual_v2_qualification(
         )
         if ready.returncode != 0:
             raise AgentLoopError(f"Unable to mark qualified PR #{pr_number} ready for manual review.")
-        after_ready = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
-        ready_head = after_ready.get("head") if isinstance(after_ready.get("head"), dict) else {}
-        ready_labels = {
-            item.get("name") for item in (after_ready.get("labels") or [])
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        }
-        if ready_head.get("sha") != expected_head_sha or after_ready.get("draft") is True or MANAGED_LABEL in ready_labels:
-            raise AgentLoopError(
-                f"PR #{pr_number} changed while being made ready; the approved head is not safely published."
-            )
+        changed = (
+            f"PR #{pr_number} changed while being made ready; the approved head is not safely published."
+        )
+    after = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    after_head = after.get("head") if isinstance(after.get("head"), dict) else {}
+    after_labels = _label_names_or_none(after)
+    if (
+        after_head.get("sha") != expected_head_sha
+        or after.get("draft") is not False
+        or after_labels is None
+        or MANAGED_LABEL not in after_labels
+    ):
+        raise AgentLoopError(changed)
+    _verify_manual_qualification_label_provenance(
+        runner, config=config, pr_number=pr_number, contract=contract,
+    )
 
     run_text = str(contract.attached_run_id) if contract.attached_run_id is not None else "unknown"
     attempt_text = str(contract.run_attempt) if contract.run_attempt is not None else "unknown"
@@ -4575,7 +5813,9 @@ def publish_manual_v2_qualification(
         f"protection={contract.protection_mode or 'unknown'} nonce={contract.nonce or 'unknown'} "
         f"run_id={run_text} attempt={attempt_text} generation={contract.intent_generation or 'unknown'} -->\n\n"
         f"Managed exact-head CI qualified `{expected_head_sha}` for manual merge. "
-        "The managed suppression label was released and this SHA is the only advertised merge target."
+        "The managed label is retained so ordinary CI does not re-run on this qualified head; "
+        "it has no effect while the PR is ready. Removing the label, or re-running agent-loop "
+        "on this PR, returns it to ordinary CI."
     )
     if contract.protection_mode != "strict":
         body += (
@@ -4598,6 +5838,60 @@ def publish_manual_v2_qualification(
             f"PR #{pr_number} head changed after qualification publication; rerun review and exact-head CI."
         )
     return expected_head_sha
+
+
+def release_retained_managed_label(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path,
+) -> bool:
+    """Release a label retained on an open ready PR at PR-loop entry.
+
+    A successful manual qualification keeps ``agent-loop-managed`` on the
+    ready PR.  Every later invocation first returns such a PR to the
+    ready/unlabeled state the lifecycle already handles.  Removing a label
+    from a ready PR can only restore ordinary CI, so no provenance check is
+    needed.  Drafts, closed PRs, unlabeled PRs and malformed reads are left
+    untouched (downstream reads fail on malformed state as before).  Every
+    command runs in ``cwd`` because the coder checkout may not exist yet.
+    Returns True only when the label was removed and its absence confirmed.
+    """
+    pr = _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
+    labels = _label_names_or_none(pr)
+    if (
+        pr is None
+        or labels is None
+        or pr.get("state") != "open"
+        or pr.get("draft") is not False
+        or MANAGED_LABEL not in labels
+    ):
+        return False
+    failure = AgentLoopError(
+        f"PR #{pr_number} is ready and still carries `{MANAGED_LABEL}`; it could not be removed, "
+        "so no managed-CI or review work was started. Remove the label manually, then rerun."
+    )
+    # A runner exception (transport or subprocess failure) at either step is
+    # reported with the same manual remedy; the read-back may fail after the
+    # DELETE already succeeded, so absence is never assumed.
+    try:
+        removed = _delete_managed_label(runner, config=config, pr_number=pr_number, cwd=cwd)
+    except Exception as exc:
+        raise failure from exc
+    if not removed:
+        raise failure
+    try:
+        after = _label_names_or_none(
+            _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
+        )
+    except Exception as exc:
+        raise failure from exc
+    if after is None or MANAGED_LABEL in after:
+        raise failure
+    log(
+        config,
+        f"PR #{pr_number}: removed `{MANAGED_LABEL}` from the ready PR at entry "
+        "(label origin was not checked); "
+        "ordinary CI resumes and the run continues as ready/unlabeled",
+    )
+    return True
 
 
 def _api_json(runner: Runner, config: AgentLoopConfig, endpoint: str, *, quiet: bool = False) -> dict[str, object]:
@@ -4667,7 +5961,14 @@ def publish_round_readiness(
     *,
     config: AgentLoopConfig,
     head_sha: str,
-) -> None:
+) -> bool:
+    """Publish the informational ``agent-loop/round-readiness`` status.
+
+    The status is non-required: nothing gates on it (the authoritative gate is
+    the workflow-published exact-head status), so a refused write is logged and
+    the round continues.  Some hosts refuse every commit-status write, e.g. a
+    Claude Code cloud session's proxy (#1052).  Returns whether it was published.
+    """
     result = runner.run(
         [
             config.gh_cmd,
@@ -4686,7 +5987,14 @@ def publish_round_readiness(
         check=False,
     )
     if result.returncode != 0:
-        raise AgentLoopError(f"Unable to publish `{READINESS_CONTEXT}` for {head_sha}.")
+        detail = ((result.stderr or "").strip().splitlines() or [f"exit {result.returncode}"])[-1]
+        log(
+            config,
+            f"Warning: could not publish the non-required `{READINESS_CONTEXT}` status for "
+            f"{head_sha} ({detail}); continuing, since nothing gates on it.",
+        )
+        return False
+    return True
 
 
 def dispatch_final_qualification(
@@ -4768,6 +6076,10 @@ def _dispatch_v2_qualification(
         _ensure_v2_intent(
             runner, config=config, pr_number=pr_number, expected_head_sha=expected_head_sha, contract=contract
         )
+    except (ManagedCiHostFooterIncompatibleError, ManagedCiIntentLedgerError):
+        # Terminal operator-action errors: ordinary recovery would release
+        # suppression around a ledger the workflow rejects or cannot see.
+        raise
     except AgentLoopError as exc:
         if not config.managed_ci_pr_mode and contract.authenticated_resume is None:
             raise
@@ -4821,7 +6133,18 @@ def _dispatch_v2_qualification(
         _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
     attached = _discover_v2_run(runner, config=config, contract=contract, retries=3)
     if attached is None:
-        _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+        # This PATCH directly precedes a dispatch, so it renews created_at in
+        # place: the workflow's dispatch validator bounds the record's age,
+        # and a recovered record may be stale or future-dated.  Same comment,
+        # nonce, and generation; no second intent is posted.
+        contract.created_at = int(time.time())
+        patch_result = _patch_intent(
+            runner, config=config, contract=contract, state="dispatch-requested"
+        )
+        _require_workflow_dispatch_authorization(
+            runner, config=config, contract=contract, patch_result=patch_result
+        )
+        contract.dispatch_issued = True
         result = runner.run(
             [
                 config.gh_cmd,
@@ -4849,6 +6172,7 @@ def _dispatch_v2_qualification(
             )
         attached = _discover_v2_run(runner, config=config, contract=contract, retries=3)
     if attached is not None:
+        contract.dispatch_issued = True
         contract.attached_run_id = attached[0]
         contract.run_attempt = attached[1]
         contract.terminal_outcome = None
@@ -4937,6 +6261,7 @@ def _reset_v2_intent_generation(contract: ManagedCiContract) -> None:
     contract.terminal_attempts = ()
     contract.terminal_outcome = None
     contract.intent_state = None
+    contract.dispatch_issued = False
 
 
 def _restore_v2_intent_fields(contract: ManagedCiContract, intent: dict[str, object]) -> None:
@@ -4955,6 +6280,13 @@ def _restore_v2_intent_fields(contract: ManagedCiContract, intent: dict[str, obj
     nonce = intent.get("nonce")
     if not isinstance(nonce, str) or not nonce:
         raise AgentLoopError("Managed-CI v2 intent comment lacks a nonce.")
+    if not re.fullmatch(INTENT_NONCE_PATTERN, nonce):
+        # The workflow requires this exact token shape; never resume a nonce
+        # its validator would fail.
+        raise ManagedCiIntentLedgerError(
+            "Managed-CI v2 intent comment carries a malformed nonce; repair or delete "
+            "the intent comment and resume."
+        )
     contract.nonce = nonce
     contract.created_at = intent.get("created_at") if isinstance(intent.get("created_at"), int) else None
     contract.attached_run_id = intent.get("run_id") if isinstance(intent.get("run_id"), int) else None
@@ -5038,26 +6370,42 @@ def _ensure_v2_intent(
     contract.pr_number = pr_number
     contract.expected_head_sha = expected_head_sha
     contract.repository = config.repo
-    comments = _api_list(
-        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+    trusted_login = _intent_producer_login(contract)
+    trusted_id = _intent_producer_id(contract)
+    page = _read_intent_comment_page(runner, config, pr_number)
+    # Every nonce-independent failure the workflow would raise for any nonce,
+    # including a freshly minted one, stops here: nothing is adopted, posted,
+    # or dispatched while such a comment exists.
+    fatal = intent_page_pre_nonce_fatal(
+        page,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=contract.visible_intent_capable,
+        host_footer_capable=contract.host_footer_capable,
     )
-    if comments is None:
-        raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
-    matching: list[tuple[int, dict[str, object]]] = []
-    for raw in comments:
-        body = raw.get("body")
-        author = raw.get("user") if isinstance(raw.get("user"), dict) else {}
-        if not isinstance(body, str) or INTENT_MARKER not in body:
+    if fatal is not None:
+        raise ManagedCiIntentLedgerError(
+            f"PR #{pr_number}: the managed-CI v2 intent ledger holds a comment the base workflow "
+            f"rejects ({fatal}); repair or delete that comment and resume."
+        )
+    # Candidates are trusted, envelope-matching, version-2 object payloads for
+    # this PR head and generation, including malformed ones: the workflow's
+    # verdict for that nonce decides whether one is adoptable.
+    candidates: dict[str, object] = {}
+    for raw in page:
+        assert isinstance(raw, dict)  # guaranteed by the fatal scan above
+        user = raw["user"]
+        assert isinstance(user, dict)
+        if user.get("login") != trusted_login:
             continue
-        if author.get("login") != contract.trusted_actor_login or author.get("id") != contract.trusted_actor_id:
+        match = match_intent_envelope(
+            raw.get("body"),
+            visible_capable=contract.visible_intent_capable,
+            host_footer_capable=contract.host_footer_capable,
+        )
+        if match is None:
             continue
-        try:
-            encoded = body.split(INTENT_MARKER, 1)[1].split("-->", 1)[0].strip()
-            intent = json.loads(encoded)
-        except (IndexError, json.JSONDecodeError):
-            continue
-        if not isinstance(intent, dict):
-            continue
+        intent = json.loads(match.group("payload"))
         if intent.get("repository") != config.repo:
             continue
         if contract.intent_generation is not None and intent.get("generation") != contract.intent_generation:
@@ -5069,17 +6417,33 @@ def _ensure_v2_intent(
                     "it will not be attached to this invocation",
                 )
             continue
-        if intent.get("pr") == pr_number and intent.get("expected_head_sha") == expected_head_sha:
-            cid = raw.get("id")
-            if isinstance(cid, int):
-                matching.append((cid, intent))
-    distinct = {str(item.get("nonce")) for _, item in matching}
-    if len(distinct) > 1:
+        if intent.get("pr") != pr_number or intent.get("expected_head_sha") != expected_head_sha:
+            continue
+        nonce = intent.get("nonce")
+        candidates[json.dumps(nonce, sort_keys=True)] = nonce
+    if len(candidates) > 1:
         raise AgentLoopError("Competing managed-CI v2 intent comments exist for this PR head.")
-    if matching:
-        contract.intent_comment_id, intent = matching[-1]
-        _restore_v2_intent_fields(contract, intent)
-        contract.intent_comment_id = matching[-1][0]
+    if candidates:
+        (candidate,) = candidates.values()
+        verdict = classify_intent_page(
+            page,
+            requested_nonce=candidate,
+            trusted_login=trusted_login,
+            trusted_id=trusted_id,
+            visible_capable=contract.visible_intent_capable,
+            host_footer_capable=contract.host_footer_capable,
+            binding=_intent_binding(contract, nonce=candidate),
+        )
+        if verdict.outcome == "fail" or verdict.record is None or verdict.comment_id is None:
+            raise ManagedCiIntentLedgerError(
+                f"PR #{pr_number}: the managed-CI v2 intent for this head is one the base workflow "
+                f"rejects ({verdict.reason}); repair or delete the intent comment and resume."
+            )
+        # A lone valid record of this generation is adopted whatever its
+        # age: the dispatch-requested PATCH that precedes a dispatch renews
+        # created_at in place.
+        _restore_v2_intent_fields(contract, verdict.record)
+        contract.intent_comment_id = verdict.comment_id
         return
     _reset_v2_intent_generation(contract)
     contract.nonce = secrets.token_urlsafe(24)
@@ -5087,20 +6451,24 @@ def _ensure_v2_intent(
     body = _intent_body(contract, pr_number=pr_number, expected_head_sha=expected_head_sha, state="prepared")
     # The create is verified against the stored body and the authenticated
     # producer; a numeric ID alone is not proof the ledger was persisted.
-    contract.intent_comment_id = post_verified_trusted_pr_protocol_comment(
+    written = post_verified_trusted_pr_protocol_comment_observed(
         runner,
         config=config,
         pr_number=pr_number,
         body=body,
-        expected_author_login=_intent_producer_login(contract),
-        expected_author_id=_intent_producer_id(contract),
+        expected_author_login=trusted_login,
+        expected_author_id=trusted_id,
     )
+    _guard_host_footer_compatibility(contract, written, pr_number=pr_number)
+    contract.intent_comment_id = written.comment_id
     contract.intent_state = "prepared"
 
 
-def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract, state: str) -> None:
+def _patch_intent(
+    runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract, state: str
+) -> WrittenProtocolComment | None:
     if contract.intent_comment_id is None or contract.nonce is None:
-        return
+        return None
     _validate_v2_intent_publication(contract, state=state)
     body = _intent_body(
         contract,
@@ -5111,7 +6479,7 @@ def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedC
     # The immutable identifying fields are already in the original marker;
     # state updates add only live provenance and are still actor-owned.  The
     # stored body and producer are read back before the state is recorded.
-    patch_verified_trusted_protocol_comment(
+    written = patch_verified_trusted_protocol_comment_observed(
         runner,
         config=config,
         comment_id=contract.intent_comment_id,
@@ -5119,7 +6487,489 @@ def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedC
         expected_author_login=_intent_producer_login(contract),
         expected_author_id=_intent_producer_id(contract),
     )
+    _guard_host_footer_compatibility(contract, written, pr_number=contract.pr_number)
     contract.intent_state = state
+    return written
+
+
+def _guard_host_footer_compatibility(
+    contract: ManagedCiContract, written: WrittenProtocolComment, *, pr_number: int | None
+) -> None:
+    """Stop when the host footered an intent that the base workflow cannot see.
+
+    An older base workflow fullmatches only the unfootered envelope, so it
+    would skip this intent: a dispatch would fail to find its authorization,
+    and an already-dispatched run can no longer be trusted to qualify.
+    """
+    if not written.host_footer_observed or contract.host_footer_capable:
+        return
+    phase: Literal["pre-dispatch", "post-dispatch"] = (
+        "post-dispatch"
+        if contract.dispatch_issued or contract.attached_run_id is not None
+        else "pre-dispatch"
+    )
+    raise ManagedCiHostFooterIncompatibleError(pr_number=pr_number, phase=phase, run_id=contract.attached_run_id)
+
+
+class ManagedCiHostFooterIncompatibleError(AgentLoopError):
+    """A footering host wrote an intent that an older base workflow would skip.
+
+    Terminal and exempt from ordinary recovery: the operator must merge the
+    workflow that advertises ``AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1`` first.
+    """
+
+    def __init__(
+        self,
+        *,
+        pr_number: int | None,
+        phase: Literal["pre-dispatch", "post-dispatch"],
+        run_id: int | None = None,
+    ) -> None:
+        self.phase = phase
+        subject = f"PR #{pr_number}" if pr_number is not None else "The managed PR"
+        if phase == "pre-dispatch":
+            outcome = "No managed-CI run was dispatched."
+        else:
+            run_text = f" ({run_id})" if run_id is not None else ""
+            outcome = (
+                f"The managed-CI run already dispatched{run_text} is left in place, "
+                "is not cancelled, and does not qualify this head."
+            )
+        super().__init__(
+            f"{subject}: this host appended its known comment footer to the managed-CI intent "
+            f"record, but the base workflow does not advertise {HOST_FOOTER_INTENT_MARKER} and "
+            f"would skip the footered intent ({phase}). {outcome} Merge the updated "
+            f".github/workflows/ci.yml into the base branch, or run from a host that does not "
+            "footer comments, then resume."
+        )
+
+
+class ManagedCiIntentLedgerError(AgentLoopError):
+    """The PR's intent ledger holds a state the base workflow would fail.
+
+    Terminal and exempt from ordinary recovery; the message names the
+    offending comment so the operator can repair or delete it and resume.
+    """
+
+
+class ManagedCiIntentFreshnessError(ManagedCiIntentLedgerError):
+    """The renewed intent would fall outside the workflow's age window."""
+
+
+# Mirror of the base workflow's MANAGED_CI_V2_VALIDATOR block in
+# .github/workflows/ci.yml.  Keep the key set, patterns, states, envelope
+# forms, and failure order in lockstep with that block; the page-level
+# parity test runs both against one corpus.
+INTENT_REQUIRED_KEYS = frozenset({
+    "version", "repository", "pr", "expected_head_sha", "base_ref",
+    "workflow_revision", "generation", "nonce", "created_at", "state",
+    "run_id", "run_attempt", "terminal_run_id", "terminal_run_attempt",
+    "terminal_outcome", "terminal_attempts",
+})
+INTENT_ALLOWED_STATES = frozenset({"prepared", "dispatch-requested", "attached", "completed"})
+INTENT_SHA_PATTERN = r"[0-9a-f]{40}"
+INTENT_NONCE_PATTERN = r"[A-Za-z0-9_-]{32}"
+_INTENT_VISIBLE_LINE = r"(?:Managed CI authorization for exact head (?P<visible_sha>[0-9a-f]{40})\.\n\n)?"
+_INTENT_RECORD = r"<!-- AGENT_MANAGED_CI_INTENT_V2 (?P<payload>.*?) -->"
+_INTENT_ENVELOPE_RE = re.compile(r"^" + _INTENT_VISIBLE_LINE + _INTENT_RECORD + r"$")
+_INTENT_FOOTERED_ENVELOPE_RE = re.compile(
+    _INTENT_VISIBLE_LINE + _INTENT_RECORD + re.escape(KNOWN_HOST_COMMENT_FOOTER)
+)
+# The workflow's dispatch validator (MANAGED_CI_V2_DISPATCH_VALIDATOR) bounds
+# the record's age in both directions.  The start margin covers queue and
+# runner start-up latency between this gate and that validator.
+INTENT_MAX_AGE_SECONDS = 15 * 60
+INTENT_MAX_FUTURE_SKEW_SECONDS = 5 * 60
+DISPATCH_START_MARGIN_SECONDS = 5 * 60
+
+
+@dataclass(frozen=True)
+class IntentBinding:
+    """The PR/head tuple a workflow binds an intent record to."""
+
+    repository: str | None
+    pr: int | None
+    expected_head_sha: str | None
+    base_ref: str | None
+    workflow_revision: str | None
+    nonce: object
+    require_generation: bool = True
+
+
+@dataclass(frozen=True)
+class IntentPageVerdict:
+    """The workflow's decision for one requested nonce over one comment page.
+
+    ``recoverable`` is a lone valid ``prepared`` record: the workflow fails it
+    as not yet a dispatch authorization, but the producer may advance it.
+    """
+
+    outcome: Literal["fail", "recoverable", "authorized"]
+    record: dict[str, object] | None = None
+    comment_id: int | None = None
+    reason: str | None = None
+
+
+def _intent_binding(contract: ManagedCiContract, *, nonce: object) -> IntentBinding:
+    return IntentBinding(
+        repository=contract.repository,
+        pr=contract.pr_number,
+        expected_head_sha=contract.expected_head_sha,
+        base_ref=contract.base_ref,
+        workflow_revision=contract.workflow_revision,
+        nonce=nonce,
+    )
+
+
+def match_intent_envelope(
+    body: object, *, visible_capable: bool, host_footer_capable: bool
+) -> re.Match[str] | None:
+    """Match one comment body exactly as the base workflow's envelope does.
+
+    The bare and visible-line forms are matched against the stripped body.
+    The footered form is matched against the raw body, only when the
+    workflow advertises it, so no whitespace or doubled footer is admitted.
+    """
+    if not isinstance(body, str):
+        return None
+    match = _INTENT_ENVELOPE_RE.fullmatch(body.strip())
+    if match is None and host_footer_capable:
+        match = _INTENT_FOOTERED_ENVELOPE_RE.fullmatch(body)
+    if match is None:
+        return None
+    if match.group("visible_sha") is not None and not visible_capable:
+        return None
+    return match
+
+
+def _exact_int(value: object, *, positive: bool = False) -> bool:
+    return type(value) is int and (not positive or value > 0)
+
+
+def _exact_string(value: object, pattern: str | None = None) -> bool:
+    return type(value) is str and (pattern is None or re.fullmatch(pattern, value) is not None)
+
+
+def validate_intent_record(
+    record: dict[str, object], match: re.Match[str], *, binding: IntentBinding
+) -> str | None:
+    """Return the workflow's failure reason for one same-nonce record, if any."""
+    visible_sha = match.group("visible_sha")
+    if visible_sha is not None and visible_sha != record.get("expected_head_sha"):
+        return "visible intent line disagrees with the authorized head"
+    if set(record) != INTENT_REQUIRED_KEYS:
+        return "trusted intent has an invalid schema"
+    checks: tuple[tuple[bool, str], ...] = (
+        (_exact_string(record.get("repository"), r"[^/\s]+/[^/\s]+"), "repository"),
+        (_exact_int(record.get("pr"), positive=True), "pr"),
+        (_exact_string(record.get("expected_head_sha"), INTENT_SHA_PATTERN), "expected_head_sha"),
+        (_exact_string(record.get("base_ref"), r"[^\s]+"), "base_ref"),
+        (_exact_string(record.get("workflow_revision"), INTENT_SHA_PATTERN), "workflow_revision"),
+    )
+    for valid, name in checks:
+        if not valid:
+            return "invalid " + name
+    if binding.require_generation or record.get("generation") is not None:
+        if not _exact_string(record.get("generation"), r"[A-Za-z0-9_-]+"):
+            return "invalid generation"
+    if not _exact_string(record.get("nonce"), INTENT_NONCE_PATTERN):
+        return "invalid nonce"
+    if not _exact_int(record.get("created_at"), positive=True):
+        return "invalid created_at"
+    state = record.get("state")
+    if not _exact_string(state, r"(?:prepared|dispatch-requested|attached|completed)"):
+        return "invalid state"
+    if state not in INTENT_ALLOWED_STATES:
+        return "invalid lifecycle state"
+    run_id, run_attempt = record.get("run_id"), record.get("run_attempt")
+    if state in {"prepared", "dispatch-requested"}:
+        if run_id is not None or run_attempt is not None:
+            return "early lifecycle state has run fields"
+    elif not _exact_int(run_id, positive=True) or not _exact_int(run_attempt, positive=True):
+        return "attached lifecycle state lacks paired run fields"
+    terminal_id = record.get("terminal_run_id")
+    terminal_attempt = record.get("terminal_run_attempt")
+    if terminal_id is not None and not _exact_int(terminal_id, positive=True):
+        return "invalid terminal run ID"
+    if terminal_id is None and terminal_attempt is not None:
+        return "terminal attempt has no terminal run ID"
+    if terminal_id is not None and not _exact_int(terminal_attempt, positive=True):
+        return "invalid terminal run attempt"
+    outcome = record.get("terminal_outcome")
+    if outcome not in {None, "no-status"}:
+        return "invalid terminal outcome"
+    attempts = record.get("terminal_attempts")
+    if not isinstance(attempts, list):
+        return "terminal attempt history is not a list"
+    seen_attempts: set[tuple[object, object]] = set()
+    for item in attempts:
+        if not isinstance(item, dict) or set(item) != {"run_id", "run_attempt"}:
+            return "malformed terminal attempt history"
+        item_id, item_attempt = item["run_id"], item["run_attempt"]
+        if not _exact_int(item_id, positive=True):
+            return "invalid terminal history run ID"
+        if not _exact_int(item_attempt, positive=True):
+            return "invalid terminal history run attempt"
+        key = (item_id, item_attempt)
+        if key in seen_attempts:
+            return "duplicate terminal attempt history"
+        seen_attempts.add(key)
+    terminal_key = (terminal_id, terminal_attempt)
+    if terminal_id is not None and terminal_key not in seen_attempts:
+        return "terminal run is absent from terminal attempt history"
+    if state == "prepared" and (
+        terminal_id is not None or terminal_attempt is not None or outcome is not None or attempts
+    ):
+        return "prepared intent has terminal lifecycle fields"
+    if state == "dispatch-requested" and terminal_id is not None and outcome != "no-status":
+        return "dispatch-requested retry lacks no-status outcome"
+    if state == "attached" and outcome is not None:
+        return "attached intent has terminal outcome"
+    if state == "completed" and outcome == "no-status" and (run_id, run_attempt) != terminal_key:
+        return "completed no-status record is not bound to its terminal run"
+    if state in {"attached", "completed"} and outcome is None and (run_id, run_attempt) in seen_attempts:
+        return "active run is already terminal history"
+    expected = {
+        "repository": binding.repository,
+        "pr": binding.pr,
+        "expected_head_sha": binding.expected_head_sha,
+        "base_ref": binding.base_ref,
+        "workflow_revision": binding.workflow_revision,
+        "nonce": binding.nonce,
+    }
+    if any(record[key] != value for key, value in expected.items()):
+        return "trusted intent binding drifted"
+    return None
+
+
+def _walk_intent_page(
+    page: list[object],
+    *,
+    requested_nonce: object,
+    check_nonce: bool,
+    trusted_login: str,
+    trusted_id: int | None,
+    visible_capable: bool,
+    host_footer_capable: bool,
+    binding: IntentBinding | None,
+) -> tuple[str | None, list[tuple[int | None, dict[str, object]]]]:
+    """Walk one page in the workflow's exact order.
+
+    Returns the first failure reason (naming the comment) and the validated
+    records for ``requested_nonce``.  With ``check_nonce`` false the walk
+    stops before nonce comparison, reporting only nonce-independent failures.
+    """
+    validated: list[tuple[int | None, dict[str, object]]] = []
+    for index, comment in enumerate(page):
+        if not isinstance(comment, dict):
+            return f"comment #{index}: malformed comment object", validated
+        comment_id = comment.get("id") if _exact_int(comment.get("id")) else None
+        label = f"comment {comment_id}" if comment_id is not None else f"comment #{index}"
+        user = comment.get("user")
+        if not isinstance(user, dict) or type(user.get("login")) is not str:
+            return f"{label}: malformed comment author", validated
+        if user["login"] != trusted_login:
+            continue
+        if trusted_id is not None and user.get("id") != trusted_id:
+            return f"{label}: trusted comment author ID drifted", validated
+        body = comment.get("body")
+        if type(body) is not str:
+            return f"{label}: trusted comment body is not text", validated
+        match = match_intent_envelope(
+            body, visible_capable=visible_capable, host_footer_capable=host_footer_capable
+        )
+        if match is None:
+            continue
+        try:
+            record = json.loads(match.group("payload"))
+        except json.JSONDecodeError:
+            return f"{label}: trusted intent envelope contains malformed JSON", validated
+        if not isinstance(record, dict):
+            return f"{label}: trusted intent payload is not an object", validated
+        if record.get("version") != 2:
+            return f"{label}: unsupported intent version", validated
+        if not check_nonce or record.get("nonce") != requested_nonce:
+            continue
+        assert binding is not None
+        reason = validate_intent_record(record, match, binding=binding)
+        if reason is not None:
+            return f"{label}: {reason}", validated
+        validated.append((comment_id, record))
+    return None, validated
+
+
+def intent_page_pre_nonce_fatal(
+    page: list[object],
+    *,
+    trusted_login: str,
+    trusted_id: int | None,
+    visible_capable: bool,
+    host_footer_capable: bool,
+) -> str | None:
+    """Return the first failure the workflow raises for every requested nonce."""
+    reason, _ = _walk_intent_page(
+        page,
+        requested_nonce=None,
+        check_nonce=False,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=visible_capable,
+        host_footer_capable=host_footer_capable,
+        binding=None,
+    )
+    return reason
+
+
+def classify_intent_page(
+    page: list[object],
+    *,
+    requested_nonce: object,
+    trusted_login: str,
+    trusted_id: int | None,
+    visible_capable: bool,
+    host_footer_capable: bool,
+    binding: IntentBinding,
+) -> IntentPageVerdict:
+    """Mirror the workflow's ``validate()`` decision for one requested nonce.
+
+    Freshness is deliberately not judged here: the workflow checks the age
+    window separately in its dispatch validator.
+    """
+    reason, validated = _walk_intent_page(
+        page,
+        requested_nonce=requested_nonce,
+        check_nonce=True,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=visible_capable,
+        host_footer_capable=host_footer_capable,
+        binding=binding,
+    )
+    if reason is not None:
+        return IntentPageVerdict("fail", reason=reason)
+    if len(validated) != 1:
+        return IntentPageVerdict(
+            "fail", reason="expected exactly one fresh intent for requested nonce"
+        )
+    comment_id, record = validated[0]
+    if record["state"] == "prepared":
+        return IntentPageVerdict(
+            "recoverable",
+            record=record,
+            comment_id=comment_id,
+            reason="prepared intent is not a dispatch authorization",
+        )
+    return IntentPageVerdict("authorized", record=record, comment_id=comment_id)
+
+
+def _read_intent_comment_page(
+    runner: Runner, config: AgentLoopConfig, pr_number: int
+) -> list[object]:
+    """Read the PR comment page exactly as the workflow receives it.
+
+    Unlike ``_api_list``, a JSON list is returned unfiltered: a non-dict entry
+    must reach the workflow-mirror scan, which fails closed on it as the
+    workflow does, instead of collapsing to an uninspectable read.
+    """
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "api",
+            "--paginate",
+            f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
+    # An empty body is not an empty ledger: treating it as ``[]`` would mint
+    # a fresh intent without having inspected the existing comments.
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError("Unable to inspect managed-CI v2 intent history.") from exc
+    if not isinstance(payload, list):
+        raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
+    # The page stays raw (the envelope mirror owns the footered form), but a
+    # footer seen only on this re-read is still reported once per invocation.
+    for comment in payload:
+        body = comment.get("body") if isinstance(comment, dict) else None
+        if isinstance(body, str) and INTENT_MARKER in body and strip_known_host_footer(body)[1]:
+            note_host_footer_observed(config, "managed-CI intent re-read")
+            break
+    return payload
+
+
+def _require_workflow_dispatch_authorization(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    contract: ManagedCiContract,
+    patch_result: WrittenProtocolComment | None,
+) -> None:
+    """Dispatch only what the workflow would accept, within its age window.
+
+    The page is re-read after the dispatch-requested PATCH and must classify
+    as ``authorized`` for this contract's comment.  The age window is checked
+    against the PATCH's server ``updated_at`` (or local time when absent),
+    never against the comment's creation time, which predates the renewal.
+    """
+    pr_number = contract.pr_number or 0
+    trusted_login = _intent_producer_login(contract)
+    trusted_id = _intent_producer_id(contract)
+    page = _read_intent_comment_page(runner, config, pr_number)
+    fatal = intent_page_pre_nonce_fatal(
+        page,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=contract.visible_intent_capable,
+        host_footer_capable=contract.host_footer_capable,
+    )
+    if fatal is not None:
+        raise ManagedCiIntentLedgerError(
+            f"PR #{pr_number}: managed-CI dispatch refused because the intent ledger holds a "
+            f"comment the base workflow rejects ({fatal}); repair or delete that comment and resume."
+        )
+    verdict = classify_intent_page(
+        page,
+        requested_nonce=contract.nonce,
+        trusted_login=trusted_login,
+        trusted_id=trusted_id,
+        visible_capable=contract.visible_intent_capable,
+        host_footer_capable=contract.host_footer_capable,
+        binding=_intent_binding(contract, nonce=contract.nonce),
+    )
+    if (
+        verdict.outcome != "authorized"
+        or verdict.record is None
+        or verdict.comment_id != contract.intent_comment_id
+    ):
+        reason = verdict.reason or (
+            f"authorized comment {verdict.comment_id} is not this invocation's intent "
+            f"{contract.intent_comment_id}"
+        )
+        raise ManagedCiIntentLedgerError(
+            f"PR #{pr_number}: managed-CI dispatch refused because the base workflow would not "
+            f"authorize intent {contract.intent_comment_id} ({reason}); repair or delete the "
+            "named comment and resume."
+        )
+    server_time = patch_result.server_updated_at if patch_result is not None else None
+    reference = server_time if server_time is not None else int(time.time())
+    source = "server updated_at" if server_time is not None else "local clock"
+    created_at = verdict.record["created_at"]
+    assert isinstance(created_at, int)
+    age = reference - created_at
+    if not (
+        -INTENT_MAX_FUTURE_SKEW_SECONDS
+        <= age
+        <= INTENT_MAX_AGE_SECONDS - DISPATCH_START_MARGIN_SECONDS
+    ):
+        raise ManagedCiIntentFreshnessError(
+            f"PR #{pr_number}: managed-CI dispatch refused because intent "
+            f"{contract.intent_comment_id} has created_at={created_at}, which is outside the "
+            f"workflow's age window at {reference} ({source}). Correct the local clock and resume."
+        )
 
 
 def _discover_v2_snapshot(
@@ -5662,6 +7512,7 @@ def wait_for_ordinary_recovery(
         // config.ci_poll_interval_seconds,
     )
     latest: PullRequestChecks | None = None
+    unverified_green_attempts = 0
     for attempt in range(attempts):
         live_head = get_pr_head_sha(runner, config, capability.pr_number)
         if live_head != expected_head:
@@ -5692,24 +7543,49 @@ def wait_for_ordinary_recovery(
         completed = [run for run in recovery_runs if run.get("status") == "completed"]
         if completed and any(run.get("conclusion") != "success" for run in completed):
             return ManagedCiOutcome(status="failed", checks=latest, head_sha=live_head)
-        reliable = latest.check_query_status == "ok" and latest.branch_protection_status in {
-            "configured", "not_found",
-        }
-        if (
+        # A draft reports DRAFT, never CLEAN; under unreadable protection the
+        # finalizer re-checks CLEAN after readiness and before any merge.
+        reliable = latest.check_query_status == "ok" and (
+            board_protection_is_reliable(latest, mergeability, head_sha=live_head)
+            or protection_awaits_readiness(latest, mergeability, head_sha=live_head)
+        )
+        green_board = (
             recovery_runs
             and any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in completed)
+            and latest.check_query_status == "ok"
             and latest.state == "passing"
             and bool(latest.passing)
-            and reliable
             and not latest.pending
             and not latest.missing_required
-        ):
+        )
+        if green_board and reliable:
             log(config, f"PR #{capability.pr_number}: ordinary unlabeled recovery passed at {expected_head}")
-            return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
+            return ManagedCiOutcome(
+                status="passed", checks=latest, mergeability=mergeability, head_sha=live_head,
+            )
+        if green_board and latest.branch_protection_status == "forbidden":
+            # The board is green but neither CLEAN nor a same-head DRAFT can
+            # stand in for the unreadable protection.  Stop after the bounded
+            # startup window instead of polling to the full CI timeout.
+            unverified_green_attempts += 1
+            if unverified_green_attempts >= startup_attempt_limit:
+                return ManagedCiOutcome(
+                    status="protection_unreadable", checks=latest,
+                    mergeability=mergeability, head_sha=live_head,
+                )
+        else:
+            unverified_green_attempts = 0
         if not recovery_runs and attempt + 1 >= startup_attempt_limit:
             return ManagedCiOutcome(status="not_started", checks=latest, head_sha=live_head)
         if attempt < attempts - 1:
             runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
+    if unverified_green_attempts:
+        # The budget expired on a green board that only the unreadable
+        # protection kept from qualifying; report that cause, not a timeout.
+        return ManagedCiOutcome(
+            status="protection_unreadable", checks=latest,
+            mergeability=mergeability, head_sha=live_head,
+        )
     return ManagedCiOutcome(status="timeout", checks=latest, head_sha=expected_head)
 
 

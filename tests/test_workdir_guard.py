@@ -1,5 +1,6 @@
 import shlex
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -1228,22 +1229,28 @@ def test_checkout_inspected_evidence_rejects_implausibly_large_line_number_witho
         )
 
 
-def test_checkout_inspected_evidence_rejects_unreadable_file_without_crashing(tmp_path):
+def test_checkout_inspected_evidence_rejects_unreadable_file_without_crashing(tmp_path, monkeypatch):
     # is_file() only checks the path resolves to a regular file; it does not
     # guarantee the file can actually be opened (deleted or made unreadable
     # between the check and open() -- e.g. a permission race). An OSError
     # from open() must be translated into AgentLoopError like every other
     # unresolvable reference, not left to escape and bypass the repair path.
+    # The OSError is injected rather than produced with chmod(0o000), which
+    # root ignores.
     target = tmp_path / "src.py"
     target.write_text("line1\nline2\n", encoding="utf-8")
-    target.chmod(0o000)
-    try:
-        with pytest.raises(AgentLoopError, match="could not be read"):
-            validate_checkout_inspected_evidence(
-                [_checkout_claim("src.py:1")], assigned_workdir=tmp_path
-            )
-    finally:
-        target.chmod(0o644)
+    real_open = Path.open
+
+    def failing_open(self, *args, **kwargs):
+        if self == target.resolve():
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    with pytest.raises(AgentLoopError, match="could not be read"):
+        validate_checkout_inspected_evidence(
+            [_checkout_claim("src.py:1")], assigned_workdir=tmp_path
+        )
 
 
 def test_checkout_inspected_evidence_rejects_line_zero(tmp_path):

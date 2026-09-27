@@ -48,7 +48,7 @@ def test_live_carried_item_requires_explanation(disposition, note):
     with pytest.raises(AgentLoopError, match="requires an actionable note"):
         _validate_review_response(
             carried_review(disposition=disposition, note=note),
-            reviewer="Codex", unresolved_items=(carried_item(),),
+            reviewer="Codex", unresolved_items=(carried_item(),), architecture_status_mode="legacy",
         )
 
 
@@ -56,13 +56,13 @@ def test_live_carried_item_requires_explanation(disposition, note):
 def test_live_carried_item_rejects_blank_note(note):
     with pytest.raises(AgentLoopError):
         _validate_review_response(
-            carried_review(note=note), reviewer="Codex", unresolved_items=(carried_item(),),
+            carried_review(note=note), reviewer="Codex", unresolved_items=(carried_item(),), architecture_status_mode="legacy",
         )
 
 
 def test_resolved_note_optional_and_historical_blocker_still_readable():
     _validate_review_response(
-        carried_review(disposition="resolved"), reviewer="Codex", unresolved_items=(carried_item(),),
+        carried_review(disposition="resolved"), reviewer="Codex", unresolved_items=(carried_item(),), architecture_status_mode="legacy",
     )
     old = parse_pr_review(carried_review(), reviewer="Codex")
     items, _ = _apply_unresolved_item_dispositions(
@@ -74,7 +74,7 @@ def test_resolved_note_optional_and_historical_blocker_still_readable():
 
 def test_note_survives_publication_metadata_and_reconciliation():
     parsed = _validate_review_response(
-        carried_review(note=NOTE), reviewer="Codex", unresolved_items=(carried_item(),),
+        carried_review(note=NOTE), reviewer="Codex", unresolved_items=(carried_item(),), architecture_status_mode="legacy",
     )
     public = _render_public_pr_review_comment(
         parsed, reviewer="Codex", prior_items=(carried_item(),), dispositions=parsed.dispositions,
@@ -107,7 +107,7 @@ def test_carried_machine_obligation_keeps_authority_after_reparsed_approval():
         prior_item_dispositions=[{"item_id": "item-30", "disposition": "resolved"}],
     )
     parsed = _validate_review_response(
-        review, reviewer="Codex", unresolved_items=(machine_item,)
+        review, reviewer="Codex", unresolved_items=(machine_item,), architecture_status_mode="legacy"
     )
     saved = _attach_round_metadata(
         "Published review.\n<!-- AGENT_STATE: approved -->\n-- Codex",
@@ -551,3 +551,38 @@ def test_coder_context_keeps_out_of_checkout_baseline_as_non_evidence(tmp_path, 
     payload = json.loads(context[context.index("{"):])
     assert payload["tests_run"] == ["python3 -m pytest tests/test_api.py -q"]
     assert payload["out_of_checkout_context_runs_not_evidence"] == [baseline]
+
+
+def test_reviewer_context_shows_dropped_citations_restored_from_metadata_927():
+    """#927: a resumed round's dropped-citation records reach the reviewer context."""
+    payload, end = json.JSONDecoder().raw_decode(structured_coder_followup(summary="Checked receipts."))
+    payload["test_observations"] = [
+        {"command": "python -m pytest -q", "receipt_id": "known", "claim": "current-result"},
+        {"command": "python -m pytest -q", "receipt_id": "r-1", "claim": "bogus"},
+    ]
+    text = json.dumps(payload) + structured_coder_followup(summary="Checked receipts.")[end:]
+    parsed = orchestrator.validate_structured_coder_followup(text)
+    [record] = parsed.test_observation_degradations
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123",
+        test_observation_degradations=(record,),
+    )
+    context = _coder_followup_review_context(text, metadata, head_sha="abc123")
+    assert '"test_observation_degradations"' in context
+    assert "coder_followup.test_observations[1]" in context
+    without = _coder_followup_review_context(
+        text, dataclasses.replace(metadata, test_observation_degradations=()), head_sha="abc123"
+    )
+    assert "test_observation_degradations" not in without
+
+
+def test_metadata_writer_persists_citation_records_only_for_coder_results_927():
+    payload, end = json.JSONDecoder().raw_decode(structured_coder_followup(summary="Checked."))
+    payload["test_observations"] = [7]
+    text = json.dumps(payload) + structured_coder_followup(summary="Checked.")[end:]
+    parsed = orchestrator.validate_structured_coder_followup(text)
+    fields = orchestrator._test_observation_degradation_fields(parsed)
+    assert fields == {"test_observation_degradations": parsed.test_observation_degradations}
+    assert len(fields["test_observation_degradations"]) == 1
+    assert orchestrator._test_observation_degradation_fields(None) == {}
+    assert orchestrator._test_observation_degradation_fields("clarify") == {}

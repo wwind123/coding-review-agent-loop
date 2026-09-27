@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import replace
@@ -70,6 +71,19 @@ def select_coder_followup_items(
         item
         for item in unresolved_items
         if item.item_id not in CODER_NON_CLASSIFIABLE_ITEM_IDS
+    )
+
+
+def coder_followup_is_ci_repair(
+    coder_followup_items: Sequence[UnresolvedReviewItem],
+) -> bool:
+    """Whether a coder round exists only to repair tool-owned CI failures.
+
+    The set must be non-empty: an acknowledgement-only round has no
+    classifiable items and must not be reported as a CI repair (#1024).
+    """
+    return bool(coder_followup_items) and all(
+        _machine_obligation_is_ci(item) for item in coder_followup_items
     )
 
 
@@ -427,8 +441,11 @@ def _validate_review_response(
     reviewer: str,
     unresolved_items: Sequence[UnresolvedReviewItem],
     current_round_items: Sequence[UnresolvedReviewItem] = (),
+    architecture_status_mode: str,
 ) -> ParsedReview:
-    parsed = parse_pr_review(text, reviewer=reviewer)
+    parsed = parse_pr_review(
+        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+    )
 
     unresolved_by_id = {item.item_id: item for item in unresolved_items}
     dispositions = _maybe_fill_resolved_dispositions_from_prose(
@@ -474,14 +491,9 @@ def _validate_review_response(
                 "relevant evidence, and the change or test needed. A status alone or a "
                 "review-level summary is not an item-specific explanation."
             )
-    return ParsedReview(
-        state=parsed.state,
-        summary=parsed.summary,
-        blocking_items=parsed.blocking_items,
-        followups=parsed.followups,
-        dispositions=dispositions,
-        raw_dispositions_text=parsed.raw_dispositions_text,
-    )
+    # Replace only the dispositions: the assessment, its degradation records
+    # and every other parsed field survive a carried-item round (#925).
+    return replace(parsed, dispositions=dispositions)
 
 
 def _upsert_human_requirements_ack_item(
@@ -769,6 +781,7 @@ def _validate_coder_followup_response(
     authoritative_test_observations=None,
     delivered_risk_test_matrix_row_ids=None,
     execution_catalog=None,
+    architecture_status_mode: str,
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -780,6 +793,7 @@ def _validate_coder_followup_response(
         authoritative_test_observations=authoritative_test_observations,
         delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
         execution_catalog=execution_catalog,
+        architecture_status_mode=architecture_status_mode,
     )
     if structured_followup is not None:
         _validate_structured_coder_followup_items(
@@ -1014,6 +1028,96 @@ def _collect_prior_compact_summaries(
     return tuple(summaries)
 
 
+# The compact prior ledger rides in every round comment's metadata, so its
+# size must not scale with round count (#1003).  The budget is measured as the
+# UTF-8 byte length of each JSON-serialized entry, which is exactly what the
+# round transport compresses and base64-encodes.  Base64 adds a third and zlib
+# cannot expand incompressible input by more than a few bytes, so even a
+# worst-case (non-ASCII, high-entropy) ledger encodes to roughly 21,500
+# characters, well inside the 60,000-character comment limit.
+COMPACT_PRIOR_SUMMARIES_MAX_BYTES = 16_000
+COMPACT_PRIOR_DETAILS_OMITTED_SUFFIX = " (details compacted)"
+COMPACT_PRIOR_OMITTED_NOTICE_RE = re.compile(
+    r"^\[compacted\] (?P<count>\d+) earlier prior item summar(?:y|ies) omitted"
+)
+
+
+def _compact_prior_entry_size(entry: str) -> int:
+    return len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+
+
+def _compact_prior_summaries_size(summaries: Sequence[str]) -> int:
+    # Serialized UTF-8 bytes plus one JSON list separator between entries.
+    return sum(_compact_prior_entry_size(summary) for summary in summaries) + max(
+        len(summaries) - 1, 0
+    )
+
+
+def _compact_prior_omitted_notice(count: int) -> str:
+    noun = "summary" if count == 1 else "summaries"
+    return (
+        f"[compacted] {count} earlier prior item {noun} omitted to bound "
+        "round metadata; those items were already dispositioned in earlier rounds."
+    )
+
+
+def bound_compact_prior_summaries(
+    summaries: Sequence[str],
+    *,
+    max_bytes: int = COMPACT_PRIOR_SUMMARIES_MAX_BYTES,
+) -> tuple[str, ...]:
+    """Bound the append-only compact prior ledger independent of round count.
+
+    Oldest entries degrade first: their bodies collapse to the header line
+    (item id, disposition label, reviewer, source round), then whole headers
+    fold into a single omission notice.  The newest entries stay verbatim.
+    The result is idempotent, so re-bounding a persisted ledger is stable.
+    """
+    entries = list(summaries)
+    omitted = 0
+    if entries:
+        match = COMPACT_PRIOR_OMITTED_NOTICE_RE.match(entries[0])
+        if match:
+            omitted = int(match.group("count"))
+            entries = entries[1:]
+
+    rendered = [_compact_prior_omitted_notice(omitted), *entries] if omitted else entries
+    if _compact_prior_summaries_size(rendered) <= max_bytes:
+        return tuple(rendered)
+    # Fill the budget newest-first.  Once one entry must degrade to its header,
+    # every older entry degrades too; once a header no longer fits, every older
+    # entry folds into the omission notice.
+    notice_reserve = _compact_prior_entry_size(
+        _compact_prior_omitted_notice(omitted + len(entries))
+    ) + 1
+    budget = max_bytes - notice_reserve
+    kept: list[str] = []
+    used = 0
+    headers_only = False
+    for position in range(len(entries) - 1, -1, -1):
+        entry = entries[position]
+        separator = 1 if kept else 0
+        entry_size = _compact_prior_entry_size(entry)
+        if not headers_only and used + separator + entry_size <= budget:
+            kept.append(entry)
+            used += separator + entry_size
+            continue
+        headers_only = True
+        header = entry.split("\n", 1)[0]
+        if not header.endswith(COMPACT_PRIOR_DETAILS_OMITTED_SUFFIX):
+            header += COMPACT_PRIOR_DETAILS_OMITTED_SUFFIX
+        header_size = _compact_prior_entry_size(header)
+        if used + separator + header_size > budget:
+            omitted += position + 1
+            break
+        kept.append(header)
+        used += separator + header_size
+    kept.reverse()
+    if omitted:
+        kept.insert(0, _compact_prior_omitted_notice(omitted))
+    return tuple(kept)
+
+
 def _validate_plan_review_response(
     text: str,
     *,
@@ -1021,8 +1125,11 @@ def _validate_plan_review_response(
     unresolved_items: Sequence[UnresolvedReviewItem],
     current_round_items: Sequence[UnresolvedReviewItem] = (),
     surfaced_requirement_ids: Sequence[str] = (),
+    architecture_status_mode: str,
 ) -> ParsedPlanReview:
-    parsed = parse_plan_review(text, reviewer=reviewer)
+    parsed = parse_plan_review(
+        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+    )
     validate_human_requirement_dispositions(
         parsed.human_requirement_dispositions,
         surfaced_requirement_ids=surfaced_requirement_ids,
@@ -1058,13 +1165,9 @@ def _validate_plan_review_response(
                 "Plan review did not evaluate all prior unresolved plan items: "
                 + ", ".join(missing)
             )
-    return ParsedPlanReview(
-        state=parsed.state,
-        summary=parsed.summary,
-        items=parsed.items,
-        dispositions=dispositions,
-        raw_dispositions_text=parsed.raw_dispositions_text,
-    )
+    # Replace only the dispositions: the assessment, its degradation records
+    # and every other parsed field survive a carried-item round (#925).
+    return replace(parsed, dispositions=dispositions)
 
 
 def _record_prior_item_disposition(

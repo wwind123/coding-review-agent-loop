@@ -137,7 +137,7 @@ def test_issue_implementation_protocol_preserves_positive_pr_blocked_conflict():
     )
     result = _validate_issue_implementation_response(
         text,
-        human_requirements=(requirement,),
+        human_requirements=(requirement,), architecture_status_mode="legacy",
     )
 
     assert isinstance(result, _TerminalIssueImplementationConflict)
@@ -286,7 +286,10 @@ def test_discuss_answer_needs_human_contract_and_legacy_decoder_are_isolated():
         DiscussUnresolvedItem("blocker", "Verify availability."),
     )
 from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER
-from coding_review_agent_loop.errors import UnknownPriorItemDispositionError
+from coding_review_agent_loop.errors import (
+    NonRepairableEvidenceRejection,
+    UnknownPriorItemDispositionError,
+)
 from coding_review_agent_loop.orchestrator import (
     _detect_discuss_consensus,
     _decode_public_response_json_prefix,
@@ -1032,7 +1035,7 @@ def test_validate_plan_review_response_rejects_duplicate_item_ids():
                     text="Keep the extra regression coverage.",
                     status="same-plan",
                 ),
-            ),
+            ), architecture_status_mode="legacy",
         )
 
 
@@ -1055,7 +1058,7 @@ def test_validate_plan_review_response_rejects_unknown_item_ids():
                     text="Keep the extra regression coverage.",
                     status="same-plan",
                 ),
-            ),
+            ), architecture_status_mode="legacy",
         )
 
 
@@ -1070,7 +1073,7 @@ def test_validate_plan_review_response_rejects_unknown_item_with_empty_prior_led
         _validate_plan_review_response(
             review,
             reviewer="OpenAI Codex",
-            unresolved_items=(),
+            unresolved_items=(), architecture_status_mode="legacy",
         )
 
     assert exc_info.value.unknown_ids == ("item-1",)
@@ -1110,7 +1113,7 @@ def test_validate_plan_review_response_describes_same_round_unknown_item():
             review,
             reviewer="OpenAI Codex",
             unresolved_items=(),
-            current_round_items=(current_round_item,),
+            current_round_items=(current_round_item,), architecture_status_mode="legacy",
         )
 
     assert "item-2" in exc_info.value.same_round_description
@@ -1144,7 +1147,7 @@ def test_validate_plan_review_response_accepts_structured_resolved_dispositions(
                 text="Clarify the fallback trigger.",
                 status="blocking",
             ),
-        ),
+        ), architecture_status_mode="legacy",
     )
 
     assert [(item.item_id, item.disposition) for item in parsed.dispositions] == [
@@ -1181,7 +1184,7 @@ def test_validate_plan_review_response_rejects_missing_structured_dispositions()
                     text="Clarify the fallback trigger.",
                     status="blocking",
                 ),
-            ),
+            ), architecture_status_mode="legacy",
         )
 
 
@@ -1342,7 +1345,7 @@ def test_validate_review_response_accepts_structured_resolved_dispositions():
                 text="Keep the PR body issue reference.",
                 status="blocking",
             ),
-        ),
+        ), architecture_status_mode="legacy",
     )
 
     assert [(item.item_id, item.disposition) for item in parsed.dispositions] == [
@@ -1362,7 +1365,7 @@ def test_validate_review_response_rejects_unknown_item_with_empty_prior_ledger()
         _validate_review_response(
             review,
             reviewer="OpenAI Codex",
-            unresolved_items=(),
+            unresolved_items=(), architecture_status_mode="legacy",
         )
 
     assert exc_info.value.unknown_ids == ("item-1",)
@@ -1393,7 +1396,7 @@ def test_validate_review_response_rejects_ambiguous_blanket_prose():
                     text="Rename the helper.",
                     status="same-pr",
                 ),
-            ),
+            ), architecture_status_mode="legacy",
         )
 
 
@@ -2455,32 +2458,68 @@ def test_semantic_matrix_claim_empty_fact_normalizes_to_default(kind, field, val
 
 @pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
 @pytest.mark.parametrize(
+    ("mutate", "path_suffix", "rule"),
+    [
+        (lambda c: c.update(workflow_path_claim=5), ".workflow_path_claim", "ill-typed"),
+        (lambda c: c.update(workflow_path_claim=["path"]), ".workflow_path_claim", "ill-typed"),
+        (lambda c: c.update(workflow_path_claim=True), ".workflow_path_claim", "ill-typed"),
+        (lambda c: c.update(workflow_path_claim={"a": 1}), ".workflow_path_claim", "ill-typed"),
+        (lambda c: c.update(test_identifiers="test_protocol"), ".test_identifiers", "ill-typed"),
+        (lambda c: c.update(test_locations={"a": 1}), ".test_locations", "ill-typed"),
+        (lambda c: c.update(outcome_assertions=[3]), ".outcome_assertions", "ill-typed"),
+        (lambda c: c.update(forbidden_effect_assertions=[""]), ".forbidden_effect_assertions", "ill-typed"),
+        (lambda c: c.update(workflow_path_claim="x" * 5000), ".workflow_path_claim", "exceeds the field bound"),
+        (lambda c: c.update(test_identifiers=["x" * 5000]), ".test_identifiers", "exceeds the field bound"),
+        (lambda c: c.update(test_identifiers=["tests/t.py::t", "tests/t.py::t"]), ".test_identifiers", "duplicated"),
+        (lambda c: c.update(test_locations=["tests/t.py", "tests/t.py"]), ".test_locations", "duplicated"),
+        (lambda c: c.update(outcome_assertions=["passed", "passed"]), ".outcome_assertions", "duplicated"),
+        (lambda c: c.update(forbidden_effect_assertions=["none", "none"]), ".forbidden_effect_assertions", "duplicated"),
+        (lambda c: c.update(caveats="one caveat"), ".caveats", "ill-typed"),
+        (lambda c: c.update(caveats=[7]), ".caveats", "ill-typed"),
+        (lambda c: c.update(surprise="value"), "", "unknown keys"),
+        (lambda c: c.update(citations=[]), "", "unknown keys"),
+        (lambda c: c.update(Status="verified"), "", "unknown keys"),
+        (lambda c: c.pop("execution_refs"), ".execution_refs", "key is absent"),
+        (lambda c: c.update(execution_refs=[]), ".execution_refs", "no selector"),
+        (lambda c: c.update(execution_refs=["turn:observation-1", "turn:observation-1"]), ".execution_refs", "more than once"),
+        (lambda c: c.update(execution_refs=[3]), ".execution_refs", "non-blank strings"),
+        (lambda c: c.update(execution_refs=["   "]), ".execution_refs", "non-blank strings"),
+        (lambda c: c.update(execution_refs="turn:observation-1"), ".execution_refs", "non-blank strings"),
+        (lambda c: c.update(execution_refs=None), ".execution_refs", "non-blank strings"),
+    ],
+)
+def test_semantic_matrix_claim_format_defects_drop_only_that_claim_927(kind, mutate, path_suffix, rule):
+    """#927: claim-scope format, key and type defects drop the claim, not the envelope."""
+    claim = {"row_id": "row-1", "execution_refs": ["turn:observation-1"]}
+    mutate(claim)
+    other = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(kind, [claim, other], row_ids=("row-1", "row-2"))
+
+    claims = parsed.risk_test_matrix_claims
+    assert [item.row_id for item in claims.claims] == ["row-2"]
+    [record] = claims.degradations
+    assert record.element_path == f"{kind}.risk_test_matrix_claims[0]{path_suffix}"
+    assert rule in record.rule
+    assert record.outcome == "claim-dropped"
+    assert "\n" not in record.observed_preview
+    assert claims.dropped_row_ids == ()
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
     ("mutate", "match"),
     [
-        (lambda c: c.update(workflow_path_claim=5), "workflow_path_claim must be a string"),
-        (lambda c: c.update(workflow_path_claim=["path"]), "workflow_path_claim must be a string"),
-        (lambda c: c.update(workflow_path_claim=True), "workflow_path_claim must be a string"),
-        (lambda c: c.update(test_identifiers="test_protocol"), "test_identifiers must be a JSON array"),
-        (lambda c: c.update(test_locations={"a": 1}), "test_locations must be a JSON array"),
-        (lambda c: c.update(outcome_assertions=[3]), "outcome_assertions"),
-        (lambda c: c.update(forbidden_effect_assertions=[""]), "forbidden_effect_assertions"),
-        (lambda c: c.update(workflow_path_claim="x" * 5000), "workflow_path_claim exceeds"),
-        (lambda c: c.update(test_identifiers=["x" * 5000]), "test_identifiers"),
-        (lambda c: c.update(test_identifiers=["tests/t.py::t", "tests/t.py::t"]), "test_identifiers contains duplicate"),
-        (lambda c: c.update(test_locations=["tests/t.py", "tests/t.py"]), "test_locations contains duplicate"),
-        (lambda c: c.update(outcome_assertions=["passed", "passed"]), "outcome_assertions contains duplicate"),
-        (lambda c: c.update(forbidden_effect_assertions=["none", "none"]), "forbidden_effect_assertions contains duplicate"),
-        (lambda c: c.update(surprise="value"), "unknown field"),
-        (lambda c: c.pop("execution_refs"), "missing required field"),
-        (lambda c: c.update(execution_refs=[]), "at least one selector"),
-        (lambda c: c.pop("row_id"), "missing required field"),
-        (lambda c: c.update(row_id="row-unknown"), "not an approved enforceable matrix row"),
-        (lambda c: c.update(execution_refs=["turn:observation-1", "turn:observation-1"]), "more than once"),
         (lambda c: c.update(execution_refs=[f"cmd-{i}" for i in range(9)]), "8-item bound"),
-        (lambda c: c.update(execution_refs=[3]), "must be a string"),
-        (lambda c: c.update(execution_refs=["   "]), "non-empty string"),
-        (lambda c: c.update(execution_refs="turn:observation-1"), "must be a JSON array"),
         (lambda c: c.update(execution_refs=["x" * 16_385]), "16384-byte bound"),
+        (lambda c: c.update(workflow_path_claim="x" * 16_385), "16384-byte bound"),
+        (lambda c: c.update(test_identifiers=["x" * 16_385]), "16384-byte bound"),
+        (lambda c: c.update(caveats=[f"c{i}" for i in range(17)]), "16-item bound"),
+        (lambda c: c.update(status="verified"), "orchestrator-owned authority"),
+        (lambda c: c.update(evidence_citations=[]), "orchestrator-owned authority"),
+        (lambda c: c.update(receipt_id="r-1"), "orchestrator-owned authority"),
+        (lambda c: c.update(command="pytest"), "orchestrator-owned authority"),
+        (lambda c: c.update(claim="current-result"), "orchestrator-owned authority"),
     ],
 )
 def test_semantic_matrix_claim_authority_defects_still_reject(kind, mutate, match):
@@ -2492,8 +2531,115 @@ def test_semantic_matrix_claim_authority_defects_still_reject(kind, mutate, matc
 
 
 @pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize("key", sorted(["status", "evidence_citations", "receipt_id", "command", "claim"]))
+def test_semantic_matrix_claim_reserved_key_rejects_even_on_a_degraded_claim_927(kind, key):
+    """A degradable defect on the same claim never masks a reserved authority key."""
+    claim = {"row_id": "finding-3", "execution_refs": [], "notes": "x", key: "forged"}
+
+    with pytest.raises(AgentLoopError, match="orchestrator-owned authority"):
+        _validate_claims_envelope(kind, [claim])
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_for_unapproved_row_is_dropped_not_rejected(kind):
+    """#920: one claim citing a sibling phase's row must not discard the envelope."""
+    valid = _complete_semantic_claim()
+    sibling = {**_complete_semantic_claim(), "row_id": "legacy-planning-metadata-fallback"}
+    other_valid = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(
+        kind,
+        [valid, sibling, other_valid, dict(sibling)],
+        row_ids=("row-1", "row-2"),
+    )
+
+    assert parsed is not None
+    if kind == "issue_implementation":
+        assert parsed.pr_number == 77
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-1", "row-2"]
+    assert claims.dropped_row_ids == ("legacy-planning-metadata-fallback",)
+    # A dropped claim is not serialized back as coverage.
+    assert [item["row_id"] for item in claims.to_payload()] == ["row-1", "row-2"]
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_empty_approved_set_drops_every_claim(kind):
+    """#920: an explicitly empty scoped set is a restriction, not 'no restriction'."""
+    parsed = _validate_claims_envelope(kind, [_complete_semantic_claim()], row_ids=())
+
+    assert parsed.risk_test_matrix_claims.claims == ()
+    assert parsed.risk_test_matrix_claims.dropped_row_ids == ("row-1",)
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    ("row_id", "rule"),
+    [
+        (5, "not a string"),
+        (None, "not a string"),
+        (["row-1"], "not a string"),
+        ({"id": "row-1"}, "not a string"),
+        ("finding-3", "not a valid matrix-specific identifier"),
+        ("hr-7", "not a valid matrix-specific identifier"),
+        ("   ", "not a valid matrix-specific identifier"),
+        ("x" * 200, "not a valid matrix-specific identifier"),
+    ],
+)
+def test_semantic_matrix_claim_bad_row_id_degrades_only_that_claim(kind, row_id, rule):
+    """#926: a malformed or mistyped row_id drops that claim, not the envelope."""
+    bad = {**_complete_semantic_claim(), "row_id": row_id}
+
+    parsed = _validate_claims_envelope(kind, [bad, _complete_semantic_claim()], row_ids=("row-1",))
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-1"]
+    assert claims.dropped_row_ids == ()
+    [record] = claims.degradations
+    assert record.element_path.endswith("risk_test_matrix_claims[0].row_id")
+    assert rule in record.rule
+    assert record.outcome == "claim-dropped"
+    assert len(record.observed_preview) <= 121
+    assert "\n" not in record.observed_preview
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_absent_row_id_degrades_only_that_claim(kind):
+    bad = _complete_semantic_claim()
+    bad.pop("row_id")
+
+    parsed = _validate_claims_envelope(kind, [_complete_semantic_claim(), bad], row_ids=("row-1",))
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-1"]
+    [record] = claims.degradations
+    assert record.element_path.endswith("risk_test_matrix_claims[1].row_id")
+    assert record.rule == "row_id key is absent"
+
+
+def test_semantic_matrix_claim_row_id_beyond_hard_cap_still_rejects():
+    """#926: the one reserved fatal row-ID case is unbounded input."""
+    claim = {**_complete_semantic_claim(), "row_id": "x" * 16_385}
+
+    with pytest.raises(AgentLoopError, match="16384-byte bound"):
+        _validate_claims_envelope("coder_followup", [claim], row_ids=("row-1",))
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_absent_row_id_wins_over_unknown_key_927(kind):
+    """#927: an unknown key also degrades, so one record is kept and the row-ID rule wins."""
+    bad = {"execution_refs": ["turn:observation-1"], "surprise": 1}
+
+    parsed = _validate_claims_envelope(kind, [bad], row_ids=("row-1",))
+
+    [record] = parsed.risk_test_matrix_claims.degradations
+    assert record.rule == "row_id key is absent"
+    assert parsed.risk_test_matrix_claims.claims == ()
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
 def test_semantic_matrix_claim_inadmissible_selector_still_rejects(kind):
-    with pytest.raises(AgentLoopError, match="not an admissible passing observation"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="not an admissible passing observation"):
         _validate_claims_envelope(
             kind,
             [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
@@ -2640,7 +2786,7 @@ def test_semantic_matrix_claim_launch_integrity_failing_or_unknown_selector_stil
     It is a real broker handle, so selecting it is an authority decision and
     must not be downgraded to a dropped ref.
     """
-    with pytest.raises(AgentLoopError, match="launch-integrity"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="launch-integrity"):
         _validate_claims_envelope(
             kind,
             [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
@@ -2653,9 +2799,130 @@ def test_semantic_matrix_claim_launch_integrity_failing_or_unknown_selector_stil
         )
 
 
+_FAILING_LAUNCH_CATALOG_926 = [
+    *_ADMISSIBLE_CATALOG,
+    {
+        "execution_ref": "turn:observation-2",
+        "outcome": "passed",
+        "provenance": "parent-observed",
+        "wrapper_bootstrap": "failed",
+        "inner_exec": "started",
+        "suite_start": "verified",
+    },
+]
+
+
+def _claim_for_row_926(row_id: object, refs: list[str]) -> dict[str, object]:
+    claim = _complete_semantic_claim()
+    claim["row_id"] = row_id
+    claim["execution_refs"] = refs
+    return claim
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    "degraded_row_id",
+    [
+        "row-1",  # duplicated approved row (the other copy is valid)
+        "row-unknown",  # well-formed but unapproved
+        "finding-3",  # malformed
+        7,  # mistyped
+    ],
+)
+def test_semantic_matrix_claim_row_id_degradation_keeps_selector_authority_fatal_926(
+    kind, degraded_row_id
+):
+    """A row-ID defect must not skip the unchanged non-row-ID authority checks.
+
+    Before #926 each of these follow-ups was rejected; a degraded row ID now
+    only decides whether the claim is kept, after the selector rules ran.
+    """
+    claims = [
+        _claim_for_row_926(degraded_row_id, ["turn:observation-2"]),
+        _claim_for_row_926("row-1", ["turn:observation-1"]),
+    ]
+    with pytest.raises(NonRepairableEvidenceRejection, match="launch-integrity"):
+        _validate_claims_envelope(
+            kind, claims, row_ids=("row-1", "row-2"), catalog=_FAILING_LAUNCH_CATALOG_926
+        )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize("refs", [[], ["turn:observation-1", "turn:observation-1"]])
+@pytest.mark.parametrize(
+    ("degraded_row_id", "rule"),
+    [
+        ("row-1", "claimed more than once"),
+        ("row-unknown", "outside the approved enforceable set"),
+        ("finding-3", "not a valid matrix-specific identifier"),
+    ],
+)
+def test_semantic_matrix_claim_row_id_rule_wins_over_selector_defect_927(
+    kind, refs, degraded_row_id, rule
+):
+    """#927: selector-shape defects now degrade too, and the row-ID rule wins.
+
+    Exactly one record is kept for the degraded claim, so an unapproved row
+    keeps its ``unapproved-row-claim`` pairing.
+    """
+    claims = [
+        _claim_for_row_926(degraded_row_id, refs),
+        _claim_for_row_926("row-1", ["turn:observation-1"]),
+    ]
+    parsed = _validate_claims_envelope(
+        kind, claims, row_ids=("row-1", "row-2"), catalog=_ADMISSIBLE_CATALOG
+    )
+    records = [
+        record for record in parsed.risk_test_matrix_claims.degradations
+        if record.element_path.endswith("[0].row_id")
+    ]
+    assert len(records) == 1
+    assert rule in records[0].rule
+    assert not any(
+        record.element_path.endswith("[0].execution_refs")
+        for record in parsed.risk_test_matrix_claims.degradations
+    )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_duplicate_row_wins_over_fact_typing_927(kind):
+    duplicate = _claim_for_row_926("row-1", ["turn:observation-1"])
+    duplicate["test_identifiers"] = [7]
+    claims = [duplicate, _claim_for_row_926("row-1", ["turn:observation-1"])]
+    parsed = _validate_claims_envelope(
+        kind, claims, row_ids=("row-1", "row-2"), catalog=_ADMISSIBLE_CATALOG
+    )
+    claims_carrier = parsed.risk_test_matrix_claims
+    assert claims_carrier.claims == ()
+    assert len(claims_carrier.degradations) == 2
+    assert all("more than once" in record.rule for record in claims_carrier.degradations)
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_semantic_matrix_claim_valid_duplicates_still_degrade_926(kind):
+    catalog = [
+        *_ADMISSIBLE_CATALOG,
+        {"execution_ref": "turn:observation-2", "outcome": "passed", "provenance": "parent-observed"},
+    ]
+    parsed = _validate_claims_envelope(
+        kind,
+        [
+            _claim_for_row_926("row-1", ["turn:observation-1"]),
+            _claim_for_row_926("row-2", ["turn:observation-2"]),
+            _claim_for_row_926("row-1", ["turn:observation-2"]),
+        ],
+        row_ids=("row-1", "row-2"),
+        catalog=catalog,
+    )
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-2"]
+    assert len(claims.degradations) == 2
+    assert all("more than once" in record.rule for record in claims.degradations)
+
+
 def test_semantic_matrix_claim_catalog_collision_still_rejects():
     entry = {"execution_ref": "turn:observation-1", "outcome": "passed", "provenance": "parent-observed"}
-    with pytest.raises(AgentLoopError, match="colliding execution_ref"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="colliding execution_ref"):
         _validate_claims_envelope(
             "issue_implementation",
             [{"row_id": "row-1", "execution_refs": [_COMMAND_REF]}],
@@ -2686,13 +2953,17 @@ def test_semantic_matrix_claims_share_one_admissible_selector_across_rows(kind):
     assert second.execution_refs == ("turn:observation-1", "turn:observation-2")
 
 
-def test_semantic_matrix_claim_duplicate_selector_within_one_row_rejects():
-    with pytest.raises(AgentLoopError, match=r"\[0\]\.execution_refs selects .* more than once"):
-        _validate_claims_envelope(
-            "issue_implementation",
-            [{"row_id": "row-1", "execution_refs": ["turn:observation-1", "turn:observation-1"]}],
-            row_ids=("row-1",),
-        )
+def test_semantic_matrix_claim_duplicate_selector_within_one_row_drops_the_claim():
+    """#927: a repeated selector drops the claim; it is never silently deduplicated."""
+    parsed = _validate_claims_envelope(
+        "issue_implementation",
+        [{"row_id": "row-1", "execution_refs": ["turn:observation-1", "turn:observation-1"]}],
+        row_ids=("row-1",),
+    )
+    assert parsed.risk_test_matrix_claims.claims == ()
+    [record] = parsed.risk_test_matrix_claims.degradations
+    assert record.element_path == "issue_implementation.risk_test_matrix_claims[0].execution_refs"
+    assert "more than once" in record.rule
 
 
 def test_semantic_matrix_claims_without_catalog_keep_selectors_verbatim():
@@ -2707,12 +2978,15 @@ def test_semantic_matrix_claims_without_catalog_keep_selectors_verbatim():
     assert claim.execution_refs == (_COMMAND_REF, "anything")
     assert claim.dropped_execution_refs == ()
     assert claim.caveats == ()
-    with pytest.raises(AgentLoopError, match="1024-byte bound"):
-        _parse_semantic_risk_coverage_claims(
-            [{"row_id": "row-1", "execution_refs": ["x" * 1_025]}],
-            context="claims",
-            expected_row_ids=["row-1"],
-        )
+    # #927: without a catalog an over-field-bound selector drops the claim.
+    dropped = _parse_semantic_risk_coverage_claims(
+        [{"row_id": "row-1", "execution_refs": ["x" * 1_025]}],
+        context="claims",
+        expected_row_ids=["row-1"],
+    )
+    assert dropped.claims == ()
+    [record] = dropped.degradations
+    assert record.rule == "selector exceeds the field bound without a catalog"
 
 
 def test_shared_semantic_claim_example_parses_through_claim_parser():
@@ -2789,7 +3063,7 @@ def test_semantic_matrix_claims_reject_known_launch_integrity_failures_before_au
         if kind == "issue_implementation"
         else validate_structured_coder_followup
     )
-    with pytest.raises(AgentLoopError, match="launch-integrity"):
+    with pytest.raises(NonRepairableEvidenceRejection, match="launch-integrity"):
         validator(
             text,
             delivered_risk_test_matrix_row_ids=["row-1"],
@@ -2865,8 +3139,13 @@ def test_validate_structured_coder_followup_accepts_exact_test_observation_shape
         '"claim": "current-result"',
         '"claim": "current-result", "unexpected": true',
     )
-    with pytest.raises(AgentLoopError, match="unknown field"):
-        validate_structured_coder_followup(invalid)
+    # #927: an item-level citation defect drops that citation with a record.
+    degraded = validate_structured_coder_followup(invalid)
+    assert degraded.test_observations == ()
+    [record] = degraded.test_observation_degradations
+    assert record.element_path == "coder_followup.test_observations[0]"
+    assert record.outcome == "citation-dropped"
+    assert "unexpected" in record.observed_preview
 
 
 def test_validate_structured_coder_followup_accepts_optional_item_notes():
@@ -3244,7 +3523,7 @@ def test_fresh_task_contract_rejects_legacy_marker_only_output():
         from coding_review_agent_loop.orchestrator import _require_task_implementation_result
         _require_task_implementation_result(
             "Implemented.\n<!-- AGENT_PR: 12 -->\n<!-- AGENT_STATE: blocking -->",
-            required_architecture_impact_contract=1,
+            required_architecture_impact_contract=1, architecture_status_mode="legacy",
         )
 
 
@@ -3714,7 +3993,7 @@ def test_unversioned_plans_keep_explicit_legacy_typed_stages_materializable():
 def test_validate_plan_revision_response_rejects_marker_only_markdown():
     with pytest.raises(AgentLoopError, match="Plan revision did not use the required structured format"):
         _validate_plan_revision_response(
-            "Revised plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+            "Revised plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex", architecture_status_mode="legacy"
         )
 
 
@@ -3733,7 +4012,7 @@ def test_validate_plan_revision_response_rejects_unknown_prior_disposition():
     )
 
     with pytest.raises(UnknownPriorItemDispositionError) as exc_info:
-        _validate_plan_revision_response(revision, unresolved_items=(active_item,))
+        _validate_plan_revision_response(revision, unresolved_items=(active_item,), architecture_status_mode="legacy")
 
     assert exc_info.value.unknown_ids == ("item-15",)
     assert exc_info.value.allowed_ids == ("item-12",)
@@ -4769,7 +5048,16 @@ def test_semantic_claim_truncates_an_overlong_fact_list_instead_of_rejecting(kin
     assert claim.test_locations == ("tests/test_mod.py",)
 
 
-def test_semantic_claim_still_rejects_a_malformed_overlong_fact_list():
+def _single_dropped_fact_record(claims):
+    parsed = _validate_claims_envelope("coder_followup", claims)
+    assert parsed.risk_test_matrix_claims.claims == ()
+    [record] = parsed.risk_test_matrix_claims.degradations
+    assert record.element_path == "coder_followup.risk_test_matrix_claims[0].test_identifiers"
+    return record
+
+
+def test_semantic_claim_drops_a_malformed_overlong_fact_list():
+    """#927: a malformed over-long fact list drops the claim; truncation cannot hide it."""
     identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(12)] + [""]
     claims = [{
         "row_id": "row-1",
@@ -4777,13 +5065,13 @@ def test_semantic_claim_still_rejects_a_malformed_overlong_fact_list():
         "test_identifiers": identifiers,
     }]
 
-    with pytest.raises(AgentLoopError, match="test_identifiers"):
-        _validate_claims_envelope("coder_followup", claims)
+    record = _single_dropped_fact_record(claims)
+    assert "ill-typed" in record.rule
 
 
 @pytest.mark.parametrize("repeat_index", [0, 11])
-def test_semantic_claim_rejects_a_duplicate_in_the_discarded_tail(repeat_index):
-    """#913: truncation must not hide a duplicate that falls past the bound."""
+def test_semantic_claim_drops_a_duplicate_in_the_discarded_tail(repeat_index):
+    """#913/#927: truncation must not hide a duplicate that falls past the bound."""
     identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(12)]
     identifiers.append(identifiers[repeat_index])
     claims = [{
@@ -4792,11 +5080,10 @@ def test_semantic_claim_rejects_a_duplicate_in_the_discarded_tail(repeat_index):
         "test_identifiers": identifiers,
     }]
 
-    with pytest.raises(AgentLoopError, match="test_identifiers contains duplicate items"):
-        _validate_claims_envelope("coder_followup", claims)
+    assert "duplicated" in _single_dropped_fact_record(claims).rule
 
 
-def test_semantic_claim_rejects_duplicates_confined_to_the_discarded_tail():
+def test_semantic_claim_drops_duplicates_confined_to_the_discarded_tail():
     identifiers = [f"tests/test_mod.py::test_case_{index}" for index in range(12)]
     identifiers.extend(["tests/test_mod.py::test_tail", "tests/test_mod.py::test_tail"])
     claims = [{
@@ -4805,8 +5092,7 @@ def test_semantic_claim_rejects_duplicates_confined_to_the_discarded_tail():
         "test_identifiers": identifiers,
     }]
 
-    with pytest.raises(AgentLoopError, match="test_identifiers contains duplicate items"):
-        _validate_claims_envelope("coder_followup", claims)
+    assert "duplicated" in _single_dropped_fact_record(claims).rule
 
 
 def test_semantic_claim_discloses_every_truncated_fact_list_and_dropped_refs():
@@ -4841,6 +5127,267 @@ def test_semantic_risk_claim_schema_text_states_the_fact_list_bound():
     assert "split broader coverage across additional" in text
 
 
+# --- #925: parse-time degradation of the architecture_impact status ---------
+
+from agent_loop_helpers import (  # noqa: E402
+    structured_coder_followup as _deg_coder_followup,
+    structured_issue_implementation as _deg_issue_implementation,
+    structured_plan_revision as _deg_plan_revision,
+    structured_plan_state as _deg_plan_state,
+    structured_plan_review as _deg_plan_review,
+    structured_pr_review as _deg_pr_review,
+)
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    ARCHITECTURE_IMPACT_UNDETERMINED,
+    ArchitectureImpactContract,
+    parse_architecture_impact,
+    parse_architecture_impact_degradable,
+)
+
+_CORROBORATED_IMPACT = {
+    "status": "modified",
+    "rationale": "The parser gains a degraded status.",
+    "affected_components": ["protocol parser"],
+    "dependencies": ["repair preservation"],
+    "execution_data_flows": ["response -> parser -> seam"],
+    "persistence": ["round metadata degradation records"],
+    "public_contracts": ["architecture_impact status"],
+    "security_boundaries": ["agent payload trust boundary"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the degraded status.",
+}
+
+
+def _deg_uncorroborated(**overrides):
+    impact = {
+        "status": "modified",
+        "rationale": "Something changed.",
+        "affected_components": [],
+        "dependencies": [],
+        "execution_data_flows": [],
+        "persistence": [],
+        "public_contracts": [],
+        "security_boundaries": [],
+        "canonical_document_action": "no-change",
+        "canonical_document_path": None,
+        "canonical_document_rationale": "",
+    }
+    impact.update(overrides)
+    return impact
+
+
+def _with_impact(rendered: str, impact) -> str:
+    """Replace (or remove, for None) the architecture_impact of a fixture."""
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    if impact is None:
+        payload.pop("architecture_impact", None)
+    else:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload) + rendered[split:]
+
+
+def test_corroborated_modified_status_normalizes_to_changed_with_one_record():
+    impact, record = parse_architecture_impact_degradable(_CORROBORATED_IMPACT)
+    assert impact.status == "changed"
+    assert impact.affected_components == ("protocol parser",)
+    assert record is not None
+    assert record.element_path == "architecture_impact.status"
+    assert record.rule == "architecture_impact.status-closed-enum-near-miss"
+    assert record.observed_preview == "modified"
+    assert record.outcome == "normalized-to-changed"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},  # empty lists
+        {"canonical_document_path": None, "canonical_document_action": "update",
+         "canonical_document_rationale": "x", "affected_components": ["a"],
+         "dependencies": ["b"], "execution_data_flows": ["c"], "persistence": ["d"],
+         "public_contracts": ["e"], "security_boundaries": ["f"]},  # null path only
+        {"canonical_document_action": "no-change", "canonical_document_path": "ARCHITECTURE.md",
+         "canonical_document_rationale": "x", "affected_components": ["a"],
+         "dependencies": ["b"], "execution_data_flows": ["c"], "persistence": ["d"],
+         "public_contracts": ["e"], "security_boundaries": ["f"]},  # canonical-doc fields only
+        {"affected_components": ["a"], "dependencies": ["b"], "execution_data_flows": ["c"],
+         "persistence": ["d"], "public_contracts": ["e"], "security_boundaries": [],
+         "canonical_document_action": "update", "canonical_document_path": "A.md",
+         "canonical_document_rationale": "x"},  # one empty changed-only list
+    ],
+)
+def test_uncorroborated_modified_status_degrades_to_undetermined(overrides):
+    impact, record = parse_architecture_impact_degradable(_deg_uncorroborated(**overrides))
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert impact.status not in {"changed", "unchanged"}
+    assert record is not None and record.outcome == "degraded-to-undetermined"
+
+
+def test_key_presence_alone_does_not_corroborate_a_near_miss():
+    # Every changed-only key is present, but none carries evidence.
+    impact, record = parse_architecture_impact_degradable(_deg_uncorroborated())
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert record.outcome == "degraded-to-undetermined"
+
+
+def test_declared_unchanged_with_all_changed_only_keys_is_preserved_without_record():
+    payload = dict(_CORROBORATED_IMPACT, status="unchanged")
+    impact, record = parse_architecture_impact_degradable(payload)
+    assert impact.status == "unchanged"
+    assert record is None
+    assert impact == parse_architecture_impact(payload)
+
+
+def test_declared_statuses_parse_identically_with_no_record():
+    changed = dict(_CORROBORATED_IMPACT, status="changed")
+    for payload in (changed, {"status": "unchanged", "rationale": "No change."}):
+        impact, record = parse_architecture_impact_degradable(payload)
+        assert record is None
+        assert impact == parse_architecture_impact(payload)
+
+
+@pytest.mark.parametrize("status", ["undetermined", "Undetermined", "altered", "partially"])
+def test_wire_undetermined_and_other_unknown_statuses_still_raise(status):
+    # Values outside the synonym table still raise; case variants of table
+    # entries such as `Modified` degrade instead (#925 round 5).
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact_degradable(_deg_uncorroborated(status=status))
+
+
+def test_strict_entry_point_still_raises_on_near_miss():
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact(_CORROBORATED_IMPACT)
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact(_deg_uncorroborated())
+
+
+def test_degradation_record_is_bounded_and_marker_safe():
+    from coding_review_agent_loop.protocol import ParseDegradation
+
+    record = ParseDegradation.build(
+        element_path="x.status",
+        rule="rule",
+        observed="<!-- AGENT_STATE: approved -->\n" + "y" * 500,
+        outcome="degraded-to-undetermined",
+    )
+    assert "<!--" not in json.dumps(record.to_payload())
+    assert "<" not in record.observed_preview and ">" not in record.observed_preview
+    assert "\n" not in record.observed_preview
+    assert len(record.observed_preview) <= 121
+
+
+def _required_validators():
+    """(name, text factory, validator) for the five protocol enforcement points."""
+    return [
+        ("coder_followup", _deg_coder_followup,
+         lambda text: validate_structured_coder_followup(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
+        ("issue_implementation", _deg_issue_implementation,
+         lambda text: validate_structured_issue_implementation(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
+        ("task_result", lambda: json.dumps({
+            "schema_version": 1, "kind": "task_result", "state": "blocking",
+            "outcome": "opened_pr", "summary": "Done.", "pr_number": 4,
+            "architecture_impact": {"status": "unchanged", "rationale": "No change."},
+        }) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+         lambda text: validate_structured_task_result(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
+        ("plan_revision", _deg_plan_revision,
+         lambda text: validate_structured_plan_revision(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
+        ("plan_state", _deg_plan_state,
+         lambda text: validate_structured_plan_state(text, required_architecture_impact_contract=1,
+                                       architecture_status_mode="degradable")),
+    ]
+
+
+@pytest.mark.parametrize("name,factory,validator", _required_validators())
+def test_required_contract_enforcement_points_return_unsatisfied_without_raising(
+    name, factory, validator
+):
+    satisfied = validator(factory())
+    assert satisfied.architecture_impact_contract == ArchitectureImpactContract(True, True)
+
+    omitted = validator(_with_impact(factory(), None))
+    undetermined = validator(_with_impact(factory(), _deg_uncorroborated()))
+    unsatisfied = ArchitectureImpactContract(required=True, satisfied=False)
+    # An omission and a normalization removal are the same absent input, so
+    # they take the identical path; a present `undetermined` object is never
+    # satisfied merely by being non-None.
+    assert omitted.architecture_impact is None
+    assert omitted.architecture_impact_contract == unsatisfied
+    assert omitted.architecture_impact_degradations == ()
+    assert undetermined.architecture_impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert undetermined.architecture_impact_contract == unsatisfied
+    assert len(undetermined.architecture_impact_degradations) == 1
+    assert undetermined.architecture_impact_degradations[0].element_path == (
+        f"{name}.architecture_impact.status"
+    )
+
+
+@pytest.mark.parametrize("name,factory,validator", _required_validators())
+def test_required_contract_enforcement_points_still_raise_for_unrelated_defects(
+    name, factory, validator
+):
+    text = _with_impact(factory(), None)
+    split = text.index("}\n") + 1
+    payload = json.loads(text[:split])
+    payload["unexpected_key"] = True
+    with pytest.raises(AgentLoopError):
+        validator(json.dumps(payload) + text[split:])
+
+
+def test_unsatisfied_issue_implementation_conflict_returns_parsed_instead_of_raising():
+    text = _deg_issue_implementation(
+        human_requirement_ids=["Requirement 1"],
+        human_requirement_dispositions=[
+            {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "Blocked."}
+        ],
+    )
+    from coding_review_agent_loop.errors import IssueImplementationConflictError
+
+    with pytest.raises(IssueImplementationConflictError):
+        validate_structured_issue_implementation(text, required_architecture_impact_contract=1)
+    parsed = validate_structured_issue_implementation(
+        _with_impact(text, None), required_architecture_impact_contract=1
+    )
+    assert parsed.pr_number == 77
+    assert parsed.architecture_impact_contract.satisfied is False
+
+
+def test_non_required_parse_keeps_contract_unrequired():
+    parsed = validate_structured_coder_followup(_with_impact(_deg_coder_followup(), None))
+    assert parsed.architecture_impact_contract.required is False
+
+
+def test_review_parsers_carry_degradation_records():
+    pr = parse_structured_pr_review(
+        _with_impact(_deg_pr_review(), _deg_uncorroborated()), reviewer="OpenAI Codex",
+        architecture_status_mode="degradable",
+    )
+    plan = parse_structured_plan_review(
+        _with_impact(_deg_plan_review(), _deg_uncorroborated()), reviewer="OpenAI Codex",
+        architecture_status_mode="degradable",
+    )
+    for parsed, kind in ((pr, "pr_review"), (plan, "plan_review")):
+        assert parsed.architecture_impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+        (record,) = parsed.architecture_impact_degradations
+        assert record.element_path == f"{kind}.architecture_impact.status"
+
+
+def test_patch_replace_near_miss_is_rejected_with_route_forward_diagnostic():
+    from coding_review_agent_loop.protocol import _parse_plan_patch_field_value
+
+    with pytest.raises(AgentLoopError) as error:
+        _parse_plan_patch_field_value(
+            "architecture_impact", _CORROBORATED_IMPACT, context="plan_revision_patch.operations[0].value"
+        )
+    message = str(error.value)
+    assert "`changed`" in message and "`unchanged`" in message
+    assert "`modified` is not accepted in a patch" in message
+
+
 def _changed_architecture_impact(status: str) -> dict[str, object]:
     return {
         "status": status,
@@ -4857,7 +5404,7 @@ def _changed_architecture_impact(status: str) -> dict[str, object]:
     }
 
 
-def test_plan_review_normalizes_modified_architecture_status_916():
+def test_plan_review_keeps_envelope_for_modified_architecture_status_916():
     from coding_review_agent_loop.protocol import parse_structured_plan_review
 
     payload = json.dumps({
@@ -4872,15 +5419,19 @@ def test_plan_review_normalizes_modified_architecture_status_916():
         "architecture_impact": _changed_architecture_impact("modified"),
     }) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
 
-    parsed = parse_structured_plan_review(payload, reviewer="OpenAI Codex")
+    parsed = parse_structured_plan_review(
+        payload, reviewer="OpenAI Codex", architecture_status_mode="degradable"
+    )
 
+    # A fresh review degrades the uncorroborated near miss (#925) rather than
+    # rejecting the round; the #916 synonym table is now the explicit legacy
+    # decode for stored text, exercised below.
     assert parsed is not None
     assert parsed.architecture_impact is not None
-    assert parsed.architecture_impact.status == "changed"
-    assert any(
-        "from `modified` to `changed`" in note
-        for note in parsed.architecture_impact.uncertainty
-    )
+    assert parsed.architecture_impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    (record,) = parsed.architecture_impact_degradations
+    assert record.observed_preview == "modified"
+    assert record.outcome == "degraded-to-undetermined"
 
 
 @pytest.mark.parametrize(
@@ -4898,7 +5449,9 @@ def test_plan_review_normalizes_modified_architecture_status_916():
 def test_architecture_status_synonyms_normalize_with_audit_note_916(raw, expected):
     from coding_review_agent_loop.protocol import parse_architecture_impact
 
-    impact = parse_architecture_impact(_changed_architecture_impact(raw))
+    impact = parse_architecture_impact(
+        _changed_architecture_impact(raw), architecture_status_mode="legacy"
+    )
 
     assert impact.status == expected
     assert impact.uncertainty[-1].startswith("agent-loop normalized architecture_impact.status")
@@ -4918,8 +5471,12 @@ def test_normalized_architecture_impact_reparses_idempotently_916():
 
     from coding_review_agent_loop.protocol import parse_architecture_impact
 
-    first = parse_architecture_impact(_changed_architecture_impact("modified"))
-    second = parse_architecture_impact(json.loads(json.dumps(asdict(first))))
+    first = parse_architecture_impact(
+        _changed_architecture_impact("modified"), architecture_status_mode="legacy"
+    )
+    second = parse_architecture_impact(
+        json.loads(json.dumps(asdict(first))), architecture_status_mode="legacy"
+    )
 
     assert second == first
 
@@ -4928,7 +5485,10 @@ def test_changed_synonym_without_changed_field_set_still_fails_916():
     from coding_review_agent_loop.protocol import parse_architecture_impact
 
     with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
-        parse_architecture_impact({"status": "modified", "rationale": "Something moved."})
+        parse_architecture_impact(
+            {"status": "modified", "rationale": "Something moved."},
+            architecture_status_mode="legacy",
+        )
 
 
 @pytest.mark.parametrize("raw", ["partially", "maybe", "extended"])
@@ -4936,4 +5496,606 @@ def test_unmapped_architecture_status_still_fails_916(raw):
     from coding_review_agent_loop.protocol import parse_architecture_impact
 
     with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_architecture_impact(
+            _changed_architecture_impact(raw), architecture_status_mode="legacy"
+        )
+
+
+@pytest.mark.parametrize("raw", ["modified", "change", "none", "same"])
+def test_default_strict_mode_rejects_every_synonym_925(raw):
+    from coding_review_agent_loop.protocol import parse_architecture_impact
+
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
         parse_architecture_impact(_changed_architecture_impact(raw))
+
+
+# --- #925 round 2: explicit parser modes and the single-alias vocabulary ------
+
+
+@pytest.mark.parametrize("spelling", ["updated", "change", "changes", "modifies", "modify"])
+def test_degradable_mode_never_maps_a_second_changed_alias(spelling):
+    impact, record = parse_architecture_impact_degradable(dict(_CORROBORATED_IMPACT, status=spelling))
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert record.outcome == "degraded-to-undetermined"
+    assert record.rule == "status-not-in-closed-enum"
+    assert impact.uncertainty == ()
+
+
+@pytest.mark.parametrize("spelling", ["none", "same", "no-change", "not-changed", "unmodified"])
+def test_degradable_mode_never_resolves_a_near_miss_to_unchanged(spelling):
+    impact, record = parse_architecture_impact_degradable(dict(_CORROBORATED_IMPACT, status=spelling))
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert record.observed_preview == spelling
+
+
+@pytest.mark.parametrize("alias_key", ["execution_flows", "data_flows"])
+def test_flow_alias_only_modified_degrades_without_rejecting(alias_key):
+    payload = dict(_CORROBORATED_IMPACT)
+    flows = payload.pop("execution_data_flows")
+    payload[alias_key] = flows
+    impact, record = parse_architecture_impact_degradable(payload)
+    assert impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert "execution_data_flows" in record.rule
+
+
+def test_predicate_implies_every_changed_required_key():
+    from coding_review_agent_loop.protocol import (
+        _ARCHITECTURE_CHANGED_REQUIRED_KEYS,
+        architecture_impact_near_miss_corroborated,
+    )
+
+    assert architecture_impact_near_miss_corroborated(_CORROBORATED_IMPACT)
+    for key in _ARCHITECTURE_CHANGED_REQUIRED_KEYS:
+        reduced = {k: v for k, v in _CORROBORATED_IMPACT.items() if k != key}
+        assert not architecture_impact_near_miss_corroborated(reduced), key
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+def test_valid_statuses_parse_identically_in_every_mode(mode):
+    for status in ("changed", "unchanged"):
+        value = dict(_CORROBORATED_IMPACT, status=status)
+        degradable, record = parse_architecture_impact_degradable(value)
+        assert record is None
+        assert parse_architecture_impact(value, architecture_status_mode=mode) == degradable
+
+
+def test_structured_parsers_default_to_strict_and_accept_explicit_legacy():
+    text = _with_impact(_deg_plan_state(), _changed_architecture_impact("modified"))
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        validate_structured_plan_state(text)
+    legacy = validate_structured_plan_state(text, architecture_status_mode="legacy")
+    assert legacy.architecture_impact.status == "changed"
+    assert legacy.architecture_impact_degradations == ()
+    assert legacy.architecture_impact.uncertainty[-1].startswith("agent-loop normalized")
+
+
+def test_historical_parsers_decode_in_legacy_mode():
+    from coding_review_agent_loop.protocol import parse_historical_structured_issue_implementation
+
+    text = _with_impact(_deg_issue_implementation(), _changed_architecture_impact("modified"))
+    parsed = parse_historical_structured_issue_implementation(text)
+    assert parsed.architecture_impact.status == "changed"
+    assert parsed.architecture_impact_degradations == ()
+
+
+@pytest.mark.parametrize("spelling", ["modified", "updated", "none"])
+def test_patch_replace_rejects_every_synonym_with_route_forward(spelling):
+    from coding_review_agent_loop.protocol import _parse_plan_patch_field_value
+
+    with pytest.raises(AgentLoopError) as error:
+        _parse_plan_patch_field_value(
+            "architecture_impact", dict(_CORROBORATED_IMPACT, status=spelling),
+            context="plan_revision_patch.operations[0].value",
+        )
+    assert f"`{spelling}` is not accepted in a patch" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "spelling", ["Unchanged", "Changed", "UNCHANGED", "no change", "no_change", " none ", "Same"]
+)
+def test_case_and_separator_variants_degrade_instead_of_rejecting_the_envelope(spelling):
+    # The legacy table looked statuses up after case and separator
+    # normalization; degradable mode must degrade those variants, never
+    # reject the whole review envelope (#925 round 5).
+    from coding_review_agent_loop.protocol import parse_structured_plan_review
+
+    payload = json.dumps({
+        "schema_version": 1,
+        "kind": "plan_review",
+        "state": "approved",
+        "summary": "Plan looks good.",
+        "blocking_plan_issues": [],
+        "same_plan_followups": [],
+        "future_followups": [],
+        "prior_plan_item_dispositions": [],
+        "architecture_impact": dict(_CORROBORATED_IMPACT, status=spelling),
+    }) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+
+    parsed = parse_structured_plan_review(
+        payload, reviewer="OpenAI Codex", architecture_status_mode="degradable"
+    )
+    assert parsed.architecture_impact.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    (record,) = parsed.architecture_impact_degradations
+    assert record.outcome == "degraded-to-undetermined"
+    assert record.observed_preview == spelling.strip()
+    # Strict mode still rejects every variant.
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        parse_structured_plan_review(payload, reviewer="OpenAI Codex")
+
+
+@pytest.mark.parametrize("spelling", ["Modified", "MODIFIED", " modified "])
+def test_case_variant_of_modified_honors_the_alias_when_corroborated(spelling):
+    impact, record = parse_architecture_impact_degradable(dict(_CORROBORATED_IMPACT, status=spelling))
+    assert impact.status == "changed"
+    assert record.outcome == "normalized-to-changed"
+    uncorroborated, record = parse_architecture_impact_degradable(
+        {"status": spelling, "rationale": "Something moved."}
+    )
+    assert uncorroborated.status == ARCHITECTURE_IMPACT_UNDETERMINED
+    assert record.outcome == "degraded-to-undetermined"
+
+
+def test_case_variant_required_contract_response_survives_as_unsatisfied():
+    text = _with_impact(_deg_plan_state(), dict(_CORROBORATED_IMPACT, status="Unchanged"))
+    parsed = validate_structured_plan_state(
+        text, required_architecture_impact_contract=1, architecture_status_mode="degradable"
+    )
+    assert parsed.architecture_impact_contract.satisfied is False
+    assert [r.outcome for r in parsed.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+
+
+@pytest.mark.parametrize("spelling", ["Modified", "no_change", "None"])
+def test_patch_replace_route_forward_covers_case_and_separator_variants(spelling):
+    from coding_review_agent_loop.protocol import _parse_plan_patch_field_value
+
+    with pytest.raises(AgentLoopError) as error:
+        _parse_plan_patch_field_value(
+            "architecture_impact", dict(_CORROBORATED_IMPACT, status=spelling),
+            context="plan_revision_patch.operations[0].value",
+        )
+    assert "is not accepted in a patch" in str(error.value)
+
+
+def test_every_parser_call_site_in_src_chooses_its_mode_explicitly():
+    """Static classification: no parser or helper call silently takes a default."""
+    import ast
+    from pathlib import Path
+
+    parsers = {
+        "parse_structured_pr_review", "parse_structured_plan_review",
+        "validate_structured_coder_followup", "validate_structured_issue_implementation",
+        "validate_structured_task_result", "validate_structured_plan_revision",
+        "validate_structured_plan_state", "parse_plan_decomposition",
+        "parse_pr_review", "parse_plan_review", "parse_architecture_impact",
+        "_parse_architecture_impact",
+    }
+    helpers = {
+        "_validate_issue_implementation_response", "_require_task_implementation_result",
+        "_require_plan_state_or_clarification", "_validate_plan_revision_response",
+        "_validate_coder_followup_response", "_validate_review_response",
+        "_validate_plan_review_response",
+    }
+    # Calls that deliberately forward a received mode, or omit one on purpose.
+    allowed_without_keyword = {
+        # Historical wrappers set legacy through kwargs.setdefault.
+        ("protocol.py", "validate_structured_coder_followup"),
+        ("protocol.py", "validate_structured_issue_implementation"),
+        # The patch replace is intentionally strict by default (step 11).
+        ("protocol.py", "_parse_architecture_impact"),
+    }
+    root = Path(__file__).resolve().parents[1] / "src" / "coding_review_agent_loop"
+    unclassified = []
+    degradable_factories = 0
+    for path in root.glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name == "_architecture_mode_validators":
+                degradable_factories += 1
+            if name not in parsers | helpers:
+                continue
+            if any(k.arg == "architecture_status_mode" for k in node.keywords):
+                continue
+            if any(k.arg is None for k in node.keywords):
+                continue
+            if (path.name, name) in allowed_without_keyword:
+                continue
+            unclassified.append(f"{path.name}:{node.lineno} {name}")
+    assert unclassified == []
+    # Seven required-contract invocations plus four live review invocations.
+    assert degradable_factories == 11
+
+
+# ---------------------------------------------------------------------------
+# #927: degradable follow-up test-observation citations.
+# ---------------------------------------------------------------------------
+
+_VALID_CITATION_927 = {
+    "command": "python -m pytest tests/test_protocol.py -q",
+    "receipt_id": "known",
+    "claim": "current-result",
+}
+_MALFORMED_CITATIONS_927 = [
+    5,
+    {"command": "python -m pytest -q", "receipt_id": "r-2", "claim": "reproduced"},
+    {"command": "python -m pytest -q"},
+    {"command": "  ", "receipt_id": "r-4", "claim": "current-result"},
+    {**_VALID_CITATION_927, "extra": True},
+    None,
+    ["list"],
+    {"command": "python -m pytest -q", "receipt_id": 7, "claim": "current-result"},
+]
+
+
+def _citation_response_927(kind, observations):
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "state": "blocking",
+        "summary": "Checked receipts.",
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "test_observations": observations,
+    }
+    if kind == "issue_implementation":
+        payload["pr_number"] = 77
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _validate_citations_927(kind, observations):
+    from coding_review_agent_loop.protocol import validate_structured_issue_implementation
+
+    validator = (
+        validate_structured_issue_implementation
+        if kind == "issue_implementation"
+        else validate_structured_coder_followup
+    )
+    return validator(_citation_response_927(kind, observations))
+
+
+def _render_927(kind, parsed):
+    from coding_review_agent_loop.comment_rendering import (
+        _render_public_coder_followup_comment,
+        _render_public_issue_implementation_comment,
+    )
+
+    if kind == "issue_implementation":
+        return _render_public_issue_implementation_comment(parsed, agent="Claude")
+    return _render_public_coder_followup_comment(parsed, agent="Claude")
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+@pytest.mark.parametrize("drops", [1, 7, 8])
+def test_malformed_citations_are_dropped_with_one_record_each_927(kind, drops):
+    malformed = _MALFORMED_CITATIONS_927[:drops]
+    observations = [_VALID_CITATION_927, *malformed]
+    parsed = _validate_citations_927(kind, observations)
+
+    assert [item.receipt_id for item in parsed.test_observations] == ["known"]
+    records = parsed.test_observation_degradations
+    assert len(records) == drops
+    assert [record.element_path for record in records] == [
+        f"{kind}.test_observations[{index}]" for index in range(1, drops + 1)
+    ]
+    assert all(record.outcome == "citation-dropped" for record in records)
+    assert all(record.rule and record.observed_preview for record in records)
+    rendered = _render_927(kind, parsed)
+    assert rendered.count("### Test observation parse degradations") == 1
+    for record in records:
+        assert f"`{record.element_path}`" in rendered
+    assert "omitted" not in rendered
+    # Re-parsing the stored raw response reproduces identical records.
+    assert _validate_citations_927(kind, observations).test_observation_degradations == records
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+@pytest.mark.parametrize("drops", [9, 20])
+def test_citation_drops_beyond_the_render_limit_reject_the_response_927(kind, drops):
+    malformed = [{"command": "x", "receipt_id": f"r-{index}", "claim": "bad"} for index in range(drops)]
+    with pytest.raises(AgentLoopError, match=f"has {drops} malformed citations, beyond the 8-citation drop bound"):
+        _validate_citations_927(kind, [_VALID_CITATION_927, *malformed])
+
+
+def test_each_citation_rule_is_recorded_per_element_927():
+    parsed = _validate_citations_927("coder_followup", _MALFORMED_CITATIONS_927[:5])
+    rules = [record.rule for record in parsed.test_observation_degradations]
+    assert rules == [
+        "citation is not a JSON object",
+        "citation claim is not current-result or base-reproduction",
+        "citation keys are not exactly command, receipt_id and claim",
+        "citation command or receipt_id is not a non-blank string",
+        "citation keys are not exactly command, receipt_id and claim",
+    ]
+    previews = [record.observed_preview for record in parsed.test_observation_degradations]
+    assert previews[0] == "type number"
+    assert previews[1] == "reproduced"
+    assert "extra" in previews[4]
+
+
+@pytest.mark.parametrize("value", [None, {"command": "x"}, "text"])
+def test_non_list_test_observations_counts_as_one_field_drop_927(value):
+    parsed = _validate_citations_927("coder_followup", value)
+    assert parsed.test_observations == ()
+    [record] = parsed.test_observation_degradations
+    assert record.element_path == "coder_followup.test_observations"
+    assert record.rule == "test_observations is not a JSON array; no citation is kept"
+
+
+def test_over_bound_dropped_citation_values_reject_927():
+    from coding_review_agent_loop.protocol import DROPPED_VALUE_MAX_BYTES
+
+    huge = {"command": "x" * DROPPED_VALUE_MAX_BYTES, "receipt_id": "r", "claim": "bad"}
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _validate_citations_927("coder_followup", [_VALID_CITATION_927, huge])
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _validate_citations_927("coder_followup", {"blob": "y" * DROPPED_VALUE_MAX_BYTES})
+
+
+def test_citation_drop_is_monotone_in_surviving_citations_and_receipt_support_927():
+    from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+    from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+
+    evidence = bounded_evidence_for_round({"observations": [{
+        "command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"],
+        "outcome": "passed", "provenance": "parent-observed", "receipt_id": "known",
+        "turn_id": "current-turn", "environment": "unknown", "attribution": {"state": "current-head"},
+    }]})
+    malformed = {"command": "python -m pytest tests/test_protocol.py -q", "receipt_id": "known", "claim": "bogus"}
+    degraded = _validate_citations_927("coder_followup", [_VALID_CITATION_927, malformed])
+    removed = _validate_citations_927("coder_followup", [_VALID_CITATION_927])
+    assert degraded.test_observations == removed.test_observations
+
+    def receipts(parsed):
+        return _render_test_observation_citations(
+            parsed.test_observations, local_test_evidence=evidence, current_test_turn_id="current-turn"
+        )
+
+    assert receipts(degraded) == receipts(removed)
+    assert "verified against the parent journal" in receipts(degraded)
+
+
+# ---------------------------------------------------------------------------
+# #1016: one reserved row-ID namespace rule for validation and neutralization.
+# ---------------------------------------------------------------------------
+
+import itertools  # noqa: E402
+
+from coding_review_agent_loop import protocol as protocol_1016  # noqa: E402
+
+
+def _valid_row_id_1016(value: str) -> bool:
+    return protocol_1016._is_valid_risk_row_id(value)
+
+
+def _neutralize_1016(value: str) -> str:
+    return protocol_1016._neutralize_identifier_like(value)
+
+
+def _reserved_output_spans_1016(text: str) -> list[str]:
+    return [
+        span for span in protocol_1016._IDENTIFIER_LIKE_SPAN_RE.findall(text)
+        if protocol_1016._has_reserved_namespace(span)
+    ]
+
+
+@pytest.mark.parametrize(
+    "row_id",
+    [
+        "finding-3", "Finding-3", "FINDING-3", "fInDiNg3",
+        "hr-2", "HR-2", "Hr-2", "hR-x", "HR-", "HR-0abc", "hr-hr-2",
+        "item-1", "Item-1", "ITEM1", "Item9",
+        "blocker-2", "Blocker-2", "BLOCKER_2",
+        "review-7", "Review-7", "REVIEW.7",
+        "x-Finding-7", "x_ITEM.4", "x.Review9", "row-blocker_12",
+        "item-item-3", "finding-3-review-4",
+    ],
+)
+def test_reserved_row_id_namespaces_are_refused_in_every_case_1016(row_id):
+    """Row namespace-boundaries: capitalization no longer bypasses the refusal."""
+    assert not _valid_row_id_1016(row_id)
+    with pytest.raises(AgentLoopError, match="may not resemble a reviewer finding ID"):
+        protocol_1016._validate_risk_row_id(row_id, context="matrix.rows[0].row_id")
+    assert _neutralize_1016(row_id) != row_id
+
+
+@pytest.mark.parametrize(
+    "row_id",
+    [
+        "subitem-3", "planreview-2", "lineitem-9", "chr-1", "thr-ee",
+        "SubItem-3", "PlanReview-2", "CHR-1",
+        "x-hr-2", "a.HR-2", "row_hr-7",
+        "row-first", "Row-First", "Items", "item-x", "Item-X", "findings",
+        "Findings-3", "reviewer-3", "Blockers_2", "HRX", "hr", "Finding",
+        "x" * 128,
+    ],
+)
+def test_legal_row_ids_pass_and_are_not_neutralized_1016(row_id):
+    """Row namespace-boundaries: embedded substrings and unrelated mixed case stay legal."""
+    assert _valid_row_id_1016(row_id)
+    assert protocol_1016._validate_risk_row_id(row_id, context="matrix.rows[0].row_id") == row_id
+    assert _neutralize_1016(row_id) == row_id
+
+
+@pytest.mark.parametrize("row_id", ["-row", "bad row id", "row/1", "ïtem-3", "x" * 129, ""])
+def test_row_id_syntax_and_byte_bound_are_unchanged_1016(row_id):
+    with pytest.raises(AgentLoopError):
+        protocol_1016._validate_risk_row_id(row_id, context="matrix.rows[0].row_id")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Finding-3", "Finding·3"),
+        ("FINDING-3", "FINDING·3"),
+        ("finding3", "finding·3"),
+        ("HR-2", "HR·2"),
+        ("HR-", "HR·"),
+        ("Item9", "Item·9"),
+        ("Blocker_5", "Blocker·5"),
+        ("Review.2", "Review·2"),
+        ("x-Finding-7", "x-Finding·7"),
+        ("HR-0abc", "HR·0abc"),
+        ("hr-hr-2", "hr·hr·2"),
+        ("HR-Hr-3", "HR·Hr·3"),
+        ("x hr-hr-2", "x hr·hr·2"),
+        ("x HR-Hr-3", "x HR·Hr·3"),
+        ("hr--item-3", "hr·-item·3"),
+        ("item-item-3", "item-item·3"),
+        ("finding-3-review-4", "finding·3-review·4"),
+        ("note Finding-3", "note Finding·3"),
+        ("keys Finding-3, item-2", "keys Finding·3, item·2"),
+        ("(HR-2)", "(HR·2)"),
+        ("`item-4`", "`item·4`"),
+        ("a\nReview-1\nb", "a\nReview·1\nb"),
+        ("ids subitem-3, chr-1", "ids subitem-3, chr-1"),
+        ("planreview-2 lineitem-9 thr-ee", "planreview-2 lineitem-9 thr-ee"),
+        ("x-hr-2 and hr-2", "x-hr-2 and hr·2"),
+        ("caféhr-2", "caféhr·2"),
+    ],
+)
+def test_neutralizer_hand_written_expectations_1016(text, expected):
+    """Row preview-span-scanning: independently written expected outputs."""
+    neutralized = _neutralize_1016(text)
+    assert neutralized == expected
+    assert _reserved_output_spans_1016(neutralized) == []
+    assert _neutralize_1016(neutralized) == neutralized
+
+
+def _case_variants_1016(token: str) -> list[str]:
+    alternating = "".join(ch.upper() if i % 2 else ch for i, ch in enumerate(token))
+    return sorted({token, token.upper(), token.capitalize(), alternating})
+
+
+def _row_id_corpus_1016() -> list[tuple[str, bool]]:
+    """Candidate IDs whose expected verdict follows the rule's prose, not its code."""
+    corpus: list[tuple[str, bool]] = []
+    boundary_prefixes = ("", "x-", "x_", "x.", "row-a-")
+    embedded_prefixes = ("sub", "x", "plan", "7")
+    for token in ("item", "finding", "review", "blocker"):
+        for variant in _case_variants_1016(token):
+            for prefix, separator, suffix in itertools.product(
+                boundary_prefixes + embedded_prefixes, ("", "-", "_", "."), ("3", "42x", "x", "")
+            ):
+                reserved = prefix in boundary_prefixes and suffix[:1].isdigit()
+                corpus.append((f"{prefix}{variant}{separator}{suffix}", not reserved))
+    for variant in ("hr", "HR", "Hr", "hR"):
+        for prefix, suffix in itertools.product(("", "c", "x-", "t", "a."), ("2", "ee", "", "-1")):
+            # The requirement prefix is reserved only at the start of the ID.
+            corpus.append((f"{prefix}{variant}-{suffix}", prefix != ""))
+    return corpus
+
+
+def test_generated_row_id_corpus_validation_and_neutralization_agree_1016():
+    """Row neutralization-parity: neutralize(x) != x implies not valid(x), both directions."""
+    corpus = _row_id_corpus_1016()
+    assert len(corpus) > 500
+    for row_id, expected_valid in corpus:
+        valid = _valid_row_id_1016(row_id)
+        neutralized = _neutralize_1016(row_id)
+        assert valid == expected_valid, row_id
+        if neutralized != row_id:
+            assert not valid, row_id
+        if valid:
+            assert neutralized == row_id, row_id
+        else:
+            assert "·" in neutralized, row_id
+        assert _reserved_output_spans_1016(neutralized) == [], row_id
+        assert _neutralize_1016(neutralized) == neutralized, row_id
+
+
+def test_generated_free_text_previews_neutralize_every_reserved_span_1016():
+    """Row preview-span-scanning: prose wrappers, delimiters and legal IDs survive."""
+    wrappers = (
+        "note {}", "{}, row-first", "({})", "`{}`", "a\n{}\nb", "keys {}, subitem-3",
+        "{} chr-1", "ids lineitem-9,{}", "[{}]: thr-ee",
+    )
+    legal_neighbours = ("row-first", "subitem-3", "chr-1", "lineitem-9", "thr-ee")
+    for row_id, expected_valid in _row_id_corpus_1016():
+        for wrapper in wrappers:
+            text = wrapper.format(row_id)
+            neutralized = _neutralize_1016(text)
+            assert _reserved_output_spans_1016(neutralized) == [], text
+            assert _neutralize_1016(neutralized) == neutralized, text
+            for neighbour in legal_neighbours:
+                if neighbour in wrapper:
+                    assert neighbour in neutralized, text
+            if expected_valid:
+                assert neutralized == text, text
+            else:
+                assert neutralized != text, text
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize(
+    ("row_id", "preview"),
+    [
+        ("Finding-3", "Finding·3"),
+        ("HR-2", "HR·2"),
+        ("Item9", "Item·9"),
+        ("BLOCKER_2", "BLOCKER·2"),
+        ("bad Finding-3", "bad Finding·3"),
+        ("x HR-Hr-3", "x HR·Hr·3"),
+    ],
+)
+def test_reserved_case_variant_claim_degrades_as_malformed_in_both_envelopes_1016(kind, row_id, preview):
+    """Row claim-degradation: the reserved claim drops locally; the sibling survives."""
+    claim = {**_complete_semantic_claim(), "row_id": row_id}
+    other = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(kind, [claim, other], row_ids=("row-1", "row-2"))
+
+    claims = parsed.risk_test_matrix_claims
+    assert [item.row_id for item in claims.claims] == ["row-2"]
+    [record] = claims.degradations
+    assert record.element_path == f"{kind}.risk_test_matrix_claims[0].row_id"
+    assert record.rule == protocol_1016.CLAIM_ROW_ID_MALFORMED_RULE
+    assert record.observed_preview == preview
+    assert claims.dropped_row_ids == ()
+    assert claims.unapproved_claim_row_ids == ()
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize("row_id", ["subitem-3", "planreview-2", "lineitem-9", "chr-1", "thr-ee"])
+def test_valid_embedded_unapproved_row_id_keeps_exact_preview_1016(kind, row_id):
+    claim = {**_complete_semantic_claim(), "row_id": row_id}
+    other = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(kind, [claim, other], row_ids=("row-1", "row-2"))
+
+    claims = parsed.risk_test_matrix_claims
+    assert [item.row_id for item in claims.claims] == ["row-2"]
+    [record] = claims.degradations
+    assert record.rule == "row_id is outside the approved enforceable set"
+    assert record.observed_preview == row_id
+    assert claims.dropped_row_ids == (row_id,)
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_unknown_key_preview_neutralizes_reserved_keys_only_1016(kind):
+    claim = {**_complete_semantic_claim(), "Finding-3": "x", "subitem-3": "y"}
+    other = {**_complete_semantic_claim(), "row_id": "row-2"}
+
+    parsed = _validate_claims_envelope(kind, [claim, other], row_ids=("row-1", "row-2"))
+
+    [record] = parsed.risk_test_matrix_claims.degradations
+    assert record.rule == protocol_1016.CLAIM_UNKNOWN_KEYS_RULE
+    assert record.observed_preview == "Finding·3, subitem-3"
+
+
+def test_citation_key_and_claim_previews_neutralize_reserved_tokens_only_1016():
+    observed = protocol_1016._citation_defect_observed(
+        {"HR-2": 1, "chr-1": 2, "item-4": 3}, protocol_1016.CITATION_KEYS_RULE
+    )
+    assert observed == "keys HR·2, chr-1, item·4"
+    observed_claim = protocol_1016._citation_defect_observed(
+        {"command": "c", "receipt_id": "r", "claim": "see Review-7 and planreview-2"},
+        protocol_1016.CITATION_CLAIM_RULE,
+    )
+    assert observed_claim == "see Review·7 and planreview-2"

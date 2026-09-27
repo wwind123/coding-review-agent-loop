@@ -5,14 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
-from .errors import AgentLoopError
+from .errors import AgentLoopError, IssueImplementationConflictError
 from .round_transport import (
     MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS,
     PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE,
@@ -26,6 +26,8 @@ from .comment_rendering import (
     decode_execution_recommendation_marker,
     RISK_TEST_MATRIX_MARKER_RE,
     decode_risk_test_matrix_marker,
+    render_parse_degradations_section,
+    render_test_observation_degradations_section,
 )
 from .local_test_evidence import canonicalize_bounded_evidence
 from .protocol_markers import (
@@ -34,11 +36,14 @@ from .protocol_markers import (
     protocol_record_label,
     sanitize_historical_text,
     scan_reserved_markers,
+    strip_known_host_footer,
 )
 from .workdir_guard import validate_checkout_inspected_evidence
 from .protocol import (
     HTML_COMMENT_RE,
     SIGNATURE_RE,
+    ParseDegradation,
+    parse_degradation_payload,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
     ParsedDiscussFinalSynthesis,
@@ -67,6 +72,10 @@ from .protocol import (
     risk_test_matrix_identity,
     sanitize_risk_test_matrix,
     parse_plan_revision_patch,
+    StructuredCoderFollowup,
+    StructuredIssueImplementation,
+    parse_historical_structured_coder_followup,
+    parse_historical_structured_issue_implementation,
 )
 from .plan_assembly import decode_assembled_plan_sidecar, rendered_plan_identity
 from .review_scheduling import FORCE_FULL_SOURCES, ReviewSchedulingContract, SCHEDULER_PHASES
@@ -201,6 +210,12 @@ class PostedRoundMetadata:
     qualification_checkpoint: "QualificationCheckpoint | None" = None
     architecture_identity: dict | None = None
     architecture_impact: dict | None = None
+    # Parser-derived degradation records for this round's assessment (#924).
+    # Only the orchestrator writes metadata, so agents cannot author these.
+    architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
+    # Records of malformed follow-up citations dropped by the degradable
+    # citation parser (#927); restored onto the coder carrier on resume.
+    test_observation_degradations: tuple[ParseDegradation, ...] = ()
     architecture_contract_version: int | None = None
     # Planning generation discriminator.  Absent is intentionally legacy
     # undecided; generation 1 is required to resume a fresh recommendation.
@@ -241,6 +256,10 @@ class PostedRoundMetadata:
     # ``absent`` is a legacy (pre-#959) record, ``invalid`` a present but
     # malformed value.  Constructing with an anchor promotes it to ``valid``.
     risk_test_matrix_evidence_full_round_status: str = "absent"
+    # PR head a coder follow-up was dispatched against (#1034).  Written only
+    # on PR coder follow-up records and omitted from the encoding when None,
+    # so historical records decode unchanged and re-encode byte-identically.
+    followup_dispatch_head: str | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -270,6 +289,10 @@ class PostedRoundMetadata:
             or not re.fullmatch(r"[0-9a-f]{64}", self.reviewer_board_amendment_digest)
         ):
             raise ValueError("invalid reviewer board amendment digest")
+        if self.followup_dispatch_head is not None and not _is_followup_dispatch_head(
+            self.followup_dispatch_head
+        ):
+            raise ValueError("invalid followup_dispatch_head: expected a hex Git commit SHA")
         if self.scheduler_force_full_source is not None and (
             self.scheduler_force_full_source not in FORCE_FULL_SOURCES
             or self.scheduler_force_full is not True
@@ -628,6 +651,37 @@ class PostedRoundRecord:
 class ResumedRoundSelection:
     anchor_record: PostedRoundRecord
     current_round_records: tuple[PostedRoundRecord, ...]
+
+
+def rebuild_resumed_coder_carrier(
+    text: str | None, metadata: "PostedRoundMetadata | None"
+) -> StructuredCoderFollowup | StructuredIssueImplementation | None:
+    """Rebuild a resumed round's coder carrier from its durable raw response.
+
+    Dropped-citation records are restored from the round metadata written
+    when the response was accepted (#927), so a restart never loses them.
+    The degradable citation parser is deterministic, so re-parsing the
+    stored ``raw_structured_coder_response`` yields the same records.
+    """
+    if not text:
+        return None
+    carrier: StructuredCoderFollowup | StructuredIssueImplementation | None
+    try:
+        carrier = parse_historical_structured_issue_implementation(text)
+    except IssueImplementationConflictError as exc:
+        carrier = exc.payload if isinstance(exc.payload, StructuredIssueImplementation) else None
+    except AgentLoopError:
+        carrier = None
+    if carrier is None:
+        try:
+            carrier = parse_historical_structured_coder_followup(text)
+        except AgentLoopError:
+            return None
+    if carrier is None or metadata is None:
+        return carrier
+    return replace(
+        carrier, test_observation_degradations=tuple(metadata.test_observation_degradations)
+    )
 
 
 @dataclass(frozen=True)
@@ -1012,6 +1066,7 @@ def recover_plan_validation_diagnostic(
     architecture_contract_version: int | None,
     execution_strategy_contract_version: int | None,
     risk_test_matrix_contract_version: int | None,
+    on_host_footer: Callable[[str], None] | None = None,
 ) -> PlanValidationDiagnosticTransport | None:
     """Recover one authenticated current diagnostic using payload attempt order."""
     if not expected_author_login or expected_author_id < 1:
@@ -1019,8 +1074,18 @@ def recover_plan_validation_diagnostic(
     candidates: list[PlanValidationDiagnosticTransport] = []
     by_id: dict[int, str] = {}
     for comment in comments:
-        body = getattr(comment, "body", None)
-        if not isinstance(body, str) or not PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.search(body):
+        raw_body = getattr(comment, "body", None)
+        if not isinstance(raw_body, str):
+            continue
+        # Comment-ingestion boundary (#1043): remove the known host footer
+        # exactly once here.  The decoder never strips, so a doubled or variant
+        # suffix stays ineligible.
+        body, footered = strip_known_host_footer(raw_body)
+        # Report the observation at the boundary, before any marker, identity,
+        # or decoder exit, like the other ingestion boundaries.
+        if footered and on_host_footer is not None:
+            on_host_footer("plan-validation diagnostic recovery")
+        if not PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.search(body):
             continue
         comment_id, author_login, author_id, created_at = _comment_identity(comment)
         # Old or shape-only comments are not trusted recovery records.
@@ -1950,6 +2015,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["reviewer_board_amendment_digest"] = metadata.reviewer_board_amendment_digest
     if metadata.plan_candidate_key is not None:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
+    if metadata.followup_dispatch_head is not None:
+        payload["followup_dispatch_head"] = metadata.followup_dispatch_head
     if metadata.risk_test_matrix_evidence_full_round is not None:
         payload["risk_test_matrix_evidence_full_round"] = (
             metadata.risk_test_matrix_evidence_full_round
@@ -1967,6 +2034,17 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
     }
     if any(value not in (None, (), []) for value in matrix_values.values()):
         payload.update(matrix_values)
+    if metadata.architecture_impact_degradations:
+        # Optional: omitted when empty so undegraded rounds keep their shape.
+        payload["architecture_impact_degradations"] = [
+            record.to_payload() for record in metadata.architecture_impact_degradations
+        ]
+    if metadata.test_observation_degradations:
+        # Optional, like the field above, so rounds without citation records
+        # keep their exact historical encoding.
+        payload["test_observation_degradations"] = [
+            record.to_payload() for record in metadata.test_observation_degradations
+        ]
     if metadata.qualification_checkpoint is not None:
         payload["qualification_checkpoint"] = (
             metadata.qualification_checkpoint.as_dict()
@@ -1974,6 +2052,39 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             else metadata.qualification_checkpoint
         )
     return encode_mapping(payload)
+
+
+def _decode_parse_degradations(value: object) -> tuple[ParseDegradation, ...]:
+    """Rehydrate records strictly; historical or malformed entries yield none."""
+    if not isinstance(value, list):
+        return ()
+    records: list[ParseDegradation] = []
+    for item in value[:32]:
+        try:
+            records.append(parse_degradation_payload(item))
+        except AgentLoopError:
+            continue
+    return tuple(records)
+
+
+# A Git commit SHA (SHA-1 or SHA-256, abbreviated or full) in lowercase hex;
+# placeholders such as ``unknown`` never qualify as a dispatch head (#1034).
+_FOLLOWUP_DISPATCH_HEAD_RE = re.compile(r"[0-9a-f]{4,64}")
+
+
+def _is_followup_dispatch_head(value: object) -> bool:
+    return isinstance(value, str) and _FOLLOWUP_DISPATCH_HEAD_RE.fullmatch(value) is not None
+
+
+def _decode_followup_dispatch_head(payload: Mapping[str, object]) -> str | None:
+    # Absent is historical; a present malformed value is rejected rather than
+    # decoded as absence, so it can never silently drop the head signal.
+    if "followup_dispatch_head" not in payload:
+        return None
+    value = payload["followup_dispatch_head"]
+    if not _is_followup_dispatch_head(value):
+        raise ValueError("followup_dispatch_head must be a hex Git commit SHA")
+    return str(value)
 
 
 def _decode_plan_supersession_field(payload: Mapping[str, object], key: str) -> str | None:
@@ -2102,6 +2213,12 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             architecture_impact=(
                 payload.get("architecture_impact")
                 if isinstance(payload.get("architecture_impact"), dict) else None
+            ),
+            architecture_impact_degradations=_decode_parse_degradations(
+                payload.get("architecture_impact_degradations")
+            ),
+            test_observation_degradations=_decode_parse_degradations(
+                payload.get("test_observation_degradations")
             ),
             architecture_contract_version=(
                 int(payload["architecture_contract_version"])
@@ -2244,6 +2361,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             reviewer_board_amendment_digest=_decode_plan_supersession_field(
                 payload, "reviewer_board_amendment_digest"
             ),
+            followup_dispatch_head=_decode_followup_dispatch_head(payload),
             **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),
         )
@@ -2255,8 +2373,34 @@ def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:
     return _decode_round_metadata_mapping(decode_mapping(encoded))
 
 
+def followup_head_unchanged_sha(metadata: PostedRoundMetadata | None) -> str | None:
+    """Return the PR head a coder follow-up left unchanged, else ``None`` (#1034).
+
+    The signal is purely SHA-based: a coder record whose persisted dispatch
+    head equals its recorded subject.  Historical records without the
+    dispatch head never qualify, so their rendering and context stay as-is.
+    """
+    if metadata is None or metadata.role != "coder":
+        return None
+    dispatch_head = metadata.followup_dispatch_head
+    subject = metadata.subject
+    if not dispatch_head or not subject or subject == "unknown":
+        return None
+    return subject if subject == dispatch_head else None
+
+
 def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
     marker = f"<!-- AGENT_LOOP_META: {_encode_round_metadata(metadata)} -->"
+    degradations = render_parse_degradations_section(metadata.architecture_impact_degradations)
+    if degradations is not None and degradations not in str(body):
+        # Surface degraded elements in the round summary so a degraded round
+        # never reads as fully assessed.
+        body = _insert_before_trailing_markers(str(body), degradations)
+    citation_degradations = render_test_observation_degradations_section(
+        metadata.test_observation_degradations
+    )
+    if citation_degradations is not None and citation_degradations not in str(body):
+        body = _insert_before_trailing_markers(str(body), citation_degradations)
     lines = body.splitlines()
     index = len(lines)
     while index > 0 and not lines[index - 1].strip():
@@ -2282,6 +2426,20 @@ def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
     return TrustedBody.canonical(rendered, expected_tokens=expected)
 
 
+def _insert_before_trailing_markers(body: str, section: str) -> str:
+    lines = body.splitlines()
+    index = len(lines)
+    while index > 0:
+        candidate = lines[index - 1]
+        if not candidate.strip() or HTML_COMMENT_RE.match(candidate) or SIGNATURE_RE.match(candidate):
+            index -= 1
+            continue
+        break
+    prefix = "\n".join(lines[:index]).rstrip("\n")
+    suffix = "\n".join(lines[index:]).lstrip("\n")
+    return "\n\n".join(part for part in (prefix, section, suffix) if part)
+
+
 def _strip_round_metadata(body: str) -> str:
     cleaned = re.sub(
         r"\n?\s*<!--\s*AGENT_LOOP_META:\s*[A-Za-z0-9+/=_-]+\s*-->\s*\n?",
@@ -2298,6 +2456,10 @@ _LEGACY_MACHINE_REVIEWERS = {
     "GitHub PR checks": "github-pr-checks",
     "Alembic migration validation": "alembic-migration",
 }
+
+
+_LEGACY_UNTRUSTED_LINEAGE_NOTE = "Synthetic machine record lacked trusted orchestrator lineage."
+_LEGACY_UNBOUND_HEAD_NOTE = "Known machine item could not be bound to a failed head."
 
 
 def _legacy_machine_kind(item: UnresolvedReviewItem) -> str | None:
@@ -2347,7 +2509,7 @@ def _legacy_machine_promotion(
             failed_head_sha=None,
             candidate_head_sha=None,
             obligation_identity=f"unknown:{item.item_id}",
-            notes=(*item.notes, "Synthetic machine record lacked trusted orchestrator lineage."),
+            notes=(*item.notes, _LEGACY_UNTRUSTED_LINEAGE_NOTE),
             resolution_owners=(),
             owner_states=(),
         )
@@ -2377,7 +2539,7 @@ def _legacy_machine_promotion(
             obligation_kind="unknown",
             lifecycle="repair_required",
             obligation_identity=f"unknown:{item.item_id}",
-            notes=(*item.notes, "Known machine item could not be bound to a failed head."),
+            notes=(*item.notes, _LEGACY_UNBOUND_HEAD_NOTE),
             resolution_owners=(),
             owner_states=(),
         )
@@ -2424,6 +2586,114 @@ def _promote_legacy_machine_items(records: Sequence[PostedRoundRecord]) -> tuple
     return tuple(promoted)
 
 
+PLAN_DEMOTED_MACHINE_ITEM_NOTE = (
+    "Planning has no machine-obligation clearance path; this orchestrator-authored "
+    "plan item was restored to an ordinary reviewer-dispositionable finding (#1005)."
+)
+
+
+_REVIEWER_DISPOSITION_NOTE_RE = re.compile(r"[A-Za-z][A-Za-z0-9 ._-]*: \S")
+
+
+def _has_legacy_promotion_note_tail(notes: Sequence[str]) -> bool:
+    """True when the promotion's diagnostic note is followed only by reviewer notes.
+
+    ``_apply_unresolved_item_dispositions`` appends ``"<reviewer>: <note>"``
+    evidence to a machine record each round it is dispositioned, so a promoted
+    item carried through approval rounds holds those notes after the diagnostic.
+    """
+    diagnostics = {_LEGACY_UNTRUSTED_LINEAGE_NOTE, _LEGACY_UNBOUND_HEAD_NOTE}
+    positions = [index for index, note in enumerate(notes) if note in diagnostics]
+    if len(positions) != 1:
+        return False
+    return all(
+        _REVIEWER_DISPOSITION_NOTE_RE.match(note) for note in notes[positions[0] + 1:]
+    )
+
+
+def _is_legacy_promoted_plan_item(item: UnresolvedReviewItem) -> bool:
+    """Recognize exactly what ``_legacy_machine_promotion`` made of a plan item."""
+    return (
+        item.is_machine_obligation
+        and item.reviewer == "Orchestrator"
+        and item.item_id not in {"item-merge-conflict", "item-human-requirements-acknowledgement"}
+        and item.authority in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY}
+        and item.obligation_kind == "unknown"
+        and item.obligation_identity == f"unknown:{item.item_id}"
+        and item.lifecycle == "repair_required"
+        and item.candidate_head_sha is None
+        # Only the authority/head combinations the promotion can emit: machine
+        # authority bound to a failed head, or unknown authority with no head
+        # plus the diagnostic note the promotion appended for that outcome.
+        and (
+            (item.authority == MACHINE_AUTHORITY and bool(item.failed_head_sha))
+            or (
+                item.authority == UNKNOWN_MACHINE_AUTHORITY
+                and not item.failed_head_sha
+                and _has_legacy_promotion_note_tail(item.notes)
+            )
+        )
+        # The legacy promotion always clears ownership; a machine record that
+        # still names owners is not identifiable as that promotion.
+        and not item.resolution_owners
+        and not item.owner_states
+        and item.status in {"blocking", "same-pr"}
+        and not any(note.startswith("Invalid persisted machine") for note in item.notes)
+    )
+
+
+def _demote_plan_machine_item(item: UnresolvedReviewItem) -> UnresolvedReviewItem:
+    """Return a plan-flow machine record to the ordinary finding representation.
+
+    The planning loop never mints machine obligations and has no path that
+    clears one: reviewer dispositions are evidence only for machine records,
+    and the human-requirements/merge-conflict/CI clearance paths are PR-only.
+    A machine-authority item in a plan ledger (historically the legacy
+    promotion of the orchestrator's human-requirements re-injection item)
+    would therefore stay blocking forever and force a revision after every
+    unanimous approval (#1005).  Restoring the legacy representation lets the
+    reviewers disposition it like every other plan finding; the
+    human-requirements gate still re-checks acknowledgements each round and
+    re-injects a fresh item if they remain missing.
+
+    Only the exact legacy-promotion shape is restored.  A malformed or
+    otherwise unrecognized machine record (for example the ``unknown`` blocker
+    the decoder mints for an invalid persisted field) stays a machine
+    obligation, so the planning loop stops on it with a diagnostic instead of
+    letting a reviewer approval clear corrupted state.
+    """
+    if not _is_legacy_promoted_plan_item(item):
+        return item
+    notes = item.notes
+    if PLAN_DEMOTED_MACHINE_ITEM_NOTE not in notes:
+        notes = (*notes, PLAN_DEMOTED_MACHINE_ITEM_NOTE)
+    return replace(
+        item,
+        authority=None,
+        obligation_kind=None,
+        lifecycle=None,
+        failed_head_sha=None,
+        candidate_head_sha=None,
+        obligation_identity=None,
+        notes=notes,
+        resolution_owners=(),
+        owner_states=(),
+    )
+
+
+def _demote_plan_machine_items(records: Sequence[PostedRoundRecord]) -> tuple[PostedRoundRecord, ...]:
+    demoted: list[PostedRoundRecord] = []
+    for record in records:
+        metadata = record.metadata
+        prior = tuple(_demote_plan_machine_item(item) for item in metadata.prior_items)
+        new_items = tuple(_demote_plan_machine_item(item) for item in metadata.new_items)
+        if prior != metadata.prior_items or new_items != metadata.new_items:
+            metadata = replace(metadata, prior_items=prior, new_items=new_items)
+            record = replace(record, metadata=metadata)
+        demoted.append(record)
+    return tuple(demoted)
+
+
 def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) -> tuple[PostedRoundRecord, ...]:
     records: list[PostedRoundRecord] = []
     bodies = tuple(body for comment in comments if isinstance((body := getattr(comment, "body", None)), str))
@@ -2463,6 +2733,10 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
                 body=_strip_round_metadata(body),
             )
         )
+    if flow == "plan":
+        # Legacy machine promotion exists for PR ledgers, whose machine gates
+        # have clearance paths.  A plan ledger has none (#1005).
+        return _demote_plan_machine_items(tuple(records))
     return _promote_legacy_machine_items(tuple(records))
 
 
@@ -3667,6 +3941,7 @@ def _resume_plan_round(
             if response_kind == "plan_revision":
                 parsed_revision = validate_structured_plan_revision(
                     coder_output,
+                    architecture_status_mode="legacy",
                     require_execution_strategy_contract=1,
                     require_risk_test_matrix_contract=(1 if matrix_metadata_version == 1 else 0),
                 )
@@ -3678,6 +3953,7 @@ def _resume_plan_round(
             elif response_kind == "plan_state":
                 parsed = validate_structured_plan_state(
                     coder_output,
+                    architecture_status_mode="legacy",
                     require_execution_strategy_contract=1,
                     require_risk_test_matrix_contract=(1 if matrix_metadata_version == 1 else 0),
                 )

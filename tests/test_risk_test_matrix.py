@@ -187,6 +187,153 @@ def test_one_shared_selector_verifies_every_row_it_covers() -> None:
     assert not result.diagnostics
 
 
+def test_builder_reports_dropped_unapproved_row_claims() -> None:
+    # Regression for #920: a claim dropped for citing a sibling phase's row is
+    # surfaced as a diagnostic while the valid claim still verifies its row.
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-1")
+    claims = SemanticRiskCoverageClaims(
+        (
+            SemanticRiskCoverageClaim(
+                row_id="row-ordinary",
+                execution_refs=("invocation:observation-1",),
+                test_identifiers=("test_row_ordinary",),
+                test_locations=("tests/test_protocol.py::test_row_ordinary",),
+                workflow_path_claim="The run covered this workflow path.",
+                outcome_assertions=("The row's test passed.",),
+                forbidden_effect_assertions=("No unauthorized evidence was accepted.",),
+            ),
+        ),
+        dropped_row_ids=("legacy-planning-metadata-fallback",),
+    )
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert [row.row_id for row in result.evidence.rows] == ["row-ordinary"]
+    assert [row.status for row in result.evidence.rows] == ["verified"]
+    assert [(item.row_id, item.code) for item in result.diagnostics] == [
+        ("legacy-planning-metadata-fallback", "unapproved-row-claim")
+    ]
+    message = result.diagnostics[0].message
+    assert "not in the approved enforceable matrix set for this turn" in message
+    assert "not in the approved matrix" in message
+
+
+def _followup_with_claims_920(claims) -> str:
+    text = structured_coder_followup()
+    payload, end = json.JSONDecoder().raw_decode(text)
+    payload["risk_test_matrix_claims"] = claims
+    return json.dumps(payload) + text[end:]
+
+
+def _staged_context_920():
+    payload = _matrix()
+    payload["rows"] = [
+        {**_row("row-first"), "execution_owner": "stage-first"},
+        {**_row("row-later"), "execution_owner": "stage-later"},
+    ]
+    matrix = parse_risk_test_matrix(payload)
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        render_risk_test_matrix_section(matrix),
+        expected_hash=None,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    return matrix, context
+
+
+def test_stage_owning_no_rows_drops_sibling_claim_and_names_owners() -> None:
+    """#920: an explicitly empty scoped set must not mean 'unrestricted'."""
+    matrix, context = _staged_context_920()
+    scoped = scope_approved_plan_matrix(
+        context,
+        execution_owner="stage-empty",
+        valid_stage_ids=("stage-first", "stage-later", "stage-empty"),
+    )
+    assert scoped.risk_test_matrix_expected_row_ids == ()
+    observation = _derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")
+    claim = {
+        "row_id": "row-first",
+        "execution_refs": ["turn:observation-1"],
+        "test_identifiers": ["tests/test_protocol.py::test_first"],
+        "test_locations": ["tests/test_protocol.py"],
+        "workflow_path_claim": "stage path",
+        "outcome_assertions": ["passed"],
+        "forbidden_effect_assertions": ["none"],
+    }
+
+    parsed = validate_structured_coder_followup(
+        _followup_with_claims_920([claim]),
+        delivered_risk_test_matrix_row_ids=scoped.risk_test_matrix_expected_row_ids,
+        execution_catalog=[observation],
+    )
+
+    assert parsed is not None
+    assert parsed.risk_test_matrix_claims.claims == ()
+    assert parsed.risk_test_matrix_claims.dropped_row_ids == ("row-first",)
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=parsed.risk_test_matrix_claims,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+        execution_owner=scoped.risk_test_matrix_execution_owner,
+    )
+    assert all(row.status != "verified" for row in result.evidence.rows)
+    dropped = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert [item.row_id for item in dropped] == ["row-first"]
+    assert "execution owner `stage-empty`" in dropped[0].message
+    assert "belongs to execution owner `stage-first`" in dropped[0].message
+
+
+def test_correction_keeps_the_original_dropped_row_audit_record() -> None:
+    """#920: a successful correction must not erase that a claim was dropped."""
+    original = validate_structured_coder_followup(
+        _followup_with_claims_920([
+            {"row_id": "row-sibling", "execution_refs": ["turn:observation-1"]},
+        ]),
+        delivered_risk_test_matrix_row_ids=("row-ordinary",),
+        execution_catalog=[_derived_observation(
+            execution_ref="turn:observation-1", receipt_id="receipt-1",
+        )],
+    )
+    assert original.risk_test_matrix_claims.dropped_row_ids == ("row-sibling",)
+    catalog = [_derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")]
+
+    corrected = orchestrator_module._parse_fresh_correction_claims(
+        _followup_with_claims_920([
+            {"row_id": "row-ordinary", "execution_refs": ["turn:observation-1"]},
+        ]),
+        original,
+        row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+
+    assert corrected is not None
+    assert [claim.row_id for claim in corrected.risk_test_matrix_claims.claims] == ["row-ordinary"]
+    assert corrected.risk_test_matrix_claims.dropped_row_ids == ("row-sibling",)
+    # The audit record neither triggers nor fails the bounded correction.
+    assert "unapproved-row-claim" in orchestrator_module._NON_ACTIONABLE_RISK_DIAGNOSTICS
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -2106,3 +2253,857 @@ def test_untruncated_semantic_claim_still_verifies() -> None:
 
     assert result.evidence.rows[0].status == "verified"
     assert not [d for d in result.diagnostics if d.code == "truncated-semantic-claim"]
+
+
+# --- #926: claim-scope row-ID degradation at the pre-authentication parser ---
+
+
+def _claim_926(row_id: object = "row-first", ref: str = "turn:observation-1") -> dict[str, object]:
+    return {
+        "row_id": row_id,
+        "execution_refs": [ref],
+        "test_identifiers": ["tests/test_protocol.py::test_first"],
+        "test_locations": ["tests/test_protocol.py"],
+        "workflow_path_claim": "The claimed workflow path ran.",
+        "outcome_assertions": ["The test passed."],
+        "forbidden_effect_assertions": ["No evidence was invented."],
+    }
+
+
+def _two_row_matrix_926():
+    return parse_risk_test_matrix({**_matrix(), "rows": [_row("row-first"), _row("row-second")]})
+
+
+def _parse_and_derive_926(claims, *, row_ids, matrix=None):
+    matrix = matrix or _two_row_matrix_926()
+    catalog = [
+        _derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1"),
+        _derived_observation(execution_ref="turn:observation-2", receipt_id="receipt-2"),
+    ]
+    parsed = validate_structured_coder_followup(
+        _followup_with_claims_920(claims),
+        delivered_risk_test_matrix_row_ids=row_ids,
+        execution_catalog=catalog,
+    )
+    assert parsed is not None
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=parsed.risk_test_matrix_claims,
+        observations=tuple(catalog),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+    return parsed, result
+
+
+def _statuses(result) -> dict[str, str]:
+    return {row.row_id: row.status for row in result.evidence.rows}
+
+
+def test_unapproved_row_claim_drops_with_record_and_keeps_complete_evidence_926() -> None:
+    """Row claim-unknown-row: an unapproved ID emits no canonical row."""
+    parsed, result = _parse_and_derive_926(
+        [_claim_926("row-first"), _claim_926("row-unknown", "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-first"]
+    assert [record.element_path for record in claims.degradations] == [
+        "coder_followup.risk_test_matrix_claims[1].row_id"
+    ]
+    assert claims.degradations[0].outcome == "claim-dropped"
+    # Every approved enforceable row exactly once; no row for the unapproved ID.
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+    assert _statuses(result) == {"row-first": "verified", "row-second": "missing"}
+    codes = [(item.row_id, item.code) for item in result.diagnostics]
+    assert ("row-unknown", "unapproved-row-claim") in codes
+    # The unapproved record keeps its historical diagnostic only, not a second one.
+    assert not [code for _row_id, code in codes if code == "degraded-row-claim"]
+
+
+def test_duplicate_row_claim_drops_every_copy_926() -> None:
+    """Row claim-duplicate-row: no arbitrary copy becomes the row's coverage."""
+    parsed, result = _parse_and_derive_926(
+        [
+            _claim_926("row-first"),
+            _claim_926("row-second", "turn:observation-2"),
+            _claim_926("row-first", "turn:observation-2"),
+        ],
+        row_ids=("row-first", "row-second"),
+    )
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-second"]
+    assert [record.element_path for record in claims.degradations] == [
+        "coder_followup.risk_test_matrix_claims[0].row_id",
+        "coder_followup.risk_test_matrix_claims[2].row_id",
+    ]
+    assert all("more than once" in record.rule for record in claims.degradations)
+    assert _statuses(result) == {"row-first": "missing", "row-second": "verified"}
+    degraded = [item for item in result.diagnostics if item.code == "degraded-row-claim"]
+    assert [item.row_id for item in degraded] == [
+        "coder_followup.risk_test_matrix_claims[0].row_id",
+        "coder_followup.risk_test_matrix_claims[2].row_id",
+    ]
+    assert "row-first" in degraded[0].message
+    assert ("row-first", "missing-claim") in [(i.row_id, i.code) for i in result.diagnostics]
+
+
+@pytest.mark.parametrize(
+    "bad_row_id",
+    ["finding-3", "hr-2", "item-1", "bad row id", "x" * 300, "`row-first`\nline two"],
+)
+def test_malformed_row_id_claim_degrades_with_sanitized_preview_926(bad_row_id) -> None:
+    """Row claim-invalid-row-id: sanitized, bounded, never admitted."""
+    parsed, result = _parse_and_derive_926(
+        [_claim_926(bad_row_id, "turn:observation-2"), _claim_926("row-first")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-first"]
+    [record] = claims.degradations
+    assert "\n" not in record.observed_preview
+    assert "`" not in record.observed_preview
+    assert len(record.observed_preview) <= 121
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+    assert _statuses(result) == {"row-first": "verified", "row-second": "missing"}
+    [degraded] = [item for item in result.diagnostics if item.code == "degraded-row-claim"]
+    # Keyed by element path, so a namespace-like value never becomes a row ID.
+    assert degraded.row_id == "coder_followup.risk_test_matrix_claims[0].row_id"
+    assert "\n" not in degraded.message
+
+
+@pytest.mark.parametrize("row_id", ["ABSENT", 7, 1.5, None, True, ["row-first"], {"row": "row-first"}])
+def test_absent_or_mistyped_row_id_claim_degrades_at_its_index_926(row_id) -> None:
+    """Row claim-rowid-absent-or-mistyped: dropped at its index, type name only."""
+    bad = _claim_926(row_id, "turn:observation-2")
+    if row_id == "ABSENT":
+        bad.pop("row_id")
+    parsed, result = _parse_and_derive_926(
+        [_claim_926("row-first"), bad, _claim_926("row-second", "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    claims = parsed.risk_test_matrix_claims
+    assert [claim.row_id for claim in claims.claims] == ["row-first", "row-second"]
+    [record] = claims.degradations
+    assert record.element_path == "coder_followup.risk_test_matrix_claims[1].row_id"
+    if row_id == "ABSENT":
+        assert record.rule == "row_id key is absent"
+    else:
+        assert record.rule == "row_id is not a string"
+        assert record.observed_preview.startswith("type ")
+        # No rendering of the value itself.
+        assert "row-first" not in record.observed_preview
+    assert _statuses(result) == {"row-first": "verified", "row-second": "verified"}
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+
+
+def test_all_claims_degraded_followup_survives_with_no_coverage_926() -> None:
+    bad_absent = _claim_926()
+    bad_absent.pop("row_id")
+    parsed, result = _parse_and_derive_926(
+        [
+            bad_absent,
+            _claim_926(5),
+            _claim_926("finding-9"),
+            _claim_926("row-other"),
+            _claim_926("row-first"),
+            _claim_926("row-first"),
+        ],
+        row_ids=("row-first", "row-second"),
+    )
+
+    assert parsed.risk_test_matrix_claims.claims == ()
+    assert len(parsed.risk_test_matrix_claims.degradations) == 6
+    assert _statuses(result) == {"row-first": "missing", "row-second": "missing"}
+
+
+@pytest.mark.parametrize("context", ["zero-owned-stage", "not-applicable-matrix"])
+def test_authoritative_empty_row_set_admits_no_claim_926(context) -> None:
+    """Row claim-empty-approved-rowset: [] is authoritative, None is unscoped."""
+    if context == "zero-owned-stage":
+        _matrix_payload, approved = _staged_context_920()
+        row_ids = scope_approved_plan_matrix(
+            approved,
+            execution_owner="stage-empty",
+            valid_stage_ids=("stage-first", "stage-later", "stage-empty"),
+        ).risk_test_matrix_expected_row_ids
+    else:
+        na = parse_risk_test_matrix(_not_applicable())
+        identity = risk_test_matrix_identity(na)
+        row_ids = make_approved_plan_context(
+            render_risk_test_matrix_section(na),
+            expected_hash=None,
+            risk_test_matrix_contract_version=1,
+            risk_test_matrix_payload=na.to_payload(),
+            risk_test_matrix_changes_payload=(),
+            risk_test_matrix_identity=identity,
+            risk_test_matrix_boundary_digest=identity,
+        ).risk_test_matrix_expected_row_ids
+    assert tuple(row_ids) == ()
+    catalog = [_derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")]
+    claims = [_claim_926("row-first"), _claim_926("row-later")]
+
+    scoped = validate_structured_coder_followup(
+        _followup_with_claims_920(claims),
+        delivered_risk_test_matrix_row_ids=row_ids,
+        execution_catalog=catalog,
+    )
+    assert scoped.risk_test_matrix_claims.claims == ()
+    assert [record.element_path for record in scoped.risk_test_matrix_claims.degradations] == [
+        "coder_followup.risk_test_matrix_claims[0].row_id",
+        "coder_followup.risk_test_matrix_claims[1].row_id",
+    ]
+
+    unscoped = validate_structured_coder_followup(
+        _followup_with_claims_920(claims),
+        delivered_risk_test_matrix_row_ids=None,
+        execution_catalog=catalog,
+    )
+    assert [claim.row_id for claim in unscoped.risk_test_matrix_claims.claims] == [
+        "row-first", "row-later",
+    ]
+    assert unscoped.risk_test_matrix_claims.degradations == ()
+
+
+def test_degradation_is_never_stronger_than_the_undegraded_claim_set_926() -> None:
+    """A degraded claim set never reports more verified rows than the clean one."""
+    rank = {"verified": 2}
+    _clean_parsed, clean = _parse_and_derive_926(
+        [_claim_926("row-first"), _claim_926("row-second", "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+    for degraded_claims in (
+        [_claim_926("row-first"), _claim_926(3, "turn:observation-2")],
+        [_claim_926("row-first"), _claim_926("finding-1", "turn:observation-2")],
+        [_claim_926("row-first"), _claim_926("row-first"), _claim_926("row-second", "turn:observation-2")],
+    ):
+        _parsed, degraded = _parse_and_derive_926(degraded_claims, row_ids=("row-first", "row-second"))
+        for row_id, status in _statuses(degraded).items():
+            assert rank.get(status, 0) <= rank.get(_statuses(clean)[row_id], 0)
+        assert len(degraded.diagnostics) >= len(clean.diagnostics)
+
+
+def test_correction_keeps_claim_degradation_records_926() -> None:
+    catalog = [_derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")]
+    original = validate_structured_coder_followup(
+        _followup_with_claims_920([_claim_926(5)]),
+        delivered_risk_test_matrix_row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+    assert len(original.risk_test_matrix_claims.degradations) == 1
+
+    corrected = orchestrator_module._parse_fresh_correction_claims(
+        _followup_with_claims_920([_claim_926("row-ordinary")]),
+        original,
+        row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+
+    assert corrected.risk_test_matrix_claims.degradations == original.risk_test_matrix_claims.degradations
+    assert "degraded-row-claim" in orchestrator_module._NON_ACTIONABLE_RISK_DIAGNOSTICS
+
+
+def test_degraded_row_claim_is_rendered_as_a_dropped_claim_926() -> None:
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    _parsed, result = _parse_and_derive_926(
+        [_claim_926("row-first"), _claim_926("finding-4", "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    dropped = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert len(dropped) == 1
+    assert "coder_followup.risk_test_matrix_claims[1].row_id" in dropped[0]
+    assert "not a valid matrix-specific identifier" in dropped[0]
+
+
+def test_repeated_unapproved_row_claims_each_keep_a_durable_diagnostic_926() -> None:
+    """Every dropped unapproved claim reaches round metadata and the render."""
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    parsed, result = _parse_and_derive_926(
+        [
+            _claim_926("row-sibling"),
+            _claim_926("row-first"),
+            _claim_926("row-sibling", "turn:observation-2"),
+        ],
+        row_ids=("row-first", "row-second"),
+    )
+
+    assert parsed.risk_test_matrix_claims.dropped_row_ids == ("row-sibling",)
+    dropped = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert [item.row_id for item in dropped] == ["row-sibling", "row-sibling"]
+    assert "coder_followup.risk_test_matrix_claims[0].row_id" in dropped[0].message
+    assert "coder_followup.risk_test_matrix_claims[2].row_id" in dropped[1].message
+    assert all("outside the approved enforceable set" in item.message for item in dropped)
+    assert all("claim-dropped" in item.message for item in dropped)
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    restored = [item for item in decoded.risk_test_matrix_diagnostics if item["code"] == "unapproved-row-claim"]
+    assert [item["message"] for item in restored] == [item.message for item in dropped]
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    lines = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert len(lines) == 2
+    assert "risk_test_matrix_claims[0].row_id" in lines[0]
+    assert "risk_test_matrix_claims[2].row_id" in lines[1]
+
+
+def test_unapproved_row_ids_sharing_a_preview_keep_exact_attribution_926() -> None:
+    """Two distinct unapproved IDs with one bounded preview stay distinct."""
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    first_id = "a" * 120 + "x"
+    second_id = "a" * 120 + "y"
+    parsed, result = _parse_and_derive_926(
+        [_claim_926(first_id), _claim_926(second_id, "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    records = parsed.risk_test_matrix_claims.degradations
+    assert records[0].observed_preview == records[1].observed_preview
+    dropped = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert [item.row_id for item in dropped] == [first_id, second_id]
+    assert "coder_followup.risk_test_matrix_claims[0].row_id" in dropped[0].message
+    assert "coder_followup.risk_test_matrix_claims[1].row_id" in dropped[1].message
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    restored = [item for item in decoded.risk_test_matrix_diagnostics if item["code"] == "unapproved-row-claim"]
+    assert [item["row_id"] for item in restored] == [first_id, second_id]
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    lines = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert len(lines) == 2
+
+
+def test_correction_keeps_distinct_drops_at_the_same_index_926() -> None:
+    """A correction drop that looks like the original's keeps its own ID and position."""
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    first_id = "a" * 120 + "x"
+    second_id = "a" * 120 + "y"
+    catalog = [_derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")]
+    original = validate_structured_coder_followup(
+        _followup_with_claims_920([_claim_926(first_id)]),
+        delivered_risk_test_matrix_row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+    corrected = orchestrator_module._parse_fresh_correction_claims(
+        _followup_with_claims_920([_claim_926(second_id)]),
+        original,
+        row_ids=("row-ordinary",),
+        execution_catalog=catalog,
+    )
+    claims = corrected.risk_test_matrix_claims
+    assert len(claims.degradations) == 2
+
+    matrix = parse_risk_test_matrix(_matrix())
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=tuple(catalog),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+    dropped = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert [item.row_id for item in dropped] == [first_id, second_id]
+    assert "`coder_followup.risk_test_matrix_claims[0].row_id`" in dropped[0].message
+    assert "correction.coder_followup.risk_test_matrix_claims[0].row_id" in dropped[1].message
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    restored = [item for item in decoded.risk_test_matrix_diagnostics if item["code"] == "unapproved-row-claim"]
+    assert [(item["row_id"], item["message"]) for item in restored] == [
+        (item.row_id, item.message) for item in dropped
+    ]
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    lines = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert len(lines) == 2
+    assert "correction." in lines[1] and "correction." not in lines[0]
+
+
+@pytest.mark.parametrize(
+    "bad_row_id",
+    [
+        "finding-3", "hr-2", "item-1", "blocker_5", "review.2", "HR-0abc", "x-finding-7", "Item9",
+        "Finding-3", "BLOCKER-2", "hr-hr-2", "x HR-Hr-3",
+    ],
+)
+def test_malformed_identifier_like_row_id_is_neutralized_in_public_output_926(bad_row_id) -> None:
+    """A malformed row ID cannot surface as an intact finding- or requirement-style token."""
+    import re
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    reserved = re.compile(r"(item|finding|review|blocker)[-_.]?\d|hr-", re.I)
+    parsed, result = _parse_and_derive_926(
+        [_claim_926(bad_row_id, "turn:observation-2"), _claim_926("row-first")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    [record] = parsed.risk_test_matrix_claims.degradations
+    assert not reserved.search(record.observed_preview)
+    assert "·" in record.observed_preview
+    # Case variants such as ``Item9`` are reserved too (#1016), so every one
+    # takes the malformed-row path rather than the unapproved-row path.
+    assert record.rule == "row_id is not a valid matrix-specific identifier"
+    assert not [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    [dropped] = [item for item in result.diagnostics if item.code == "degraded-row-claim"]
+    assert not reserved.search(dropped.message)
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert not any(reserved.search(item["message"]) for item in decoded.risk_test_matrix_diagnostics)
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    [line] = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert "·" in line
+    assert not reserved.search(rendered)
+
+
+@pytest.mark.parametrize("row_id", ["Finding-3", "FINDING-3", "HR-2", "Item-1", "Blocker-2", "Review-7"])
+def test_strict_matrix_parsing_refuses_reserved_case_variants_1016(row_id) -> None:
+    """Row namespace-boundaries: capitalization no longer bypasses strict matrix parsing."""
+    with pytest.raises(AgentLoopError, match="may not resemble a reviewer finding ID"):
+        parse_risk_test_matrix({**_matrix(), "rows": [_row(row_id)]})
+
+
+@pytest.mark.parametrize("row_id", ["subitem-3", "planreview-2", "lineitem-9", "chr-1", "thr-ee", "Row-Mixed"])
+def test_strict_matrix_parsing_keeps_embedded_substring_ids_1016(row_id) -> None:
+    matrix = parse_risk_test_matrix({**_matrix(), "rows": [_row(row_id)]})
+    assert [row.row_id for row in matrix.rows] == [row_id]
+
+
+@pytest.mark.parametrize("row_id", ["subitem-3", "planreview-2", "lineitem-9", "chr-1", "thr-ee"])
+def test_unapproved_embedded_substring_row_id_keeps_exact_attribution_1016(row_id) -> None:
+    """Row diagnostic-attribution: the dropped-claim line names the real row ID."""
+    from coding_review_agent_loop.comment_rendering import _render_risk_test_matrix_evidence
+
+    parsed, result = _parse_and_derive_926(
+        [_claim_926("row-first"), _claim_926(row_id, "turn:observation-2")],
+        row_ids=("row-first", "row-second"),
+    )
+
+    [record] = parsed.risk_test_matrix_claims.degradations
+    assert record.rule == "row_id is outside the approved enforceable set"
+    assert record.observed_preview == row_id
+    assert [row.row_id for row in result.evidence.rows] == ["row-first", "row-second"]
+    assert _statuses(result) == {"row-first": "verified", "row-second": "missing"}
+    [dropped] = [item for item in result.diagnostics if item.code == "unapproved-row-claim"]
+    assert dropped.row_id == row_id
+    assert f"`{row_id}`" in dropped.message
+    assert "·" not in dropped.message
+
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="subject",
+        risk_test_matrix_diagnostics=tuple(item.to_payload() for item in result.diagnostics),
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    [restored] = [item for item in decoded.risk_test_matrix_diagnostics if item["code"] == "unapproved-row-claim"]
+    assert (restored["row_id"], restored["message"]) == (row_id, dropped.message)
+
+    rendered = _render_risk_test_matrix_evidence(result.evidence, diagnostics=result.diagnostics)
+    [line] = [line for line in rendered.splitlines() if line.startswith("- Dropped claim:")]
+    assert row_id in line
+    assert "·" not in line
+
+
+# ---------------------------------------------------------------------------
+# #927: claim-scope conversions, the fatal set that stays, and monotonicity.
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.errors import NonRepairableEvidenceRejection  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    DROPPED_VALUE_MAX_BYTES,
+    NonRepairableEvidenceRejection as _ProtocolNonRepairable,
+    _parse_semantic_risk_coverage_claims,
+)
+
+_CATALOG_927 = (
+    _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-1"),
+    _derived_observation(execution_ref="invocation:observation-2", receipt_id="receipt-2"),
+)
+_FAILING_927 = _derived_observation(
+    execution_ref="invocation:observation-9", receipt_id="receipt-9", outcome="failed"
+)
+
+
+def _matrix_927():
+    return parse_risk_test_matrix({**_matrix(), "rows": [_row("row-a"), _row("row-b")]})
+
+
+def _claim_927(row_id="row-a", refs=("invocation:observation-1",)):
+    return {
+        "row_id": row_id,
+        "execution_refs": list(refs),
+        "test_identifiers": [f"tests/test_x.py::test_{row_id}"],
+        "test_locations": ["tests/test_x.py"],
+        "workflow_path_claim": "The workflow path ran.",
+        "outcome_assertions": ["The test passed."],
+        "forbidden_effect_assertions": ["Nothing was invented."],
+    }
+
+
+def _parse_927(claims, *, catalog=_CATALOG_927, row_ids=("row-a", "row-b")):
+    return _parse_semantic_risk_coverage_claims(
+        claims,
+        context="coder_followup.risk_test_matrix_claims",
+        expected_row_ids=None if row_ids is None else list(row_ids),
+        execution_catalog=catalog,
+    )
+
+
+def _derive_927(parsed):
+    return derive_risk_test_matrix_evidence(
+        matrix=_matrix_927(),
+        claims=parsed,
+        observations=_CATALOG_927,
+        execution_catalog=_CATALOG_927,
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(_matrix_927()),
+    )
+
+
+def _row_view(result):
+    return [
+        (row.row_id, row.status, tuple(item.receipt_id for item in row.evidence_citations))
+        for row in result.evidence.rows
+    ]
+
+
+def _assert_monotone_drop(defective, *, catalog=_CATALOG_927):
+    """The degraded payload derives exactly what the payload without the claim derives."""
+    valid = _claim_927("row-a")
+    degraded = _parse_927([valid, defective], catalog=catalog)
+    removed = _parse_927([valid], catalog=catalog)
+    assert degraded.claims == removed.claims
+    [record] = degraded.degradations
+    assert record.outcome == "claim-dropped"
+    assert record.element_path.startswith("coder_followup.risk_test_matrix_claims[1]")
+    with_drop = _derive_927(degraded)
+    without = _derive_927(removed)
+    assert _row_view(with_drop) == _row_view(without)
+    assert _row_view(with_drop) == [("row-a", "verified", ("receipt-1",)), ("row-b", "missing", ())]
+    extra = [item for item in with_drop.diagnostics if item not in without.diagnostics]
+    assert [(item.row_id, item.code) for item in extra] == [
+        (record.element_path, "degraded-row-claim")
+    ]
+    return record
+
+
+@pytest.mark.parametrize("refs", [[], None])
+def test_claim_with_no_selectors_is_dropped_not_fatal_927(refs):
+    """#855/#927: an empty or absent execution_refs drops only that claim."""
+    defective = _claim_927("row-b")
+    if refs is None:
+        defective.pop("execution_refs")
+    else:
+        defective["execution_refs"] = refs
+    record = _assert_monotone_drop(defective)
+    assert record.element_path == "coder_followup.risk_test_matrix_claims[1].execution_refs"
+    assert record.rule in {"execution_refs contains no selector", "execution_refs key is absent"}
+
+
+@pytest.mark.parametrize(
+    ("mutate", "rule"),
+    [
+        (lambda c: c.update(execution_refs=["invocation:observation-2", "invocation:observation-2"]), "more than once"),
+        (lambda c: c.update(execution_refs=[3]), "non-blank strings"),
+        (lambda c: c.update(execution_refs="invocation:observation-2"), "non-blank strings"),
+        (lambda c: c.update(notes="free text"), "unknown keys"),
+        (lambda c: c.update(citations=[]), "unknown keys"),
+        (lambda c: c.update(Status="verified"), "unknown keys"),
+        (lambda c: c.update(workflow_path_claim=7), "ill-typed"),
+        (lambda c: c.update(workflow_path_claim=True), "ill-typed"),
+        (lambda c: c.update(workflow_path_claim=["path"]), "ill-typed"),
+        (lambda c: c.update(workflow_path_claim={"path": 1}), "ill-typed"),
+        (lambda c: c.update(test_locations="tests/test_x.py"), "ill-typed"),
+        (lambda c: c.update(outcome_assertions=["dup", "dup"]), "duplicated"),
+        (lambda c: c.update(test_identifiers=["x" * 2_000]), "exceeds the field bound"),
+        (lambda c: c.update(workflow_path_claim="x" * 2_000), "exceeds the field bound"),
+        (lambda c: c.update(caveats=[None]), "ill-typed"),
+    ],
+)
+def test_claim_format_defect_drops_only_that_claim_927(mutate, rule):
+    defective = _claim_927("row-b", refs=("invocation:observation-2",))
+    mutate(defective)
+    record = _assert_monotone_drop(defective)
+    assert rule in record.rule
+
+
+def test_non_object_claim_records_only_its_type_927():
+    record = _assert_monotone_drop("row-b")
+    assert record.element_path == "coder_followup.risk_test_matrix_claims[1]"
+    assert record.rule == "claim is not a JSON object"
+    assert record.observed_preview == "type string"
+
+
+@pytest.mark.parametrize(("value", "label"), [(None, "null"), ({"row_id": "row-a"}, "object"), ("row-a", "string")])
+def test_non_array_claims_field_yields_no_claims_and_one_record_927(value, label):
+    parsed = _parse_927(value)
+    assert parsed.claims == ()
+    [record] = parsed.degradations
+    assert record.element_path == "coder_followup.risk_test_matrix_claims"
+    assert record.observed_preview == f"type {label}"
+    assert [status for _row_id, status, _c in _row_view(_derive_927(parsed))] == ["missing", "missing"]
+
+
+def test_non_array_claims_field_with_colliding_catalog_still_rejects_927():
+    collision = (*_CATALOG_927, _CATALOG_927[0])
+    with pytest.raises(NonRepairableEvidenceRejection, match="colliding execution_ref"):
+        _parse_927({"not": "an array"}, catalog=collision)
+
+
+def test_absent_row_id_and_empty_refs_yield_one_row_id_record_927():
+    defective = _claim_927("row-b")
+    defective.pop("row_id")
+    defective["execution_refs"] = []
+    record = _assert_monotone_drop(defective)
+    assert record.rule == "row_id key is absent"
+
+
+def test_empty_approved_set_keeps_the_unapproved_pairing_over_empty_refs_927():
+    parsed = _parse_927([{**_claim_927("row-a"), "execution_refs": []}], row_ids=())
+    [record] = parsed.degradations
+    assert record.rule == "row_id is outside the approved enforceable set"
+    assert parsed.dropped_row_ids == ("row-a",)
+    assert parsed.unapproved_claim_row_ids == ((record, "row-a"),)
+
+
+def test_admissible_plus_out_of_catalog_ref_keeps_the_claim_927():
+    parsed = _parse_927([_claim_927("row-a", refs=("invocation:observation-1", "invocation:elsewhere"))])
+    [claim] = parsed.claims
+    assert claim.execution_refs == ("invocation:observation-1",)
+    assert claim.dropped_execution_refs == ("invocation:elsewhere",)
+    assert parsed.degradations == ()
+
+
+def test_no_catalog_oversize_selector_drops_the_claim_and_hard_cap_rejects_927():
+    dropped = _parse_927([_claim_927("row-a", refs=("x" * 2_000,))], catalog=None)
+    assert dropped.claims == ()
+    [record] = dropped.degradations
+    assert record.rule == "selector exceeds the field bound without a catalog"
+    assert record.element_path.endswith("[0].execution_refs")
+    assert record.observed_preview == "2000 bytes"
+    with_row_defect = _parse_927([_claim_927("finding-3", refs=("x" * 2_000,))], catalog=None)
+    [row_record] = with_row_defect.degradations
+    assert row_record.rule == "row_id is not a valid matrix-specific identifier"
+    with pytest.raises(AgentLoopError, match="16384-byte bound"):
+        _parse_927([_claim_927("row-a", refs=("x" * 20_000,))], catalog=None)
+
+
+def test_degraded_claim_citing_a_failing_selector_still_rejects_927():
+    catalog = (*_CATALOG_927, _FAILING_927)
+    claim = {**_claim_927("finding-3", refs=("invocation:observation-9",)), "notes": "degradable"}
+    with pytest.raises(_ProtocolNonRepairable, match="not an admissible passing observation"):
+        _parse_927([_claim_927("row-a"), claim], catalog=catalog)
+
+
+@pytest.mark.parametrize("key", ["status", "evidence_citations", "receipt_id", "command", "claim"])
+def test_reserved_authority_key_rejects_while_ordinary_unknown_keys_degrade_927(key):
+    with pytest.raises(AgentLoopError, match="orchestrator-owned authority"):
+        _parse_927([_claim_927("row-a"), {**_claim_927("row-b"), key: "forged"}])
+    for ordinary in ("citations", "notes", key.capitalize()):
+        parsed = _parse_927([{**_claim_927("row-b"), ordinary: "x"}])
+        [record] = parsed.degradations
+        assert record.rule == "claim carries unknown keys"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda c: c.update(workflow_path_claim="x" * 16_385), "16384-byte bound"),
+        (lambda c: c.update(test_identifiers=["x" * 16_385]), "16384-byte bound"),
+        (lambda c: c.update(execution_refs=[f"invocation:observation-{i}" for i in range(9)]), "8-item bound"),
+        (lambda c: c.update(caveats=[f"c{i}" for i in range(17)]), "16-item bound"),
+    ],
+)
+def test_hard_bound_claim_defects_still_reject_even_when_degraded_927(mutate, match):
+    claim = _claim_927("finding-3")
+    claim["notes"] = "also degradable"
+    mutate(claim)
+    with pytest.raises(AgentLoopError, match=match):
+        _parse_927([claim])
+
+
+def test_every_claim_degraded_keeps_the_envelope_927():
+    parsed = _parse_927([7, {"row_id": "row-a"}, {**_claim_927("row-b"), "notes": 1}])
+    assert parsed.claims == ()
+    assert len(parsed.degradations) == 3
+    assert [status for _r, status, _c in _row_view(_derive_927(parsed))] == ["missing", "missing"]
+
+
+def test_dropped_value_bound_edge_and_over_bound_values_reject_927():
+    at_bound = "x" * (DROPPED_VALUE_MAX_BYTES - 2)  # compact JSON adds two quotes
+    assert len(json.dumps(at_bound)) == DROPPED_VALUE_MAX_BYTES
+    parsed = _parse_927([at_bound])
+    assert [record.rule for record in parsed.degradations] == ["claim is not a JSON object"]
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _parse_927([at_bound + "x"])
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _parse_927({"blob": "x" * DROPPED_VALUE_MAX_BYTES})
+    oversized_unknown = {**_claim_927("row-b"), "notes": "y" * DROPPED_VALUE_MAX_BYTES}
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _parse_927([_claim_927("row-a"), oversized_unknown])
+
+
+def test_canonical_evidence_citations_stay_strict_927():
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    valid = {"command": "python -m pytest tests/test_x.py -q", "receipt_id": "receipt-1", "claim": "current-result"}
+
+    def evidence(citations):
+        return {
+            "matrix_identity": identity,
+            "rows": [{
+                "row_id": "row-ordinary",
+                "status": "timed-out",
+                "test_identifiers": ["test_x"],
+                "test_locations": ["tests/test_x.py:1"],
+                "workflow_path_claim": "Reached the branch.",
+                "outcome_assertions": ["Timed out."],
+                "forbidden_effect_assertions": ["No merge."],
+                "evidence_citations": citations,
+                "caveats": [],
+            }],
+        }
+
+    assert parse_risk_test_matrix_evidence(evidence([valid]), matrix=matrix).rows[0].evidence_citations
+    with pytest.raises(AgentLoopError, match=r"evidence_citations\[1\]"):
+        parse_risk_test_matrix_evidence(evidence([valid, {"command": "x"}]), matrix=matrix)
+    with pytest.raises(AgentLoopError, match="must be a JSON array"):
+        parse_risk_test_matrix_evidence(evidence(valid), matrix=matrix)
+
+
+@pytest.mark.parametrize("catalog", [_CATALOG_927, None], ids=["catalog", "no-catalog"])
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: c.update(execution_refs=["invocation:observation-1" + " " * 20_000]),
+        lambda c: c.update(execution_refs=["invocation:observation-1", " " * 20_000]),
+        lambda c: c.update(workflow_path_claim="The workflow path ran." + " " * 20_000),
+        lambda c: c.update(test_identifiers=[" " * 20_000 + "tests/test_x.py::test_row-a"]),
+        lambda c: c.update(caveats=["caveat" + "\n" * 20_000]),
+        lambda c: c.update(row_id="row-a" + " " * 20_000),
+    ],
+    ids=["padded-ref", "blank-ref", "padded-workflow", "padded-fact", "padded-caveat", "padded-row-id"],
+)
+def test_whitespace_padding_never_bypasses_the_hard_cap_927(mutate, catalog):
+    """The 16,384-byte cap is measured on the raw value, before trimming."""
+    claim = _claim_927("row-a")
+    mutate(claim)
+    with pytest.raises(AgentLoopError, match="16384-byte bound"):
+        _parse_927([claim], catalog=catalog)
+
+
+def test_padding_within_the_hard_cap_still_normalizes_927():
+    claim = _claim_927("row-a", refs=("invocation:observation-1" + " " * 100,))
+    [parsed] = _parse_927([claim]).claims
+    assert parsed.execution_refs == ("invocation:observation-1",)
+
+
+def _large_bounded_claim_927(row_id):
+    """A claim within every per-field bound whose compact JSON exceeds the dropped-value bound."""
+    claim = _claim_927(row_id)
+    claim["outcome_assertions"] = [f"{index:02d}" + "a" * 998 for index in range(12)]
+    claim["test_identifiers"] = [f"{index:02d}" + "t" * 798 for index in range(6)]
+    assert len(json.dumps(claim, separators=(",", ":"))) > DROPPED_VALUE_MAX_BYTES
+    return claim
+
+
+def test_large_bounded_claim_is_accepted_for_an_approved_row_927():
+    [claim] = _parse_927([_large_bounded_claim_927("row-a")]).claims
+    assert claim.row_id == "row-a"
+
+
+@pytest.mark.parametrize(
+    ("claims", "row_ids", "rule"),
+    [
+        (lambda: [_large_bounded_claim_927("row-b")], ("row-a",), "outside the approved enforceable set"),
+        (lambda: [_large_bounded_claim_927("row-a"), _large_bounded_claim_927("row-a")], ("row-a",), "more than once"),
+        (lambda: [_large_bounded_claim_927("finding-3")], ("row-a",), "not a valid matrix-specific identifier"),
+        (lambda: [{k: v for k, v in _large_bounded_claim_927("row-a").items() if k != "row_id"}], ("row-a",), "key is absent"),
+    ],
+    ids=["unapproved", "duplicate", "malformed", "absent"],
+)
+def test_row_id_only_drop_of_a_large_bounded_claim_keeps_the_envelope_927(claims, row_ids, rule):
+    """#920/#926: a row-ID drop never rejects more strongly than accepting the claim would."""
+    parsed = _parse_927(claims(), row_ids=row_ids)
+    assert parsed.claims == ()
+    assert parsed.degradations
+    assert all(rule in record.rule for record in parsed.degradations)
+
+
+def test_large_claim_with_a_non_row_id_defect_still_hits_the_bound_927():
+    claim = {**_large_bounded_claim_927("row-b"), "notes": "x"}
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _parse_927([claim], row_ids=("row-a",))
+    mistyped = {**_claim_927("row-a"), "row_id": ["x" * 1_000] * 20}
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _parse_927([mistyped], row_ids=("row-a",))
+
+
+@pytest.mark.parametrize("duplicate", [False, True], ids=["unapproved", "duplicate"])
+def test_row_id_only_drop_still_bounds_a_truncated_fact_tail_927(duplicate):
+    """The discarded tail of an over-long fact list is the one unbounded part of a row-ID-only drop."""
+    row_id = "row-a" if duplicate else "row-b"
+    claim = _claim_927(row_id)
+    claim["test_identifiers"] = [f"tests/test_x.py::t{index}" for index in range(3_000)]
+    claims = [claim, _claim_927("row-a")] if duplicate else [claim]
+    with pytest.raises(AgentLoopError, match="bound for a dropped value"):
+        _parse_927(claims, row_ids=("row-a",))
+    # A short tail stays within the bound, so the drop keeps the envelope.
+    claim["test_identifiers"] = claim["test_identifiers"][:20]
+    parsed = _parse_927(claims, row_ids=("row-a",))
+    assert parsed.degradations and parsed.claims == ()

@@ -42,6 +42,81 @@ typed stages remain legacy-undecided. A bounded repair can only reformat a
 complete recoverable v1 source; missing or partial strategy data requires a new
 planner turn.
 
+### Plan-growth gate
+
+`--plan-execution-mode auto` takes the one-shot or staged choice from the
+planner's recommendation. Reviewers can then drive detail into a one-shot plan
+round after round until it no longer fits a comment (#871). The plan-growth
+gate (#886) measures every generation-1 candidate plan deterministically and
+routes a grown one-shot plan back to a choice: restructure as staged, or carry
+a reviewed justification.
+
+**Signals.** A signal crosses when its measurement reaches its threshold:
+
+| Signal | Measurement | Flag (default) |
+| --- | --- | --- |
+| `rendered-size` | Characters of the candidate's canonical plan text (the text the approved-plan hash covers, before round metadata, the compact digest or sidecar spill) | `--plan-growth-max-chars` (120000, twice the 60000-character comment limit) |
+| `scope-items` | Distinct `execution_recommendation` scope item IDs | `--plan-growth-max-scope-items` (12) |
+| `matrix-rows` | Risk-matrix rows | `--plan-growth-max-matrix-rows` (18) |
+| `revision-count` | Authenticated planner-authored plan candidates, including this one | `--plan-growth-max-revisions` (6) |
+
+The size comparison is a heuristic for "this plan carries too much design
+detail", not a transport check; transport overflow is handled separately. The
+canonical text carries the recommendation and matrix both rendered and as
+encoded records, so it runs about twice the visible plan: approved plans in
+this repository measured about 21k characters for a three-scope-item plan and
+50-85k for ordinary five- or six-item plans, while plans that outgrew one
+delivery measured 120-195k.
+Revision count is only a combining signal: it crosses only while the plan is at
+least half the size threshold. Reviewer-only phase-advance rounds and resumed
+replays never count as revisions, and reviewer finding counts are never a
+signal. Non-positive thresholds are rejected. The defaults sit well above
+ordinary plans, so small work keeps the one-shot path unchanged.
+
+**Gate.** With `--plan-growth-gate enforce` (the default), a v1 one-shot plan
+that crosses any signal must carry `one_shot_growth_justification` with exactly
+`crossed_signals` (the signals it crosses, no more and no fewer) and a
+`rationale` of at most 2000 characters. The field is part of the canonical plan
+payload and therefore of the plan identity reviewers approve. Every candidate is
+self-checked against its own measurements before any reviewer turn: a missing
+or incomplete justification, a leftover justification on a plan that no longer
+crosses anything, or any justification on a staged plan is a correctable
+validation failure fed back to the planner. A revision may also answer the
+notice by shrinking below every threshold. A semantic patch writes the field
+with `replace`; `replace` with `null` removes it. When a candidate recovered from
+history fails the gate, an all-approved round (or, under primary-then-panel, a
+primary approval that would otherwise schedule the panel advance) starts a
+planner revision carrying an orchestrator growth notice instead of approving;
+the notice is not a reviewer item. Resume, carried approvals and managed-CI
+authorization re-apply the same check and fail closed. Legacy unversioned plans
+are never gated, and `--plan-growth-gate off` disables the gate while still
+logging measurements.
+
+**Reviewer lever.** Plan reviewers may block with a finding that says "this
+detail belongs in a child plan; restructure as staged" rather than pushing more
+detail into the parent. They evaluate any growth justification as a semantic
+claim like any other. The planner answers with a staged recommendation or a
+justification. When staging, the parent keeps scope, stage boundaries,
+interfaces between stages and acceptance criteria; per-stage design goes to
+`requires-child-planning` children.
+
+**Scope ledger.** A revision that converts a v1 one-shot plan to staged must
+keep every prior scope item's ID, requirement text and acceptance criteria
+(whitespace-normalized; added criteria and new items are allowed). Make
+intentional scope edits in a separate non-converting revision so reviewers see
+them as an ordinary scope change. This rule applies even with the gate off.
+
+**Rebind advisory.** When a signed re-plan rebinds an existing PR to a one-shot
+replacement plan that crosses a structural signal, the rebind comment carries an
+informational growth advisory, independent of the contract-expansion notice. It
+lists the crossed signals and the reviewed justification (or states that none
+exists) and never blocks the rebind.
+
+**Costs.** Staged work costs more: child issues, handoffs and a managed-CI
+cycle per child. A parent that is too thin under-specifies its children, and a
+child that itself recommends staging still stops for human handling (#720). The
+gate asks for a reviewed choice; it does not force staging.
+
 ### Child execution dispositions
 
 Every child in a fresh staged generation-1 recommendation has a reviewed
@@ -191,6 +266,24 @@ With exactly one matching record and an open canonical PR, planning reopens:
   (the rerun performs the rebind only) or the new one (the rerun resumes the
   PR). The write is skipped when it already exists. A plan-only invocation
   stops after approval; the next rerun performs only the rebind.
+- Before that rebind comment is written, the superseded and replacement plans
+  are compared on their structural contract: plan steps (full text), every
+  field value of each risk/test matrix row (keyed by row ID), every field
+  value of the execution recommendation (scope items, coupling constraints,
+  allocations, and every stage field including summary, order, dependencies,
+  notes, risk, and execution disposition), and its strategy. When the
+  replacement has a step whose text is not in the superseded plan (even at the
+  same step count), adds a row, adds or changes a value in an existing row or
+  in the recommendation, or changes the strategy, a log line records it and a
+  bounded notice section in the same rebind comment names what grew and notes
+  that the PR's implementation predates it, so the operator can decide whether
+  to decompose. Each named item is bounded but shows its changed part: lines
+  of a multi-line item are joined, and a long prefix shared with the
+  superseded item is elided. Because it shares the rebind comment, an
+  interruption cannot
+  leave a rebind without its notice. The notice is informational only: it
+  never stops the run, a failure to compare is only logged, quoted plan text is
+  escaped, an equivalent plan adds nothing, and it is not repeated later.
 - The PR-side closing contract keeps authenticating against the closing-contract
   lineage base: the most recent issue-side handoff record that is not a same-PR
   equal-ID plan replacement. The plan hash comes from the latest record. The
@@ -446,6 +539,40 @@ Use `--architecture-read-size`, `--architecture-snapshot-max-chars`, and
 an explicitly restrictive value fails before invocation if protected context
 cannot fit. The default expands as needed for the bounded architecture block.
 
+#### Degraded architecture-impact assessments
+
+Fresh coder and reviewer turns must return an `architecture_impact` whose
+`status` is `changed` or `unchanged`. A response that uses a near-miss spelling
+is not discarded:
+
+- `modified` is read as `changed` only when the payload corroborates a change.
+  The payload must list non-empty affected components, dependencies,
+  `execution_data_flows`, persistence, public contracts and security
+  boundaries, and name a canonical-document action, path and rationale.
+- Any other spelling, such as `updated`, `none` or `same`, and an uncorroborated
+  `modified`, is treated as undetermined. It never counts as `unchanged`.
+
+When a response is accepted, the posted text is rewritten into its canonical
+form. The status becomes `changed`, or an undetermined optional review
+assessment is dropped. The text therefore always parses strictly afterwards.
+Stored plans, checkpoints and earlier posted rounds are still decoded exactly
+as before.
+
+An omitted or undetermined required assessment leaves the contract
+unsatisfied. The turn is refused with a message naming `architecture_impact`
+and its accepted values. It is retried within `--agent-max-retries`, and the
+retried prompt repeats that message. No repair call is spent on it, including
+when it arrives as a response-file artifact or from completion recovery. When
+the retries run out, the refused response is kept for the operator. The repair
+pass cannot add an assessment that the agent did not supply, and a repair that
+only adds a signed-requirement acknowledgement cannot change an accepted
+assessment. Each degradation is listed under **Parse degradations** in the
+round summary. A decomposition reports its degradations in a separate
+parent-issue comment, whether it was accepted or refused. Its topology
+checkpoint is unchanged. A semantic plan patch that replaces
+`architecture_impact` with any near-miss spelling is rejected with a message
+telling the planner to use `changed` or `unchanged`.
+
 ## Agent Backends
 
 Currently supported local agent CLIs:
@@ -495,6 +622,7 @@ refusal metadata without triggering stability waiting.
 ## Prerequisites
 
 - `gh` is installed and authenticated for the target GitHub repository.
+  Where GitHub GraphQL is refused (for example Claude Code cloud sessions), install the `agent-loop-gh` shim as `gh` ahead of the real one and grant the agents write access to the response directory; see [Running where GitHub GraphQL is refused](../README.md#running-where-github-graphql-is-refused).
 - `claude` is installed and authenticated if either side uses Claude.
 - `codex` is installed and authenticated if either side uses Codex.
 - `gemini` is installed and authenticated if either side uses Gemini. For individual Google accounts after the consumer cutoff, prefer `agy`; direct Gemini CLI support is best-effort for enterprise/API-key users who can provide logs when issues are not locally reproducible.
@@ -639,7 +767,8 @@ The plugin acts on pytest's own final resolved options, whatever supplied them
 `pytest_xdist_auto_num_workers` hook):
 
 1. A pre-yield `pytest_cmdline_main` wrapper runs before xdist resolves
-   `-n`. Clamp lowers an over-budget integer (budget 1 becomes serial) and caps
+   `-n`. When the wrapper marked the run for a **budget default** (below), it
+   first sets `-n <budget>` if nothing resolved a worker choice. Clamp lowers an over-budget integer (budget 1 becomes serial) and caps
    `--maxprocesses` for `auto`/`logical`. Refuse judges
    `min(value, maxprocesses)`, so `pytest -n 8 --maxprocesses=2` under budget 2
    runs.
@@ -660,6 +789,30 @@ The plugin acts on pytest's own final resolved options, whatever supplied them
    and action `clamped`, `unchanged` or `exceeded`. Worker-restart gateways are
    not counted. A first-test **executed** marker is informational only.
 
+**Budget default (issue #1073).** The plugin only caps xdist; on its own it
+never enables it, so a coder's plain `pytest` ran serially however large the
+budget. In clamp and refuse with a budget above one, the wrapper therefore
+marks a direct pytest for a default of `budget` workers when its argv names no
+worker or xdist choice (`-n`, `--numprocesses`, `--maxprocesses`, `--tx`,
+`--dist`, `-d`, `-p no:xdist`, or the serial-only `--pdb`, `--trace`,
+`--looponfail`, `--collect-only`) and the repository declares xdist support (the same bounded
+detection that drives the coder prompt, run from the nearest `.git` ancestor
+of the working directory). The plugin applies the default only when xdist is
+active and pytest's full resolved argument list (argv with `PYTEST_ADDOPTS`
+and ini or `-o` `addopts` prepended, captured in
+`pytest_load_initial_conftests`) and parsed options still name none of those
+choices; otherwise the run keeps its own choice. The argument list matters
+because an explicit `--dist no` parses to the same value as the default. For a
+command the wrapper would give the default, the coder prompt's timeout
+recommendation takes the larger watchdog of the parallel and serial cohorts,
+because the run still goes serial when xdist is missing or addopts say
+`--dist no`. It uses the wrapper's repository-root detection, and a
+remembered cohort that differs from the expected one is also folded into the
+maximum. When xdist is not installed or is disabled, the
+run stays serial and the plugin prints a one-line notice. The confirmation
+record carries `defaulted`. Pass `-n 0` or `-p no:xdist` to keep a focused run
+serial.
+
 Every refusal writes its refused record first and then raises a usage error,
 so pytest exits 4 before any gateway or test exists. Report writes are best
 effort: a write failure prints one stderr line and never changes pytest's exit
@@ -667,7 +820,17 @@ status. xdist worker processes never enforce or write. Each top-level
 `pytest.main` in a process claims the spec for its own Config and reports under
 its own session; configs nested inside an active claim (pytester,
 `pytest.main` in a test) and child processes that inherit the environment are
-never enforced and write only a best-effort nested marker.
+never enforced. Enforcement and observation are top-level only: for the whole
+of every claimed session the plugin withdraws its own
+`PYTEST_PLUGINS` entry from the process environment (keeping any caller
+entries), so a test that launches a nested `python -m pytest` — including one
+with a replaced `PYTHONPATH` that could not import the plugin — neither loads
+nor fails on it, and stays unobserved. The entry is restored when a claim ends,
+and is never touched by a `pytest.main` that fails before claiming (for example
+a usage error), so a launcher script's later sequential `pytest.main` still
+loads the plugin. A
+nested session that loads the plugin explicitly (`-p _agent_loop_worker_cap`)
+writes only a best-effort nested marker.
 
 The enforcement contract is deliberately narrow. A repository tryfirst
 `pytest_xdist_setupnodes` wrapper registered after the plugin can add gateways
@@ -723,6 +886,41 @@ the ceiling and bounded only by cgroup limits. Off mode takes no worker-budget
 lock and terminates nothing. Test suites that exercise `run-tests` itself must
 give the inner call its own environment (clear `AGENT_LOOP_INVOCATION_ID` and
 run from its own cwd), as this repository's `tests/conftest.py` does.
+
+**Shared host capacity.** The lock above is per invocation, so without more
+accounting two loops on one host would each size themselves against the same
+CPUs and memory. In clamp and refuse, after taking its per-invocation lock a
+command reserves its workers in a host-wide capacity record: one reservation
+file per invocation lock, in the same uid-owned lock directory, written and
+counted under a short accounting mutex that never blocks for the length of a
+test command. Each reservation records its worker count, its per-worker
+memory cost and the loop's view of host capacity, computed from host facts
+only (usable CPUs, and usable host memory minus the reserve), not from the
+loop's own cgroup caps or `--test-workers`. When no other live reservation
+exists the full budget is granted, so a single-loop host behaves as before.
+Otherwise the grant must fit both pools: the CPU pool less the workers already
+reserved, and the memory pool less each holder's workers times its own
+per-worker cost, where the strictest capacity any live holder recorded
+applies, so loops with different headroom or `--test-worker-memory` settings
+cannot overcommit memory together. The command is lowered to what fits (the
+injected plugin then enforces the lower number), or gets `worker-budget-busy`
+(exit 125) when nothing fits. Every reservation has its own record, so a
+share left behind by an earlier command of the same invocation keeps counting.
+The reservation is anchored to the target atomically at launch: the spawned
+child inherits the per-invocation lock, writes its own pid (its process-group
+id) to the reservation's anchor file, and only then drops the lock and execs,
+so a wrapper killed at any point after `fork` cannot free the share, even for
+a command that replaces its environment. A reservation keeps counting while
+its holder's per-invocation lock is held (including by the survivor watcher),
+while any member of the anchored target process group is alive, or while any
+process launched with its `AGENT_LOOP_WORKER_RESERVATION` token survives. The
+same check runs when a command finishes: a share whose target group or
+token-carrying descendants (for example a worker that escaped into a new
+session) are still alive, or whose target outlived a post-spawn failure, is
+kept rather than dropped. Once none of those holds, the next command that does
+the accounting reclaims the entry, so a crashed loop cannot deadlock the host. Set
+`AGENT_LOOP_TEST_WORKER_HOST_SHARING=off` in the wrapper's environment to opt
+out and keep the per-invocation-only behavior.
 
 **Runtime cohorts.** `test-runtime.json` cohorts are keyed on
 `(normalized command, environment fingerprint, workers)`. The normalized
@@ -882,23 +1080,49 @@ command string may appear in several rows.
 One admissible selector may also appear in several rows (#865): a single
 wrapper run commonly executes the tests for more than one row, and each row is
 still verified only on its own semantic facts and the shared passing receipt.
-Within one row a selector may be listed at most once.
+Within one claim a selector may be listed at most once.
 
-These cases still reject the envelope, because they forge or corrupt execution
-authority, are unbounded input, or are owned elsewhere:
+Other claim-scope defects drop only the offending claim before authentication
+(#926, #927). Each dropped claim keeps one bounded parse-degradation record,
+and after authentication it yields a `degraded-row-claim` diagnostic while the
+row reads `missing`. The dropped defects are:
 
-- unknown keys, and ill-typed or oversize facts;
-- a missing, invalid, unapproved, or duplicate `row_id`;
-- a missing `execution_refs` key or an empty list (#855);
-- more than eight refs, non-string or blank refs, or a ref over the
-  16,384-byte hard cap;
-- an admissible selector listed twice within one row, or a colliding catalog;
+- a missing, malformed, mistyped, unapproved, or duplicated `row_id`;
+- a claim that is not a JSON object, or a `risk_test_matrix_claims` value that
+  is not an array, which keeps no claim;
+- a missing, empty, or ill-typed `execution_refs` (#855), or an admissible
+  selector listed twice within one claim;
+- an unknown key, or an ill-typed, duplicated, or over-bound fact;
+- without an execution catalog, a selector over the 1,024-byte field bound.
+
+When one claim has several defects, exactly one record is kept, and the
+row-ID rules win.
+
+These cases still reject the envelope, because they forge or decide execution
+authority or are unbounded input:
+
+- a claim key that names orchestrator-owned verification authority: `status`,
+  `evidence_citations`, `receipt_id`, `command`, or `claim`;
+- more than 24 claims, eight refs, or 16 caveats, any value over the
+  16,384-byte hard cap, or a dropped value whose compact JSON exceeds that
+  bound;
+- a colliding catalog;
 - an in-catalog selector that is not a passing parent-observed observation, or
   whose supplied launch-integrity state is failing or unknown (wrapper
   bootstrap, inner exec, and suite start must all be authoritative). It is a
   real broker handle, so selecting it is an authority decision, not a format
   defect;
 - legacy canonical evidence fields in a fresh response.
+
+A malformed `test_observations` citation in a follow-up or implementation
+result is dropped with its own record, and the round summary lists every
+dropped citation. More than eight malformed citations reject the response.
+
+Catalog collisions and non-passing or non-authoritative in-catalog selectors
+are not repairable by reformatting, so they skip the structured repair pass
+and its model fallback chain entirely. The run reports `Failure category:
+semantic-evidence-rejection` with the selector named, rather than a repair
+timeout (#990).
 
 Broader handoff atomicity for other envelope failures after a PR is pushed is
 owned by #827 and #828.
@@ -1023,7 +1247,21 @@ The modes are:
   While a phase's child is still open the rerun names it and prints the exact
   command to resume it. Once every phase is complete the rerun reports a
   terminal state instead - one line per stage, plus any retained-parent and
-  final-integration obligations - and dispatches nothing. Completion evidence
+  final-integration obligations - and dispatches nothing. The same terminal
+  state is also written back to the parent as a completion comment
+  (`AGENT_PLAN_STAGED_COMPLETION`) naming each stage, its child issue, and its
+  merged PR and merge commit, so the parent's newest record no longer announces
+  the last dispatched phase. The child run whose auto-merge delivers the last
+  phase writes it immediately; otherwise the next parent rerun does. It is
+  written once per plan identity: an existing record counts only when it was
+  authored by the authenticated GitHub actor (login and immutable user ID) and
+  records exactly the delivered stages. Existing records are looked up in the
+  parent's complete REST comment history, which carries the numeric author ID
+  and older comments the `gh issue view` projection omits. Nothing is posted
+  while any merge commit or that history is unreadable, so a later run can
+  still write the complete record. It
+  states that agent-loop leaves the parent open for the operator to verify and
+  close. Completion evidence
   is authenticated: a closed child whose PR evidence is missing, unreadable or
   unmerged, an open child whose canonical PR is merged or closed, and a handoff
   recorded for a later phase while an earlier one is incomplete all stop the run
@@ -1856,9 +2094,36 @@ Execution model:
   plan/PR state (current plan or PR diff, prior unresolved items, PR checks
   snapshot), then all pending turns are submitted to a thread pool. Same-round
   reviewers never see each other's in-progress output.
-- A validated healthy review is posted by the main thread as soon as its worker
-  completes. Its provisional publication checkpoint is durable, so resume
-  avoids duplicate comments even if the next run is sequential.
+- Reviewer bodies are withheld until every reviewer in the round has
+  returned; the main thread then posts each validated healthy review in
+  completion order. Publishing a finished review while a peer is still running
+  would put it on the PR/issue the slower reviewer can read mid-turn (a
+  tool-enabled reviewer could echo it), so agreement across the panel would no
+  longer be independent (#1025). Each provisional publication checkpoint is
+  durable, so resume avoids duplicate comments even if the next run is
+  sequential. No reviewer is ever invoked while a same-round peer's body is
+  public:
+  - Before the first post, every settled outcome (validated response, or a
+    failure that settles the reviewer as unavailable) is written to a private
+    per-round spool under the repo cache
+    (`<agent-memory-dir>/../review-round-spool/`). If the run stops between two
+    posts, a rerun -- with or without `--review-parallel` -- replays the
+    unpublished outcomes through the same validator instead of re-invoking
+    those reviewers. The spool is deleted once every post succeeds.
+  - If a reviewer fails fatally or returns an incomplete review, so a rerun
+    must invoke it again, nothing is posted: the healthy reviews stay in the
+    spool, the failure is raised, and the rerun replays them while only the
+    failed reviewer runs, with no peer body visible.
+  - A round that still holds spooled outcomes is always finished through this
+    withhold-then-publish path, even when the rerun omits `--review-parallel`
+    (reviewers that need a fresh turn then run one at a time), so a sequential
+    rerun never posts a replayed review before a retried reviewer runs.
+  - If a same-round peer is already public -- including a posted review that
+    resume rejected, for example after the requirements changed -- and a
+    reviewer's spooled outcome is missing or no longer validates (for example,
+    a rerun on another host), the run stops before invoking it. Rerun from the host that holds the spool, or
+    delete the round's already-posted reviewer comments so the whole round runs
+    again.
 - The orchestrator still waits for every reviewer to settle before shared state
   changes: it aggregates outcomes, numbers unresolved items, and may begin
   coder work only in configured `--reviewer` order. It then posts a neutral
@@ -1866,10 +2131,11 @@ Execution model:
   excluded from reviewer/approval selection. On resume, settled `new_items`
   from that reconciliation checkpoint remain authoritative; provisional
   publication checkpoints do not cause those items to be numbered again.
-- Only after every healthy outcome is applied does the orchestrator raise a
-  fatal failure, if any: a quota-reset failure takes priority; otherwise the
-  first failure in configured `--reviewer` order. Because healthy reviewers
-  were already posted, a rerun resumes them instead of re-invoking them.
+- A fatal failure is raised -- a quota-reset failure takes priority; otherwise
+  the first failure in configured `--reviewer` order -- after the healthy
+  outcomes are spooled but before any is posted, so a rerun replays them
+  instead of re-invoking them. When every launched reviewer failed, there is
+  nothing to withhold and the round settles as before.
 - Existing per-reviewer policies are unchanged and isolated per turn: retry,
   structured repair, the unavailable-reviewer / incomplete-review
   distinction, and the PR flow's single-reviewer-fatal rule. One reviewer's
@@ -2456,10 +2722,16 @@ than carrying the plan into implementation.
 
 #### Exclusions
 
-Discussion-mode scheduling and the child-planning cycle always invoke the full
-board, enforced by configuration reset rather than by convention: the child
-planning configuration and the semantic-dedupe isolated provider configuration
-both reset the planning policy, primary, and force-full fields. PR-flow
+Discussion-mode scheduling always invokes the full board, enforced by
+configuration reset rather than by convention: the semantic-dedupe isolated
+provider configuration resets the planning policy, primary, and force-full
+fields. A child-planning cycle inherits the operator's `--plan-review-policy`
+and `--primary-plan-reviewer`, because they express how plan review is
+conducted across the run, but no parent scheduling state crosses the boundary:
+the child configuration resets the force-full latch and uses the `auto`
+execution mode, since the child plan is a fresh artifact that no parent
+approval covers. When the parent run was given `--plan-review-force-full`, the
+child cycle logs once that the override is not inherited. PR-flow
 scheduling, qualification, managed CI, branch protection, and merge behavior are
 unchanged. The staged planning policy remains non-default until a flow-separated
 frozen evaluation justifies the latency and cost tradeoff. That comparison is
@@ -2531,7 +2803,8 @@ What each mechanism produces and where the run stops:
   current (first incomplete) `agent-pr` phase and stops after that phase's PR
   review loop. Rerunning the parent advances to the next phase once the current
   phase's child is closed with a merged PR, and reports a terminal delivery
-  report once every phase is complete. If the selected phase is `human-action`
+  report once every phase is complete, recording it on the parent as an
+  `AGENT_PLAN_STAGED_COMPLETION` comment. If the selected phase is `human-action`
   or `manual-close` and its child is still open, the run stops without
   implementing anything. Resume an in-progress child with
   `agent-loop issue <child>`; rerun the parent to move on to the next phase.
@@ -2590,7 +2863,9 @@ Two worked examples:
    parent. When every phase is delivered the parent rerun prints a terminal
    report naming each stage and any operator-owned retained-parent or
    final-integration work, and dispatches nothing further; it does not close
-   the parent for you. `--materialize-split-issues` is not used anywhere in
+   the parent for you. That report is also posted to the parent once as a
+   completion record - by the child run that auto-merges the last phase, or
+   by the next parent rerun. `--materialize-split-issues` is not used anywhere in
    this flow — the phase children already are the detailed decomposition.
 2. **Discuss-mode split consensus.** Run
    `agent-loop discuss 123 --repo OWNER/REPO --materialize-split-issues` to
@@ -3135,8 +3410,9 @@ withhold code approval.
 The checked-in workflow for `wwind123/coding-review-agent-loop` is the
 base-branch security boundary for managed CI. It declares the literal
 `AGENT_LOOP_MANAGED_CI_V2`,
-`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1`, and
-`AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1` capabilities and subscribes to
+`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1`,
+`AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1`, and
+`AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1` capabilities and subscribes to
 exactly `opened`, `synchronize`, `reopened`, and `unlabeled` pull-request
 activities. A trusted same-repository draft on `main` with a reserved
 `agent-loop/managed-*` head may suppress the opening matrix before its label is
@@ -3225,6 +3501,59 @@ defect from bypassing the voluntary gate. The flag is rejected for adoption and
 does not waive identity, workflow, nonce, exact-head qualification, or
 `--match-head-commit` merge checks.
 
+##### Unreadable Actions variable or classic protection (cloud sessions)
+
+Some hosts, such as Claude Code cloud sessions, refuse two of these reads with
+HTTP 403 (#1040). Only gh's own trailing stderr status line, for example
+`gh: Resource not accessible by integration (HTTP 403)`, counts as a 403. Text
+in the response body, a mid-line mention, and conflicting status lines never
+do.
+
+- **`AGENT_LOOP_MANAGED_ACTOR` is refused.** `--managed-ci-trusted-actor`
+  stands in for the variable at every identity check. The authenticated login
+  must still equal it. The run logs that the actor is asserted, unverified
+  locally, and enforced by the workflow, and preflight prints
+  `variable=<login> (asserted; unverified locally, enforced by workflow)`.
+  This fails safe: the workflow compares against the real
+  `vars.AGENT_LOOP_MANAGED_ACTOR`, so a wrong assertion leaves ordinary PR CI
+  unsuppressed and fails managed dispatch validation. A readable variable that
+  differs still refuses. A `404` and every other error behave as before.
+- **Classic branch protection is refused.** agent-loop then reads the
+  effective branch rules and rulesets. An active ruleset that requires exactly
+  `final-ci/exact-head` is still strict, but only when its `bypass_actors` list
+  is visible and empty. GitHub hides bypass actors from tokens without
+  write/admin access to the ruleset, and hidden bypass actors do not prove
+  enforcement. When the rules were fully inspected and show no strict
+  enforcement (an empty list, gh's strict `404`/`422` no-rules response, or
+  only bypassable, evaluate-mode, or hidden-bypass rulesets), protection is
+  `unreadable`. Malformed rule or ruleset data, and a rules read that failed
+  any other way, remain `indeterminate`, which no waiver can override.
+
+`unreadable` is a separate state from `voluntary`. Preflight exits `10` for it
+and names both flags. It is waived only by
+`--allow-unprotected-managed-ci --allow-unreadable-protection` together, on
+every invocation. `--allow-unreadable-protection` is rejected without its
+companion flag, and so it is also rejected for adoption. Its merge-safety
+meaning is the same as voluntary protection: GitHub is not shown to enforce
+the exact-head gate. Authorization records persist the waiver as
+`allow-unreadable-protection`, the override audit record carries
+`protection=unreadable`, and resume commands keep both flags. A later
+`agent-loop pr` or `issue` rerun recovers the persisted state from the
+actor-authored creation authorization. It refuses without changing the PR
+when the flags are missing, when the records disagree, or when the live
+assessment differs from the persisted state, including when the base has
+since become strictly protected. A missing-flag refusal prints a resume
+command that adds the missing flags. One disagreement is reconciled rather
+than refused: a PR authorized where protection was `unreadable` resumes, with
+both flags, on a host that reads the base as `voluntary`. The PR keeps its
+persisted `unreadable` state, and the new resume audit record carries it.
+Every other refusal that no flag can resolve, such as a different live
+disagreement, authorization records that disagree with each other, or a
+record that does not match the PR, says that no resume flag reconciles it and
+prints no command. A missing-flag refusal whose records also disagree is
+reported as that disagreement. Only a transient GitHub read failure offers a
+retry of the same command, and it is labeled as a retry.
+
 This intentionally tightens the issue-created v2 path for workflows that can
 suppress `pull_request` CI. A repository that previously ran that v2 flow
 without non-bypassable GitHub protection now uses ordinary CI unless the
@@ -3281,6 +3610,33 @@ an existing valid creation, fresh, or continuity authorization at that exact
 head instead of publishing a competing grant; conflicting records,
 ambiguous provenance, or changed live state fail closed before labels,
 readiness, review dispatch, qualification, or merge writes.
+The one exception is accumulated unbound history (#1065): prior grants that
+differ from the live grant only in their recorded protection (for example,
+grants written by earlier resume attempts on a host that read the base as
+unreadable), or compatible grants whose heads GitHub cannot prove are
+ancestors of the live head. Neither kind reaches the live head. Rather than
+refusing on the conflict it exists to clear, the fresh grant then retires every prior actor-owned authorization record for the PR: it
+publishes one superseding record that names the retired comment IDs, and
+every later reader (fresh reuse, ordinary recovery, the resume audit, and the
+plan-binding check) treats those records as history. Nothing is deleted. A
+record whose base, actor, managed-label provenance, or approved plan (other
+than a verified retired plan) differs still refuses and is never superseded.
+Ordinary resumes retire the same history as they go (#1069), so an
+interrupted run does not require the fresh grant. When a continuity record is
+published for an orchestrator-produced head, it names in the same act every
+earlier record of this actor for the PR that is otherwise compatible (same
+base, actor, actor-owned managed-label event, approved plan, and the
+protection of the chain being extended) but cannot reach the new head because
+GitHub cannot prove its head is an ancestor. That includes a continuity child
+of the same predecessor left by an interrupted attempt whose head the branch
+has since discarded; a child that can still reach the new head remains a fork
+and refuses. The continuity record's own predecessor chain is never retired,
+and a failed ancestry comparison keeps the record rather than retiring it.
+Records whose recorded protection differs are not retired on the ordinary
+path: recovery and the resume audit refuse on them before any round runs,
+because which protection state governs the PR is for the fresh grant to
+adjudicate. Records that differ in base, actor, label provenance, or plan are
+likewise left for the existing checks to refuse.
 The grant records the live voluntary or plan-limited protection assessment,
 and the PR tuple, managed-label event, and authorization-comment set are read
 again immediately before publication. Managed issue recovery from a legacy
@@ -3342,6 +3698,9 @@ The preferred recovery for a canonical issue handoff is to rerun the original
 `agent-loop issue <number>` command. That preserves its planning and
 implementation shape and reuses the authenticated issue-to-PR association;
 `agent-loop pr <number>` is the direct fallback when the PR is already known.
+A ready PR that still carries `agent-loop-managed` from a successful explicit
+manual qualification is first returned to ready/unlabeled at PR-loop entry,
+so the rules below apply to it unchanged.
 An authenticated ready/unlabeled issue-created or `managed-pr` PR may be
 reconstructed only when the new invocation has an explicit `--managed-ci`.
 An implicit `--auto-merge` invocation leaves that state ready and unlabeled,
@@ -3462,19 +3821,35 @@ malformed metadata and authorization-comment fallbacks are rejected. A push,
 branch name, PR body, author, label, draft state, missing link, fork, or race cannot extend
 authority; recovery prints the explicit fresh-authorization command instead.
 
-A merge-conflict resolution round is the single exception, because it runs no
-reviewer. When the head conflicts with the base branch, agent-loop skips the
+Two reviewer-less rounds are the only exceptions. A merge-conflict resolution
+round is the first, because it runs no reviewer. When the head conflicts with the base branch, agent-loop skips the
 board and routes the round to the coder, so continuity accepts that head move on
 the tool-owned merge-conflict obligation instead of a review pair: exactly one
 actor-authored coder round metadata record for the new exact head, newer than
 the predecessor authorization, carrying the orchestrator-minted merge-conflict
 obligation that no agent response can add or classify. The continuity record
-binds that one record, and resume re-parses and rechecks the same shape. A head
-advance with neither an ordered review/coder pair nor that obligation still
-fails closed, and the board must still approve the exact final head before
-qualification or merge. This removes the second `--managed-ci-fresh` grant that
-an ordinary base-branch move used to require, without widening what counts as an
-approval.
+binds that one record, and resume re-parses and rechecks the same shape. This
+removes the second `--managed-ci-fresh` grant that an ordinary base-branch move
+used to require, without widening what counts as an approval.
+
+An exact-head CI repair round is the second exception. When managed exact-head
+CI fails on a head the whole board already approved, the failure did not come
+from a reviewer, and the run logs `repairing failed CI` for that coder round.
+Continuity accepts the resulting head move on the tool-minted CI obligation
+instead of a review pair: exactly one actor-authored coder round metadata record
+for the new exact head, newer than the predecessor authorization, carrying the
+orchestrator-minted `managed-exact-head-ci` or `github-pr-checks` obligation in
+`awaiting_current_head_review`, bound to the failed predecessor head and the new
+candidate head. No agent response can introduce that obligation or set its
+heads. The run therefore repairs a post-approval CI failure and continues to
+re-review, qualification, and merge in one invocation instead of stopping for a
+PR-mode resume (#1024). An older binary resuming such a chain cannot
+reauthenticate the link and stops rather than granting anything.
+
+A head advance with none of an ordered review/coder pair, the merge-conflict
+obligation, or a CI obligation bound to exactly that transition still fails
+closed, and the board must still approve the exact final head before
+qualification or merge.
 
 #### Creating a managed PR from an existing branch
 
@@ -3586,6 +3961,90 @@ advertises the capability; against an older workflow, which accepts only the
 bare record, the comment stays marker-only. The bare form remains accepted by
 the current workflow for this transition.
 
+##### Host comment footer (#1043)
+
+Claude Code cloud sessions append one fixed footer to every comment they
+post, whoever wrote the text: a blank line, `---`, and the line
+`_Generated by [Claude Code](https://claude.ai/code)_`, with no trailing
+newline. Agent-loop tolerates exactly that suffix, once, and nothing else:
+
+- **Read-back.** A trusted comment write is accepted when the stored body
+  equals the posted body, or equals it followed by exactly one footer. Any
+  other difference still fails with "returned a different body". Each write
+  also reports whether the footer was seen and the read-back's server
+  `updated_at`. The comment's `created_at` is never used as a write time,
+  because it is the creation time of a possibly older comment. An issue record
+  written this way returns the posted canonical body, never the footered one.
+- **Strip once, at ingestion.** The footer is removed exactly once, where a raw
+  GitHub comment body enters a strict protocol reader. There are three such
+  boundaries: authenticated comment envelopes
+  (`read_authenticated_protocol_comments`), the managed-CI comment readers,
+  and plan-validation diagnostic recovery from issue comments. Strict parsers
+  and decoders never strip. A doubled, misplaced, near-miss, or
+  whitespace-variant footer therefore still reaches them with foreign text
+  attached, and is rejected. The managed-CI issue authorization record is
+  authenticated against its complete canonical rendering, or the historical
+  marker-only rendering byte for byte, so any extra prose is rejected.
+- **Intent envelope.** A base workflow that advertises
+  `AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1` also admits the bare or visible-line
+  intent record followed by exactly the footer. That form is matched against
+  the raw, unstripped comment body, so no whitespace or second footer can ride
+  along. Agent-loop's intent rediscovery uses the same envelope and gates the
+  footered form on the same capability.
+- **Older base workflows.** Against a base workflow without the capability,
+  observing the footer on an intent write is a terminal error. Before dispatch
+  (the intent create, or the dispatch-requested update) no run is dispatched.
+  After dispatch, the existing run is left in place and not cancelled, no new
+  run is dispatched, and no qualification or success is claimed from it. A
+  run counts as dispatched only once agent-loop issued the dispatch call or
+  attached a run; the `dispatch-requested` state alone is not evidence of a
+  dispatch. Merge the updated `ci.yml` into the base branch, then resume.
+- **Logging.** The first observation of the footer in an invocation is logged
+  once. The latch resets with each owned usage context, so each direct issue,
+  task, PR, or discuss run logs at most once, and a nested PR run shares the
+  outer run's latch.
+
+PR bodies are not covered: the footer has been observed only on comments.
+
+##### Agent-side mirror of the workflow's intent decision
+
+Rediscovery and dispatch reuse the workflow's decision rather than a looser
+parser. The intent page is read unfiltered: a non-object entry reaches the
+check instead of collapsing to an unreadable page. A transport failure or a
+non-list response keeps the generic "could not inspect" error. The mirror
+has two parts:
+
+- A nonce-independent scan that fails the page for every nonce, including a
+  freshly minted one: a non-object entry, any comment with a malformed author,
+  a trusted login with a drifted actor ID, a trusted non-text body, or an
+  envelope-matching trusted comment whose payload is malformed JSON, not an
+  object, or not version 2.
+- A per-nonce classifier with three outcomes. `authorized` means the workflow
+  would accept the record. `recoverable` means a lone valid `prepared` record,
+  which the producer may advance. `fail` covers everything else, including
+  duplicate same-nonce records and any schema or binding failure.
+
+Adoption is scoped to the invocation's intent generation. A lone valid record
+of the current generation is adopted in place, whatever its age. Records from
+an earlier generation are superseded and never adopted. A fatal page or a
+`fail` verdict stops before anything is adopted, posted, or dispatched.
+Differing candidate nonces keep the existing competing-intents error.
+
+The dispatch-requested update that directly precedes a dispatch renews the
+record's `created_at` in place. It keeps the same comment, nonce, and
+generation. Agent-loop then re-reads the page and requires `authorized` for
+its own comment. It also checks the renewed `created_at` against the update's
+server `updated_at`, or local time when that is absent. The allowed window is
+at most five minutes in the future and at most the workflow's 15-minute age
+limit minus a five-minute start margin. Other dispatch-requested updates,
+which may attach an existing run instead of dispatching, leave `created_at`
+unchanged.
+
+Ledger, freshness, and footer-incompatibility errors are terminal: they are
+never routed to ordinary recovery. Their messages name the operator action:
+repair or delete the named intent comment, correct the local clock, or merge
+the updated workflow. Then resume.
+
 The v2 intent lifecycle is deliberately limited to `prepared`,
 `dispatch-requested`, `attached`, and `completed`. `prepared` and
 `dispatch-requested` always serialize `run_id: null` and `run_attempt: null`,
@@ -3600,26 +4059,68 @@ replacement.
 After correlated success, auto-merge applies the short-lived
 `agent-loop-exact-head-qualified` label, marks the PR ready, rechecks its head,
 and merges with `--match-head-commit`. Explicit `--managed-ci` never applies
-that bare label and never calls the merge API: it releases the managed label,
-marks an issue-created draft ready, writes a SHA-bearing
-`AGENT_LOOP_MANAGED_CI_QUALIFIED_V2` audit comment, and prints:
+that bare label and never calls the merge API. It keeps `agent-loop-managed`,
+verifies before readiness and again before the audit comment that the active
+label event is still the one this run authenticated (same event ID and trusted
+actor), marks an issue-created draft ready (an adopted PR must already be
+exactly non-draft), writes a SHA-bearing `AGENT_LOOP_MANAGED_CI_QUALIFIED_V2`
+audit comment, and prints:
 
 ```bash
 gh pr merge <number> --repo OWNER/REPO --merge --match-head-commit <qualified-sha>
 ```
 
-The PR stays open for a human. A later head change invalidates the result. A
-rerun of a successful issue-created manual result first makes the PR draft
-again, suspending the earlier manual command; if reconstruction fails, rerun
-managed qualification or restore readiness manually and use the old guarded
-command only after confirming that exact SHA is still live. For an explicitly
-unprotected run, the audit and terminal warning state that GitHub cannot force
-the human to use the qualified SHA after agent-loop exits. Explicit mode
-requires complete v2; it rejects v1 instead of silently claiming qualification.
+The label stays on the ready PR on purpose. Removing it would fire
+`unlabeled`, which always runs the ordinary suite, so the qualified head would
+be tested a second time. On a ready PR the label suppresses nothing: routing
+suppresses only a draft on an `agent-loop/managed-*` branch. Removing the label
+by hand still restores ordinary CI.
+
+If publication fails at any step (head check, guard, either provenance check,
+readiness, verification after readiness, the audit write, or the final head
+check), the label is released before the error is reported. This happens
+whether the PR is still draft or already ready, even for issue-created and
+`managed-pr` runs, whose other interruptions keep the label. The release
+follows these rules:
+
+- A labels list that proves the label is absent: nothing is written.
+- A label owned by this run's event: removed.
+- A present label whose event history cannot be read: removed anyway
+  (fail-open).
+- A readable label event from someone else: left in place, and the error says
+  to remove it manually if it is stale.
+- A PR that cannot be read: a removal is attempted, and HTTP 404 counts as
+  already absent.
+
+If the removal itself fails, the error names the manual label removal.
+
+The PR stays open for a human. A later head change invalidates the result.
+Every later agent-loop invocation on that PR, explicit or implicit, first
+removes a retained label from an open ready PR at PR-loop entry. That happens
+before any managed-CI authentication or workdir setup. The run then follows the
+ready/unlabeled contract below, exactly as for a PR qualified before labels were
+retained. Drafts, closed PRs, and unlabeled PRs are not touched. If the removal
+or its read-back fails, the run stops before any other work and asks you to
+remove the label manually. A rerun of a successful issue-created manual result
+therefore costs one ordinary run at entry, then makes the PR draft again,
+suspending the earlier manual command. If that re-entered run is interrupted
+before publication, it is kept draft/labeled for exact resume, like any other
+interrupted managed run. If reconstruction fails, rerun managed qualification
+or restore readiness manually, and use the old guarded command only after
+confirming that exact SHA is still live. Residual: if a human converts a
+qualified PR back to draft and pushes, the retained label suppresses ordinary
+CI for that push, as for any draft/labeled managed PR. Strict protection still
+blocks merging the new head without `final-ci/exact-head`. Remove
+`agent-loop-managed` to restore ordinary CI. For an explicitly unprotected run,
+the audit and terminal warning state that GitHub cannot force the human to use
+the qualified SHA after agent-loop exits. Explicit mode requires complete v2;
+it rejects v1 instead of silently claiming qualification.
 
 A v2 issue-created PR has zero billed routing jobs at opening, zero hosted
 minutes per intermediate revision, one final matrix, and one rounded
 publisher/aggregate minute—about 11–14 minutes for a 10–13 minute matrix.
+Because a successful manual qualification keeps the label, no second
+ordinary run follows it on the qualified head.
 `agent-loop pr <n>` has already paid the ordinary opening matrix and remains
 roughly the earlier 20–25-minute shape plus recovery work. Keep routing,
 aggregate, and qualification telemetry separate for billing comparisons.
@@ -3636,7 +4137,9 @@ hosted matrix contexts are not presented as actionable review failures.
 Actually observed non-final failures remain visible. If a configured
 pre-review `--test-command` passes, agent-loop also publishes the non-required
 `agent-loop/round-readiness` status on that head; it never publishes readiness
-without running that command.
+without running that command. Because nothing gates on it, a refused status write
+(for example on a host whose proxy forbids commit-status writes) is logged as a
+warning and the round continues.
 
 After every required reviewer approves one live head, agent-loop dispatches the
 repository's `CI` workflow with the PR number and that exact expected SHA. In
@@ -3898,6 +4401,81 @@ agent-loop issue 56 \
   --gemini-arg=--approval-mode --gemini-arg=auto_edit
 ```
 
+### Sandboxed role permissions
+
+`--agent-permissions {default,sandboxed,dangerous}` selects the mode;
+`--dangerous-agent-permissions` is an alias for `dangerous` and conflicts with
+any other mode. `default` and `dangerous` produce exactly the argv above.
+`sandboxed` builds CLI-enforced grants for each Claude and Codex invocation from
+its role (implemented in `agent_permissions.py`):
+
+- Only the exact `coder` role gets the coder grant. Every other role,
+  including role-less planner turns and unknown roles, fails closed to
+  read-only. Every committing turn (direct and plan-first issue
+  implementation, task implementation, PR fixes) therefore passes the `coder`
+  role explicitly; a role-less implementation turn would get the read-only
+  grant and could neither edit nor commit.
+- A Claude coder gets `--permission-mode acceptEdits`, `--setting-sources
+  user` (so checkout `.claude/settings*.json` cannot widen later grants),
+  path-scoped `Write`/`Edit` rules for its assigned checkout (the configured
+  path and, when it differs, its resolved path), `Bash(git *)`, the gh subcommands coder prompts use, the read-only inspector,
+  and one exact, wildcard-free rule for the resolved `agent-loop run-tests`
+  invocation, which is the same string the coder prompt shows. The invocation
+  uses `--test-command`, else the first verified test-profile command, and the
+  preflight-verified, virtualenv-preserving wrapper. When nothing resolves the
+  test rule is omitted and a warning is logged.
+- A Claude non-coder gets `--restricted`, `--tools
+  Read,Grep,Glob,Write,Edit,Bash`, an empty `--strict-mcp-config`,
+  `--permission-mode dontAsk`, `--permission-prompts none`, `Write`/`Edit`
+  rules for the validated response root only, and one Bash rule: the pinned
+  `agent-loop inspect` prefix. It also gets `--disallowedTools` for `git` and
+  `gh`: Claude Code auto-approves some read-only commands (`git status` among
+  them) whatever the allow list says, so omitting a program does not refuse it,
+  and a bare `git` in the shared checkout would run a planted `.git/config`.
+  The deny rules are declared before the allow rules so neither variadic option
+  absorbs the other, and they do not cover the inspector prefix. See the
+  README's [inspector reference](../README.md#sandboxed-role-permissions).
+- Every sandboxed invocation also has the inherited `GIT_TRACE*` variables,
+  `GIT_CONFIG_COUNT` and `GIT_EXTERNAL_DIFF` neutralized on the agent process
+  itself. `inspect` has an environment allowlist, but the CLI that calls it
+  does not, so an inherited `GIT_TRACE2_EVENT` otherwise reaches the CLI's own
+  git calls and writes `trace2.json` into the checkout.
+- A Codex non-coder gets `--sandbox read-only` and `approval_policy="never"`,
+  and `--output-last-message` points at the pre-created public response file,
+  so failed-exit salvage reads it as usual. It has no network.
+- A committing Codex coder (issue implementation, plan-first `auto` or
+  implementation modes, `pr`, `managed-pr`, `task`), any Gemini or Antigravity
+  selection (including the default repair and semantic-followup backends), and
+  every `--<agent>-arg` are rejected before any agent runs;
+  `run_agent_result` refuses an unsupported agent as a runtime backstop.
+  Antigravity stays refused because `agy` offers no per-invocation,
+  CLI-enforced read-only grant (#1079). Observed live with agy 1.2.11,
+  `agy --sandbox` confines only its terminal tool: shell writes to the
+  workspace fail as a read-only file system, but its file-writing tool still
+  writes the checkout, and a bare `git status` there runs a planted
+  `core.fsmonitor`. Its allow rules (`permissions.allow`) exist only in the
+  shared per-user settings file, and headless mode ends the whole turn with no
+  output at the first tool it cannot prompt for. The refusal therefore names
+  the trade: a sandboxed review board has only Claude and Codex reviewers. The
+  live suite's Antigravity case asserts these premises, so a change in agy's
+  sandbox fails it and prompts revisiting the refusal.
+- At startup the response root is created one private component at a time,
+  checked to be real directories owned by you that are not group- or
+  world-writable, and checked not to overlap any agent checkout or the
+  repository checkout agent-loop runs from, in either direction. Immediately
+  before every sandboxed spawn those components, every recorded checkout's
+  resolved target and device/inode (for a not-yet-created checkout, the
+  location its nearest existing ancestor resolves to), and the overlap are
+  re-verified, and the per-invocation file is
+  created with `O_CREAT|O_EXCL|O_NOFOLLOW`. Before every read-only Claude spawn
+  the inspector's interpreter, package files, and pinned git and gh are
+  re-fingerprinted. Any mismatch reports agent-unavailable (`environment`)
+  without spawning.
+
+The opt-in live enforcement suite `tests/test_sandboxed_permissions_live.py`
+runs the real Claude and Codex CLIs against these grants when
+`AGENT_LOOP_LIVE_PERMISSION_TESTS=1` is set; it is skipped by default.
+
 Providing any `--claude-arg`, `--codex-arg`, or `--gemini-arg` replaces that agent's default entirely. Claude and Gemini prompts include a tool-owned response-file path under `/tmp/coding-review-agent-loop/responses/`; when the file exists and is non-empty, the loop validates and posts that file instead of stdout so CLI diagnostics and tool narration do not leak into GitHub comments. Gemini still supports stdout marker filtering as a fallback. If you pass `--gemini-arg=--output-format --gemini-arg=json`, the loop extracts the JSON `response` field before parsing markers when no response file was written. Fallback stdout is never posted unless the required protocol marker validates.
 
 ## Protocol
@@ -3941,6 +4519,15 @@ If the PR head advanced without a current-head coder metadata comment, resume
 uses metadata-backed active `blocking` and `same-pr` items from the latest
 recorded head and sends them to the coder for a structured follow-up before
 reviewers run again.
+So when a later run finds the PR head advanced by a commit without coder
+metadata, such as a manual push, and active prior review items can be
+recovered, it routes those items through a coder recovery round before the
+full-board review; the coder is told the external head may or may not satisfy
+each item and must check them one by one. If that round leaves the PR head
+unchanged, the follow-up comment and the next reviewer context record the items
+as claimed already present at that head rather than as fixes made by the turn.
+A head change observed while the run is still watching checks restarts review
+instead of starting a recovery round.
 
 Reviewer responses should use structured JSON first. A PR review starts with:
 
@@ -4088,7 +4675,34 @@ Signed human reviewer comments are requirements when the comment body ends with
 a standalone `-- Human Reviewer` signature. Issue comments become signed
 planning or implementation requirements; PR comments become signed PR-review
 requirements. They override AI reviewer preferences unless they are unsafe,
-impossible, or superseded by a later signed human instruction.
+impossible, or superseded by a later signed human instruction. Unsigned
+comments, issue acceptance criteria, reviewer item IDs, reviewer comments, and
+labels are never signed requirements, so a plain comment is silently not read
+as one by design.
+
+**Adding instructions to an approved PR.** Signed PR comments are not limited to answering a **Human decision required**
+(exit status `4`) boundary. They are also the operator path for adding
+instructions to a PR that every reviewer has already approved at its head.
+Without one, `agent-loop pr <number>` on that head finds no coder blocker,
+prints `PR #<number> approved by ...`, and exits without invoking an agent;
+`--pr-review-force-full` does not change that, because it selects reviewers and
+creates no coder obligation. To reopen the PR:
+
+1. Post a PR comment with the instructions, ending with a line containing
+   exactly `-- Human Reviewer`.
+2. Rerun `agent-loop pr <number>`.
+
+The new requirement ID is absent from every carried or resumed approval's
+recorded requirement coverage, so those approvals no longer count and each
+reviewer is re-invoked at the same head. A reviewer that finds the requirement
+unmet blocks, which dispatches the coder in the same PR; the coder must
+disposition the requirement and reviewers must mark it resolved before the loop
+approves again. The approval message and `agent-loop pr --help` name this path.
+
+Only a human may sign. The signature certifies human authorship and nothing
+verifies it, so an agent must never add it on its own initiative; when an
+operator instructs an agent to relay their decision, the comment must disclose
+the relay.
 
 When signed requirements are present, legacy coder markdown acknowledgement
 responses must include:
@@ -4746,8 +5360,15 @@ shebang, interpreter,
 package-origin, virtualenv, and invocation identity so repair or replacement
 causes a fresh probe.
 
-For the recognized inner forms direct `pytest`/`py.test` and exactly
-`<python> -m pytest`, agent-loop performs a fixed `--version` bootstrap probe
+For the recognized inner forms direct `pytest`/`py.test`, exactly
+`<python> -m pytest`, and Node's built-in test runner (`node`/`nodejs` with
+`--test` before any positional argument, and every other option on a fixed
+allow-list with values only in `--name=value` form, so print-and-exit options
+such as `--version`, `--help`, `--check`, or `--eval` stay unrecognized;
+startup-code options (`--import`, `--require`, loaders, `--test-global-setup`,
+`--env-file`, custom `--test-reporter` modules) and a non-empty `NODE_OPTIONS`
+also stay unrecognized because a preload can exit 0 before any test runs), agent-loop
+performs a fixed `--version` bootstrap probe
 under the same five-second bound. Other launchers are never classified from
 stderr or an exit code. Results carry independent `wrapper_bootstrap`,
 `inner_exec`, and `suite_start` states plus the existing suite outcome. Direct
@@ -4866,6 +5487,17 @@ timeouts are lower-bound evidence, never successes. Samples are retained up to
 20 per command/fingerprint cohort and 200 cohorts, and stale after 30 days or
 relevant lockfile, configuration, target, or fixture changes. Persistence is
 best-effort and uses an advisory lock plus atomic replacement.
+
+Rows carry `launch_integrity`. A `run-tests` wrapper row is `verified` only
+when `wrapper_bootstrap` is `verified`, `inner_exec` is `started`, and
+`suite_start` is `verified`; a configured local/pre-review gate row (which has
+no wrapper to bootstrap) is `verified` only when `inner_exec` is `started` and
+`suite_start` is `verified`. An `unverified` row is the same launch the
+evidence gate refuses as an `execution_refs` selector, so it is kept only as
+non-evidence: `recommend_timeout` skips it and prompt rendering never lists it
+as a remembered command. Legacy rows without the field fail closed the same
+way, because argv alone cannot prove the suite start was authenticated, so
+unauthenticated wrappers already in history stop being recommended.
 
 ### Semantic revision assembly
 

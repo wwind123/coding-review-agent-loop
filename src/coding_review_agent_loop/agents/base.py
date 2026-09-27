@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import tempfile
 import uuid
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from ..runner import CommandResult, Runner
+from ..scratch import make_private_dirs
 from ..containment import ContainmentEvidence
 from ..usage import UsageMetadata
 
@@ -102,10 +102,6 @@ class AgentBackend(Protocol):
     ) -> AgentResult: ...
 
 
-def _safe_repo_slug(repo: str) -> str:
-    return repo.replace("/", "-").replace(":", "-")
-
-
 def public_response_path(
     config: AgentLoopConfig,
     agent: AgentName,
@@ -114,21 +110,18 @@ def public_response_path(
 ) -> Path:
     # Every invocation gets a new path.  Backends read only this path after
     # their command returns, so an artifact from an earlier invocation cannot
-    # be mistaken for the current response.
-    base_dir = (
-        root
-        if root is not None
-        else Path(tempfile.gettempdir())
-        / "coding-review-agent-loop"
-        / "responses"
-        / _safe_repo_slug(config.repo)
-    )
+    # be mistaken for the current response.  Sandboxed Claude and Codex spawns
+    # use agent_permissions.prepare_response_file instead, which pre-creates
+    # the file under the physically validated root.
+    from ..agent_permissions import response_root
+
+    base_dir = root if root is not None else response_root(config)
     path = (
         base_dir
         / agent
         / f"{uuid.uuid4().hex}.md"
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
+    make_private_dirs(path.parent)
     return path
 
 
@@ -155,6 +148,22 @@ requirements are present, place `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` and the
 `AGENT_PLAN_STATE` footer.
 You MUST write this file before your turn ends. A turn that ends without
 writing this file results in a review failure.
+"""
+
+
+def with_sandboxed_last_message_instruction(prompt: str) -> str:
+    """Sandboxed Codex non-coders cannot write files; the CLI records the reply."""
+    return f"""{prompt}
+
+PUBLIC RESPONSE:
+
+Your final message is written verbatim by the Codex CLI to the public response
+file and is the only text the orchestrator will post. Make your final message
+exactly the public response content: for structured responses it must start
+directly with {{, contain exactly one structured JSON object, then the required
+footer marker and signature, with no headings, prose, or markdown code fences
+around it. Include the required AGENT_STATE / AGENT_PR / AGENT_CLARIFY markers
+as requested above. Your sandbox is read-only, so do not try to write files.
 """
 
 

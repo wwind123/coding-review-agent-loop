@@ -87,7 +87,7 @@ audit read them back. Older marker-only copies, which GitHub renders as
 
 ## Requirements
 
-- Python 3.11 or newer.
+- Python 3.12 or newer.
 - Git and [GitHub CLI](https://cli.github.com/) with `gh auth status` succeeding.
 - Repository access sufficient for the requested issue, branch, PR, and comment
   operations.
@@ -114,6 +114,19 @@ require `agent-loop-managed`. Unlabeled events always run the ordinary Python
 3.12 suite, and forks, malformed payloads, trust mismatches, and all ordinary
 PRs fail open to that suite. Pushes to `main` and all-empty manual dispatches
 also run the complete suite.
+
+A successful explicit `--managed-ci` manual qualification keeps
+`agent-loop-managed` on the PR it has just made ready. Removing the label would
+fire `unlabeled` and re-run the full suite on the head that exact-head CI has
+just qualified. A ready PR is never suppressed, so the retained label has no
+effect there. Removing it by hand still returns the PR to ordinary CI. If
+publication fails at any step, agent-loop releases the label, unless a
+readable label event from someone else owns it; that label is left and
+reported. Any later agent-loop invocation on the PR removes a retained label
+from an open ready PR before any other managed-CI work, then continues exactly
+as for a ready/unlabeled PR. If a qualified PR is converted back to draft and
+pushed by hand, the label suppresses ordinary CI for that push. Remove the label
+to restore it.
 
 After the workflow change is merged, the sole-maintainer rollout is ordered:
 
@@ -188,6 +201,9 @@ In skill mode, the test-gate policy is selected with
 
 Clone the repository and install it into a virtual environment:
 
+If `python3 --version` reports an interpreter older than 3.12, name a newer
+one explicitly in the `venv` step, for example `python3.12 -m venv .venv`.
+
 ```bash
 gh repo clone wwind123/coding-review-agent-loop
 cd coding-review-agent-loop
@@ -206,6 +222,217 @@ codex --version
 ```
 
 Substitute `agy --version` or `gemini --version` when using those backends.
+
+### Running where GitHub GraphQL is refused
+
+Some hosts, notably Claude Code cloud sessions, block every GitHub GraphQL
+request at an egress proxy while allowing repository-scoped REST
+(`repos/{owner}/{repo}/...`). Much of `gh`'s porcelain (`gh issue view --json`,
+`gh pr view --json`, `gh pr create`, `gh repo clone`, …) is GraphQL-backed, so
+without the steps below agent-loop and its coder agents fail on their first
+GitHub read.
+
+**1. Check whether you need this.**
+
+```bash
+gh api graphql -f query='{viewer{login}}'
+```
+
+If this prints your login, GraphQL works and you can skip this section. If it
+fails with `GitHub GraphQL is not available`, continue. A supplied personal
+token does not help: such proxies replace the `Authorization` header.
+
+**2. Install agent-loop with Python 3.12 or newer.** The [Install](#install)
+steps start with `gh repo clone`, which is itself GraphQL-backed and fails
+before the shim exists, so clone over plain HTTPS instead:
+
+```bash
+git clone https://github.com/wwind123/coding-review-agent-loop.git
+cd coding-review-agent-loop
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+```
+
+The package includes a second command, `agent-loop-gh`, in the same `bin/`
+directory as `agent-loop`. Keep the virtual environment activated (or invoke
+`.venv/bin/agent-loop` explicitly) in every later step and shell to find
+`agent-loop`, and separately keep the step-3 `export PATH` in every shell
+regardless: it is what puts the `gh` shim ahead of the real `gh` on `PATH`,
+and `agent-loop` itself never adds it.
+
+**3. Put the shim ahead of the real `gh`.** `agent-loop-gh` is a
+`gh`-compatible shim that answers exactly the porcelain forms agent-loop, its
+skill helpers, and its coder prompts use over REST, printing the same `--json`
+shape `gh` would. Every other command, including every `gh api` call, passes
+through to the real `gh` unchanged. It must be found as `gh` on `PATH`, not only
+passed with `--gh-cmd`, because the coder and reviewer agents run `gh`
+themselves:
+
+```bash
+.venv/bin/agent-loop-gh shim-install ~/.local/agent-loop-gh/bin
+export PATH="$HOME/.local/agent-loop-gh/bin:$PATH"
+```
+
+`shim-install` creates a `gh` symlink to the installed `agent-loop-gh`.
+
+**4. Verify.**
+
+```bash
+command -v gh                                   # ~/.local/agent-loop-gh/bin/gh
+gh issue view 1 --repo OWNER/REPO --json title  # answered over REST
+```
+
+**5. Authenticate the agent CLIs** as usual. On a headless host, `codex login
+--device-auth` signs Codex in to a ChatGPT plan with a link and code opened on
+another device; `CODEX_API_KEY` instead bills the API account, and takes
+precedence over the sign-in while it is set.
+
+**6. Give each agent only the access its role needs.** Where
+`--dangerous-agent-permissions` is unwanted or refused (a Claude Code cloud
+session's permission classifier, for example, blocks spawning agents with
+sandboxes disabled), use `--agent-permissions sandboxed`. agent-loop then builds
+CLI-enforced grants for every invocation from the provider and the role, so no
+`--claude-arg`/`--codex-arg` is needed (and none is accepted):
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO --plan-first \
+  --plan-execution-mode implement-one-shot \
+  --agent-permissions sandboxed \
+  --coder claude --reviewer codex --reviewer claude \
+  --repair-backend claude --repair-model MODEL \
+  --semantic-followup-backend claude \
+  --test-command "python -m pytest tests/ -q"
+```
+
+Instead of `--semantic-followup-backend claude` you may pass
+`--no-semantic-followup-dedupe`. Both helper backends must be overridden
+because their defaults are rejected in this mode: the default repair backend
+(`antigravity`) and the default semantic-followup backend (`gemini`) have no
+role grant. Codex or Claude repair needs an explicit `--repair-model`.
+
+What each role gets:
+
+| Role | Claude | Codex |
+|------|--------|-------|
+| Coder (implementation, PR fixes, completion recovery) | `acceptEdits` plus path-scoped `Write`/`Edit` rules for its assigned checkout (as given and as resolved); user-only setting sources; `Bash(git *)`; the gh subcommands coder prompts use (`gh pr create/view/edit/comment/checks/diff`, `gh issue view/comment`, `gh run view`, `gh label create/list`, `gh repo view`); the read-only inspector; and exactly one test rule, the resolved `agent-loop run-tests … -- <test command>` invocation shown in the prompt | rejected (see below) |
+| Every other role (reviewer, planner, analyzer, summary, repair, semantic dedupe, and any unknown or missing role) | `--restricted` with an explicit `--tools` set, `dontAsk`, no permission prompts, an empty strict MCP config, writes only to its response file, and one shell grant: `agent-loop inspect` | `--sandbox read-only` with approvals set to `never`; the Codex CLI writes its final message to the validated response file |
+
+Requirements and limitations of sandboxed mode:
+
+- **Install agent-loop outside the agent checkouts** (for example with
+  `uv tool install`, or a separate clone's virtual environment). The inspector
+  grant is pinned to the orchestrator's interpreter in Python isolated mode
+  (`-I`), and its installed package files are fingerprinted at startup and
+  re-verified before every read-only Claude turn; startup fails fast when the
+  interpreter or package lies inside a checkout.
+- **`git` and `gh` found first on `PATH` must also live outside every
+  checkout**; they are pinned by absolute path for the run, and checkout
+  directories must not precede them on `PATH`. The inspector runs only those
+  pinned binaries, so a `git` or `gh` planted in a checkout later is never
+  executed. Upgrading git or gh during a run blocks read-only turns until the
+  run is restarted. Without `gh` on `PATH`, gh inspection is unavailable. When
+  the pinned `gh` is the step-3 shim, the inspector's gh subcommands work only
+  if the real `gh` sits in the same directory as the pinned `git`, because the
+  shim finds the real `gh` on the inspector's constructed `PATH`.
+- **`TMPDIR` must resolve outside every checkout**, including the repository
+  checkout you run agent-loop from. Responses go to a private directory under
+  `${TMPDIR:-/tmp}/coding-review-agent-loop/responses/`, whose
+  agent-loop-created components must be real directories owned by you that
+  are not group- or world-writable (no symlinks). agent-loop creates its
+  scratch directories with mode `700` whatever your umask; a component left
+  group-writable by an older release is refused, and the refusal lists every
+  such component with a single `chmod go-w` command that fixes them all. The directory and every checkout, including one not yet
+  created, are re-verified before each spawn, so checkouts and their parent
+  directories must not be moved, replaced, or redirected during a run.
+- **Pass-through agent arguments are rejected** (`--claude-arg`,
+  `--codex-arg`, `--gemini-arg`, `--antigravity-arg`); use the dedicated
+  model and effort options instead.
+- **A committing Codex coder is rejected.** Codex's sandbox keeps the
+  repository's `.git` read-only even with `--add-dir`, so `git commit` fails.
+  Use `--coder claude` (or `--implementation-coder claude`); a Codex planner in
+  a plan-only run is allowed.
+- **Codex non-coders have no network**, because the read-only sandbox disables
+  it; they rely on the issue and PR context in the prompt.
+- **Gemini and Antigravity cannot be selected** on any path (coder, reviewer,
+  analyzer, repair, or semantic dedupe), so a sandboxed review board has at
+  most the Claude and Codex reviewers. That is a trade of review depth for
+  containment: to keep an Antigravity reviewer, run with `default` or
+  `dangerous` permissions. Antigravity has no CLI-enforced read-only grant.
+  `agy --sandbox` restricts only its terminal, so its file-writing tool can
+  still write the checkout and a bare `git` there runs the checkout's
+  `.git/config`. Its allow rules live only in the shared user settings file.
+- **The inspector refuses checkouts with unusual git config.** `agent-loop
+  inspect` runs only the pinned git and gh with a closed environment
+  allowlist and a `PATH` built from their directories (inherited `GIT_*`
+  variables, including every trace variable, and `GH_DEBUG` never apply),
+  ignores system and global git config, and refuses to run when the checkout's
+  local, worktree, or included config has a key outside its allowlist, for
+  example a filter (including LFS), signing, include, trace-target, or alias
+  setting. The refusal names the key and the file it came from; the reviewer can
+  still read files directly. See [the inspector reference](#sandboxed-role-permissions).
+- **Coders run tests as the same OS user.** The mode stops accidental and
+  prompt-driven checkout mutation by non-coders and detects or refuses
+  between-turn tampering with the inspector code, the pinned git and gh
+  binaries, git configuration, and the response directory. It is not OS-level
+  isolation from a deliberately hostile coder.
+
+`--dangerous-agent-permissions` is unchanged and still turns the agents'
+sandboxes off entirely; `--agent-permissions dangerous` is its alias.
+
+**These settings do not persist.** The venv activation and `export PATH` lines
+last only for the current shell. Add both to your shell profile or the host's
+setup script, or repeat both in each new shell; invoking `.venv/bin/agent-loop`
+explicitly only substitutes for venv activation, not for the step-3 `export
+PATH`, which is what keeps the `gh` shim ahead of the real `gh` and must be
+re-run (or re-sourced) in every new shell regardless. The symlink points into
+the virtual environment, so rerun `shim-install` after recreating `.venv`. On
+ephemeral hosts such as cloud containers, repeat every step, including the
+Codex sign-in, in each new session.
+
+**Transport selection.** `AGENT_LOOP_GH_TRANSPORT` chooses how the shim talks
+to GitHub: `auto` (default) probes GraphQL once and uses REST only when the
+refusal is identified (the result is cached for 15 minutes), `rest` always
+emulates, and `graphql` always passes through. On a host where GraphQL works,
+`auto` passes through, so the shim can stay installed. Set
+`AGENT_LOOP_REAL_GH` if the real `gh` is not on `PATH`.
+
+**Behavior in REST mode.** An unsupported flag or `--json` field fails with a
+pointer to `gh api repos/...` rather than being ignored; issue search is
+evaluated locally because `search/issues` is not repository-scoped; and PR
+commit provenance fails closed above GitHub REST's 250-commit listing limit.
+
+**Managed CI in such sessions.** The same hosts also refuse two reads that
+`--managed-ci` uses before it creates a PR. Both answers are `403`s:
+
+- The `AGENT_LOOP_MANAGED_ACTOR` Actions variable is refused by the proxy.
+  When gh reports a strict `HTTP 403` for that read, `--managed-ci-trusted-actor`
+  stands in for the variable. The run logs that the actor is asserted and
+  unverified locally, and `managed-ci preflight` prints it as `asserted`.
+  This fails safe because the workflow still enforces the real
+  `vars.AGENT_LOOP_MANAGED_ACTOR` server-side. A mismatch leaves ordinary PR CI
+  unsuppressed, and managed dispatches fail validation. A variable that can be
+  read and differs still refuses, as does a `404` or any other error.
+- Classic branch protection is refused by the session's GitHub App (it lacks
+  administration read). The effective rules and rulesets are still readable.
+  When they show no strict `final-ci/exact-head` enforcement, protection is
+  classified as `unreadable`, which is distinct from `voluntary`. It can be
+  waived only with `--allow-unreadable-protection`, which requires
+  `--allow-unprotected-managed-ci`. The waiver has the same merge-safety
+  meaning as voluntary protection: GitHub is not shown to enforce the
+  exact-head gate. After such a `403`, a ruleset counts as strict only when its
+  bypass actors are visible and empty. Malformed rule data, or a rules read that
+  is not gh's strict `404`/`422`, stays indeterminate, and no waiver applies.
+
+`agent-loop managed-ci preflight` exits `10` (known not ready) for `unreadable`
+protection and names both flags. A cloud-session invocation therefore looks
+like:
+
+```bash
+agent-loop issue <issue-number> --repo OWNER/REPO --plan-first \
+  --implement-after-approval --managed-ci --managed-ci-trusted-actor <login> \
+  --allow-unprotected-managed-ci --allow-unreadable-protection
+```
 
 ## Quick Start
 
@@ -298,7 +525,14 @@ PR mode must also provide `--managed-ci-issue <issue-number>`. This creates a
 new operator grant after validating the live PR tuple, fetching the issue and
 canonical plan scope, and confirming a server-observed issue-to-PR association.
 It reuses any valid exact-head authorization and does not adopt arbitrary
-existing PRs. If structured response validation rejected the implementation
+existing PRs. Earlier actor-owned authorization records that differ only in
+their recorded protection, or that GitHub cannot chain to the live head, are
+retired by one superseding record rather than refused; any other conflicting
+record still fails closed. Ordinary resumes prevent that accumulation: each
+continuity record they publish also retires the same actor's otherwise
+compatible, same-protection records that GitHub cannot chain to the new head
+(a protection disagreement still needs the fresh grant), so an interrupted run does
+not leave a stranded grant behind for a later `--managed-ci-fresh` to clear. If structured response validation rejected the implementation
 before accepting its PR number, strict protection instead uses ordinary
 same-PR issue/PR discovery and resume; the fresh unprotected grant is not
 available or required for a strict base. If a strict draft was left unlabeled,
@@ -316,7 +550,11 @@ creating a waiver record.
    request, unavailable required input, or the round limit.
 
 Repeat `--reviewer` to require multiple approvals. Use `--review-parallel` when
-the reviewers have distinct workdirs and may run concurrently:
+the reviewers have distinct workdirs and may run concurrently. Same-round
+review comments are posted only after every reviewer in the round has
+returned, so no reviewer can read a peer's findings mid-turn. A reviewer that
+must be retried, or a round interrupted mid-publication, is resumed from a
+private local spool rather than re-run against peers' posted reviews:
 
 ```bash
 agent-loop pr 456 \
@@ -403,6 +641,21 @@ action in a comment ending with `-- Human Reviewer`, then resume the PR. An
 issue-created managed PR keeps its suppression label while waiting, so ordinary
 CI is not released before approval.
 
+The same signed comment is also how an operator adds instructions to a PR that
+is **already approved at its head**. Without one, rerunning `agent-loop pr
+<number>` on an approved head prints the approval and exits without invoking any
+agent: a plain PR comment is not read as a requirement, and
+`--pr-review-force-full` changes who reviews, not what must be fixed. Post the
+new instructions in a PR comment ending with a line containing exactly
+`-- Human Reviewer`, then rerun `agent-loop pr <number>`. A new or edited signed
+requirement invalidates every carried approval, so reviewers re-check the same
+head against it and any unmet part becomes a coder obligation in that PR. The
+approval message and `agent-loop pr --help` name this path.
+
+The signature certifies that a human wrote the requirement, and nothing verifies
+authorship. An agent must not apply it on its own initiative; when an operator
+tells an agent to relay a decision, the relay must be disclosed in the comment.
+
 ## Current Limitations
 
 - Run only one active `agent-loop` invocation per repository per machine. The
@@ -432,7 +685,7 @@ Plan-first mode supports five post-approval choices:
 | `plan-only` | Post the approved plan and stop. This is the default. |
 | `implement-one-shot` | Implement the approved plan in one PR. |
 | `decompose-only` | Create detailed child issues for the approved phases and stop. |
-| `implement-by-phase` | Create the phase issues and implement the current (first incomplete) phase; rerun the parent to advance to the next phase, and to get a terminal delivery report once every phase is complete. |
+| `implement-by-phase` | Create the phase issues and implement the current (first incomplete) phase; rerun the parent to advance to the next phase, and to get a terminal delivery report once every phase is complete. That report is also posted once to the parent as a completion record (by the child run that auto-merges the last phase, or by the next parent rerun); the parent is left open for the operator to close. |
 | `auto` | After approval, select one-shot or by-phase, then route each staged child from its reviewed disposition. |
 
 Example:
@@ -506,7 +759,10 @@ Child plan supersession:
    opened, no implementation turn runs, nothing is written on the PR, and
    reviewer approvals recorded before the rebind do not count under the new
    plan. `agent-loop pr <n>` never re-plans or rebinds; on an inadmissible
-   binding it fails closed and prints the same route.
+   binding it fails closed and prints the same route. If the replacement plan
+   adds or replaces steps, adds matrix rows or changes an existing row, or adds
+   or changes any execution-recommendation value (including its strategy), the rebind comment also carries an
+   informational notice naming what grew; it never stops the run.
 
 **Deliberate re-plan of an admissible plan.** The same signed record also
 authorizes replacing a bound child plan that is still admissible, for example
@@ -875,13 +1131,31 @@ approve the exact final plan. Because each phase advance costs a planning round,
 raise `--max-rounds` when enabling it. `--plan-review-force-full` authorizes the
 complete plan board and recovers the two ownership-ambiguity diagnostics; it
 cannot recover an unreadable planning history. Omitting the flags keeps today's
-full-board planning behavior unchanged, and discussion-mode and child-planning
-cycles always stay full-board. `review-evaluation` reports planning runs in
+full-board planning behavior unchanged, and discussion-mode cycles always stay
+full-board. A child-planning cycle inherits `--plan-review-policy` and
+`--primary-plan-reviewer` but never the parent's `--plan-review-force-full`
+override or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board
 planning can be compared on calls, tokens, latency, overlap, severity-weighted
 marginal findings, and escaped plan defects before any proposal to change the
 default. See
 [staged issue plan review](docs/local_agent_loop.md#staged-issue-plan-review).
+
+Planning also applies a plan-growth gate (#886). When a one-shot plan reaches a
+growth threshold, it cannot be approved until a revision restructures it as
+staged or carries a reviewed `one_shot_growth_justification` that names exactly
+the crossed signals:
+
+| Flag | Default | Signal |
+| --- | --- | --- |
+| `--plan-growth-gate {enforce,off}` | `enforce` | Turns the gate on or off; scope-ledger preservation still applies when it is off |
+| `--plan-growth-max-chars N` | `120000` | `rendered-size`: canonical plan characters (about twice the visible plan, since encoded records are included) |
+| `--plan-growth-max-scope-items N` | `12` | `scope-items`: distinct scope items |
+| `--plan-growth-max-matrix-rows N` | `18` | `matrix-rows`: risk-matrix rows |
+| `--plan-growth-max-revisions N` | `6` | `revision-count`: planner candidates, counted only while the plan is at least half the size threshold |
+
+Reviewers may block with "this detail belongs in a child plan; restructure as
+staged". See [plan-growth gate](docs/local_agent_loop.md#plan-growth-gate).
 
 ## Safety and Permissions
 
@@ -899,6 +1173,73 @@ agent-loop pr 456 --repo OWNER/REPO \
 
 The flag is intentionally explicit. It does not make agent output, fetched
 issue text, dependencies, shell commands, or generated code trustworthy.
+
+### Sandboxed role permissions
+
+`--agent-permissions {default,sandboxed,dangerous}` selects the permission
+mode (default: `default`). `default` passes no permission arguments, and
+`dangerous` is the same as `--dangerous-agent-permissions`; combining that flag
+with another mode is an error. `sandboxed` builds role-scoped, CLI-enforced
+grants for Claude and Codex per invocation; see
+[Running where GitHub GraphQL is refused](#running-where-github-graphql-is-refused),
+step 6, for a complete invocation, the per-role grants, and the requirements.
+
+In sandboxed mode the only shell command a Claude non-coder may run is the
+read-only inspector:
+
+```text
+agent-loop inspect --git=<absolute git> [--gh=<absolute gh>] git|gh ARGS
+```
+
+The grant runs it as `<python> -I -m coding_review_agent_loop.cli inspect
+--git=<pinned git> --gh=<pinned gh> …`, with the paths pinned at startup, and
+`--git=`/`--gh=` are accepted only once each in those leading positions.
+Everything else is checked against closed allowlists before git or gh runs:
+
+- **Subcommands and options.** `git diff|log|show|status|rev-parse|ls-files`
+  with `--stat`, `--name-only`, `--name-status`, `--numstat`, `--patch`/`-p`,
+  `-U<n>`/`--unified=<n>`, `--format=`/`--pretty=`, `-n <k>`/`--max-count=<k>`,
+  `--oneline`, `--porcelain`, `--short`, `--branch`, and `--abbrev-ref` (each
+  where it applies); and, only with `--gh=`, `gh issue view|pr view|pr diff|pr
+  checks` with `--repo`, `--comments`, `--json <fields>`, and `--name-only`.
+  Positional arguments may not start with `-` except after `--`. Abbreviations,
+  unknown options, `git grep`, `-O`/`--open-files-in-pager`, `--output`,
+  `--ext-diff`, `--textconv`, `--no-index`, `--show-signature`, `git -c`,
+  `gh api`, `--web`, `--jq`, and `--template` are rejected.
+- **Format placeholders.** `--format`/`--pretty` accept `oneline`, `short`,
+  `medium`, `full`, `fuller`, `reference`, or a `format:`/`tformat:` string
+  whose placeholders are all among `%H %h %T %t %P %p %an %ae %ad %ar %at %aI
+  %cn %ce %cd %cr %ct %cI %s %b %B %d %D %n %%`; every `%G` form, `%(...)`, and
+  `%C...` are rejected.
+- **Environment.** git and gh get an environment built from an empty mapping:
+  `HOME`, `USER`, `LOGNAME`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`,
+  `TMPDIR`, `XDG_{CONFIG,CACHE,DATA,STATE}_HOME`, `SSL_CERT_FILE`,
+  `SSL_CERT_DIR`, the proxy variables (either case), `GH_TOKEN`,
+  `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`,
+  `GH_CONFIG_DIR`, and `AGENT_LOOP_GH_TRANSPORT`, plus a `PATH` made of the
+  pinned executables' directories and forced `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_NO_LAZY_FETCH=1`, `GIT_OPTIONAL_LOCKS=0`,
+  `GIT_TERMINAL_PROMPT=0`, and `cat` pagers. No inherited `GIT_*` variable is
+  ever passed.
+- **Forced git config.** git runs with `--no-pager`, `--no-ext-diff`, and
+  `--no-textconv`, and with `-c` overrides that disable the pager, fsmonitor,
+  external diff, signature display and every gpg program, all transports,
+  hooks, submodule recursion, and Trace2 targets. `status`, `diff`, `log`,
+  and `show` also get `--ignore-submodules=all`, so git never runs inside a
+  submodule whose own config the gate does not scan. agent-loop's own
+  pre- and post-turn workdir snapshot in sandboxed mode goes through the same
+  gate and hardened git.
+- **Repository-config gate.** Before any git or gh subprocess, the inspector
+  lists the checkout's config with `git config --list --show-origin
+  --show-scope --includes` and refuses to run if any non-command key is
+  outside `core.{repositoryformatversion,filemode,bare=false,logallrefupdates,
+  ignorecase,precomposeunicode,symlinks,autocrlf,eol,safecrlf,quotepath,abbrev}`,
+  `extensions.{objectformat,worktreeconfig,refstorage}`,
+  `remote.<name>.{url,pushurl,fetch,gh-resolved}`,
+  `branch.<name>.{remote,merge,rebase}`, and `user.{name,email}`. The error
+  names the key and its origin, for example `agent-loop inspect: rejected:
+  repository git config key 'filter.lfs.clean' from file:.git/config is
+  outside the inspect allowlist`.
 
 Other important boundaries:
 
@@ -940,6 +1281,12 @@ best-effort, retained to 20 samples per command/fingerprint cohort and 200
 cohorts, and becomes stale after 30 days or when relevant inputs change.
 Cohorts also key on the worker count, so serial and parallel durations never
 blend.
+Each row also records `launch_integrity`: a run whose launch was not fully
+verified (for example an ad hoc shell script wrapping pytest, whose suite start
+is unknown) is the same run the evidence gate refuses, so it is stored as
+non-evidence. Only `verified` rows feed a timeout recommendation or are
+surfaced to coders as remembered commands; older rows without the field are
+treated as non-evidence too.
 
 `run-tests`, `containment-preflight` and the loop flows accept
 `--test-workers N`, `--test-worker-memory SIZE` and
@@ -947,7 +1294,14 @@ blend.
 a containment-derived budget in `AGENT_LOOP_TEST_WORKERS`; in the default
 `clamp` mode an injected pytest plugin lowers over-budget pytest-xdist requests
 (`-n auto`, `-n 16`, config or `PYTEST_ADDOPTS`) to that budget, `refuse` rejects
-them before any test runs, and `off` only advertises the budget. See
+them before any test runs, and `off` only advertises the budget. In clamp and
+refuse, a plain direct pytest in a repository that declares pytest-xdist
+support also runs with the budget as its default `-n` when xdist is installed;
+a command naming `-n`, `--dist`, `--tx` or `-p no:xdist` keeps its own choice,
+and a target without xdist still runs serially. Concurrent
+loops on one host share a host-wide worker pool: a command is lowered to the
+workers other live loops have not reserved, or gets `worker-budget-busy` when
+none are left; set `AGENT_LOOP_TEST_WORKER_HOST_SHARING=off` to opt out. See
 [Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
 
 Remembered commands are suggestions only: agents must inspect the checkout and
@@ -965,7 +1319,13 @@ environment, including ambient values merged with a partial overlay. The probe
 never runs remembered test arguments,
 installs dependencies, contacts a database, or executes an arbitrary shell.
 Recognized inner launchers receive the same bounded `--version` probe: direct
-`pytest`/`py.test` and exactly `<python> -m pytest`; other commands remain
+`pytest`/`py.test`, exactly `<python> -m pytest`, and Node's built-in runner
+(`node --test ...`, with `--test` before the first positional argument and
+every other option on a fixed allow-list so print-and-exit options such as
+`--version` or `--help` and startup-code options such as `--import`/`--require`
+stay unrecognized, as does a non-empty `NODE_OPTIONS`; probed as
+`node --version`); other
+commands remain
 unknown rather than being judged from text or exit codes. The runtime result
 keeps independent `wrapper_bootstrap`, `inner_exec`, and `suite_start` states,
 so a missing executable or import is launcher health rather than a suite
@@ -1020,6 +1380,23 @@ with `--ci-timeout-seconds` (default 1200) and its polling interval with
 `--ci-poll-interval-seconds` (default 30). GitHub runner stalls are bounded by
 `--ci-queued-grace-seconds`; see
 [External CI infrastructure stalls](docs/local_agent_loop.md#external-ci-infrastructure-stalls).
+
+When the token cannot read classic branch protection (an `HTTP 403`, as in
+sessions whose GitHub App lacks administration read), the required checks are
+unknown. A green board then counts as reliable only when GitHub reports a
+`CLEAN` merge state for the same head, which GitHub computes from the real
+protection. The merge still pins that head with `--match-head-commit`. If
+every observed check passed but the merge state stays `BLOCKED`, `UNSTABLE`,
+`UNKNOWN`, or unavailable for the bounded startup window
+(`--ci-startup-timeout-seconds`), the watch stops without merging and says why,
+instead of polling until `--ci-timeout-seconds`. Managed ordinary recovery
+keeps its PR draft while CI runs, and GitHub reports `DRAFT` rather than
+`CLEAN` for a draft. So recovery qualifies the green draft board for the same
+head and marks the PR ready. It merges only if GitHub then reports `CLEAN`
+within the same bounded window. Otherwise the PR stays ready and unmerged. If
+the recovery board is green but its merge state is neither a same-head `DRAFT`
+nor `CLEAN` (for example `UNKNOWN`) for that window, recovery stops early with
+the PR still a draft.
 
 ### Managed exact-head CI
 

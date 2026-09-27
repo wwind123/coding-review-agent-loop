@@ -1273,6 +1273,302 @@ def test_legacy_machine_item_requires_orchestrator_lineage_for_promotion() -> No
     assert ambiguous_item.obligation_kind == "unknown"
 
 
+def test_plan_flow_never_promotes_orchestrator_item_to_machine_obligation() -> None:
+    """Planning has no machine clearance path, so recovery keeps the finding form (#1005)."""
+    legacy = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Reviewer(s) Codex approved without acknowledging the signed human requirements.",
+        status="blocking",
+        source_status="blocking",
+    )
+    body = _attach_round_metadata(
+        "Orchestrator plan review.",
+        PostedRoundMetadata(
+            flow="plan",
+            role="summary",
+            agent="Orchestrator",
+            round_number=3,
+            subject="plan-subject",
+            new_items=(legacy,),
+        ),
+    )
+
+    plan_item = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.new_items[0]
+
+    assert not plan_item.is_machine_obligation
+    assert plan_item.reviewer == "Orchestrator"
+    remaining, _future = _apply_unresolved_item_dispositions(
+        [plan_item],
+        {
+            "item-7": [
+                ReviewItemDisposition(
+                    reviewer="Codex",
+                    item_id="item-7",
+                    disposition="resolved",
+                    note="Acknowledged.",
+                )
+            ]
+        },
+        same_status="same-plan",
+    )
+    assert remaining == []
+
+
+def test_plan_flow_demotes_persisted_machine_obligation_to_reviewer_finding() -> None:
+    promoted = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Reviewer(s) Codex approved without acknowledging the signed human requirements.",
+        status="blocking",
+        source_status="blocking",
+        authority=UNKNOWN_MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="unknown:item-7",
+        notes=("Known machine item could not be bound to a failed head.",),
+    )
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=4,
+            subject="plan-subject",
+            prior_items=(promoted,),
+        ),
+    )
+
+    demoted = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert not demoted.is_machine_obligation
+    assert demoted.item_id == "item-7"
+    assert demoted.status == "blocking"
+    assert demoted.text == promoted.text
+    assert any("#1005" in note for note in demoted.notes)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # The decoder's blocker for an invalid persisted machine field/record.
+        {
+            "obligation_identity": "invalid-machine-record",
+            "notes": ("Invalid persisted machine field: authority",),
+        },
+        # A machine record that is not the legacy promotion shape.
+        {"reviewer": "Codex"},
+        {"obligation_identity": "unknown:item-99"},
+        # The legacy promotion clears ownership; contradictory ownership is
+        # not identifiable as that promotion.
+        {"resolution_owners": ("Codex",), "owner_states": (("Codex", "pending"),)},
+        # Authority/head combinations the legacy promotion cannot emit.
+        {"failed_head_sha": "plan-subject"},
+        {"notes": ()},
+        {"authority": MACHINE_AUTHORITY},
+        # The diagnostic must be followed only by reviewer disposition notes.
+        {
+            "notes": (
+                "Known machine item could not be bound to a failed head.",
+                "free-form tampering",
+            )
+        },
+        {
+            "notes": (
+                "Known machine item could not be bound to a failed head.",
+                "Synthetic machine record lacked trusted orchestrator lineage.",
+            )
+        },
+    ],
+)
+def test_plan_flow_keeps_unrecognized_machine_record_fail_closed(overrides) -> None:
+    item = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic blocker.",
+        status="blocking",
+        source_status="blocking",
+        authority=UNKNOWN_MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="unknown:item-7",
+        notes=("Known machine item could not be bound to a failed head.",),
+    )
+    from dataclasses import replace as _replace
+
+    item = _replace(item, **overrides)
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=4,
+            subject="plan-subject",
+            prior_items=(item,),
+        ),
+    )
+
+    kept = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert kept.is_machine_obligation
+    remaining, _future = _apply_unresolved_item_dispositions(
+        [kept],
+        {
+            "item-7": [
+                ReviewItemDisposition(
+                    reviewer="Codex", item_id="item-7", disposition="resolved", note="Looks fine."
+                )
+            ]
+        },
+        same_status="same-plan",
+    )
+    assert [entry.item_id for entry in remaining] == ["item-7"]
+
+
+def test_plan_flow_demotes_promotion_carrying_later_reviewer_notes() -> None:
+    """Disposition evidence appended after the promotion must not block recovery."""
+    promoted = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic blocker.",
+        status="blocking",
+        source_status="blocking",
+        notes=(
+            "Synthetic machine record lacked trusted orchestrator lineage.",
+            "Codex: Acknowledged in the revised plan.",
+            "Antigravity: Covered by step 2.",
+        ),
+        authority=UNKNOWN_MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="unknown:item-7",
+    )
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=5,
+            subject="plan-subject", prior_items=(promoted,),
+        ),
+    )
+
+    demoted = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert not demoted.is_machine_obligation
+    remaining, _future = _apply_unresolved_item_dispositions(
+        [demoted],
+        {
+            "item-7": [
+                ReviewItemDisposition(
+                    reviewer="Codex", item_id="item-7", disposition="resolved", note="Done."
+                )
+            ]
+        },
+        same_status="same-plan",
+    )
+    assert remaining == []
+
+
+def test_plan_flow_demotes_trusted_machine_authority_promotion() -> None:
+    promoted = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic blocker.",
+        status="blocking",
+        source_status="blocking",
+        authority=MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        failed_head_sha="plan-subject",
+        obligation_identity="unknown:item-7",
+    )
+    body = _attach_round_metadata(
+        "Revised plan.",
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=4,
+            subject="plan-subject", prior_items=(promoted,),
+        ),
+    )
+
+    demoted = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert not demoted.is_machine_obligation
+
+
+def test_plan_flow_keeps_invalid_persisted_authority_fail_closed() -> None:
+    payload = {
+        "flow": "plan",
+        "role": "coder",
+        "agent": "Claude",
+        "round_number": 4,
+        "subject": "plan-subject",
+        "prior_items": [
+            {
+                "item_id": "item-7",
+                "reviewer": "Orchestrator",
+                "source_round": 3,
+                "text": "Synthetic blocker.",
+                "status": "blocking",
+                "source_status": "blocking",
+                "authority": 17,
+                "obligation_kind": "unknown",
+            }
+        ],
+    }
+
+    kept = _extract_round_metadata_records(
+        [SimpleNamespace(body=_comment(payload))], flow="plan"
+    )[0].metadata.prior_items[0]
+
+    assert kept.is_machine_obligation
+    assert kept.obligation_identity == "invalid-machine-record"
+
+
+def test_pr_flow_still_promotes_orchestrator_item_to_unknown_machine_obligation() -> None:
+    legacy = UnresolvedReviewItem(
+        item_id="item-7",
+        reviewer="Orchestrator",
+        source_round=3,
+        text="Synthetic orchestrator blocker.",
+        status="blocking",
+        source_status="blocking",
+    )
+    body = _attach_round_metadata(
+        "Orchestrator summary.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=3,
+            subject="head123",
+            new_items=(legacy,),
+        ),
+    )
+
+    pr_item = _extract_round_metadata_records(
+        [SimpleNamespace(body=body)], flow="pr"
+    )[0].metadata.new_items[0]
+
+    assert pr_item.is_machine_obligation
+    assert pr_item.obligation_kind == "unknown"
+
+
 def test_legacy_coder_checkpoint_recovers_failed_head_from_scheduler_provenance() -> None:
     legacy = UnresolvedReviewItem(
         item_id="item-30",
@@ -2021,6 +2317,62 @@ def test_planning_scheduler_record_with_a_partial_candidate_key_decodes_invalid(
     )
 
 
+# --- #925: degradation records in round metadata ------------------------------
+
+def _deg_record(outcome="degraded-to-undetermined"):
+    from coding_review_agent_loop.protocol import ParseDegradation
+
+    return ParseDegradation.build(
+        element_path="pr_review.architecture_impact.status",
+        rule="architecture_impact.status-closed-enum-near-miss",
+        observed="modified",
+        outcome=outcome,
+    )
+
+
+def test_degradation_records_round_trip_through_round_metadata():
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _decode_round_metadata,
+        _encode_round_metadata,
+    )
+
+    records = (_deg_record(), _deg_record("normalized-to-changed"))
+    metadata = PostedRoundMetadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=2, subject="head",
+        architecture_impact_degradations=records,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.architecture_impact_degradations == records
+
+
+def test_historical_and_malformed_degradation_metadata_rehydrate_safely():
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _decode_round_metadata_mapping,
+        _encode_round_metadata,
+    )
+
+    metadata = PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex", round_number=2, subject="head")
+    encoded = _encode_round_metadata(metadata)
+    payload = transport.decode_mapping(encoded)
+    # Undegraded rounds keep the historical key shape.
+    assert "architecture_impact_degradations" not in payload
+    assert _decode_round_metadata_mapping(payload).architecture_impact_degradations == ()
+
+    payload["architecture_impact_degradations"] = [
+        _deg_record().to_payload(),
+        {"element_path": "x", "rule": "y"},  # missing keys: dropped
+        {**_deg_record().to_payload(), "outcome": "laundered-to-unchanged"},  # unknown outcome: dropped
+        {**_deg_record().to_payload(), "extra": "agent-authored"},  # extra key: dropped
+        "not a mapping",
+    ]
+    decoded = _decode_round_metadata_mapping(payload)
+    assert decoded.architecture_impact_degradations == (_deg_record(),)
+    payload["architecture_impact_degradations"] = "not a list"
+    assert _decode_round_metadata_mapping(payload).architecture_impact_degradations == ()
+
+
 # --- #948: dedicated overflow error, fit check and size attribution ---
 
 
@@ -2456,3 +2808,115 @@ def test_959_matrix_full_round_construction_status_rules():
 
 def test_959_matrix_full_round_does_not_change_growth_spill_fields():
     assert transport._GROWTH_SPILL_FIELDS == ("prior_items", "risk_test_matrix_evidence")
+
+
+# --- #927: dropped-citation records in round metadata and on resume ----------
+
+def _citation_response_927(kind):
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "state": "blocking",
+        "summary": "Checked receipts.",
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "test_observations": [
+            {"command": "python -m pytest -q", "receipt_id": "known", "claim": "current-result"},
+            *[{"command": "python -m pytest -q", "receipt_id": f"r-{index}", "claim": "bogus"} for index in range(8)],
+        ],
+    }
+    if kind == "issue_implementation":
+        payload["pr_number"] = 77
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _parse_927(kind, text):
+    from coding_review_agent_loop.protocol import (
+        validate_structured_coder_followup,
+        validate_structured_issue_implementation,
+    )
+
+    if kind == "issue_implementation":
+        return validate_structured_issue_implementation(text)
+    return validate_structured_coder_followup(text)
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_citation_records_round_trip_through_round_metadata_927(kind):
+    text = _citation_response_927(kind)
+    records = _parse_927(kind, text).test_observation_degradations
+    assert len(records) == 8
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+        raw_structured_coder_response=text,
+        test_observation_degradations=records,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.test_observation_degradations == records
+
+
+def test_historical_and_malformed_citation_metadata_decode_to_no_records_927():
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Claude", round_number=1, subject="head")
+    encoded = _encode_round_metadata(metadata)
+    payload = transport.decode_mapping(encoded)
+    # A round without citation records keeps its exact historical encoding.
+    assert "test_observation_degradations" not in payload
+    assert _encode_round_metadata(
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+            test_observation_degradations=(),
+        )
+    ) == encoded
+    assert _decode_round_metadata_mapping(payload).test_observation_degradations == ()
+    payload["test_observation_degradations"] = [{"element_path": "x"}, "not a mapping"]
+    assert _decode_round_metadata_mapping(payload).test_observation_degradations == ()
+    payload["test_observation_degradations"] = "not a list"
+    assert _decode_round_metadata_mapping(payload).test_observation_degradations == ()
+
+
+def test_round_summary_renders_every_citation_record_once_beside_architecture_records_927():
+    text = _citation_response_927("coder_followup")
+    records = _parse_927("coder_followup", text).test_observation_degradations
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+        architecture_impact_degradations=(_deg_record(),),
+        test_observation_degradations=records,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.architecture_impact_degradations == (_deg_record(),)
+    assert decoded.test_observation_degradations == records
+    body = _attach_round_metadata("Coder follow-up.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude", metadata)
+    assert body.count("### Test observation parse degradations") == 1
+    assert body.count("### Parse degradations") == 1
+    for record in records:
+        assert f"`{record.element_path}`" in body
+    assert "omitted" not in body
+    # A follow-up comment that already carries the section is not duplicated.
+    again = _attach_round_metadata(body.split("<!-- AGENT_LOOP_META")[0], metadata)
+    assert again.count("### Test observation parse degradations") == 1
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_resumed_round_restores_citation_records_equal_to_a_reparse_927(kind):
+    from coding_review_agent_loop.round_state import _resume_pr_round, rebuild_resumed_coder_carrier
+
+    text = _citation_response_927(kind)
+    records = _parse_927(kind, text).test_observation_degradations
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+        raw_structured_coder_response=text,
+        test_observation_degradations=records,
+    )
+    comment = IssueComment(
+        author="bot", created_at="2026-09-23T00:00:00Z",
+        body=_attach_round_metadata("Coder follow-up.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude", metadata),
+    )
+    resumed = _resume_pr_round([comment], head_sha="head", configured_reviewers=("codex",))
+    assert resumed is not None
+    assert resumed.coder_metadata.test_observation_degradations == records
+    carrier = rebuild_resumed_coder_carrier(resumed.coder_output, resumed.coder_metadata)
+    assert carrier.kind == kind
+    assert carrier.test_observation_degradations == records
+    assert _parse_927(kind, resumed.coder_output).test_observation_degradations == records

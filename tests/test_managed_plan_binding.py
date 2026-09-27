@@ -153,6 +153,76 @@ def test_binding_rejects_continuity_without_its_round_records(tmp_path):
         _verify(tmp_path, comments)
 
 
+# --- #1024: a CI repair round links the chain with its coder record alone ---
+
+
+def _ci_repair_coder_comment(comment_id, *, login="agent-loop", user_id=1,
+                             failed="head-0", candidate="head-1"):
+    """The coder record exactly as the orchestrator serializes it after a push."""
+    from coding_review_agent_loop.unresolved_items import (
+        MANAGED_CI_OBLIGATION_KIND,
+        _advance_machine_obligations_for_head,
+        _upsert_machine_obligation,
+    )
+
+    minted = _upsert_machine_obligation(
+        [], item_number=1, kind=MANAGED_CI_OBLIGATION_KIND, source_round=1,
+        text="final-ci/exact-head failed.", failed_head_sha=failed,
+    )
+    advanced = _advance_machine_obligations_for_head(minted, current_head_sha=candidate)
+    return {
+        "id": comment_id,
+        "user": {"login": login, "id": user_id},
+        "body": _attach_round_metadata(
+            "coder round",
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="agent-loop", round_number=2,
+                subject="head-1", prior_items=tuple(advanced),
+            ),
+        ),
+    }
+
+
+def _ci_repair_chain(coder=None, *, coder_id=89):
+    return [
+        _auth_comment(41, _root()),
+        coder or _ci_repair_coder_comment(coder_id),
+        _auth_comment(100, _continuity(round_comment_ids=(coder_id,))),
+    ]
+
+
+def test_ci_repair_continuity_chain_binds_the_plan(tmp_path):
+    _verify(tmp_path, _ci_repair_chain())
+
+
+@pytest.mark.parametrize(
+    "coder",
+    [
+        # The referenced record changed actor.
+        _ci_repair_coder_comment(89, login="mallory", user_id=9),
+        # The referenced record now binds a different transition.
+        _ci_repair_coder_comment(89, failed="head-x"),
+        _ci_repair_coder_comment(89, candidate="head-x"),
+        # The referenced record no longer carries the CI obligation at all.
+        _round_comment(89, role="coder", subject="head-1", round_number=2),
+    ],
+    ids=["foreign-actor", "failed-head-changed", "candidate-head-changed", "obligation-gone"],
+)
+def test_ci_repair_chain_rejects_a_changed_referenced_record(tmp_path, coder):
+    with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+        _verify(tmp_path, _ci_repair_chain(coder))
+
+
+def test_ci_repair_chain_rejects_a_record_reordered_before_the_predecessor(tmp_path):
+    comments = [
+        _ci_repair_coder_comment(40),
+        _auth_comment(41, _root()),
+        _auth_comment(100, _continuity(round_comment_ids=(40,))),
+    ]
+    with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+        _verify(tmp_path, comments)
+
+
 def test_binding_rejects_an_uninspectable_comment_list(tmp_path):
     runner = CommentsRunner([], returncode=1)
     with pytest.raises(AgentLoopError, match="could not be inspected"):

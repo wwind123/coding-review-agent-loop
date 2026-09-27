@@ -22,6 +22,8 @@ from .protocol import (
     DeferredStage,
     ExecutionStrategyRecommendation,
     HumanRequirementDisposition,
+    OneShotGrowthJustification,
+    PLAN_REVISION_PATCH_CLEARABLE_FIELDS,
     PlanRevisionPatch,
     PlanRevisionPatchOperation,
     RiskTestMatrix,
@@ -37,6 +39,7 @@ from .protocol import (
     _expect_optional_issue_id_list,
     _expect_string_list,
     _expect_typed_plan_stages,
+    ARCHITECTURE_IMPACT_DECLARED_STATUSES,
     _parse_architecture_impact,
     _expect_deferred_stage_list,
     _extract_structured_plan_revision_payload,
@@ -84,6 +87,13 @@ def _typed_stage_payload(stages: TypedPlanStages) -> dict[str, object]:
 def _architecture_payload(value: ArchitectureImpact | None) -> dict[str, object] | None:
     if value is None:
         return None
+    if value.status not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
+        # A degraded (parser-only) status must never reach a canonical payload
+        # or aggregate identity.  Fail closed rather than omitting the key.
+        raise AgentLoopError(
+            "Canonical plan assembly requires architecture_impact.status `changed` or "
+            f"`unchanged`; refusing degraded status {value.status!r}."
+        )
     # Keep all fields, including empty arrays, because the object is already a
     # parsed generation-1 value and canonical identity must include its full
     # contract rather than a display-only subset.
@@ -178,6 +188,10 @@ def structured_plan_revision_to_payload(
         payload["risk_test_matrix_changes"] = [
             change.to_payload() for change in plan.risk_test_matrix_changes
         ]
+    # Serialized only when present so identities of plans that never carry a
+    # growth justification stay byte-identical (#886).
+    if plan.one_shot_growth_justification is not None:
+        payload["one_shot_growth_justification"] = plan.one_shot_growth_justification.to_payload()
     return payload
 
 
@@ -189,9 +203,10 @@ def _parse_wire_plan_payload(payload: Mapping[str, object]) -> StructuredPlanRev
     )
     kind = payload.get("kind")
     if kind == "plan_revision":
-        parsed = validate_structured_plan_revision(text)
+        # Stored plans re-authenticate in the explicit legacy decode (#925).
+        parsed = validate_structured_plan_revision(text, architecture_status_mode="legacy")
     elif kind == "plan_state":
-        parsed = validate_structured_plan_state(text)
+        parsed = validate_structured_plan_state(text, architecture_status_mode="legacy")
     else:
         raise AgentLoopError("Authenticated plan base must be plan_revision or plan_state.")
     if parsed is None:
@@ -426,6 +441,8 @@ def _field_payload(value: object) -> object:
             return _deferred_stage_payload(value)  # type: ignore[arg-type]
         return [_field_payload(item) for item in value]
     if isinstance(value, RiskTestMatrixMetadata):
+        return value.to_payload()
+    if isinstance(value, OneShotGrowthJustification):
         return value.to_payload()
     return value
 
@@ -706,6 +723,14 @@ def assemble_authenticated_plan_revision(
         candidate = _field_payload(operation.value)
         if operation.field in payload and payload[operation.field] == candidate:
             raise AgentLoopError(f"replace for `{operation.field}` is payload-identical and has no effect.")
+        if (
+            candidate is None
+            and operation.field in PLAN_REVISION_PATCH_CLEARABLE_FIELDS
+            and operation.field not in payload
+        ):
+            raise AgentLoopError(
+                f"replace for `{operation.field}` with null has no effect: the base carries no value."
+            )
 
     if matrix_operations:
         assert isinstance(matrix_payload, dict)
@@ -723,6 +748,9 @@ def assemble_authenticated_plan_revision(
         if operation.op != "replace":
             continue
         assert operation.field is not None
+        if operation.value is None and operation.field in PLAN_REVISION_PATCH_CLEARABLE_FIELDS:
+            payload.pop(operation.field, None)
+            continue
         payload[operation.field] = _field_payload(operation.value)
         if operation.field == "execution_recommendation":
             if "execution_strategy_contract_version" not in payload:

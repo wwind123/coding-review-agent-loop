@@ -25,6 +25,7 @@ from .ci_health import (
     is_wholly_infrastructure_blocked,
 )
 from .errors import AgentLoopError
+from .github_transport import TransportConfigError, is_graphql_refusal, transport_mode
 from .pr_contract import (
     PR_EXPECTED_CLOSING_MARKER,
     PR_EXPECTED_CLOSING_MARKER_RE,
@@ -49,6 +50,8 @@ from .protocol_markers import (
     TrustedBody,
     named_reserved_marker_tokens,
     record_shaped_untrusted_markers,
+    stored_body_matches_posted,
+    strip_known_host_footer,
 )
 from .runner import Runner
 from .workdirs import active_workdir
@@ -339,7 +342,8 @@ def _query_pr_commit_connection(
     result = runner.run(args, cwd=active_workdir(config), check=False)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
-        raise AgentLoopError(
+        error_type = _GraphQLRefusedError if is_graphql_refusal(detail) else AgentLoopError
+        raise error_type(
             f"GitHub PR commit provenance query failed for PR #{pr_number}"
             + (f": {detail}" if detail else ".")
         )
@@ -413,9 +417,20 @@ def read_pull_request_commit_metadata(
     """
     if config.dry_run:
         return ()
-    first_payload = _query_pr_commit_connection(
-        runner, config=config, pr_number=pr_number, after=None
-    )
+    try:
+        mode = transport_mode()
+    except TransportConfigError as exc:
+        raise AgentLoopError(str(exc)) from exc
+    if mode == "rest":
+        return _read_pull_request_commit_metadata_rest(runner, config=config, pr_number=pr_number)
+    try:
+        first_payload = _query_pr_commit_connection(
+            runner, config=config, pr_number=pr_number, after=None
+        )
+    except _GraphQLRefusedError:
+        if mode != "auto":
+            raise
+        return _read_pull_request_commit_metadata_rest(runner, config=config, pr_number=pr_number)
     before_head, expected_total, first_commits, has_next, cursor = _parse_pr_commit_connection_page(
         first_payload, pr_number=pr_number
     )
@@ -456,6 +471,97 @@ def read_pull_request_commit_metadata(
     final_head, final_total, _ignored, _ignored_next, _ignored_cursor = _parse_pr_commit_connection_page(
         final_payload, pr_number=pr_number
     )
+    if final_head != before_head or final_total != expected_total:
+        raise AgentLoopError(f"PR #{pr_number} commit history changed during provenance scan.")
+    return tuple(commits)
+
+
+class _GraphQLRefusedError(AgentLoopError):
+    """The host refused GraphQL itself (not a GitHub-side query error)."""
+
+
+# GitHub's REST commit listing for a pull request stops at 250 commits.
+REST_PR_COMMIT_LIMIT = 250
+
+
+def _rest_pr_object(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> tuple[str, int]:
+    result = runner.run(
+        [config.gh_cmd, "api", f"repos/{config.repo}/pulls/{pr_number}"],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError(f"GitHub REST read of PR #{pr_number} failed during commit provenance.")
+    data = _load_json_object(result, description=f"PR #{pr_number} for commit provenance")
+    head = data.get("head")
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    total = data.get("commits")
+    if not isinstance(head_sha, str) or not head_sha:
+        raise AgentLoopError(f"GitHub returned no current head OID for PR #{pr_number}.")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise AgentLoopError(f"GitHub returned an invalid commit total for PR #{pr_number}.")
+    return head_sha, total
+
+
+def _read_pull_request_commit_metadata_rest(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+) -> tuple[PullRequestCommitMetadata, ...]:
+    """REST equivalent of the GraphQL commit connection, with the same invariants.
+
+    Used only where GraphQL is refused (#1029).  REST cannot list more than
+    250 commits, so a longer history fails closed rather than returning a
+    partial provenance set.
+    """
+    before_head, expected_total = _rest_pr_object(runner, config=config, pr_number=pr_number)
+    if expected_total > REST_PR_COMMIT_LIMIT:
+        raise AgentLoopError(
+            f"GitHub PR #{pr_number} has {expected_total} commits; the REST API used where GraphQL is "
+            f"unavailable lists at most {REST_PR_COMMIT_LIMIT}, so commit provenance cannot be read completely."
+        )
+    page_size = 100
+    commits: list[PullRequestCommitMetadata] = []
+    seen_oids: set[str] = set()
+    for page in range(1, REST_PR_COMMIT_LIMIT // page_size + 2):
+        result = runner.run(
+            [
+                config.gh_cmd,
+                "api",
+                f"repos/{config.repo}/pulls/{pr_number}/commits?per_page={page_size}&page={page}",
+            ],
+            cwd=active_workdir(config),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AgentLoopError(f"GitHub REST commit page {page} for PR #{pr_number} failed.")
+        try:
+            items = json.loads(result.stdout or "null")
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError(f"GitHub returned a malformed commit page for PR #{pr_number}.") from exc
+        if not isinstance(items, list):
+            raise AgentLoopError(f"GitHub returned a malformed commit page for PR #{pr_number}.")
+        for item in items:
+            commit = item.get("commit") if isinstance(item, dict) else None
+            oid = item.get("sha") if isinstance(item, dict) else None
+            message = commit.get("message") if isinstance(commit, dict) else None
+            if not isinstance(oid, str) or not oid or not isinstance(message, str):
+                raise AgentLoopError(f"GitHub returned an incomplete commit node for PR #{pr_number}.")
+            if oid in seen_oids:
+                raise AgentLoopError(f"GitHub commit pagination for PR #{pr_number} repeated a commit.")
+            seen_oids.add(oid)
+            commits.append(PullRequestCommitMetadata(oid=oid, message=message))
+        if len(items) < page_size:
+            break
+    else:
+        raise AgentLoopError(f"GitHub commit pagination for PR #{pr_number} did not terminate.")
+    if len(commits) != expected_total:
+        raise AgentLoopError(
+            f"GitHub PR #{pr_number} commit provenance was truncated: provider reported "
+            f"{expected_total} commits but returned {len(commits)}."
+        )
+    final_head, final_total = _rest_pr_object(runner, config=config, pr_number=pr_number)
     if final_head != before_head or final_total != expected_total:
         raise AgentLoopError(f"PR #{pr_number} commit history changed during provenance scan.")
     return tuple(commits)
@@ -1032,6 +1138,13 @@ def _parse_pr_metadata(
         url=_optional_str(data.get("url")),
         body=_optional_str(data.get("body")),
     )
+
+
+def strip_bot_login_suffix(login: str | None) -> str | None:
+    """Spell an app login as GitHub GraphQL does (REST appends ``[bot]``)."""
+    if isinstance(login, str) and login.endswith("[bot]"):
+        return login[: -len("[bot]")]
+    return login
 
 
 def _author_login(raw: object) -> str | None:
@@ -1822,9 +1935,38 @@ def _merge_issue_comment_transport_identity(
     # ``gh issue view --comments`` is itself a bounded projection.  A full
     # page without the marker may simply mean that the durable record is on a
     # later REST page, so probe REST at the projection boundary too.
-    page_size = 100
+    page_size = _REST_ISSUE_COMMENT_PAGE_SIZE
     if not marker_in_projection and len(comments) < page_size:
         return comments
+    transport_comments = read_rest_issue_comments(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        purpose="trusted planning diagnostics cannot be resumed safely",
+    )
+    return _merge_transport_comments(
+        comments, transport_comments, issue_number=issue_number
+    )
+
+
+_REST_ISSUE_COMMENT_PAGE_SIZE = 100
+
+
+def read_rest_issue_comments(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    purpose: str,
+) -> tuple[IssueComment, ...]:
+    """Read an issue's complete comment history from REST, with numeric IDs.
+
+    Unlike the ``gh issue view --comments`` projection, every comment carries
+    its numeric comment ID and immutable author user ID, and no older comment
+    is dropped at a connection cap.  Any incomplete read fails closed; the
+    ``purpose`` clause names what cannot proceed safely without it.
+    """
+    page_size = _REST_ISSUE_COMMENT_PAGE_SIZE
     page = 1
     raw_transport_comments: list[object] = []
     seen_ids: set[int] = set()
@@ -1844,7 +1986,7 @@ def _merge_issue_comment_transport_identity(
         if result.returncode != 0:
             raise AgentLoopError(
                 f"GitHub issue comment recovery for issue #{issue_number} is incomplete; "
-                "trusted planning diagnostics cannot be resumed safely."
+                f"{purpose}."
             )
         try:
             raw_page = json.loads(result.stdout or "[]")
@@ -1879,15 +2021,38 @@ def _merge_issue_comment_transport_identity(
         raise AgentLoopError(
             f"GitHub issue comment recovery for issue #{issue_number} exceeded its pagination bound."
         )
-    transport_comments = _parse_issue_comments(raw_transport_comments)
+    return _parse_issue_comments(raw_transport_comments)
+
+
+def _merge_transport_comments(
+    comments: tuple[IssueComment, ...],
+    transport_comments: tuple[IssueComment, ...],
+    *,
+    issue_number: int,
+) -> tuple[IssueComment, ...]:
+    # GraphQL spells an app's login without the ``[bot]`` suffix REST uses, so
+    # the match key normalizes it; a key shared by different raw logins is
+    # ambiguous and never borrows either identity (#1029).
     by_key: dict[tuple[str | None, str | None, str | None], list[IssueComment]] = {}
     for comment in transport_comments:
-        by_key.setdefault((comment.author, comment.created_at, comment.body), []).append(comment)
+        key = (strip_bot_login_suffix(comment.author), comment.created_at, comment.body)
+        by_key.setdefault(key, []).append(comment)
     merged: list[IssueComment] = []
     matched_transport_ids: set[int] = set()
     for comment in comments:
-        candidates = by_key.get((comment.author, comment.created_at, comment.body), [])
-        transport = candidates.pop(0) if candidates else None
+        candidates = by_key.get(
+            (strip_bot_login_suffix(comment.author), comment.created_at, comment.body), []
+        )
+        ambiguous = len({candidate.author for candidate in candidates}) > 1
+        if ambiguous and isinstance(comment.body, str) and any(
+            marker in comment.body
+            for marker in ("AGENT_PLAN_VALIDATION_DIAGNOSTIC", "AGENT_LOOP_META", "AGENT_LOOP_SIDECAR")
+        ):
+            raise AgentLoopError(
+                f"GitHub issue comment recovery for issue #{issue_number} found protocol comments from "
+                "different authors that differ only by an app `[bot]` suffix; refusing to guess their identity."
+            )
+        transport = candidates.pop(0) if candidates and not ambiguous else None
         if transport is not None and transport.comment_id is not None:
             matched_transport_ids.add(transport.comment_id)
         if (
@@ -1905,11 +2070,14 @@ def _merge_issue_comment_transport_identity(
                 f"GitHub issue comment recovery for issue #{issue_number} could not authenticate "
                 "a planning diagnostic against the live REST record."
             )
+        # A matched comment takes its whole identity from the live REST record
+        # so login and numeric IDs agree for downstream authentication.
         merged.append(
             replace(
                 comment,
                 comment_id=(transport.comment_id if transport is not None else comment.comment_id),
                 author_id=(transport.author_id if transport is not None else comment.author_id),
+                author=(transport.author if transport is not None else comment.author),
             )
         )
     # The GraphQL projection can omit older comments once it reaches its
@@ -2295,7 +2463,41 @@ class AuthenticatedCommentView:
         )
 
 
-def _authenticated_comment_from_rest(raw: object, *, surface: str) -> AuthenticatedComment:
+_host_footer_logged = False
+
+
+def reset_host_footer_log_latch() -> None:
+    """Start a new invocation's host-footer log latch.
+
+    Called only from ``_new_usage_context``, whose callers are exactly the run
+    entries that own a usage context, so every owning invocation logs the
+    footer once and a nested run that received a usage context shares it.
+    """
+    global _host_footer_logged
+    _host_footer_logged = False
+
+
+def note_host_footer_observed(config: AgentLoopConfig | None, context: str) -> None:
+    """Log once per invocation that the known host comment footer was seen."""
+    global _host_footer_logged
+    if _host_footer_logged or config is None:
+        return
+    _host_footer_logged = True
+    log(
+        config,
+        "GitHub host appended its known comment footer to a stored protocol record "
+        f"({context}); the exact footer is tolerated once and removed before parsing.",
+    )
+
+
+def _authenticated_comment_from_rest(
+    raw: object, *, surface: str, config: AgentLoopConfig | None = None
+) -> AuthenticatedComment:
+    """Build one authenticated envelope from a raw REST comment.
+
+    This is a comment-ingestion boundary: the known host footer is removed
+    here exactly once (#1043), so downstream strict parsers never strip it.
+    """
     if not isinstance(raw, dict):
         raise AgentLoopError(f"Authenticated comment read of {surface} returned an incomplete page.")
     user = raw.get("user")
@@ -2304,6 +2506,10 @@ def _authenticated_comment_from_rest(raw: object, *, surface: str) -> Authentica
             f"Authenticated comment read of {surface} returned a comment without an author."
         )
     body = raw.get("body")
+    if isinstance(body, str):
+        body, footered = strip_known_host_footer(body)
+        if footered:
+            note_host_footer_observed(config, f"re-read on {surface}")
     return AuthenticatedComment(
         surface=surface,
         comment_id=raw.get("id"),  # type: ignore[arg-type]
@@ -2368,7 +2574,9 @@ def read_authenticated_protocol_comments(
                 f"Authenticated comment read of {surface} returned an oversized page {page}."
             )
         for raw_comment in raw_page:
-            envelope = _authenticated_comment_from_rest(raw_comment, surface=surface)
+            envelope = _authenticated_comment_from_rest(
+                raw_comment, surface=surface, config=config
+            )
             if envelope.comment_id in seen_ids:
                 raise AgentLoopError(
                     f"Authenticated comment read of {surface} repeated comment ID "
@@ -2485,12 +2693,61 @@ def verify_written_protocol_comment(
     expected_author_id: int | None,
     context: str,
 ) -> int:
+    """Apply the uniform read-back contract and return the comment ID."""
+    return verify_written_protocol_comment_observed(
+        runner,
+        config=config,
+        payload=payload,
+        body=body,
+        expected_author_login=expected_author_login,
+        expected_author_id=expected_author_id,
+        context=context,
+    ).comment_id
+
+
+@dataclass(frozen=True)
+class WrittenProtocolComment:
+    """One verified comment write and what its read-back observed.
+
+    ``server_updated_at`` is the epoch-second value of the read-back
+    envelope's ``updated_at`` only.  It never falls back to ``created_at``,
+    which is the comment's immutable creation time and would misdate a PATCH
+    of an older comment.
+    """
+
+    comment_id: int
+    host_footer_observed: bool
+    server_updated_at: int | None
+
+
+def _envelope_updated_at_epoch(envelope: dict[str, object]) -> int | None:
+    value = envelope.get("updated_at")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return int(parse_comment_timestamp(value).timestamp())
+    except AgentLoopError:
+        return None
+
+
+def verify_written_protocol_comment_observed(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    payload: dict[str, object],
+    body: TrustedBody,
+    expected_author_login: str | None,
+    expected_author_id: int | None,
+    context: str,
+) -> WrittenProtocolComment:
     """Apply the uniform read-back contract to one comment write response.
 
     Every tool-owned comment write compares the server's stored body for the
     just-written comment against the exact posted carrier and verifies the
     producing identity.  When the write response carries no body or author, the
-    comment is fetched explicitly rather than trusted on its status code.
+    comment is fetched explicitly rather than trusted on its status code.  The
+    stored body may carry exactly one known host footer (#1043); any other
+    difference fails closed.
     """
     comment_id = payload.get("id")
     if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id < 1:
@@ -2502,7 +2759,8 @@ def verify_written_protocol_comment(
         envelope = _fetch_protocol_comment_envelope(
             runner, config=config, comment_id=comment_id, context=context
         )
-    if envelope.get("body") != str(body):
+    matches, footer_observed = stored_body_matches_posted(envelope.get("body"), str(body))
+    if not matches:
         raise AgentLoopError(f"{context} returned a different body.")
     returned_user = envelope.get("user") or envelope.get("author")
     if not isinstance(returned_user, dict):
@@ -2513,7 +2771,13 @@ def verify_written_protocol_comment(
         raise AgentLoopError(f"{context} was authored by an unexpected actor.")
     if expected_author_id is not None and user_id != expected_author_id:
         raise AgentLoopError(f"{context} has an unexpected actor identity.")
-    return comment_id
+    if footer_observed:
+        note_host_footer_observed(config, context)
+    return WrittenProtocolComment(
+        comment_id=comment_id,
+        host_footer_observed=footer_observed,
+        server_updated_at=_envelope_updated_at_epoch(envelope),
+    )
 
 
 def post_verified_trusted_pr_protocol_comment(
@@ -2525,7 +2789,27 @@ def post_verified_trusted_pr_protocol_comment(
     expected_author_login: str | None = None,
     expected_author_id: int | None = None,
 ) -> int:
-    """Persist one trusted PR protocol record and return its server ID.
+    """Persist one trusted PR protocol record and return its server ID."""
+    return post_verified_trusted_pr_protocol_comment_observed(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=body,
+        expected_author_login=expected_author_login,
+        expected_author_id=expected_author_id,
+    ).comment_id
+
+
+def post_verified_trusted_pr_protocol_comment_observed(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    body: TrustedBody,
+    expected_author_login: str | None = None,
+    expected_author_id: int | None = None,
+) -> WrittenProtocolComment:
+    """Persist one trusted PR protocol record and report its read-back.
 
     Durable authorization records use the REST issue-comment endpoint so the
     returned comment identity is available to the caller.  The body is
@@ -2565,7 +2849,7 @@ def post_verified_trusted_pr_protocol_comment(
         raise AgentLoopError(
             f"Trusted PR protocol record for PR #{pr_number} returned no comment ID."
         )
-    return verify_written_protocol_comment(
+    return verify_written_protocol_comment_observed(
         runner,
         config=config,
         payload=payload,
@@ -2586,6 +2870,28 @@ def patch_verified_trusted_protocol_comment(
     expected_author_id: int | None = None,
     surface: str = PR_COMMENT_SURFACE,
 ) -> int:
+    """Update one trusted protocol comment and return its verified ID."""
+    return patch_verified_trusted_protocol_comment_observed(
+        runner,
+        config=config,
+        comment_id=comment_id,
+        body=body,
+        expected_author_login=expected_author_login,
+        expected_author_id=expected_author_id,
+        surface=surface,
+    ).comment_id
+
+
+def patch_verified_trusted_protocol_comment_observed(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    comment_id: int,
+    body: TrustedBody,
+    expected_author_login: str | None = None,
+    expected_author_id: int | None = None,
+    surface: str = PR_COMMENT_SURFACE,
+) -> WrittenProtocolComment:
     """Update one trusted protocol comment and verify the stored result.
 
     A successful exit status is not proof that the new body was persisted, so
@@ -2622,7 +2928,7 @@ def patch_verified_trusted_protocol_comment(
         raise AgentLoopError(f"{context} returned no comment envelope.")
     if payload.get("id") is None:
         payload = {**payload, "id": comment_id}
-    updated_id = verify_written_protocol_comment(
+    written = verify_written_protocol_comment_observed(
         runner,
         config=config,
         payload=payload,
@@ -2631,9 +2937,9 @@ def patch_verified_trusted_protocol_comment(
         expected_author_id=expected_author_id,
         context=context,
     )
-    if updated_id != comment_id:
+    if written.comment_id != comment_id:
         raise AgentLoopError(f"{context} returned a different comment identity.")
-    return updated_id
+    return written
 
 
 def post_trusted_pr_contract_record(
@@ -2734,11 +3040,14 @@ def post_verified_trusted_issue_protocol_comment(
         raise AgentLoopError(
             f"Trusted issue protocol record for issue #{issue_number} returned no numeric comment ID."
         )
-    returned_body = payload.get("body")
-    if returned_body != str(body):
+    matches, footer_observed = stored_body_matches_posted(payload.get("body"), str(body))
+    if not matches:
         raise AgentLoopError(
             f"Trusted issue protocol record for issue #{issue_number} returned a different body."
         )
+    # The wrapper carries the posted canonical body, never the host-footered
+    # stored body, so downstream byte-exact checks stay exact (#1043).
+    returned_body = str(body)
     created_at = payload.get("created_at") or payload.get("createdAt")
     if not isinstance(created_at, str) or not created_at:
         raise AgentLoopError(
@@ -2764,6 +3073,10 @@ def post_verified_trusted_issue_protocol_comment(
     if login != expected_author_login or author_id != expected_author_id:
         raise AgentLoopError(
             f"Trusted issue protocol record for issue #{issue_number} was authored by an unexpected actor."
+        )
+    if footer_observed:
+        note_host_footer_observed(
+            config, f"Trusted issue protocol record for issue #{issue_number}"
         )
     return IssueComment(
         author=login,
@@ -2993,6 +3306,42 @@ def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> 
     return sha
 
 
+def get_pr_merge_commit_sha(
+    runner: Runner, config: AgentLoopConfig, pr_number: int
+) -> str:
+    """Return a merged PR's merge commit, failing closed when it cannot be read.
+
+    A durable record that names the commit must not be published without it:
+    a record written with a gap would be taken as complete by later runs.
+    """
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            config.repo,
+            "--json",
+            "mergeCommit",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    unreadable = f"Unable to read the merge commit of PR #{pr_number}."
+    if result.returncode != 0:
+        raise AgentLoopError(unreadable)
+    try:
+        data = json.loads(result.stdout or "null")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(unreadable) from exc
+    commit = data.get("mergeCommit") if isinstance(data, dict) else None
+    oid = commit.get("oid") if isinstance(commit, dict) else None
+    if isinstance(oid, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+        return oid
+    raise AgentLoopError(unreadable)
+
+
 @dataclass(frozen=True)
 class CiWatchOutcome:
     """Terminal result from the full-board post-approval watcher."""
@@ -3005,6 +3354,7 @@ class CiWatchOutcome:
         "infrastructure_stall",
         "merge_conflict",
         "head_changed",
+        "protection_unreadable",
         "dry_run",
     ]
     pr_checks: PullRequestChecks | None = None
@@ -3013,6 +3363,68 @@ class CiWatchOutcome:
     head_sha: str | None = None
     stall: CiInfrastructureStall | None = None
     attempts_used: int = 0
+
+
+def board_protection_is_reliable(
+    checks: PullRequestChecks,
+    mergeability: PullRequestMergeability | None = None,
+    *,
+    head_sha: str | None = None,
+) -> bool:
+    """Return whether the board's required-check set is known well enough.
+
+    Readable classic protection (``configured``) or its confirmed absence
+    (``not_found``) lets the observed board stand on its own.  A classic
+    protection 403 (``forbidden``) hides the required contexts, so the board
+    is trusted only when GitHub's own merge-state computation for the same
+    head is ``CLEAN``: GitHub derives it from the real protection, including
+    required contexts this token cannot read.  The merge itself still pins the
+    head, and GitHub enforces protection again at merge time.
+    """
+    status = checks.branch_protection_status
+    if status in {"configured", "not_found"}:
+        return True
+    if status != "forbidden" or mergeability is None:
+        return False
+    return (
+        mergeability.state == "mergeable"
+        and mergeability.merge_state_raw == "CLEAN"
+        and head_sha is not None
+        and mergeability.head_sha == head_sha
+    )
+
+
+def protection_awaits_readiness(
+    checks: PullRequestChecks,
+    mergeability: PullRequestMergeability | None,
+    *,
+    head_sha: str | None,
+) -> bool:
+    """Return whether an unreadable protection can only be judged after readiness.
+
+    GitHub reports ``DRAFT`` rather than ``CLEAN`` for a draft PR, so a draft
+    under a classic-protection 403 cannot prove its required checks yet.  This
+    is never merge evidence by itself: the caller must mark the PR ready and
+    then require ``CLEAN`` for the same head via
+    :func:`board_protection_is_reliable` before merging.
+    """
+    return (
+        checks.branch_protection_status == "forbidden"
+        and mergeability is not None
+        and mergeability.state == "mergeable"
+        and mergeability.merge_state_raw == "DRAFT"
+        and head_sha is not None
+        and mergeability.head_sha == head_sha
+    )
+
+
+def _observed_board_complete(checks: PullRequestChecks) -> bool:
+    return (
+        checks.check_query_status == "ok"
+        and checks.state == "passing"
+        and not checks.pending
+        and not checks.missing_required
+    )
 
 
 def watch_pr_checks(
@@ -3037,6 +3449,7 @@ def watch_pr_checks(
     )
     latest: PullRequestChecks | None = None
     empty_attempts = 0
+    unverified_green_attempts = 0
     startup_attempt_limit = max(
         1,
         (config.ci_startup_timeout_seconds + config.ci_poll_interval_seconds - 1)
@@ -3071,9 +3484,9 @@ def watch_pr_checks(
                 stall=CiInfrastructureStall(checks=snapshot.infrastructure_stalls),
                 attempts_used=attempt + 1,
             )
-        reliable = snapshot.check_query_status == "ok" and snapshot.branch_protection_status in {
-            "configured", "not_found",
-        }
+        reliable = snapshot.check_query_status == "ok" and board_protection_is_reliable(
+            snapshot, mergeability, head_sha=current_head,
+        )
         # A positively observed failure is actionable even when another query
         # was partial or a required check has not materialized yet. Those
         # conditions can delay a passing decision, but they must not hide a
@@ -3085,9 +3498,24 @@ def watch_pr_checks(
             )
         if snapshot.state == "passing" and reliable and not snapshot.pending and not snapshot.missing_required:
             return CiWatchOutcome(
-                status="passed", pr_checks=snapshot, head_sha=current_head,
-                attempts_used=attempt + 1,
+                status="passed", pr_checks=snapshot, mergeability=mergeability,
+                head_sha=current_head, attempts_used=attempt + 1,
             )
+        if snapshot.branch_protection_status == "forbidden" and _observed_board_complete(snapshot):
+            # Every observed check passed, yet GitHub does not report a CLEAN
+            # merge state and the required set is unreadable.  Allow the same
+            # bounded window used for a board that has not materialized (an
+            # unseen required check may still be starting, or GitHub may still
+            # be recomputing), then stop instead of polling to the timeout.
+            unverified_green_attempts += 1
+            if unverified_green_attempts >= startup_attempt_limit:
+                return CiWatchOutcome(
+                    status="protection_unreadable", pr_checks=snapshot,
+                    mergeability=mergeability, head_sha=current_head,
+                    attempts_used=attempt + 1,
+                )
+        else:
+            unverified_green_attempts = 0
         if snapshot.state == "no_checks" and reliable and not snapshot.missing_required:
             empty_attempts += 1
             # GitHub can expose an empty rollup while a pull_request workflow
@@ -3101,8 +3529,14 @@ def watch_pr_checks(
         else:
             empty_attempts = 0
         if time.monotonic() >= deadline or attempt == limit - 1:
+            # A budget that expires on a complete green board which only the
+            # unreadable protection keeps from passing reports that cause,
+            # not a generic timeout.
             return CiWatchOutcome(
-                status="timeout", pr_checks=latest, head_sha=current_head,
+                status="protection_unreadable" if unverified_green_attempts else "timeout",
+                pr_checks=latest,
+                mergeability=mergeability if unverified_green_attempts else None,
+                head_sha=current_head,
                 attempts_used=attempt + 1,
             )
         runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))

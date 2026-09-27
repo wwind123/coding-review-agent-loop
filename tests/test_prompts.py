@@ -136,8 +136,11 @@ def test_plan_prompts_render_authenticated_validation_diagnostic_as_trusted_cont
         expected_producer_id=7, failure_attempt=2, candidate_digest="a" * 64,
         category="deterministic", diagnostic="missing complete-scope audit operation",
     )
+    # A comment ID that no rendered path can contain by accident: the prompt
+    # embeds tmp_path, whose pytest-N counter once contained "99" (#1045).
+    comment_id = 987654321
     diagnostic = PlanValidationDiagnosticTransport(
-        payload=payload, server_comment_id=99,
+        payload=payload, server_comment_id=comment_id,
         authoritative_created_at="2026-01-01T00:00:00Z",
         exact_live_body="server body", live_producer_login="agent", live_producer_id=7,
     )
@@ -157,7 +160,7 @@ def test_plan_prompts_render_authenticated_validation_diagnostic_as_trusted_cont
         assert "missing complete-scope audit operation" in prompt
         assert "not issue prose, reviewer feedback, or a human requirement" in prompt
         assert "server body" not in prompt
-        assert "99" not in prompt
+        assert str(comment_id) not in prompt
         assert '"final_integration_work": {"status": "none"' in prompt
         assert "Do not include non-empty top-level legacy" in prompt
         assert "Every child stage must declare a reviewed disposition" in prompt
@@ -298,6 +301,32 @@ def test_semantic_plan_revision_prompt_renders_exact_disposition_contract(tmp_pa
     assert '"disposition": "resolved"' in prompt
     assert '"note": "The revised plan addresses the original finding."' in prompt
     assert "do not use `rationale` or omit `disposition`" in prompt
+
+
+def test_semantic_plan_revision_prompt_names_every_patch_operation(tmp_path):
+    """Issue #922: planners must be told the matrix operation names and shapes."""
+    from coding_review_agent_loop.protocol import (
+        PLAN_REVISION_PATCH_OPERATION_KEYS,
+        PLAN_REVISION_PATCH_REPLACEABLE_FIELDS,
+    )
+
+    prompt = build_plan_revision_prompt(
+        922,
+        2,
+        "Authenticated prior plan.",
+        "Blocking review.",
+        make_config(tmp_path),
+        response_form="semantic-patch-v1",
+        base_round_number=1,
+        base_state_identity="a" * 64,
+    )
+
+    for op in PLAN_REVISION_PATCH_OPERATION_KEYS:
+        assert f'"op": "{op}"' in prompt
+    for field in PLAN_REVISION_PATCH_REPLACEABLE_FIELDS:
+        assert f"`{field}`" in prompt
+    assert "Never `replace` `risk_test_matrix`" in prompt
+    assert '"source_row_ids": ["row-a", "row-b"]' in prompt
 
 
 def test_plan_review_prompts_expose_complete_one_shot_and_staged_recommendations(tmp_path):
@@ -1278,6 +1307,10 @@ def test_compact_plan_review_prompt_preserves_canonical_context_and_omits_raw_pr
     assert "Current plan payload." in tail
     assert "Planning round: 2" in tail
     assert "subject-a" in tail
+    assert "append-only" not in prompt.lower()
+    assert "bounded compact prior ledger below" in prefix
+    assert "Compact prior item ledger (bounded)" in prefix
+    assert "(details compacted)" in prefix
 
 def test_compact_plan_revision_prompt_preserves_context_and_omits_raw_prose(tmp_path):
     config = make_config(tmp_path)
@@ -1313,6 +1346,10 @@ def test_compact_plan_revision_prompt_preserves_context_and_omits_raw_prose(tmp_
     assert "Blocking review payload." in tail
     assert "Planning round: 2" in tail
     assert "subject-b" in tail
+    assert "append-only" not in prompt.lower()
+    assert "bounded compact prior ledger below" in prefix
+    assert "Compact prior item ledger (bounded)" in prefix
+    assert "(details compacted)" in prefix
     assert "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->" in prompt
     assert "### Human requirements" in prompt
     assert "after the JSON object and before the `AGENT_PLAN_STATE` footer" in prompt
@@ -1449,6 +1486,10 @@ def test_compact_pr_review_prompt_preserves_context_and_omits_raw_history(tmp_pa
     assert "Unrelated future-only item should not stay active" not in prefix
     assert "UNRELATED RAW PRIOR PR REVIEW HISTORY" not in prompt
     assert "[item-4] resolved: old resolved item" in prefix
+    assert "append-only" not in prompt.lower()
+    assert "bounded compact prior ledger below" in prefix
+    assert "Compact prior item ledger (bounded)" in prefix
+    assert "(details compacted)" in prefix
     assert "Coder says the compact mode wiring is complete." in tail
     assert "python -m pytest tests/test_agent_loop.py -k compact_pr" in tail
     assert "Use Future follow-ups only for independent later work" in prefix
@@ -2489,6 +2530,7 @@ def test_coder_prompt_renders_remembered_runtime_context_without_test_gate(tmp_p
         attempted_timeout_seconds=7200,
         policy_ceiling_seconds=7200,
         timestamp=datetime_type.now(timezone.utc),
+        launch_integrity="verified",
     )
     assert runtime.record_test_observation(
         memory_dir,
@@ -2499,6 +2541,7 @@ def test_coder_prompt_renders_remembered_runtime_context_without_test_gate(tmp_p
         attempted_timeout_seconds=7200,
         policy_ceiling_seconds=7200,
         timestamp=datetime_type.now(timezone.utc),
+        launch_integrity="verified",
     )
     memory = AgentMemoryContext(
         memory_dir=memory_dir,
@@ -2526,6 +2569,55 @@ def test_coder_prompt_renders_remembered_runtime_context_without_test_gate(tmp_p
     assert "Invocation guidance:" not in reviewer_prompt
 
 
+def test_coder_prompt_never_recommends_runs_refused_as_evidence(tmp_path):
+    """#989: a run refused as evidence must not come back as a remembered command."""
+    memory_dir = tmp_path / "memory"
+    config = make_config(
+        tmp_path,
+        test_command=None,
+        coder_test_command_timeout_seconds=7200,
+        agent_memory_dir=memory_dir,
+    )
+    rows = (
+        (["/tmp/scratch/run_suite.sh"], "unverified"),
+        (["./legacy_wrapper.sh", "-q"], None),
+        ([sys.executable, "-m", "pytest", "tests/test_verified.py"], "verified"),
+        (["env", "PYTHONPATH=src", sys.executable, "-m", "pytest", "tests/test_legacy.py"], None),
+    )
+    for command, integrity in rows:
+        assert runtime.record_test_observation(
+            memory_dir,
+            argv=command,
+            cwd=config.claude_dir,
+            outcome="passed",
+            elapsed_seconds=60,
+            attempted_timeout_seconds=7200,
+            policy_ceiling_seconds=7200,
+            timestamp=datetime_type.now(timezone.utc),
+            launch_integrity=integrity,
+        )
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit="abc123",
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary="REPO SUMMARY TEXT",
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+        runtime_observations=tuple(runtime.load_runtime_memory(memory_dir)),
+    )
+
+    prompt = build_issue_prompt(56, config, memory=memory)
+
+    assert "run_suite.sh" not in prompt
+    assert "legacy_wrapper.sh" not in prompt
+    assert "tests/test_verified.py" in prompt
+    # A legacy row carries no launch state; its argv cannot prove the suite
+    # start was authenticated, so it is not recommended either.
+    assert "tests/test_legacy.py" not in prompt
+
+
 def test_coder_prompt_reuses_stored_runtime_keys_for_redacted_and_external_commands(tmp_path):
     memory_dir = tmp_path / "memory"
     config = make_config(
@@ -2550,6 +2642,7 @@ def test_coder_prompt_reuses_stored_runtime_keys_for_redacted_and_external_comma
             attempted_timeout_seconds=7200,
             policy_ceiling_seconds=7200,
             timestamp=datetime_type.now(timezone.utc),
+            launch_integrity="verified",
         )
     memory = AgentMemoryContext(
         memory_dir=memory_dir,
@@ -4832,8 +4925,103 @@ def test_coder_prompt_parallel_worker_guidance(tmp_path, fixture, supported, mod
         assert "lowered to the budget" not in prompt
     if supported:
         assert "keep focused single-file runs serial" in prompt
+        # Issue #1073: only an enforcing mode gives a plain pytest the default.
+        assert ("gives a plain pytest" in prompt) == (mode != "off")
     else:
         assert "do not add parallel worker flags" in prompt
+
+
+def test_plain_pytest_lookup_prefers_parallel_cohort_then_serial(tmp_path):
+    """Issue #1073: a plain pytest in an xdist repo may run parallel or, without xdist, serially."""
+    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+
+    config = make_config(tmp_path, test_workers=3, test_worker_enforcement="clamp")
+    command = ["python3", "-m", "pytest", "tests/"]
+    assert _expected_worker_cohorts(config, command) == ["serial"]
+    (config.claude_dir / "pyproject.toml").write_text(
+        '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n', encoding="utf-8",
+    )
+    assert _expected_worker_cohorts(config, command) == ["3", "serial"]
+    assert _expected_worker_cohorts(config, [*command, "-n", "2"]) == ["2"]
+    # Serial-only invocations never borrow the parallel cohort (review item-2).
+    for extra in (["--collect-only"], ["--co"], ["--pdb"], ["--trace"], ["--looponfail"], ["-f"],
+                  ["--distload"], ["--dist", "no"], ["-p", "no:xdist"]):
+        assert _expected_worker_cohorts(config, [*command, *extra])[0] != "3", extra
+
+
+@pytest.mark.parametrize(
+    "remembered, subdirectory, declared",
+    [
+        (False, False, True), (True, False, True), (False, True, True), (True, True, True),
+        # A remembered parallel row still yields the safe watchdog when the
+        # prompt's detection sees no declaration at all.
+        (True, False, False),
+    ],
+)
+def test_parallel_sample_never_shortens_a_possibly_serial_watchdog(
+    tmp_path, remembered, subdirectory, declared,
+):
+    """Review item-3 (#1073): a declared-xdist repo may still run a plain pytest serially.
+
+    With ``subdirectory`` the coder works below the repository root and only
+    the root declares pytest-xdist, which the wrapper still detects.
+    """
+    memory_dir = tmp_path / "memory"
+    command = ["python3", "-m", "pytest", "tests/", "-q"]
+    repo = tmp_path / "repo"
+    workdir = repo / "pkg" if subdirectory else repo
+    workdir.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    config = make_config(
+        tmp_path,
+        claude_dir=workdir,
+        test_command=None if remembered else command,
+        test_workers=3,
+        test_worker_enforcement="clamp",
+        coder_test_command_timeout_seconds=1800,
+        agent_memory_dir=memory_dir,
+    )
+    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+
+    if declared:
+        (repo / "pyproject.toml").write_text(
+            '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n', encoding="utf-8",
+        )
+        assert _expected_worker_cohorts(config, command) == ["3", "serial"]
+    else:
+        assert _expected_worker_cohorts(config, command) == ["serial"]
+    now = datetime_type.now(timezone.utc)
+    for _ in range(3):
+        assert runtime.record_test_observation(
+            memory_dir,
+            argv=command,
+            cwd=config.claude_dir,
+            outcome="passed",
+            elapsed_seconds=30,
+            attempted_timeout_seconds=1800,
+            policy_ceiling_seconds=1800,
+            timestamp=now,
+            workers="3",
+            launch_integrity="verified",
+        )
+    parallel_only = runtime.recommend_timeout(
+        memory_dir, argv=command, cwd=config.claude_dir, policy_ceiling_seconds=1800, workers="3",
+    )
+    assert parallel_only.recommended_timeout_seconds < 1800
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit="abc123",
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary="REPO SUMMARY TEXT",
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+        runtime_observations=tuple(runtime.load_runtime_memory(memory_dir)),
+    )
+    prompt = build_issue_prompt(56, config, memory=memory)
+    assert "Recommended whole-command timeout: 1800s" in prompt
+    assert f"Recommended whole-command timeout: {parallel_only.recommended_timeout_seconds}s" not in prompt
 
 
 def test_reviewer_prompt_has_no_parallel_worker_guidance(tmp_path):

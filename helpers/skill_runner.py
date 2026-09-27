@@ -4779,7 +4779,7 @@ def _validate_coder_implementation_response(
             approved_plan_context.risk_test_matrix_expected_row_ids
             if approved_plan_context is not None and approved_plan_context.matrix_available
             else None
-        ),
+        ), architecture_status_mode="legacy",
     )
     if isinstance(result, (StructuredIssueImplementation, _TerminalIssueImplementationConflict)):
         parsed = result if isinstance(result, StructuredIssueImplementation) else result.parsed
@@ -5617,7 +5617,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
                 approved_plan_context.risk_test_matrix_expected_row_ids
                 if approved_plan_context is not None and approved_plan_context.matrix_available
                 else None
-            ),
+            ), architecture_status_mode="legacy",
         )
         try:
             coder_output, parsed = _recover_structured_response(

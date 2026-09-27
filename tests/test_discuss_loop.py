@@ -3867,11 +3867,21 @@ def test_discuss_debater_checkout_inspected_claim_unreadable_file_triggers_repai
     # review).
     from unittest.mock import patch
 
+    # The OSError is injected rather than produced with chmod(0o000), which
+    # root ignores (#1028).
+    from pathlib import Path
+
     config = make_config(tmp_path, reviewer=("codex", "gemini"))
     unreadable = config.codex_dir / "secret.py"
     unreadable.write_text("line one\nline two\n", encoding="utf-8")
-    unreadable.chmod(0o000)
     (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
+    real_open = Path.open
+
+    def failing_open(self, *args, **kwargs):
+        if self == unreadable.resolve():
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_open(self, *args, **kwargs)
+
     invalid = _discuss_review_text(
         outcome="implement", evidence=_checkout_inspected_evidence("secret.py:1")
     )
@@ -3883,12 +3893,12 @@ def test_discuss_debater_checkout_inspected_claim_unreadable_file_triggers_repai
         gemini_outputs=[_discuss_review_text(outcome="implement")],
     )
 
-    try:
-        with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
-            result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
-    finally:
-        unreadable.chmod(0o644)
+    with patch.object(Path, "open", failing_open), patch(
+        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired
+    ) as repair:
+        result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
 
+    assert repair.called
     assert result == 0
     assert "Consensus kind: `unanimous` after round 1." in runner.comments[-1]
 

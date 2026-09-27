@@ -16,6 +16,8 @@ from coding_review_agent_loop.plan_assembly import (
     structured_plan_revision_to_payload,
 )
 from coding_review_agent_loop.protocol import (
+    PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS,
+    PLAN_REVISION_PATCH_OPERATION_KEYS,
     RISK_MATRIX_MAX_ROWS,
     parse_plan_revision_patch,
     validate_structured_plan_revision_patch,
@@ -98,6 +100,97 @@ def test_patch_parser_is_strict_and_distinguishes_legacy_plan_revision() -> None
         parse_plan_revision_patch({**payload, "kind": "plan_revision"})
     with pytest.raises(AgentLoopError, match="unknown field"):
         parse_plan_revision_patch({**payload, "unexpected": True})
+
+
+def test_replace_on_matrix_names_dedicated_operations_instead_of_non_writable() -> None:
+    """Issue #922: the rejection must be truthful and name a usable operation."""
+    state = _state(_base([_row("row-a")]))
+    payload = _patch(
+        state,
+        [
+            {"op": "replace", "field": "summary", "value": "Revised summary."},
+            {"op": "replace", "field": "risk_test_matrix", "value": {"applicability": "applicable"}},
+        ],
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        parse_plan_revision_patch(payload)
+    message = str(excinfo.value)
+    assert "derived or not writable" not in message
+    assert "plan_revision_patch.operations[1]: `risk_test_matrix` cannot be revised with `replace`" in message
+    assert (
+        "use matrix_add, matrix_edit, matrix_retire, matrix_split, matrix_merge or matrix_metadata_replace."
+        in message
+    )
+    assert set(PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS["risk_test_matrix"]) <= PLAN_REVISION_PATCH_OPERATION_KEYS
+    # The rejected patch assembles nothing: the replace is neither applied to
+    # the matrix nor silently dropped from the revision.
+    with pytest.raises(AgentLoopError, match="cannot be revised with `replace`"):
+        assemble_authenticated_plan_revision(state, payload)
+
+
+def test_retry_with_a_named_matrix_operation_is_accepted_922() -> None:
+    """#922/#927: the route forward named by the diagnostic actually works."""
+    state = _state(_base([_row("row-a")]))
+    rejected = _patch(
+        state,
+        [{"op": "replace", "field": "risk_test_matrix", "value": {"applicability": "applicable"}}],
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        parse_plan_revision_patch(rejected)
+    named = PLAN_REVISION_PATCH_DEDICATED_FIELD_OPERATIONS["risk_test_matrix"]
+    assert "matrix_edit" in named and "matrix_metadata_replace" in named
+    for op in named:
+        assert op in str(excinfo.value)
+    edit_retry = _patch(
+        state,
+        [{
+            "op": "matrix_edit",
+            "row_id": "row-a",
+            "row": _row("row-a", outcome="The retried edit applied."),
+            "rationale": "Use the operation the diagnostic named.",
+        }],
+    )
+    parse_plan_revision_patch(edit_retry)
+    edited, _sidecar = assemble_authenticated_plan_revision(state, edit_retry)
+    assert edited.risk_test_matrix.rows[0].expected_outcome == "The retried edit applied."
+    metadata_retry = _patch(
+        state,
+        [{
+            "op": "matrix_metadata_replace",
+            "value": {
+                "applicability": "applicable",
+                "important_exclusions": ["A revised exclusion."],
+            },
+            "audit_operation": "change",
+            "rationale": "Replace the matrix metadata through its dedicated operation.",
+        }],
+    )
+    parse_plan_revision_patch(metadata_retry)
+    replaced, _sidecar = assemble_authenticated_plan_revision(state, metadata_retry)
+    assert replaced.risk_test_matrix.important_exclusions == ("A revised exclusion.",)
+
+
+@pytest.mark.parametrize("field", ["risk_test_matrix_changes", "plan_identity", "not_a_plan_field"])
+def test_replace_on_genuinely_derived_field_keeps_non_writable_wording(field: str) -> None:
+    """A field no operation can write gets a truthful rejection with no invented route."""
+    state = _state(_base([_row("row-a")]))
+    payload = _patch(state, [{"op": "replace", "field": field, "value": []}])
+    with pytest.raises(AgentLoopError, match=f"`{field}` is derived or not writable") as excinfo:
+        parse_plan_revision_patch(payload)
+    message = str(excinfo.value)
+    for op in PLAN_REVISION_PATCH_OPERATION_KEYS - {"replace"}:
+        assert op not in message, op
+
+
+def test_unknown_operation_names_every_valid_operation() -> None:
+    state = _state(_base([_row("row-a")]))
+    payload = _patch(state, [{"op": "change", "row_id": "row-a", "row": _row("row-a")}])
+    with pytest.raises(AgentLoopError) as excinfo:
+        parse_plan_revision_patch(payload)
+    message = str(excinfo.value)
+    assert "op is unknown: 'change'" in message
+    for op in PLAN_REVISION_PATCH_OPERATION_KEYS:
+        assert op in message
 
 
 def test_single_field_replacement_preserves_undeclared_authenticated_payload() -> None:
@@ -673,3 +766,60 @@ def test_stored_patch_provenance_round_trips_and_resumes(tmp_path) -> None:
     resumed_plan, resumed_round = resumed
     assert resumed_plan == canonical_plan
     assert resumed_round.coder_output == raw_patch_body
+
+
+# --- #925: degraded statuses never reach approved plan state ------------------
+
+_DEG_CHANGED_IMPACT = {
+    "status": "changed",
+    "rationale": "The revision adds a publication seam.",
+    "affected_components": ["round_state.py"],
+    "dependencies": ["plan_assembly.py"],
+    "execution_data_flows": ["plan round -> metadata"],
+    "persistence": ["round metadata"],
+    "public_contracts": ["canonical plan"],
+    "security_boundaries": ["approved plan identity"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Record the new seam.",
+}
+
+
+def test_patch_replace_with_near_miss_status_is_rejected_with_route_forward() -> None:
+    state = _state(_base([_row("row-a")]))
+    patch = _patch(
+        state,
+        [{"op": "replace", "field": "architecture_impact",
+          "value": dict(_DEG_CHANGED_IMPACT, status="modified")}],
+    )
+    with pytest.raises(AgentLoopError) as error:
+        assemble_authenticated_plan_revision(state, patch)
+    message = str(error.value)
+    assert "`changed` or `unchanged`" in message
+    assert "`modified` is not accepted in a patch" in message
+    with pytest.raises(AgentLoopError, match="not accepted in a patch"):
+        parse_plan_revision_patch(patch)
+
+
+def test_canonical_assembly_fails_closed_on_a_degraded_status() -> None:
+    from coding_review_agent_loop.protocol import (
+        ARCHITECTURE_IMPACT_UNDETERMINED,
+        validate_structured_plan_revision,
+    )
+
+    payload = dict(_base([_row("row-a")]), architecture_impact=_DEG_CHANGED_IMPACT)
+    text = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    plan = validate_structured_plan_revision(text)
+    identity = aggregate_plan_identity(structured_plan_revision_to_payload(plan))
+    degraded = replace(
+        plan,
+        architecture_impact=replace(plan.architecture_impact, status=ARCHITECTURE_IMPACT_UNDETERMINED),
+    )
+    with pytest.raises(AgentLoopError, match="refusing degraded status"):
+        structured_plan_revision_to_payload(degraded)
+    # An undegraded plan's canonical payload and identity are unchanged.
+    assert aggregate_plan_identity(structured_plan_revision_to_payload(plan)) == identity
+    reauthenticated = AuthenticatedPlanState.from_plan(
+        structured_plan_revision_to_payload(plan), round_number=4
+    )
+    assert reauthenticated.plan.architecture_impact == plan.architecture_impact

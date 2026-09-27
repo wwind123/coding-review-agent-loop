@@ -672,10 +672,14 @@ def test_fresh_plan_decomposition_requires_architecture_impact():
     payload_dict = json.loads(payload)
     payload_dict.pop("architecture_impact")
     payload_without_impact = json.dumps(payload_dict)
-    with pytest.raises(AgentLoopError, match="architecture_impact"):
-        parse_plan_decomposition(
-            payload_without_impact, required_architecture_impact_contract=1
-        )
+    # An absent required assessment is a field-scope defect (#925): the
+    # decomposition parses, carrying an unsatisfied contract for the seam.
+    parsed = parse_plan_decomposition(
+        payload_without_impact, required_architecture_impact_contract=1
+    )
+    assert parsed.architecture_impact is None
+    assert parsed.architecture_impact_contract.required is True
+    assert parsed.architecture_impact_contract.satisfied is False
 
 def test_parse_plan_decomposition_accepts_normalized_earlier_phase_dependency():
     parsed = parse_plan_decomposition(
@@ -2611,6 +2615,329 @@ def test_staged_parent_reports_a_terminal_state_when_every_phase_is_complete(tmp
     assert not any(cmd[:3] == ["gh", "issue", "close"] for cmd, _cwd in runner.commands)
 
 
+def _merged_pr_payload(pr_number, merge_commit):
+    return {**pr_payload_for_state(pr_number, "MERGED"), "mergeCommit": {"oid": merge_commit}}
+
+
+def _two_stage_parent_records():
+    plan, created, summary = staged_legacy_plan_records(stage_count=2)
+    parent_comments = approved_plan_comments(plan) + [
+        {"author": {"login": "bot"}, "createdAt": "2026-09-20T00:00:02Z", "body": summary},
+        phase_handoff_comment(plan, created, 1),
+        phase_handoff_comment(plan, created, 2),
+    ]
+    return plan, parent_comments
+
+
+def _completion_records(runner):
+    return [comment for comment in runner.comments if "AGENT_PLAN_STAGED_COMPLETION" in comment]
+
+
+def test_delivered_staged_parent_carries_one_completion_record_naming_every_child(
+    tmp_path, capsys
+):
+    """#1018: completing both stages writes a completion record back to the parent."""
+    plan, parent_comments = _two_stage_parent_records()
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={
+            99: [child_pr_handoff_comment(99, 912)],
+            100: [child_pr_handoff_comment(100, 913)],
+        },
+        issue_payloads_by_number={99: {"state": "closed"}, 100: {"state": "closed"}},
+        pr_payloads_by_number={
+            912: _merged_pr_payload(912, "0c657e93" + "a" * 32),
+            913: _merged_pr_payload(913, "3c48424d" + "b" * 32),
+        },
+        authenticated_actor=_ACTOR,
+        serve_rest_issue_comments=True,
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    records = _completion_records(runner)
+    assert len(records) == 1
+    record = records[0]
+    assert "All 2 staged phases of the approved plan for issue #56 are delivered." in record
+    assert "| #99 | PR #912 merged at `0c657e93aaaa` |" in record
+    assert "| #100 | PR #913 merged at `3c48424dbbbb` |" in record
+    assert "agent-loop does not close this issue itself" in record
+    ((_comment, metadata),) = phase_progress_module.find_staged_completion_records(
+        [IssueComment(author="bot", body=record, created_at=None)],
+        parent_issue=56,
+        plan_hash=approved_plan_hash(plan),
+        mode="implement-by-phase",
+    )
+    assert [
+        (stage.child_issue_number, stage.pr_number, stage.merge_commit)
+        for stage in metadata.stages
+    ] == [(99, 912, "0c657e93" + "a" * 32), (100, 913, "3c48424d" + "b" * 32)]
+    assert "Recorded the staged completion on issue #56." in capsys.readouterr().out
+    assert not any(cmd[:3] == ["gh", "issue", "close"] for cmd, _cwd in runner.commands)
+
+    # A normal parent rerun reads the parent through the `gh issue view`
+    # projection, which shows the record's author login but no numeric ID.
+    # The record is still recognized, from the REST history, and not reposted.
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert len(_completion_records(runner)) == 1
+    assert "Recorded the staged completion" not in capsys.readouterr().out
+
+
+def _staged_child_context(number):
+    return IssueContext(
+        number=number,
+        repo="OWNER/REPO",
+        title=f"Stage {number}",
+        body="Child phase issue for parent #56.\n\nStage work.",
+        url=f"https://github.com/OWNER/REPO/issues/{number}",
+        comments=(),
+    )
+
+
+@pytest.mark.parametrize(
+    "last_pr_state,merged_pr,recorded",
+    [
+        pytest.param("MERGED", 913, True, id="last-stage-merged"),
+        pytest.param("OPEN", 913, False, id="last-stage-still-open"),
+        pytest.param("MERGED", 999, False, id="other-pr-merged"),
+    ],
+)
+def test_child_merge_of_the_last_stage_records_parent_completion(
+    tmp_path, capsys, last_pr_state, merged_pr, recorded
+):
+    """#1018: the child run that merges the final stage writes the parent record.
+
+    GitHub closes the child from its PR asynchronously, so the child is still
+    OPEN here; only the exact child/PR pair this run merged counts as complete.
+    """
+    _plan, parent_comments = _two_stage_parent_records()
+    runner = FakeRunner(
+        issue_comments=parent_comments,
+        issue_comments_by_number={
+            99: [child_pr_handoff_comment(99, 912)],
+            100: [child_pr_handoff_comment(100, 913)],
+        },
+        issue_payloads_by_number={99: {"state": "closed"}, 100: {"state": "open"}},
+        pr_payloads_by_number={
+            912: _merged_pr_payload(912, "0c657e93" + "a" * 32),
+            913: (
+                _merged_pr_payload(913, "3c48424d" + "b" * 32)
+                if last_pr_state == "MERGED"
+                else pr_payload_for_state(913, "OPEN")
+            ),
+        },
+        authenticated_actor=_ACTOR,
+        serve_rest_issue_comments=True,
+    )
+
+    def merge_hook():
+        orchestrator_module._record_staged_parent_completion_after_merge(
+            runner,
+            config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+            issue_context=_staged_child_context(100),
+            pr_number=merged_pr,
+        )
+
+    merge_hook()
+
+    records = _completion_records(runner)
+    output = capsys.readouterr().out
+    if recorded:
+        assert len(records) == 1
+        assert "| #99 | PR #912 merged" in records[0]
+        assert "| #100 | PR #913 merged" in records[0]
+        assert "PR #913 delivered the last staged phase of issue #56" in output
+        # The record is written once per plan identity: a second writer (a
+        # parent rerun, or a repeated hook) finds it and posts nothing.
+        merge_hook()
+        assert len(_completion_records(runner)) == 1
+    else:
+        assert records == []
+    if merged_pr == 999:
+        assert "no completion record was written" in output
+
+
+_ACTOR = ("coding-review-agent-loop", 4242)
+
+
+def _delivered_two_stage_runner(*, extra_parent_comments=(), merge_commit_913=True):
+    _plan, parent_comments = _two_stage_parent_records()
+    return FakeRunner(
+        issue_comments=parent_comments + list(extra_parent_comments),
+        issue_comments_by_number={
+            99: [child_pr_handoff_comment(99, 912)],
+            100: [child_pr_handoff_comment(100, 913)],
+        },
+        issue_payloads_by_number={99: {"state": "closed"}, 100: {"state": "closed"}},
+        pr_payloads_by_number={
+            912: _merged_pr_payload(912, "0c657e93" + "a" * 32),
+            913: (
+                _merged_pr_payload(913, "3c48424d" + "b" * 32)
+                if merge_commit_913
+                else pr_payload_for_state(913, "MERGED")
+            ),
+        },
+        authenticated_actor=_ACTOR,
+        serve_rest_issue_comments=True,
+    )
+
+
+def _run_merge_hook(runner, tmp_path):
+    orchestrator_module._record_staged_parent_completion_after_merge(
+        runner,
+        config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+        issue_context=_staged_child_context(100),
+        pr_number=913,
+    )
+
+
+def test_completion_record_is_not_published_without_every_merge_commit(tmp_path, capsys):
+    """#1018 review: an unreadable merge commit withholds the record entirely.
+
+    A record written with a gap would be accepted as complete by later runs,
+    so nothing is posted and a later run can still write the full record.
+    """
+    runner = _delivered_two_stage_runner(merge_commit_913=False)
+
+    _run_merge_hook(runner, tmp_path)
+
+    assert _completion_records(runner) == []
+    assert "Unable to read the merge commit of PR #913" in capsys.readouterr().out
+
+    # Once the commit is readable, the same writer publishes the full record.
+    runner.pr_payloads_by_number[913] = _merged_pr_payload(913, "3c48424d" + "b" * 32)
+    _run_merge_hook(runner, tmp_path)
+    records = _completion_records(runner)
+    assert len(records) == 1
+    assert "| #100 | PR #913 merged at `3c48424dbbbb` |" in records[0]
+
+
+def _completion_comment_by(author, record_body, *, rest_only=False):
+    """A parent comment in the shape GitHub returns it.
+
+    The `gh issue view` projection carries only the login; a numeric ``id`` in
+    ``author`` is exposed solely through the REST history.
+    """
+    comment = {
+        "author": {"login": author["login"]},
+        "createdAt": "2026-09-21T00:00:00Z",
+        "body": record_body,
+    }
+    if "id" in author:
+        comment["_rest_author_id"] = author["id"]
+    if rest_only:
+        comment["_rest_only"] = True
+    return comment
+
+
+def _genuine_record_body(tmp_path):
+    """The exact record body a trusted writer publishes for the delivered topology."""
+    runner = _delivered_two_stage_runner()
+    _run_merge_hook(runner, tmp_path)
+    (body,) = [
+        comment["body"]
+        for comment in runner.issue_comments
+        if "AGENT_PLAN_STAGED_COMPLETION" in comment["body"]
+    ]
+    return body
+
+
+@pytest.mark.parametrize(
+    "author",
+    [
+        pytest.param({"login": "someone-else", "id": 9999}, id="other-actor"),
+        pytest.param({"login": _ACTOR[0], "id": 9999}, id="same-login-other-id"),
+        pytest.param({"login": _ACTOR[0]}, id="no-immutable-id"),
+    ],
+)
+def test_unauthenticated_completion_claim_does_not_suppress_the_record(
+    tmp_path, capsys, author
+):
+    """#1018 review: only a record by the authenticated actor counts as written."""
+    forged = _completion_comment_by(author, _genuine_record_body(tmp_path))
+    capsys.readouterr()
+    runner = _delivered_two_stage_runner(extra_parent_comments=[forged])
+
+    _run_merge_hook(runner, tmp_path)
+
+    assert len(_completion_records(runner)) == 1
+    assert "recorded the staged completion on the parent" in capsys.readouterr().out
+
+
+def test_authenticated_record_with_different_stages_does_not_suppress_the_record(tmp_path):
+    """#1018 review: a trusted record must also match the delivered topology."""
+    plan, _parent_comments = _two_stage_parent_records()
+    stale_metadata = phase_progress_module.StagedCompletionMetadata(
+        parent_issue=56,
+        plan_hash=approved_plan_hash(plan),
+        mode="implement-by-phase",
+        stages=(
+            phase_progress_module.StagedCompletionStage(
+                phase_index=1, stage_id="1", automation="agent-pr",
+                child_issue_number=99, pr_number=911, merge_commit="1" * 40,
+            ),
+        ),
+    )
+    stale_body = (
+        "Stale claim.\n\n<!-- AGENT_PLAN_STAGED_COMPLETION: "
+        f"{phase_progress_module._encode_completion_metadata(stale_metadata)} -->"
+    )
+    trusted_author = {"login": _ACTOR[0], "id": _ACTOR[1]}
+    runner = _delivered_two_stage_runner(
+        extra_parent_comments=[_completion_comment_by(trusted_author, stale_body)]
+    )
+
+    _run_merge_hook(runner, tmp_path)
+
+    records = _completion_records(runner)
+    assert len(records) == 1
+    assert "| #99 | PR #912 merged at `0c657e93aaaa` |" in records[0]
+
+
+@pytest.mark.parametrize(
+    "rest_only",
+    [
+        pytest.param(False, id="in-projection"),
+        pytest.param(True, id="dropped-from-capped-projection"),
+    ],
+)
+def test_authenticated_matching_record_suppresses_a_second_write(tmp_path, rest_only):
+    """#1018: the genuine record, by the authenticated actor, is written once.
+
+    It is recognized from the REST history even when the capped `gh issue
+    view` projection no longer shows it.
+    """
+    trusted_author = {"login": _ACTOR[0], "id": _ACTOR[1]}
+    runner = _delivered_two_stage_runner(
+        extra_parent_comments=[
+            _completion_comment_by(
+                trusted_author, _genuine_record_body(tmp_path), rest_only=rest_only
+            )
+        ]
+    )
+
+    _run_merge_hook(runner, tmp_path)
+
+    assert _completion_records(runner) == []
+    rest_reads = [
+        cmd for cmd, _cwd in runner.commands
+        if cmd[:2] == ["gh", "api"] and "issues/56/comments?" in cmd[2]
+    ]
+    assert rest_reads
+
+
+def test_unreadable_parent_history_withholds_the_record(tmp_path, capsys):
+    """#1018 review: without the complete REST history, nothing is posted."""
+    runner = _delivered_two_stage_runner()
+    runner.serve_rest_issue_comments = False  # the endpoint answers a non-list
+
+    _run_merge_hook(runner, tmp_path)
+
+    assert _completion_records(runner) == []
+    assert "no completion record was written" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("pr_state", [None, "OPEN"])
 def test_staged_parent_hints_only_for_an_open_child(tmp_path, capsys, pr_state):
     """Matrix row `open-child-runnable-hint`."""
@@ -3238,6 +3565,184 @@ def test_human_first_topology_reports_a_later_closed_human_stage(tmp_path, capsy
     )
     assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+# --- #925: degraded decomposition assessments --------------------------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    create_decomposition_child_issues as _deg_create_children,
+)
+from coding_review_agent_loop.errors import AgentInvocationError as _DegInvocationError  # noqa: E402
+
+_DEG_DECOMP_PHASE = {
+    "title": "Schema helpers",
+    "scope": "Add parser dataclasses and tests.",
+    "non_goals": "No live orchestrator switch.",
+    "dependency_notes": "First phase; no dependencies.",
+    "rollout_risk": "low - internal only.",
+    "validation": "Run python -m pytest tests/test_agent_loop.py.",
+    "parent_context": "Approved plan slice: add schema helpers and preserve behavior.",
+    "automation": "agent-pr",
+    "depends_on": [],
+}
+_DEG_DECOMP_IMPACT = {
+    "status": "modified",
+    "rationale": "Decomposition changes the parser.",
+    "affected_components": ["protocol parser"],
+    "dependencies": ["repair preservation"],
+    "execution_data_flows": ["response -> parser -> seam"],
+    "persistence": ["round metadata"],
+    "public_contracts": ["architecture_impact status"],
+    "security_boundaries": ["agent payload trust boundary"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the degraded status.",
+}
+
+
+def _deg_decomposition(impact):
+    payload = json.loads(plan_decomposition_json(_DEG_DECOMP_PHASE))
+    if impact is None:
+        payload.pop("architecture_impact")
+    else:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload)
+
+
+def _deg_decompose_runner(decomposition_outputs):
+    return FakeRunner(
+        claude_outputs=[structured_plan_state(summary="Add schema helpers."), *decomposition_outputs],
+        codex_outputs=["Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"],
+        issue_urls=["https://github.com/OWNER/REPO/issues/101"],
+    )
+
+
+@pytest.mark.parametrize(
+    "impact",
+    [None, {"status": "modified", "rationale": "Something changed."}],
+    ids=["omitted", "uncorroborated"],
+)
+def test_degraded_decomposition_publishes_no_child_issue_or_checkpoint(tmp_path, impact):
+    runner = _deg_decompose_runner([_deg_decomposition(impact)])
+    config = make_config(tmp_path, plan_execution_mode="decompose-only", agent_max_retries=0)
+
+    with pytest.raises(_DegInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert runner.issues == []
+    assert not any("Topology checkpoint recorded" in comment for comment in runner.comments)
+    preserved = error.value.preserved_unsatisfied_response
+    assert preserved is not None
+    assert "architecture_impact" in preserved.diagnostic
+    assert "`changed` or `unchanged`" in preserved.diagnostic
+    expected = [] if impact is None else ["degraded-to-undetermined"]
+    assert [r.outcome for r in preserved.architecture_impact_degradations] == expected
+    assert error.value.failure_category == "deterministic"
+
+
+def test_create_children_guard_refuses_an_unsatisfied_decomposition(tmp_path):
+    decomposition = parse_plan_decomposition(
+        _deg_decomposition(None), required_architecture_impact_contract=1
+    )
+    runner = FakeRunner()
+    with pytest.raises(AgentLoopError, match="absent or undetermined"):
+        _deg_create_children(
+            runner,
+            config=make_config(tmp_path),
+            parent_issue=56,
+            approved_plan=structured_plan_state(summary="Add schema helpers."),
+            decomposition=decomposition,
+        )
+    assert runner.issues == []
+    assert runner.comments == []
+
+
+def _deg_checkpoint_comment(runner):
+    (checkpoint,) = [c for c in runner.comments if "Topology checkpoint recorded" in c]
+    return checkpoint
+
+
+def test_accepted_corroborated_decomposition_surfaces_records_without_changing_checkpoint(tmp_path):
+    degraded_runner = _deg_decompose_runner([_deg_decomposition(_DEG_DECOMP_IMPACT)])
+    assert run_issue_loop(
+        degraded_runner, issue_number=56,
+        config=make_config(tmp_path / "degraded", plan_execution_mode="decompose-only"),
+        plan_first=True,
+    ) == 0
+    clean_runner = _deg_decompose_runner(
+        [_deg_decomposition(dict(_DEG_DECOMP_IMPACT, status="changed"))]
+    )
+    assert run_issue_loop(
+        clean_runner, issue_number=56,
+        config=make_config(tmp_path / "clean", plan_execution_mode="decompose-only"),
+        plan_first=True,
+    ) == 0
+
+    assert len(degraded_runner.issues) == 1
+    degradation_comments = [
+        c for c in degraded_runner.comments if "Decomposition parse degradations" in c
+    ]
+    assert len(degradation_comments) == 1
+    assert "normalized-to-changed" in degradation_comments[0]
+    assert "<!--" not in degradation_comments[0]
+    assert not any("parse degradations" in c for c in clean_runner.comments)
+    # The topology checkpoint payload and body are identical to an undegraded one.
+    assert _deg_checkpoint_comment(degraded_runner) == _deg_checkpoint_comment(clean_runner)
+
+
+def test_valid_checkpoint_reuses_unchanged_through_the_orchestrator_decode(tmp_path):
+    """A pre-existing checkpoint is reused with no contract check and no records."""
+    first = _deg_decompose_runner([_deg_decomposition(dict(_DEG_DECOMP_IMPACT, status="changed"))])
+    first.issue_urls = []  # child creation fails after the checkpoint is posted
+    plan = structured_plan_state(summary="Add schema helpers.")
+    with pytest.raises(Exception):
+        run_issue_loop(
+            first, issue_number=56,
+            config=make_config(tmp_path / "first", plan_execution_mode="decompose-only"),
+            plan_first=True,
+        )
+    checkpoint_body = _deg_checkpoint_comment(first)
+    restored = find_existing_topology_checkpoint(
+        (IssueComment(author="bot", created_at=None, body=checkpoint_body),),
+        parent_issue=56,
+        plan_hash=approved_plan_hash(plan),
+        mode="decompose-only",
+    )
+    assert restored is not None and restored.architecture_impact["status"] == "changed"
+
+    def plan_record(body, role, state=None):
+        return {
+            "author": {"login": "bot"},
+            "createdAt": "2026-05-23T00:00:00Z",
+            "body": _attach_round_metadata(
+                body,
+                PostedRoundMetadata(
+                    flow="plan", role=role, agent="Claude" if role == "coder" else "Codex",
+                    round_number=1, subject=_plan_subject(plan), state=state,
+                ),
+            ),
+        }
+
+    second = FakeRunner(
+        issue_comments=[
+            plan_record(plan, "coder"),
+            plan_record(
+                "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+                "reviewer", "approved",
+            ),
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:02Z", "body": checkpoint_body},
+        ],
+        issue_urls=["https://github.com/OWNER/REPO/issues/101"],
+    )
+    assert run_issue_loop(
+        second, issue_number=56,
+        config=make_config(tmp_path / "second", plan_execution_mode="decompose-only"),
+        plan_first=True,
+    ) == 0
+    # Reused without a new decomposition turn, with no degradation surfacing.
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in second.commands)
+    assert len(second.issues) == 1
+    assert not any("parse degradations" in c for c in second.comments)
 
 
 # ---------------------------------------------------------------------------

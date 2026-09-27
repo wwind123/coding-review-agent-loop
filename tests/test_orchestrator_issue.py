@@ -1374,7 +1374,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
         require_risk_test_matrix_contract=True,
         authoritative_test_observations=(current,),
         delivered_risk_test_matrix_row_ids=plan_context.risk_test_matrix_expected_row_ids,
-        execution_catalog=(current,),
+        execution_catalog=(current,), architecture_status_mode="legacy",
     )
     assert initial_parsed.pr_number == 77
     initial_claim = initial_parsed.risk_test_matrix_claims.claims[0]
@@ -2349,7 +2349,9 @@ def test_invalid_terminal_plan_repair_replaces_persisted_candidate_provenance(
     tmp_path, monkeypatch
 ):
     source_payload = json.loads(structured_plan_state().split("\n", 1)[0])
-    source_payload.pop("architecture_impact")
+    # An unrelated repairable defect: a sole missing assessment is refused
+    # without repair, because repair may not supply one (#925).
+    source_payload["unexpected_key"] = True
     source_candidate = (
         json.dumps(source_payload)
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -2404,7 +2406,9 @@ def test_terminal_plan_repair_provider_failure_does_not_persist_stale_diagnostic
     tmp_path, monkeypatch, outcome, returncode, expected_category
 ):
     payload = json.loads(structured_plan_state().split("\n", 1)[0])
-    payload.pop("architecture_impact")
+    # An unrelated repairable defect: a sole missing assessment is refused
+    # without repair, because repair may not supply one (#925).
+    payload["unexpected_key"] = True
     candidate = (
         json.dumps(payload)
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -2481,7 +2485,9 @@ def test_terminal_transient_plan_repair_is_resumable_provider_failure(
 ):
     """Issue #846: a chain ending in a transient agy failure is not deterministic."""
     payload = json.loads(structured_plan_state().split("\n", 1)[0])
-    payload.pop("architecture_impact")
+    # An unrelated repairable defect: a sole missing assessment is refused
+    # without repair, because repair may not supply one (#925).
+    payload["unexpected_key"] = True
     candidate = (
         json.dumps(payload)
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -4907,6 +4913,135 @@ def test_issue_loop_plan_first_resumes_with_only_missing_reviewer_for_current_pl
     assert runner.comments[-1].startswith("Planning complete for issue #56.")
 
 @pytest.mark.parametrize(
+    "persisted_as_machine", ["legacy", "promoted", "promoted-with-reviewer-notes"]
+)
+def test_issue_loop_plan_first_resume_clears_orchestrator_item_on_unanimous_approval(
+    tmp_path, persisted_as_machine
+):
+    """An orchestrator-authored plan item stays reviewer-clearable after resume (#1005).
+
+    Recovery used to promote it to an ``unknown`` machine obligation, which no
+    planning participant can clear, so every unanimous approval was followed by
+    another revision forever.  A ledger that already persisted the promoted
+    form must be recoverable too.
+    """
+    current_plan = "Revised plan.\n- Add state reconstruction.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    subject = _plan_subject(current_plan)
+    orchestrator_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Orchestrator",
+        source_round=1,
+        text="Reviewer(s) Codex approved without acknowledging the signed human requirements.",
+        status="blocking",
+        source_status="blocking",
+    )
+    if persisted_as_machine != "legacy":
+        notes = ("Synthetic machine record lacked trusted orchestrator lineage.",)
+        if persisted_as_machine == "promoted-with-reviewer-notes":
+            # Evidence appended by earlier approval rounds that could not clear it.
+            notes = (*notes, "Codex: Acknowledged in the revised plan.")
+        orchestrator_item = replace(
+            orchestrator_item,
+            authority="unknown",
+            obligation_kind="unknown",
+            lifecycle="repair_required",
+            obligation_identity="unknown:item-1",
+            notes=notes,
+        )
+    summary_comment = _attach_round_metadata(
+        "Orchestrator plan review.",
+        PostedRoundMetadata(
+            flow="plan",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject=subject,
+            new_items=(orchestrator_item,),
+        ),
+    )
+    coder_comment = _attach_round_metadata(
+        current_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=2,
+            subject=subject,
+            prior_items=(orchestrator_item,),
+        ),
+    )
+    runner = FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": summary_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:05:00Z", "body": coder_comment},
+        ],
+        codex_outputs=[
+            "Plan looks sound."
+            + prior_plan_item_dispositions("[item-1] resolved: acknowledged in the revised plan")
+            + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex",), max_rounds=3)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    agent_commands = [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
+    assert agent_commands == ["codex"]
+    assert runner.comments[-1].startswith("Planning complete for issue #56.")
+
+
+def test_issue_loop_plan_first_stops_when_only_unclearable_items_block_approval(tmp_path):
+    """A malformed plan machine record fails closed instead of revising forever (#1005).
+
+    Recovery restores only the recognized legacy promotion; any other machine
+    record (here the decoder's invalid-record blocker) must neither be cleared
+    by a reviewer approval nor drive another revision.
+    """
+    current_plan = "Revised plan.\n- Add state reconstruction.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    subject = _plan_subject(current_plan)
+    machine_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Orchestrator",
+        source_round=1,
+        text="Synthetic orchestrator blocker.",
+        status="blocking",
+        source_status="blocking",
+        authority="unknown",
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="invalid-machine-record",
+        notes=("Invalid persisted machine record: corrupted.",),
+    )
+    coder_comment = _attach_round_metadata(
+        current_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=2,
+            subject=subject,
+            prior_items=(machine_item,),
+        ),
+    )
+    runner = FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:05:00Z", "body": coder_comment},
+        ],
+        codex_outputs=[
+            "Plan looks sound."
+            + prior_plan_item_dispositions("[item-1] resolved: nothing remains")
+            + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex",), max_rounds=3)
+
+    with pytest.raises(AgentLoopError, match=r"item-1 \(owner Orchestrator, kind unknown\)"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+
+
+@pytest.mark.parametrize(
     "line",
     [
         "[item-1] same-plan: none",
@@ -7250,6 +7385,189 @@ def test_strict_pre_pr_number_rejection_directs_ordinary_discovery_without_reimp
     assert sum(
         command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
     ) == coder_calls
+
+
+@pytest.mark.parametrize(
+    ("protection_mode", "unreadable_waiver", "fresh_offered"),
+    [
+        ("unreadable", True, True),
+        ("unreadable", False, False),
+        ("voluntary", False, True),
+        ("plan_limited", False, True),
+    ],
+)
+def test_pre_pr_number_rejection_guidance_follows_the_state_specific_waiver(
+    tmp_path, monkeypatch, protection_mode, unreadable_waiver, fresh_offered,
+):
+    valid = structured_issue_implementation(
+        pr_number=77,
+        tests_run=["python3 -m pytest tests/test_managed_ci.py -q"],
+    )
+    payload, end = json.JSONDecoder().raw_decode(valid)
+    payload.pop("architecture_impact")
+    rejected = json.dumps(payload) + valid[end:]
+    runner = _IssueRecoveryWorkflowRunner(labeled=True, codex_outputs=[rejected])
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="claude",
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        allow_unreadable_protection=unreadable_waiver,
+        agent_max_retries=0,
+    )
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="agent-loop",
+        protection_mode=protection_mode,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *_a, **_k: (None, None, ()),
+    )
+
+    with pytest.raises(AgentLoopError, match="rejected before a PR number was accepted") as exc_info:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(exc_info.value)
+    assert "do not rerun implementation" in message
+    if fresh_offered:
+        assert "--managed-ci-fresh" in message
+        if protection_mode == "unreadable":
+            assert "--allow-unprotected-managed-ci --allow-unreadable-protection" in message
+        else:
+            assert "(including the unprotected waiver);" in message
+    else:
+        assert "--managed-ci-fresh" not in message
+        assert "Fresh authorization is unavailable" in message
+        assert "--allow-unreadable-protection" in message
+
+
+class _CloudSessionIssueRunner(_IssueRecoveryWorkflowRunner):
+    """Refuse the Actions variable and classic protection reads with gh 403s (#1040)."""
+
+    _REFUSED = {
+        "/actions/variables/AGENT_LOOP_MANAGED_ACTOR": (
+            "gh: Access to this GitHub Actions path is not permitted through this proxy (HTTP 403)\n"
+        ),
+        "/branches/main/protection/required_status_checks": (
+            "gh: Resource not accessible by integration (HTTP 403)\n"
+        ),
+    }
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next((part for part in args if part.startswith("repos/")), "")
+        for suffix, stderr in self._REFUSED.items():
+            if endpoint.endswith(suffix) and "--method" not in args:
+                recorded, cwd_path = self._record_command(args, cwd)
+                return CommandResult(recorded, cwd_path, "", stderr, 1)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+class _CloudSessionCreatingCoderRunner(_CloudSessionIssueRunner):
+    """The fake coder creates the reserved managed PR its prompt describes."""
+
+    def __init__(self, **kwargs):
+        super().__init__(labeled=False, **kwargs)
+        # No PR exists until the coder creates one.
+        self.pr_payload["body"] = "Fixes #56"
+        self.rest_pr["body"] = "Fixes #56"
+        self.created_pr_body = None
+
+    def _run_with_log_locked(self, args, *, cwd, log_path, check, input_text=None):
+        self._create_reserved_pr(args, input_text)
+        return super()._run_with_log_locked(
+            args, cwd=cwd, log_path=log_path, check=check, input_text=input_text,
+        )
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        self._create_reserved_pr(args, input_text)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    def _create_reserved_pr(self, args, input_text):
+        if [str(part) for part in args[:2]] == ["codex", "exec"] and self.created_pr_body is None:
+            prompt = " ".join(str(part) for part in args) + (input_text or "")
+            branch = re.search(r"reserved branch `([^`]+)`", prompt)
+            nonce = re.search(r"nonce=([A-Za-z0-9_-]+)", prompt)
+            assert branch is not None and branch.group(1) == "agent-loop/managed-56"
+            assert "gh pr create --draft --label agent-loop-managed" in prompt
+            assert nonce is not None
+            # Mirrors `gh pr create --draft --label agent-loop-managed --body-file`.
+            body = f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce.group(1)}"
+            self.created_pr_body = body
+            self.pr_payload["body"] = body
+            self.rest_pr["body"] = body
+            self.rest_pr["draft"] = True
+            self.rest_pr["labels"] = [{"name": "agent-loop-managed"}]
+
+
+@pytest.mark.parametrize("unreadable_waiver", [True, False])
+def test_cloud_session_issue_run_creates_reserved_managed_pr_only_with_both_waivers(
+    tmp_path, monkeypatch, capsys, unreadable_waiver,
+):
+    # The coder creates the reserved PR and reports it. Its legacy report is
+    # rejected only after the orchestrator has accepted the PR number,
+    # authenticated the opening tuple, and persisted the creation authorization.
+    runner = _CloudSessionCreatingCoderRunner(
+        codex_outputs=[
+            "Fixed issue.\nTests: python -m pytest https://live.example\n"
+            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n"
+            "-- OpenAI Codex"
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="claude",
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        allow_unreadable_protection=unreadable_waiver,
+    )
+
+    with pytest.raises(AgentLoopError) as exc_info:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(exc_info.value)
+    commands = [command for command, _cwd in runner.commands]
+    coder_calls = [command for command in commands if command[:2] == ["codex", "exec"]]
+    # The orchestrator itself never applies a label or dispatches: the coder
+    # creates the PR born draft and labeled.
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    records = [
+        parsed
+        for comment in runner.authorization_comments
+        if (parsed := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    if not unreadable_waiver:
+        assert "--allow-unreadable-protection" in message
+        assert "no PR was created" in message
+        assert coder_calls == []
+        assert runner.created_pr_body is None
+        assert records == []
+        assert runner.rest_pr["labels"] == []
+        assert not any("--method" in command for command in commands)
+        return
+
+    assert runner.created_pr_body is not None, message
+    assert re.search("authorization checkpoint.*persisted", message), (message, runner.created_pr_body)
+    assert len(coder_calls) == 1
+    assert runner.rest_pr["labels"] == [{"name": "agent-loop-managed"}]
+    body_nonce = runner.created_pr_body.rsplit("nonce=", 1)[1]
+    assert len(records) == 1
+    record = records[0]
+    assert (record.kind, record.pr_number, record.issue_number) == ("creation", 77, 56)
+    assert (record.protection, record.waiver) == ("unreadable", "allow-unreadable-protection")
+    assert record.nonce == body_nonce
+    assert record.actor_login == "agent-loop"
+    assert "--allow-unreadable-protection is also active" in capsys.readouterr().out
 
 
 def test_managed_issue_legacy_recovery_rejects_unexpected_closing_reference(
@@ -10380,6 +10698,304 @@ def test_get_issue_state_reads_with_check_disabled(tmp_path):
     assert seen["check"] is False
 
 
+# --- #925: the architecture_impact contract refusal seam ---------------------
+
+from coding_review_agent_loop.errors import AgentInvocationError as _DegInvocationError  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    validate_structured_coder_followup as _deg_validate_coder_followup,
+    validate_structured_plan_revision as _deg_validate_plan_revision,
+    validate_structured_task_result as _deg_validate_task_result,
+)
+from agent_loop_helpers import structured_coder_followup as _deg_coder_followup  # noqa: E402
+
+_DEG_CORROBORATED = {
+    "status": "modified",
+    "rationale": "The parser gains a degraded status.",
+    "affected_components": ["protocol parser"],
+    "dependencies": ["repair preservation"],
+    "execution_data_flows": ["response -> parser -> seam"],
+    "persistence": ["round metadata degradation records"],
+    "public_contracts": ["architecture_impact status"],
+    "security_boundaries": ["agent payload trust boundary"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the degraded status.",
+}
+_DEG_UNCORROBORATED = {"status": "modified", "rationale": "Something changed."}
+
+
+def _deg_with(rendered, impact, **extra):
+    split = rendered.index("}\n") + 1
+    payload = json.loads(rendered[:split])
+    if impact is None:
+        payload.pop("architecture_impact", None)
+    else:
+        payload["architecture_impact"] = impact
+    payload.update(extra)
+    return json.dumps(payload) + rendered[split:]
+
+
+def _deg_task_text(impact, outcome="opened_pr"):
+    payload = {
+        "schema_version": 1, "kind": "task_result", "state": "blocking",
+        "outcome": outcome, "summary": "Done.",
+    }
+    if outcome == "opened_pr":
+        payload["pr_number"] = 4
+    if impact is not None:
+        payload["architecture_impact"] = impact
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _deg_issue_validators():
+    """The opt-in degradable validate and its strict re-parse, as call sites build them."""
+    return orchestrator_module._architecture_mode_validators(
+        lambda mode: lambda text: orchestrator_module._validate_issue_implementation_response(
+            text, human_requirements=(), require_architecture_impact=True,
+            architecture_status_mode=mode,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "impact,records",
+    [(None, []), (_DEG_UNCORROBORATED, ["degraded-to-undetermined"])],
+    ids=["omitted", "uncorroborated"],
+)
+def test_seam_refuses_and_retains_an_unsatisfied_response(tmp_path, impact, records):
+    text = _deg_with(structured_issue_implementation(), impact)
+    runner = _FakeRunner(claude_outputs=[text])
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(_DegInvocationError) as error:
+        orchestrator_module._run_validated_agent(
+            runner, agent="claude", config=config, prompt="Implement.",
+            marker_description="structured issue_implementation result",
+            **_deg_issue_validators(),
+            require_architecture_impact_contract=True,
+        )
+
+    preserved = error.value.preserved_unsatisfied_response
+    assert preserved is not None and preserved.text == text
+    assert "issue_implementation must include architecture_impact" in preserved.diagnostic
+    assert "`changed` or `unchanged`" in preserved.diagnostic
+    assert [r.outcome for r in preserved.architecture_impact_degradations] == records
+    assert error.value.failure_category == "deterministic"
+    assert "architecture_impact" in str(error.value)
+    # The same retry budget as the former raise: one agent turn, no extras.
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]) == 1
+
+
+def test_seam_accepts_a_corroborated_near_miss_with_its_record(tmp_path):
+    text = _deg_with(structured_issue_implementation(), _DEG_CORROBORATED)
+    runner = _FakeRunner(claude_outputs=[text])
+    response = orchestrator_module._run_validated_agent(
+        runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+        prompt="Implement.", marker_description="structured issue_implementation result",
+        **_deg_issue_validators(), require_architecture_impact_contract=True,
+    )
+    assert response.marker_value.architecture_impact.status == "changed"
+    # The accepted text is canonical: it re-parses strictly and no longer
+    # carries the near miss.
+    assert '"modified"' not in response.text
+    assert validate_structured_issue_implementation(
+        response.text, required_architecture_impact_contract=1
+    ).architecture_impact.status == "changed"
+    assert [r.outcome for r in response.marker_value.architecture_impact_degradations] == [
+        "normalized-to-changed"
+    ]
+
+
+def test_unsatisfied_conflict_payload_is_not_hidden_by_the_conflict_wrapper():
+    blocked = [{"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "Blocked."}]
+    text = _deg_with(
+        structured_issue_implementation(
+            human_requirement_ids=["Requirement 1"], human_requirement_dispositions=blocked
+        ),
+        None,
+    )
+    # The typed conflict is raised only for a satisfied contract; an
+    # unsatisfied one returns the parsed payload for the seam to refuse.
+    result = validate_structured_issue_implementation(text, required_architecture_impact_contract=1)
+    assert result.pr_number == 77
+    assert orchestrator_module.architecture_impact_contract_unsatisfied(result)
+    # A conflict wrapper around an unsatisfied payload is still unsatisfied.
+    wrapped = orchestrator_module._TerminalIssueImplementationConflict(result)
+    assert orchestrator_module.architecture_impact_contract_unsatisfied(wrapped)
+
+
+def test_unsatisfied_blocking_task_is_not_hidden_by_the_no_pr_wrapper(tmp_path):
+    result = orchestrator_module._require_task_implementation_result(
+        _deg_task_text(None, outcome="blocking"), required_architecture_impact_contract=1, architecture_status_mode="legacy"
+    )
+    assert not isinstance(result, orchestrator_module._TerminalNoPrImplementation)
+    assert orchestrator_module.architecture_impact_contract_unsatisfied(result)
+    satisfied = orchestrator_module._require_task_implementation_result(
+        _deg_task_text({"status": "unchanged", "rationale": "No change."}, outcome="blocking"),
+        required_architecture_impact_contract=1, architecture_status_mode="legacy",
+    )
+    assert isinstance(satisfied, orchestrator_module._TerminalNoPrImplementation)
+
+    runner = _FakeRunner(claude_outputs=[_deg_task_text(None, outcome="blocking")])
+    with pytest.raises(_DegInvocationError) as error:
+        orchestrator_module._run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Task.", marker_description="structured task_result JSON",
+            validate=lambda text: orchestrator_module._require_task_implementation_result(
+                text, required_architecture_impact_contract=1, architecture_status_mode="legacy"
+            ),
+            require_architecture_impact_contract=True,
+        )
+    assert "task_result must include architecture_impact" in (
+        error.value.preserved_unsatisfied_response.diagnostic
+    )
+
+
+def test_unknown_result_type_fails_closed(tmp_path):
+    with pytest.raises(AgentLoopError, match="not an enumerated"):
+        orchestrator_module.architecture_impact_contract_unsatisfied(object())
+    with pytest.raises(AgentLoopError, match="not an enumerated"):
+        orchestrator_module._architecture_result_fields(object())
+    runner = _FakeRunner(claude_outputs=[structured_issue_implementation()])
+    with pytest.raises(_DegInvocationError, match="not an enumerated"):
+        orchestrator_module._run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+            prompt="Implement.", marker_description="result",
+            validate=lambda text: object(), require_architecture_impact_contract=True,
+        )
+    # Contract-free results pass through.
+    for value in ("clarification", 77, orchestrator_module._TerminalNoPrImplementation("clarification")):
+        assert orchestrator_module.architecture_impact_contract_unsatisfied(value) is False
+
+
+def test_metadata_writer_requires_the_whole_result():
+    config_like = SimpleNamespace(architecture_context=None)
+    with pytest.raises(TypeError):
+        orchestrator_module._architecture_metadata_fields(config_like, impact=None)
+
+
+@pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
+def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kind):
+    factory = structured_plan_state if kind == "plan_state" else structured_plan_revision
+    source = _deg_with(factory(), _DEG_UNCORROBORATED, unexpected_key=True)
+    repaired = _deg_with(factory(), None)
+    validators = orchestrator_module._architecture_mode_validators(
+        (lambda mode: lambda text: validate_structured_plan_state(
+            text, required_architecture_impact_contract=1, architecture_status_mode=mode))
+        if kind == "plan_state"
+        else (lambda mode: lambda text: _deg_validate_plan_revision(
+            text, required_architecture_impact_contract=1, architecture_status_mode=mode))
+    )
+    persisted = []
+    runner = _FakeRunner(claude_outputs=[source])
+    with patch.object(orchestrator_module, "attempt_repair", lambda raw, cmd, **kw: repaired):
+        with pytest.raises(_DegInvocationError) as error:
+            orchestrator_module._run_validated_agent(
+                runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
+                prompt="Plan.", marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+                **validators, use_repair=True, repair_expected_kind=kind,
+                require_architecture_impact_contract=True,
+                plan_validation_failure_handler=lambda exhaustion, err: persisted.append(exhaustion),
+            )
+
+    assert error.value.failure_category == "deterministic"
+    assert error.value.failure_category != "repair-provider-failure"
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None
+    assert exhaustion.candidate_kind == kind
+    assert exhaustion.candidate_text == repaired
+    assert exhaustion.candidate_digest == hashlib.sha256(repaired.encode()).hexdigest()
+    assert f"{kind} must include architecture_impact" in exhaustion.diagnostic
+    assert persisted == [exhaustion]
+    preserved = error.value.preserved_unsatisfied_response
+    # The retained candidate keeps its out-of-band record.
+    assert preserved.text == repaired
+    assert [r.outcome for r in preserved.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+    assert "undetermined" not in preserved.text
+
+
+def _deg_round_trip(result):
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+        **orchestrator_module._architecture_metadata_fields(
+            make_config_for_metadata(), result=result
+        ),
+    )
+    body = _attach_round_metadata("Coder round summary.\n-- Anthropic Claude", metadata)
+    return metadata, body, _decode_round_metadata(
+        re.search(r"AGENT_LOOP_META: ([A-Za-z0-9+/=_-]+)", body).group(1)
+    )
+
+
+def make_config_for_metadata():
+    return SimpleNamespace(architecture_context=None)
+
+
+@pytest.mark.parametrize(
+    "name,parse",
+    [
+        ("issue_implementation", lambda: validate_structured_issue_implementation(
+            _deg_with(structured_issue_implementation(), _DEG_CORROBORATED),
+            required_architecture_impact_contract=1, architecture_status_mode="degradable")),
+        ("task_result", lambda: _deg_validate_task_result(
+            _deg_task_text(_DEG_CORROBORATED), required_architecture_impact_contract=1,
+            architecture_status_mode="degradable")),
+        ("plan_state", lambda: validate_structured_plan_state(
+            _deg_with(structured_plan_state(), _DEG_CORROBORATED),
+            required_architecture_impact_contract=1, architecture_status_mode="degradable")),
+        ("plan_revision", lambda: _deg_validate_plan_revision(
+            _deg_with(structured_plan_revision(), _DEG_CORROBORATED),
+            required_architecture_impact_contract=1, architecture_status_mode="degradable")),
+        ("coder_followup", lambda: _deg_validate_coder_followup(
+            _deg_with(_deg_coder_followup(), _DEG_CORROBORATED),
+            required_architecture_impact_contract=1, architecture_status_mode="degradable")),
+    ],
+)
+def test_accepted_non_review_carrier_persists_and_renders_its_record(name, parse):
+    parsed = parse()
+    metadata, body, decoded = _deg_round_trip(parsed)
+    assert metadata.architecture_impact["status"] == "changed"
+    (record,) = decoded.architecture_impact_degradations
+    assert record == parsed.architecture_impact_degradations[0]
+    assert record.element_path == f"{name}.architecture_impact.status"
+    assert record.outcome == "normalized-to-changed"
+    assert "### Parse degradations" in body
+    assert "normalized-to-changed" in body
+
+
+def test_accepted_conflict_wrapper_persists_its_record():
+    parsed = validate_structured_issue_implementation(
+        _deg_with(structured_issue_implementation(), _DEG_CORROBORATED),
+        architecture_status_mode="degradable",
+    )
+    wrapped = orchestrator_module._TerminalIssueImplementationConflict(parsed)
+    fields = orchestrator_module._architecture_metadata_fields(make_config_for_metadata(), result=wrapped)
+    assert [r.outcome for r in fields["architecture_impact_degradations"]] == ["normalized-to-changed"]
+
+
+def test_plan_first_round_metadata_carries_a_corroborated_plan_state_record(tmp_path):
+    plan = _deg_with(structured_plan_state(summary="Add schema helpers."), _DEG_CORROBORATED)
+    runner = _FakeRunner(
+        claude_outputs=[plan],
+        codex_outputs=["Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path, plan_execution_mode="decompose-only", max_rounds=1)
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except (AgentLoopError, StopIteration, IndexError):
+        pass  # only the posted planning round matters here
+    bodies = [comment["body"] for comment in runner.issue_comments]
+    plan_rounds = [c for c in bodies if "AGENT_LOOP_META" in c and "### Parse degradations" in c]
+    assert plan_rounds, "the planning round must surface its degradation record"
+    decoded = _decode_round_metadata(
+        re.search(r"AGENT_LOOP_META: ([A-Za-z0-9+/=_-]+)", plan_rounds[0]).group(1)
+    )
+    assert [r.outcome for r in decoded.architecture_impact_degradations] == ["normalized-to-changed"]
+    assert decoded.architecture_impact["status"] == "changed"
+
+
 # ---------------------------------------------------------------------------
 # Approved child plan that fails the inherited check before any handoff (#936)
 # ---------------------------------------------------------------------------
@@ -10969,12 +11585,13 @@ def test_m948_overflow_the_digest_cannot_fix_fails_closed_and_posts_nothing(tmp_
         # Not in the transport spill set, so no presentation change can help.
         compact_prior_summaries=(_m948_noise("unspillable", 120_000),),
     )
-    body = _m948_assemble(
-        "plan_state", parsed, raw_text, config=config, ids=(), direct=False, metadata=metadata
-    )
     runner = FakeRunner()
+    # The final fit check (#886) refuses the digest during assembly, so no
+    # post is ever attempted.
     with pytest.raises(_m948_transport.RoundCommentOverflowError) as excinfo:
-        _m948_post_issue_comment(runner, config=config, issue_number=56, body=body)
+        _m948_assemble(
+            "plan_state", parsed, raw_text, config=config, ids=(), direct=False, metadata=metadata
+        )
     assert "compact_prior_summaries=" in str(excinfo.value)
     assert _m948_noise("unspillable", 64) not in str(excinfo.value)
     assert runner.issue_comments == []
@@ -11504,3 +12121,1253 @@ def test_board_amendment_reenters_a_reconciled_round_under_the_amended_board(tmp
     audits = [c["body"] for c in runner.issue_comments if "Reviewer board amendment applied." in c["body"]]
     assert len(audits) == 1 and "item-1 (Antigravity -> Codex)" in audits[0]
     assert "agy" not in _m943_reviewer_calls(runner)[len(calls_before):]
+
+
+# ---------------------------------------------------------------------------
+# #925 review round 2: contract retry, artifact and recovery routes, the
+# acceptance boundary, per-candidate repair refusal, and carriers
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.orchestrator import (  # noqa: E402
+    CompletionRecoveryPolicy as _r2_CompletionRecoveryPolicy,
+    _attempt_claude_completion_recovery as _r2_attempt_recovery,
+    _new_usage_context as _r2_new_usage_context,
+)
+from coding_review_agent_loop.protocol import ParsedPlanReview as _r2_ParsedPlanReview  # noqa: E402
+from coding_review_agent_loop.round_state import PostedRoundMetadata as _r2_Metadata  # noqa: E402
+from agent_loop_helpers import (  # noqa: E402
+    FakeRunner as _r2_FakeRunner,
+    structured_plan_review as _r2_plan_review,
+    structured_pr_review as _r2_pr_review,
+)
+
+
+def _r2_claude_prompts(runner):
+    return ["\n".join(cmd) for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+
+
+def _r2_run(runner, tmp_path, *, retries, **extra):
+    return orchestrator_module._run_validated_agent(
+        runner, agent="claude", config=make_config(tmp_path, agent_max_retries=retries),
+        prompt="Implement the issue.",
+        marker_description="structured issue_implementation result",
+        **_deg_issue_validators(), require_architecture_impact_contract=True, **extra,
+    )
+
+
+@pytest.mark.parametrize("impact", [None, _DEG_UNCORROBORATED], ids=["omitted", "uncorroborated"])
+def test_unsatisfied_contract_retries_once_with_a_field_naming_reprompt(tmp_path, impact):
+    unsatisfied = _deg_with(structured_issue_implementation(), impact)
+    valid = structured_issue_implementation()
+    runner = _r2_FakeRunner(claude_outputs=[unsatisfied, valid])
+
+    response = _r2_run(runner, tmp_path, retries=1)
+
+    assert response.marker_value.architecture_impact.status in {"changed", "unchanged"}
+    first, second = _r2_claude_prompts(runner)
+    assert "Previous response not accepted: architecture_impact" not in first
+    assert "Previous response not accepted: architecture_impact" in second
+    for token in ("architecture_impact", "`changed`", "`unchanged`"):
+        assert token in second
+    section = orchestrator_module._architecture_contract_retry_prompt(
+        "P", "<!-- AGENT_STATE: approved --> " + "x" * 5000
+    )
+    assert "<!--" not in section and len(section) < 2000
+
+
+def test_always_unsatisfied_contract_stops_after_the_existing_budget(tmp_path):
+    unsatisfied = _deg_with(structured_issue_implementation(), None)
+    runner = _r2_FakeRunner(claude_outputs=[unsatisfied, unsatisfied, unsatisfied, unsatisfied])
+
+    with pytest.raises(_DegInvocationError) as error:
+        _r2_run(runner, tmp_path, retries=2)
+
+    assert len(_r2_claude_prompts(runner)) == 3  # agent_max_retries + 1
+    assert error.value.failure_category == "deterministic"
+    assert error.value.preserved_unsatisfied_response.text == unsatisfied
+
+
+def test_contract_only_failure_makes_no_repair_invocation(tmp_path):
+    calls = []
+    unsatisfied = _deg_with(structured_issue_implementation(), None)
+    runner = _r2_FakeRunner(claude_outputs=[unsatisfied])
+    with patch.object(
+        orchestrator_module, "attempt_repair", lambda raw, cmd, **kw: calls.append(raw)
+    ):
+        with pytest.raises(_DegInvocationError):
+            _r2_run(runner, tmp_path, retries=0, use_repair=True,
+                    repair_expected_kind="issue_implementation")
+    assert calls == []
+
+
+@pytest.mark.parametrize("returncode", [1, None], ids=["nonzero", "timeout"])
+def test_unsatisfied_response_file_artifact_is_a_deterministic_contract_retry(tmp_path, returncode):
+    artifact = _deg_with(structured_issue_implementation(), None)
+    valid = structured_issue_implementation()
+    runner = _r2_FakeRunner(
+        claude_outputs=[("provider diagnostics only", returncode), valid],
+        public_response_outputs=[artifact],
+    )
+    usage = _r2_new_usage_context(make_config(tmp_path))
+
+    response = _r2_run(runner, tmp_path, retries=1, usage_context=usage)
+
+    assert response.marker_value.architecture_impact is not None
+    prompts = _r2_claude_prompts(runner)
+    assert len(prompts) == 2
+    assert "Previous response not accepted: architecture_impact" in prompts[1]
+    first_record = usage.records[0]
+    assert first_record.validation_status == "invalid"
+
+
+@pytest.mark.parametrize("returncode", [1, None], ids=["nonzero", "timeout"])
+def test_unsatisfied_artifact_exhaustion_preserves_the_artifact(tmp_path, returncode):
+    artifact = _deg_with(structured_issue_implementation(), _DEG_UNCORROBORATED)
+    runner = _r2_FakeRunner(
+        claude_outputs=[("provider diagnostics only", returncode)],
+        public_response_outputs=[artifact],
+    )
+    with pytest.raises(_DegInvocationError) as error:
+        _r2_run(runner, tmp_path, retries=0)
+    assert error.value.failure_category == "deterministic"
+    preserved = error.value.preserved_unsatisfied_response
+    assert preserved.text == artifact
+    assert [r.outcome for r in preserved.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+
+
+@pytest.mark.parametrize("returncode", [1, None], ids=["nonzero", "timeout"])
+def test_artifact_canonicalization_failure_is_deterministic_not_transport(tmp_path, returncode):
+    # A corroborated `modified` artifact parses with a record, but its strict
+    # re-parse fails the canonical comparison: the attempt keeps the
+    # canonicalization diagnostic and is never classified as a timeout or
+    # command failure, nor as an unsatisfied architecture contract.
+    artifact = _deg_with(structured_issue_implementation(), _DEG_CORROBORATED)
+    mismatched = validate_structured_issue_implementation(
+        _deg_with(structured_issue_implementation(pr_number=99), dict(_DEG_CORROBORATED, status="changed"))
+    )
+    runner = _r2_FakeRunner(
+        claude_outputs=[("provider diagnostics only", returncode)],
+        public_response_outputs=[artifact],
+    )
+    usage = _r2_new_usage_context(make_config(tmp_path))
+    validators = dict(_deg_issue_validators(), strict_revalidate=lambda _text: mismatched)
+    with pytest.raises(_DegInvocationError) as error:
+        orchestrator_module._run_validated_agent(
+            runner, agent="claude", config=make_config(tmp_path, agent_max_retries=1),
+            prompt="Implement the issue.",
+            marker_description="structured issue_implementation result",
+            **validators, require_architecture_impact_contract=True, usage_context=usage,
+        )
+    assert error.value.failure_category == "deterministic"
+    reason = str(error.value).split("Reason: ", 1)[1].split(". Required marker", 1)[0]
+    assert reason.startswith("Accepted-text canonicalization failed")
+    assert "timed out" not in reason and "exited with" not in reason
+    assert "architecture_impact" not in reason
+    assert error.value.preserved_unsatisfied_response is None
+    assert len(_r2_claude_prompts(runner)) == 1
+    assert usage.records[0].validation_status == "invalid"
+
+
+def test_metadata_helper_rejects_an_unlisted_assessment_bearing_object():
+    # An object carrying an assessment but outside the enumerated carriers is
+    # never persisted as fully assessed with its records silently dropped.
+    impostor = SimpleNamespace(
+        architecture_impact=validate_structured_issue_implementation(
+            _deg_with(structured_issue_implementation(), _DEG_CORROBORATED),
+            architecture_status_mode="degradable",
+        ).architecture_impact,
+        architecture_impact_degradations=(),
+    )
+    with pytest.raises(AgentLoopError, match="not an enumerated"):
+        orchestrator_module._architecture_result_fields(impostor)
+    with pytest.raises(AgentLoopError, match="not an enumerated"):
+        orchestrator_module._architecture_metadata_fields(
+            make_config_for_metadata(), result=impostor
+        )
+
+
+@pytest.mark.parametrize("form", ["artifact", "text"])
+def test_completion_recovery_routes_an_unsatisfied_contract_to_the_ordinary_retry(tmp_path, form):
+    unsatisfied = _deg_with(structured_issue_implementation(), None)
+    if form == "artifact":
+        runner = _r2_FakeRunner(
+            claude_outputs=[("still running", 1)], public_response_outputs=[unsatisfied]
+        )
+    else:
+        runner = _r2_FakeRunner(claude_outputs=[unsatisfied])
+    validators = _deg_issue_validators()
+
+    def refusing(text):
+        parsed = validators["validate"](text)
+        if orchestrator_module.architecture_impact_contract_unsatisfied(parsed):
+            raise orchestrator_module._ArchitectureImpactContractUnsatisfied(
+                orchestrator_module._architecture_contract_diagnostic(parsed)
+            )
+        return parsed
+
+    config = make_config(tmp_path, coder="claude")
+    outcome = _r2_attempt_recovery(
+        runner, config=config, completion_recovery=_r2_CompletionRecoveryPolicy(issue_number=56),
+        session_id="sess-1", validate=refusing, usage_context=_r2_new_usage_context(config),
+        run_id="run-1", role=None, label=None, timeout_seconds=None,
+    )
+    assert outcome.validated is None
+    assert outcome.contract_unsatisfied is True
+    assert outcome.failure_category == "deterministic"
+    assert outcome.terminal_public_response is None
+    assert "architecture_impact" in outcome.error
+    assert runner.comments == []
+
+
+def test_accepted_uncorroborated_review_text_drops_the_assessment(tmp_path):
+    text = _deg_with(_r2_plan_review(), _DEG_UNCORROBORATED)
+    runner = _r2_FakeRunner(codex_outputs=[text])
+    validators = orchestrator_module._architecture_mode_validators(
+        lambda mode: lambda candidate: orchestrator_module._validate_plan_review_response(
+            candidate, reviewer="OpenAI Codex", unresolved_items=(),
+            architecture_status_mode=mode,
+        )
+    )
+    response = orchestrator_module._run_validated_agent(
+        runner, agent="codex", config=make_config(tmp_path, agent_max_retries=0),
+        prompt="Review.", marker_description="plan review", **validators,
+    )
+    assert response.marker_value.architecture_impact is None
+    (record,) = response.marker_value.architecture_impact_degradations
+    assert record.outcome == "degraded-to-undetermined"
+    assert "architecture_impact" not in json.loads(response.text.split("\n<!--", 1)[0])
+    assert response.text.rstrip().endswith("-- OpenAI Codex")
+    # The accepted text passes every strict re-parse.
+    strict = orchestrator_module._validate_plan_review_response(
+        response.text, reviewer="OpenAI Codex", unresolved_items=(),
+        architecture_status_mode="strict",
+    )
+    assert strict.architecture_impact is None
+
+
+def test_record_free_candidates_pass_the_boundary_byte_identical(tmp_path):
+    parsed = validate_structured_issue_implementation(structured_issue_implementation())
+    accepted = orchestrator_module._accept_candidate(
+        structured_issue_implementation(), parsed,
+        strict_revalidate=None, runner=None, acquisition=None,
+    )
+    assert accepted.text == structured_issue_implementation()
+    assert accepted.marker_value is parsed
+
+
+def test_projection_mismatch_is_refused_rather_than_accepted():
+    text = _deg_with(structured_issue_implementation(), _DEG_CORROBORATED)
+    degraded = validate_structured_issue_implementation(text, architecture_status_mode="degradable")
+    other = validate_structured_issue_implementation(
+        _deg_with(structured_issue_implementation(pr_number=99), dict(_DEG_CORROBORATED, status="changed"))
+    )
+    with pytest.raises(orchestrator_module._AcceptedTextCanonicalizationError):
+        orchestrator_module._accept_candidate(
+            text, degraded, strict_revalidate=lambda _text: other, runner=None, acquisition=None,
+        )
+
+
+def test_degrade_flag_without_a_strict_reparse_fails_closed(tmp_path):
+    with pytest.raises(AgentLoopError, match="strict re-parse"):
+        orchestrator_module._run_validated_agent(
+            _r2_FakeRunner(), agent="claude", config=make_config(tmp_path),
+            prompt="x", marker_description="x", validate=lambda text: text,
+            degrade_architecture_impact=True,
+        )
+
+
+def test_satisfied_blocking_task_keeps_its_payload_and_records():
+    text = _deg_task_text(_DEG_CORROBORATED, outcome="blocking")
+    result = orchestrator_module._require_task_implementation_result(
+        text, required_architecture_impact_contract=1, architecture_status_mode="degradable"
+    )
+    assert isinstance(result, orchestrator_module._TerminalNoPrImplementation)
+    assert result.state == "blocking"
+    assert result.parsed.architecture_impact.status == "changed"
+    fields = orchestrator_module._architecture_metadata_fields(
+        make_config_for_metadata(), result=result
+    )
+    assert fields["architecture_impact"]["status"] == "changed"
+    assert [r.outcome for r in fields["architecture_impact_degradations"]] == ["normalized-to-changed"]
+    # The accepted text is canonical and the wrapper survives the boundary.
+    accepted = orchestrator_module._accept_candidate(
+        text, result,
+        strict_revalidate=lambda candidate: orchestrator_module._require_task_implementation_result(
+            candidate, required_architecture_impact_contract=1, architecture_status_mode="strict"
+        ),
+        runner=None, acquisition=None,
+    )
+    assert isinstance(accepted.marker_value, orchestrator_module._TerminalNoPrImplementation)
+    assert '"modified"' not in accepted.text
+    assert accepted.marker_value.parsed.architecture_impact_degradations == (
+        result.parsed.architecture_impact_degradations
+    )
+
+
+@pytest.mark.parametrize("kind", ["plan", "pr"])
+def test_carried_item_review_rebuild_keeps_every_parsed_field(kind):
+    item = SimpleNamespace(item_id="item-1", status="blocking", reviewer="Codex", text="Fix it.")
+    dispositions = [{"item_id": "item-1", "disposition": "resolved", "note": "Fixed."}]
+    rendered = (
+        _r2_plan_review(prior_plan_item_dispositions=dispositions)
+        if kind == "plan" else _r2_pr_review(prior_item_dispositions=dispositions)
+    )
+    text = _deg_with(rendered, _DEG_CORROBORATED)
+    helper = (
+        orchestrator_module._validate_plan_review_response
+        if kind == "plan" else orchestrator_module._validate_review_response
+    )
+    with_items = helper(
+        text, reviewer="OpenAI Codex", unresolved_items=[item], architecture_status_mode="degradable"
+    )
+    assert with_items.architecture_impact.status == "changed"
+    assert [r.outcome for r in with_items.architecture_impact_degradations] == ["normalized-to-changed"]
+    assert [d.item_id for d in with_items.dispositions] == ["item-1"]
+
+
+def test_refused_decomposition_posts_one_comment_and_never_masks_the_error(tmp_path):
+    runner = _r2_FakeRunner()
+    error = _DegInvocationError(
+        "exhausted",
+        preserved_unsatisfied_response=orchestrator_module.PreservedUnsatisfiedResponse(
+            text="{}", diagnostic="plan_decomposition must include architecture_impact",
+            architecture_impact_degradations=(),
+        ),
+    )
+    orchestrator_module._surface_refused_decomposition(
+        runner, config=make_config(tmp_path), issue_number=56, error=error
+    )
+    bodies = [c["body"] for c in runner.issue_comments]
+    assert len(bodies) == 1
+    assert "Decomposition parse degradations" in bodies[0]
+    assert "omitted" in bodies[0]
+    assert "AGENT_LOOP_META" not in bodies[0]
+
+    def failing_post(*args, **kwargs):
+        raise RuntimeError("GitHub unavailable")
+
+    with patch.object(orchestrator_module, "post_issue_comment", failing_post):
+        orchestrator_module._surface_refused_decomposition(
+            runner, config=make_config(tmp_path), issue_number=56, error=error
+        )
+
+
+def test_resumed_review_architecture_comes_from_round_metadata():
+    impact = validate_structured_issue_implementation(
+        _deg_with(structured_issue_implementation(), dict(_DEG_CORROBORATED, status="changed"))
+    ).architecture_impact
+    record = orchestrator_module.ParseDegradation.build(
+        element_path="plan_review.architecture_impact.status", rule="r",
+        observed="modified", outcome="normalized-to-changed",
+    )
+    metadata = SimpleNamespace(
+        architecture_contract_version=1,
+        architecture_impact=orchestrator_module.sanitize_architecture_impact(impact),
+        architecture_impact_degradations=(record,),
+    )
+    rebuilt, records = orchestrator_module._resumed_review_architecture(metadata, None)
+    assert rebuilt == impact
+    assert records == (record,)
+    # A degraded review stored no assessment: it stays absent, with its record.
+    degraded = SimpleNamespace(
+        architecture_contract_version=1, architecture_impact=None,
+        architecture_impact_degradations=(record,),
+    )
+    assert orchestrator_module._resumed_review_architecture(degraded, impact) == (None, (record,))
+    # Wrong keys or a non-declared status never fabricate an assessment.
+    bad = dict(orchestrator_module.sanitize_architecture_impact(impact), status="undetermined")
+    assert orchestrator_module._architecture_impact_from_metadata(bad) is None
+    assert orchestrator_module._architecture_impact_from_metadata({"status": "changed"}) is None
+    # A record older than architecture metadata falls back to its text.
+    legacy = SimpleNamespace(architecture_contract_version=None)
+    assert orchestrator_module._resumed_review_architecture(legacy, impact) == (impact, ())
+
+
+def test_acknowledgement_repair_pins_the_accepted_assessment(tmp_path):
+    record = orchestrator_module.ParseDegradation.build(
+        element_path="pr_review.architecture_impact.status", rule="r",
+        observed="modified", outcome="degraded-to-undetermined",
+    )
+    accepted = SimpleNamespace(architecture_impact=None, architecture_impact_degradations=(record,))
+    fabricated = orchestrator_module._validate_review_response(
+        _deg_with(_r2_pr_review(), {"status": "unchanged", "rationale": "No change."}),
+        reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="strict",
+    )
+    config = make_config(tmp_path)
+    assert orchestrator_module._pin_acknowledgement_repair(
+        accepted, fabricated, config=config, reviewer_name="Codex"
+    ) is None
+    ack_only = orchestrator_module._validate_review_response(
+        _deg_with(_r2_pr_review(), None),
+        reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="strict",
+    )
+    pinned = orchestrator_module._pin_acknowledgement_repair(
+        accepted, ack_only, config=config, reviewer_name="Codex"
+    )
+    assert pinned.architecture_impact is None
+    assert pinned.architecture_impact_degradations == (record,)
+    # Absence is pinned for the repair when the accepted source has none.
+    assert orchestrator_module._acknowledgement_repair_forbids_assessment(_deg_with(_r2_pr_review(), None))
+    # New repair output is validated strictly: a legacy synonym is rejected.
+    with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
+        orchestrator_module._validate_review_response(
+            _deg_with(_r2_pr_review(), {"status": "none", "rationale": "No change."}),
+            reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="strict",
+        )
+
+
+def test_refused_repair_candidate_is_decided_per_candidate_before_success(tmp_path):
+    """A pinned refusal stops the chain and never counts as a success."""
+    from coding_review_agent_loop.repair import CandidateDecision, execute_repair
+    from test_cli_repair import RepairRunner
+
+    source = _deg_with(structured_issue_implementation(), None, unexpected_key=True)
+    candidate = _deg_with(structured_issue_implementation(), None)
+    config = make_config(
+        tmp_path, repair_backend="claude", repair_models=("model-a", "model-b")
+    )
+    usage = _r2_new_usage_context(config)
+    parse = lambda text: validate_structured_issue_implementation(  # noqa: E731
+        text, required_architecture_impact_contract=1, architecture_status_mode="degradable"
+    )
+    runner = RepairRunner([(candidate, 0), (candidate, 0)])
+    repaired, parsed, attempts = execute_repair(
+        source, runner=runner, config=config, run_id=None, usage_context=usage,
+        validate=parse, forbid_architecture_impact=True,
+        candidate_refusal=lambda output, result: CandidateDecision(
+            parsed=result, refusal="issue_implementation must include architecture_impact"
+        ),
+        expected_kind="issue_implementation",
+    )
+    assert (repaired, parsed) == (None, None)
+    assert [a.outcome for a in attempts] == ["architecture_contract_unsatisfied"]
+    assert attempts[0].fallback_planned is False
+    assert attempts[0].validation_result is not None
+    (record,) = usage.records
+    assert record.outcome == "architecture_contract_unsatisfied"
+    assert record.validation_status == "invalid"
+
+
+# --- #925 round 5: acknowledgement repairs through the real planning flow ----
+
+
+def _ack_staged_run(
+    tmp_path, monkeypatch, *, repaired_impact, repaired_status=None, max_rounds=None
+):
+    """Run staged planning whose primary approves with a degraded assessment.
+
+    The primary's review carries an uncorroborated `modified`, so acceptance
+    removes the assessment and records the degradation; it also lacks the
+    signed-human acknowledgement, which the post-acceptance repair adds.
+    """
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    unacknowledged = _deg_with(unacknowledged, _DEG_UNCORROBORATED)
+    if repaired_status is not None:
+        repaired_impact = {"status": repaired_status, "rationale": "No architectural change."}
+    repaired = _deg_with(repaired, repaired_impact)
+    runner = _FakeRunner(
+        claude_outputs=[plan_output] * 4,
+        codex_outputs=[unacknowledged] * 4,
+        gemini_outputs=[panel] * 4,
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    repair_calls = []
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    outcome = None
+    repair_results = []
+    real_structured_repair = orchestrator_module._run_structured_repair
+
+    def spy_repair(*args, **kwargs):
+        result = real_structured_repair(*args, **kwargs)
+        repair_results.append(result)
+        return result
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator_module, "_run_structured_repair", spy_repair
+    ):
+        try:
+            outcome = run_issue_loop(
+                runner, issue_number=56,
+                config=(
+                    _staged_plan_config(tmp_path)
+                    if max_rounds is None
+                    else _staged_plan_config(tmp_path, max_rounds=max_rounds)
+                ),
+                plan_first=True,
+            )
+        except AgentLoopError as exc:
+            outcome = exc
+    codex_records = [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    _ack_staged_run.repair_results = repair_results
+    return outcome, codex_records, repair_calls, requirement
+
+
+def test_staged_acknowledgement_repair_keeps_the_degraded_assessment_and_record(
+    tmp_path, monkeypatch
+):
+    outcome, codex_records, repair_calls, requirement = _ack_staged_run(
+        tmp_path, monkeypatch, repaired_impact=None
+    )
+    assert outcome == 0
+    assert repair_calls, "the acknowledgement repair must run through the flow"
+    # The repair source is the canonical accepted text: the degraded
+    # assessment was already removed at acceptance.
+    assert '"modified"' not in repair_calls[0]
+    # Both the first record and the superseding re-post carry a null
+    # assessment plus the original degradation record.
+    assert len(codex_records) >= 2
+    for record in codex_records:
+        assert record.architecture_impact is None
+        assert [r.outcome for r in record.architecture_impact_degradations] == [
+            "degraded-to-undetermined"
+        ]
+    assert codex_records[-1].surfaced_reviewer_requirement_ids == (requirement.requirement_id,)
+
+
+_ACK_REFUSAL = {"unchanged": "must not introduce one", "none": "must be `changed` or `unchanged`"}
+
+
+def _assert_refused_by(repair_results, status):
+    assert repair_results
+    for _text, validated, attempts in repair_results:
+        assert validated is None
+        assert _ACK_REFUSAL[status] in attempts[-1].diagnostic
+
+
+@pytest.mark.parametrize("status", ["unchanged", "none"])
+def test_staged_acknowledgement_repair_cannot_add_an_assessment(tmp_path, monkeypatch, status):
+    outcome, codex_records, repair_calls, _requirement = _ack_staged_run(
+        tmp_path, monkeypatch, repaired_impact=None, repaired_status=status, max_rounds=1
+    )
+    assert repair_calls, "the acknowledgement repair must run through the flow"
+    # The refusal comes from the absence pin or strict validation.
+    _assert_refused_by(_ack_staged_run.repair_results, status)
+    # The refused repair is never published: no record asserts an assessment,
+    # and the primary's approval is never carried as acknowledged.
+    assert outcome != 0
+    for record in codex_records:
+        assert record.architecture_impact is None
+        assert record.surfaced_reviewer_requirement_ids == ()
+
+
+def _ack_nonstaged_run(tmp_path, monkeypatch, *, repaired_status=None):
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    unacknowledged = _deg_with(unacknowledged, _DEG_UNCORROBORATED)
+    repaired = _deg_with(
+        repaired,
+        None if repaired_status is None
+        else {"status": repaired_status, "rationale": "No architectural change."},
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output] * 4,
+        codex_outputs=[unacknowledged] * 4,
+        gemini_outputs=[panel] * 4,
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    repair_calls = []
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
+        agent_max_retries=0, agent_retry_backoff_seconds=0,
+    )
+    repair_results = []
+    real_structured_repair = orchestrator_module._run_structured_repair
+
+    def spy_repair(*args, **kwargs):
+        result = real_structured_repair(*args, **kwargs)
+        repair_results.append(result)
+        return result
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator_module, "_run_structured_repair", spy_repair
+    ):
+        try:
+            outcome = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        except AgentLoopError as exc:
+            outcome = exc
+    codex_records = [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    _ack_nonstaged_run.repair_results = repair_results
+    return outcome, codex_records, repair_calls
+
+
+def test_nonstaged_acknowledgement_repair_posts_one_comment_with_the_record(
+    tmp_path, monkeypatch
+):
+    outcome, codex_records, repair_calls = _ack_nonstaged_run(tmp_path, monkeypatch)
+    assert outcome == 0, outcome
+    assert repair_calls, "the acknowledgement repair must run through the flow"
+    # The comment posted before the gate, from the accepted carrier, is the
+    # only reviewer publication; a successful repair posts nothing new.
+    assert len(codex_records) == 1
+    (record,) = codex_records
+    assert record.architecture_impact is None
+    assert [r.outcome for r in record.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+
+
+@pytest.mark.parametrize("status", ["unchanged", "none"])
+def test_nonstaged_acknowledgement_repair_cannot_add_an_assessment(
+    tmp_path, monkeypatch, status
+):
+    outcome, codex_records, repair_calls = _ack_nonstaged_run(
+        tmp_path, monkeypatch, repaired_status=status
+    )
+    assert repair_calls
+    _assert_refused_by(_ack_nonstaged_run.repair_results, status)
+    assert outcome != 0
+    assert len(codex_records) == 1
+    assert codex_records[0].architecture_impact is None
+
+
+
+
+def _ack_plan_resume_run(tmp_path, monkeypatch, *, parallel, codex_impact, repaired_impact):
+    """Interrupt a plan round at its acknowledgement repair, then resume it.
+
+    ``parallel`` selects the early-publication path, whose record stores the
+    canonical JSON response; otherwise the record is an authoritative
+    rendered-prose post.
+    """
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    unacknowledged = _deg_with(unacknowledged, codex_impact)
+    repaired = _deg_with(repaired, repaired_impact)
+    runner = _FakeRunner(
+        claude_outputs=[plan_output] * 4,
+        codex_outputs=[unacknowledged] * 4,
+        gemini_outputs=[panel] * 4,
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
+        agent_max_retries=0, agent_retry_backoff_seconds=0, review_parallel=parallel,
+    )
+
+    def interrupt(raw, cmd, **kwargs):
+        raise KeyboardInterrupt
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    agents_before = [cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"claude", "codex", "gemini"}]
+
+    carriers, pinned, repair_results, repair_calls = [], [], [], []
+    real_pin = orchestrator_module._pin_acknowledgement_repair
+    real_structured_repair = orchestrator_module._run_structured_repair
+
+    def spy_pin(accepted, repaired_value, **kwargs):
+        carriers.append(accepted)
+        result = real_pin(accepted, repaired_value, **kwargs)
+        pinned.append((repaired_value, result))
+        return result
+
+    def spy_repair(*args, **kwargs):
+        result = real_structured_repair(*args, **kwargs)
+        repair_results.append(result)
+        return result
+
+    def fake_repair(raw, cmd, **kwargs):
+        repair_calls.append(raw)
+        return repaired
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
+        orchestrator_module, "_pin_acknowledgement_repair", spy_pin
+    ), patch.object(orchestrator_module, "_run_structured_repair", spy_repair):
+        try:
+            outcome = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        except AgentLoopError as exc:
+            outcome = exc
+    agents_after = [cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"claude", "codex", "gemini"}]
+    records = [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    return SimpleNamespace(
+        outcome=outcome, carriers=carriers, pinned=pinned, repair_results=repair_results,
+        repair_calls=repair_calls, records=records,
+        resumed_without_reinvocation=agents_before == agents_after,
+    )
+
+
+def _assert_degraded_carrier(carrier):
+    assert carrier.architecture_impact is None
+    assert [r.outcome for r in carrier.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+
+
+def test_resumed_authoritative_plan_review_keeps_metadata_carrier_and_is_not_repaired(
+    tmp_path, monkeypatch
+):
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=False,
+        codex_impact=_DEG_UNCORROBORATED, repaired_impact=None,
+    )
+    assert run.resumed_without_reinvocation
+    assert [record.phase for record in run.records] == ["authoritative"]
+    # The carrier is rebuilt from round metadata, never from rendered prose.
+    (carrier,) = run.carriers
+    _assert_degraded_carrier(carrier)
+    # The existing substance gate refuses the prose source before any repair
+    # model runs, and nothing new is posted for the reviewer.
+    assert run.repair_calls == []
+    assert run.outcome != 0
+    assert len(run.records) == 1
+
+
+def test_resumed_publication_plan_review_accepts_acknowledgement_only_repair(
+    tmp_path, monkeypatch
+):
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=True,
+        codex_impact=_DEG_UNCORROBORATED, repaired_impact=None,
+    )
+    assert run.resumed_without_reinvocation
+    assert [record.phase for record in run.records] == ["publication"]
+    (carrier,) = run.carriers
+    _assert_degraded_carrier(carrier)
+    assert len(run.repair_calls) == 1
+    assert '"modified"' not in run.repair_calls[0]
+    ((_repaired, pinned),) = run.pinned
+    _assert_degraded_carrier(pinned)
+    assert run.outcome == 0
+
+
+@pytest.mark.parametrize(
+    "status,diagnostic",
+    [("unchanged", "must not introduce one"), ("none", "must be `changed` or `unchanged`")],
+)
+def test_resumed_publication_plan_review_repair_cannot_add_an_assessment(
+    tmp_path, monkeypatch, status, diagnostic
+):
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=True, codex_impact=_DEG_UNCORROBORATED,
+        repaired_impact={"status": status, "rationale": "No architectural change."},
+    )
+    assert run.resumed_without_reinvocation
+    (carrier,) = run.carriers
+    _assert_degraded_carrier(carrier)
+    # The refusal comes from the absence pin (or, for `none`, from strict
+    # validation of the new repair output), not from an unrelated failure.
+    ((_text, validated, attempts),) = run.repair_results
+    assert validated is None
+    assert diagnostic in attempts[-1].diagnostic
+    assert run.outcome != 0
+    assert all(record.architecture_impact is None for record in run.records)
+
+
+def test_resumed_publication_corroborated_review_refuses_a_changed_assessment(
+    tmp_path, monkeypatch
+):
+    # A corroborated `modified` is accepted as `changed` with its record.  A
+    # repair that rewrites the accepted assessment is refused; the accepted
+    # status is pinned in preservation, and the equality check backs it up.
+    changed = dict(_DEG_CORROBORATED, status="unchanged")
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=True,
+        codex_impact=_DEG_CORROBORATED, repaired_impact=changed,
+    )
+    (carrier,) = run.carriers
+    assert carrier.architecture_impact.status == "changed"
+    assert [r.outcome for r in carrier.architecture_impact_degradations] == [
+        "normalized-to-changed"
+    ]
+    ((_text, validated, attempts),) = run.repair_results
+    assert validated is None
+    assert "architecture_impact.status" in attempts[-1].diagnostic
+    ((_repaired, pinned),) = run.pinned
+    assert pinned is None
+    assert run.outcome != 0
+    assert all(
+        record.architecture_impact is None or record.architecture_impact["status"] == "changed"
+        for record in run.records
+    )
+
+
+def test_acknowledgement_equality_check_refuses_a_changed_assessment_directly(tmp_path):
+    # Defense in depth behind preservation: any durable difference fails.
+    accepted = validate_structured_plan_state(
+        _deg_with(structured_plan_state(), dict(_DEG_CORROBORATED, status="changed"))
+    )
+    altered = replace(
+        accepted,
+        architecture_impact=replace(accepted.architecture_impact, rationale="Different."),
+    )
+    assert orchestrator_module._pin_acknowledgement_repair(
+        accepted, altered, config=make_config(tmp_path), reviewer_name="Codex"
+    ) is None
+
+
+def test_resumed_publication_genuine_omission_cannot_gain_an_assessment(
+    tmp_path, monkeypatch
+):
+    run = _ack_plan_resume_run(
+        tmp_path, monkeypatch, parallel=True, codex_impact=None,
+        repaired_impact={"status": "unchanged", "rationale": "No architectural change."},
+    )
+    (carrier,) = run.carriers
+    assert carrier.architecture_impact is None
+    assert carrier.architecture_impact_degradations == ()
+    ((_text, validated, attempts),) = run.repair_results
+    assert validated is None
+    assert "must not introduce one" in attempts[-1].diagnostic
+    assert run.outcome != 0
+
+
+# --- #1047: retained managed label after manual qualification -----------------
+
+import coding_review_agent_loop.managed_ci as _m1047_managed_ci  # noqa: E402
+from coding_review_agent_loop.config import github_bootstrap_cwd as _m1047_bootstrap_cwd  # noqa: E402
+from coding_review_agent_loop.orchestrator import run_pr_loop as _m1047_run_pr_loop  # noqa: E402
+
+_M1047_DELETE = [
+    "gh", "api", "--method", "DELETE",
+    "repos/OWNER/REPO/issues/77/labels/agent-loop-managed",
+]
+
+
+class _M1047Stop(Exception):
+    """Sentinel that ends a run once the path under test was reached."""
+
+
+class _M1047LivePrRunner(_FakeRunner):
+    """Serve the live REST PR, its label events and label writes for PR #77."""
+
+    def __init__(
+        self,
+        *,
+        draft=False,
+        labels=("agent-loop-managed",),
+        delete_returncode=0,
+        events_fail_from=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.live_pr = {
+            "state": "open",
+            "draft": draft,
+            "labels": [{"name": name} for name in labels],
+            "head": {"sha": self.pr_payload.get("headRefOid")},
+        }
+        self.events = [{
+            "id": 101, "event": "labeled", "label": {"name": "agent-loop-managed"},
+            "actor": {"login": "agent-loop", "id": 1},
+        }]
+        self.delete_returncode = delete_returncode
+        self.events_fail_from = events_fail_from
+        self.event_reads = 0
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(arg) for arg in args]
+        endpoint = next((part for part in cmd if part.startswith("repos/")), "")
+        if cmd == ["gh", "api", "repos/OWNER/REPO/pulls/77"]:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, json.dumps(self.live_pr), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/issues/77/events?"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            index = self.event_reads
+            self.event_reads += 1
+            if self.events_fail_from is not None and index >= self.events_fail_from:
+                return CommandResult(cmd, cwd_path, "", "events unavailable", 1)
+            return CommandResult(cmd, cwd_path, json.dumps(self.events), "", 0)
+        if cmd[:5] == _M1047_DELETE:
+            cmd, cwd_path = self._record_command(args, cwd)
+            if self.delete_returncode:
+                return CommandResult(cmd, cwd_path, "", "gh: Server Error (HTTP 500)", 1)
+            self.live_pr["labels"] = [
+                item for item in self.live_pr["labels"] if item["name"] != "agent-loop-managed"
+            ]
+            self.events.append({
+                "id": 102, "event": "unlabeled", "label": {"name": "agent-loop-managed"},
+                "actor": {"login": "agent-loop", "id": 1},
+            })
+            return CommandResult(cmd, cwd_path, "", "", 0)
+        if cmd[:3] == ["gh", "pr", "ready"]:
+            cmd, cwd_path = self._record_command(args, cwd)
+            self.live_pr["draft"] = False
+            return CommandResult(cmd, cwd_path, "", "", 0)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    def managed_deletes(self):
+        return [command for command, _cwd in self.commands if command[:5] == _M1047_DELETE]
+
+    def has_managed_label(self):
+        return any(item["name"] == "agent-loop-managed" for item in self.live_pr["labels"])
+
+
+def _m1047_recorder(runner, seen, name):
+    def record(*args, **kwargs):
+        seen.append((name, runner.has_managed_label(), runner.live_pr["draft"]))
+        raise _M1047Stop(name)
+    return record
+
+
+def _m1047_contract(origin):
+    return ManagedCiContract(
+        protocol_version=2,
+        issue_created_pr=origin == "issue-created",
+        origin=origin,
+        active_label_event_id=101,
+        invocation_applied_label=True,
+        trusted_actor_login="agent-loop",
+        trusted_actor_id=1,
+        protection_mode="strict",
+        base_ref="main",
+    )
+
+
+def _m1047_release_spy(monkeypatch):
+    calls = []
+    real = orchestrator_module.release_adopted_managed_ci
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get("contract"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "release_adopted_managed_ci", spy)
+    return calls
+
+
+@pytest.mark.parametrize("path", ["activation", "revalidation", "recovery", "fresh", "source-managed"])
+def test_m1047_entry_normalization_runs_before_every_managed_resume_path(
+    tmp_path, monkeypatch, path,
+):
+    runner = _M1047LivePrRunner()
+    overrides = {"managed_ci": True, "max_rounds": 1}
+    if path == "fresh":
+        overrides.update(managed_ci_fresh_authorization=True, managed_ci_issue_number=5)
+    config = make_config(tmp_path, **overrides)
+    seen = []
+    kwargs = {}
+    if path == "activation":
+        monkeypatch.setattr(orchestrator_module, "recover_issue_created_handoff", lambda *a, **k: None)
+        monkeypatch.setattr(
+            orchestrator_module, "activate_managed_ci", _m1047_recorder(runner, seen, path)
+        )
+    elif path == "revalidation":
+        kwargs["managed_ci_handoff"] = object()
+        monkeypatch.setattr(
+            orchestrator_module, "revalidate_issue_created_handoff",
+            _m1047_recorder(runner, seen, path),
+        )
+    elif path == "recovery":
+        monkeypatch.setattr(
+            orchestrator_module, "recover_issue_created_handoff",
+            _m1047_recorder(runner, seen, path),
+        )
+    elif path == "fresh":
+        monkeypatch.setattr(orchestrator_module, "validate_open_issue", lambda *a, **k: None)
+        monkeypatch.setattr(
+            orchestrator_module, "get_issue_context",
+            lambda *a, **k: SimpleNamespace(number=5, comments=[], human_requirements=()),
+        )
+        monkeypatch.setattr(
+            orchestrator_module, "authorize_fresh_issue_created_resume",
+            _m1047_recorder(runner, seen, path),
+        )
+    else:
+        monkeypatch.setattr(
+            orchestrator_module, "recover_managed_pr_origin",
+            lambda *a, **k: ("feature", "abc123", "agent-loop/managed-77", None),
+        )
+        monkeypatch.setattr(orchestrator_module, "validate_managed_pr_body", lambda *a, **k: None)
+        monkeypatch.setattr(
+            orchestrator_module, "authenticate_source_managed_resume",
+            _m1047_recorder(runner, seen, path),
+        )
+
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config, **kwargs)
+
+    # The path saw ready/unlabeled, exactly as for a historical qualified PR.
+    assert seen == [(path, False, False)]
+    assert len(runner.managed_deletes()) == 1
+
+
+def test_m1047_implicit_invocation_also_releases_retained_label(tmp_path, monkeypatch):
+    runner = _M1047LivePrRunner()
+    config = make_config(tmp_path, max_rounds=1)
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+    )
+
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert seen == [("recovery", False, False)]
+    assert len(runner.managed_deletes()) == 1
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"draft": True},
+        {"draft": True, "labels": ()},
+        {"labels": ()},
+    ],
+    ids=["draft-labeled", "draft-unlabeled", "ready-unlabeled"],
+)
+def test_m1047_entry_normalization_leaves_other_pr_states_untouched(tmp_path, monkeypatch, state):
+    runner = _M1047LivePrRunner(**state)
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+    )
+
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert runner.managed_deletes() == []
+    assert seen == [("recovery", "labels" not in state, state.get("draft", False))]
+
+
+def test_m1047_failed_automerge_ready_labeled_pr_is_normalized_on_retry(tmp_path, monkeypatch):
+    qualified = _m1047_managed_ci.QUALIFIED_LABEL
+    runner = _M1047LivePrRunner(labels=("agent-loop-managed", qualified))
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+    )
+
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert seen == [("recovery", False, False)]
+    assert runner.live_pr["labels"] == [{"name": qualified}]
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_m1047_entry_release_failure_stops_before_any_other_work(tmp_path, monkeypatch):
+    runner = _M1047LivePrRunner(delete_returncode=1)
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    for name in (
+        "recover_issue_created_handoff", "revalidate_issue_created_handoff",
+        "authenticate_source_managed_resume", "authorize_fresh_issue_created_resume",
+        "activate_managed_ci",
+    ):
+        monkeypatch.setattr(
+            orchestrator_module, name,
+            lambda *a, _name=name, **k: pytest.fail(f"{_name} ran after a failed entry release"),
+        )
+
+    with pytest.raises(AgentLoopError, match="Remove the label manually, then rerun"):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    writes = [
+        command for command, _cwd in runner.commands
+        if command[:1] in (["claude"], ["codex"])
+        or command[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"], ["gh", "pr", "comment"])
+        or (command[:2] == ["gh", "api"] and any(m in command for m in ("POST", "PATCH", "DELETE")))
+    ]
+    assert writes == runner.managed_deletes()
+    assert runner.live_pr["draft"] is False
+
+
+@pytest.mark.parametrize("delete_returncode", [0, 1], ids=["released", "delete-fails"])
+@pytest.mark.parametrize("labels", [("agent-loop-managed",), ()], ids=["labeled", "unlabeled"])
+def test_m1047_entry_normalization_uses_bootstrap_cwd_without_coder_checkout(
+    tmp_path, monkeypatch, delete_returncode, labels,
+):
+    config = make_config(tmp_path, create_dirs=False, managed_ci=True, max_rounds=1)
+    config.codex_dir.mkdir(parents=True)
+    assert not config.claude_dir.exists()
+    bootstrap = _m1047_bootstrap_cwd(config)
+    assert bootstrap == config.codex_dir
+    runner = _M1047LivePrRunner(labels=labels, delete_returncode=delete_returncode)
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+    )
+
+    expected = (
+        pytest.raises(AgentLoopError, match="Remove the label manually")
+        if labels and delete_returncode
+        else pytest.raises(_M1047Stop)
+    )
+    with expected:
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    normalization = [
+        (command, cwd) for command, cwd in runner.commands
+        if command == ["gh", "api", "repos/OWNER/REPO/pulls/77"] or command[:5] == _M1047_DELETE
+    ]
+    assert normalization
+    assert {cwd for _command, cwd in normalization} == {bootstrap}
+    assert not config.claude_dir.exists()
+    assert len(runner.managed_deletes()) == (1 if labels else 0)
+
+
+def _m1047_reach_publication(monkeypatch, runner, contract, *, dispatch_error=None):
+    monkeypatch.setattr(orchestrator_module, "recover_issue_created_handoff", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator_module, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(orchestrator_module, "dispatch_final_qualification", lambda *a, **k: None)
+
+    def wait(*args, **kwargs):
+        if dispatch_error is not None:
+            raise dispatch_error
+        return ManagedCiOutcome(status="passed", head_sha=runner.pr_payload.get("headRefOid"))
+
+    monkeypatch.setattr(orchestrator_module, "wait_for_final_qualification", wait)
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+@pytest.mark.parametrize("state", ["draft", "ready"])
+def test_m1047_failed_publication_releases_label_despite_preservation(
+    tmp_path, monkeypatch, origin, state,
+):
+    # Draft: the pre-readiness provenance read fails.  Ready: the first read
+    # succeeds, then the pre-record read and cleanup's read fail.
+    runner = _M1047LivePrRunner(
+        draft=True,
+        events_fail_from=0 if state == "draft" else 1,
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop", max_rounds=1)
+    contract = _m1047_contract(origin)
+    assert orchestrator_module._preserve_issue_created_managed_suppression(
+        contract, active_exception=AgentLoopError("any")
+    )
+    _m1047_reach_publication(monkeypatch, runner, contract)
+    release_calls = _m1047_release_spy(monkeypatch)
+
+    with pytest.raises(AgentLoopError, match="the head is not qualified"):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not runner.has_managed_label()
+    assert len(runner.managed_deletes()) == 1
+    assert runner.live_pr["draft"] is (state == "draft")
+    # Preservation still applies in the finally block, so no second release.
+    assert release_calls == []
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+def test_m1047_interruption_before_publication_still_preserves_label(tmp_path, monkeypatch, origin):
+    runner = _M1047LivePrRunner(
+        draft=True, codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    _m1047_reach_publication(
+        monkeypatch, runner, _m1047_contract(origin),
+        dispatch_error=AgentLoopError("dispatch lost"),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "publish_manual_v2_qualification",
+        lambda *a, **k: pytest.fail("publication must not run"),
+    )
+    release_calls = _m1047_release_spy(monkeypatch)
+
+    with pytest.raises(AgentLoopError, match="dispatch lost"):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert runner.has_managed_label() and runner.live_pr["draft"] is True
+    assert runner.managed_deletes() == []
+    assert release_calls == []
+
+
+def test_m1047_successful_publication_keeps_label_and_finally_does_not_release(
+    tmp_path, monkeypatch,
+):
+    runner = _M1047LivePrRunner(
+        draft=True, codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    _m1047_reach_publication(monkeypatch, runner, _m1047_contract("issue-created"))
+
+    def publish(*args, **kwargs):
+        runner.live_pr["draft"] = False
+        return kwargs["expected_head_sha"]
+
+    monkeypatch.setattr(orchestrator_module, "publish_manual_v2_qualification", publish)
+    release_calls = _m1047_release_spy(monkeypatch)
+
+    assert _m1047_run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert runner.has_managed_label() and runner.live_pr["draft"] is False
+    assert runner.managed_deletes() == []
+    assert release_calls == []
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+def test_m1047_reentry_that_aborts_before_publication_is_preserved_for_exact_resume(
+    tmp_path, monkeypatch, origin,
+):
+    runner = _M1047LivePrRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    contract = _m1047_contract(origin)
+    _m1047_reach_publication(
+        monkeypatch, runner, contract, dispatch_error=AgentLoopError("review aborted"),
+    )
+    observed_at_activation = []
+
+    def reenter(*args, **kwargs):
+        # Existing ready/unlabeled re-entry: `ready --undo` and reapply the label.
+        observed_at_activation.append((runner.has_managed_label(), runner.live_pr["draft"]))
+        runner.live_pr["draft"] = True
+        runner.live_pr["labels"] = [{"name": "agent-loop-managed"}]
+        return contract
+
+    monkeypatch.setattr(orchestrator_module, "activate_managed_ci", reenter)
+    release_calls = _m1047_release_spy(monkeypatch)
+
+    with pytest.raises(AgentLoopError, match="review aborted"):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert observed_at_activation == [(False, False)]
+    assert len(runner.managed_deletes()) == 1
+    assert release_calls == []
+    assert runner.has_managed_label() and runner.live_pr["draft"] is True
+
+    # The next invocation resumes through the draft/labeled path untouched.
+    seen = []
+    monkeypatch.setattr(
+        orchestrator_module, "activate_managed_ci", _m1047_recorder(runner, seen, "activation"),
+    )
+    with pytest.raises(_M1047Stop):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+    assert seen == [("activation", True, True)]
+    assert len(runner.managed_deletes()) == 1

@@ -8,7 +8,7 @@ from .github import PullRequestChecks
 from .logging import log
 from .errors import AgentLoopError
 from .runner import Runner
-from .test_runtime import record_launcher_health, record_test_observation
+from .test_runtime import launch_integrity_state, record_launcher_health, record_test_observation
 from .workdirs import active_workdir
 
 
@@ -82,6 +82,9 @@ def _record_gate_observation(config: AgentLoopConfig, result) -> None:
         policy_ceiling_seconds=int(config.coder_test_command_timeout_seconds),
         returncode=result.returncode,
         containment=(result.containment.to_dict() if result.containment is not None else None),
+        # A gate run whose suite start was not verified (e.g. a shell
+        # wrapper) is recorded only as non-evidence (#989).
+        launch_integrity=launch_integrity_state(result, wrapper_boundary=False),
     )
 
 
@@ -173,6 +176,23 @@ def _pending_ci_stop_message(pr_number: int, state: str, details: list[str]) -> 
         headline,
         "",
         _pending_ci_stop_guidance(state),
+        "",
+    ]
+    lines.extend(f"- {detail}" for detail in details)
+    lines.extend(["", "-- coding-review-agent-loop"])
+    return "\n".join(lines)
+
+
+def _unreadable_protection_stop_message(pr_number: int, details: list[str]) -> str:
+    lines = [
+        f"Reviewers approved PR #{pr_number}, and every observed GitHub check passed, "
+        "but merge readiness cannot be confirmed.",
+        "",
+        "The current GitHub token cannot read branch protection (HTTP 403), so the "
+        "required checks are unknown, and GitHub did not report a `CLEAN` merge state "
+        "for the current head. An unmet protection rule, such as a required review or "
+        "a required check that has not reported, may remain. Satisfy it, or grant the "
+        "token administration read access, then merge manually or rerun agent-loop.",
         "",
     ]
     lines.extend(f"- {detail}" for detail in details)

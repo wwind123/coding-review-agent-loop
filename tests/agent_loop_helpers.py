@@ -267,8 +267,20 @@ class FakeRunner(Runner):
         pr_payloads_by_number=None,
         malformed_issue_view_numbers=None,
         malformed_pr_view_numbers=None,
+        authenticated_actor=None,
+        serve_rest_issue_comments=False,
     ):
         super().__init__(dry_run=False)
+        # Opt-in REST issue-comment history (#1018): the paginated
+        # `issues/N/comments` endpoint answers with the same comments the
+        # `gh issue view` projection shows, in REST shape (`user`, numeric
+        # `id`, `created_at`), so only REST carries the immutable author ID.
+        self.serve_rest_issue_comments = serve_rest_issue_comments
+        # Opt-in `gh api user` identity (#1018): a (login, id) pair.  When set,
+        # issue comments this runner posts carry that immutable author ID, so
+        # author-authenticated records can be recovered.  Unset keeps the
+        # historical unresolvable-actor behavior.
+        self.authenticated_actor = authenticated_actor
         self.claude_outputs = list(claude_outputs or [])
         self.codex_outputs = list(codex_outputs or [])
         self.gemini_outputs = list(gemini_outputs or [])
@@ -1040,14 +1052,24 @@ class FakeRunner(Runner):
             else:
                 raw_body = ""
             self.comments.append(_strip_round_metadata(raw_body))
-            self.issue_comments.append(
-                {
-                    "author": {"login": "coding-review-agent-loop"},
-                    "createdAt": f"2026-05-23T00:00:{len(self.issue_comments):02d}Z",
-                    "body": raw_body,
-                }
-            )
+            posted = {
+                "author": {"login": "coding-review-agent-loop"},
+                "createdAt": f"2026-05-23T00:00:{len(self.issue_comments):02d}Z",
+                "body": raw_body,
+            }
+            if self.authenticated_actor is not None:
+                # Like GitHub, the `gh issue view` projection shows only the
+                # login; the immutable user ID is visible through REST alone.
+                posted["author"] = {"login": self.authenticated_actor[0]}
+                posted["_rest_author_id"] = self.authenticated_actor[1]
+            self.issue_comments.append(posted)
             return CommandResult(cmd, cwd_path, "", "", 0)
+
+        if cmd[:3] == ["gh", "api", "user"] and self.authenticated_actor is not None:
+            login, actor_id = self.authenticated_actor
+            return CommandResult(
+                cmd, cwd_path, json_dumps({"login": login, "id": actor_id}), "", 0
+            )
 
         if cmd[:3] == ["gh", "issue", "create"]:
             title = cmd[cmd.index("--title") + 1]
@@ -1147,9 +1169,37 @@ class FakeRunner(Runner):
                 "url": source.get("url"),
                 "author": source.get("author"),
                 "createdAt": source.get("createdAt"),
-                "comments": self._issue_comments_for(number),
+                # `_rest_only` models an older comment the capped `gh issue
+                # view` projection drops but the REST history still returns.
+                "comments": [
+                    comment
+                    for comment in self._issue_comments_for(number)
+                    if not comment.get("_rest_only")
+                ],
             }
             return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
+
+        rest_comments = (
+            re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)", cmd[2])
+            if cmd[:2] == ["gh", "api"] and len(cmd) > 2 and self.serve_rest_issue_comments
+            else None
+        )
+        if rest_comments is not None:
+            number, per_page, page = (int(value) for value in rest_comments.groups())
+            rest_page = [
+                {
+                    "id": 10_000 + index,
+                    "user": (
+                        {**(comment.get("author") or {}), "id": comment["_rest_author_id"]}
+                        if "_rest_author_id" in comment
+                        else comment.get("author")
+                    ),
+                    "created_at": comment.get("createdAt"),
+                    "body": comment.get("body"),
+                }
+                for index, comment in enumerate(self._issue_comments_for(number), start=1)
+            ][(page - 1) * per_page:page * per_page]
+            return CommandResult(cmd, cwd_path, json_dumps(rest_page), "", 0)
 
         if cmd[:2] == ["gh", "api"] and "/issues/" in cmd[2]:
             match = re.search(r"/issues/(\d+)", cmd[2])

@@ -750,7 +750,7 @@ def test_codex_chatgpt_unsupported_model_public_response_skips_retry_repair_and_
                 validate=lambda text: _validate_review_response(
                     text,
                     reviewer="OpenAI Codex",
-                    unresolved_items=(),
+                    unresolved_items=(), architecture_status_mode="legacy",
                 ),
                 use_repair=True,
                 repair_expected_kind="pr_review",
@@ -866,7 +866,7 @@ def test_structured_plan_review_transient_terms_with_trailing_prose_normalizes(t
             validate=lambda text: _validate_plan_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="plan_review",
@@ -909,7 +909,7 @@ def test_structured_pr_review_transient_terms_duplicate_footer_normalizes(tmp_pa
             validate=lambda text: _validate_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -976,7 +976,7 @@ def test_structured_coder_followup_transient_terms_before_footer_runs_repair(tmp
             validate=lambda text: _validate_coder_followup_response(
                 text,
                 unresolved_items=unresolved_items,
-                human_requirements=(),
+                human_requirements=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="coder_followup",
@@ -1029,7 +1029,7 @@ def test_run_validated_agent_recovers_coder_followup_from_message_text_when_resp
         validate=lambda text: _validate_coder_followup_response(
             text,
             unresolved_items=unresolved_items,
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         ),
         repair_expected_kind="coder_followup",
     )
@@ -1071,7 +1071,7 @@ def test_run_validated_agent_recovers_fenced_coder_followup_from_raw_stdout(tmp_
         validate=lambda text: _validate_coder_followup_response(
             text,
             unresolved_items=unresolved_items,
-            human_requirements=(),
+            human_requirements=(), architecture_status_mode="legacy",
         ),
         repair_expected_kind="coder_followup",
     )
@@ -1194,7 +1194,7 @@ def test_malformed_structured_review_model_support_terms_still_runs_repair(tmp_p
             validate=lambda text: _validate_review_response(
                 text,
                 reviewer="Google Gemini",
-                unresolved_items=(),
+                unresolved_items=(), architecture_status_mode="legacy",
             ),
             use_repair=True,
             repair_expected_kind="pr_review",
@@ -1592,6 +1592,65 @@ def test_cli_distinguishes_human_decision_from_generic_failure(capsys):
 def test_managed_ci_fresh_cli_rejects_incomplete_authorization(argv, message, capsys):
     assert main(argv) == 1
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["issue", "56", "--repo", "OWNER/REPO", "--managed-ci",
+         "--managed-ci-trusted-actor", "agent-loop", "--allow-unreadable-protection"],
+        ["pr", "77", "--repo", "OWNER/REPO", "--managed-ci",
+         "--managed-ci-trusted-actor", "agent-loop", "--allow-unreadable-protection"],
+        ["pr", "77", "--repo", "OWNER/REPO", "--auto-merge",
+         "--managed-ci-trusted-actor", "agent-loop", "--managed-ci-adopt-existing-pr",
+         "--allow-unreadable-protection"],
+        ["managed-pr", "--repo", "OWNER/REPO", "--head", "fix/direct-change",
+         "--title", "Direct change", "--managed-ci",
+         "--managed-ci-trusted-actor", "agent-loop", "--allow-unreadable-protection"],
+    ],
+)
+def test_allow_unreadable_protection_requires_the_unprotected_waiver(
+    argv, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: make_config(tmp_path))
+    # The validation error precedes every GitHub call, including base resolution.
+    monkeypatch.setattr(
+        cli_module, "resolve_base_branch",
+        lambda *_a, **_k: pytest.fail("GitHub was read before flag validation"),
+    )
+    assert main(argv) == 1
+    assert (
+        "--allow-unreadable-protection requires --allow-unprotected-managed-ci"
+        in capsys.readouterr().err
+    )
+
+
+def test_allow_unreadable_protection_with_adoption_keeps_adoption_refusal(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: make_config(tmp_path))
+    assert main([
+        "pr", "77", "--repo", "OWNER/REPO", "--auto-merge",
+        "--managed-ci-trusted-actor", "agent-loop", "--managed-ci-adopt-existing-pr",
+        "--allow-unprotected-managed-ci", "--allow-unreadable-protection",
+    ]) == 1
+    assert (
+        "--allow-unprotected-managed-ci cannot be used with --managed-ci-adopt-existing-pr"
+        in capsys.readouterr().err
+    )
+
+
+def test_config_records_unreadable_protection_waiver():
+    args = build_parser().parse_args([
+        "issue", "1040", "--repo", "OWNER/REPO", "--managed-ci",
+        "--managed-ci-trusted-actor", "agent-loop", "--allow-unprotected-managed-ci",
+        "--allow-unreadable-protection",
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.allow_unprotected_managed_ci is True
+    assert config.allow_unreadable_protection is True
 
 
 def test_config_records_explicit_existing_pr_managed_ci_adoption(tmp_path):
@@ -2787,6 +2846,34 @@ def test_issue_and_task_loops_use_repo_default_when_base_is_omitted(tmp_path, mo
     assert not any("origin/main" in arg for cmd in commands for arg in cmd)
 
 
+@pytest.mark.parametrize("mode", ["issue", "task"])
+def test_direct_issue_and_task_implementation_turns_run_as_coder_role(tmp_path, monkeypatch, mode):
+    """#1077: without role="coder" a sandboxed run gives the turn the read-only grant."""
+    runner = FakeRunner(
+        claude_outputs=[
+            "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(tmp_path, reviewer="codex", auto_agent_dirs=("claude", "codex"))
+    real_run_validated_agent = orchestrator_module._run_validated_agent
+    roles: dict[str, object] = {}
+
+    def recording_run_validated_agent(*args, **kwargs):
+        roles.setdefault(kwargs.get("operation_description"), kwargs.get("role"))
+        return real_run_validated_agent(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", recording_run_validated_agent)
+
+    if mode == "issue":
+        assert run_issue_loop(runner, issue_number=56, config=config) == 0
+    else:
+        assert run_task_loop(runner, task_text="Add /healthz endpoint.", config=config) == 0
+
+    assert roles[f"{mode} implementation"] == "coder"
+
+
 def test_unresolved_base_metadata_produces_targeted_override_error(tmp_path):
     runner = FakeRunner(
         pr_payload={"baseRefName": None},
@@ -3479,6 +3566,105 @@ def test_explicit_agent_args_replace_dangerous_profile(tmp_path):
     assert config.claude_args == ("--permission-mode", "acceptEdits")
     assert config.codex_args == ("--sandbox", "workspace-write")
     assert config.gemini_args == ("--approval-mode", "auto_edit")
+
+
+def _permission_args(tmp_path, *extra):
+    return build_parser().parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+        *extra,
+    ])
+
+
+SANDBOXED_HELPERS = (
+    "--repair-backend", "claude", "--repair-model", "claude-haiku-4-5",
+    "--semantic-followup-backend", "claude",
+)
+
+
+def test_agent_permissions_sandboxed_parses_with_empty_static_args(tmp_path):
+    config = config_from_args(
+        _permission_args(tmp_path, "--agent-permissions", "sandboxed", *SANDBOXED_HELPERS),
+        FakeRunner(),
+    )
+    assert config.agent_permissions == "sandboxed"
+    assert config.claude_args == config.codex_args == config.gemini_args == config.antigravity_args == ()
+
+
+def test_agent_permissions_dangerous_is_byte_identical_to_legacy_flag(tmp_path):
+    legacy = config_from_args(_permission_args(tmp_path, "--dangerous-agent-permissions"), FakeRunner())
+    explicit = config_from_args(_permission_args(tmp_path, "--agent-permissions", "dangerous"), FakeRunner())
+    both = config_from_args(
+        _permission_args(tmp_path, "--dangerous-agent-permissions", "--agent-permissions", "dangerous"),
+        FakeRunner(),
+    )
+    default = config_from_args(_permission_args(tmp_path, "--agent-permissions", "default"), FakeRunner())
+    for config in (legacy, explicit, both):
+        assert config.agent_permissions == "dangerous"
+        assert config.claude_args == ("--dangerously-skip-permissions",)
+        assert config.codex_args == ("--dangerously-bypass-approvals-and-sandbox",)
+        assert config.gemini_args == ("--yolo", "--skip-trust")
+    assert default.agent_permissions == "default"
+    assert default.claude_args == default.codex_args == default.gemini_args == ()
+
+
+@pytest.mark.parametrize("mode", ["sandboxed", "default"])
+def test_dangerous_flag_conflicts_with_other_agent_permissions(tmp_path, mode):
+    args = _permission_args(tmp_path, "--dangerous-agent-permissions", "--agent-permissions", mode, *SANDBOXED_HELPERS)
+    with pytest.raises(AgentLoopError, match="conflicts with --agent-permissions"):
+        config_from_args(args, FakeRunner())
+
+
+@pytest.mark.parametrize(
+    "passthrough",
+    [
+        "--claude-arg=--permission-mode",
+        "--claude-arg=--dangerously-skip-permissions",
+        "--codex-arg=-c",
+        "--codex-arg=--config=sandbox_mode=danger-full-access",
+        "--gemini-arg=--yolo",
+        "--antigravity-arg=--x",
+    ],
+)
+def test_sandboxed_rejects_every_passthrough_agent_arg(tmp_path, passthrough):
+    args = _permission_args(tmp_path, "--agent-permissions", "sandboxed", *SANDBOXED_HELPERS, passthrough)
+    option = passthrough.split("=", 1)[0]
+    with pytest.raises(AgentLoopError, match=f"{option} .* is not allowed with --agent-permissions sandboxed"):
+        config_from_args(args, FakeRunner())
+
+
+def test_sandboxed_names_default_repair_backend_before_command_preflight(tmp_path):
+    args = _permission_args(tmp_path, "--agent-permissions", "sandboxed", "--semantic-followup-backend", "claude")
+    with pytest.raises(AgentLoopError, match="--repair-backend claude\\|codex --repair-model MODEL"):
+        config_from_args(args, FakeRunner())
+    args = _permission_args(
+        tmp_path, "--agent-permissions", "sandboxed", "--repair-backend", "codex", "--repair-model", "m"
+    )
+    with pytest.raises(AgentLoopError, match="--no-semantic-followup-dedupe"):
+        config_from_args(args, FakeRunner())
+
+
+def test_sandboxed_codex_pr_coder_fails_before_any_agent_runs(tmp_path, monkeypatch, capsys):
+    from coding_review_agent_loop import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("no agent may run")
+    )
+    code = cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--dry-run",
+        "--claude-dir", str(tmp_path / "claude"), "--codex-dir", str(tmp_path / "codex"),
+        "--subprocess-log-dir", str(tmp_path / "logs"),
+        "--agent-permissions", "sandboxed", "--coder", "codex", "--reviewer", "claude",
+        *SANDBOXED_HELPERS,
+    ])
+    assert code == 1
+    assert "cannot run a committing Codex coder" in capsys.readouterr().err
 
 
 def test_resume_plan_round_prefers_latest_metadata_ledger_for_same_plan_replay():
@@ -4309,7 +4495,7 @@ def test_claude_self_update_replay_recovers_valid_response_with_remaining_timeou
         prompt="Review the PR.",
         marker_description="<!-- AGENT_STATE: approved|blocking -->",
         validate=lambda text: _validate_review_response(
-            text, reviewer="Anthropic Claude", unresolved_items=()
+            text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
         ),
         timeout_seconds=12,
     )
@@ -4359,7 +4545,7 @@ def test_claude_self_update_stability_failure_preserves_ordinary_retry_budget(tm
         prompt="Review the PR.",
         marker_description="<!-- AGENT_STATE: approved|blocking -->",
         validate=lambda text: _validate_review_response(
-            text, reviewer="Anthropic Claude", unresolved_items=()
+            text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
         ),
     )
 
@@ -4402,7 +4588,7 @@ def test_claude_self_update_stability_failure_sets_final_category(tmp_path):
             prompt="Review the PR.",
             marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Anthropic Claude", unresolved_items=()
+                text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4447,7 +4633,7 @@ def test_claude_replay_refusal_is_diagnostic_only_and_does_not_wait_or_override_
                 prompt="Review the PR.",
                 marker_description="<!-- AGENT_STATE: approved|blocking -->",
                 validate=lambda text: _validate_review_response(
-                    text, reviewer="Anthropic Claude", unresolved_items=()
+                    text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
                 ),
                 usage_context=usage,
             )
@@ -4478,7 +4664,7 @@ def test_transient_claude_replay_refusal_keeps_provider_retry_and_category(tmp_p
             prompt="Review the PR.",
             marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Anthropic Claude", unresolved_items=()
+                text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4500,7 +4686,7 @@ def test_transient_claude_replay_refusal_only_retains_transient_category(tmp_pat
                 prompt="Review the PR.",
                 marker_description="<!-- AGENT_STATE: approved|blocking -->",
                 validate=lambda text: _validate_review_response(
-                    text, reviewer="Anthropic Claude", unresolved_items=()
+                    text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
                 ),
             )
 
@@ -4557,7 +4743,7 @@ def test_codex_executable_replacement_replay_uses_fresh_full_timeout(tmp_path):
             prompt="Review the PR.",
             marker_description="<!-- AGENT_STATE: approved|blocking -->",
             validate=lambda text: _validate_review_response(
-                text, reviewer="OpenAI Codex", unresolved_items=()
+                text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
             ),
             timeout_seconds=60,
         )
@@ -4596,7 +4782,7 @@ def test_codex_replacement_replay_does_not_consume_ordinary_retry(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="OpenAI Codex", unresolved_items=()
+                text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4627,7 +4813,7 @@ def test_codex_replacement_exhaustion_keeps_specific_terminal_category(tmp_path)
                 prompt="Review the PR.",
                 marker_description="test",
                 validate=lambda text: _validate_review_response(
-                    text, reviewer="OpenAI Codex", unresolved_items=()
+                    text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
                 ),
             )
 
@@ -4660,7 +4846,7 @@ def test_codex_unstable_replacement_retains_ordinary_retry(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="OpenAI Codex", unresolved_items=()
+                text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4687,7 +4873,7 @@ def test_codex_replacement_context_does_not_change_long_quota_exit_priority(tmp_
                 prompt="Review the PR.",
                 marker_description="test",
                 validate=lambda text: _validate_review_response(
-                    text, reviewer="OpenAI Codex", unresolved_items=()
+                    text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
                 ),
             )
 
@@ -4747,7 +4933,7 @@ def test_gemini_replacement_replay_uses_fresh_timeout_and_provider_suffix(tmp_pa
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Gemini", unresolved_items=()
+                text, reviewer="Google Gemini", unresolved_items=(), architecture_status_mode="legacy"
             ),
             timeout_seconds=60,
         )
@@ -4786,7 +4972,7 @@ def test_gemini_unstable_replacement_preserves_ordinary_retry(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Gemini", unresolved_items=()
+                text, reviewer="Google Gemini", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4821,7 +5007,7 @@ def test_claude_quiet_unstable_replacement_keeps_ordinary_retry(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Anthropic Claude", unresolved_items=()
+                text, reviewer="Anthropic Claude", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4869,7 +5055,7 @@ def test_antigravity_quiet_unstable_replacement_reaches_model_fallback(tmp_path)
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Antigravity", unresolved_items=()
+                text, reviewer="Google Antigravity", unresolved_items=(), architecture_status_mode="legacy"
             ),
         )
 
@@ -4918,7 +5104,7 @@ def test_antigravity_replacement_replay_does_not_advance_model_state(tmp_path):
             prompt="Review the PR.",
             marker_description="test",
             validate=lambda text: _validate_review_response(
-                text, reviewer="Google Antigravity", unresolved_items=()
+                text, reviewer="Google Antigravity", unresolved_items=(), architecture_status_mode="legacy"
             ),
             timeout_seconds=60,
         )
@@ -5088,7 +5274,7 @@ def test_orchestrator_retries_capture_diagnostics_as_tooling_failure(
                 prompt="Review the PR.",
                 marker_description="test",
                 validate=lambda value: _validate_review_response(
-                    value, reviewer="OpenAI Codex", unresolved_items=()
+                    value, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
                 ),
             )
 
@@ -6633,3 +6819,70 @@ def test_m953_discuss_round_comment_with_spilled_prior_items_is_bot_authored():
         )
 
     assert _discuss_subject(context(spilled)) == _discuss_subject(context())
+
+
+# --- host footer log once per owning invocation (#1043) ----------------------
+
+_OWNING_RUN_ENTRIES = {"run_issue_loop", "run_task_loop", "run_pr_loop", "run_discuss_loop"}
+
+
+def _orchestrator_tree():
+    return ast.parse(Path(orchestrator_module.__file__).read_text(encoding="utf-8"))
+
+
+def test_only_owning_run_entries_create_a_usage_context():
+    callers = {}
+    for function in ast.walk(_orchestrator_tree()):
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        for node in ast.walk(function):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_new_usage_context":
+                callers.setdefault(function.name, []).append(node)
+    callers.pop("_new_usage_context", None)
+    assert set(callers) == _OWNING_RUN_ENTRIES
+    # Each owning entry creates a context (and so resets the latch) only when
+    # it did not receive one, so a nested run shares the outer latch.
+    for function in ast.walk(_orchestrator_tree()):
+        if isinstance(function, ast.FunctionDef) and function.name in _OWNING_RUN_ENTRIES:
+            owned = [
+                node for node in ast.walk(function)
+                if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+                and getattr(node.values[0], "id", None) == "usage_context"
+                and isinstance(node.values[1], ast.Call)
+                and getattr(node.values[1].func, "id", None) == "_new_usage_context"
+            ]
+            assert len(owned) == 1, function.name
+
+
+def test_nested_run_pr_loop_calls_pass_the_outer_usage_context():
+    nested = [
+        node for node in ast.walk(_orchestrator_tree())
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "run_pr_loop"
+    ]
+    assert nested
+    for call in nested:
+        assert any(keyword.arg == "usage_context" for keyword in call.keywords), call.lineno
+
+
+def test_host_footer_log_latch_resets_with_each_owned_usage_context(tmp_path, monkeypatch):
+    import coding_review_agent_loop.github as github_module
+
+    lines = []
+    monkeypatch.setattr(github_module, "log", lambda _config, message: lines.append(message))
+    config = make_config(tmp_path)
+    # An earlier invocation in this process left the latch set.
+    github_module.reset_host_footer_log_latch()
+    github_module.note_host_footer_observed(config, "earlier invocation")
+    assert len(lines) == 1
+
+    # Two successive owning invocations each log once, however often the
+    # footer is observed on write and re-read paths.
+    for expected in (2, 3):
+        orchestrator_module._new_usage_context(config)
+        for context in ("write", "re-read", "nested PR run"):
+            github_module.note_host_footer_observed(config, context)
+        assert len(lines) == expected
+
+    # With no footer observed, an owning invocation logs nothing.
+    orchestrator_module._new_usage_context(config)
+    assert len(lines) == 3

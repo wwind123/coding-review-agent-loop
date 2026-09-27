@@ -126,7 +126,7 @@ def _scenario_review_item(scenario: dict) -> UnresolvedReviewItem:
     parsed = _validate_review_response(
         _review_response(scenario["pr_review"]),
         reviewer="OpenAI Codex",
-        unresolved_items=(),
+        unresolved_items=(), architecture_status_mode="legacy",
     )
     assert parsed.state == "blocking"
     assert len(parsed.blocking_items) == 1
@@ -290,7 +290,7 @@ def test_fixture_scenarios_use_their_review_finding_and_existing_orchestration_r
     parsed = _validate_coder_followup_response(
         _coder_response(scenario["coder_followup"]),
         unresolved_items=(item,),
-        human_requirements=(),
+        human_requirements=(), architecture_status_mode="legacy",
     )
     expected = scenario["expected"]
     classification = expected["classification"]
@@ -322,7 +322,7 @@ def test_fixture_scenarios_use_their_review_finding_and_existing_orchestration_r
                 }
             ),
             reviewer="OpenAI Codex",
-            unresolved_items=tuple(annotated),
+            unresolved_items=tuple(annotated), architecture_status_mode="legacy",
         )
         remaining, future = apply_item_dispositions(
             tuple(annotated),
@@ -352,7 +352,7 @@ def test_fixture_scenarios_use_their_review_finding_and_existing_orchestration_r
             }
         ),
         reviewer="OpenAI Codex",
-        unresolved_items=(item,),
+        unresolved_items=(item,), architecture_status_mode="legacy",
     )
     remaining, future = apply_item_dispositions(
         (item,),
@@ -391,7 +391,7 @@ def test_dispute_evidence_is_preserved_as_the_existing_plan_conflict_channel():
     parsed = _validate_coder_followup_response(
         response,
         unresolved_items=(item,),
-        human_requirements=(),
+        human_requirements=(), architecture_status_mode="legacy",
     )
     assert parsed.disputed_items == ("item-1",)
     assert parsed.dispute_evidence["item-1"] == "The reviewer is wrong."

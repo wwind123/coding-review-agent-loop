@@ -7,7 +7,7 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence
 from urllib.parse import urlsplit
 
 from .errors import AgentLoopError
@@ -134,16 +134,25 @@ def gate_workdir_replay(
     return WorkdirReplayEvidence(reason)
 
 
+# (args, workdir) -> an object with returncode/stdout/stderr, replacing the
+# runner's bare ``git`` for probes that must not honor checkout config.
+GitProbeRunner = Callable[[tuple[str, ...], Path], object]
+
+
 def _git_probe(
     runner: object,
     *,
     workdir: Path,
     args: tuple[str, ...],
     tolerate_exceptions: bool,
+    git_runner: GitProbeRunner | None = None,
 ) -> GitProbeResult:
     command = ("git", *args)
     try:
-        result = runner.run(command, cwd=workdir, check=False)  # type: ignore[attr-defined]
+        if git_runner is not None:
+            result = git_runner(args, workdir)
+        else:
+            result = runner.run(command, cwd=workdir, check=False)  # type: ignore[attr-defined]
     except (AgentLoopError, OSError) as exc:
         if not tolerate_exceptions:
             raise
@@ -186,6 +195,7 @@ def read_workdir_head(
     workdir: Path,
     *,
     tolerate_exceptions: bool = False,
+    git_runner: GitProbeRunner | None = None,
 ) -> GitProbeResult:
     """Read only ``git rev-parse HEAD`` from ``workdir``."""
     return _git_probe(
@@ -193,6 +203,7 @@ def read_workdir_head(
         workdir=workdir,
         args=("rev-parse", "HEAD"),
         tolerate_exceptions=tolerate_exceptions,
+        git_runner=git_runner,
     )
 
 
@@ -201,19 +212,27 @@ def capture_workdir_snapshot(
     workdir: Path,
     *,
     tolerate_exceptions: bool = False,
+    git_runner: GitProbeRunner | None = None,
 ) -> WorkdirSnapshot:
-    """Capture HEAD and ``git status --porcelain`` without mutating the checkout."""
+    """Capture HEAD and ``git status --porcelain`` without mutating the checkout.
+
+    ``git_runner`` replaces the bare ``git`` (sandboxed mode passes the
+    hardened, config-gated runner so a coder-planted hook or filter in a
+    shared checkout never runs before a turn).
+    """
     return WorkdirSnapshot(
         head=read_workdir_head(
             runner,
             workdir,
             tolerate_exceptions=tolerate_exceptions,
+            git_runner=git_runner,
         ),
         status=_git_probe(
             runner,
             workdir=workdir,
             args=("status", "--porcelain"),
             tolerate_exceptions=tolerate_exceptions,
+            git_runner=git_runner,
         ),
     )
 

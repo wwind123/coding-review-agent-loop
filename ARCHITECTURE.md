@@ -41,9 +41,46 @@ flowchart LR
   a PR. The orchestrator validates the reported result and owns normal review
   publication, handoff, scheduling, and finalization.
 - Reviewers are instructed to inspect the verified checkout without modifying
-  code or running tests. This is a command policy, not a universal read-only
-  filesystem sandbox; actual enforcement depends on backend permissions and
-  the execution environment.
+  code or running tests. In `default` and `dangerous` permission modes this is
+  a command policy, not a universal read-only filesystem sandbox; actual
+  enforcement depends on backend permissions and the execution environment.
+- `--agent-permissions sandboxed` (`agent_permissions.py`) turns the role split
+  into CLI-enforced permission classes built per invocation: only the exact
+  `coder` role gets the coder grant (Claude only; a committing Codex coder is
+  rejected because its sandbox keeps `.git` read-only), and every other or
+  missing role fails closed to read-only. Claude non-coders run with
+  `--restricted`, writes limited to the response root, and a single shell
+  grant, `agent-loop inspect`; Codex non-coders run in the read-only sandbox,
+  with no network, and the Codex CLI writes their response. Gemini and
+  Antigravity, and every pass-through `--<agent>-arg`, are rejected at config
+  time, with a `run_agent_result` guard as backstop.
+- The sandboxed response root is a physically validated boundary: created as
+  private, non-symlink components, checked not to overlap any agent checkout in
+  either direction, and re-verified (components, checkout identities, overlap)
+  immediately before every sandboxed spawn; the per-invocation file is created
+  exclusively without following symlinks.
+- `agent-loop inspect` (`inspect_tool.py`, standard library only) is the
+  read-only git/gh boundary for Claude non-coders. Its argument allowlist,
+  forced git config, closed environment allowlist with a `PATH` built from the
+  startup-pinned git and gh directories, and repository-config gate stop
+  inherited environment, `PATH` entries, coder-controlled git config
+  (filters, diff drivers, gpg programs, includes, aliases, hooks, trace
+  targets), and `.gitattributes` from making an inspection run a program or
+  write a file. Submodule recursion is forced off (`--ignore-submodules=all`
+  plus `-c` overrides), because a populated submodule's own local config lies
+  outside the gate. agent-loop's own workdir snapshot around a sandboxed
+  Claude turn uses the same pinned, gated, hardened git, so it cannot run
+  coder-planted config either. Its interpreter (`-I`), package files, and the pinned git and
+  gh are fingerprinted at startup and re-verified before each read-only Claude
+  spawn; a mismatch is reported as agent-unavailable without spawning.
+- Residual: sandboxed coders run tests and `git` (including their own hooks,
+  aliases, and checkout-local binaries) as the same OS user. The mode prevents
+  accidental and prompt-driven checkout mutation by non-coders and detects or
+  refuses between-turn tampering with inspector code, pinned binaries, git
+  configuration, and the response root; it is not OS-level isolation from a
+  deliberately hostile coder, which could, for example, write to a
+  user-writable directory holding a pinned binary between the check and the
+  turn. In `default` mode command policy remains the only control.
 - Model responses propose verdicts and actions. They are not authoritative Git
   state, CI results, or permission grants.
 - The tool publishes reviews as PR conversation comments, not native GitHub
@@ -66,7 +103,7 @@ Source paths below are relative to
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py`, `plan_review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head or a candidate plan. |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. Structured plan coder comments additionally have a bounded visible digest, selected only when the full comment overflows the body budget (see *Compact-on-overflow plan presentation*). The visible coder matrix-evidence section is collapsed and, on PR coder follow-ups, projected as a delta against the previous coder round, while canonical evidence stays complete (see *Delta matrix-evidence presentation*). |
-| GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier. |
+| GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier, which tolerates exactly one known host comment footer (#1043). |
 | Workflow transaction model (#827, stage A) | `workflow_transaction.py` | Typed transition intent whose canonical hash is the transaction ID; append-only prepared/terminal transaction record codec (PR-comment-only); version-2 handoff and PR contract derivation; lineage, era, approved-plan anchor, scheduler-checkpoint, and legacy-root resolvers. Every resolver accepts only the author-authenticated comment view read by `github.read_authenticated_protocol_comments`. Model only: no writer emits these records and no orchestration call site consumes them yet; the version-1 reader entry points are unchanged and still reject version 2. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
@@ -242,11 +279,42 @@ handle, or oversize text up to a hard cap) is a claim defect, not an envelope
 defect: it is dropped with a caveat before authentication and becomes an
 `unknown-execution-ref` diagnostic afterwards. One admissible selector may be
 cited by several rows, since one wrapper run routinely covers several rows;
-each row still verifies only on its own facts. Authority violations stay fatal:
-unknown keys, bad row IDs, empty selector lists, an admissible selector
-repeated within one row, catalog collisions, in-catalog selectors that are non-passing or
-whose launch integrity is failing or unknown (real broker handles, so
-selecting one is an authority decision), and legacy canonical fields. Repair
+each row still verifies only on its own facts. Row-ID defects are likewise
+claim defects (#920, #926): a claim whose `row_id` is outside the approved
+enforceable set, absent, not a string, malformed (including finding- or
+requirement-like forms), or claimed more than once is dropped -- every copy of
+a duplicate, so no arbitrary copy becomes coverage -- with one bounded,
+parser-derived degradation record on the claims carrier. A supplied approved
+set is authoritative even when empty; only an omitted set is unscoped.
+Derivation emits one diagnostic per dropped claim: the historical
+`unapproved-row-claim` code for an unapproved ID, naming the claim's position,
+and for every other record a `degraded-row-claim`
+diagnostic keyed by the claim's element path, never by agent text; it emits no
+canonical row for a dropped claim, and the affected approved row reads
+`missing`. The one
+reserved fatal row-ID case is a value beyond the 16,384-byte hard cap, which is
+unbounded input. The remaining claim-scope defects are claim drops too
+(#927), each with one record: a claim that is not an object, an absent, empty
+or ill-typed `execution_refs`, an admissible selector repeated within one
+claim, an unknown key, an ill-typed fact or one over the field bound, a
+selector over the field bound when no catalog is supplied, and a
+`risk_test_matrix_claims` value that is not an array, which keeps no claim and
+records one field-scope drop. A claim with several defects keeps exactly one
+record, and the row-ID rules win. Authority violations and hard bounds stay
+fatal and are checked before any degradation, so a degradable defect never
+masks them: keys that name orchestrator-owned verification authority
+(`status`, `evidence_citations`, `receipt_id`, `command`, `claim`), the row,
+ref, caveat and 16,384-byte caps, a dropped value whose compact JSON exceeds
+the same byte bound (for a claim dropped only by a row-ID rule, which already
+passed every per-field bound, only the discarded tail of an over-long fact list
+is measured), catalog collisions, in-catalog selectors that are
+non-passing or whose launch integrity is failing or unknown (real broker
+handles, so selecting one is an authority decision), and legacy canonical
+fields. The
+catalog-authority rejections (collisions and non-passing or non-authoritative
+selectors) never route to structured repair, since reformatting cannot change
+them: the run stops once, naming the rejection as a
+`semantic-evidence-rejection` rather than a repair timeout (#990). Repair
 does not generate matrix identities, canonical rows, receipt IDs, mappings,
 statuses, or evidence envelopes. Derived evidence and diagnostics are the
 durable replay artifact; live execution selectors are not. Historical accepted
@@ -578,6 +646,24 @@ fail open. Pushes to `main` and all-empty manual dispatches remain full-suite
 paths; label-addition, readiness, and draft-conversion events are deliberately
 not subscribed to.
 
+Explicit manual qualification keeps the managed label on the PR it readies, so
+no `unlabeled` event re-runs ordinary CI on the qualified head. A ready PR is
+never suppressed, and `unlabeled` still restores ordinary CI whenever the label
+is removed. Publication checks twice, before readiness and before the audit
+record, that the active label event is the contract's event and actor. Any
+publication failure releases the label, whether the PR is still draft or
+already ready, and regardless of the orchestrator's interrupted-run
+preservation. The label is removed when the event is owned or unprovable
+(fail-open). A readable label event from someone else is left and reported.
+The next agent-loop invocation removes a retained label from an open ready PR
+at PR-loop entry, in the bootstrap directory, before lifecycle authentication
+and workdir setup. Every lifecycle classifier therefore still sees only the
+draft/labeled and ready/unlabeled states. If a re-entered run aborts before
+publication, it is kept draft/labeled for exact resume, like any other
+interrupted managed run. Residual: if a human converts a qualified PR back to
+draft and pushes, that push is suppressed until the label is removed. Strict
+protection still requires `final-ci/exact-head` for the new head.
+
 Managed dispatch is authorized in base-workflow code. It resolves the
 configured `AGENT_LOOP_MANAGED_ACTOR` to the live identity, requires both the
 initiating and re-run actors to match, validates the live PR and current base
@@ -612,6 +698,49 @@ The unprotected managed-CI waiver is a voluntary tool gate, not a replacement
 for GitHub enforcement. Historical audit markers cannot grant fresh authority;
 the live actor, repository, PR lifecycle, and provenance must be revalidated.
 See [managed CI](docs/local_agent_loop.md#managed-exact-head-ci).
+
+Two preflight reads can be refused where the rest of managed CI works, for
+example in Claude Code cloud sessions (#1040). Each fallback is keyed to a
+strict HTTP 403, taken only from gh's own trailing stderr status line; response
+bodies are never searched for status digits.
+
+- A refused `AGENT_LOOP_MANAGED_ACTOR` read lets `--managed-ci-trusted-actor`
+  stand in as an *asserted* actor at every identity site. The authenticated
+  login must still equal it. The boundary is the workflow: it enforces the real
+  variable server-side, so a wrong assertion leaves ordinary CI unsuppressed
+  and fails managed dispatch validation rather than failing open. A readable
+  variable that differs, a 404, or any other error keeps failing closed.
+- A refused classic-protection read (`required_status_checks`, or
+  `enforce_admins` behind a required context) makes protection indeterminate,
+  not absent. It becomes the distinct `unreadable` state only when the
+  effective rules were fully inspected: a list, or gh's strict 404/422
+  no-rules response. It also requires that no ruleset proves strict
+  enforcement. After such a 403, a ruleset proves strict only when it requires
+  exactly `final-ci/exact-head` and its `bypass_actors` are visible and empty.
+  Malformed rule or ruleset data, and any other rules failure, stay
+  `indeterminate`, which nothing can waive. On readable classic paths only
+  the context matching changed: it is now an exact
+  `required_status_checks` match, which can only remove a false `strict`.
+
+Readiness maps `voluntary`, `plan_limited` and `unreadable` to
+override-eligible without consulting invocation flags. Only the authorization
+gates consult `waivable_protection_states(config)`: creation, fresh
+authorization, resume, activation, recovery, and fresh-command advice.
+`--allow-unprotected-managed-ci` waives `voluntary` and `plan_limited`, and
+`unreadable` additionally requires `--allow-unreadable-protection`. The
+legacy non-suppressing workflow exception stays a separate clause.
+Authorization records derive their persisted waiver from protection through
+one mapping (`allow-unreadable-protection` for `unreadable`), and the parser
+rejects crossed pairings. The override audit trailer keeps its field set and
+simply carries `protection=unreadable`. Issue-created recovery restores the
+persisted state read-only. A selection pass validates every actor-authored
+authorization record with protection and plan-scope comparisons deferred, and
+the creation records supply the state. A confirmation pass then requires every
+record, and the live assessment, to agree. A base that has since become
+`strict` also refuses, because activation's strict path does not run the
+resume-audit plan-scope gate that recovery deferred to. Plan-scope checks are enforced by
+the activation-time resume-audit gate, after the canonical plan is bound and
+before any mutation.
 
 Issue-created managed-CI authorization is a durable orchestration protocol,
 not coder evidence. Once a structurally accepted implementation response
@@ -672,14 +801,18 @@ at the live head. The only accepted exception follows resume: a single fresh
 grant may supersede the creation record at the same head. That terminal must
 link through round-backed continuity records to a creation or fresh root, the
 chain must not fork, and every record in it must carry the approved plan hash.
+Records retired by a later fresh grant (#1065) or continuity record (#1069)
+are history and are ignored by this check; a continuity record retires only
+the actor's otherwise compatible records that cannot reach its new head, never
+its own predecessor chain.
 A strictly protected base publishes no authorization record, so the binding
 comes from the same sources its resume used: the reserved managed branch for
 the issue, plus the issue's completely approved canonical plan, whose hash must
 still equal the bound plan. Any gap fails qualification closed. Runs that do
 have an issue-side handoff, and all non-managed runs, keep the issue-side check.
 
-The merge-conflict resolution round is the one automatic transition that has no
-reviewer to correlate. When the live head conflicts with the base branch the
+Two automatic transitions have no reviewer to correlate: the merge-conflict
+resolution round and the exact-head CI repair round. When the live head conflicts with the base branch the
 orchestrator skips reviewers by construction and routes the round to the coder,
 so no blocking reviewer record for the predecessor head can ever exist. That
 head advance is authorized instead by the tool-owned merge-conflict obligation:
@@ -690,9 +823,26 @@ merge-conflict obligation in its round items. That obligation is minted by the
 tool and sits outside the coder's classifiable item namespace, so an agent
 response cannot introduce it. The continuity comment binds that single record,
 and resume reauthenticates the same shape rather than a reviewer pair that never
-existed. A head advance carrying neither an ordered blocking-review/coder pair
-nor that obligation still fails closed, and every reviewer must still approve
-the exact final head before qualification or merge.
+existed.
+
+The exact-head CI repair round (#1024) is the second such transition. When
+managed exact-head CI fails on a head every reviewer already approved, the
+failure comes from CI rather than a reviewer, so the coder round that repairs it
+has no blocking review to pair with. That head advance is authorized by the
+tool-minted CI obligation in the state the coder record carries after the push:
+exactly one coder round metadata record for the new exact head and the
+immediately following round, authored by the bound actor, newer than the
+predecessor authorization, carrying a machine-authority `managed-exact-head-ci`
+or `github-pr-checks` obligation in `awaiting_current_head_review` whose failed
+head is the predecessor head and whose candidate head is the new head. The
+orchestrator mints the obligation and advances its lifecycle and heads; an agent
+response cannot introduce it or set those fields. Resume reauthenticates the
+same shape, bound to both heads of the transition.
+
+A head advance carrying none of an ordered blocking-review/coder pair, the
+merge-conflict obligation, or a CI obligation bound to exactly that transition
+still fails closed, and every reviewer must still approve the exact final head
+before qualification or merge.
 
 ## State and Recovery
 
@@ -718,6 +868,32 @@ alike — is verified by comparing the server's stored body for that comment wit
 the exact posted carrier and checking the producing login and ID, fetching the
 comment when the write response carries no envelope; a rejected read-back takes
 that seam's existing failure path rather than being accepted on an exit status.
+
+Some hosts append a fixed footer to every posted comment (Claude Code cloud
+sessions; #1043). The one byte-exact suffix `KNOWN_HOST_COMMENT_FOOTER` in
+`protocol_markers.py` is tolerated once and nowhere else:
+
+- Read-back accepts the stored body when it equals the posted body, or the
+  posted body plus that suffix. Each write reports whether the footer was
+  observed and the server's `updated_at`, never the comment's `created_at`.
+- The suffix is stripped exactly once, where a raw comment body enters a strict
+  reader. There are three such boundaries: `_authenticated_comment_from_rest`,
+  managed-CI `_normalized_comment_body`, and plan-validation diagnostic
+  recovery. Strict parsers never strip, so doubled or variant footers are still
+  rejected.
+- The managed-CI issue authorization parser requires the whole body to equal
+  its canonical rendering, or the historical marker-only rendering.
+- The base workflow admits a footered intent only through a raw-body match, and
+  advertises that with `AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1`. Agent-loop's
+  intent rediscovery and pre-dispatch gate mirror that workflow's page
+  decision. The mirror returns `authorized`, `recoverable` (a lone `prepared`
+  record), or `fail`, plus nonce-independent fatal comments.
+- Before a dispatch, agent-loop renews the intent's `created_at` in place and
+  checks it against the workflow's age window.
+- Against an older workflow, an observed footer on an intent write raises a
+  terminal, recovery-exempt error. That is `pre-dispatch` unless a dispatch was
+  issued or a run attached.
+- Observation is logged once per owned usage context.
 
 Resume reconstructs state from recorded evidence and then checks it against the
 live PR, issue, plan, requirements, and policy. GitHub metadata is durable but
@@ -771,7 +947,10 @@ Key contracts to preserve when changing the implementation:
 - Do not equate missing required input, interrupted commands, or infrastructure
   failures with approval. Distinguish them from actionable code defects.
 - Permissions and resource containment are different controls. Permission bypass
-  flags do not make fetched content or agent commands trustworthy.
+  flags do not make fetched content or agent commands trustworthy. Sandboxed
+  role grants never widen with operator pass-through arguments, and a failed
+  pre-spawn boundary or provenance re-check is never retried with the same
+  grant.
 
 These are design contracts and validation responsibilities, not a claim that
 every integration path is bug-free. Use source inspection and regression tests
@@ -837,6 +1016,75 @@ Architecture-context injection is bounded and advisory on the supported prompt
 paths, and fresh turns with an acquired architecture snapshot use the versioned
 architecture-impact assessment. Legacy records remain decodable without
 inventing a snapshot or assessment; source inspection remains required.
+
+Semantic-claim validation degrades the narrowest offending element instead of
+rejecting the whole response. The architecture-impact parser has three explicit
+modes. `strict` is the default and accepts only `changed` and `unchanged`.
+`legacy` is the #916 synonym normalization, selected explicitly only where
+stored or historical text is decoded: plan re-authentication, both topology
+checkpoint decodes, and re-parses of posted or resumed records. `degradable`
+is selected only by the agent-response validation of the seven
+required-contract invocations and the four live review invocations. It honors
+exactly one alias: `modified` becomes `changed` when the payload corroborates a
+change, meaning every changed-only list, including the literal
+`execution_data_flows` key, is non-empty, and the payload names a real
+canonical-document action. Every other synonym, and an uncorroborated
+`modified`, becomes the parser-only `undetermined` status, which has no wire
+form and never resolves to `unchanged`.
+
+Accepted text is canonicalized at one acceptance boundary that every
+successful exit of `_run_validated_agent` and of completion recovery goes
+through. The status is rewritten to `changed`, or an undetermined optional
+review assessment is removed. The rewritten text is then re-parsed strictly
+under the candidate's own test-turn context, and the degradation records are
+reattached, so later strict re-parses of posted text still succeed.
+
+A required assessment that is omitted, removed, or `undetermined` does not
+satisfy the contract. The validators return it without raising, and
+`_run_validated_agent` refuses it. The refusal is deterministic and makes no
+repair call. It takes an ordinary retry whose prompt names `architecture_impact`
+and its accepted values, within the existing `--agent-max-retries` budget and
+attempt bound. This applies to a primary response, a response-file artifact
+from a timeout or nonzero exit, a completion-recovery response, and a repair
+candidate. The refused response is kept on the final error.
+
+Semantic patch values stay strict. Canonical plan assembly and topology
+checkpoint publication refuse a degraded status. Repair normalizes a near miss
+before the repair prompt is built. It pins the absence of any removed
+assessment, and of an omitted required one, and it refuses an unsatisfied
+candidate before counting it as a success. Acknowledgement-only review repairs
+validate new output strictly and keep the accepted assessment. Every
+degradation produces a bounded, parser-derived record. Records travel on the
+parsed result and in an optional round-metadata field, from which resumed
+review carriers are rebuilt, and they appear in the round summary. A
+decomposition surfaces its records in a plain parent-issue comment, whether it
+was accepted or refused.
+
+Model-authored `test_observations` citations in coder follow-ups and issue
+implementations also degrade per element. A malformed citation is dropped with
+its own `citation-dropped` record, and valid citations survive. More than
+eight drops, the same limit the degradation renderer shows in full, reject the
+response, so every kept record is stored and rendered. The records travel in
+an optional `test_observation_degradations` round-metadata field, appear in
+the follow-up comment and the round summary, and are restored onto the coder
+carrier on resume. Canonical `risk_test_matrix_evidence` citations stay
+strict: a verified row must never stand on fewer citations than it declared.
+
+Every function, method and nested def in `protocol.py` that can still reach
+an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as
+`fatal`, `mixed` or `delegated`. Each raise site and raise-reaching call site
+carries an inline annotation. A propagating site names one clause from a
+closed set: unparseable envelope, kind or version mismatch, authentication or
+forgery, payload bound, authority decision, orchestrator-authored, or no
+conservative reading. A site inside a `try` whose handlers cover every class
+it can raise without re-raising is annotated as handled. Sites inside generic
+helpers are annotated as delegated to their callers. Imported raisers, such
+as the marker-neutralization check in `sanitize_historical_text`, are listed
+with the classes they raise. `tests/test_shape_check_audit.py` recomputes the
+transitive inventory from source, following bare names, same-module
+`Class.method`, `cls`, `self` and `super()` calls, constructors, and untyped
+receivers. It fails on an unclassified unit, a stale entry, a missing or
+mismatched clause, or a degrading parser that can raise or builds records.
 
 ## Semantic planning foundation
 

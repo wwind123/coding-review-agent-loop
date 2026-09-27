@@ -57,3 +57,6 @@ def _isolate_worker_budget_environment(monkeypatch):
     """
     for name in _WORKER_BUDGET_ISOLATED_ENV:
         monkeypatch.delenv(name, raising=False)
+    # Host-wide worker sharing (#987) would otherwise count the real loops on
+    # this host; tests that exercise it opt back in explicitly.
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", "off")

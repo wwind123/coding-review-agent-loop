@@ -8,7 +8,6 @@ import os
 import shlex
 import shutil
 import sys
-import tempfile
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -20,6 +19,7 @@ from .expected_closure import normalize_issue_ids
 from .github import PullRequestMetadata, detect_repo, get_repo_default_branch
 from .logging import datetime_stamp, log
 from .runner import Runner
+from .scratch import make_private_dirs, scratch_root
 from .test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from .workdirs import active_workdir, agent_workdir
 from .plan_review_scheduling import PLAN_REVIEW_POLICIES
@@ -175,6 +175,13 @@ class AgentLoopConfig:
     plan_review_policy: str = "all-reviewers"
     primary_plan_reviewer: AgentName | None = None
     plan_review_force_full: bool = False
+    # Plan-growth gate (#886): structural thresholds above which a one-shot
+    # plan needs a reviewed justification or a staged restructure.
+    plan_growth_gate: str = "enforce"
+    plan_growth_max_chars: int = 120_000
+    plan_growth_max_revisions: int = 6
+    plan_growth_max_scope_items: int = 12
+    plan_growth_max_matrix_rows: int = 18
     auto_agent_dirs: tuple[AgentName, ...] = ()
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
@@ -280,6 +287,10 @@ class AgentLoopConfig:
     # A consciously per-invocation waiver for issue-created v2 only. It is
     # never read from the environment or durable PR state.
     allow_unprotected_managed_ci: bool = False
+    # A separate explicit waiver for "unreadable" protection: classic branch
+    # protection refused this token with HTTP 403 and the readable effective
+    # rules show no strict enforcement (#1040).  Requires the waiver above.
+    allow_unreadable_protection: bool = False
     # Runtime-only correlation value minted by the issue-created preflight.
     # It is intentionally not a CLI option: a later invocation must perform a
     # new preflight rather than accepting a PR-body token it did not create.
@@ -369,6 +380,10 @@ class AgentLoopConfig:
     architecture_aggregate_max_chars: int = 24_000
     managed_context_max_chars: int = 80_000
     architecture_context: object | None = None
+    # Agent permission mode (#1035): ``default`` and ``dangerous`` keep the
+    # static per-provider args; ``sandboxed`` builds role-scoped grants per
+    # invocation (see agent_permissions.py).
+    agent_permissions: str = "default"
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -473,6 +488,26 @@ class AgentLoopConfig:
             "--implementation-claude-effort",
         )
         ensure_no_model_arg_conflicts(self)
+        from .agent_permissions import (
+            AGENT_PERMISSION_MODES,
+            validate_sandboxed_passthrough,
+            validate_sandboxed_selections,
+        )
+
+        if self.agent_permissions not in AGENT_PERMISSION_MODES:
+            raise AgentLoopError(
+                "--agent-permissions must be one of: " + ", ".join(AGENT_PERMISSION_MODES) + "."
+            )
+        if self.agent_permissions == "sandboxed":
+            validate_sandboxed_passthrough(
+                {
+                    "--claude-arg": self.claude_args,
+                    "--codex-arg": self.codex_args,
+                    "--gemini-arg": self.gemini_args,
+                    "--antigravity-arg": self.antigravity_args,
+                }
+            )
+            validate_sandboxed_selections(self)
         if self.planning_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--planning-context-mode must be either 'full' or 'compact'.")
         if self.plan_execution_mode not in PLAN_EXECUTION_MODES:
@@ -531,6 +566,16 @@ class AgentLoopConfig:
             raise AgentLoopError(
                 "--plan-review-force-full requires --plan-review-policy primary-then-panel."
             )
+        if self.plan_growth_gate not in {"enforce", "off"}:
+            raise AgentLoopError("--plan-growth-gate must be 'enforce' or 'off'.")
+        for flag, value in (
+            ("--plan-growth-max-chars", self.plan_growth_max_chars),
+            ("--plan-growth-max-revisions", self.plan_growth_max_revisions),
+            ("--plan-growth-max-scope-items", self.plan_growth_max_scope_items),
+            ("--plan-growth-max-matrix-rows", self.plan_growth_max_matrix_rows),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise AgentLoopError(f"{flag} must be a positive integer.")
         object.__setattr__(self, "pr_review_broad_rules", normalize_broad_rules(self.pr_review_broad_rules))
         if self.discuss_research not in DISCUSS_RESEARCH_MODES:
             rendered = ", ".join(f"'{mode}'" for mode in sorted(DISCUSS_RESEARCH_MODES))
@@ -861,7 +906,7 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
 
 def default_agent_workdir(repo: str, agent: AgentName) -> Path:
     repo_slug = repo_cache_slug(repo)
-    return Path(tempfile.gettempdir()) / "coding-review-agent-loop" / repo_slug / agent / "repo"
+    return scratch_root() / repo_slug / agent / "repo"
 
 
 def repo_cache_slug(repo: str) -> str:
@@ -1055,12 +1100,17 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
 
     if not path.exists():
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            make_private_dirs(path.parent)
         except OSError as exc:
             raise AgentLoopError(f"Could not create parent directory for {agent} checkout at {path}: {exc}") from exc
         runner.run((config.gh_cmd, "repo", "clone", config.repo, str(path)), cwd=path.parent)
         if runner.dry_run:
             return
+        from .agent_permissions import register_checkout
+
+        # An intentional (re-)creation is re-registered so the sandboxed
+        # boundary re-checks it rather than treating it as tampering.
+        register_checkout(config, path)
         # Fresh clones still flow through validation and sync below so the
         # same remote, cleanliness, and base-branch checks apply to every run.
 
@@ -1290,6 +1340,36 @@ def preflight_agent_commands(
         runner.remember_agent_command(command, resolved, override_flag)
 
 
+def _arg_or_default(args: argparse.Namespace, name: str, default: int) -> int:
+    """Keep an explicit value (even an invalid one) so validation can reject it."""
+    value = getattr(args, name, None)
+    return default if value is None else value
+
+
+def resolve_agent_permissions_mode(args: argparse.Namespace) -> str:
+    """Resolve ``--agent-permissions`` and its ``--dangerous-agent-permissions`` alias."""
+    explicit = getattr(args, "agent_permissions", None)
+    dangerous_flag = bool(getattr(args, "dangerous_agent_permissions", False))
+    if dangerous_flag and explicit not in (None, "dangerous"):
+        raise AgentLoopError(
+            f"--dangerous-agent-permissions conflicts with --agent-permissions {explicit}; "
+            "pass only one permission mode."
+        )
+    mode = explicit or ("dangerous" if dangerous_flag else "default")
+    if mode == "sandboxed":
+        from .agent_permissions import validate_sandboxed_passthrough
+
+        validate_sandboxed_passthrough(
+            {
+                "--claude-arg": getattr(args, "claude_arg", None),
+                "--codex-arg": getattr(args, "codex_arg", None),
+                "--gemini-arg": getattr(args, "gemini_arg", None),
+                "--antigravity-arg": getattr(args, "antigravity_arg", None),
+            }
+        )
+    return mode
+
+
 def config_from_args(
     args: argparse.Namespace,
     runner: Runner,
@@ -1299,6 +1379,28 @@ def config_from_args(
     configured_reviewers = tuple(args.reviewer or ["codex"])
     if len(set(configured_reviewers)) != len(configured_reviewers):
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")
+    if resolve_agent_permissions_mode(args) == "sandboxed":
+        # Name the unsupported selection before command preflight would
+        # report a missing default helper CLI such as agy.
+        from types import SimpleNamespace
+
+        from .agent_permissions import validate_sandboxed_selections
+
+        validate_sandboxed_selections(
+            SimpleNamespace(
+                coder=args.coder,
+                implementation_coder=getattr(args, "implementation_coder", None),
+                reviewer=configured_reviewers,
+                primary_reviewer=getattr(args, "primary_reviewer", None),
+                primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
+                discuss_analyzer=getattr(args, "discuss_analyzer", None),
+                repair_backend=getattr(args, "repair_backend", "antigravity"),
+                semantic_followup_dedupe=getattr(args, "semantic_followup_dedupe", True),
+                semantic_followup_backend=getattr(
+                    args, "semantic_followup_backend", DEFAULT_SEMANTIC_FOLLOWUP_BACKEND
+                ),
+            )
+        )
     preflight_agent_commands(args, runner, configured_reviewers)
 
     detect_dir = args.codex_dir.resolve() if args.codex_dir is not None else Path.cwd().resolve()
@@ -1360,6 +1462,14 @@ def config_from_args(
         raise AgentLoopError("--agent-max-retries must be zero or positive.")
     if any(delay <= 0 for delay in args.agent_retry_backoff_seconds):
         raise AgentLoopError("--agent-retry-backoff-seconds values must be greater than zero.")
+    permission_mode = resolve_agent_permissions_mode(args)
+    dangerous = permission_mode == "dangerous"
+
+    def static_args(agent: AgentName, supplied: list[str] | None) -> tuple[str, ...]:
+        if supplied is not None:
+            return tuple(supplied)
+        return default_agent_args(agent, dangerous=dangerous, mode=permission_mode)
+
     return AgentLoopConfig(
         repo=repo,
         claude_dir=claude_dir,
@@ -1377,28 +1487,13 @@ def config_from_args(
         codex_cmd=args.codex_cmd,
         gemini_cmd=args.gemini_cmd,
         gh_cmd=args.gh_cmd,
-        claude_args=tuple(
-            args.claude_arg
-            if args.claude_arg is not None
-            else default_agent_args("claude", dangerous=args.dangerous_agent_permissions)
-        ),
-        codex_args=tuple(
-            args.codex_arg
-            if args.codex_arg is not None
-            else default_agent_args("codex", dangerous=args.dangerous_agent_permissions)
-        ),
-        gemini_args=tuple(
-            args.gemini_arg
-            if args.gemini_arg is not None
-            else default_agent_args("gemini", dangerous=args.dangerous_agent_permissions)
-        ),
+        claude_args=static_args("claude", args.claude_arg),
+        codex_args=static_args("codex", args.codex_arg),
+        gemini_args=static_args("gemini", args.gemini_arg),
         antigravity_dir=antigravity_dir,
         antigravity_cmd=args.antigravity_cmd,
-        antigravity_args=tuple(
-            args.antigravity_arg
-            if args.antigravity_arg is not None
-            else default_agent_args("antigravity", dangerous=args.dangerous_agent_permissions)
-        ),
+        antigravity_args=static_args("antigravity", args.antigravity_arg),
+        agent_permissions=permission_mode,
         antigravity_model=args.antigravity_model,
         antigravity_models=tuple(args.antigravity_models) if getattr(args, "antigravity_models", None) is not None else (),
         antigravity_print_timeout_seconds=getattr(
@@ -1459,6 +1554,7 @@ def config_from_args(
         managed_ci=getattr(args, "managed_ci", False),
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
         allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),
+        allow_unreadable_protection=getattr(args, "allow_unreadable_protection", False),
         managed_ci_fresh_authorization=getattr(args, "managed_ci_fresh_authorization", False),
         managed_ci_issue_number=getattr(args, "managed_ci_issue", None),
         managed_ci_pr_mode=getattr(args, "command", None) == "pr",
@@ -1526,6 +1622,11 @@ def config_from_args(
         plan_review_policy=getattr(args, "plan_review_policy", None) or "all-reviewers",
         primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
         plan_review_force_full=bool(getattr(args, "plan_review_force_full", False)),
+        plan_growth_gate=getattr(args, "plan_growth_gate", None) or "enforce",
+        plan_growth_max_chars=_arg_or_default(args, "plan_growth_max_chars", 120_000),
+        plan_growth_max_revisions=_arg_or_default(args, "plan_growth_max_revisions", 6),
+        plan_growth_max_scope_items=_arg_or_default(args, "plan_growth_max_scope_items", 12),
+        plan_growth_max_matrix_rows=_arg_or_default(args, "plan_growth_max_matrix_rows", 18),
         auto_agent_dirs=auto_agent_dirs,
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),
