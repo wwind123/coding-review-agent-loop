@@ -424,7 +424,8 @@ def test_plain_pytest_in_xdist_repo_asks_for_budget_default(tmp_path):
     [
         ["-n", "2"], ["-n0"], ["--numprocesses=3"], ["--maxprocesses", "2"], ["--dist", "load"],
         ["--dist=loadfile"], ["--tx", "popen"], ["-d"], ["-p", "no:xdist"], ["-pno:xdist"],
-        ["-p=no:xdist"], ["--pdb"], ["--trace"], ["--looponfail"],
+        ["-p=no:xdist"], ["--pdb"], ["--trace"], ["--looponfail"], ["--dist", "no"],
+        ["--collect-only"], ["--co"],
     ],
 )
 def test_explicit_worker_choice_gets_no_default(tmp_path, extra):

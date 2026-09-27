@@ -794,13 +794,17 @@ never enables it, so a coder's plain `pytest` ran serially however large the
 budget. In clamp and refuse with a budget above one, the wrapper therefore
 marks a direct pytest for a default of `budget` workers when its argv names no
 worker or xdist choice (`-n`, `--numprocesses`, `--maxprocesses`, `--tx`,
-`--dist`, `-d`, `-p no:xdist`, or the xdist-incompatible `--pdb`, `--trace`,
-`--looponfail`) and the repository declares xdist support (the same bounded
+`--dist`, `-d`, `-p no:xdist`, or the serial-only `--pdb`, `--trace`,
+`--looponfail`, `--collect-only`) and the repository declares xdist support (the same bounded
 detection that drives the coder prompt, run from the nearest `.git` ancestor
 of the working directory). The plugin applies the default only when xdist is
-active and pytest's resolved options (argv, ini `addopts`, `PYTEST_ADDOPTS`)
-still name no worker count, `--tx`, `--dist` or `--collect-only`; otherwise
-the run keeps its own choice. When xdist is not installed or is disabled, the
+active and pytest's full resolved argument list (argv with `PYTEST_ADDOPTS`
+and ini or `-o` `addopts` prepended, captured in
+`pytest_load_initial_conftests`) and parsed options still name none of those
+choices; otherwise the run keeps its own choice. The argument list matters
+because an explicit `--dist no` parses to the same value as the default. The
+timeout-recommendation lookup uses the parallel cohort only for commands the
+wrapper would give the default. When xdist is not installed or is disabled, the
 run stays serial and the plugin prints a one-line notice. The confirmation
 record carries `defaulted`. Pass `-n 0` or `-p no:xdist` to keep a focused run
 serial.

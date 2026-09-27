@@ -257,12 +257,58 @@ if _pluggy_supports_wrappers():
                 if state.env_entry:
                     _restore_env_entry()
 
+    # Options that state a worker or distribution choice, or that xdist cannot
+    # combine with distribution.  Mirrors the wrapper's lexical argv check,
+    # applied here to pytest's full resolved argument list.
+    _CHOICE_OPTIONS = (
+        "-n", "--numprocesses", "--maxprocesses", "--tx", "--dist", "--distload", "-d",
+        "--looponfail", "-f", "--pdb", "--trace", "--collect-only", "--co",
+    )
+    _RESOLVED_ARGS = "_agent_loop_worker_cap_resolved_args"
+
+    def names_worker_choice(tokens) -> bool:
+        """Whether pytest arguments state a worker, distribution or xdist choice."""
+        index = 0
+        while index < len(tokens):
+            token = str(tokens[index])
+            if token == "--":
+                return False
+            for option in _CHOICE_OPTIONS:
+                if token == option or token.startswith(option + "="):
+                    return True
+                if option == "-n" and token.startswith("-n") and len(token) > 2:
+                    return True
+            value = None
+            if token == "-p" and index + 1 < len(tokens):
+                value = str(tokens[index + 1])
+                index += 1
+            elif token.startswith("-p") and len(token) > 2:
+                value = token[2:].lstrip("=")
+            if value is not None and "xdist" in value:
+                return True
+            index += 1
+        return False
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_load_initial_conftests(early_config, parser, args):
+        # ``args`` is pytest's complete argument list at this point: argv with
+        # ``PYTEST_ADDOPTS`` and ini ``addopts`` (including ``-o addopts``)
+        # already prepended.  Keeping it preserves option provenance that the
+        # parsed namespace loses, e.g. an explicit ``--dist no`` (#1073).
+        if _ARMED is None or not _ARMED.get("default_workers"):
+            return
+        try:
+            setattr(early_config, _RESOLVED_ARGS, tuple(str(arg) for arg in args))
+        except Exception:
+            pass
+
     def _apply_default_workers(state, config):
         """Give a plain pytest the wrapper's default worker count (issue #1073).
 
-        Only when pytest-xdist is active and pytest's resolved options (argv,
-        ini ``addopts``, ``PYTEST_ADDOPTS``) name no worker or distribution
-        choice; otherwise the run keeps its own choice or stays serial.
+        Only when pytest-xdist is active and pytest's resolved arguments and
+        options (argv, ini ``addopts``, ``PYTEST_ADDOPTS``) name no worker or
+        distribution choice -- an explicit ``--dist no`` included -- otherwise
+        the run keeps its own choice or stays serial.
         """
         default = state.default_workers
         if not default:
@@ -277,6 +323,9 @@ if _pluggy_supports_wrappers():
                 "agent-loop worker budget: pytest-xdist is not active in this interpreter; "
                 "running serially"
             )
+            return
+        resolved = getattr(config, _RESOLVED_ARGS, None)
+        if resolved is not None and names_worker_choice(resolved):
             return
         if (
             option.numprocesses is not None

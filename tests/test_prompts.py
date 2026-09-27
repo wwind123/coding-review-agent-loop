@@ -4943,6 +4943,10 @@ def test_plain_pytest_lookup_prefers_parallel_cohort_then_serial(tmp_path):
     )
     assert _expected_worker_cohorts(config, command) == ["3", "serial"]
     assert _expected_worker_cohorts(config, [*command, "-n", "2"]) == ["2"]
+    # Serial-only invocations never borrow the parallel cohort (review item-2).
+    for extra in (["--collect-only"], ["--co"], ["--pdb"], ["--trace"], ["--looponfail"], ["-f"],
+                  ["--distload"], ["--dist", "no"], ["-p", "no:xdist"]):
+        assert _expected_worker_cohorts(config, [*command, *extra])[0] != "3", extra
 
 
 def test_reviewer_prompt_has_no_parallel_worker_guidance(tmp_path):

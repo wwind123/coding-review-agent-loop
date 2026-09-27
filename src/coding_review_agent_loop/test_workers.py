@@ -635,7 +635,7 @@ def new_report_location() -> tuple[Path, Path]:
 # never given a default worker count (issue #1073).
 _WORKER_CHOICE_OPTIONS = (
     "-n", "--numprocesses", "--maxprocesses", "--tx", "--dist", "--distload", "-d",
-    "--looponfail", "-f", "--pdb", "--trace",
+    "--looponfail", "-f", "--pdb", "--trace", "--collect-only", "--co",
 )
 
 

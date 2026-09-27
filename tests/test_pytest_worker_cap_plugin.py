@@ -380,6 +380,13 @@ def test_plain_pytest_runs_with_the_default_workers(tmp_path, mode):
         ({"pytest.ini": "[pytest]\naddopts = -n 2\n"}, [], {}, 2),
         ({}, ["--collect-only"], {}, 0),
         ({}, ["--tx", "popen"], {}, 0),
+        # An explicit ``--dist no`` resolves to the same value as the default;
+        # it must still win over the budget default (review item-1).
+        ({}, ["--dist", "no"], {}, 0),
+        ({}, [], {"PYTEST_ADDOPTS": "--dist no"}, 0),
+        ({}, [], {"PYTEST_ADDOPTS": "--dist=no"}, 0),
+        ({"pytest.ini": "[pytest]\naddopts = --dist no\n"}, [], {}, 0),
+        ({}, ["-o", "addopts=--dist no"], {}, 0),
     ],
 )
 def test_resolved_worker_choice_wins_over_default(tmp_path, files, args, env, expected):

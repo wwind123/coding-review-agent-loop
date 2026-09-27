@@ -397,11 +397,21 @@ def _expected_worker_cohorts(config: AgentLoopConfig, command: Sequence[str]) ->
     fallback.  Serial timings are never shorter, so the fallback is safe.
     """
     try:
-        from .test_workers import detect_parallel_support, expected_workers_label
+        from .test_workers import (
+            detect_parallel_support,
+            expected_workers_label,
+            parallel_default_applies,
+        )
 
         budget = preliminary_worker_budget(config)
+        workdir = agent_workdir(config, config.coder)
         labels = [expected_workers_label(command, budget=budget.workers, mode=budget.enforcement)]
-        if detect_parallel_support(agent_workdir(config, config.coder)):
+        # Only a command the wrapper would give the default may use the
+        # parallel cohort; a serial-only invocation (``--collect-only``,
+        # ``--pdb``, ...) must never borrow a faster parallel timing.
+        if parallel_default_applies(
+            command, workdir, budget, parallel_supported=detect_parallel_support(workdir),
+        ):
             parallel = expected_workers_label(
                 command, budget=budget.workers, mode=budget.enforcement, parallel_default=True,
             )
