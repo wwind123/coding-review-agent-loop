@@ -54,6 +54,7 @@ from .board_amendment import (
 )
 from .decomposition import (
     _decode_json_payload,
+    issue_has_execution_decision,
     CreatedPhaseIssue,
     PlanDecomposition,
     RecordedPhase,
@@ -508,6 +509,7 @@ from .comment_rendering import (
 )
 from .followups import (
     APPROVED_FOLLOWUP_MARKER_RE,
+    approved_plan_hashes_for_issue,
     GroupedApprovedFollowup,
     MAX_APPROVED_FOLLOWUP_ISSUES,
     _append_approved_followups_marker,
@@ -7386,6 +7388,36 @@ def _child_resume_hint(child_issue_number: int, disposition: str) -> str:
     if disposition == EXECUTION_DISPOSITION_PLANNING:
         return f"agent-loop issue {child_issue_number} --plan-first --plan-execution-mode auto"
     return f"agent-loop issue {child_issue_number}"
+
+
+def _refuse_plain_mode_over_planning(
+    *,
+    issue_number: int,
+    comments: Sequence[object],
+    repo: str,
+) -> None:
+    """Refuse plain issue mode on an issue that planning already decided (#1088).
+
+    Plain mode implements from the issue text and never consults an approved
+    plan, so running it over one would silently discard the reviewed plan.
+    This mirrors the decomposition-child guard for a top-level issue.
+    """
+    evidence: list[str] = []
+    plan_hashes = approved_plan_hashes_for_issue(comments, issue_number=issue_number)
+    if plan_hashes:
+        evidence.append(f"an approved plan (hash {plan_hashes[-1]})")
+    if issue_has_execution_decision(comments, issue_number=issue_number):
+        evidence.append("a recorded execution decision")
+    handoff = find_latest_issue_pr_handoff(comments, issue_number=issue_number, repo=repo)
+    if handoff is not None and handoff.flow == "approved-plan-implementation":
+        evidence.append(f"an approved-plan implementation handoff to PR #{handoff.pr_number}")
+    if not evidence:
+        return
+    raise AgentLoopError(
+        f"Issue #{issue_number} already carries {', '.join(evidence)}; plain issue mode "
+        "implements from the issue text and would bypass the reviewed plan. Rerun "
+        f"`agent-loop issue {issue_number} --plan-first` to resume from the approved plan."
+    )
 
 
 def _post_child_planning_handoff(
@@ -15366,6 +15398,15 @@ def run_issue_loop(
                 parent_issue_context = get_issue_context(
                     runner, config=config, issue_number=fresh_child.parent_issue
                 )
+
+        if not plan_first:
+            # A decomposition child was routed above; this is the structurally
+            # identical top-level case, which must fail closed too (#1088).
+            _refuse_plain_mode_over_planning(
+                issue_number=issue_number,
+                comments=issue_context.comments,
+                repo=config.repo,
+            )
 
         recovered_plan_hash: str | None = None
         recovered_plan_additions: tuple[int, ...] | None = None

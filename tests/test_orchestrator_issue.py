@@ -13371,3 +13371,89 @@ def test_m1047_reentry_that_aborts_before_publication_is_preserved_for_exact_res
         _m1047_run_pr_loop(runner, pr_number=77, config=config)
     assert seen == [("activation", True, True)]
     assert len(runner.managed_deletes()) == 1
+
+
+# --- #1088: plain issue mode must not bypass an approved plan ---------------
+
+from coding_review_agent_loop.decomposition import (  # noqa: E402
+    ExecutionDecision as _M1088ExecutionDecision,
+    format_execution_decision as _m1088_format_execution_decision,
+)
+
+
+def _m1088_approval_comment(issue_number, plan_hash):
+    return {
+        "author": {"login": "bot"},
+        "createdAt": "2026-05-23T00:00:02Z",
+        "body": (
+            f"Planning complete for issue #{issue_number}.\n\n"
+            "<!-- AGENT_PLAN_APPROVED_FOLLOWUPS: "
+            f"issue={issue_number} plan={plan_hash} mode=summarize -->\n"
+            "-- coding-review-agent-loop"
+        ),
+    }
+
+
+def _m1088_assert_refused_without_coder(runner, config):
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config)
+    message = str(excinfo.value)
+    assert "agent-loop issue 56 --plan-first" in message
+    assert "plain issue mode" in message
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
+    assert runner.comments == []
+    return message
+
+
+def test_1088_plain_issue_mode_refuses_top_level_issue_with_approved_plan(tmp_path):
+    plan_hash = approved_plan_hash("Plan:\n- Make the change.")
+    runner = FakeRunner(
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        issue_comments=[_m1088_approval_comment(56, plan_hash)],
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert f"an approved plan (hash {plan_hash})" in message
+
+
+def test_1088_plain_issue_mode_refuses_top_level_issue_with_execution_decision(tmp_path):
+    decision = _M1088ExecutionDecision(
+        parent_issue=56,
+        plan_hash="sha256:" + "a" * 64,
+        plan_subject="Make the change",
+        execution_strategy_contract_version=1,
+        strategy="one-shot",
+        topology_source="approved-plan",
+        recommendation_digest="sha256:" + "b" * 64,
+        requested_policy="auto",
+        current_action="implement",
+    )
+    runner = FakeRunner(
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:03Z",
+                "body": _m1088_format_execution_decision(decision),
+            }
+        ],
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "a recorded execution decision" in message
+
+
+def test_1088_plain_issue_mode_still_runs_directly_without_plan_for_this_issue(tmp_path):
+    # An approval recorded for a different issue does not belong to #56.
+    runner = FakeRunner(
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_comments=[_m1088_approval_comment(99, approved_plan_hash("Plan:\n- Other."))],
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path)) == 0
+
+    command_names = [cmd[:2] for cmd, _cwd in runner.commands]
+    assert ["claude", "--print"] in command_names
