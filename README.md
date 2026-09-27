@@ -847,8 +847,9 @@ Reviewer board amendment:
   reused, and the removed reviewer is never invoked again.
 - **What stays immutable.** `policy` and `primary_reviewer` must match the
   persisted contract. The primary cannot be removed, and a `primary-then-panel`
-  board must keep at least one secondary. Re-adding a removed reviewer is
-  contract drift. Every scheduler record posted after the amendment carries the
+  board must keep at least one secondary. Re-adding a removed reviewer by
+  changing the reviewer flags alone is contract drift; restore it with a signed
+  record instead (see below). Every scheduler record posted after the amendment carries the
   amended board and the record's digest; any other contract fails closed, and
   at PR qualification it refuses the merge. Amendments can chain, with each
   record's `original_required_reviewers` equal to the previous amended board.
@@ -869,6 +870,35 @@ Reviewer board amendment:
   that contains only the record is not treated as a signed human requirement.
   All-reviewers PR runs and the non-staged plan path persist no contract, so
   there you change the reviewer flags directly and must not post a record.
+
+**Restoring a recovered reviewer.** Backend outages are usually temporary. When
+a removed reviewer's backend recovers, rerun with the full reviewer flags; the
+drift error then prints a filled-in restoration record. It is the same signed
+record with an optional `restored_reviewers` list, an empty `removed_reviewers`
+list, and `reason` `backend-recovered`:
+
+```json
+{
+  "original_required_reviewers": ["Codex", "Claude"],
+  "removed_reviewers": [],
+  "restored_reviewers": ["Antigravity"],
+  "reason": "backend-recovered",
+  "effective_from_round": 6
+}
+```
+
+(The other keys are the same as in the removal record.) A restoration may only
+re-add a reviewer that an earlier record in the run's amendment chain removed
+and that is not already required, so the board can never grow beyond the
+original one. It keeps the original board order. The effective round,
+activation rule, digest binding, and fail-closed handling are the same as for
+removals, and removals and restorations chain freely (remove → restore →
+remove). From its effective round the restored reviewer is required again.
+Approvals it gave before that round do not count, so it must re-approve the
+current artifact before the run can complete. Findings that were reassigned
+while it was off the board stay with their new owners and are not re-opened.
+Once the board is back to the original set, no reduced-board completion note
+is posted.
 
 See [the detailed contract](docs/local_agent_loop.md#removing-an-unavailable-reviewer-from-an-in-flight-run).
 

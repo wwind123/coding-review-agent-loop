@@ -38,16 +38,19 @@ from .config import (
 )
 from .board_amendment import (
     ContractLineage,
+    added_in_config,
     amendment_audit_already_posted,
     amendment_summary_line,
     apply_board_amendment_to_ledger,
     collect_reviewer_board_amendments,
     format_reviewer_board_amendment_comment,
     missing_from_config,
+    predates_restoration,
     reject_misplaced_pr_amendments,
     render_amendment_audit_comment,
     require_amendment_activation,
     resolve_contract_lineage,
+    restoration_rounds_from_comments,
 )
 from .decomposition import (
     _decode_json_payload,
@@ -12359,6 +12362,7 @@ def _run_plan_first_loop(
                 plan_contract_lineage.amendments.index(amendment)
             ],
             removed=amendment.removed_reviewers,
+            restored=amendment.restored_reviewers,
             start_round_number=round_number,
         ),
     )
@@ -12940,6 +12944,7 @@ def _run_plan_first_loop(
                 surfaced_requirement_ids=plan_hr_ids,
                 panel_evidence=plan_panel_evidence,
                 primary_reviewer=plan_primary_name,
+                restoration_rounds=plan_contract_lineage.restoration_rounds,
             )
             plan_history = _classify_staged_plan_history(
                 plan_records, current_key=current_plan_key
@@ -17578,8 +17583,9 @@ def _board_amendment_template(
     persisted: object,
     removed: Sequence[str],
     start_round_number: int | str,
+    restored: Sequence[str] = (),
 ) -> str:
-    """Filled-in signed amendment template printed by fail-closed errors (#943)."""
+    """Filled-in signed amendment template printed by fail-closed errors (#943, #984)."""
     return format_reviewer_board_amendment_comment(
         flow=flow,
         issue=issue_number if flow == "plan" else None,
@@ -17588,6 +17594,7 @@ def _board_amendment_template(
         policy=str(getattr(persisted, "policy")),
         primary_reviewer=getattr(persisted, "primary_reviewer"),
         removed_reviewers=tuple(removed),
+        restored_reviewers=tuple(restored),
         effective_from_round=start_round_number,  # type: ignore[arg-type]
     )
 
@@ -17601,9 +17608,10 @@ def _board_amendment_route_clause(
     configured: object | None,
     start_round_number: Callable[[], int | None],
 ) -> str:
-    """The amendment-route clause appended to a contract-drift error (#943)."""
+    """The amendment-route clause appended to a contract-drift error (#943, #984)."""
     removed = missing_from_config(persisted, configured)
-    if removed is None:
+    restored = added_in_config(persisted, configured) if removed is None else None
+    if removed is None and restored is None:
         return ""
     try:
         round_number: int | str | None = start_round_number()
@@ -17617,9 +17625,18 @@ def _board_amendment_route_clause(
         issue_number=issue_number,
         pr_number=pr_number,
         persisted=persisted,
-        removed=removed,
+        removed=removed or (),
+        restored=restored or (),
         start_round_number=round_number,
     )
+    if restored:
+        return (
+            " If a previously removed reviewer backend has recovered, a human operator may "
+            f"restore it with a signed reviewer-board amendment posted on {surface} (only a "
+            "reviewer an earlier amendment removed can be restored); replace the rationale "
+            "placeholder and keep the effective round printed here:\n\n"
+            + template
+        )
     return (
         " If a reviewer backend is unavailable, a human operator may instead remove it "
         f"with a signed reviewer-board amendment posted on {surface}; replace the "
@@ -17818,8 +17835,12 @@ def _carried_plan_approvals(
     surfaced_requirement_ids: Sequence[str],
     panel_evidence: PlanPanelEvidence,
     primary_reviewer: str | None,
+    restoration_rounds: dict[str, int] | None = None,
 ) -> tuple[str, ...]:
     """Reviewers holding a qualifying exact-key approval carried from history.
+
+    A reviewer restored by a signed board amendment (#984) carries nothing
+    from rounds before its restoration round, so it must re-approve.
 
     A carried approval counts only when the stored record matches every
     component of the current candidate key and itself carried
@@ -17837,6 +17858,10 @@ def _carried_plan_approvals(
     for record in sorted(records, key=lambda item: item.index):
         metadata = record.metadata
         if metadata.role != "reviewer" or metadata.agent not in required:
+            continue
+        if predates_restoration(
+            restoration_rounds or {}, metadata.agent, metadata.round_number
+        ):
             continue
         if metadata.agent != primary_reviewer and not (
             panel_evidence.opened
@@ -18100,6 +18125,7 @@ def _require_complete_canonical_plan_approval(
             required_reviewers=required_names,
         ),
         primary_reviewer=contract.primary_reviewer,
+        restoration_rounds=restoration_rounds_from_comments(comments, flow="plan"),
     )
     if set(carried) != configured_names:
         raise AgentLoopError(error_message)
@@ -20581,6 +20607,7 @@ def run_pr_loop(
                     pr_contract_lineage.amendments.index(amendment)
                 ],
                 removed=amendment.removed_reviewers,
+                restored=amendment.restored_reviewers,
                 start_round_number=round_number,
             ),
         )
@@ -20617,7 +20644,12 @@ def run_pr_loop(
 
         def announce_reduced_board_completion() -> str:
             """Durable reduced-board completion note (#943); returns stdout suffix."""
-            if pr_amendment_note is None or pr_contract_lineage.active_amendment is None:
+            if (
+                pr_amendment_note is None
+                or pr_contract_lineage.active_amendment is None
+                # A board restored back to C0 is not reduced (#984).
+                or not pr_contract_lineage.removed_reviewers
+            ):
                 return ""
             _post_reduced_board_completion_note(
                 runner,
@@ -21082,6 +21114,16 @@ def run_pr_loop(
                         operator_force_full=scheduler_operator_force_full,
                     )
                 }
+            # A restored reviewer (#984) must re-approve the current head: an
+            # approval from before its restoration round is never carried.
+            pr_restoration_rounds = pr_contract_lineage.restoration_rounds
+            unchanged_head_approvals = {
+                name: record
+                for name, record in unchanged_head_approvals.items()
+                if not predates_restoration(
+                    pr_restoration_rounds, name, record.metadata.round_number
+                )
+            }
             checkpoint_expected_plan_digest = (
                 approved_plan_context.plan_hash
                 if approved_plan_context is not None

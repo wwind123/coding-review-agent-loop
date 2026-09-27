@@ -488,3 +488,264 @@ def test_malformed_amendment_comment_is_not_a_signed_requirement_on_issue_or_pr(
     # Malformed JSON mixed with other text stays a signed requirement.
     mixed = malformed.replace("Reviewer board amendment:", "Also rename the flag.")
     assert not is_reviewer_board_amendment_only(parse_signed_human_requirement_body(mixed))
+
+
+# --- restoration (#984) ---------------------------------------------------
+
+
+def _restore_body(**overrides):
+    values = {
+        "original_required_reviewers": ("Codex", "Claude"),
+        "removed_reviewers": (),
+        "restored_reviewers": ("Antigravity",),
+        "effective_from_round": 4,
+        "rationale": "Antigravity quota returned; probe answered in 6.6 s.",
+    }
+    values.update(overrides)
+    return _amendment_body(**values)
+
+
+def _remove_restore_comments():
+    comments = [_comment("x")] * 8
+    comments[1] = _comment(_amendment_body(effective_from_round=2))
+    comments[4] = _comment(_restore_body(effective_from_round=4))
+    return comments
+
+
+def test_removal_only_digest_is_unchanged_by_the_optional_restore_key():
+    import hashlib
+
+    (record,) = _plan_amendments([_comment(_amendment_body())])
+    payload = json.loads(_amendment_body().split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert "restored_reviewers" not in payload
+    legacy = hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+    assert record.digest == legacy
+    assert record.restored_reviewers == ()
+
+
+def test_restoration_record_parses_and_malformed_restorations_are_reported():
+    records, ignored = parse_reviewer_board_amendment_records(_restore_body(), comment_locator="c")
+    assert ignored == ()
+    (record,) = records
+    assert record.reason == "backend-recovered"
+    assert record.removed_reviewers == ()
+    assert record.restored_reviewers == ("Antigravity",)
+    for overrides, problem in (
+        ({"restored_reviewers": ()}, "removed_reviewers must be non-empty"),
+        (
+            {"removed_reviewers": ("Claude",), "restored_reviewers": ("Claude",)},
+            "both removed and restored",
+        ),
+        ({"reason": "backend-unavailable"}, "restoration-only record"),
+    ):
+        found, problems = parse_reviewer_board_amendment_records(
+            _restore_body(**overrides), comment_locator="c"
+        )
+        assert found == () and problem in problems[0]
+    found, problems = parse_reviewer_board_amendment_records(
+        _amendment_body(reason="backend-recovered"), comment_locator="c"
+    )
+    assert found == () and "removal-only record" in problems[0]
+
+
+def test_restore_of_removed_reviewer_is_required_from_its_effective_round():
+    amendments = _plan_amendments(_remove_restore_comments())
+    d1, d2 = (record.digest for record in amendments)
+    records = [
+        _checkpoint(0, 1, C0),
+        _checkpoint(2, 2, C1, digest=d1),
+        _checkpoint(3, 3, C1, digest=d1),
+        _checkpoint(5, 4, C0, digest=d2),
+    ]
+    lineage = _resolve(records, amendments, C0)
+    assert lineage.contracts == (C0, C1, C0)
+    # C0 order is preserved, and nothing is removed any more.
+    assert lineage.current_board == BOARD
+    assert lineage.removed_reviewers == ()
+    assert lineage.restoration_rounds == {"Antigravity": 4}
+    # A round-4 record still on the reduced board fails closed.
+    with pytest.raises(AgentLoopError, match="does not carry its amended contract"):
+        _resolve([*records[:3], _checkpoint(5, 4, C1, digest=d1)], amendments, C0)
+    # Pending restoration: activation must be the round the resume re-enters.
+    pending = _resolve(records[:3], amendments, C0)
+    assert pending.pending_amendments == (amendments[1],)
+    require_amendment_activation(pending, start_round_number=4, template=lambda a, n: "")
+    with pytest.raises(AgentLoopError, match="re-enters round 5"):
+        require_amendment_activation(pending, start_round_number=5, template=lambda a, n: "")
+
+
+def test_restore_naming_a_reviewer_never_removed_fails_closed():
+    # The run started on the reduced board: Antigravity was never on it.
+    with pytest.raises(AgentLoopError, match="never removed by an earlier amendment"):
+        _resolve(
+            [_checkpoint(0, 1, C1)],
+            _plan_amendments([_comment("x"), _comment(_restore_body(effective_from_round=2))]),
+            C0,
+        )
+    # A reviewer already on the board cannot be restored.
+    (already,) = _plan_amendments(
+        [_comment(_restore_body(original_required_reviewers=BOARD, restored_reviewers=("Claude",)))]
+    )
+    with pytest.raises(AgentLoopError, match="already on the persisted board"):
+        amend_contract(C0, already)
+    # Without the chain context a restoration never applies.
+    (restore,) = _plan_amendments([_comment(_restore_body())])
+    with pytest.raises(AgentLoopError, match="never removed"):
+        amend_contract(C1, restore)
+
+
+def test_remove_restore_remove_chain_resolves_each_round():
+    comments = _remove_restore_comments()
+    comments[6] = _comment(_amendment_body(effective_from_round=6))
+    amendments = _plan_amendments(comments)
+    d1, d2, d3 = (record.digest for record in amendments)
+    records = [
+        _checkpoint(0, 1, C0),
+        _checkpoint(2, 2, C1, digest=d1),
+        _checkpoint(3, 3, C1, digest=d1),
+        _checkpoint(5, 4, C0, digest=d2),
+        _checkpoint(7, 6, C1, digest=d3),
+    ]
+    lineage = _resolve(records, amendments, C1)
+    assert lineage.contracts == (C0, C1, C0, C1)
+    assert lineage.amendments == amendments
+    assert lineage.removed_reviewers == ("Antigravity",)
+    assert lineage.restoration_rounds == {}
+    # Round 4 must carry the restored board, not the removal link's.
+    with pytest.raises(AgentLoopError, match="does not carry its amended contract"):
+        _resolve(
+            [*records[:3], _checkpoint(5, 4, C1, digest=d1), records[4]], amendments, C1
+        )
+    # Two distinct records amending one board are still a conflict.
+    comments[6] = _comment(_amendment_body(removed_reviewers=("Claude",), effective_from_round=6))
+    comments[7] = _comment(_amendment_body(effective_from_round=7))
+    with pytest.raises(AgentLoopError, match="never chooses"):
+        _resolve(records[:4], _plan_amendments(comments), C1)
+
+
+def test_restoration_does_not_reopen_reassigned_and_cleared_items():
+    amendments = _plan_amendments(_remove_restore_comments())
+    d1, d2 = (record.digest for record in amendments)
+    lineage = _resolve(
+        [_checkpoint(0, 1, C0), _checkpoint(2, 2, C1, digest=d1), _checkpoint(5, 4, C0, digest=d2)],
+        amendments,
+        C0,
+    )
+    # The ledger persisted after the removal round: Antigravity's findings were
+    # reassigned to the primary, which cleared one of them.
+    persisted = (
+        _item(
+            "item-1",
+            "Antigravity",
+            owners=("Codex",),
+            states=(("Codex", "cleared"),),
+            status="resolved",
+        ),
+        _item("item-2", "Antigravity", owners=("Codex",), states=(("Codex", "pending"),)),
+    )
+    view, reassignments = apply_board_amendment_to_ledger(
+        persisted,
+        removed_reviewers=lineage.removed_reviewers,
+        remaining_reviewers=lineage.current_board,
+        primary_reviewer="Codex",
+    )
+    assert view == persisted and reassignments == ()
+
+
+def test_restored_reviewer_must_reapprove_and_summary_names_it():
+    from coding_review_agent_loop import orchestrator
+    from coding_review_agent_loop.board_amendment import (
+        amendment_summary_line,
+        predates_restoration,
+        render_amendment_audit_comment,
+        restoration_rounds_from_comments,
+    )
+    from coding_review_agent_loop.plan_review_scheduling import (
+        PlanCandidateKey,
+        surfaced_requirement_id_digest,
+    )
+
+    comments = _remove_restore_comments()
+    amendments = _plan_amendments(comments)
+    d1, d2 = (record.digest for record in amendments)
+    lineage = _resolve(
+        [_checkpoint(0, 1, C0), _checkpoint(2, 2, C1, digest=d1), _checkpoint(5, 4, C0, digest=d2)],
+        amendments,
+        C0,
+    )
+    assert restoration_rounds_from_comments(comments, flow="plan") == {"Antigravity": 4}
+    assert restoration_rounds_from_comments(comments, flow="pr") == {}
+    assert predates_restoration(lineage.restoration_rounds, "Antigravity", 1)
+    assert not predates_restoration(lineage.restoration_rounds, "Antigravity", 4)
+    assert not predates_restoration(lineage.restoration_rounds, "Claude", 1)
+
+    key = PlanCandidateKey(
+        subject="a" * 64,
+        aggregate_plan_identity="b" * 64,
+        execution_strategy_identity="c" * 32,
+        risk_test_matrix_identity="d" * 32,
+        surfaced_requirement_id_digest=surfaced_requirement_id_digest(()),
+    )
+
+    def approval(agent, round_number, index):
+        return PostedRoundRecord(
+            index=index,
+            body="",
+            metadata=PostedRoundMetadata(
+                flow="plan",
+                role="reviewer",
+                agent=agent,
+                round_number=round_number,
+                subject=key.subject,
+                state="approved",
+                plan_candidate_key=key.as_dict(),
+            ),
+        )
+
+    def carried(records):
+        return orchestrator._carried_plan_approvals(
+            records,
+            current_key=key,
+            required_reviewers=BOARD,
+            surfaced_requirement_ids=(),
+            panel_evidence=orchestrator.PlanPanelEvidence(
+                opening_index=0, opening_source="operator"
+            ),
+            primary_reviewer="Codex",
+            restoration_rounds=lineage.restoration_rounds,
+        )
+
+    # A pre-removal approval of the very same plan does not carry.
+    stale = (approval("Codex", 1, 1), approval("Claude", 1, 2), approval("Antigravity", 1, 3))
+    assert carried(stale) == ("Claude", "Codex")
+    assert carried((*stale, approval("Antigravity", 4, 9))) == ("Antigravity", "Claude", "Codex")
+
+    note = amendment_summary_line(lineage)
+    assert "restored Antigravity (from round 4, must re-approve)" in note
+    assert "required board now Codex, Claude, Antigravity" in note
+    audit = render_amendment_audit_comment(lineage, start_round_number=4, reassignments=())
+    assert "- Removed reviewer(s): none (backend-recovered)" in audit
+    assert "Restored reviewer(s): Antigravity" in audit and "not re-opened" in audit
+
+
+def test_drift_error_offers_a_restore_template_when_config_adds_a_reviewer():
+    from coding_review_agent_loop import orchestrator
+    from coding_review_agent_loop.board_amendment import added_in_config
+
+    assert added_in_config(C1, C0) == ("Antigravity",)
+    assert added_in_config(C0, C1) is None
+    clause = orchestrator._board_amendment_route_clause(
+        flow="plan",
+        issue_number=942,
+        pr_number=None,
+        persisted=C1,
+        configured=C0,
+        start_round_number=lambda: 4,
+    )
+    assert "restore it with a signed reviewer-board amendment" in clause
+    (record,) = _plan_amendments([_comment(clause.split("\n\n", 1)[1])])
+    assert record.restored_reviewers == ("Antigravity",)
+    assert record.removed_reviewers == ()
+    assert record.effective_from_round == 4
