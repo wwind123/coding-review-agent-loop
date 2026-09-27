@@ -3271,11 +3271,11 @@ def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> 
 
 def get_pr_merge_commit_sha(
     runner: Runner, config: AgentLoopConfig, pr_number: int
-) -> str | None:
-    """Return a merged PR's merge commit, or ``None`` when it cannot be read.
+) -> str:
+    """Return a merged PR's merge commit, failing closed when it cannot be read.
 
-    Only descriptive records use this, so an unreadable value degrades to an
-    absent commit instead of failing the caller.
+    A durable record that names the commit must not be published without it:
+    a record written with a gap would be taken as complete by later runs.
     """
     result = runner.run(
         [
@@ -3291,17 +3291,18 @@ def get_pr_merge_commit_sha(
         cwd=active_workdir(config),
         check=False,
     )
+    unreadable = f"Unable to read the merge commit of PR #{pr_number}."
     if result.returncode != 0:
-        return None
+        raise AgentLoopError(unreadable)
     try:
         data = json.loads(result.stdout or "null")
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(unreadable) from exc
     commit = data.get("mergeCommit") if isinstance(data, dict) else None
     oid = commit.get("oid") if isinstance(commit, dict) else None
-    if isinstance(oid, str) and re.fullmatch(r"[0-9a-f]{7,64}", oid):
+    if isinstance(oid, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
         return oid
-    return None
+    raise AgentLoopError(unreadable)
 
 
 @dataclass(frozen=True)

@@ -36,6 +36,7 @@ from .github import (
     get_issue_state,
     get_pr_merge_commit_sha,
     post_issue_comment,
+    resolve_authenticated_github_actor,
 )
 from .issue_pr_handoff import authenticate_canonical_issue_pr
 from .protocol import ExecutionAllocation
@@ -602,24 +603,37 @@ def _decode_completion_metadata(encoded: str) -> StagedCompletionMetadata:
         raise AgentLoopError("Invalid AGENT_PLAN_STAGED_COMPLETION payload.") from exc
 
 
-def find_staged_completion_record(
+def find_staged_completion_records(
     comments: Sequence[object], *, parent_issue: int, plan_hash: str, mode: str
-) -> StagedCompletionMetadata | None:
-    """Return the parent's completion record for this plan identity, if any."""
-    found: StagedCompletionMetadata | None = None
+) -> tuple[tuple[object, StagedCompletionMetadata], ...]:
+    """Return every ``(comment, record)`` claiming this plan identity.
+
+    Candidates only: a match proves nothing about who wrote it.  Callers must
+    authenticate the comment's author and compare the recorded stages before
+    treating a candidate as the parent's completion record.
+    """
+    found: list[tuple[object, StagedCompletionMetadata]] = []
     for comment in comments:
         body = getattr(comment, "body", None)
         if not isinstance(body, str):
             continue
         for match in STAGED_COMPLETION_MARKER_RE.finditer(body):
-            metadata = _decode_completion_metadata(match.group("payload"))
+            try:
+                metadata = _decode_completion_metadata(match.group("payload"))
+            except AgentLoopError:
+                # An undecodable claim is not a record; it cannot suppress one.
+                continue
             if (
                 metadata.parent_issue == parent_issue
                 and metadata.plan_hash == plan_hash
                 and metadata.mode == mode
             ):
-                found = metadata
-    return found
+                found.append((comment, metadata))
+    return tuple(found)
+
+
+def _authored_by(comment: object, *, login: str, actor_id: int) -> bool:
+    return getattr(comment, "author", None) == login and getattr(comment, "author_id", None) == actor_id
 
 
 def _obligation_line(label: str, allocation) -> str:
@@ -691,39 +705,63 @@ def record_staged_completion(
 ) -> bool:
     """Post the parent's completion record once; returns whether one was posted.
 
-    Callers pass progress in which every phase is complete.  A record already
-    present for the same plan identity makes this a no-op, so a parent rerun
-    and the child run that merged the last stage cannot both write one.
+    Callers pass progress in which every phase is complete.  Every field is
+    resolved before anything is published - an unreadable merge commit raises
+    and posts nothing, so a later run can still write a complete record.
+
+    An existing comment suppresses the write only when it is authenticated and
+    exact: authored by this invocation's authenticated GitHub actor (login and
+    immutable user ID) and recording the same stages, children, PRs and merge
+    commits.  So a parent rerun and the child run that merged the last stage
+    cannot both write one, while a forged or stale claim cannot stand in for it.
     """
     if not progress or any(phase.status != STATUS_COMPLETE for phase in progress):
         raise AgentLoopError(
             f"Issue #{parent_issue} completion record requires every staged phase to be complete."
         )
-    if find_staged_completion_record(
-        parent_comments, parent_issue=parent_issue, plan_hash=outcome.plan_hash, mode=outcome.mode
-    ) is not None:
-        return False
-    stages = tuple(
-        StagedCompletionStage(
-            phase_index=phase.phase_index,
-            stage_id=phase.stage_id,
-            automation=phase.automation,
-            child_issue_number=int(phase.child_issue_number or 0),
-            pr_number=None if phase.is_human else phase.pr_number,
-            merge_commit=(
-                None
-                if phase.is_human or phase.pr_number is None
-                else get_pr_merge_commit_sha(runner, config, phase.pr_number)
-            ),
+    stages: list[StagedCompletionStage] = []
+    for phase in progress:
+        if phase.child_issue_number is None:
+            raise AgentLoopError(
+                f"Issue #{parent_issue} phase {phase.phase_index} (`{phase.stage_id}`) has no "
+                "child issue number; no completion record was written."
+            )
+        pr_number: int | None = None
+        merge_commit: str | None = None
+        if not phase.is_human:
+            if phase.pr_number is None:
+                raise AgentLoopError(
+                    f"Issue #{parent_issue} phase {phase.phase_index} (`{phase.stage_id}`) has no "
+                    "merged PR; no completion record was written."
+                )
+            pr_number = phase.pr_number
+            merge_commit = get_pr_merge_commit_sha(runner, config, pr_number)
+        stages.append(
+            StagedCompletionStage(
+                phase_index=phase.phase_index,
+                stage_id=phase.stage_id,
+                automation=phase.automation,
+                child_issue_number=phase.child_issue_number,
+                pr_number=pr_number,
+                merge_commit=merge_commit,
+            )
         )
-        for phase in progress
-    )
     metadata = StagedCompletionMetadata(
         parent_issue=parent_issue,
         plan_hash=outcome.plan_hash,
         mode=outcome.mode,
-        stages=stages,
+        stages=tuple(stages),
     )
+    candidates = find_staged_completion_records(
+        parent_comments, parent_issue=parent_issue, plan_hash=outcome.plan_hash, mode=outcome.mode
+    )
+    if any(recorded == metadata for _comment, recorded in candidates):
+        login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+        if any(
+            recorded == metadata and _authored_by(comment, login=login, actor_id=actor_id)
+            for comment, recorded in candidates
+        ):
+            return False
     post_issue_comment(
         runner,
         config=config,

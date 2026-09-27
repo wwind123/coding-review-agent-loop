@@ -7726,9 +7726,9 @@ def _record_staged_parent_completion_after_merge(
             return
         log(config, f"Staged parent #{parent_issue} completion record not written: {exc}")
         print(
-            f"Could not confirm whether issue #{parent_issue} has staged work left, so no "
-            f"completion record was written ({exc}). Rerunning the parent's staged plan "
-            "records it once every phase is delivered."
+            f"Staged parent issue #{parent_issue}: no completion record was written ({exc}). "
+            "Rerunning the parent's staged plan records it once every phase is delivered "
+            "and its evidence is readable."
         )
 
 
@@ -7798,14 +7798,25 @@ def _dispatch_current_decomposition_phase(
         _print_staged_terminal_report(
             issue_number=issue_number, progress=progress, outcome=outcome
         )
-        if record_staged_completion(
-            runner,
-            config=config,
-            parent_issue=issue_number,
-            parent_comments=parent_issue_context.comments,
-            progress=progress,
-            outcome=outcome,
-        ):
+        try:
+            recorded = record_staged_completion(
+                runner,
+                config=config,
+                parent_issue=issue_number,
+                parent_comments=parent_issue_context.comments,
+                progress=progress,
+                outcome=outcome,
+            )
+        except AgentLoopError as exc:
+            # The delivery report above stands; only the write-back is
+            # withheld, and nothing incomplete was published.
+            log(config, f"Issue #{issue_number} completion record not written: {exc}")
+            print(
+                f"No completion record was written to issue #{issue_number} ({exc}). "
+                "Rerun the parent once that is resolved to record it."
+            )
+            return 0
+        if recorded:
             print(f"Recorded the staged completion on issue #{issue_number}.")
         return 0
 

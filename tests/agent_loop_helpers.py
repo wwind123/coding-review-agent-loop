@@ -267,8 +267,14 @@ class FakeRunner(Runner):
         pr_payloads_by_number=None,
         malformed_issue_view_numbers=None,
         malformed_pr_view_numbers=None,
+        authenticated_actor=None,
     ):
         super().__init__(dry_run=False)
+        # Opt-in `gh api user` identity (#1018): a (login, id) pair.  When set,
+        # issue comments this runner posts carry that immutable author ID, so
+        # author-authenticated records can be recovered.  Unset keeps the
+        # historical unresolvable-actor behavior.
+        self.authenticated_actor = authenticated_actor
         self.claude_outputs = list(claude_outputs or [])
         self.codex_outputs = list(codex_outputs or [])
         self.gemini_outputs = list(gemini_outputs or [])
@@ -1040,14 +1046,23 @@ class FakeRunner(Runner):
             else:
                 raw_body = ""
             self.comments.append(_strip_round_metadata(raw_body))
+            author = {"login": "coding-review-agent-loop"}
+            if self.authenticated_actor is not None:
+                author = {"login": self.authenticated_actor[0], "id": self.authenticated_actor[1]}
             self.issue_comments.append(
                 {
-                    "author": {"login": "coding-review-agent-loop"},
+                    "author": author,
                     "createdAt": f"2026-05-23T00:00:{len(self.issue_comments):02d}Z",
                     "body": raw_body,
                 }
             )
             return CommandResult(cmd, cwd_path, "", "", 0)
+
+        if cmd[:3] == ["gh", "api", "user"] and self.authenticated_actor is not None:
+            login, actor_id = self.authenticated_actor
+            return CommandResult(
+                cmd, cwd_path, json_dumps({"login": login, "id": actor_id}), "", 0
+            )
 
         if cmd[:3] == ["gh", "issue", "create"]:
             title = cmd[cmd.index("--title") + 1]

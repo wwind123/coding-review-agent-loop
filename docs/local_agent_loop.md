@@ -1253,8 +1253,12 @@ The modes are:
   merged PR and merge commit, so the parent's newest record no longer announces
   the last dispatched phase. The child run whose auto-merge delivers the last
   phase writes it immediately; otherwise the next parent rerun does. It is
-  written once per plan identity, and it states that agent-loop leaves the
-  parent open for the operator to verify and close. Completion evidence
+  written once per plan identity: an existing record counts only when it was
+  authored by the authenticated GitHub actor (login and immutable user ID) and
+  records exactly the delivered stages. Nothing is posted while any merge
+  commit is unreadable, so a later run can still write the complete record. It
+  states that agent-loop leaves the parent open for the operator to verify and
+  close. Completion evidence
   is authenticated: a closed child whose PR evidence is missing, unreadable or
   unmerged, an open child whose canonical PR is merged or closed, and a handoff
   recorded for a later phase while an earlier one is incomplete all stop the run

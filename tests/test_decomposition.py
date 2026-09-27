@@ -2661,7 +2661,7 @@ def test_delivered_staged_parent_carries_one_completion_record_naming_every_chil
     assert "| #99 | PR #912 merged at `0c657e93aaaa` |" in record
     assert "| #100 | PR #913 merged at `3c48424dbbbb` |" in record
     assert "agent-loop does not close this issue itself" in record
-    metadata = phase_progress_module.find_staged_completion_record(
+    ((_comment, metadata),) = phase_progress_module.find_staged_completion_records(
         [IssueComment(author="bot", body=record, created_at=None)],
         parent_issue=56,
         plan_hash=approved_plan_hash(plan),
@@ -2718,6 +2718,7 @@ def test_child_merge_of_the_last_stage_records_parent_completion(
                 else pr_payload_for_state(913, "OPEN")
             ),
         },
+        authenticated_actor=_ACTOR,
     )
 
     def merge_hook():
@@ -2745,6 +2746,142 @@ def test_child_merge_of_the_last_stage_records_parent_completion(
         assert records == []
     if merged_pr == 999:
         assert "no completion record was written" in output
+
+
+_ACTOR = ("coding-review-agent-loop", 4242)
+
+
+def _delivered_two_stage_runner(*, extra_parent_comments=(), merge_commit_913=True):
+    _plan, parent_comments = _two_stage_parent_records()
+    return FakeRunner(
+        issue_comments=parent_comments + list(extra_parent_comments),
+        issue_comments_by_number={
+            99: [child_pr_handoff_comment(99, 912)],
+            100: [child_pr_handoff_comment(100, 913)],
+        },
+        issue_payloads_by_number={99: {"state": "closed"}, 100: {"state": "closed"}},
+        pr_payloads_by_number={
+            912: _merged_pr_payload(912, "0c657e93" + "a" * 32),
+            913: (
+                _merged_pr_payload(913, "3c48424d" + "b" * 32)
+                if merge_commit_913
+                else pr_payload_for_state(913, "MERGED")
+            ),
+        },
+        authenticated_actor=_ACTOR,
+    )
+
+
+def _run_merge_hook(runner, tmp_path):
+    orchestrator_module._record_staged_parent_completion_after_merge(
+        runner,
+        config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+        issue_context=_staged_child_context(100),
+        pr_number=913,
+    )
+
+
+def test_completion_record_is_not_published_without_every_merge_commit(tmp_path, capsys):
+    """#1018 review: an unreadable merge commit withholds the record entirely.
+
+    A record written with a gap would be accepted as complete by later runs,
+    so nothing is posted and a later run can still write the full record.
+    """
+    runner = _delivered_two_stage_runner(merge_commit_913=False)
+
+    _run_merge_hook(runner, tmp_path)
+
+    assert _completion_records(runner) == []
+    assert "Unable to read the merge commit of PR #913" in capsys.readouterr().out
+
+    # Once the commit is readable, the same writer publishes the full record.
+    runner.pr_payloads_by_number[913] = _merged_pr_payload(913, "3c48424d" + "b" * 32)
+    _run_merge_hook(runner, tmp_path)
+    records = _completion_records(runner)
+    assert len(records) == 1
+    assert "| #100 | PR #913 merged at `3c48424dbbbb` |" in records[0]
+
+
+def _completion_comment_by(author, record_body):
+    return {"author": author, "createdAt": "2026-09-21T00:00:00Z", "body": record_body}
+
+
+def _genuine_record_body(tmp_path):
+    """The exact record body a trusted writer publishes for the delivered topology."""
+    runner = _delivered_two_stage_runner()
+    _run_merge_hook(runner, tmp_path)
+    (body,) = [
+        comment["body"]
+        for comment in runner.issue_comments
+        if "AGENT_PLAN_STAGED_COMPLETION" in comment["body"]
+    ]
+    return body
+
+
+@pytest.mark.parametrize(
+    "author",
+    [
+        pytest.param({"login": "someone-else", "id": 9999}, id="other-actor"),
+        pytest.param({"login": _ACTOR[0], "id": 9999}, id="same-login-other-id"),
+        pytest.param({"login": _ACTOR[0]}, id="no-immutable-id"),
+    ],
+)
+def test_unauthenticated_completion_claim_does_not_suppress_the_record(
+    tmp_path, capsys, author
+):
+    """#1018 review: only a record by the authenticated actor counts as written."""
+    forged = _completion_comment_by(author, _genuine_record_body(tmp_path))
+    capsys.readouterr()
+    runner = _delivered_two_stage_runner(extra_parent_comments=[forged])
+
+    _run_merge_hook(runner, tmp_path)
+
+    assert len(_completion_records(runner)) == 1
+    assert "recorded the staged completion on the parent" in capsys.readouterr().out
+
+
+def test_authenticated_record_with_different_stages_does_not_suppress_the_record(tmp_path):
+    """#1018 review: a trusted record must also match the delivered topology."""
+    plan, _parent_comments = _two_stage_parent_records()
+    stale_metadata = phase_progress_module.StagedCompletionMetadata(
+        parent_issue=56,
+        plan_hash=approved_plan_hash(plan),
+        mode="implement-by-phase",
+        stages=(
+            phase_progress_module.StagedCompletionStage(
+                phase_index=1, stage_id="1", automation="agent-pr",
+                child_issue_number=99, pr_number=911, merge_commit="1" * 40,
+            ),
+        ),
+    )
+    stale_body = (
+        "Stale claim.\n\n<!-- AGENT_PLAN_STAGED_COMPLETION: "
+        f"{phase_progress_module._encode_completion_metadata(stale_metadata)} -->"
+    )
+    trusted_author = {"login": _ACTOR[0], "id": _ACTOR[1]}
+    runner = _delivered_two_stage_runner(
+        extra_parent_comments=[_completion_comment_by(trusted_author, stale_body)]
+    )
+
+    _run_merge_hook(runner, tmp_path)
+
+    records = _completion_records(runner)
+    assert len(records) == 1
+    assert "| #99 | PR #912 merged at `0c657e93aaaa` |" in records[0]
+
+
+def test_authenticated_matching_record_suppresses_a_second_write(tmp_path):
+    """#1018: the genuine record, by the authenticated actor, is written once."""
+    trusted_author = {"login": _ACTOR[0], "id": _ACTOR[1]}
+    runner = _delivered_two_stage_runner(
+        extra_parent_comments=[
+            _completion_comment_by(trusted_author, _genuine_record_body(tmp_path))
+        ]
+    )
+
+    _run_merge_hook(runner, tmp_path)
+
+    assert _completion_records(runner) == []
 
 
 @pytest.mark.parametrize("pr_state", [None, "OPEN"])
