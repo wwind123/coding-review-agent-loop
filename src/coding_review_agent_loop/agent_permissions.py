@@ -844,6 +844,13 @@ def _claude_path_rule(tool: str, root: Path) -> str:
     return f"{tool}(/{root}/**)"
 
 
+def coder_checkout_paths(config: AgentLoopConfig) -> tuple[Path, ...]:
+    """The Claude coder's assigned checkout, as given and as resolved when they differ."""
+    lexical = Path(os.path.abspath(str(config.claude_dir)))
+    resolved = Path(os.path.realpath(lexical))
+    return (lexical,) if resolved == lexical else (lexical, resolved)
+
+
 def coder_test_invocation(config: AgentLoopConfig, agent: str = "claude") -> str | None:
     """The exact test invocation for a coder turn run by ``agent`` (Claude in sandboxed mode)."""
     from .test_runtime import resolve_coder_test_invocation
@@ -882,7 +889,15 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
                 _claude_path_rule("Edit", root),
                 f"Bash({prefix} *)",
             )
-        rules = ["Bash(git *)", *(f"Bash({sub} *)" for sub in CODER_GH_SUBCOMMANDS), f"Bash({prefix} *)"]
+        # --allowedTools is an exclusive allowlist here and acceptEdits only
+        # decides whether an *allowed* edit prompts, so the assigned checkout
+        # needs its own path-scoped Write/Edit rules (#1077).
+        rules = [
+            rule
+            for checkout in coder_checkout_paths(config)
+            for rule in (_claude_path_rule("Write", checkout), _claude_path_rule("Edit", checkout))
+        ]
+        rules += ["Bash(git *)", *(f"Bash({sub} *)" for sub in CODER_GH_SUBCOMMANDS), f"Bash({prefix} *)"]
         test_invocation = coder_test_invocation(config, provider)
         if test_invocation:
             rules.append(f"Bash({test_invocation})")

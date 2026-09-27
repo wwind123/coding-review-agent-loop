@@ -4365,10 +4365,14 @@ its role (implemented in `agent_permissions.py`):
 
 - Only the exact `coder` role gets the coder grant. Every other role,
   including role-less planner turns and unknown roles, fails closed to
-  read-only.
+  read-only. Every committing turn (direct and plan-first issue
+  implementation, task implementation, PR fixes) therefore passes the `coder`
+  role explicitly; a role-less implementation turn would get the read-only
+  grant and could neither edit nor commit.
 - A Claude coder gets `--permission-mode acceptEdits`, `--setting-sources
   user` (so checkout `.claude/settings*.json` cannot widen later grants),
-  `Bash(git *)`, the gh subcommands coder prompts use, the read-only inspector,
+  path-scoped `Write`/`Edit` rules for its assigned checkout (the configured
+  path and, when it differs, its resolved path), `Bash(git *)`, the gh subcommands coder prompts use, the read-only inspector,
   and one exact, wildcard-free rule for the resolved `agent-loop run-tests`
   invocation, which is the same string the coder prompt shows. The invocation
   uses `--test-command`, else the first verified test-profile command, and the

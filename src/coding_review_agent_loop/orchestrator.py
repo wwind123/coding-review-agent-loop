@@ -15603,6 +15603,9 @@ def run_issue_loop(
                 require_architecture_impact=True, architecture_status_mode=mode,
             )),
             usage_context=usage_context,
+            # Without the exact coder role a sandboxed run hands this committing
+            # turn the fail-closed read-only grant (#1077).
+            role="coder",
             use_repair=True,
             repair_expected_kind="issue_implementation",
             repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,
@@ -15936,6 +15939,7 @@ def run_task_loop(
                     required_architecture_impact_contract=1, architecture_status_mode=mode,
                 )),
                 usage_context=usage_context,
+                role="coder",
                 salvage_context=SalvageContext(
                     repo=config.repo,
                     issue_number=None,

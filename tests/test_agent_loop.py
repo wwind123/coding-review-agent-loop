@@ -2846,6 +2846,34 @@ def test_issue_and_task_loops_use_repo_default_when_base_is_omitted(tmp_path, mo
     assert not any("origin/main" in arg for cmd in commands for arg in cmd)
 
 
+@pytest.mark.parametrize("mode", ["issue", "task"])
+def test_direct_issue_and_task_implementation_turns_run_as_coder_role(tmp_path, monkeypatch, mode):
+    """#1077: without role="coder" a sandboxed run gives the turn the read-only grant."""
+    runner = FakeRunner(
+        claude_outputs=[
+            "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(tmp_path, reviewer="codex", auto_agent_dirs=("claude", "codex"))
+    real_run_validated_agent = orchestrator_module._run_validated_agent
+    roles: dict[str, object] = {}
+
+    def recording_run_validated_agent(*args, **kwargs):
+        roles.setdefault(kwargs.get("operation_description"), kwargs.get("role"))
+        return real_run_validated_agent(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", recording_run_validated_agent)
+
+    if mode == "issue":
+        assert run_issue_loop(runner, issue_number=56, config=config) == 0
+    else:
+        assert run_task_loop(runner, task_text="Add /healthz endpoint.", config=config) == 0
+
+    assert roles[f"{mode} implementation"] == "coder"
+
+
 def test_unresolved_base_metadata_produces_targeted_override_error(tmp_path):
     runner = FakeRunner(
         pr_payload={"baseRefName": None},

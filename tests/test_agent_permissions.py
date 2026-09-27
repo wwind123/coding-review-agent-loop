@@ -167,6 +167,42 @@ def test_claude_coder_grant_has_exact_test_rule_matching_prompt(tmp_path, sandbo
     assert f"`{invocation}`" in guidance
 
 
+def test_claude_coder_grant_can_edit_the_assigned_checkout(tmp_path, sandbox):
+    """#1077: the coder's exclusive allowlist must include checkout Write/Edit."""
+    config = sandboxed_config(tmp_path)
+    sandbox["establish"](config)
+    checkout = os.path.abspath(config.claude_dir)
+    root = ap.sandboxed_response_root(config)
+    coder = _allowed_tools(list(ap.role_permission_args(config, "claude", "coder")))
+    assert coder[:2] == [f"Write(/{checkout}/**)", f"Edit(/{checkout}/**)"]
+    # Path-scoped, never a bare or wildcard edit grant.
+    assert not {"Write", "Edit", "Write(*)", "Edit(*)", "Write(**)", "Edit(**)"} & set(coder)
+    # The read-only class keeps edits confined to the response root.
+    reviewer = _allowed_tools(list(ap.role_permission_args(config, "claude", "reviewer")))
+    assert [rule for rule in reviewer if not rule.startswith("Bash(")] == [
+        f"Write(/{root}/**)",
+        f"Edit(/{root}/**)",
+    ]
+    assert not any(checkout in rule for rule in reviewer)
+
+
+def test_claude_coder_grant_covers_a_symlinked_checkout_both_ways(tmp_path, sandbox):
+    real = tmp_path / "real-checkout"
+    real.mkdir()
+    link = tmp_path / "linked-checkout"
+    link.symlink_to(real, target_is_directory=True)
+    config = sandboxed_config(tmp_path, claude_dir=link)
+    sandbox["establish"](config)
+    coder = _allowed_tools(list(ap.role_permission_args(config, "claude", "coder")))
+    resolved = os.path.realpath(real)
+    assert coder[:4] == [
+        f"Write(/{link}/**)",
+        f"Edit(/{link}/**)",
+        f"Write(/{resolved}/**)",
+        f"Edit(/{resolved}/**)",
+    ]
+
+
 def test_checkout_settings_cannot_widen_grants(tmp_path, sandbox):
     config = sandboxed_config(tmp_path)
     settings = config.claude_dir / ".claude"

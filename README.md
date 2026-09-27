@@ -315,7 +315,7 @@ What each role gets:
 
 | Role | Claude | Codex |
 |------|--------|-------|
-| Coder (implementation, PR fixes, completion recovery) | `acceptEdits` in its checkout; user-only setting sources; `Bash(git *)`; the gh subcommands coder prompts use (`gh pr create/view/edit/comment/checks/diff`, `gh issue view/comment`, `gh run view`, `gh label create/list`, `gh repo view`); the read-only inspector; and exactly one test rule, the resolved `agent-loop run-tests … -- <test command>` invocation shown in the prompt | rejected (see below) |
+| Coder (implementation, PR fixes, completion recovery) | `acceptEdits` plus path-scoped `Write`/`Edit` rules for its assigned checkout (as given and as resolved); user-only setting sources; `Bash(git *)`; the gh subcommands coder prompts use (`gh pr create/view/edit/comment/checks/diff`, `gh issue view/comment`, `gh run view`, `gh label create/list`, `gh repo view`); the read-only inspector; and exactly one test rule, the resolved `agent-loop run-tests … -- <test command>` invocation shown in the prompt | rejected (see below) |
 | Every other role (reviewer, planner, analyzer, summary, repair, semantic dedupe, and any unknown or missing role) | `--restricted` with an explicit `--tools` set, `dontAsk`, no permission prompts, an empty strict MCP config, writes only to its response file, and one shell grant: `agent-loop inspect` | `--sandbox read-only` with approvals set to `never`; the Codex CLI writes its final message to the validated response file |
 
 Requirements and limitations of sandboxed mode:
