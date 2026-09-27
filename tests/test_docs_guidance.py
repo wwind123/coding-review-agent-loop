@@ -695,3 +695,33 @@ def test_cli_help_documents_agent_permissions_and_inspect():
     assert "exactresolvedtestinvocation" in help_text
     top = " ".join(parser.format_help().split())
     assert "inspect" in top and "Hardened read-only git/gh runner" in top
+
+
+def test_docs_document_the_plan_growth_gate():
+    readme = README.read_text(encoding="utf-8")
+    for flag in (
+        "--plan-growth-gate",
+        "--plan-growth-max-chars",
+        "--plan-growth-max-scope-items",
+        "--plan-growth-max-matrix-rows",
+        "--plan-growth-max-revisions",
+    ):
+        assert flag in readme, flag
+    assert "this detail belongs in a child plan; restructure as\nstaged" in readme
+    docs = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    section = docs.split("### Plan-growth gate", 1)[1].split("\n### ", 1)[0]
+    for phrase in (
+        "`rendered-size`",
+        "`scope-items`",
+        "`matrix-rows`",
+        "`revision-count`",
+        "`one_shot_growth_justification`",
+        "not a transport check",
+        "reviewer finding counts are never a\nsignal",
+        "restructure as staged",
+        "`requires-child-planning` children",
+        "This rule applies even with the gate off.",
+        "Rebind advisory.",
+        "a managed-CI\ncycle per child",
+    ):
+        assert phrase in section, phrase

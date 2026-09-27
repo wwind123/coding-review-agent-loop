@@ -3520,6 +3520,8 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--containment-memory-max", "--containment-memory-swap-max", "--containment-tasks-max",
     "--primary-reviewer",
     "--plan-review-policy", "--primary-plan-reviewer",
+    "--plan-growth-gate", "--plan-growth-max-chars", "--plan-growth-max-revisions",
+    "--plan-growth-max-scope-items", "--plan-growth-max-matrix-rows",
     "--containment-aggregate-memory-high", "--containment-aggregate-memory-max",
     "--containment-aggregate-memory-swap-max", "--containment-aggregate-tasks-max",
     "--containment-os-headroom-percent", "--containment-slice", "--containment-cache-dir",

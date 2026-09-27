@@ -562,7 +562,12 @@ from .round_state import (
     recover_plan_validation_diagnostic,
     sanitize_plan_validation_diagnostic,
 )
-from .round_transport import decode_mapping, is_round_transport_sidecar, round_comment_fits
+from .round_transport import (
+    decode_mapping,
+    is_round_transport_sidecar,
+    prepare_round_comment,
+    round_comment_fits,
+)
 from .plan_assembly import (
     AssembledPlanSidecar,
     AuthenticatedPlanState,
@@ -570,6 +575,20 @@ from .plan_assembly import (
     decode_assembled_plan_sidecar,
     hydrate_authenticated_plan_state,
     make_assembled_plan_sidecar,
+)
+from .plan_growth import (
+    STRUCTURAL_SIGNALS,
+    PlanGrowthAssessment,
+    PlanGrowthThresholds,
+    assess_plan_growth,
+    check_growth_justification,
+    check_scope_ledger_preservation,
+    growth_justification_violation,
+    plan_growth_gate_enforced,
+    plan_justification,
+    plan_strategy,
+    render_growth_measurements,
+    render_growth_notice,
 )
 from .plan_review_scheduling import (
     PLAN_HISTORY_CONTRADICTORY_KEY,
@@ -10636,6 +10655,121 @@ def _rebind_contract_expansion_notice(
         return None
 
 
+_REBIND_GROWTH_HEADING = "### Rebound plan crossed plan-growth thresholds"
+_REBIND_GROWTH_RATIONALE_CHARS = 400
+
+
+def _render_rebind_growth_advisory(
+    assessment: PlanGrowthAssessment,
+    justification: Mapping[str, object] | None,
+    *,
+    pr_number: int,
+    plan_hash: str,
+    include_rationale: bool,
+) -> str:
+    lines = [
+        _REBIND_GROWTH_HEADING,
+        "",
+        f"PR #{pr_number}'s code predates replacement plan `{plan_hash}`, a one-shot plan that "
+        "crosses plan-growth threshold(s) "
+        + ", ".join(f"`{signal}`" for signal in assessment.crossed)
+        + f" ({assessment.describe()}). Check the remaining work against the one-shot choice.",
+        "",
+    ]
+    if justification is None:
+        lines.append(
+            # Only the absence is authenticated: approval-time gate mode and
+            # thresholds are not recorded, so no reason is asserted.
+            "- No reviewed one-shot growth justification exists for this plan."
+        )
+    else:
+        named = justification.get("crossed_signals")
+        lines.append(
+            "- Reviewed justification signals: "
+            + ", ".join(f"`{signal}`" for signal in (named if isinstance(named, list) else []))
+        )
+        if include_rationale:
+            rationale = _flatten_contract_text(str(justification.get("rationale", "")))
+            if len(rationale) > _REBIND_GROWTH_RATIONALE_CHARS:
+                rationale = (
+                    rationale[: _REBIND_GROWTH_RATIONALE_CHARS - 1].rstrip()
+                    + "… (complete rationale in the authenticated plan round)"
+                )
+            lines.append(f"- Rationale excerpt: {rationale.replace('<!--', '&lt;!--')}")
+    lines.extend(
+        [
+            "",
+            "This advisory is informational and does not stop the run.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _rebind_growth_advisory(
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    comments: Sequence[object],
+    pr_number: int,
+    plan_hash: str,
+) -> str | None:
+    """Growth advisory for a rebound replacement plan (#886).
+
+    Independent of contract expansion and of justification: a grown v1
+    one-shot replacement gets the advisory whether it is justified (the
+    normal case under the enforced gate) or not.  Size is taken from the
+    authenticated coder round's stored canonical text, never a re-render.
+    Revision count is not used.  Never blocks: failures are logged.
+    """
+    try:
+        for record in reversed(_extract_round_metadata_records(comments, flow="plan")):
+            metadata = record.metadata
+            if (
+                metadata.role != "coder"
+                or metadata.canonical_plan is None
+                or metadata.assembled_plan_sidecar is None
+                or approved_plan_hash(metadata.canonical_plan) != plan_hash
+            ):
+                continue
+            payload = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar).canonical_json
+            if plan_strategy(payload) != "one-shot":
+                return None
+            assessment = assess_plan_growth(
+                payload,
+                rendered_chars=len(metadata.canonical_plan),
+                revision_count=None,
+                thresholds=PlanGrowthThresholds.from_config(config),
+            )
+            if not any(signal in STRUCTURAL_SIGNALS for signal in assessment.crossed):
+                return None
+            justification = plan_justification(payload)
+            log(
+                config,
+                f"Issue #{issue_number}: rebound replacement plan {plan_hash} is one-shot and "
+                f"crosses plan-growth signal(s) {', '.join(assessment.crossed)}",
+            )
+            render = functools.partial(
+                _render_rebind_growth_advisory,
+                assessment,
+                justification,
+                pr_number=pr_number,
+                plan_hash=plan_hash,
+            )
+            advisory = render(include_rationale=True)
+            if scan_reserved_markers(advisory):
+                advisory = render(include_rationale=False)
+            return advisory
+        log(
+            config,
+            f"Issue #{issue_number}: rebind growth advisory skipped; the structured state of "
+            f"plan {plan_hash} is not recoverable from its plan round",
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 - the advisory must never block the rebind
+        log(config, f"Issue #{issue_number}: rebind growth advisory failed: {exc}")
+        return None
+
+
 def _rebind_superseded_child_plan(
     runner: Runner,
     *,
@@ -10747,10 +10881,18 @@ def _rebind_superseded_child_plan(
         superseded_hash=plan_supersession.superseded_hash,
         plan_hash=plan_hash,
     )
+    growth_advisory = _rebind_growth_advisory(
+        config=config,
+        issue_number=issue_number,
+        comments=issue_context.comments,
+        pr_number=current.pr_number,
+        plan_hash=plan_hash,
+    )
     body = "\n".join(
         [
             *handoff_lines[:marker_position],
             *([expansion_notice, ""] if expansion_notice is not None else []),
+            *([growth_advisory, ""] if growth_advisory is not None else []),
             rebind_section,
             *handoff_lines[marker_position:],
         ]
@@ -11173,7 +11315,11 @@ def _assemble_structured_plan_round_body(
         f"Planning issue #{issue_number}: full plan comment exceeds the comment budget; "
         "posting the bounded visible digest (complete plan stays in authenticated round metadata)",
     )
-    return _attach_round_metadata(compact_comment, metadata)
+    compact_body = _attach_round_metadata(compact_comment, metadata)
+    # Final fit check (#886): a digest that still cannot be carried is
+    # refused here with the transport's own overflow error, before posting.
+    prepare_round_comment(compact_body)
+    return compact_body
 
 
 _COMPACT_DIGEST_DISPOSITION_LINE_RE = re.compile(r"^- \*\*(?P<id>[^*]+)\*\* — `")
@@ -12064,6 +12210,39 @@ def _run_plan_first_loop(
     # Set by the approval guard when an approved plan fails the inherited
     # check; the revision turn then runs with no reviewer item.
     inherited_guard_revision: str | None = None
+    # Plan-growth gate (#886): authenticated planner candidates by round, and
+    # the orchestrator growth notice that replaces an approval of a
+    # non-compliant candidate with a planner revision.
+    planner_candidate_rounds = _planner_candidate_rounds(issue_context.comments)
+    growth_guard_revision: str | None = None
+
+    def check_candidate_growth(
+        candidate: StructuredPlanState | StructuredPlanRevision,
+        *,
+        canonical_text: str,
+        prior_payload: Mapping[str, object] | None,
+        target_round: int,
+    ) -> None:
+        """Post-assembly self-check of an unpublished candidate (#886).
+
+        Measures the candidate itself: its own canonical text and the
+        planner-candidate count including it.  Every failure is a correctable
+        deterministic validation failure, fed back before any reviewer turn.
+        """
+        check_scope_ledger_preservation(prior_payload, candidate)
+        if not plan_growth_gate_enforced(config):
+            return
+        check_growth_justification(
+            candidate,
+            assess_plan_growth(
+                candidate,
+                rendered_chars=len(canonical_text),
+                revision_count=_plan_growth_candidate_count(
+                    planner_candidate_rounds, target_round
+                ),
+                thresholds=PlanGrowthThresholds.from_config(config),
+            ),
+        )
     plan_validation_diagnostic: PlanValidationDiagnosticTransport | None = None
     if resume_state is None:
         plan_validation_diagnostic = _recover_current_plan_validation_diagnostic(
@@ -12151,6 +12330,17 @@ def _run_plan_first_loop(
                     1 if require_fresh_matrix_contract else 0
                 ),
             )
+            if isinstance(candidate, StructuredPlanState):
+                check_candidate_growth(
+                    candidate,
+                    canonical_text=(
+                        render_canonical_plan_state(candidate, config)
+                        if candidate.execution_recommendation is not None
+                        else response.text
+                    ),
+                    prior_payload=None,
+                    target_round=1,
+                )
             return getattr(candidate, "risk_test_matrix", None)
 
         plan_response = run_inherited_checked_planner_turn(
@@ -12325,6 +12515,8 @@ def _run_plan_first_loop(
             require_risk_test_matrix_contract=require_fresh_matrix_contract,
         ):
             plan_validation_diagnostic = None
+        if current_plan_sidecar is not None:
+            planner_candidate_rounds.add(1)
         start_round_number = 1
         resumed_round: ResumedReviewRound | None = None
         current_coder_output = plan_output
@@ -12429,12 +12621,86 @@ def _run_plan_first_loop(
             sidecar=current_plan_sidecar,
             surfaced_requirement_ids=plan_hr_ids,
         )
+        plan_growth_assessment, plan_growth_violation = _plan_growth_gate_violation(
+            config,
+            plan_payload=(
+                current_plan_sidecar.canonical_json if current_plan_sidecar is not None else None
+            ),
+            plan_text=current_plan,
+            # Counted up to the round that published this candidate, never the
+            # loop round: a reviewer-only phase-advance round keeps the count.
+            revision_count=_plan_growth_candidate_count(
+                planner_candidate_rounds,
+                current_plan_sidecar.round_number
+                if current_plan_sidecar is not None
+                else round_number,
+            ),
+        )
+        if plan_growth_assessment is not None:
+            log(
+                config,
+                f"Planning round {round_number}: plan growth measurements: "
+                f"{plan_growth_assessment.describe()}; crossed="
+                f"{', '.join(plan_growth_assessment.crossed) or 'none'}; gate="
+                f"{config.plan_growth_gate}",
+            )
+        # Only a candidate recovered from history can reach reviewers in this
+        # state: fresh candidates are rejected by the self-check.
+        plan_growth_notice = (
+            render_growth_notice(
+                plan_growth_assessment,
+                violation=plan_growth_violation,
+                strategy=(
+                    plan_strategy(current_plan_sidecar.canonical_json)
+                    if current_plan_sidecar is not None
+                    else None
+                ),
+            )
+            if plan_growth_violation is not None and plan_growth_assessment is not None
+            else None
+        )
+        # Reviewers see the measurements of every crossed one-shot candidate,
+        # justified or not; the corrective notice is only for non-compliant ones.
+        plan_growth_measurements = (
+            render_growth_measurements(plan_growth_assessment)
+            if plan_growth_assessment is not None
+            and plan_growth_assessment.crossed
+            and current_plan_sidecar is not None
+            and plan_strategy(current_plan_sidecar.canonical_json) == "one-shot"
+            else None
+        )
         plan_scheduler_decision = None
         plan_panel_evidence = PlanPanelEvidence()
         plan_qualifying_approvals: tuple[str, ...] = ()
         plan_previous_key: PlanCandidateKey | None = None
         round_reviewers = tuple(configured_reviewers)
-        if staged_planning:
+        # Under primary-then-panel, a non-compliant candidate the primary has
+        # already approved can never pass, so the panel is not scheduled on it:
+        # this round invokes no reviewer and the gate below starts a planner
+        # revision instead of a reviewer-only phase advance (#886).
+        growth_skip_panel = False
+        if staged_planning and plan_growth_notice is not None and plan_primary_name is not None:
+            plan_records = plan_history_records(refresh=True, round_number=round_number)
+            growth_skip_panel = plan_primary_name in _carried_plan_approvals(
+                plan_records,
+                current_key=current_plan_key,
+                required_reviewers=plan_reviewer_names,
+                surfaced_requirement_ids=plan_hr_ids,
+                panel_evidence=_derive_plan_panel_evidence(
+                    plan_records,
+                    primary_reviewer=plan_primary_name,
+                    required_reviewers=plan_reviewer_names,
+                ),
+                primary_reviewer=plan_primary_name,
+            )
+        if growth_skip_panel:
+            round_reviewers = ()
+            log(
+                config,
+                f"Planning round {round_number}: the primary approved a candidate that fails "
+                "the plan-growth gate; no panel review is scheduled on it",
+            )
+        if staged_planning and not growth_skip_panel:
             assert plan_scheduler_contract is not None
             incomplete_key = current_plan_key.incompleteness_reason()
             if incomplete_key is not None:
@@ -12762,6 +13028,8 @@ def _run_plan_first_loop(
                 inherited_matrix_binding=inherited_matrix_binding,
                 inherited_reviewed_deltas=inherited_review_deltas,
                 inherited_check_failure=inherited_review_failure,
+                plan_growth_notice=plan_growth_notice,
+                plan_growth_measurements=plan_growth_measurements,
             )
 
         plan_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -13507,6 +13775,19 @@ def _run_plan_first_loop(
             and not must_fix_items
             and plan_missing_approvals
         )
+        growth_guard_revision = None
+        if plan_growth_notice is not None and all_approved and not must_fix_items:
+            # A non-compliant candidate can never pass, so neither a
+            # reviewer-only panel advance nor an approval is spent on it: the
+            # next round is a planner revision carrying the growth notice.
+            if plan_phase_advance_pending:
+                log(
+                    config,
+                    f"Planning round {round_number}: skipping the reviewer-only plan phase "
+                    "advance; the candidate fails the plan-growth gate",
+                )
+            plan_phase_advance_pending = False
+            growth_guard_revision = plan_growth_notice
         # The outstanding phase, not the one that just ran: both the durable
         # phase-advance record and the round-budget diagnostic must name the
         # round that is still pending.
@@ -13600,6 +13881,12 @@ def _run_plan_first_loop(
                     "--max-rounds and rerun; re-planning continues the existing round "
                     "numbering."
                 )
+        elif growth_guard_revision is not None:
+            log(
+                config,
+                f"Planning round {round_number}: reviewers approved, but the plan fails the "
+                f"plan-growth gate ({plan_growth_violation}); starting a planner revision",
+            )
         elif all_approved and not must_fix_items and not plan_missing_approvals:
             if plan_amendment_note:
                 log(
@@ -14190,6 +14477,15 @@ def _run_plan_first_loop(
             raise AgentLoopError(f"Unknown plan execution mode: {mode}")
 
         if round_number == config.max_rounds:
+            if growth_guard_revision is not None:
+                raise AgentLoopError(
+                    f"Reached max planning rounds ({config.max_rounds}) for issue #{issue_number} "
+                    "while the plan-growth gate still blocked approval: the one-shot plan "
+                    f"crosses plan-growth threshold(s) without a covering justification "
+                    f"({plan_growth_violation}). Raise --max-rounds and rerun so a revision "
+                    "restructures the plan as staged or justifies one-shot, or rerun with "
+                    "--plan-growth-gate off."
+                )
             if plan_phase_advance_pending:
                 # Distinct from the blocking-plan-issues message: no reviewer
                 # reported a blocker, the run simply ran out of rounds while a
@@ -14261,6 +14557,13 @@ def _run_plan_first_loop(
             # The revised subject gets the complete board and carries no
             # approval from the superseded one.
             plan_automatic_force_full = True
+        if growth_guard_revision is not None:
+            # Attributed to the orchestrator; no reviewer item ID is minted.
+            combined_review = (
+                f"{combined_review}\n\n{growth_guard_revision}"
+                if combined_review
+                else growth_guard_revision
+            )
         if supersession_revision_pending:
             # The signed authorization is the revision's instruction; the
             # planner must actually replace the plan, not return it (#985).
@@ -14321,6 +14624,7 @@ def _run_plan_first_loop(
                     response_form=("semantic-patch-v1" if semantic_revision else None),
                     base_round_number=(semantic_base.round_number if semantic_base is not None else None),
                     base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
+                    plan_growth_notice=plan_growth_notice,
                 ),
                 session_id=coder_session_id,
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
@@ -14434,7 +14738,28 @@ def _run_plan_first_loop(
                     response.marker_value,
                     result_round_number=round_number + 1,
                 )
+                check_candidate_growth(
+                    assembled_candidate,
+                    canonical_text=render_canonical_plan_revision(
+                        assembled_candidate, must_fix_items, config
+                    ),
+                    prior_payload=semantic_base.canonical_payload,
+                    target_round=round_number + 1,
+                )
                 return assembled_candidate.risk_test_matrix
+            if isinstance(response.marker_value, StructuredPlanRevision):
+                check_candidate_growth(
+                    response.marker_value,
+                    canonical_text=render_canonical_plan_revision(
+                        response.marker_value, must_fix_items, config
+                    ),
+                    prior_payload=(
+                        current_plan_sidecar.canonical_json
+                        if current_plan_sidecar is not None
+                        else None
+                    ),
+                    target_round=round_number + 1,
+                )
             return getattr(response.marker_value, "risk_test_matrix", None)
 
         plan_response = run_inherited_checked_planner_turn(
@@ -14685,6 +15010,8 @@ def _run_plan_first_loop(
             require_risk_test_matrix_contract=require_fresh_matrix_contract,
         ):
             plan_validation_diagnostic = None
+        if current_plan_sidecar is not None:
+            planner_candidate_rounds.add(round_number + 1)
         resumed_round = None
 
     raise AgentLoopError(
@@ -17353,6 +17680,92 @@ def _classify_staged_plan_history(
     )
 
 
+def _planner_candidate_rounds(comments: Sequence[object]) -> set[int]:
+    """Round numbers of authenticated planner-authored plan candidates (#886).
+
+    Only coder plan rounds that carry an assembled plan state count, so
+    reviewer-only phase-advance rounds never do, and a resumed replay of the
+    same round number counts once.  ``round_number`` is never used as a
+    count directly.
+    """
+    try:
+        records = _extract_round_metadata_records(comments, flow="plan")
+    except AgentLoopError:
+        return set()
+    return {
+        record.metadata.round_number
+        for record in records
+        if record.metadata.role == "coder"
+        and record.metadata.canonical_plan is not None
+        and record.metadata.assembled_plan_sidecar is not None
+    }
+
+
+def _plan_growth_candidate_count(candidate_rounds: set[int], round_number: int) -> int:
+    """Planner candidates up to and including the one published at ``round_number``.
+
+    ``round_number`` must be the round that published (or, for the
+    pre-publication self-check, will publish) the candidate; callers never
+    pass a reviewer-only round.
+    """
+    return len({item for item in candidate_rounds if item < round_number} | {round_number})
+
+
+def _plan_growth_gate_violation(
+    config: AgentLoopConfig,
+    *,
+    plan_payload: Mapping[str, object] | None,
+    plan_text: str,
+    revision_count: int,
+) -> tuple[PlanGrowthAssessment | None, str | None]:
+    """Assessment and gate violation of one authenticated plan candidate.
+
+    ``None`` violation for legacy unversioned plans, free-form plans and when
+    ``--plan-growth-gate off``.
+    """
+    if plan_payload is None or plan_strategy(plan_payload) is None:
+        return None, None
+    assessment = assess_plan_growth(
+        plan_payload,
+        rendered_chars=len(plan_text),
+        revision_count=revision_count,
+        thresholds=PlanGrowthThresholds.from_config(config),
+    )
+    if not plan_growth_gate_enforced(config):
+        return assessment, None
+    return assessment, growth_justification_violation(plan_payload, assessment)
+
+
+def _require_plan_growth_compliance(
+    comments: Sequence[object],
+    *,
+    config: AgentLoopConfig,
+    plan_text: str,
+    plan_round: ResumedReviewRound,
+    error_message: str,
+) -> None:
+    """Fail closed when carried approvals would approve a non-compliant plan (#886)."""
+    coder_metadata = plan_round.coder_metadata
+    if coder_metadata is None or coder_metadata.assembled_plan_sidecar is None:
+        return
+    sidecar = decode_assembled_plan_sidecar(coder_metadata.assembled_plan_sidecar)
+    _assessment, violation = _plan_growth_gate_violation(
+        config,
+        plan_payload=sidecar.canonical_json,
+        plan_text=plan_text,
+        # The coder round that published the candidate, not the resumed
+        # anchor round (which may be a later reviewer-only round).
+        revision_count=_plan_growth_candidate_count(
+            _planner_candidate_rounds(comments), sidecar.round_number
+        ),
+    )
+    if violation is not None:
+        raise AgentLoopError(
+            f"{error_message} Plan growth gate: {violation} Re-run planning so a revision "
+            "restructures the plan as staged or carries a reviewed justification."
+        )
+
+
 def _require_complete_canonical_plan_approval(
     comments: Sequence[object],
     *,
@@ -17372,8 +17785,16 @@ def _require_complete_canonical_plan_approval(
     union of qualifying exact-key approvals carried from the whole planning
     history is always consulted instead — the same carry the final planning gate
     uses.  A reviewer whose latest record for the exact plan is not an
-    approval still leaves the set incomplete (#962).
+    approval still leaves the set incomplete (#962).  Carried approvals of a
+    plan that fails the plan-growth gate never count (#886).
     """
+    _require_plan_growth_compliance(
+        comments,
+        config=config,
+        plan_text=plan_text,
+        plan_round=plan_round,
+        error_message=error_message,
+    )
     configured_names = {agent_display_name(reviewer) for reviewer in reviewers(config)}
     if not plan_policy_capabilities(config.plan_review_policy).scheduler_enabled:
         round_approved = {

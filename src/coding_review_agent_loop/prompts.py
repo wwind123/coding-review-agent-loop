@@ -2647,6 +2647,98 @@ def render_inherited_coverage_delta(
     )
 
 
+PLAN_GROWTH_REVIEWER_LEVER = (
+    "this detail belongs in a child plan; restructure as staged"
+)
+
+
+def _plan_growth_thresholds_text(config: AgentLoopConfig) -> str:
+    from .plan_growth import PlanGrowthThresholds
+
+    thresholds = PlanGrowthThresholds.from_config(config)
+    return (
+        f"`rendered-size` at {thresholds.max_chars} characters of canonical plan text; "
+        f"`scope-items` at {thresholds.max_scope_items} distinct execution-recommendation "
+        f"scope items; `matrix-rows` at {thresholds.max_matrix_rows} risk-matrix rows; "
+        f"`revision-count` at {thresholds.max_revisions} planner-authored candidates, "
+        f"counted only while the plan is at least {thresholds.max_chars // 2} characters"
+    )
+
+
+def _plan_growth_planner_guidance(
+    config: AgentLoopConfig,
+    growth_notice: str | None = None,
+    *,
+    semantic_patch: bool = False,
+) -> str:
+    """Planner-facing plan-growth rules (#886)."""
+    ledger_rule = (
+        "Converting a one-shot plan to staged must preserve the scope ledger: every prior "
+        "scope item keeps its `scope_item_id`, its `requirement` text and all of its "
+        "`acceptance_criteria` verbatim (adding criteria or new scope items is allowed); make "
+        "intentional scope edits in a separate non-converting revision."
+    )
+    if getattr(config, "plan_growth_gate", "enforce") != "enforce":
+        return f"Plan-growth gate is off for this run. {ledger_rule}\n"
+    if semantic_patch:
+        write_rule = (
+            "Write it with `{\"op\": \"replace\", \"field\": \"one_shot_growth_justification\", "
+            "\"value\": {\"crossed_signals\": [\"rendered-size\"], \"rationale\": \"...\"}}`; "
+            "`value` null removes it."
+        )
+    else:
+        write_rule = (
+            "Add it as a top-level `\"one_shot_growth_justification\": "
+            "{\"crossed_signals\": [\"rendered-size\"], \"rationale\": \"...\"}` object."
+        )
+    lines = [
+        "Plan-growth gate: a signal crosses when its measurement reaches its threshold: "
+        f"{_plan_growth_thresholds_text(config)}. A one-shot plan that crosses any signal "
+        "cannot be approved unless it carries `one_shot_growth_justification` whose "
+        "`crossed_signals` names exactly the signals it crosses, with a `rationale` (at most "
+        "2000 characters) that reviewers evaluate as a semantic claim. A one-shot plan that "
+        "crosses nothing, and every staged plan, must not carry one. "
+        f"{write_rule} {ledger_rule}",
+    ]
+    if growth_notice:
+        lines.append(
+            f"{growth_notice} While a one-shot plan crosses signals, the revision must either "
+            "restructure it as a staged execution_recommendation or justify one-shot for "
+            "exactly the signals it still crosses (shrinking below every threshold is also "
+            "acceptable, and then no justification may remain). When staging, the "
+            "parent keeps scope, stage boundaries, interfaces between stages and acceptance "
+            "criteria; per-stage design goes to `requires-child-planning` children. Weigh the "
+            "cost: staged work adds child issues, handoffs and a managed-CI cycle per child, a "
+            "too-thin parent under-specifies its children, and a child that itself recommends "
+            "staging stops for human handling (#720)."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _plan_growth_review_guidance(
+    config: AgentLoopConfig,
+    growth_notice: str | None = None,
+    growth_measurements: str | None = None,
+) -> str:
+    """Reviewer-facing plan-growth lever (#886)."""
+    lever = (
+        "Plan-growth lever: when a one-shot plan is accumulating per-stage design detail, you "
+        f"may block with a finding that says \"{PLAN_GROWTH_REVIEWER_LEVER}\" instead of "
+        "asking for more detail in the parent plan. Evaluate any "
+        "`one_shot_growth_justification` in the plan as a semantic claim like any other: "
+        "block it when the rationale does not show why one-shot remains correct."
+    )
+    if growth_measurements:
+        lever += f"\n{growth_measurements}"
+    if growth_notice:
+        lever += (
+            f"\n{growth_notice} The orchestrator will not approve this plan until a revision "
+            "satisfies the plan-growth gate: a one-shot plan justifies exactly the signals it "
+            "crosses, and a plan that crosses nothing, or is staged, carries no justification."
+        )
+    return lever + "\n"
+
+
 def build_issue_plan_prompt(
     issue_number: int,
     config: AgentLoopConfig,
@@ -2675,6 +2767,7 @@ For a plan (rather than a clarification), respond with exactly one structured JS
 
 {_execution_strategy_contract_guidance()}
 
+{_plan_growth_planner_guidance(config)}
 {{
   "schema_version": 1,
   "kind": "plan_state",
@@ -2773,6 +2866,8 @@ def build_plan_review_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
     inherited_check_failure: str | None = None,
+    plan_growth_notice: str | None = None,
+    plan_growth_measurements: str | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2791,6 +2886,8 @@ def build_plan_review_prompt(
             inherited_matrix_binding=inherited_matrix_binding,
             inherited_reviewed_deltas=inherited_reviewed_deltas,
             inherited_check_failure=inherited_check_failure,
+            plan_growth_notice=plan_growth_notice,
+            plan_growth_measurements=plan_growth_measurements,
         )
         return compact_prompt
     coder_name = agent_display_name(config.coder)
@@ -2828,6 +2925,7 @@ Plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
+{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}
 Review the plan for correctness, architecture fit, missing edge cases, test
 strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -2912,6 +3010,8 @@ def _build_compact_plan_review_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
     inherited_check_failure: str | None = None,
+    plan_growth_notice: str | None = None,
+    plan_growth_measurements: str | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_name = agent_display_name(reviewer)
@@ -2949,7 +3049,10 @@ def _build_compact_plan_review_prompt(
                 config, protected_context=(human_requirements_block,)
             ),
         review_command_policy=_review_command_policy(config),
-        response_protocol=_plan_review_schema_and_rules() + "\n" + unresolved_items_guidance + _phased_plan_guard(config),
+        response_protocol=(
+            _plan_review_schema_and_rules() + "\n" + unresolved_items_guidance
+            + _phased_plan_guard(config) + _plan_growth_review_guidance(config)
+        ),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
     action = (
@@ -2972,7 +3075,7 @@ Current implementation plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{_agent_unavailable_guidance(reviewer_signature)}
+{(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{_agent_unavailable_guidance(reviewer_signature)}
 {_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
 items left active for this planning round. Do not place your signature before
@@ -3078,6 +3181,7 @@ def _build_semantic_plan_revision_prompt(
     base_state_identity: str,
     plan_validation_diagnostic: object | None,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    plan_growth_notice: str | None = None,
 ) -> str:
     """Prompt for the revision-only semantic contract.
 
@@ -3154,7 +3258,8 @@ text; do not use `rationale` or omit `disposition`.
 Whole-field `replace` accepts only these fields: `summary`, `plan_steps`,
 `architecture_impact`, `additional_closing_issue_ids`,
 `human_requirement_dispositions`, `execution_recommendation`,
-`external_dependencies`, `deferred_work`, `plan_actions`, `deferred_stages`.
+`external_dependencies`, `deferred_work`, `plan_actions`, `deferred_stages`,
+`one_shot_growth_justification` (value null removes it).
 Never `replace` `risk_test_matrix` and never re-emit the whole matrix; revise it
 with these per-row operations (each object uses exactly the keys shown, and
 every `row`/`target_row`/`target_rows` entry is a complete matrix row):
@@ -3173,6 +3278,7 @@ every `row`/`target_row`/`target_rows` entry is a complete matrix row):
   `merge`, and `value` may add `not_applicable_rationale`.
 No other operation names exist.
 
+{_plan_growth_planner_guidance(config, plan_growth_notice, semantic_patch=True)}
 Operations are applied atomically and simultaneously. The patch must contain
 at least one real change, and its binding must match the authenticated values
 above exactly. Repair may fix only response-envelope presentation; it cannot
@@ -3199,6 +3305,7 @@ def build_plan_revision_prompt(
     base_round_number: int | None = None,
     base_state_identity: str | None = None,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    plan_growth_notice: str | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if response_form == "semantic-patch-v1":
@@ -3217,6 +3324,7 @@ def build_plan_revision_prompt(
             base_state_identity=base_state_identity,
             plan_validation_diagnostic=plan_validation_diagnostic,
             inherited_matrix_binding=inherited_matrix_binding,
+            plan_growth_notice=plan_growth_notice,
         )
     if compact_context:
         return _build_compact_plan_revision_prompt(
@@ -3233,6 +3341,7 @@ def build_plan_revision_prompt(
             require_risk_test_matrix_contract=require_risk_test_matrix_contract,
             plan_validation_diagnostic=plan_validation_diagnostic,
             inherited_matrix_binding=inherited_matrix_binding,
+            plan_growth_notice=plan_growth_notice,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3293,6 +3402,7 @@ Use this mandatory structured JSON response format:
     include_risk_test_matrix_contract=require_risk_test_matrix_contract
 )}
 
+{_plan_growth_planner_guidance(config, plan_growth_notice)}
 {{
   "schema_version": 1,
   "kind": "plan_revision",
@@ -3364,6 +3474,7 @@ def _build_compact_plan_revision_prompt(
     require_risk_test_matrix_contract: bool,
     plan_validation_diagnostic: object | None,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
+    plan_growth_notice: str | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3395,7 +3506,7 @@ def _build_compact_plan_revision_prompt(
         ),
         response_protocol=_plan_revision_schema_and_rules(
             include_risk_test_matrix_contract=require_risk_test_matrix_contract
-        ),
+        ) + "\n" + _plan_growth_planner_guidance(config),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
     action = (
@@ -3415,7 +3526,7 @@ Reviewers: {reviewer_name}
 Action for this call: {action}
 
 {format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
-
+{_plan_growth_planner_guidance(config, plan_growth_notice) if plan_growth_notice else ""}
 Previous implementation plan:
 
 {previous_plan}

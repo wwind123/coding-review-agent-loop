@@ -438,6 +438,25 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "rather than a claim."
         ),
     ),
+    "_expect_growth_justification": ShapeCheckClassification(
+        "fatal",
+        frozenset({"no-conservative-reading", "payload-bound"}),
+        (
+            "Fatal sites: no-conservative-reading: removing the element would weaken an "
+            "obligation, finding, disposition, approved topology or discussion answer "
+            "rather than a claim; payload-bound: a hard cap or count bound that keeps an "
+            "accepted payload bounded."
+        ),
+    ),
+    "_expect_optional_growth_justification": ShapeCheckClassification(
+        "fatal",
+        frozenset({"no-conservative-reading"}),
+        (
+            "Fatal sites: no-conservative-reading: removing the element would weaken an "
+            "obligation, finding, disposition, approved topology or discussion answer "
+            "rather than a claim."
+        ),
+    ),
     "_expect_execution_recommendation": ShapeCheckClassification(
         "fatal",
         frozenset({"no-conservative-reading"}),

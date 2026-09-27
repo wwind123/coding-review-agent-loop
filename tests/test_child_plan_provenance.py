@@ -1867,6 +1867,9 @@ def test_m931_weakened_revision_candidate_is_replanned_over_the_unchanged_base(
 
 
 def _m976_full_plan_state():
+    # A maximal 24-row matrix crosses the plan-growth matrix-rows signal
+    # (#886); tests built on it run with --plan-growth-gate off because they
+    # exercise assembly and replan routing, not the growth gate.
     from coding_review_agent_loop.protocol import RISK_MATRIX_MAX_ROWS
 
     payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
@@ -1906,7 +1909,7 @@ def test_m976_top_level_row_bound_overflow_is_replanned_instead_of_fatal(tmp_pat
         ],
     )
     assert orchestrator.run_issue_loop(
-        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
     ) == 0
 
     planner_prompts = _agent_prompts(runner, "claude")
@@ -1933,7 +1936,7 @@ def test_m976_top_level_row_bound_overflow_exhausts_as_deterministic_failure(tmp
     )
     with pytest.raises(AgentInvocationError, match="fail deterministic plan assembly") as error:
         orchestrator.run_issue_loop(
-            runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+            runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
         )
     assert error.value.failure_category == "deterministic"
     assert "consolidate scenarios explicitly" in str(error.value)
@@ -1985,7 +1988,7 @@ def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monk
         ],
     )
     assert orchestrator.run_issue_loop(
-        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
     ) == 0
 
     planner_prompts = _agent_prompts(runner, "claude")
@@ -2016,7 +2019,7 @@ def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path
         AgentInvocationError, match="fail semantic patch payload validation"
     ) as error:
         orchestrator.run_issue_loop(
-            runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+            runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
         )
     assert error.value.failure_category == "deterministic"
     exhaustion = error.value.plan_validation_exhaustion
@@ -2049,7 +2052,7 @@ def test_m979_patch_envelope_defect_still_routes_to_repair(tmp_path, monkeypatch
         ],
     )
     assert orchestrator.run_issue_loop(
-        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
     ) == 0
     assert repair_calls == [(missing_footer, "plan_revision_patch")]
     assert len(_agent_prompts(runner, "claude")) == 2
@@ -2184,7 +2187,7 @@ def test_m979_strict_patch_schema_failure_is_replanned_without_repair(
         ],
     )
     assert orchestrator.run_issue_loop(
-        runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
+        runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
     ) == 0
     planner_prompts = _agent_prompts(runner, "claude")
     assert len(planner_prompts) == 3
@@ -2810,6 +2813,138 @@ def test_m1013_expansion_notice_failure_never_blocks_the_run(tmp_path, monkeypat
     assert sum(1 for body in world.posted() if CHILD_PLAN_REBIND_MARKER_RE.search(body)) == 1
     assert _m1013_notices(world) == []
     assert len(world.agent_calls("codex")) == 2
+
+
+# --- #886: plan-growth advisory on the real rebind transition ---------------
+
+_M886_RATIONALE = "One parser seam; staging would ship a first stage with no effect."
+
+
+def _m886_with_justification(patch_text, *signals):
+    patch = json.loads(patch_text.split("\n<!--", 1)[0])
+    patch["operations"].append({
+        "op": "replace", "field": "one_shot_growth_justification",
+        "value": {"crossed_signals": list(signals), "rationale": _M886_RATIONALE},
+    })
+    return json.dumps(patch) + PLAN_FOOTER
+
+
+def _m886_advisories(world):
+    return [body for body in world.posted() if "### Rebound plan crossed plan-growth thresholds" in body]
+
+
+@pytest.mark.parametrize("expands", [True, False])
+def test_m886_justified_grown_replacement_gets_a_growth_advisory(tmp_path, monkeypatch, expands):
+    """Row `rebind-advisory` cases (a) and (b)."""
+    # The expanding patch restores the weakened inherited row.
+    world = _M936World(tmp_path, monkeypatch, weak=expands)
+    patch = (
+        _m1013_expanding_patch(world, extra_steps=["Add parser mode."])
+        if expands
+        else _m936_patch(world.old_state, None, summary="Justified summary.")
+    )
+    assert world.run_issue(
+        config=world.config(plan_growth_max_scope_items=1),
+        claude_outputs=[_m886_with_justification(patch, "scope-items")],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    (advisory,) = _m886_advisories(world)
+    assert "`scope-items`" in advisory and "PR #77" in advisory
+    assert "Reviewed justification signals: `scope-items`" in advisory
+    assert _M886_RATIONALE in advisory
+    assert CHILD_PLAN_REBIND_MARKER_RE.search(advisory)
+    assert len(_m1013_notices(world)) == (1 if expands else 0)
+    # Informational only: the PR is still reviewed under the rebound plan.
+    assert len(world.agent_calls("codex")) == 2
+
+
+def test_m886_gate_off_replacement_advisory_says_no_justification(tmp_path, monkeypatch):
+    """Row `rebind-advisory` case (c)."""
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    assert world.run_issue(
+        config=world.config(plan_growth_gate="off", plan_growth_max_scope_items=1),
+        claude_outputs=[_m936_patch(world.old_state, None, summary="Unjustified summary.")],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    (advisory,) = _m886_advisories(world)
+    assert "No reviewed one-shot growth justification exists" in advisory
+    assert "gate was off" not in advisory
+    assert _m1013_notices(world) == []
+
+
+def test_m886_small_replacement_shows_only_the_expansion_notice(tmp_path, monkeypatch):
+    """Row `rebind-advisory` case (d)."""
+    world = _M936World(tmp_path, monkeypatch)
+    assert world.run_issue(
+        claude_outputs=[_m1013_expanding_patch(world, extra_steps=["Add parser mode."])],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    assert len(_m1013_notices(world)) == 1
+    assert _m886_advisories(world) == []
+
+
+def test_m886_size_only_crossing_from_the_disposition_section_gets_the_advisory(
+    tmp_path, monkeypatch
+):
+    """Row `rebind-advisory` case (f) through the real rebind transition."""
+    from coding_review_agent_loop.comment_rendering import (
+        render_canonical_plan_revision,
+        render_canonical_plan_state,
+    )
+    from coding_review_agent_loop.plan_assembly import assemble_authenticated_plan_revision
+
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    patch = _m886_with_justification(
+        _m936_patch(world.old_state, None, summary="Justified summary."), "rendered-size"
+    )
+    base = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(world.old_state), round_number=1
+    )
+    assembled, _sidecar = assemble_authenticated_plan_revision(
+        base, json.loads(patch.split("\n<!--", 1)[0]), result_round_number=2
+    )
+    config = world.config()
+    canonical = render_canonical_plan_revision(assembled, (), config)
+    state_only = render_canonical_plan_state(
+        dataclasses.replace(
+            validate_structured_plan_state(world.old_state),
+            summary=assembled.summary,
+            one_shot_growth_justification=assembled.one_shot_growth_justification,
+        ),
+        config,
+    )
+    # Only the revision's prior-item disposition section pushes the stored
+    # canonical text over the threshold; a state-only re-render stays under.
+    assert "### Prior plan review item dispositions" in canonical
+    threshold = len(canonical)
+    assert len(state_only) < threshold
+    assert world.run_issue(
+        config=world.config(plan_growth_max_chars=threshold),
+        claude_outputs=[patch],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    (advisory,) = _m886_advisories(world)
+    assert f"canonical plan size {threshold} characters" in advisory
+    assert "`rendered-size`" in advisory and "Reviewed justification signals: `rendered-size`" in advisory
+    assert _m1013_notices(world) == []
+    # Non-blocking: the PR was still reviewed under the rebound plan.
+    assert len(world.agent_calls("codex")) == 2
+
+
+def test_m886_growth_advisory_failure_never_blocks_the_rebind(tmp_path, monkeypatch):
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+
+    def broken(*args, **kwargs):
+        raise AgentLoopError("assessment unavailable")
+
+    monkeypatch.setattr(orchestrator, "_render_rebind_growth_advisory", broken)
+    assert world.run_issue(
+        config=world.config(plan_growth_gate="off", plan_growth_max_scope_items=1),
+        claude_outputs=[_m936_patch(world.old_state, None, summary="Unjustified summary.")],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+    ) == 0
+    assert sum(1 for body in world.posted() if CHILD_PLAN_REBIND_MARKER_RE.search(body)) == 1
+    assert _m886_advisories(world) == []
 
 
 def test_m1013_step_identity_compares_full_text_not_the_clipped_prefix():

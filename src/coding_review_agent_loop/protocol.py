@@ -1289,6 +1289,64 @@ TRACKER_ACTION_TITLE_RE = re.compile(
 )
 
 
+# Structural plan-growth signals (#886).  The closed set is shared by the
+# typed justification parser and ``plan_growth``'s deterministic assessment.
+PLAN_GROWTH_SIGNALS = ("rendered-size", "scope-items", "matrix-rows", "revision-count")
+PLAN_GROWTH_JUSTIFICATION_MAX_RATIONALE_CHARS = 2_000
+
+
+@dataclass(frozen=True)
+class OneShotGrowthJustification:
+    """A reviewed claim that a grown one-shot plan should stay one-shot (#886).
+
+    Shape only: which signals must be named is decided by the post-assembly
+    growth self-check, which can measure the candidate's canonical rendering.
+    """
+
+    crossed_signals: tuple[str, ...]
+    rationale: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {"crossed_signals": list(self.crossed_signals), "rationale": self.rationale}
+
+
+def _expect_growth_justification(value: object, *, context: str) -> OneShotGrowthJustification:
+    payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
+    _expect_exact_keys(payload, context=context, required={"crossed_signals", "rationale"})  # shape-check: fatal:no-conservative-reading
+    signals_value = payload["crossed_signals"]
+    if not isinstance(signals_value, list) or not signals_value:
+        raise AgentLoopError(f"{context}.crossed_signals must be a non-empty JSON array.")  # shape-check: fatal:no-conservative-reading
+    signals: list[str] = []
+    for index, item in enumerate(signals_value):
+        if not isinstance(item, str) or item not in PLAN_GROWTH_SIGNALS:
+            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                f"{context}.crossed_signals[{index}] must be one of: "
+                + ", ".join(PLAN_GROWTH_SIGNALS)
+                + "."
+            )
+        if item in signals:
+            raise AgentLoopError(f"{context}.crossed_signals must not repeat `{item}`.")  # shape-check: fatal:no-conservative-reading
+        signals.append(item)
+    rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")  # shape-check: fatal:no-conservative-reading
+    if len(rationale) > PLAN_GROWTH_JUSTIFICATION_MAX_RATIONALE_CHARS:
+        raise AgentLoopError(  # shape-check: fatal:payload-bound
+            f"{context}.rationale must be at most "
+            f"{PLAN_GROWTH_JUSTIFICATION_MAX_RATIONALE_CHARS} characters."
+        )
+    return OneShotGrowthJustification(crossed_signals=tuple(signals), rationale=rationale)
+
+
+def _expect_optional_growth_justification(
+    payload: Mapping[str, object], *, context: str
+) -> OneShotGrowthJustification | None:
+    if "one_shot_growth_justification" not in payload:
+        return None
+    return _expect_growth_justification(  # shape-check: fatal:no-conservative-reading
+        payload["one_shot_growth_justification"],
+        context=f"{context}.one_shot_growth_justification",
+    )
+
+
 @dataclass(frozen=True)
 class StructuredPlanRevision:
     schema_version: int
@@ -1311,6 +1369,8 @@ class StructuredPlanRevision:
     risk_test_matrix_changes: tuple["RiskTestMatrixChange", ...] = ()
     architecture_impact_contract: ArchitectureImpactContract = ArchitectureImpactContract()
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
+    # Absent unless the planner justified keeping a grown plan one-shot (#886).
+    one_shot_growth_justification: OneShotGrowthJustification | None = None
 
 
 @dataclass(frozen=True)
@@ -1334,6 +1394,8 @@ class StructuredPlanState:
     risk_test_matrix_changes: tuple["RiskTestMatrixChange", ...] = ()
     architecture_impact_contract: ArchitectureImpactContract = ArchitectureImpactContract()
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
+    # Absent unless the planner justified keeping a grown plan one-shot (#886).
+    one_shot_growth_justification: OneShotGrowthJustification | None = None
 
 
 # The matrix is deliberately a structured, generation-gated contract.  It is
@@ -6243,6 +6305,7 @@ def validate_structured_plan_revision(
             "risk_test_matrix_contract_version",
             "risk_test_matrix",
             "risk_test_matrix_changes",
+            "one_shot_growth_justification",
         },
     )
     execution_version, execution_recommendation = _parse_execution_contract_fields(  # shape-check: fatal:no-conservative-reading
@@ -6310,6 +6373,9 @@ def validate_structured_plan_revision(
             architecture_impact, required=required_architecture_impact_contract == 1
         ),
         architecture_impact_degradations=architecture_impact_degradations,
+        one_shot_growth_justification=_expect_optional_growth_justification(  # shape-check: fatal:no-conservative-reading
+            payload, context="plan_revision"
+        ),
     )
 
 
@@ -6347,6 +6413,7 @@ def validate_structured_plan_state(
             "risk_test_matrix_contract_version",
             "risk_test_matrix",
             "risk_test_matrix_changes",
+            "one_shot_growth_justification",
         },
     )
     execution_version, execution_recommendation = _parse_execution_contract_fields(  # shape-check: fatal:no-conservative-reading
@@ -6400,6 +6467,9 @@ def validate_structured_plan_state(
             architecture_impact, required=required_architecture_impact_contract == 1
         ),
         architecture_impact_degradations=architecture_impact_degradations,
+        one_shot_growth_justification=_expect_optional_growth_justification(  # shape-check: fatal:no-conservative-reading
+            payload, context="plan_state"
+        ),
     )
 
 
@@ -7870,8 +7940,11 @@ PLAN_REVISION_PATCH_REPLACEABLE_FIELDS = frozenset(
         "deferred_work",
         "plan_actions",
         "deferred_stages",
+        "one_shot_growth_justification",
     }
 )
+# Whole-field replaces whose ``null`` value removes the key (#886).
+PLAN_REVISION_PATCH_CLEARABLE_FIELDS = frozenset({"one_shot_growth_justification"})
 # Fields that cannot take a wholesale ``replace`` but do have a write path
 # through dedicated per-row operations.  Diagnostics name these operations so
 # an author who picked the wrong operation can recover on the next attempt.
@@ -8115,6 +8188,10 @@ def _parse_plan_patch_field_value(field_name: str, value: object, *, context: st
         return _expect_execution_recommendation(value, context=context)  # shape-check: fatal:no-conservative-reading
     if field_name in {"external_dependencies", "deferred_work", "plan_actions", "deferred_stages"}:
         return _expect_deferred_stage_list({field_name: value}, field_name, context=context)  # shape-check: fatal:no-conservative-reading
+    if field_name == "one_shot_growth_justification":
+        if value is None:
+            return None
+        return _expect_growth_justification(value, context=context)  # shape-check: fatal:no-conservative-reading
     raise AgentLoopError(f"{context} is not a writable semantic plan field.")  # shape-check: fatal:no-conservative-reading
 
 

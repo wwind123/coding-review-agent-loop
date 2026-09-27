@@ -161,6 +161,40 @@ def test_repair_preserves_every_nested_execution_recommendation_field(strategy):
             check(source, target)
 
 
+@pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
+def test_repair_preserves_one_shot_growth_justification(kind):
+    source = _execution_source(strategy="one-shot")
+    source["kind"] = kind
+    source["one_shot_growth_justification"] = {
+        "crossed_signals": ["scope-items", "rendered-size"],
+        "rationale": "The scope items share one parser seam and cannot ship separately.",
+    }
+    check(source, deepcopy(source))
+    reflowed = deepcopy(source)
+    reflowed["one_shot_growth_justification"]["rationale"] = (
+        "The scope items  share one parser seam\nand cannot ship separately."
+    )
+    check(source, reflowed)
+
+    removed = deepcopy(source)
+    del removed["one_shot_growth_justification"]
+    rewritten_rationale = deepcopy(source)
+    rewritten_rationale["one_shot_growth_justification"]["rationale"] = "It is fine."
+    rewritten_signals = deepcopy(source)
+    rewritten_signals["one_shot_growth_justification"]["crossed_signals"] = ["scope-items"]
+    nulled = deepcopy(source)
+    nulled["one_shot_growth_justification"] = None
+    for target in (removed, rewritten_rationale, rewritten_signals, nulled):
+        with pytest.raises(AgentLoopError, match="one_shot_growth_justification"):
+            check(source, target)
+
+    unjustified = deepcopy(source)
+    del unjustified["one_shot_growth_justification"]
+    check(unjustified, deepcopy(unjustified))
+    with pytest.raises(AgentLoopError, match="one_shot_growth_justification"):
+        check(unjustified, source)
+
+
 def test_prompt_demands_lossless_repair_and_separate_ledgers():
     prompt = _build_repair_prompt("malformed", expected_kind="coder_followup",
                                   unresolved_item_ids=("item-1",),

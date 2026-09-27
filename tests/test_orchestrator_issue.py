@@ -11518,12 +11518,13 @@ def test_m948_overflow_the_digest_cannot_fix_fails_closed_and_posts_nothing(tmp_
         # Not in the transport spill set, so no presentation change can help.
         compact_prior_summaries=(_m948_noise("unspillable", 120_000),),
     )
-    body = _m948_assemble(
-        "plan_state", parsed, raw_text, config=config, ids=(), direct=False, metadata=metadata
-    )
     runner = FakeRunner()
+    # The final fit check (#886) refuses the digest during assembly, so no
+    # post is ever attempted.
     with pytest.raises(_m948_transport.RoundCommentOverflowError) as excinfo:
-        _m948_post_issue_comment(runner, config=config, issue_number=56, body=body)
+        _m948_assemble(
+            "plan_state", parsed, raw_text, config=config, ids=(), direct=False, metadata=metadata
+        )
     assert "compact_prior_summaries=" in str(excinfo.value)
     assert _m948_noise("unspillable", 64) not in str(excinfo.value)
     assert runner.issue_comments == []
