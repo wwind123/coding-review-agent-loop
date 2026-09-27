@@ -1017,3 +1017,85 @@ def test_live_revision_newly_crossing_a_signal_is_rejected_before_review(tmp_pat
     assert coders[1].assembled_plan_sidecar["canonical_json"]["one_shot_growth_justification"][
         "crossed_signals"
     ] == ["rendered-size", "scope-items"]
+
+
+# --- review round 3: phase-advance revision count and stale-justification notice
+
+def test_phase_advance_round_does_not_increment_revision_count(tmp_path):
+    """Item-3 / row `revision-count-only`: a reviewer-only round keeps the count."""
+    canonical = render_canonical_plan_state(validate_structured_plan_state(structured_v1_plan_state()))
+    staged = dict(
+        reviewer=("codex", "gemini"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex", max_rounds=6,
+        # Size between half and the full threshold; a second candidate would
+        # cross revision-count, but the single candidate must not.
+        plan_growth_max_chars=len(canonical) + 100, plan_growth_max_revisions=2,
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = _config(tmp_path, **staged)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    records = _plan_records(runner)
+    assert [record.round_number for record in records if record.phase == "plan-phase-advance"] == [2]
+    # One planner turn: the panel's approval in the reviewer-only round 2 was
+    # not turned into a forced revision.
+    assert len(_prompts(runner, "claude")) == 1
+    panel = [" ".join(cmd) for cmd, _cwd in runner.commands if cmd[0] == "gemini"]
+    assert len(panel) == 1 and "Planning round: 2" in panel[0]
+    assert "Orchestrator plan-growth notice" not in panel[0]
+    assert "Plan-growth measurements" not in panel[0]
+    # Carried-approval recovery anchors on the round-2 panel record and still
+    # counts one candidate.
+    comments = [SimpleNamespace(body=str(item["body"])) for item in runner.issue_comments]
+    plan_text, plan_round = orchestrator_module._resume_plan_round(
+        comments, configured_reviewers=orchestrator_module.reviewers(config)
+    )
+    assert plan_round.round_number == 2
+    orchestrator_module._require_complete_canonical_plan_approval(
+        comments, config=config, plan_text=plan_text, plan_round=plan_round,
+        human_requirements=(), error_message="incomplete",
+    )
+
+
+def test_recovered_stale_justification_gets_a_removal_notice(tmp_path):
+    """Item-4: a recovered stale justification is named as such, not as a crossing."""
+    stale = _state_text(one_shot_growth_justification=_justification("scope-items"))
+    history_runner = FakeRunner(
+        claude_outputs=[stale], codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert run_issue_loop(
+        history_runner, issue_number=56,
+        config=_config(tmp_path, plan_growth_gate="off"), plan_first=True,
+    ) == 0
+    runner = FakeRunner(
+        issue_comments=list(history_runner.issue_comments),
+        claude_outputs=[_patch_text(stale, [
+            {"op": "replace", "field": "one_shot_growth_justification", "value": None},
+        ])],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    assert run_issue_loop(runner, issue_number=56, config=_config(tmp_path), plan_first=True) == 0
+    planner = _prompts(runner, "claude")
+    assert len(planner) == 1
+    assert "stale" in planner[0] and "No restructuring is required" in planner[0]
+    assert "threshold(s)  without" not in planner[0]
+    assert "crosses plan-growth threshold(s) " not in planner[0].split("Orchestrator plan-growth notice", 1)[1][:200]
+    coder = [record for record in _plan_records(runner) if record.role == "coder"][-1]
+    assert "one_shot_growth_justification" not in coder.assembled_plan_sidecar["canonical_json"]
+
+
+def test_growth_notice_for_staged_or_uncrossed_plans_names_the_violation():
+    from coding_review_agent_loop.plan_growth import render_growth_notice
+
+    thresholds = PlanGrowthThresholds()
+    plan = _parsed()
+    assessment = assess_plan_growth(plan, rendered_chars=10, revision_count=1, thresholds=thresholds)
+    staged = render_growth_notice(assessment, violation="VIOLATION.", strategy="staged")
+    assert "VIOLATION." in staged and "one-shot plan crosses" not in staged
+    crossed = assess_plan_growth(
+        plan, rendered_chars=10, revision_count=1, thresholds=PlanGrowthThresholds(max_scope_items=1)
+    )
+    assert "`scope-items`" in render_growth_notice(crossed, violation="x")

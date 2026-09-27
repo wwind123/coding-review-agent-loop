@@ -2702,9 +2702,10 @@ def _plan_growth_planner_guidance(
     ]
     if growth_notice:
         lines.append(
-            f"{growth_notice} This revision must either restructure the plan as a staged "
-            "execution_recommendation or justify one-shot for exactly the signals it still "
-            "crosses (shrinking below every threshold is also acceptable). When staging, the "
+            f"{growth_notice} While a one-shot plan crosses signals, the revision must either "
+            "restructure it as a staged execution_recommendation or justify one-shot for "
+            "exactly the signals it still crosses (shrinking below every threshold is also "
+            "acceptable, and then no justification may remain). When staging, the "
             "parent keeps scope, stage boundaries, interfaces between stages and acceptance "
             "criteria; per-stage design goes to `requires-child-planning` children. Weigh the "
             "cost: staged work adds child issues, handoffs and a managed-CI cycle per child, a "
@@ -2731,8 +2732,9 @@ def _plan_growth_review_guidance(
         lever += f"\n{growth_measurements}"
     if growth_notice:
         lever += (
-            f"\n{growth_notice} The orchestrator will not approve this plan as one-shot until a "
-            "revision is staged or carries a justification covering exactly the crossed signals."
+            f"\n{growth_notice} The orchestrator will not approve this plan until a revision "
+            "satisfies the plan-growth gate: a one-shot plan justifies exactly the signals it "
+            "crosses, and a plan that crosses nothing, or is staged, carries no justification."
         )
     return lever + "\n"
 

@@ -12626,7 +12626,14 @@ def _run_plan_first_loop(
                 current_plan_sidecar.canonical_json if current_plan_sidecar is not None else None
             ),
             plan_text=current_plan,
-            revision_count=_plan_growth_candidate_count(planner_candidate_rounds, round_number),
+            # Counted up to the round that published this candidate, never the
+            # loop round: a reviewer-only phase-advance round keeps the count.
+            revision_count=_plan_growth_candidate_count(
+                planner_candidate_rounds,
+                current_plan_sidecar.round_number
+                if current_plan_sidecar is not None
+                else round_number,
+            ),
         )
         if plan_growth_assessment is not None:
             log(
@@ -12639,7 +12646,15 @@ def _run_plan_first_loop(
         # Only a candidate recovered from history can reach reviewers in this
         # state: fresh candidates are rejected by the self-check.
         plan_growth_notice = (
-            render_growth_notice(plan_growth_assessment)
+            render_growth_notice(
+                plan_growth_assessment,
+                violation=plan_growth_violation,
+                strategy=(
+                    plan_strategy(current_plan_sidecar.canonical_json)
+                    if current_plan_sidecar is not None
+                    else None
+                ),
+            )
             if plan_growth_violation is not None and plan_growth_assessment is not None
             else None
         )
@@ -17686,7 +17701,12 @@ def _planner_candidate_rounds(comments: Sequence[object]) -> set[int]:
 
 
 def _plan_growth_candidate_count(candidate_rounds: set[int], round_number: int) -> int:
-    """Planner candidates up to and including the one published at ``round_number``."""
+    """Planner candidates up to and including the one published at ``round_number``.
+
+    ``round_number`` must be the round that published (or, for the
+    pre-publication self-check, will publish) the candidate; callers never
+    pass a reviewer-only round.
+    """
     return len({item for item in candidate_rounds if item < round_number} | {round_number})
 
 
@@ -17727,13 +17747,15 @@ def _require_plan_growth_compliance(
     coder_metadata = plan_round.coder_metadata
     if coder_metadata is None or coder_metadata.assembled_plan_sidecar is None:
         return
-    payload = decode_assembled_plan_sidecar(coder_metadata.assembled_plan_sidecar).canonical_json
+    sidecar = decode_assembled_plan_sidecar(coder_metadata.assembled_plan_sidecar)
     _assessment, violation = _plan_growth_gate_violation(
         config,
-        plan_payload=payload,
+        plan_payload=sidecar.canonical_json,
         plan_text=plan_text,
+        # The coder round that published the candidate, not the resumed
+        # anchor round (which may be a later reviewer-only round).
         revision_count=_plan_growth_candidate_count(
-            _planner_candidate_rounds(comments), plan_round.round_number
+            _planner_candidate_rounds(comments), sidecar.round_number
         ),
     )
     if violation is not None:

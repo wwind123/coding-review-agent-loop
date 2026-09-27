@@ -326,8 +326,26 @@ def render_growth_measurements(assessment: PlanGrowthAssessment) -> str:
     )
 
 
-def render_growth_notice(assessment: PlanGrowthAssessment) -> str:
-    """Orchestrator growth notice for prompts; never a reviewer item."""
+def render_growth_notice(
+    assessment: PlanGrowthAssessment,
+    *,
+    violation: str | None = None,
+    strategy: str | None = "one-shot",
+) -> str:
+    """Orchestrator growth notice for prompts; never a reviewer item.
+
+    A candidate recovered from history can fail the gate without an uncovered
+    crossing: a stale justification on a plan that crosses nothing, or any
+    justification on a staged plan.  That notice names the actual violation
+    (remove the justification) instead of an empty signal list.
+    """
+    if strategy != "one-shot" or not assessment.crossed:
+        return (
+            "Orchestrator plan-growth notice (not a reviewer finding): "
+            + (violation or "the plan carries a stale `one_shot_growth_justification`.")
+            + " No restructuring is required for this; only the stale justification must go. "
+            f"Measurements: {assessment.describe()}."
+        )
     return (
         "Orchestrator plan-growth notice (not a reviewer finding): the current one-shot plan "
         "crosses plan-growth threshold(s) "
