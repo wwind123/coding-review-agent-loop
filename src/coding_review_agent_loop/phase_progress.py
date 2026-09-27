@@ -36,7 +36,9 @@ from .github import (
     get_issue_state,
     get_pr_merge_commit_sha,
     post_issue_comment,
+    read_rest_issue_comments,
     resolve_authenticated_github_actor,
+    strip_bot_login_suffix,
 )
 from .issue_pr_handoff import authenticate_canonical_issue_pr
 from .protocol import ExecutionAllocation
@@ -633,7 +635,13 @@ def find_staged_completion_records(
 
 
 def _authored_by(comment: object, *, login: str, actor_id: int) -> bool:
-    return getattr(comment, "author", None) == login and getattr(comment, "author_id", None) == actor_id
+    # REST spells an app login with a ``[bot]`` suffix; the immutable user ID
+    # is the identity, the normalized login only has to agree with it.
+    return (
+        getattr(comment, "author_id", None) == actor_id
+        and strip_bot_login_suffix(getattr(comment, "author", None))
+        == strip_bot_login_suffix(login)
+    )
 
 
 def _obligation_line(label: str, allocation) -> str:
@@ -699,7 +707,6 @@ def record_staged_completion(
     *,
     config: AgentLoopConfig,
     parent_issue: int,
-    parent_comments: Sequence[object],
     progress: Sequence[PhaseProgress],
     outcome: StagedTopologyOutcome,
 ) -> bool:
@@ -714,6 +721,12 @@ def record_staged_completion(
     immutable user ID) and recording the same stages, children, PRs and merge
     commits.  So a parent rerun and the child run that merged the last stage
     cannot both write one, while a forged or stale claim cannot stand in for it.
+
+    Existing records are read from the parent's complete REST comment history,
+    not the caller's ``gh issue view`` projection: that projection carries no
+    numeric author ID and can drop older comments at its connection cap, so a
+    genuine record there could neither authenticate nor be seen.  An
+    incomplete read raises and posts nothing.
     """
     if not progress or any(phase.status != STATUS_COMPLETE for phase in progress):
         raise AgentLoopError(
@@ -752,8 +765,14 @@ def record_staged_completion(
         mode=outcome.mode,
         stages=tuple(stages),
     )
+    history = read_rest_issue_comments(
+        runner,
+        config=config,
+        issue_number=parent_issue,
+        purpose="the staged completion record cannot be checked for an existing copy",
+    )
     candidates = find_staged_completion_records(
-        parent_comments, parent_issue=parent_issue, plan_hash=outcome.plan_hash, mode=outcome.mode
+        history, parent_issue=parent_issue, plan_hash=outcome.plan_hash, mode=outcome.mode
     )
     if any(recorded == metadata for _comment, recorded in candidates):
         login, actor_id = resolve_authenticated_github_actor(runner, config=config)

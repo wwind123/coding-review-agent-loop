@@ -1255,8 +1255,11 @@ The modes are:
   phase writes it immediately; otherwise the next parent rerun does. It is
   written once per plan identity: an existing record counts only when it was
   authored by the authenticated GitHub actor (login and immutable user ID) and
-  records exactly the delivered stages. Nothing is posted while any merge
-  commit is unreadable, so a later run can still write the complete record. It
+  records exactly the delivered stages. Existing records are looked up in the
+  parent's complete REST comment history, which carries the numeric author ID
+  and older comments the `gh issue view` projection omits. Nothing is posted
+  while any merge commit or that history is unreadable, so a later run can
+  still write the complete record. It
   states that agent-loop leaves the parent open for the operator to verify and
   close. Completion evidence
   is authenticated: a closed child whose PR evidence is missing, unreadable or

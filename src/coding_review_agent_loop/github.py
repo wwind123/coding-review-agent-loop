@@ -1935,9 +1935,38 @@ def _merge_issue_comment_transport_identity(
     # ``gh issue view --comments`` is itself a bounded projection.  A full
     # page without the marker may simply mean that the durable record is on a
     # later REST page, so probe REST at the projection boundary too.
-    page_size = 100
+    page_size = _REST_ISSUE_COMMENT_PAGE_SIZE
     if not marker_in_projection and len(comments) < page_size:
         return comments
+    transport_comments = read_rest_issue_comments(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        purpose="trusted planning diagnostics cannot be resumed safely",
+    )
+    return _merge_transport_comments(
+        comments, transport_comments, issue_number=issue_number
+    )
+
+
+_REST_ISSUE_COMMENT_PAGE_SIZE = 100
+
+
+def read_rest_issue_comments(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    purpose: str,
+) -> tuple[IssueComment, ...]:
+    """Read an issue's complete comment history from REST, with numeric IDs.
+
+    Unlike the ``gh issue view --comments`` projection, every comment carries
+    its numeric comment ID and immutable author user ID, and no older comment
+    is dropped at a connection cap.  Any incomplete read fails closed; the
+    ``purpose`` clause names what cannot proceed safely without it.
+    """
+    page_size = _REST_ISSUE_COMMENT_PAGE_SIZE
     page = 1
     raw_transport_comments: list[object] = []
     seen_ids: set[int] = set()
@@ -1957,7 +1986,7 @@ def _merge_issue_comment_transport_identity(
         if result.returncode != 0:
             raise AgentLoopError(
                 f"GitHub issue comment recovery for issue #{issue_number} is incomplete; "
-                "trusted planning diagnostics cannot be resumed safely."
+                f"{purpose}."
             )
         try:
             raw_page = json.loads(result.stdout or "[]")
@@ -1992,7 +2021,15 @@ def _merge_issue_comment_transport_identity(
         raise AgentLoopError(
             f"GitHub issue comment recovery for issue #{issue_number} exceeded its pagination bound."
         )
-    transport_comments = _parse_issue_comments(raw_transport_comments)
+    return _parse_issue_comments(raw_transport_comments)
+
+
+def _merge_transport_comments(
+    comments: tuple[IssueComment, ...],
+    transport_comments: tuple[IssueComment, ...],
+    *,
+    issue_number: int,
+) -> tuple[IssueComment, ...]:
     # GraphQL spells an app's login without the ``[bot]`` suffix REST uses, so
     # the match key normalizes it; a key shared by different raw logins is
     # ambiguous and never borrows either identity (#1029).

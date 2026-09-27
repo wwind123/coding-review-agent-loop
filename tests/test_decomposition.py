@@ -2649,6 +2649,8 @@ def test_delivered_staged_parent_carries_one_completion_record_naming_every_chil
             912: _merged_pr_payload(912, "0c657e93" + "a" * 32),
             913: _merged_pr_payload(913, "3c48424d" + "b" * 32),
         },
+        authenticated_actor=_ACTOR,
+        serve_rest_issue_comments=True,
     )
     config = make_config(tmp_path, plan_execution_mode="implement-by-phase")
 
@@ -2673,6 +2675,13 @@ def test_delivered_staged_parent_carries_one_completion_record_naming_every_chil
     ] == [(99, 912, "0c657e93" + "a" * 32), (100, 913, "3c48424d" + "b" * 32)]
     assert "Recorded the staged completion on issue #56." in capsys.readouterr().out
     assert not any(cmd[:3] == ["gh", "issue", "close"] for cmd, _cwd in runner.commands)
+
+    # A normal parent rerun reads the parent through the `gh issue view`
+    # projection, which shows the record's author login but no numeric ID.
+    # The record is still recognized, from the REST history, and not reposted.
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert len(_completion_records(runner)) == 1
+    assert "Recorded the staged completion" not in capsys.readouterr().out
 
 
 def _staged_child_context(number):
@@ -2719,6 +2728,7 @@ def test_child_merge_of_the_last_stage_records_parent_completion(
             ),
         },
         authenticated_actor=_ACTOR,
+        serve_rest_issue_comments=True,
     )
 
     def merge_hook():
@@ -2769,6 +2779,7 @@ def _delivered_two_stage_runner(*, extra_parent_comments=(), merge_commit_913=Tr
             ),
         },
         authenticated_actor=_ACTOR,
+        serve_rest_issue_comments=True,
     )
 
 
@@ -2802,8 +2813,22 @@ def test_completion_record_is_not_published_without_every_merge_commit(tmp_path,
     assert "| #100 | PR #913 merged at `3c48424dbbbb` |" in records[0]
 
 
-def _completion_comment_by(author, record_body):
-    return {"author": author, "createdAt": "2026-09-21T00:00:00Z", "body": record_body}
+def _completion_comment_by(author, record_body, *, rest_only=False):
+    """A parent comment in the shape GitHub returns it.
+
+    The `gh issue view` projection carries only the login; a numeric ``id`` in
+    ``author`` is exposed solely through the REST history.
+    """
+    comment = {
+        "author": {"login": author["login"]},
+        "createdAt": "2026-09-21T00:00:00Z",
+        "body": record_body,
+    }
+    if "id" in author:
+        comment["_rest_author_id"] = author["id"]
+    if rest_only:
+        comment["_rest_only"] = True
+    return comment
 
 
 def _genuine_record_body(tmp_path):
@@ -2870,18 +2895,47 @@ def test_authenticated_record_with_different_stages_does_not_suppress_the_record
     assert "| #99 | PR #912 merged at `0c657e93aaaa` |" in records[0]
 
 
-def test_authenticated_matching_record_suppresses_a_second_write(tmp_path):
-    """#1018: the genuine record, by the authenticated actor, is written once."""
+@pytest.mark.parametrize(
+    "rest_only",
+    [
+        pytest.param(False, id="in-projection"),
+        pytest.param(True, id="dropped-from-capped-projection"),
+    ],
+)
+def test_authenticated_matching_record_suppresses_a_second_write(tmp_path, rest_only):
+    """#1018: the genuine record, by the authenticated actor, is written once.
+
+    It is recognized from the REST history even when the capped `gh issue
+    view` projection no longer shows it.
+    """
     trusted_author = {"login": _ACTOR[0], "id": _ACTOR[1]}
     runner = _delivered_two_stage_runner(
         extra_parent_comments=[
-            _completion_comment_by(trusted_author, _genuine_record_body(tmp_path))
+            _completion_comment_by(
+                trusted_author, _genuine_record_body(tmp_path), rest_only=rest_only
+            )
         ]
     )
 
     _run_merge_hook(runner, tmp_path)
 
     assert _completion_records(runner) == []
+    rest_reads = [
+        cmd for cmd, _cwd in runner.commands
+        if cmd[:2] == ["gh", "api"] and "issues/56/comments?" in cmd[2]
+    ]
+    assert rest_reads
+
+
+def test_unreadable_parent_history_withholds_the_record(tmp_path, capsys):
+    """#1018 review: without the complete REST history, nothing is posted."""
+    runner = _delivered_two_stage_runner()
+    runner.serve_rest_issue_comments = False  # the endpoint answers a non-list
+
+    _run_merge_hook(runner, tmp_path)
+
+    assert _completion_records(runner) == []
+    assert "no completion record was written" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("pr_state", [None, "OPEN"])

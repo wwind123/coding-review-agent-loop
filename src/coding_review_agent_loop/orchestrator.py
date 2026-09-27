@@ -7712,7 +7712,6 @@ def _record_staged_parent_completion_after_merge(
             runner,
             config=config,
             parent_issue=parent_issue,
-            parent_comments=parent_context.comments,
             progress=progress,
             outcome=outcome,
         ):
@@ -7803,7 +7802,6 @@ def _dispatch_current_decomposition_phase(
                 runner,
                 config=config,
                 parent_issue=issue_number,
-                parent_comments=parent_issue_context.comments,
                 progress=progress,
                 outcome=outcome,
             )
