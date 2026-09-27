@@ -1106,6 +1106,33 @@ def validate_repair_preservation(
             preserve_matrix_value(source.get("risk_test_matrix"), target.get("risk_test_matrix"), "risk_test_matrix")
             preserve_matrix_value(source.get("risk_test_matrix_changes"), target.get("risk_test_matrix_changes"), "risk_test_matrix_changes")
 
+    # The growth justification is a reviewed claim that is part of plan
+    # identity (#886): repair may not remove, invent, or rewrite it.
+    if source["kind"] in {"plan_state", "plan_revision"}:
+        field = "one_shot_growth_justification"
+        require((field in source) == (field in target), field)
+        if field in source:
+            source_justification = source[field]
+            target_justification = target[field]
+            if isinstance(source_justification, dict):
+                require(
+                    isinstance(target_justification, dict)
+                    and set(source_justification) == set(target_justification),
+                    field,
+                )
+                for key, value in source_justification.items():
+                    candidate = target_justification[key]
+                    if isinstance(value, str):
+                        require(
+                            isinstance(candidate, str)
+                            and _normalized(value) == _normalized(candidate),
+                            f"{field}.{key}",
+                        )
+                    else:
+                        require(candidate == value, f"{field}.{key}")
+            else:
+                require(target_justification == source_justification, field)
+
     summary = source.get("summary")
     summary_fragments = _fragments(summary)
     if isinstance(summary, str) and summary_fragments:
