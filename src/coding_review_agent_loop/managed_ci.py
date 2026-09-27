@@ -343,9 +343,10 @@ class ManagedCiIssueAuthorization:
     predecessor_comment_id: int | None = None
     round_comment_ids: tuple[int, ...] = ()
     approved_plan_hash: str | None = None
-    # Earlier actor-owned records this fresh grant retires (#1065).  A
-    # superseded record is history: it is neither a competing grant nor a
-    # predecessor, so accumulated unbound records cannot wedge a PR.
+    # Earlier actor-owned records this fresh grant (#1065) or continuity
+    # record (#1069) retires.  A superseded record is history: it is neither
+    # a competing grant nor a predecessor, so accumulated unbound records
+    # cannot wedge a PR.
     superseded_comment_ids: tuple[int, ...] = ()
 
     def to_payload(self) -> dict[str, object]:
@@ -395,6 +396,12 @@ class AuthenticatedManagedResume:
     source_sha: str | None = None
     managed_branch: str | None = None
     override_nonce: str | None = None
+
+
+# Record kinds that may retire earlier records: the explicit fresh grant
+# (#1065) and the ordinary path's continuity record (#1069).  A creation
+# checkpoint is the PR's first record and never supersedes.
+_SUPERSEDING_AUTHORIZATION_KINDS = frozenset({"fresh", "continuity"})
 
 
 def _encode_issue_authorization_payload(payload: dict[str, object]) -> str:
@@ -493,9 +500,10 @@ def parse_issue_created_authorization_comment(
         raise AgentLoopError(
             "Managed-CI issue authorization record has invalid superseded record IDs."
         )
-    if superseded_comment_ids and kind != "fresh":
+    if superseded_comment_ids and kind not in _SUPERSEDING_AUTHORIZATION_KINDS:
         raise AgentLoopError(
-            "Only a fresh managed-CI authorization may supersede earlier records."
+            "Only a fresh or continuity managed-CI authorization may supersede "
+            "earlier records."
         )
     allowed_fields = {
         "version", "kind", "repository", "issue", "pr", "base", "head", "actor",
@@ -1745,10 +1753,11 @@ def _authorization_comment_records(
 def _superseded_authorization_ids(
     records: Iterable[tuple[int, ManagedCiIssueAuthorization]],
 ) -> frozenset[int]:
-    """Return the comment IDs retired by an earlier fresh grant (#1065).
+    """Return the comment IDs retired by a later superseding record.
 
-    Only a fresh record may supersede, only records published before it, and
-    only records in its own repository/issue/PR scope.  Supersession is
+    Only a fresh (#1065) or continuity (#1069) record may supersede, only
+    records published before it, and only records in its own
+    repository/issue/PR scope.  Supersession is
     transitive by construction: a retired record stays retired even after
     the grant that retired it is itself superseded.
     """
@@ -1756,7 +1765,7 @@ def _superseded_authorization_ids(
     by_comment_id = dict(records)
     superseded: set[int] = set()
     for comment_id, record in records:
-        if record.kind != "fresh":
+        if record.kind not in _SUPERSEDING_AUTHORIZATION_KINDS:
             continue
         for retired_id in record.superseded_comment_ids:
             retired = by_comment_id.get(retired_id)
@@ -2217,6 +2226,87 @@ def _continuity_live_pr_tuple(
     )
 
 
+def _stranded_continuity_comment_ids(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    records: Collection[tuple[int, ManagedCiIssueAuthorization]],
+    predecessor: ManagedCiIssueAuthorization,
+    predecessor_comment_ids: Collection[int],
+    new_head: str,
+) -> tuple[int, ...]:
+    """Return this actor's unbound records a continuity record retires (#1069).
+
+    Uses the #1065 predicate: a record is unbound when it does not reach the
+    new head, because its recorded protection differs from the chain this
+    record extends or because GitHub cannot prove its head is an ancestor of
+    the new head.  Only records that are otherwise compatible are in scope:
+    same repository/issue/PR, base, actor, an actor-owned managed-label event,
+    and the handoff's approved plan.  The predecessor's own ancestry is never
+    retired, and any record that differs in base, actor, label provenance, or
+    plan is left in place for the existing readers to refuse on.
+    """
+    by_comment_id = dict(records)
+    chain_ids: set[int] = set(predecessor_comment_ids)
+    pending = list(predecessor_comment_ids)
+    while pending:
+        current = by_comment_id.get(pending.pop())
+        parent_id = current.predecessor_comment_id if current is not None else None
+        if parent_id is not None and parent_id not in chain_ids:
+            chain_ids.add(parent_id)
+            pending.append(parent_id)
+    candidates = [
+        (comment_id, record)
+        for comment_id, record in records
+        if comment_id not in chain_ids
+        and record.repository.casefold() == config.repo.casefold()
+        and record.issue_number == handoff.issue_number
+        and record.pr_number == handoff.pr_number
+        and record.base_ref == handoff.base_ref
+        and record.actor_login.casefold() == handoff.trusted_actor_login.casefold()
+        and record.actor_id == handoff.trusted_actor_id
+        and (record.approved_plan_hash or None) == (handoff.approved_plan_hash or None)
+    ]
+    if not candidates:
+        return ()
+    label_events = _managed_label_event_history(
+        runner,
+        config=config,
+        pr_number=handoff.pr_number,
+        actor_login=handoff.trusted_actor_login,
+        actor_id=handoff.trusted_actor_id,
+    )
+    if label_events is None:
+        # Without label provenance no record can be proven compatible, so
+        # none is retired; publication proceeds exactly as before.
+        return ()
+    valid_label_event_ids = {event_id for event_id, _login, _actor_id in label_events}
+    stranded: set[int] = set()
+    for comment_id, record in candidates:
+        if record.label_event_id not in valid_label_event_ids:
+            continue
+        if record.protection != predecessor.protection or record.waiver != predecessor.waiver:
+            stranded.add(comment_id)
+            continue
+        if record.head_sha == new_head:
+            continue
+        try:
+            reaches = _github_proves_descendant(
+                runner,
+                config=config,
+                predecessor_head=record.head_sha,
+                live_head=new_head,
+            )
+        except AgentLoopError:
+            # A failed comparison proves nothing either way: keep the record
+            # rather than retire it or block the continuity write.
+            continue
+        if not reaches:
+            stranded.add(comment_id)
+    return tuple(sorted(stranded))
+
+
 def publish_issue_created_continuity_authorization(
     runner: Runner,
     *,
@@ -2319,6 +2409,15 @@ def publish_issue_created_continuity_authorization(
         raise AgentLoopError(
             "Managed-CI head continuity found a forked predecessor authorization; refusing to proceed."
         )
+    superseded_comment_ids = _stranded_continuity_comment_ids(
+        runner,
+        config=config,
+        handoff=handoff,
+        records=records,
+        predecessor=predecessor,
+        predecessor_comment_ids=predecessor_comment_ids,
+        new_head=new_head,
+    )
     normalized_round_comment_ids = tuple(sorted(set(round_comment_ids)))
 
     def revalidate_before_publication(authorization: ManagedCiIssueAuthorization) -> None:
@@ -2410,7 +2509,15 @@ def publish_issue_created_continuity_authorization(
         predecessor_comment_id=predecessor_comment_id,
         round_comment_ids=normalized_round_comment_ids,
         approved_plan_hash=handoff.approved_plan_hash,
+        superseded_comment_ids=superseded_comment_ids,
     )
+    if superseded_comment_ids:
+        log(
+            config,
+            f"PR #{handoff.pr_number}: continuity authorization supersedes "
+            f"{len(superseded_comment_ids)} earlier unbound actor-owned authorization "
+            f"record(s) ({', '.join(str(value) for value in superseded_comment_ids)})",
+        )
     round_comments = _api_list(
         runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
     )
@@ -3205,7 +3312,7 @@ def _recover_issue_created_protection(
         if parsed is None:
             raise refuse(f"authorization comment {comment.get('id')} is malformed")
         records.append((comment, parsed))
-    # A fresh grant's superseded records are retired history (#1065).
+    # Superseded records are retired history (#1065, #1069).
     superseded = _superseded_authorization_ids(
         (comment["id"], parsed)
         for comment, parsed in records

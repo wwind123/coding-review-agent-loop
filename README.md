@@ -520,7 +520,10 @@ It reuses any valid exact-head authorization and does not adopt arbitrary
 existing PRs. Earlier actor-owned authorization records that differ only in
 their recorded protection, or that GitHub cannot chain to the live head, are
 retired by one superseding record rather than refused; any other conflicting
-record still fails closed. If structured response validation rejected the implementation
+record still fails closed. Ordinary resumes prevent that accumulation: each
+continuity record they publish also retires the same actor's otherwise
+compatible records that cannot reach the new head, so an interrupted run does
+not leave a stranded grant behind for a later `--managed-ci-fresh` to clear. If structured response validation rejected the implementation
 before accepting its PR number, strict protection instead uses ordinary
 same-PR issue/PR discovery and resume; the fresh unprotected grant is not
 available or required for a strict base. If a strict draft was left unlabeled,
