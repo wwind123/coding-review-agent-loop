@@ -1470,6 +1470,67 @@ def test_pr_partial_round_with_rejected_posted_record_stops_before_invoking(
     assert len(runner.reviewer_launches) == launches_before
 
 
+def _held_pr_round_with_invalid_gemini_spool(tmp_path):
+    runner = _PartialPublicationProbeRunner(
+        round_markers=("Gemini approves the PR.",),
+        codex_outputs=[("codex exploded", 1)],
+        gemini_outputs=[structured_pr_review(summary="Gemini approves the PR.", reviewer="Google Gemini")],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True, agent_max_retries=0
+    )
+    with pytest.raises(AgentLoopError, match="Codex"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    # No same-round body is public; Gemini's withheld review no longer validates.
+    assert runner.comments == []
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["response"]["text"] = "not a structured PR review"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    runner.codex_outputs.append(structured_pr_review(summary="Codex approves after rerun."))
+    return runner, config
+
+
+def test_pr_spooled_reviewer_falling_back_to_fresh_turn_is_synced_first(tmp_path):
+    runner, config = _held_pr_round_with_invalid_gemini_spool(tmp_path)
+    runner.gemini_outputs.append(
+        structured_pr_review(summary="Gemini approves on a fresh turn.", reviewer="Google Gemini")
+    )
+    real_sync = orchestrator.sync_reviewer_pr_before_review
+    gemini_launches_at_sync = []
+
+    def recording_sync(config, runner_arg, reviewer, pr_number, pr_metadata):
+        if reviewer == "gemini":
+            gemini_launches_at_sync.append(runner.reviewer_launches.count("gemini"))
+        return real_sync(config, runner_arg, reviewer, pr_number, pr_metadata)
+
+    launches_before = runner.reviewer_launches.count("gemini")
+    with patch.object(orchestrator, "sync_reviewer_pr_before_review", recording_sync):
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # Gemini's replay failed, so it ran a fresh turn -- after being synced.
+    assert runner.reviewer_launches.count("gemini") == launches_before + 1
+    assert gemini_launches_at_sync and gemini_launches_at_sync[0] == launches_before
+
+
+def test_pr_spooled_reviewer_fallback_sync_failure_is_not_launched(tmp_path):
+    runner, config = _held_pr_round_with_invalid_gemini_spool(tmp_path)
+    real_sync = orchestrator.sync_reviewer_pr_before_review
+
+    def failing_sync(config, runner_arg, reviewer, pr_number, pr_metadata):
+        if reviewer == "gemini":
+            raise AgentLoopError("Gemini checkout is desynced from the PR head.")
+        return real_sync(config, runner_arg, reviewer, pr_number, pr_metadata)
+
+    launches_before = runner.reviewer_launches.count("gemini")
+    with patch.object(orchestrator, "sync_reviewer_pr_before_review", failing_sync):
+        with pytest.raises(AgentLoopError, match="desynced"):
+            run_pr_loop(runner, pr_number=77, config=config)
+
+    assert runner.reviewer_launches.count("gemini") == launches_before
+    assert not runner.peer_body_visible_at_launch
+
+
 def test_review_round_spool_rejects_foreign_or_malformed_records(tmp_path):
     from coding_review_agent_loop.review_spool import ReviewRoundSpool
 

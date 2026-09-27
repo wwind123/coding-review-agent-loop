@@ -11479,6 +11479,7 @@ def _launch_reviewer_turns(
     config: AgentLoopConfig | None = None,
     already_posted: Sequence[AgentName] = (),
     max_workers: int | None = None,
+    prepare_fallback: Callable[[AgentName], None] | None = None,
 ) -> dict[AgentName, _ReviewerTurnResult]:
     """Run workers concurrently, then deliver results in completion order.
 
@@ -11512,10 +11513,16 @@ def _launch_reviewer_turns(
     A reviewer in ``already_posted`` has its own same-round record on the
     surface that resume rejected; it is re-invoked, never replayed.
 
+    Callers may skip per-reviewer launch preparation for reviewers expected to
+    replay.  ``prepare_fallback`` runs for any of them whose replay fell back
+    to a fresh turn; an ``AgentLoopError`` it raises becomes that reviewer's
+    turn failure instead of a launch.
+
     The round's spool is discarded only after every publication succeeded.
     """
     results: dict[AgentName, _ReviewerTurnResult] = {}
     replayed: set[AgentName] = set()
+    replay_fallbacks: list[AgentName] = []
     if spool is not None and replay_turn is not None:
         for reviewer in pending:
             reviewer_name = agent_display_name(reviewer)
@@ -11525,6 +11532,7 @@ def _launch_reviewer_turns(
             fields = spool.load(reviewer_name)
             if fields is None:
                 continue
+            replay_fallbacks.append(reviewer)
             failure = _replay_spooled_failure(fields, reviewer_name)
             result = (
                 _ReviewerTurnResult(reviewer_name=reviewer_name, error=failure)
@@ -11543,6 +11551,15 @@ def _launch_reviewer_turns(
                     surface=spool.surface, number=spool.number, round_number=spool.round_number,
                     reviewer_name=agent_display_name(reviewer), public_peers=peers,
                 )
+    if prepare_fallback is not None:
+        for reviewer in [r for r in replay_fallbacks if r in to_launch]:
+            try:
+                prepare_fallback(reviewer)
+            except AgentLoopError as exc:
+                results[reviewer] = _ReviewerTurnResult(
+                    reviewer_name=agent_display_name(reviewer), error=exc
+                )
+                to_launch.remove(reviewer)
     if to_launch:
         # A sequential run finishing a held round launches one reviewer at a
         # time (reviewer workdirs may be shared); publication is still withheld
@@ -21329,6 +21346,11 @@ def run_pr_loop(
                             public_peers=pr_same_batch_public_peers,
                             retry_bound=_pr_retry_bound,
                             max_workers=None if config.review_parallel else 1,
+                            # A spooled reviewer skipped the pre-review sync
+                            # above; sync it if its replay falls back to a turn.
+                            prepare_fallback=lambda reviewer: sync_reviewer_pr_before_review(
+                                config, runner, reviewer, pr_number, pr_metadata
+                            ),
                             already_posted=tuple(
                                 reviewer for reviewer in configured_reviewers
                                 if agent_display_name(reviewer) in completed_by_name
