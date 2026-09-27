@@ -630,6 +630,82 @@ def new_report_location() -> tuple[Path, Path]:
     return directory, directory / "report.jsonl"
 
 
+# Options that state a worker or distribution choice, or that pytest-xdist
+# cannot combine with distribution.  A direct pytest carrying any of them is
+# never given a default worker count (issue #1073).
+_WORKER_CHOICE_OPTIONS = (
+    "-n", "--numprocesses", "--maxprocesses", "--tx", "--dist", "--distload", "-d",
+    "--looponfail", "-f", "--pdb", "--trace",
+)
+
+
+def _names_worker_choice(tokens: Sequence[str], start: int) -> bool:
+    """Whether direct-pytest arguments already state a worker/xdist choice."""
+    index = start
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return False
+        for option in _WORKER_CHOICE_OPTIONS:
+            if token == option or token.startswith(option + "="):
+                return True
+            if option == "-n" and token.startswith("-n") and len(token) > 2:
+                return True
+        value: str | None = None
+        if token == "-p" and index + 1 < len(tokens):
+            value = tokens[index + 1]
+            index += 1
+        elif token.startswith("-p") and len(token) > 2:
+            value = token[2:].lstrip("=")
+        if value is not None and "xdist" in value:
+            return True
+        index += 1
+    return False
+
+
+def _project_root(cwd: Path) -> Path:
+    """The nearest ancestor of ``cwd`` holding ``.git``; ``cwd`` when none does."""
+    try:
+        start = Path(cwd).resolve()
+    except OSError:
+        return Path(cwd)
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return start
+
+
+def parallel_default_applies(
+    argv: Sequence[str],
+    cwd: Path,
+    budget: WorkerBudget,
+    *,
+    mode: str | None = None,
+    parallel_supported: bool | None = None,
+) -> bool:
+    """Whether a plain direct pytest should be given ``-n <budget>`` by default.
+
+    The budget alone only caps pytest-xdist; nothing opted a plain pytest in,
+    so coder test runs stayed serial (issue #1073).  The default applies only
+    to a direct pytest that names no worker/xdist choice, under an enforcing
+    mode with more than one worker, in a repository that declares xdist
+    support.  The plugin applies it only if xdist is actually active, so a
+    target without xdist still runs serially.
+    """
+    effective_mode = mode or budget.enforcement
+    if effective_mode not in {"clamp", "refuse"} or budget.workers <= 1:
+        return False
+    tokens = [str(item) for item in argv]
+    shape = classify_command(tokens)
+    if shape.command_class != "direct-pytest" or shape.pytest_args_start is None:
+        return False
+    if _names_worker_choice(tokens, shape.pytest_args_start):
+        return False
+    if parallel_supported is None:
+        parallel_supported = detect_parallel_support(_project_root(cwd))
+    return parallel_supported
+
+
 def apply_worker_budget(
     argv: Sequence[str],
     env: Mapping[str, str],
@@ -638,6 +714,7 @@ def apply_worker_budget(
     *,
     mode: str | None = None,
     report_location: tuple[Path, Path] | None = None,
+    parallel_supported: bool | None = None,
 ) -> WorkerDecision:
     """Compute the effective argv/env for one command under ``budget``.
 
@@ -645,9 +722,14 @@ def apply_worker_budget(
     of a plugin-disabling ``-p no:`` in clamp mode).  Every other command
     keeps its argv and gets the same inert control environment in clamp and
     refuse.  Off mode injects nothing.  Worker values are never refused here:
-    the plugin judges pytest's final resolved options.
+    the plugin judges pytest's final resolved options.  A plain direct pytest
+    in a repository that declares xdist support also asks the plugin for a
+    default of ``budget`` workers (see ``parallel_default_applies``);
+    ``parallel_supported`` overrides the repository detection.
     """
-    del cwd  # classification is purely lexical; kept for interface symmetry
+    parallel_default = parallel_default_applies(
+        argv, cwd, budget, mode=mode, parallel_supported=parallel_supported,
+    )
     effective_mode = mode or budget.enforcement
     tokens = [str(item) for item in argv]
     shape = classify_command(tokens)
@@ -688,10 +770,12 @@ def apply_worker_budget(
         tokens = kept[: shape.pytest_args_start] + ["-p", PLUGIN_MODULE] + kept[shape.pytest_args_start:]
 
     report_dir, report_path = report_location or new_report_location()
-    spec = json.dumps(
-        {"version": 1, "budget": budget.workers, "mode": effective_mode, "report": str(report_path)},
-        sort_keys=True,
-    )
+    spec_values: dict[str, object] = {
+        "version": 1, "budget": budget.workers, "mode": effective_mode, "report": str(report_path),
+    }
+    if parallel_default:
+        spec_values["default_workers"] = budget.workers
+    spec = json.dumps(spec_values, sort_keys=True)
     plugin_dir = str(plugin_directory())
     auto_cap: str | None = None
     if effective_mode == "clamp":
@@ -1750,8 +1834,18 @@ def analyze_worker_report(
     return WorkerReportAnalysis(cohort, enforcement, tuple(caveats), tuple(notices), False, tuple(summaries))
 
 
-def expected_workers_label(argv: Sequence[str], *, budget: int | None = None, mode: str | None = None) -> str:
-    """Best-effort cohort label used to look up a recommendation for ``argv``."""
+def expected_workers_label(
+    argv: Sequence[str],
+    *,
+    budget: int | None = None,
+    mode: str | None = None,
+    parallel_default: bool = False,
+) -> str:
+    """Best-effort cohort label used to look up a recommendation for ``argv``.
+
+    ``parallel_default`` says the repository declares xdist support, so a
+    plain pytest is expected to run with the budget's default worker count.
+    """
     if mode not in {"clamp", "refuse"} or budget is None:
         return argv_only_workers_label(argv)
     tokens = [str(item) for item in argv]
@@ -1777,7 +1871,7 @@ def expected_workers_label(argv: Sequence[str], *, budget: int | None = None, mo
             return COHORT_UNKNOWN
         index += 1
     if requested is None:
-        return COHORT_SERIAL
+        return str(budget) if parallel_default and budget > 1 else COHORT_SERIAL
     if not requested.isdigit():
         return COHORT_UNKNOWN
     number = int(requested)
@@ -1948,7 +2042,15 @@ def render_worker_guidance(budget: WorkerBudget, *, parallel_supported: bool, pr
         f"({estimate}: {budget.describe()}). "
         + ENFORCEMENT_SENTENCES[budget.enforcement],
     ]
-    if parallel_supported:
+    if parallel_supported and budget.enforcement != "off" and budget.workers > 1:
+        lines.append(
+            "This repository supports parallel pytest workers: `agent-loop run-tests` gives a "
+            "plain pytest `-n $AGENT_LOOP_TEST_WORKERS` by default when pytest-xdist is "
+            "installed, and a command that already names `-n`, `--dist`, `--tx` or "
+            "`-p no:xdist` keeps its own choice (never `-n auto` above the budget); keep focused "
+            "single-file runs serial with `-n 0`."
+        )
+    elif parallel_supported:
         lines.append(
             "This repository supports parallel pytest workers: for broad or full-suite runs, "
             "pass `-n $AGENT_LOOP_TEST_WORKERS` (never `-n auto` above the budget); keep focused "

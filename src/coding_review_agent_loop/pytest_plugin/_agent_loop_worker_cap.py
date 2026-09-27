@@ -58,7 +58,10 @@ def _load_spec():
         or not report
     ):
         return None
-    return {"budget": budget, "mode": mode, "report": report}
+    default = value.get("default_workers")
+    if isinstance(default, bool) or not isinstance(default, int) or not 1 < default <= budget:
+        default = None
+    return {"budget": budget, "mode": mode, "report": report, "default_workers": default}
 
 
 def _plugin_entries(raw):
@@ -152,6 +155,8 @@ class _Session:
         self.budget = spec["budget"]
         self.mode = spec["mode"]
         self.report = spec["report"]
+        self.default_workers = spec.get("default_workers")
+        self.defaulted = False
         self.config = config
         self.session = f"{os.getpid()}-{time.monotonic_ns()}"
         self.seq = 0
@@ -252,8 +257,49 @@ if _pluggy_supports_wrappers():
                 if state.env_entry:
                     _restore_env_entry()
 
+    def _apply_default_workers(state, config):
+        """Give a plain pytest the wrapper's default worker count (issue #1073).
+
+        Only when pytest-xdist is active and pytest's resolved options (argv,
+        ini ``addopts``, ``PYTEST_ADDOPTS``) name no worker or distribution
+        choice; otherwise the run keeps its own choice or stays serial.
+        """
+        default = state.default_workers
+        if not default:
+            return
+        option = config.option
+        try:
+            xdist_active = config.pluginmanager.hasplugin("xdist")
+        except Exception:
+            xdist_active = False
+        if not xdist_active or not hasattr(option, "numprocesses"):
+            state.notices.append(
+                "agent-loop worker budget: pytest-xdist is not active in this interpreter; "
+                "running serially"
+            )
+            return
+        if (
+            option.numprocesses is not None
+            or getattr(option, "maxprocesses", None)
+            or getattr(option, "tx", None)
+            or getattr(option, "dist", "no") != "no"
+            or getattr(option, "distload", False)
+            or getattr(option, "looponfail", False)
+            or getattr(option, "usepdb", False)
+            or getattr(option, "trace", False)
+            or getattr(option, "collectonly", False)
+        ):
+            return
+        option.numprocesses = default
+        state.defaulted = True
+        state.notices.append(
+            f"agent-loop worker budget: running with -n {default} (budget default for a plain "
+            "pytest; pass -n 0 or -p no:xdist to run serially)"
+        )
+
     def _option_gate(state, config):
         option = config.option
+        _apply_default_workers(state, config)
         numprocesses = getattr(option, "numprocesses", None)
         maxprocesses = getattr(option, "maxprocesses", None)
         state.requested = numprocesses
@@ -371,6 +417,7 @@ if _pluggy_supports_wrappers():
                 {
                     "kind": "confirmed",
                     "requested": requested,
+                    "defaulted": state.defaulted,
                     "auto_raw": state.auto_raw,
                     "planned": state.planned,
                     "effective": effective,

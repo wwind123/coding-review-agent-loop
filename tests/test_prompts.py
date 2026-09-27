@@ -4925,8 +4925,24 @@ def test_coder_prompt_parallel_worker_guidance(tmp_path, fixture, supported, mod
         assert "lowered to the budget" not in prompt
     if supported:
         assert "keep focused single-file runs serial" in prompt
+        # Issue #1073: only an enforcing mode gives a plain pytest the default.
+        assert ("gives a plain pytest" in prompt) == (mode != "off")
     else:
         assert "do not add parallel worker flags" in prompt
+
+
+def test_plain_pytest_lookup_prefers_parallel_cohort_then_serial(tmp_path):
+    """Issue #1073: a plain pytest in an xdist repo may run parallel or, without xdist, serially."""
+    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+
+    config = make_config(tmp_path, test_workers=3, test_worker_enforcement="clamp")
+    command = ["python3", "-m", "pytest", "tests/"]
+    assert _expected_worker_cohorts(config, command) == ["serial"]
+    (config.claude_dir / "pyproject.toml").write_text(
+        '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n', encoding="utf-8",
+    )
+    assert _expected_worker_cohorts(config, command) == ["3", "serial"]
+    assert _expected_worker_cohorts(config, [*command, "-n", "2"]) == ["2"]
 
 
 def test_reviewer_prompt_has_no_parallel_worker_guidance(tmp_path):
