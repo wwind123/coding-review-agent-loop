@@ -47,12 +47,16 @@ PLAN_GROWTH_GATE_MODES = ("enforce", "off")
 # Past it, body size no longer limits publication by canonical size: digest
 # text is bounded (9.1-10.5k visible measured on #946 and #1035) and the
 # canonical text spills, so the digest overflows only if unspillable metadata
-# grows.  The one canonical-size publication limit left is the metadata codec:
+# grows.  The remaining canonical-size limits are the metadata codec's:
 # `_attach_round_metadata` encodes the complete metadata before any spill, and
 # `encode_mapping` refuses a compressed form above _MAX_COMPRESSED (8,000,000
-# bytes).  The largest plan measured here, #871's final candidate, used about
-# 132,000 compressed bytes of complete metadata (estimated from its nine spill
-# sidecars and residual anchor metadata), about 1.7% of that cap.
+# bytes); decoding refuses more than _MAX_DECOMPRESSED (16,000,000 bytes) per
+# payload or spilled field.  For #871's final candidate, the largest plan seen,
+# the spilled fields compressed independently plus the residual anchor
+# metadata come to about 132,000 bytes, about 1.7% of the compressed cap.
+# That sum is inferred from sidecar comment lengths, not a measurement of the
+# joint compression, and no decompressed size was measured.  Neither codec
+# limit has been exercised by a real plan.
 #
 # Measured on this repository's plan anchors (2026-09-28, read-only GitHub
 # API, see docs/local_agent_loop.md):

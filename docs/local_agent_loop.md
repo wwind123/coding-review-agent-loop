@@ -94,12 +94,16 @@ default is anchored to.
 
 Past the transition, the comment body no longer limits publication by
 canonical size. The digest's visible text is bounded, and the canonical text
-spills, so the digest overflows only if unspillable metadata grows. The one
-canonical-size limit left is the metadata codec. The complete round metadata
-is encoded before any spill, and `encode_mapping` refuses a compressed form
-above 8,000,000 bytes. The largest plan measured, #871's final candidate, used
-about 132,000 compressed bytes of complete metadata, about 1.7% of that cap.
-That figure is estimated from its spill sidecars and residual anchor metadata.
+spills, so the digest overflows only if unspillable metadata grows. The
+canonical-size limits left are the metadata codec's. The complete round
+metadata is encoded before any spill, and `encode_mapping` refuses a
+compressed form above 8,000,000 bytes. Decoding refuses more than 16,000,000
+decompressed bytes per payload or spilled field. For #871's final candidate,
+the largest plan seen, the independently compressed spilled fields plus the
+residual anchor metadata come to about 132,000 bytes, about 1.7% of the
+compressed cap. That sum is inferred from sidecar comment lengths. It is not a
+measurement of joint compression, and no decompressed size was measured.
+Neither codec limit has been exercised by a real plan.
 Measured on this repository's plan anchors with the read-only GitHub API:
 
 | Quantity | Measured | Source |

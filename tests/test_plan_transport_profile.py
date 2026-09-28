@@ -66,12 +66,14 @@ def test_default_size_threshold_is_derived_from_the_digest_transition():
     )
 
 
-def test_measured_codec_usage_is_far_below_the_codec_cap():
-    """#871's final candidate, the largest plan measured, against the cap.
+def test_inferred_codec_usage_is_far_below_the_codec_cap():
+    """#871's final candidate, the largest plan seen, against the cap.
 
-    Its complete metadata is estimated from its nine spill sidecar comment
-    lengths and its residual anchor metadata: strip the sidecar label and
-    marker framing and the JSON envelope, then undo two base64 layers.
+    The figure sums its independently compressed spilled fields, inferred
+    from its nine spill sidecar comment lengths, and its residual anchor
+    metadata: strip the sidecar label and marker framing and the JSON
+    envelope, then undo two base64 layers.  It is not the compressed size of
+    the complete metadata as one payload, which was not measured.
     """
     sidecar_lengths = [10_379, 10_690, 53_869, 3_085, 25_375, 25_908, 53_853, 12_877, 10_371]
     framing, envelope, residual_metadata = 180, 260, 24_995
