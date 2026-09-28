@@ -4450,8 +4450,8 @@ def _restore_ordinary_ci_after_v2_fallback(
         if report_context is not None:
             report_context.recovery_incapable_fallback = True
         message = (
-            f"Managed-CI v2 could not activate ({reason}); `{MANAGED_LABEL}` was retained and no "
-            "label DELETE was made because the base workflow does not prove an unlabeled "
+            f"Managed-CI v2 could not activate ({reason}); this run made no `{MANAGED_LABEL}` "
+            "label DELETE because the base workflow does not prove an unlabeled "
             "pull_request recovery route. "
             + _measured_state_line(runner, config, pr_number)
         )

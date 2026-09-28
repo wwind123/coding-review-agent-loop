@@ -11788,16 +11788,16 @@ def test_m1067_recovery_incapable_base_reports_without_release(tmp_path):
     assert _m1067_ready_calls(runner) == []
 
 
-def test_m1067_orchestrator_prints_state_report_for_fallback(tmp_path, capsys, monkeypatch):
+def test_m1067_state_report_default_keeps_contract_equality():
     report = "Before this run PR #7 was ready/unlabeled; it is now draft/labeled."
     contract = ManagedCiContract(activation_path="ordinary_fallback", state_report=report)
     assert contract.state_report == report
-    # The default keeps every existing constructor and equality.
+    # The default keeps every existing constructor and equality; the
+    # orchestrator print is exercised through run_pr_loop in
+    # tests/test_orchestrator_pr.py.
     assert ManagedCiContract(activation_path="ordinary_fallback") == ManagedCiContract(
         activation_path="ordinary_fallback", state_report=None
     )
-    source = Path(orchestrator.__file__).read_text(encoding="utf-8")
-    assert "activation.state_report" in source
 
 
 @pytest.mark.parametrize(
@@ -12361,7 +12361,7 @@ def test_m1067_implicit_fallback_helper_variants_make_no_ordinary_claim(tmp_path
         # the label; the fallback helper makes no DELETE.
         assert _m1067_label_deletes(runner) == []
         assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
-        assert f"`{MANAGED_LABEL}` was retained and no label DELETE was made" in err
+        assert f"this run made no `{MANAGED_LABEL}` label DELETE" in err
         assert "PR #7 is now draft/labeled." in err
         assert _m1067_ready_calls(runner) == []
 
@@ -12375,7 +12375,7 @@ def test_m1067_explicit_fallback_helper_on_recovery_incapable_base_retains_label
 
     text = str(raised.value)
     _m1067_assert_text(text)
-    assert f"`{MANAGED_LABEL}` was retained and no label DELETE was made" in text
+    assert f"this run made no `{MANAGED_LABEL}` label DELETE" in text
     assert "PR #7 is now draft/labeled." in text
     assert "did NOT qualify" in text
     assert _m1067_label_deletes(runner) == []
@@ -12456,4 +12456,38 @@ def test_m1067_nonzero_undo_with_pr_still_ready_gives_inspection_remedy(tmp_path
     assert "Do not ready or unlabel the PR. Inspect it with `gh api repos/OWNER/REPO/pulls/7" in text
     assert "Resume with `" not in text
     assert "gh pr ready 7" not in text
+    assert _m1067_ready_calls(runner) == []
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_m1067_recovery_incapable_fallback_helper_measures_concurrent_unlabel(tmp_path, capsys, managed):
+    # Review item-7: label presence comes only from the measured read; the
+    # helper states just that this run made no DELETE.
+    runner = _m1067_plan_limited_runner(workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY)
+    runner.rest_pr["labels"] = [{"name": MANAGED_LABEL}]
+    config = make_config(
+        tmp_path, managed_ci=managed, auto_merge=not managed,
+        managed_ci_trusted_actor="agent-loop", quiet=False,
+    )
+    original = managed_ci._measured_state_line
+
+    def unlabel_then_measure(runner_, config_, pr_number):
+        runner_.rest_pr["labels"] = []  # another actor removed the label
+        return original(runner_, config_, pr_number)
+
+    import unittest.mock as mock
+    with mock.patch.object(managed_ci, "_measured_state_line", unlabel_then_measure):
+        if managed:
+            with pytest.raises(AgentLoopError) as raised:
+                _m1067_implicit_activation(runner, config)
+            text = str(raised.value)
+        else:
+            assert _m1067_implicit_activation(runner, config) is None
+            text = capsys.readouterr().err
+
+    _m1067_assert_text(text)
+    assert f"this run made no `{MANAGED_LABEL}` label DELETE" in text
+    assert "PR #7 is now draft/unlabeled." in text
+    assert "retained" not in text
+    assert _m1067_label_deletes(runner) == []
     assert _m1067_ready_calls(runner) == []
