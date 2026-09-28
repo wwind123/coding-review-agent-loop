@@ -12,6 +12,14 @@ which writes an authoritative report before attempting the target exec.  This
 is important because systemd's numeric exit status alone cannot distinguish a
 launcher failure from a target which legitimately returned 1 or 203.
 
+The scope is deliberately separate from the orchestrator's own cgroup so the
+orchestrator can kill it, but that separation also means the target would
+survive the orchestrator.  The shim therefore holds the read end of a
+supervisor pipe whose only write end lives in the orchestrator process.  When
+the orchestrator dies, for any reason, the kernel closes that write end and
+the shim kills every process in its scope before the unsupervised target can
+publish anything (issue #1092).
+
 Every other platform, and Linux hosts without the required user-manager
 capabilities, uses the runner's process-group termination.  That fallback is
 explicitly reported and makes no memory-ceiling claim.
@@ -29,15 +37,18 @@ import os
 import platform
 import re
 import shutil
+import select
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from stat import S_ISFIFO
 from typing import Mapping, Sequence
 
 from .errors import AgentLoopError
@@ -601,14 +612,37 @@ def _counter_capabilities(cgroup_root: Path) -> tuple[tuple[str, ...], tuple[str
     return tuple(supported), tuple(unavailable), tuple(required_missing)
 
 
-def _probe_argv(policy: ContainmentPolicy, *, unit: str, report: Path) -> list[str]:
+def _probe_argv(policy: ContainmentPolicy, *, unit: str, report: Path, supervisor_fd: int) -> list[str]:
     return build_scope_argv(
         policy,
         (sys.executable, "-c", "import time; time.sleep(2)"),
         report_path=report,
         unit_name=unit,
         limits=policy.aggregate,
+        supervisor_fd=supervisor_fd,
     )
+
+
+def open_supervisor_pipe() -> tuple[int, int]:
+    """Return ``(read_fd, write_fd)`` for a scope's supervisor liveness pipe.
+
+    Both ends are non-inheritable.  The read end is handed to exactly one
+    launcher through ``pass_fds``; the write end never leaves this process, so
+    the shim sees EOF as soon as the orchestrator exits or closes the handle.
+    """
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(read_fd, False)
+    os.set_inheritable(write_fd, False)
+    return read_fd, write_fd
+
+
+def _close_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def build_scope_argv(
@@ -618,15 +652,22 @@ def build_scope_argv(
     report_path: Path,
     unit_name: str,
     limits: ResourceLimits,
+    supervisor_fd: int,
 ) -> list[str]:
-    """Build the exact foreground systemd scope argv used in production."""
+    """Build the exact foreground systemd scope argv used in production.
+
+    ``supervisor_fd`` is the read end of the supervisor pipe; the caller must
+    pass it to the launcher with ``pass_fds``.  The shim refuses to start the
+    target without it and kills the scope when it reaches EOF.
+    """
     return [
         policy.systemd_run, "--user", "--scope", "--quiet",
         f"--slice={policy.slice_name}", f"--unit={unit_name}",
         *[arg for prop in limits.as_properties() for arg in ("--property", prop)],
         "--property", "OOMPolicy=kill",
         "--", sys.executable, "-m", "coding_review_agent_loop.containment",
-        "--shim", "--report", str(report_path), "--", *map(str, target_argv),
+        "--shim", "--report", str(report_path), "--unit", unit_name,
+        "--supervisor-fd", str(int(supervisor_fd)), "--", *map(str, target_argv),
     ]
 
 
@@ -656,11 +697,17 @@ def preflight_containment(policy: ContainmentPolicy, *, cgroup_root: Path = Path
         process = None
         stdout = ""
         stderr = ""
+        supervisor_fds: tuple[int, int] | None = None
         try:
             # Keep the harmless probe alive long enough to inspect the actual
             # transient scope.  Looking only at /sys/fs/cgroup itself is wrong
             # on hosts where controllers are delegated below the root.
-            process = subprocess.Popen(_probe_argv(policy, unit=unit, report=report), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            supervisor_fds = open_supervisor_pipe()
+            process = subprocess.Popen(
+                _probe_argv(policy, unit=unit, report=report, supervisor_fd=supervisor_fds[0]),
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                pass_fds=(supervisor_fds[0],),
+            )
             deadline = time.monotonic() + 5
             parsed: dict[str, object] | None = None
             while time.monotonic() < deadline and process.poll() is None:
@@ -696,6 +743,9 @@ def preflight_containment(policy: ContainmentPolicy, *, cgroup_root: Path = Path
                 for stream in (process.stdout, process.stderr):
                     if stream is not None:
                         stream.close()
+            if supervisor_fds is not None:
+                for fd in supervisor_fds:
+                    _close_fd(fd)
             report.unlink(missing_ok=True)
     else:
         supported, unavailable, required_missing = _counter_capabilities(cgroup_root)
@@ -918,33 +968,234 @@ def _write_report(path: Path, payload: Mapping[str, object]) -> None:
     os.replace(temp, path)
 
 
-def _shim(argv: Sequence[str]) -> int:
-    tokens = list(argv)
+SUPERVISOR_POLL_SECONDS = 0.2
+SUPERVISOR_LOST_EXIT_CODE = 128 + signal.SIGKILL
+
+
+def _parse_shim_args(tokens: Sequence[str]) -> tuple[dict[str, str], list[str]] | None:
+    """Parse ``--shim --report R [--unit U] [--supervisor-fd N] -- target``."""
+    options: dict[str, str] = {}
+    index = 1 if tokens[:1] == ["--shim"] else 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return options, list(tokens[index + 1 :])
+        if token not in {"--report", "--unit", "--supervisor-fd"} or index + 1 >= len(tokens):
+            return None
+        options[token] = tokens[index + 1]
+        index += 2
+    return options, []
+
+
+def _supervisor_alive(fd: int) -> bool:
+    """Return whether the supervisor still holds the write end of ``fd``.
+
+    The orchestrator never writes to the pipe, so any readiness -- EOF,
+    unexpected data, or an error -- means supervision can no longer be
+    established.  Uncertainty is treated as loss.
+    """
     try:
-        report_index = tokens.index("--report") + 1
-        report_path = Path(tokens[report_index])
-    except (ValueError, IndexError):
-        return 2
+        ready, _, _ = select.select([fd], [], [], 0)
+    except (OSError, ValueError):
+        return False
+    return not ready
+
+
+def _validate_supervisor_fd(value: str | None) -> tuple[int | None, str | None]:
+    if value is None:
+        return None, "no supervisor liveness descriptor was supplied"
     try:
-        remainder = tokens[tokens.index("--", report_index + 1) + 1 :]
+        fd = int(value)
+        if fd < 0:
+            raise ValueError(value)
     except ValueError:
-        remainder = []
+        return None, f"invalid supervisor liveness descriptor {value!r}"
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError as exc:
+        return None, f"supervisor liveness descriptor {fd} is unavailable: {exc}"
+    if not S_ISFIFO(mode):
+        return None, f"supervisor liveness descriptor {fd} is not a pipe"
+    if not _supervisor_alive(fd):
+        return None, "the supervisor exited before the target started"
+    return fd, None
+
+
+def _verified_scope(unit_name: str | None) -> tuple[Path | None, str | None]:
+    """Return this shim's own scope cgroup when it is provably ``unit_name``.
+
+    A shim launched with ``--unit`` must be running in exactly that scope,
+    otherwise it could not reach the target's descendants on supervisor loss;
+    that is a startup failure.  Without ``--unit`` (in-process callers) no
+    cgroup is ever touched, so an unrelated cgroup can never be killed.
+    """
+    if not unit_name:
+        return None, None
+    cgroup = cgroup_path_for_pid(os.getpid())
+    if cgroup is None or cgroup.name != unit_name:
+        return None, f"shim is not running in its scope {unit_name!r}"
+    return cgroup, None
+
+
+def _scope_members(cgroup: Path) -> list[int] | None:
+    try:
+        return [
+            int(line) for line in (cgroup / "cgroup.procs").read_text(encoding="ascii").split()
+            if line.strip().isdigit()
+        ]
+    except (OSError, ValueError):
+        return None
+
+
+def _sweep_scope(cgroup: Path) -> bool:
+    """SIGKILL every scope member except this shim; True once only it remains."""
+    own = os.getpid()
+    # Repeat to catch processes forked mid-sweep; TasksMax bounds the fan-out.
+    for _ in range(50):
+        members = _scope_members(cgroup)
+        if members is None:
+            return False
+        others = [pid for pid in members if pid != own]
+        if not others:
+            return True
+        for pid in others:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.02)
+    return False
+
+
+def _escalate_scope_kill(scope: Path, unit_name: str | None) -> None:
+    """Kill the whole scope, this shim included, by every available route."""
+    try:
+        (scope / "cgroup.kill").write_text("1", encoding="ascii")
+    except OSError:
+        pass
+    systemctl = shutil.which("systemctl")
+    if unit_name and systemctl:
+        try:
+            subprocess.run(
+                (systemctl, "--user", "kill", "--kill-who=all", "--signal", "KILL", unit_name),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _empty_scope(child: subprocess.Popen, scope: Path | None, unit_name: str | None) -> None:
+    """SIGKILL the target and return only once nothing but the shim remains.
+
+    No graceful wind-down: a target without a supervisor must not get the
+    chance to commit, push or open a pull request.  Nothing here writes a
+    report, so a failed or stalled filesystem cannot delay the kill.
+
+    The member sweep runs first because it spares the shim.  When it cannot
+    prove the scope empty (``cgroup.procs`` unreadable, or members still
+    appearing after a bounded sweep) the shim escalates to killing the whole
+    scope, itself included, through ``cgroup.kill`` and systemd.  If both are
+    unavailable it keeps sweeping and never exits with a descendant still
+    alive, so its supervisor watch cannot end early (fail closed).
+    """
+    try:
+        child.kill()
+    except OSError:
+        pass
+    if scope is not None:
+        delay = 0.05
+        while not _sweep_scope(scope):
+            _escalate_scope_kill(scope, unit_name)
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
+    try:
+        child.wait()
+    except BaseException:
+        pass
+
+
+def _try_write_report(path: Path, payload: Mapping[str, object]) -> None:
+    try:
+        _write_report(path, payload)
+    except BaseException:
+        pass
+
+
+def _shim(argv: Sequence[str]) -> int:
+    parsed = _parse_shim_args(list(argv))
+    if parsed is None or "--report" not in parsed[0]:
+        return 2
+    options, remainder = parsed
+    report_path = Path(options["--report"])
+    unit_name = options.get("--unit")
     if not remainder:
         _write_report(report_path, {"state": "target-exec-error", "errno": errno.ENOENT, "error": "target argv is empty"})
         return 127
+    # Fail closed: without a live supervisor there is nobody to review what
+    # the target produces, so it is never started (issue #1092).
+    supervisor_fd, problem = _validate_supervisor_fd(options.get("--supervisor-fd"))
+    scope = None
+    if supervisor_fd is not None:
+        scope, problem = _verified_scope(unit_name)
+    if problem is not None:
+        _write_report(report_path, {"state": "target-exec-error", "errno": errno.EPIPE, "error": f"supervisor liveness check failed: {problem}"})
+        return 125
     try:
         child = subprocess.Popen(remainder, start_new_session=False)
     except OSError as exc:
         _write_report(report_path, {"state": "target-exec-error", "errno": exc.errno, "error": str(exc)})
         return 127 if exc.errno == errno.ENOENT else 126
-    target_cgroup = cgroup_path_for_pid(child.pid)
-    _write_report(report_path, {"state": "target-started", "pid": child.pid, "cgroup_path": str(target_cgroup) if target_cgroup else None})
+    # The supervisor watch starts before anything that can block (report
+    # writes, cgroup reads), in its own thread, so a stalled filesystem can
+    # never keep an unsupervised target alive.
+    lost = threading.Event()
+    stop = threading.Event()
+    kill_lock = threading.Lock()
+
+    def empty_scope() -> None:
+        with kill_lock:
+            _empty_scope(child, scope, unit_name)
+
+    def watch() -> None:
+        while not stop.is_set():
+            try:
+                ready, _, _ = select.select([supervisor_fd], [], [], SUPERVISOR_POLL_SECONDS)
+            except (OSError, ValueError):
+                ready = [supervisor_fd]
+            if ready:
+                lost.set()
+                empty_scope()
+                return
+
+    watcher = threading.Thread(target=watch, name="agent-loop-supervisor-watch", daemon=True)
+    watcher_started = False
+    target_cgroup: Path | None = None
+    # From here on every exit path, including a watcher that cannot start
+    # (for example TasksMax exhausted) or a failed report write, must leave
+    # no target process running without its supervisor watch.
     try:
+        watcher.start()
+        watcher_started = True
+        target_cgroup = cgroup_path_for_pid(child.pid)
+        _write_report(report_path, {"state": "target-started", "pid": child.pid, "cgroup_path": str(target_cgroup) if target_cgroup else None})
         code = child.wait()
+        # The direct target has exited; any background or new-session
+        # descendant is killed before the watch ends and the shim exits.
+        empty_scope()
     except BaseException:
-        child.kill()
-        child.wait()
+        empty_scope()
         raise
+    finally:
+        stop.set()
+        if watcher_started:
+            watcher.join()
+    if lost.is_set():
+        # The kill already happened; the diagnostic report is best effort.
+        _try_write_report(report_path, {
+            "state": "supervisor-lost", "pid": child.pid,
+            "cgroup_path": str(target_cgroup) if target_cgroup else None,
+        })
+        return SUPERVISOR_LOST_EXIT_CODE
     _write_report(report_path, {"state": "target-exited", "pid": child.pid, "returncode": code, "cgroup_path": str(target_cgroup) if target_cgroup else None})
     return int(code if code >= 0 else 128 + (-code))
 
@@ -992,6 +1243,8 @@ class InvocationHandle:
     diagnostics: tuple[str, ...] = ()
     _resource_result: str | None = field(default=None, repr=False, compare=False)
     _resource_result_reset: bool = field(default=False, repr=False, compare=False)
+    _supervisor_read_fd: int | None = field(default=None, repr=False, compare=False)
+    _supervisor_write_fd: int | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def prepare(
@@ -1057,12 +1310,16 @@ class InvocationHandle:
         """Build the launcher for ``target_argv`` without reacquiring the lease."""
         launch = tuple(str(item) for item in target_argv)
         if self.capabilities is not None and self.capabilities.memory_ceiling_claimed:
+            # A fresh supervisor pipe per binding: the shim of this launcher
+            # is killed with its scope when this process drops the write end.
+            self._close_supervisor_pipe()
+            self._supervisor_read_fd, self._supervisor_write_fd = open_supervisor_pipe()
             # Re-resolve the child profile against the effective aggregate in
             # case another process holds a stricter active lease.
             launch = tuple(
                 build_scope_argv(
                     self.policy, launch, report_path=self.report_path, unit_name=self.unit_name,
-                    limits=self.child_limits,
+                    limits=self.child_limits, supervisor_fd=self._supervisor_read_fd,
                 )
             )
         self.launcher_argv = launch
@@ -1071,6 +1328,17 @@ class InvocationHandle:
     @property
     def managed(self) -> bool:
         return self.backend == "systemd-cgroup-v2"
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        """Descriptors the launcher must inherit (the supervisor read end)."""
+        return (self._supervisor_read_fd,) if self._supervisor_read_fd is not None else ()
+
+    def _close_supervisor_pipe(self) -> None:
+        _close_fd(self._supervisor_read_fd)
+        _close_fd(self._supervisor_write_fd)
+        self._supervisor_read_fd = None
+        self._supervisor_write_fd = None
 
     def refresh_report(self) -> ExecReport | None:
         report = ExecReport.read(self.report_path)
@@ -1213,6 +1481,9 @@ class InvocationHandle:
         return result.returncode != 0
 
     def close(self) -> None:
+        # Dropping the write end ends supervision: a target still running in
+        # the scope is killed by its shim rather than left orphaned.
+        self._close_supervisor_pipe()
         self._reset_failed_resource_unit()
         if self.lease is not None:
             self.lease.close()
