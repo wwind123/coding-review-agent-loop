@@ -45,8 +45,10 @@ PLAN_GROWTH_GATE_MODES = ("enforce", "off")
 # (2026-09-28, `plan_transport_profile`, see docs/local_agent_loop.md):
 #
 # * visible ratio: #886's approved plan publishes 17,791 visible characters for
-#   68,956 canonical characters, 0.258 (the recommendation and matrix sections
-#   are always compacted near the limit, since compaction starts at 50-60k);
+#   68,956 canonical characters, 0.258.  That anchor is transport-settled: its
+#   recommendation and matrix markers are already spill references and both
+#   sections are compacted, so the 17,791 is residual text transport cannot
+#   shrink further;
 # * metadata floor: the largest residual round metadata of a plan anchor with
 #   its canonical text already spilled is 24,995 characters (#871's final
 #   candidate; 10.7-17.1k on #894, #943, #1040 and #1043);

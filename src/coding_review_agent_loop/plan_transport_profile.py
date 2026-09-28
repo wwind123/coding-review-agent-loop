@@ -71,6 +71,10 @@ class PlanTransportSample:
     metadata_floor_chars: int
     spilled_fields: tuple[str, ...]
     sidecar_comments: int
+    # Every execution-recommendation and risk-matrix marker in the anchor is
+    # already a transport reference, so its section is compacted and the
+    # visible text is the residual transport cannot shrink further.
+    transport_settled: bool = True
 
     @property
     def anchor_visible_chars(self) -> int:
@@ -87,13 +91,17 @@ class PlanTransportSample:
         return self.anchor_visible_chars / self.canonical_chars
 
     @property
-    def projected_cliff_chars(self) -> int:
+    def projected_cliff_chars(self) -> int | None:
         """Canonical size at which this plan's anchor would stop fitting.
 
         Assumes the visible text grows in proportion to the canonical text
         while the metadata floor stays fixed: every field that grows with the
-        plan is spillable.
+        plan is spillable.  ``None`` for an unsettled anchor, whose visible
+        text still holds an inline recommendation or matrix that transport
+        would spill and compact as the plan grows.
         """
+        if not self.transport_settled:
+            return None
         budget = MAX_GITHUB_BODY_CHARS - self.metadata_floor_chars
         return self.canonical_chars * budget // max(self.anchor_visible_chars, 1)
 
@@ -107,16 +115,25 @@ def _reference_anchors(value: object) -> set[str]:
     return anchors
 
 
-def _marker_reference_anchors(body: str) -> set[str]:
+def _marker_references(body: str) -> tuple[set[str], bool]:
+    """Transport anchors referenced by recommendation and matrix markers.
+
+    Also reports whether every such marker is a transport reference, which
+    is when transport has nothing left to spill or compact in the body.
+    """
     anchors: set[str] = set()
+    settled = True
     for pattern in (_EXECUTION_RECOMMENDATION_RE, _RISK_TEST_MATRIX_RE):
         for match in pattern.finditer(body):
             try:
                 parsed = json.loads(base64.urlsafe_b64decode(match.group("payload")))
             except ValueError:
+                settled = False
                 continue
-            anchors |= _reference_anchors(parsed)
-    return anchors
+            found = _reference_anchors(parsed)
+            settled = settled and bool(found)
+            anchors |= found
+    return anchors, settled
 
 
 def _sidecar_anchors(body: str) -> set[str]:
@@ -188,7 +205,7 @@ def measure_plan_rounds(
         spilled = tuple(
             sorted(field for field, value in payload.items() if _reference_anchors(value))
         )
-        anchors = _marker_reference_anchors(body)
+        anchors, settled = _marker_references(body)
         for value in payload.values():
             anchors |= _reference_anchors(value)
         round_number = payload.get("round_number")
@@ -203,6 +220,7 @@ def measure_plan_rounds(
                 metadata_floor_chars=metadata_floor_chars(hydrated),
                 spilled_fields=spilled,
                 sidecar_comments=sum(1 for found in sidecar_anchors if found & anchors),
+                transport_settled=settled,
             )
         )
     return samples
@@ -216,13 +234,21 @@ class PlanTransportSummary:
     median_compression_ratio: float
     median_visible_ratio: float
     largest_metadata_floor_chars: int
-    lowest_projected_cliff_chars: int
-    median_projected_cliff_chars: int
+    # Projections come from transport-settled samples only; ``None`` when
+    # there are none.
+    settled_samples: int
+    lowest_projected_cliff_chars: int | None
+    median_projected_cliff_chars: int | None
 
 
 def summarize(samples: Sequence[PlanTransportSample]) -> PlanTransportSummary:
     if not samples:
         raise AgentLoopError("No measurable planner rounds.")
+    cliffs = [
+        sample.projected_cliff_chars
+        for sample in samples
+        if sample.projected_cliff_chars is not None
+    ]
     return PlanTransportSummary(
         samples=len(samples),
         largest_published_chars=max(sample.canonical_chars for sample in samples),
@@ -234,25 +260,47 @@ def summarize(samples: Sequence[PlanTransportSample]) -> PlanTransportSummary:
             statistics.median(sample.visible_ratio for sample in samples), 3
         ),
         largest_metadata_floor_chars=max(sample.metadata_floor_chars for sample in samples),
-        lowest_projected_cliff_chars=min(sample.projected_cliff_chars for sample in samples),
-        median_projected_cliff_chars=int(
-            statistics.median(sample.projected_cliff_chars for sample in samples)
-        ),
+        settled_samples=len(cliffs),
+        lowest_projected_cliff_chars=min(cliffs) if cliffs else None,
+        median_projected_cliff_chars=int(statistics.median(cliffs)) if cliffs else None,
     )
+
+
+def parse_paginated_pages(stdout: str) -> list[object]:
+    """Items of ``gh api --paginate`` output: JSON arrays printed back to back.
+
+    Older gh releases (2.45, pinned by this repository's tests) have no
+    ``--slurp``, so the pages are decoded one after another instead.
+    """
+    decoder = json.JSONDecoder()
+    items: list[object] = []
+    index = 0
+    while True:
+        while index < len(stdout) and stdout[index].isspace():
+            index += 1
+        if index >= len(stdout):
+            return items
+        page, index = decoder.raw_decode(stdout, index)
+        if not isinstance(page, list):
+            raise AgentLoopError("Expected a JSON array page from gh api --paginate.")
+        items.extend(page)
 
 
 def _fetch_issue_bodies(repo: str, issue_number: int, gh_cmd: str) -> list[str]:
     result = subprocess.run(
         [
-            gh_cmd, "api", "--paginate", "--slurp",
+            gh_cmd, "api", "--paginate",
             f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
         ],
         check=True,
         capture_output=True,
         text=True,
     )
-    pages = json.loads(result.stdout)
-    return [str(comment.get("body") or "") for page in pages for comment in page]
+    return [
+        str(comment.get("body") or "")
+        for comment in parse_paginated_pages(result.stdout)
+        if isinstance(comment, Mapping)
+    ]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -283,6 +331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "visible_ratio": round(sample.visible_ratio, 3),
                     "spilled_fields": list(sample.spilled_fields),
                     "sidecar_comments": sample.sidecar_comments,
+                    "transport_settled": sample.transport_settled,
                     "projected_cliff_chars": sample.projected_cliff_chars,
                 }
             )

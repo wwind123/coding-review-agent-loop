@@ -92,7 +92,7 @@ anchors:
 
 | Quantity | Measured | Source |
 | --- | --- | --- |
-| Visible characters per canonical character | 0.258 | #886's approved plan: 17,791 visible for 68,956 canonical |
+| Visible characters per canonical character | 0.258 | #886's approved plan: 17,791 visible for 68,956 canonical, with its recommendation and matrix already spilled and compacted |
 | Metadata floor with canonical text spilled | 24,995 (largest) | #871's final candidate; 10.7-17.1k on #894, #943, #1040, #1043 |
 | Largest visible plan text published | 42,495 | #1040's final candidate, 6,850 characters of headroom |
 | Tightest anchor headroom | 3,422 | #871's final candidate |
@@ -112,7 +112,10 @@ python -m coding_review_agent_loop.plan_transport_profile --repo OWNER/NAME 886 
 It prints, per published planner round, the canonical size, the compression
 ratio `encode_mapping` achieves on it, the visible and metadata split of the
 anchor, the metadata floor, the spilled fields and sidecar comment count, and
-the projected cliff, followed by a summary.
+the projected cliff, followed by a summary. A cliff is projected only for a
+transport-settled anchor, one whose recommendation and matrix markers are
+already spill references. Otherwise its visible text still holds sections that
+transport would spill and compact as the plan grows.
 
 Revision count is only a combining signal: it crosses only while the plan is at
 least half the size threshold. Reviewer-only phase-advance rounds and resumed

@@ -1,8 +1,11 @@
 """Canonical plan size against published round transport (#1075)."""
 
 import base64
+import json
 import os
+from types import SimpleNamespace
 
+import coding_review_agent_loop.plan_transport_profile as profile
 import coding_review_agent_loop.round_transport as transport
 from coding_review_agent_loop.config import AgentLoopConfig
 from coding_review_agent_loop.plan_growth import (
@@ -16,6 +19,7 @@ from coding_review_agent_loop.plan_transport_profile import (
     PlanTransportSample,
     measure_plan_rounds,
     metadata_floor_chars,
+    parse_paginated_pages,
     summarize,
 )
 
@@ -115,6 +119,56 @@ def test_metadata_floor_spills_every_growing_field():
 
     assert floor < 3_000
     assert metadata_floor_chars(small) == len(transport.encode_mapping(small))
+
+
+def _marker(token: str, payload: dict[str, object]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    return f"<!-- {token}: {encoded} -->"
+
+
+def test_inline_recommendation_or_matrix_leaves_the_anchor_unsettled():
+    inline = "## Plan\n\n" + _marker("AGENT_EXECUTION_RECOMMENDATION", {"strategy": "one-shot"})
+    reference = {
+        "$round_transport_risk_test_matrix": "a" * 24,
+        "field": "risk_test_matrix_marker",
+        "parts": 1,
+        "sha256": "b" * 64,
+        "spill": "c" * 64,
+    }
+    settled = "## Plan\n\n" + _marker("AGENT_RISK_TEST_MATRIX", reference)
+    payload = _plan_payload("Plan text. " * 50)
+
+    [unsettled_sample] = measure_plan_rounds([_comment(payload, inline)])
+    [settled_sample] = measure_plan_rounds([_comment(payload, settled)])
+
+    assert unsettled_sample.transport_settled is False
+    assert unsettled_sample.projected_cliff_chars is None
+    assert settled_sample.transport_settled is True
+    assert settled_sample.projected_cliff_chars is not None
+    summary = summarize([unsettled_sample, settled_sample])
+    assert summary.samples == 2 and summary.settled_samples == 1
+    assert summary.lowest_projected_cliff_chars == settled_sample.projected_cliff_chars
+    assert summarize([unsettled_sample]).lowest_projected_cliff_chars is None
+
+
+def test_paginated_pages_parse_without_slurp():
+    stdout = '[{"body": "a"}, {"body": "b\\nc"}]\n[{"body": "d"}]\n'
+
+    assert parse_paginated_pages(stdout) == [{"body": "a"}, {"body": "b\nc"}, {"body": "d"}]
+    assert parse_paginated_pages("") == []
+
+
+def test_fetch_does_not_pass_slurp(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(stdout='[{"body": "x"}][{"body": null}]')
+
+    monkeypatch.setattr(profile.subprocess, "run", fake_run)
+
+    assert profile._fetch_issue_bodies("o/r", 886, "gh") == ["x", ""]
+    assert "--slurp" not in calls[0] and "--paginate" in calls[0]
 
 
 def test_summary_reports_the_lowest_projected_cliff():
