@@ -35,6 +35,7 @@ from coding_review_agent_loop.containment import (
     _counter_capabilities,
     build_scope_argv,
     evidence_for,
+    open_supervisor_pipe,
     _shim,
     default_policy,
     parse_limit,
@@ -97,17 +98,233 @@ def test_optional_counter_absence_is_capability_metadata(tmp_path):
 
 
 def test_shim_report_is_authoritative_for_target_exit_one_and_203(tmp_path):
-    for code in (1, 203):
-        report = tmp_path / f"report-{code}.json"
+    read_fd, write_fd = open_supervisor_pipe()
+    try:
+        for code in (1, 203):
+            report = tmp_path / f"report-{code}.json"
+            assert _shim(
+                [
+                    "--shim", "--report", str(report), "--supervisor-fd", str(read_fd), "--",
+                    sys.executable, "-c", f"raise SystemExit({code})",
+                ]
+            ) == code
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            assert payload["state"] == "target-exited"
+            assert payload["returncode"] == code
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def _never_started_target(marker: Path) -> list[str]:
+    return [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('ran')"]
+
+
+def test_shim_refuses_to_start_target_without_supervisor(tmp_path):
+    """Issue #1092: no supervisor liveness descriptor means no target."""
+    report = tmp_path / "report.json"
+    marker = tmp_path / "ran"
+    assert _shim(["--shim", "--report", str(report), "--", *_never_started_target(marker)]) == 125
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["state"] == "target-exec-error"
+    assert "supervisor" in payload["error"]
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("descriptor", ["not-a-number", "-1", "9999"])
+def test_shim_fails_closed_on_unusable_supervisor_descriptor(tmp_path, descriptor):
+    report = tmp_path / "report.json"
+    marker = tmp_path / "ran"
+    assert _shim(
+        ["--shim", "--report", str(report), "--supervisor-fd", descriptor, "--",
+         *_never_started_target(marker)]
+    ) == 125
+    assert json.loads(report.read_text(encoding="utf-8"))["state"] == "target-exec-error"
+    assert not marker.exists()
+
+
+def test_shim_refuses_non_pipe_supervisor_descriptor(tmp_path):
+    report = tmp_path / "report.json"
+    marker = tmp_path / "ran"
+    with (tmp_path / "plain").open("w") as handle:
         assert _shim(
-            [
-                "--shim", "--report", str(report), "--",
-                sys.executable, "-c", f"raise SystemExit({code})",
-            ]
-        ) == code
-        payload = json.loads(report.read_text(encoding="utf-8"))
-        assert payload["state"] == "target-exited"
-        assert payload["returncode"] == code
+            ["--shim", "--report", str(report), "--supervisor-fd", str(handle.fileno()), "--",
+             *_never_started_target(marker)]
+        ) == 125
+    assert "not a pipe" in json.loads(report.read_text(encoding="utf-8"))["error"]
+    assert not marker.exists()
+
+
+def test_shim_refuses_when_supervisor_already_exited(tmp_path):
+    report = tmp_path / "report.json"
+    marker = tmp_path / "ran"
+    read_fd, write_fd = open_supervisor_pipe()
+    os.close(write_fd)
+    try:
+        assert _shim(
+            ["--shim", "--report", str(report), "--supervisor-fd", str(read_fd), "--",
+             *_never_started_target(marker)]
+        ) == 125
+    finally:
+        os.close(read_fd)
+    assert "exited before the target started" in json.loads(report.read_text(encoding="utf-8"))["error"]
+    assert not marker.exists()
+
+
+# A target that publishes its pid, then "publishes work" only after a delay
+# that outlives the supervisor.  The marker stands in for a push or PR.
+_PUBLISH_LATE_TARGET = (
+    PUBLISH_SNIPPET
+    + "import os, sys, time\n"
+    "_publish(sys.argv[1], [os.getpid()])\n"
+    "time.sleep(4)\n"
+    "open(sys.argv[2], 'w').write('published')\n"
+)
+
+
+def _wait_for(path: Path, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            pytest.fail(f"{path} was not written within {timeout}s")
+        time.sleep(0.02)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process-group launcher semantics are POSIX")
+def test_shim_kills_target_when_supervisor_dies(tmp_path):
+    """Issue #1092: losing the supervisor kills the target before it publishes."""
+    import subprocess
+
+    report = tmp_path / "report.json"
+    pid_file = tmp_path / "target.pid"
+    published = tmp_path / "published"
+    read_fd, write_fd = open_supervisor_pipe()
+    shim = subprocess.Popen(
+        [
+            sys.executable, "-m", "coding_review_agent_loop.containment",
+            "--shim", "--report", str(report), "--unit", "agent-loop-not-this-cgroup.scope",
+            "--supervisor-fd", str(read_fd), "--",
+            sys.executable, "-c", _PUBLISH_LATE_TARGET, str(pid_file), str(published),
+        ],
+        pass_fds=(read_fd,),
+        start_new_session=True,
+    )
+    os.close(read_fd)
+    records: list[tuple[int, str]] = []
+    try:
+        _wait_for(pid_file)
+        records = read_pid_record(pid_file)
+        # The supervisor dies: its write end is the only one, so the shim sees EOF.
+        os.close(write_fd)
+        write_fd = None
+        assert shim.wait(timeout=5) != 0
+        for pid, start in records:
+            assert wait_until_gone(pid, start_time=start), "target outlived its supervisor"
+        assert json.loads(report.read_text(encoding="utf-8"))["state"] == "supervisor-lost"
+        time.sleep(4.5)
+        assert not published.exists(), "an unsupervised target published its work"
+    finally:
+        if write_fd is not None:
+            os.close(write_fd)
+        if shim.poll() is None:
+            shim.kill()
+            shim.wait()
+        for pid, start in records:
+            kill_if_same_instance(pid, start)
+
+
+def test_managed_binding_passes_supervisor_pipe_and_close_releases_it(tmp_path):
+    policy = default_policy(mode="auto", cache_dir=tmp_path)
+    handle = InvocationHandle.prepare(
+        policy,
+        role="coder",
+        target_argv=[sys.executable, "-c", "pass"],
+        manifest=CapabilityManifest("process-group", False, reason="no lease in this test"),
+    )
+    try:
+        assert handle.pass_fds == ()
+        handle.capabilities = CapabilityManifest("systemd-cgroup-v2", True)
+        argv = handle.bind_target([sys.executable, "-c", "pass"])
+        (read_fd,) = handle.pass_fds
+        assert argv[argv.index("--supervisor-fd") + 1] == str(read_fd)
+        assert argv[argv.index("--unit", argv.index("--shim")) + 1] == handle.unit_name
+        write_fd = handle._supervisor_write_fd
+        assert write_fd is not None and not os.get_inheritable(write_fd)
+        # Rebinding replaces the pipe: the previous write end is released.
+        opened = set(os.listdir("/proc/self/fd")) if sys.platform == "linux" else None
+        handle.bind_target([sys.executable, "-c", "pass"])
+        assert len(handle.pass_fds) == 1
+        if opened is not None:
+            assert set(os.listdir("/proc/self/fd")) == opened
+    finally:
+        handle.close()
+    assert handle.pass_fds == ()
+    assert handle._supervisor_write_fd is None
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="systemd containment is Linux-only")
+def test_systemd_scope_target_dies_with_its_orchestrator(monkeypatch, tmp_path):
+    """Issue #1092 regression: SIGKILL the orchestrator; the scoped target dies.
+
+    The target double-forks a descendant into a new session, which neither a
+    process-group kill nor a parent-death signal would reach; only the scope
+    kill does.
+    """
+    import signal
+    import subprocess
+
+    monkeypatch.delenv("AGENT_LOOP_INVOCATION_ID", raising=False)
+    policy = default_policy(mode="auto", cache_dir=tmp_path / "runtime")
+    manifest = preflight_containment(policy)
+    if not manifest.memory_ceiling_claimed:
+        pytest.skip(manifest.reason or "systemd cgroup preflight unavailable")
+    pid_file = tmp_path / "scoped.pid"
+    published = tmp_path / "published"
+    target_code = (
+        PUBLISH_SNIPPET
+        + "import os, subprocess, sys, time\n"
+        "late = 'import sys, time; time.sleep(4); open(sys.argv[1], \"w\").write(\"published\")'\n"
+        "escaped = subprocess.Popen([sys.executable, '-c', late, sys.argv[2]], start_new_session=True)\n"
+        "_publish(sys.argv[1], [os.getpid(), escaped.pid])\n"
+        "time.sleep(4)\n"
+        "open(sys.argv[2], 'w').write('published')\n"
+    )
+    orchestrator_code = (
+        "import os, subprocess, sys, time, json, uuid\n"
+        "from pathlib import Path\n"
+        "from coding_review_agent_loop.containment import build_scope_argv, default_policy, open_supervisor_pipe\n"
+        "policy = default_policy(mode='auto', cache_dir=Path(sys.argv[1]))\n"
+        "read_fd, write_fd = open_supervisor_pipe()\n"
+        "argv = build_scope_argv(policy, [sys.executable, '-c', sys.argv[2], sys.argv[3], sys.argv[4]],\n"
+        "    report_path=Path(sys.argv[5]), unit_name='agent-loop-t1092-' + uuid.uuid4().hex[:12] + '.scope',\n"
+        "    limits=policy.role_limits('coder'), supervisor_fd=read_fd)\n"
+        "subprocess.Popen(argv, pass_fds=(read_fd,), start_new_session=True)\n"
+        "os.close(read_fd)\n"
+        "time.sleep(60)\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(Path(__file__).resolve().parents[1] / "src"), os.environ.get("PYTHONPATH")]))}
+    orchestrator = subprocess.Popen(
+        [sys.executable, "-c", orchestrator_code, str(tmp_path / "runtime"), target_code,
+         str(pid_file), str(published), str(tmp_path / "report.json")],
+        env=env, start_new_session=True,
+    )
+    records: list[tuple[int, str]] = []
+    try:
+        _wait_for(pid_file, timeout=15)
+        records = read_pid_record(pid_file)
+        assert len(records) == 2
+        orchestrator.send_signal(signal.SIGKILL)
+        orchestrator.wait(timeout=5)
+        for pid, start in records:
+            assert wait_until_gone(pid, start_time=start), f"scoped process {pid} outlived its orchestrator"
+        time.sleep(4.5)
+        assert not published.exists(), "an orphaned target published its work"
+    finally:
+        if orchestrator.poll() is None:
+            orchestrator.kill()
+            orchestrator.wait()
+        for pid, start in records:
+            kill_if_same_instance(pid, start)
 
 
 def test_same_lane_duplicate_is_rejected_before_spawn(tmp_path, capsys):
@@ -592,7 +809,9 @@ def test_fake_systemd_memory_limit_terminates_descendant_tree(monkeypatch, tmp_p
     scope_argv = build_scope_argv(
         policy, target, report_path=tmp_path / "report.json",
         unit_name="agent-loop-limit.scope", limits=policy.role_limits("coder"),
+        supervisor_fd=7,
     )
+    assert scope_argv[scope_argv.index("--supervisor-fd") + 1] == "7"
     assert f"MemoryMax={policy.role_limits('coder').memory_max}" in scope_argv
     assert "MemorySwapMax=0" in scope_argv
     assert "TasksMax=32" in scope_argv

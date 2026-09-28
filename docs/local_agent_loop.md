@@ -722,6 +722,18 @@ and 203, to the target. Timeouts retain the `returncode is None` wall-clock
 convention, salvage a valid response file when available, terminate the full
 scope, confirm emptiness, and only then permit a retry or replacement replay.
 
+Supervision runs in both directions. The shim inherits the read end of a
+supervisor pipe (`--supervisor-fd`) whose write end is non-inheritable and
+held only by the orchestrator's invocation handle. When that write end closes
+-- the orchestrator exits, is killed, or has its own scope stopped -- the shim
+writes a `supervisor-lost` report and kills the whole scope through
+`cgroup.kill` (falling back to signalling each `cgroup.procs` member) with
+SIGKILL and no graceful wind-down, so the unsupervised turn stops with its work
+uncommitted rather than publishing it. The check fails closed: a missing,
+invalid, non-pipe, or already-closed descriptor means the target is never
+started (`target-exec-error`, shim exit 125). The process-group fallback has no
+shim and does not provide this guarantee.
+
 The managed test wrapper also locks a lane by canonical cwd, normalized argv,
 and `AGENT_LOOP_INVOCATION_ID`, using a non-inherited advisory descriptor.
 Same-lane duplicates are rejected before spawn with exit 125 and do not enter

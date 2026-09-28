@@ -612,6 +612,8 @@ def run_foreground_test(
                     lane_lock.close()
                     raise
                 spawn_cmd = list(handle.launcher_argv)
+                # The scope shim must inherit the supervisor pipe (#1092).
+                pass_fds = (*pass_fds, *getattr(handle, "pass_fds", ()))
         else:
             spawn_cmd = launch_cmd
         spawn_cwd: str | Path = cwd
@@ -1732,6 +1734,9 @@ class Runner:
                     launch_env.update(broker.environment)
                 handle = self._prepare_containment(cmd, role=inferred_role, env=launch_env)
                 launch_cmd = list(handle.launcher_argv) if handle is not None and handle.managed else cmd
+                # A managed scope shim inherits the supervisor pipe so it can
+                # kill the target if this process dies (#1092).
+                launch_pass_fds = tuple(getattr(handle, "pass_fds", ())) if handle is not None and handle.managed else ()
                 worker_budget = self._apply_worker_budget_env(inferred_role, handle, launch_env)
                 if broker is not None:
                     broker.set_execution_context(
@@ -1753,6 +1758,7 @@ class Runner:
                         text=True,
                         start_new_session=True,
                         env=launch_env,
+                        pass_fds=launch_pass_fds,
                     )
 
                 if handle is None or not handle.managed:
@@ -1960,6 +1966,11 @@ class Runner:
                         close_fds=True,
                         start_new_session=True,
                         env=launch_env,
+                        pass_fds=(
+                            tuple(getattr(handle, "pass_fds", ()))
+                            if handle is not None and handle.managed
+                            else ()
+                        ),
                     )
                 except BaseException:
                     os.close(master_fd)
@@ -1999,6 +2010,7 @@ class Runner:
                             close_fds=True,
                             start_new_session=True,
                             env=launch_env,
+                            pass_fds=tuple(getattr(handle, "pass_fds", ())),
                         )
                     except BaseException:
                         os.close(master_fd)

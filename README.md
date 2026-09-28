@@ -179,7 +179,13 @@ Inspect the resolved policy and capabilities with
 launcher is the synchronous foreground form
 `systemd-run --user --scope --quiet`; it deliberately does not use `--wait`,
 `--service`, or `--pipe`. A target-start shim report is authoritative when
-distinguishing launcher failures from target exit statuses. Optional cgroup
+distinguishing launcher failures from target exit statuses. The shim also
+holds a supervisor pipe whose only write end lives in the orchestrator: if the
+orchestrator dies (for example `systemctl --user stop` of the loop's own
+scope), the shim SIGKILLs every process in the target scope, so an orphaned
+coder cannot go on to push or open a PR. A shim that cannot confirm a live
+supervisor refuses to start the target. The process-group fallback has no
+shim and no such guarantee. Optional cgroup
 telemetry (peak memory, PSI, and swap counters) is capability-aware: missing
 files are reported as not collected rather than treated as lost evidence.
 OOM, hard memory/swap failures, and task-limit failures are
