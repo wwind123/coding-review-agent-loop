@@ -92,10 +92,15 @@ the bounded compact digest instead (#948). The round still publishes, but
 readers see a summary rather than the plan. That digest transition is what the
 default is anchored to.
 
-There is no canonical-size publication cliff behind the transition. The
-digest's visible text is bounded, and the canonical text spills, so the digest
-overflows only if unspillable metadata grows. Canonical size does not drive
-that. Measured on this repository's plan anchors:
+Past the transition, the comment body no longer limits publication by
+canonical size. The digest's visible text is bounded, and the canonical text
+spills, so the digest overflows only if unspillable metadata grows. The one
+canonical-size limit left is the metadata codec. The complete round metadata
+is encoded before any spill, and `encode_mapping` refuses a compressed form
+above 8,000,000 bytes. The metadata carries the plan at most about four times.
+Assuming four copies at up to four UTF-8 bytes per character and no compression
+gives a conservative codec floor of 500,000 canonical characters, over four
+times the default. Measured on this repository's plan anchors:
 
 | Quantity | Measured | Source |
 | --- | --- | --- |

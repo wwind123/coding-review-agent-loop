@@ -5,20 +5,27 @@ import json
 import os
 from types import SimpleNamespace
 
+import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.plan_transport_profile as profile
 import coding_review_agent_loop.round_transport as transport
+from agent_loop_helpers import make_config, structured_v1_plan_state
+from coding_review_agent_loop.comment_rendering import (
+    COMPACT_PLAN_DIGEST_BUDGET_CHARS,
+    COMPACT_PLAN_DIGEST_NOTICE,
+    render_canonical_plan_state,
+    render_public_agent_comment,
+)
 from coding_review_agent_loop.config import AgentLoopConfig
 from coding_review_agent_loop.plan_growth import (
     DEFAULT_PLAN_GROWTH_MAX_CHARS,
     DEFAULT_PLAN_GROWTH_MAX_REVISIONS,
+    PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS,
     PLAN_TRANSPORT_MEASURED_METADATA_FLOOR_CHARS,
     PLAN_TRANSPORT_MEASURED_VISIBLE_RATIO,
     PLAN_TRANSPORT_PROJECTED_DIGEST_TRANSITION_CHARS,
 )
-from coding_review_agent_loop.comment_rendering import (
-    COMPACT_PLAN_DIGEST_BUDGET_CHARS,
-    COMPACT_PLAN_DIGEST_NOTICE,
-)
+from coding_review_agent_loop.protocol import validate_structured_plan_state
+from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
 from coding_review_agent_loop.plan_transport_profile import (
     PlanTransportSample,
     measure_plan_rounds,
@@ -57,6 +64,67 @@ def test_default_size_threshold_is_derived_from_the_digest_transition():
     assert AgentLoopConfig.__dataclass_fields__["plan_growth_max_chars"].default == (
         DEFAULT_PLAN_GROWTH_MAX_CHARS
     )
+
+
+def test_codec_floor_is_far_above_the_default_and_encodes():
+    """The metadata codec is the only canonical-size publication limit.
+
+    Four copies of a plan at the conservative floor still encode under
+    the codec's compressed-size cap.
+    """
+    assert PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS == transport._MAX_COMPRESSED // 16
+    assert PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS >= 4 * DEFAULT_PLAN_GROWTH_MAX_CHARS
+    plan = _random_text(PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS * 3 // 4)
+    assert len(plan) == PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS
+    encoded = transport.encode_mapping({f"copy_{index}": plan for index in range(4)})
+    assert len(encoded) * 3 // 4 < transport._MAX_COMPRESSED
+
+
+def _long_plan(config, steps: int):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["plan_steps"] = [f"Step {index} " + "detail " * 150 for index in range(steps)]
+    raw = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    plan = validate_structured_plan_state(raw)
+    canonical = render_canonical_plan_state(plan, config)
+    metadata = PostedRoundMetadata(
+        flow="plan", role="coder", agent="Claude", round_number=2, subject="s",
+        canonical_plan=canonical, raw_structured_coder_response=raw,
+    )
+    full = render_public_agent_comment(kind="plan_state", parsed=plan, agent="claude", config=config)
+    body = orchestrator_module._assemble_structured_plan_round_body(
+        config=config, issue_number=1075, kind="plan_state", parsed_plan=plan,
+        full_comment=full, metadata=metadata, raw_text=raw, prior_items=(), model_used=None,
+        surfaced_requirement_ids=(), requires_direct_discussion_ack=False,
+    )
+    published = [str(item) for item in transport.prepare_round_comment(body)]
+    return canonical, _attach_round_metadata(full, metadata), published
+
+
+def test_assembler_overflow_publishes_a_digest_the_profile_recognises(tmp_path):
+    """The real full-comment-to-digest transition, measured end to end.
+
+    A plan whose full comment overflows goes through the orchestrator's
+    assembler, which selects the bounded digest; the published digest is
+    profiled as past the transition, with headroom to its own overflow.
+    A small plan through the same assembler stays a full comment.
+    """
+    config = make_config(tmp_path, max_rounds=4)
+    canonical, full_body, published = _long_plan(config, steps=80)
+
+    assert not transport.round_comment_fits(full_body)
+    assert COMPACT_PLAN_DIGEST_NOTICE in published[-1]
+    [sample] = measure_plan_rounds(published)
+    assert sample.canonical_chars == len(canonical) > transport.MAX_GITHUB_BODY_CHARS
+    assert sample.digest is True
+    assert sample.projected_digest_transition_chars is None
+    assert sample.digest_headroom_chars is not None and sample.digest_headroom_chars > 0
+    assert sample.anchor_visible_chars < transport.MAX_GITHUB_BODY_CHARS // 2
+
+    small_canonical, small_full, small_published = _long_plan(config, steps=2)
+    assert transport.round_comment_fits(small_full)
+    [small] = measure_plan_rounds(small_published)
+    assert small.digest is False and small.canonical_chars == len(small_canonical)
+    assert small.digest_headroom_chars is None
 
 
 def test_spilled_plan_round_measures_visible_text_floor_and_sidecars():

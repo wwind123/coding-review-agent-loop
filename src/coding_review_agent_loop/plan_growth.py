@@ -22,7 +22,7 @@ from .protocol import (
     StructuredPlanRevision,
     StructuredPlanState,
 )
-from .round_transport import MAX_GITHUB_BODY_CHARS
+from .round_transport import _MAX_COMPRESSED, MAX_GITHUB_BODY_CHARS
 
 SIGNAL_RENDERED_SIZE = "rendered-size"
 SIGNAL_SCOPE_ITEMS = "scope-items"
@@ -44,11 +44,19 @@ PLAN_GROWTH_GATE_MODES = ("enforce", "off")
 # full plan comment no longer fits, and the orchestrator posts the bounded
 # compact digest instead (#948): the round still publishes, but readers see a
 # summary rather than the plan.  That digest transition is the anchor point.
-# There is no canonical-size publication cliff behind it: digest text is
-# bounded (9.1-10.5k visible measured on #946 and #1035) and the canonical
-# text spills, so the digest overflows only if unspillable metadata grows,
-# which canonical size does not drive.  Measured on this repository's plan
-# anchors (2026-09-28, `plan_transport_profile`, see docs/local_agent_loop.md):
+# Past it, body size no longer limits publication by canonical size: digest
+# text is bounded (9.1-10.5k visible measured on #946 and #1035) and the
+# canonical text spills, so the digest overflows only if unspillable metadata
+# grows.  The one canonical-size publication limit left is the metadata codec:
+# `_attach_round_metadata` encodes the complete metadata before any spill, and
+# `encode_mapping` refuses a compressed form above _MAX_COMPRESSED (8,000,000
+# bytes).  The metadata carries the plan at most about four times (canonical
+# text, raw response and assembled sidecar JSON, plus patch provenance and the
+# recommendation and matrix records), so assuming four copies at up to four
+# UTF-8 bytes per character and no compression gives a conservative codec
+# floor of 500,000 canonical characters, over four times the default
+# (PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS).  Measured on this repository's
+# plan anchors (2026-09-28, `plan_transport_profile`, see docs/local_agent_loop.md):
 #
 # * visible ratio: #886's approved plan publishes 17,791 visible characters for
 #   68,956 canonical characters, 0.258.  That anchor is a full comment and is
@@ -77,6 +85,8 @@ PLAN_TRANSPORT_PROJECTED_DIGEST_TRANSITION_CHARS = int(
 DEFAULT_PLAN_GROWTH_MAX_CHARS = (
     int(PLAN_TRANSPORT_PROJECTED_DIGEST_TRANSITION_CHARS * 0.9) // 10_000 * 10_000
 )
+# Four plan copies in the metadata, at up to four UTF-8 bytes per character.
+PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS = _MAX_COMPRESSED // (4 * 4)
 # Revision count combines with size at half the size threshold (60,000).
 # #886's approved plan reached 68,956 characters over 7 planner candidates and
 # #871's over 8; ordinary plans measured here (#894, #943) approved within 4-5.
