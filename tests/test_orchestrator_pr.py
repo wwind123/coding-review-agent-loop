@@ -15284,3 +15284,27 @@ def test_selective_policy_signed_input_with_pending_evidence_stays_in_the_round(
     assert runner.codex_outputs == [] and runner.gemini_outputs == []
     freezes = _freeze_records(runner)
     assert len(freezes) == 1 and freezes[0].metadata.round_number == 1
+
+
+def test_head_moving_at_the_gate_read_publishes_no_freeze(tmp_path, monkeypatch):
+    """Row freeze-on-clean-board (variant: live head is H' at the last read)."""
+    runner = _frozen_runner(tmp_path)
+    config = make_config(tmp_path, max_rounds=1)
+    real_context = orchestrator.get_pr_review_context
+    moved = []
+
+    def head_moves_before_gate(runner_, **kwargs):
+        if not moved and not runner.codex_outputs:
+            moved.append(True)
+            runner.pr_payload["headRefOid"] = "def456"
+            runner.git_head = "def456"
+        return real_context(runner_, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "get_pr_review_context", head_moves_before_gate)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert moved
+    assert not isinstance(excinfo.value, HumanDecisionRequiredError)
+    assert "final barrier" in str(excinfo.value) or "exact-head evidence" in str(excinfo.value)
+    assert "evidence-freeze" not in _phases(runner)
+    assert not any("Exact-head evidence freeze" in comment for comment in runner.comments)
