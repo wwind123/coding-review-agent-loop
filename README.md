@@ -1197,7 +1197,10 @@ the crossed signals:
 | `--plan-growth-max-revisions N` | `6` | `revision-count`: planner candidates, counted only while the plan is at least half the size threshold |
 
 Reviewers may block with "this detail belongs in a child plan; restructure as
-staged". See [plan-growth gate](docs/local_agent_loop.md#plan-growth-gate).
+staged". The approved-plan handoff record carries the gate's approval-time
+verdict, and handoff-backed resume re-validates against that verdict rather
+than today's thresholds; a handoff recorded before the verdict existed is
+accepted as legacy (#1074). See [plan-growth gate](docs/local_agent_loop.md#plan-growth-gate).
 
 ## Safety and Permissions
 
