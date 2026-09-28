@@ -16,7 +16,12 @@ from .agents.base import AgentName
 from .agents.registry import default_agent_args
 from .errors import AgentLoopError
 from .expected_closure import normalize_issue_ids
-from .github import PullRequestMetadata, detect_repo, get_repo_default_branch
+from .github import (
+    PullRequestMetadata,
+    TrustedHumanActor,
+    detect_repo,
+    get_repo_default_branch,
+)
 from .logging import datetime_stamp, log
 from .runner import Runner
 from .scratch import make_private_dirs, scratch_root
@@ -281,6 +286,10 @@ class AgentLoopConfig:
     # Optional v2 managed-CI identity. A repository must independently opt in
     # with its Actions variable before this can suppress any automatic matrix.
     managed_ci_trusted_actor: str | None = None
+    # Optional identities whose signed human reviewer comments are admitted
+    # as approval-critical requirements (#1022).  Empty means unconfigured:
+    # every signed comment is admitted but labelled unverified.
+    human_reviewer_trusted_actors: tuple[TrustedHumanActor, ...] = ()
     # Explicit PR-mode opt-in for adopting an already-open PR into the v2
     # managed-CI protocol.  Kept separate from the issue-created v2 flow.
     managed_ci_adopt_existing_pr: bool = False
@@ -1346,6 +1355,47 @@ def _arg_or_default(args: argparse.Namespace, name: str, default: int) -> int:
     return default if value is None else value
 
 
+HUMAN_REVIEWER_TRUSTED_ACTOR_OPTION = "--human-reviewer-trusted-actor"
+
+
+def parse_human_reviewer_trusted_actors(
+    values: list[str] | tuple[str, ...] | None,
+) -> tuple[TrustedHumanActor, ...]:
+    """Parse repeated ``LOGIN:ID`` entries, rejecting any malformed entry (#1022)."""
+    option = HUMAN_REVIEWER_TRUSTED_ACTOR_OPTION
+    actors: list[TrustedHumanActor] = []
+    login_by_id: dict[int, str] = {}
+    for raw in values or ():
+        entry = str(raw)
+        if ":" not in entry:
+            raise AgentLoopError(f"{option} {entry!r} must have the form LOGIN:ID.")
+        login, _, raw_id = entry.rpartition(":")
+        login = login.strip()
+        raw_id = raw_id.strip()
+        if not login or any(ch.isspace() for ch in login):
+            raise AgentLoopError(f"{option} {entry!r} has a blank or malformed login.")
+        if not raw_id.isascii() or not raw_id.isdigit():
+            raise AgentLoopError(
+                f"{option} {entry!r} must end in a positive numeric GitHub user ID."
+            )
+        user_id = int(raw_id)
+        if user_id <= 0:
+            raise AgentLoopError(
+                f"{option} {entry!r} must end in a positive numeric GitHub user ID."
+            )
+        previous = login_by_id.get(user_id)
+        if previous is not None:
+            if previous.casefold() != login.casefold():
+                raise AgentLoopError(
+                    f"{option} names user ID {user_id} with conflicting logins "
+                    f"{previous!r} and {login!r}."
+                )
+            continue
+        login_by_id[user_id] = login
+        actors.append(TrustedHumanActor(login=login, user_id=user_id))
+    return tuple(actors)
+
+
 def resolve_agent_permissions_mode(args: argparse.Namespace) -> str:
     """Resolve ``--agent-permissions`` and its ``--dangerous-agent-permissions`` alias."""
     explicit = getattr(args, "agent_permissions", None)
@@ -1551,6 +1601,9 @@ def config_from_args(
         ),
         watch_pending_ci_explicit=getattr(args, "watch_pending_ci", None) is not None,
         managed_ci_trusted_actor=getattr(args, "managed_ci_trusted_actor", None),
+        human_reviewer_trusted_actors=parse_human_reviewer_trusted_actors(
+            getattr(args, "human_reviewer_trusted_actor", None)
+        ),
         managed_ci=getattr(args, "managed_ci", False),
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
         allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),

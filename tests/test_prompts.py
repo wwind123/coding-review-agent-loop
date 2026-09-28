@@ -2146,7 +2146,9 @@ def test_coder_followup_prompts_require_human_requirements_acknowledgement_only_
     )
     without_requirements = builder(77, 2, "Fix the bug.", config)
 
-    assert "authoritative for next-revision requirements" in with_requirements
+    assert "binding for disposition in next-revision requirements" in with_requirements
+    assert "but its authors are unverified" in with_requirements
+    assert "authoritative for next-revision requirements" not in with_requirements
     assert "human_requirement_dispositions" in with_requirements
     assert re.search(r"(?m)^<!-- HUMAN_REQUIREMENTS_ADDRESSED -->$", with_requirements) is None
     assert re.search(r"(?m)^### Human requirements$", with_requirements) is None
@@ -2301,7 +2303,8 @@ def test_review_prompt_includes_signed_human_requirements(tmp_path):
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert "Signed Human Reviewer Requirements" in prompt
     assert "Please use the absolute URL." in prompt
-    assert "Signed human reviewer requirements override AI reviewer preferences" in prompt
+    assert "Signed human reviewer requirements were not author-verified" in prompt
+    assert "override AI reviewer preferences" not in prompt
     assert "Verify each requirement in this set before approving." in prompt
     assert "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in prompt
 
@@ -5044,3 +5047,65 @@ def test_review_prompt_explains_human_only_exact_head_evidence_requests(tmp_path
         assert "only for evidence that an agent session cannot produce" in normalized
         assert "Never list missing human evidence in `blocking_items`" in normalized
         assert "Do not re-emit a request you just resolved" in normalized
+
+
+def _trust_requirement(verification):
+    return HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Please use the absolute URL.",
+        author_id=101 if verification == "verified" else None,
+        author_verification=verification,
+    )
+
+
+def test_prompts_label_unverified_signed_requirements_in_every_authority_statement():
+    """#1022: unverified authors are never presented as flatly authoritative."""
+    requirement = _trust_requirement("unverified")
+    listing = format_human_requirements((requirement,))
+    assert "- Author ID: (not verified)" in listing
+    assert "- Author verification: unverified: no trusted human reviewer identities are configured" in listing
+    assert "Their author identity was not verified by the tool" in listing
+    assert "They still must be dispositioned" in listing
+
+    context = prompts_module.render_coder_human_requirements_prompt_context((requirement,))
+    assert context.unverified_authors is True
+    coder = prompts_module._coder_human_requirements_guidance(context)
+    assert "is authoritative for" not in coder
+    assert "binding for disposition" in coder and "authors are unverified" in coder
+    assert f"`{requirement.requirement_id}`" in coder
+    assert "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->" in coder
+
+    review = prompts_module._human_requirements_review_guidance((requirement,))
+    assert "override AI reviewer preferences" not in review
+    assert "were not author-verified" in review
+    assert "approval gate below still applies" in review
+    assert "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in review
+
+
+def test_prompts_keep_authoritative_wording_when_every_author_is_verified():
+    requirement = _trust_requirement("verified")
+    listing = format_human_requirements((requirement,))
+    assert "- Author ID: 101" in listing
+    assert "- Author verification: verified against the configured trusted human reviewer set" in listing
+    assert "not verified by the tool" not in listing
+
+    context = prompts_module.render_coder_human_requirements_prompt_context((requirement,))
+    assert context.unverified_authors is False
+    coder = prompts_module._coder_human_requirements_guidance(context)
+    assert "is authoritative for next-revision requirements" in coder
+
+    review = prompts_module._human_requirements_review_guidance((requirement,))
+    assert "Signed human reviewer requirements override AI reviewer preferences" in review
+    assert "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in review
+
+
+def test_mixed_verification_is_treated_as_unverified():
+    from dataclasses import replace
+
+    requirements = (_trust_requirement("verified"), replace(_trust_requirement("unverified"), body="Other."))
+    listing = format_human_requirements(requirements)
+    assert "Their author identity was not verified by the tool" in listing
+    assert "override AI reviewer preferences" not in prompts_module._human_requirements_review_guidance(requirements)

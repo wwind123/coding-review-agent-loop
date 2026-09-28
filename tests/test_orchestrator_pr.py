@@ -15378,3 +15378,70 @@ def test_refresh_pass_with_deferred_evidence_survives_a_pending_check_stop(tmp_p
     assert set(freezes[0].metadata.evidence_freeze.signed_requirement_ids_at_freeze) == set(
         released.evidence_release.signed_requirement_ids_surfaced
     )
+
+
+def test_trust_set_change_on_resume_validates_against_current_surfaced_set(tmp_path):
+    """#1022: a requirement admitted by an unconfigured run and later excluded
+    by a configured trust set is no longer required, and its historical
+    acknowledgement does not crash the resumed validation."""
+    from agent_loop_helpers import structured_coder_followup
+    from coding_review_agent_loop.github import TrustedHumanActor, get_pr_review_context
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+    from test_human_requirement_trust import (
+        PR,
+        SIGNATURE,
+        RoutedRunner,
+        _comments_path,
+        _gql_comment,
+        _pr_projection,
+        _rest_comment,
+    )
+
+    body = "Relayed: widen the timeout." + SIGNATURE
+    projection = _pr_projection(comments=[_gql_comment(1, "agent-bot", body)])
+
+    def validate(text, requirements):
+        return orchestrator._validate_response_with_human_requirements(
+            text,
+            marker_validator=validate_structured_coder_followup,
+            human_requirements=requirements,
+            requirement_scope="PR requirements",
+            full_omission_fallback="Fetch the PR discussion directly before approving.",
+        )
+
+    first = get_pr_review_context(
+        RoutedRunner(projection=projection), config=make_config(tmp_path), pr_number=PR
+    )
+    (historical,) = first.human_requirements
+    historical_ack = structured_coder_followup(
+        human_requirement_ids=[historical.requirement_id],
+        human_requirement_dispositions=[{
+            "requirement_id": historical.requirement_id,
+            "disposition": "addressed",
+            "evidence": "Timeout widened.",
+        }],
+    ).replace(
+        "\n<!-- AGENT_STATE",
+        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n### Human requirements\n"
+        f"- {historical.requirement_id}: widened.\n<!-- AGENT_STATE",
+        1,
+    )
+
+    resumed_config = make_config(
+        tmp_path,
+        human_reviewer_trusted_actors=(TrustedHumanActor("maintainer", 101),),
+    )
+    resumed = get_pr_review_context(
+        RoutedRunner(
+            projection=projection,
+            rest={_comments_path(): [_rest_comment(1, "agent-bot", 555, body)]},
+        ),
+        config=resumed_config,
+        pr_number=PR,
+    )
+
+    assert resumed.human_requirements == ()
+    validate(structured_coder_followup(), resumed.human_requirements)
+    assert not orchestrator._current_plan_has_complete_human_requirement_dispositions(
+        historical_ack, surfaced_requirement_ids=()
+    )
