@@ -1191,7 +1191,7 @@ the crossed signals:
 | Flag | Default | Signal |
 | --- | --- | --- |
 | `--plan-growth-gate {enforce,off}` | `enforce` | Turns the gate on or off; scope-ledger preservation still applies when it is off |
-| `--plan-growth-max-chars N` | `120000` | `rendered-size`: canonical plan characters (about twice the visible plan, since encoded records are included) |
+| `--plan-growth-max-chars N` | `120000` | `rendered-size`: canonical plan characters (10% under the measured canonical size at which a plan round stops fitting a comment, about 135,700) |
 | `--plan-growth-max-scope-items N` | `12` | `scope-items`: distinct scope items |
 | `--plan-growth-max-matrix-rows N` | `18` | `matrix-rows`: risk-matrix rows |
 | `--plan-growth-max-revisions N` | `6` | `revision-count`: planner candidates, counted only while the plan is at least half the size threshold |

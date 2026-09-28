@@ -70,18 +70,50 @@ a reviewed justification.
 
 | Signal | Measurement | Flag (default) |
 | --- | --- | --- |
-| `rendered-size` | Characters of the candidate's canonical plan text (the text the approved-plan hash covers, before round metadata, the compact digest or sidecar spill) | `--plan-growth-max-chars` (120000, twice the 60000-character comment limit) |
+| `rendered-size` | Characters of the candidate's canonical plan text (the text the approved-plan hash covers, before round metadata, the compact digest or sidecar spill) | `--plan-growth-max-chars` (120000, derived below) |
 | `scope-items` | Distinct `execution_recommendation` scope item IDs | `--plan-growth-max-scope-items` (12) |
 | `matrix-rows` | Risk-matrix rows | `--plan-growth-max-matrix-rows` (18) |
 | `revision-count` | Authenticated planner-authored plan candidates, including this one | `--plan-growth-max-revisions` (6) |
 
 The size comparison is a heuristic for "this plan carries too much design
-detail", not a transport check; transport overflow is handled separately. The
-canonical text carries the recommendation and matrix both rendered and as
-encoded records, so it runs about twice the visible plan: approved plans in
-this repository measured about 21k characters for a three-scope-item plan and
-50-85k for ordinary five- or six-item plans, while plans that outgrew one
-delivery measured 120-195k.
+detail", not a transport check; transport overflow is handled separately.
+Approved plans in this repository measured about 21k canonical characters for a
+three-scope-item plan and 50-85k for ordinary five- or six-item plans.
+
+**Where 120000 comes from (#1075).** Canonical characters are not published
+characters. Round transport compresses round metadata and spills every field
+that grows with the plan (canonical text, raw response, assembled sidecar,
+recommendation and matrix records) into sidecar comments, stopping as soon as
+the anchor fits. So a published anchor's size says little about the plan's
+size. What cannot spill is the anchor's visible plan text plus the metadata
+floor left once the growing fields are references. A plan round fails closed
+when those two exceed 60000 characters. Measured on this repository's plan
+anchors:
+
+| Quantity | Measured | Source |
+| --- | --- | --- |
+| Visible characters per canonical character | 0.258 | #886's approved plan: 17,791 visible for 68,956 canonical |
+| Metadata floor with canonical text spilled | 24,995 (largest) | #871's final candidate; 10.7-17.1k on #894, #943, #1040, #1043 |
+| Largest visible plan text published | 42,495 | #1040's final candidate, 6,850 characters of headroom |
+| Tightest anchor headroom | 3,422 | #871's final candidate |
+
+The projected cliff is (60000 - 24995) / 0.258, about 135,700 canonical
+characters. The default is that cliff less 10%, rounded down to 10,000. The
+derivation lives next to `DEFAULT_PLAN_GROWTH_MAX_CHARS` in `plan_growth.py`.
+It rests on one visible-ratio sample. Plans that outgrew one delivery measured
+120-195k canonical characters (PR #1072) and still published, so their visible
+ratio was lower than #886's. Prose-heavy plans have a higher ratio and so a
+lower cliff. The default stays provisional until more plans are measured. To re-measure, run the profile over the issues' comments:
+
+```bash
+python -m coding_review_agent_loop.plan_transport_profile --repo OWNER/NAME 886 871 1040
+```
+
+It prints, per published planner round, the canonical size, the compression
+ratio `encode_mapping` achieves on it, the visible and metadata split of the
+anchor, the metadata floor, the spilled fields and sidecar comment count, and
+the projected cliff, followed by a summary.
+
 Revision count is only a combining signal: it crosses only while the plan is at
 least half the size threshold. Reviewer-only phase-advance rounds and resumed
 replays never count as revisions, and reviewer finding counts are never a
