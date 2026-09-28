@@ -4191,3 +4191,34 @@ def test_m993_ordinary_resume_without_a_rebind_retires_nothing(tmp_path, monkeyp
 
     assert handoff.approved_plan_hash == world.old_hash
     assert handoff.retired_plan_hashes == frozenset()
+
+
+def test_m1068_supersession_posted_during_review_stops_before_an_evidence_freeze(
+    tmp_path, monkeypatch
+):
+    """#1068: a signed re-plan is honored before any human evidence request."""
+    world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
+    record = comment(world.signed_record(rationale="Reduce scope mid-review."))
+
+    def issue_context(_runner, *, config, issue_number):
+        context = world._issue_context(_runner, config=config, issue_number=issue_number)
+        if issue_number == 56 and world.runner is not None and world.agent_calls("codex"):
+            return dataclasses.replace(context, comments=(*context.comments, record))
+        return context
+
+    monkeypatch.setattr(orchestrator, "get_issue_context", issue_context)
+    review = {
+        "schema_version": 1, "kind": "pr_review", "state": "approved",
+        "summary": "Code is complete.", "blocking_items": [], "same_pr_followups": [],
+        "future_followups": [], "prior_item_dispositions": [],
+        "exact_head_evidence_requests": ["Attach the authenticated live-CLI run for this head"],
+    }
+    evidence_review = json.dumps(review) + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+    with pytest.raises(AgentLoopError) as excinfo:
+        world.run_pr(codex_outputs=[evidence_review])
+    message = str(excinfo.value)
+    assert "authorizes replacing" in message and "no approval or merge was attempted" in message
+    assert not any("Exact-head evidence freeze" in body for body in world.runner.comments)
+    assert not any(
+        "Attach the authenticated live-CLI run" in body for body in world.runner.comments
+    )

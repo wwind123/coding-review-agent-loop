@@ -17685,8 +17685,8 @@ _EVIDENCE_RELEASE_MESSAGES = {
         "proceeds to final validation at the same head."
     ),
     "refresh-clean": (
-        "a same-head refresh for new signed input found no findings and no pending evidence. "
-        "The PR proceeds to final validation at the same head."
+        "a same-head refresh for new signed input found no findings. The PR proceeds to "
+        "final validation at the same head."
     ),
 }
 
@@ -17771,11 +17771,10 @@ def _publish_evidence_release(
     """Post the single terminal release comment carrying the released ledger."""
     released = release_evidence_freeze(items)
     message = _EVIDENCE_RELEASE_MESSAGES[reason].format(detail=detail or "see the checks comment")
-    heading = (
-        "## Exact-head evidence accepted"
-        if reason in {"evidence-cleared", "refresh-clean"}
-        else "## Exact-head evidence freeze released"
-    )
+    heading = {
+        "evidence-cleared": "## Exact-head evidence accepted",
+        "refresh-clean": "## Same-head refresh complete",
+    }.get(reason, "## Exact-head evidence freeze released")
     post_pr_comment(
         runner,
         config=config,
@@ -24127,6 +24126,7 @@ def run_pr_loop(
                 elif evidence_response_head is not None:
                     # Evidence kept at the frozen head: no CI wait or
                     # qualification; revalidate and re-persist the freeze.
+                    recheck_pending_child_plan_supersession()
                     gate_outcome = _evidence_freeze_gate(
                         runner,
                         config=config,
@@ -24154,6 +24154,27 @@ def run_pr_loop(
                         f"PR #{pr_number} evidence gate proceeded while evidence is pending; "
                         "no approval or merge was attempted."
                     )
+                else:
+                    # A pre-freeze refresh pass with the evidence still
+                    # deferred also ends with one terminal record, so a clean
+                    # stop for pending checks afterwards keeps the pass (its
+                    # reviews, requests and refreshed signed baseline) instead
+                    # of leaving it as an interrupted transcript.
+                    unresolved_items = _publish_evidence_release(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        round_number=round_number,
+                        head_sha=pass_head,
+                        items=unresolved_items,
+                        reason="refresh-clean",
+                        surfaced_requirement_ids=surfaced_reviewer_requirement_ids,
+                        allowed_rounds=allowed_rounds,
+                        watch_failure_extension_used=watch_failure_extension_used,
+                        watch_head_extension_used=watch_head_extension_used,
+                        clearances=evidence_clearances,
+                    )
+                    evidence_revalidation_required = True
 
             if must_fix_items:
                 try:
@@ -24597,6 +24618,9 @@ def run_pr_loop(
                             f"PR #{pr_number} was released to ordinary CI, but recovery provenance "
                             "could not be correlated; no merge attempted."
                         )
+                    # A signed child-plan supersession stops the run before any freeze
+                    # can ask a human for evidence under a plan authorized for replacement.
+                    recheck_pending_child_plan_supersession()
                     # Exact-head evidence gate (#1068): the last reads before any
                     # finalization side effect; publishes the single freeze when evidence
                     # is pending, and otherwise revalidates head and signed input.
@@ -24622,7 +24646,6 @@ def run_pr_loop(
                         if gate_outcome.action == "refresh":
                             stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
                             continue
-                    recheck_pending_child_plan_supersession()
                     merged = _finalize_ordinary_recovery_checked(
                         runner,
                         config=config,
@@ -24861,6 +24884,9 @@ def run_pr_loop(
                         unresolved_items = _clear_machine_obligations(
                             unresolved_items, kind="github-pr-checks"
                         )
+                        # A signed child-plan supersession stops the run before any freeze
+                        # can ask a human for evidence under a plan authorized for replacement.
+                        recheck_pending_child_plan_supersession()
                         # Exact-head evidence gate (#1068): the last reads before any
                         # finalization side effect; publishes the single freeze when evidence
                         # is pending, and otherwise revalidates head and signed input.
@@ -24886,7 +24912,6 @@ def run_pr_loop(
                             if gate_outcome.action == "refresh":
                                 stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
                                 continue
-                        recheck_pending_child_plan_supersession()
                         _ensure_finalization_ready(
                             pr_number=pr_number,
                             round_number=round_number,
@@ -25456,6 +25481,9 @@ def run_pr_loop(
                                         f"PR #{pr_number} managed resume could not be correlated to ordinary "
                                         "recovery CI; no merge attempted."
                                     )
+                                # A signed child-plan supersession stops the run before any freeze
+                                # can ask a human for evidence under a plan authorized for replacement.
+                                recheck_pending_child_plan_supersession()
                                 # Exact-head evidence gate (#1068): the last reads before any
                                 # finalization side effect; publishes the single freeze when evidence
                                 # is pending, and otherwise revalidates head and signed input.
@@ -25481,7 +25509,6 @@ def run_pr_loop(
                                     if gate_outcome.action == "refresh":
                                         stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
                                         continue
-                                recheck_pending_child_plan_supersession()
                                 merged = _finalize_ordinary_recovery_checked(
                                     runner,
                                     config=config,
@@ -25585,6 +25612,9 @@ def run_pr_loop(
                                 unresolved_items = _clear_machine_obligations(
                                     unresolved_items, kind="managed-exact-head-ci"
                                 )
+                                # A signed child-plan supersession stops the run before any freeze
+                                # can ask a human for evidence under a plan authorized for replacement.
+                                recheck_pending_child_plan_supersession()
                                 # Exact-head evidence gate (#1068): the last reads before any
                                 # finalization side effect; publishes the single freeze when evidence
                                 # is pending, and otherwise revalidates head and signed input.
@@ -25610,7 +25640,6 @@ def run_pr_loop(
                                     if gate_outcome.action == "refresh":
                                         stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
                                         continue
-                                recheck_pending_child_plan_supersession()
                                 _ensure_finalization_ready(
                                     pr_number=pr_number,
                                     round_number=round_number,
@@ -25808,6 +25837,9 @@ def run_pr_loop(
                                     f"PR #{pr_number} ordinary recovery provenance is unavailable; "
                                     "no merge attempted."
                                 )
+                            # A signed child-plan supersession stops the run before any freeze
+                            # can ask a human for evidence under a plan authorized for replacement.
+                            recheck_pending_child_plan_supersession()
                             # Exact-head evidence gate (#1068): the last reads before any
                             # finalization side effect; publishes the single freeze when evidence
                             # is pending, and otherwise revalidates head and signed input.
@@ -25833,7 +25865,6 @@ def run_pr_loop(
                                 if gate_outcome.action == "refresh":
                                     stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
                                     continue
-                            recheck_pending_child_plan_supersession()
                             merged = _finalize_ordinary_recovery_checked(
                                 runner,
                                 config=config,
@@ -25866,6 +25897,9 @@ def run_pr_loop(
                             )["coder_blockers"]
                         )
                     if not must_fix_items:
+                        # A signed child-plan supersession stops the run before any freeze
+                        # can ask a human for evidence under a plan authorized for replacement.
+                        recheck_pending_child_plan_supersession()
                         # Exact-head evidence gate (#1068): the last reads before any
                         # finalization side effect; publishes the single freeze when evidence
                         # is pending, and otherwise revalidates head and signed input.
@@ -25891,7 +25925,6 @@ def run_pr_loop(
                             if gate_outcome.action == "refresh":
                                 stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
                                 continue
-                        recheck_pending_child_plan_supersession()
                         _ensure_finalization_ready(
                             pr_number=pr_number,
                             round_number=round_number,

@@ -15317,3 +15317,64 @@ def test_head_moving_at_the_gate_read_publishes_no_freeze(tmp_path, monkeypatch)
     assert "final barrier" in str(excinfo.value) or "exact-head evidence" in str(excinfo.value)
     assert "evidence-freeze" not in _phases(runner)
     assert not any("Exact-head evidence freeze" in comment for comment in runner.comments)
+
+
+def test_refresh_pass_with_deferred_evidence_survives_a_pending_check_stop(tmp_path, monkeypatch):
+    """Rows signed-input-before-freeze and clean-reviews-check-not-green: a
+    refresh pass ends with one terminal record even when checks then pend."""
+    runner = _frozen_runner(
+        tmp_path,
+        codex_outputs=[
+            _evidence_review(
+                evidence=[_EVIDENCE_TEXT], hr=True,
+                dispositions=[_resolve("item-1", "Still needed; not a code issue.")],
+            )
+        ],
+    )
+    config = make_config(tmp_path)
+    _inject_signed_input_before(
+        monkeypatch, runner, body="Keep the legacy flag.",
+        when=lambda: len(runner.codex_outputs) == 1,
+    )
+    real_checks = orchestrator.get_pr_checks
+    pending = {"on": True}
+
+    def checks_pending_after_refresh(*args, **kwargs):
+        if pending["on"] and not runner.codex_outputs:
+            runner.pr_check_runs_payload = {
+                "check_runs": [{"name": "test", "status": "in_progress", "conclusion": None}]
+            }
+        return real_checks(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", checks_pending_after_refresh)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    releases = _release_records(runner)
+    assert [record.metadata.evidence_release.reason for record in releases] == ["refresh-clean"]
+    pass_reviews = [
+        record for record in _pr_records(runner)
+        if record.metadata.phase == "evidence-response"
+    ]
+    assert len(pass_reviews) == 1 and pass_reviews[0].index < releases[0].index
+    released = releases[0].metadata
+    assert set(pass_reviews[0].metadata.surfaced_reviewer_requirement_ids) == set(
+        released.evidence_release.signed_requirement_ids_surfaced
+    )
+    assert [item.lifecycle for item in released.prior_items
+            if item.obligation_kind == "human-exact-head-evidence"] == ["evidence_deferred"]
+    assert "evidence-freeze" not in _phases(runner)
+
+    # Restart once checks pass: the pass is kept, no reviewer re-runs, and the
+    # deferred evidence is frozen with the refreshed baseline.
+    pending["on"] = False
+    runner.pr_check_runs_payload = {
+        "check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]
+    }
+    commands_before = len(runner.commands)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(cmd[:1] == ["codex"] for cmd, _cwd in runner.commands[commands_before:])
+    freezes = _freeze_records(runner)
+    assert len(freezes) == 1
+    assert set(freezes[0].metadata.evidence_freeze.signed_requirement_ids_at_freeze) == set(
+        released.evidence_release.signed_requirement_ids_surfaced
+    )
