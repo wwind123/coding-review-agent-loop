@@ -3952,6 +3952,9 @@ class _FailedActivationContext:
     label_released: bool = False
     release_reason: str | None = None
     release_reason_kind: Literal["foreign-actor", "event-changed"] | None = None
+    # Set when a release was skipped because the base workflow has no
+    # unlabeled recovery route; it vetoes any automatic readiness write.
+    recovery_incapable_fallback: bool = False
     resume_command: str | None = None
     report: str | None = None
 
@@ -4114,8 +4117,11 @@ def _build_failed_activation_report(
                 "it would suppress ordinary CI on an unqualified head and mint a new label event."
             )
         if measured is not None and measured.labeled is True:
+            # Only an acknowledged DELETE followed by a labeled read is an
+            # observed re-add; an unconfirmed DELETE proves no transition.
+            presence = "is present again" if context.label_released else "is present"
             lines.append(
-                f"`{MANAGED_LABEL}` is present again; suppression is still active and ordinary "
+                f"`{MANAGED_LABEL}` {presence}; suppression is still active and ordinary "
                 "CI has not resumed."
             )
         elif measured is not None and measured.labeled is False and context.recovery_capable:
@@ -4126,6 +4132,7 @@ def _build_failed_activation_report(
     mismatches = _entry_tuple_mismatches(entry, measured) if measured is not None else []
     safe_manual_ready = (
         not integrity
+        and not context.recovery_incapable_fallback
         and measured is not None
         and not measured.unknown_fields()
         and measured.draft is True
@@ -4203,7 +4210,8 @@ def _evaluate_ready_restoration(
             f"No readiness restoration is needed: the PR is measured {measured.render()}"
             + (f" (changed fields: {', '.join(mismatches)})" if mismatches else "")
             + " and no ready-to-draft conversion by this run was acknowledged.",
-            "resume" if clean else "C",
+            # A nonzero ready-to-draft exit is ambiguous: always inspect.
+            "resume" if clean and not context.ready_undo_ambiguous else "C",
             None,
         )
     if measured.draft is False:
@@ -4217,6 +4225,13 @@ def _evaluate_ready_restoration(
         )
     if integrity:
         return "Automatic readiness restoration was refused for ownership integrity.", "C", None
+    if context.recovery_incapable_fallback:
+        return (
+            "Automatic readiness restoration was refused: the base workflow has no unlabeled "
+            "recovery route, so this run released no label and makes no readiness write.",
+            "C",
+            None,
+        )
     if not context.drafted_by_this_run:
         if context.ready_undo_ambiguous:
             return (
@@ -4464,6 +4479,8 @@ def _release_for_ordinary_recovery(
         report_context.release_reason = reason
         report_context.recovery_capable = recovery_capable
     if not recovery_capable:
+        if report_context is not None:
+            report_context.recovery_incapable_fallback = True
         log(
             config,
             f"PR #{pr_number}: ordinary recovery was not selected because the base workflow "

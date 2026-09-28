@@ -11731,7 +11731,7 @@ def test_m1067_recovery_incapable_base_reports_without_release(tmp_path):
     _m1067_assert_text(report)
     assert f"its `{MANAGED_LABEL}` label request was acknowledged" in report
     assert "Ordinary CI can resume" not in report
-    assert "Readiness was not restored: the PR is still labeled." in report
+    assert "base workflow has no unlabeled recovery route" in report
     assert "Do not ready or unlabel the PR." in report
     assert _m1067_label_deletes(runner) == []
     assert _m1067_ready_calls(runner) == []
@@ -12019,6 +12019,9 @@ def test_m1067_failed_delete_on_draft_labeled_entry(tmp_path, readied):
         assert "remains draft" not in text
     else:
         assert "It remains draft/labeled and managed qualification was abandoned." in text
+    # An unconfirmed DELETE proves no removal, so no re-add is claimed.
+    assert f"`{MANAGED_LABEL}` is present; suppression is still active" in text
+    assert "present again" not in text
     assert _m1067_ready_calls(runner) == []
 
 
@@ -12342,3 +12345,40 @@ def test_m1067_printed_inspection_query_tolerates_malformed_payloads(tmp_path):
     for labels in ({}, None):
         assert evaluate({"labels": labels})["labels"] == {"malformed_container": labels}
     assert evaluate({})["labels"] == {"malformed_container": None}
+
+
+def test_m1067_recovery_incapable_fallback_never_readies_after_concurrent_unlabel(tmp_path):
+    # Another actor removes the label before the report read; the skipped
+    # release still vetoes any automatic readiness write (review item-1).
+    runner = _m1067_ready_runner(
+        workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY,
+        unreadable_issue_events_after_label=True,
+        hooks={"post": lambda r: r.rest_pr.__setitem__("labels", [])},
+    )
+
+    contract = _m1067_activate(runner, _m1067_config(tmp_path))
+
+    assert contract is not None and contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is None
+    report = contract.state_report
+    _m1067_assert_text(report)
+    assert "it is now draft/unlabeled" in report
+    assert "base workflow has no unlabeled recovery route" in report
+    assert "Do not ready or unlabel the PR." in report
+    assert "gh pr ready 7" not in report
+    assert _m1067_ready_calls(runner) == []
+    assert _m1067_label_deletes(runner) == []
+
+
+def test_m1067_nonzero_undo_with_pr_still_ready_gives_inspection_remedy(tmp_path):
+    # Review item-3: an ambiguous ready-to-draft exit always gets remedy (C).
+    runner = _m1067_ready_runner(undo_returncode=1, undo_applies=False)
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "its ready-to-draft request was not confirmed" in text
+    assert "No readiness restoration is needed: the PR is measured ready/unlabeled" in text
+    assert "Do not ready or unlabel the PR. Inspect it with `gh api repos/OWNER/REPO/pulls/7" in text
+    assert "Resume with `" not in text
+    assert "gh pr ready 7" not in text
+    assert _m1067_ready_calls(runner) == []
