@@ -49,6 +49,13 @@ def _issue_comment_url(comment_id: int) -> str:
     return f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-{comment_id}"
 
 
+class RawOutput:
+    """A REST reply served verbatim, e.g. an empty successful response."""
+
+    def __init__(self, stdout: str):
+        self.stdout = stdout
+
+
 class RoutedRunner:
     """Minimal runner that serves `gh pr/issue view` and REST reads."""
 
@@ -70,6 +77,8 @@ class RoutedRunner:
                         return CommandResult(cmd, Path("."), "", "boom", 1)
                     if callable(payload):
                         payload = payload(path)
+                    if isinstance(payload, RawOutput):
+                        return CommandResult(cmd, Path("."), payload.stdout, "", 0)
                     return CommandResult(cmd, Path("."), json.dumps(payload), "", 0)
             raise AssertionError(f"unexpected REST read: {path}")
         raise AssertionError(f"unexpected command: {cmd}")
@@ -518,6 +527,8 @@ def test_bot_login_spellings_are_one_identity(tmp_path):
         ("alice:x", "positive numeric"),
         (":5", "blank or malformed login"),
         ("alice:", "positive numeric"),
+        ("alice:extra:5", "LOGIN:ID"),
+        ("alice::5", "LOGIN:ID"),
     ],
 )
 def test_malformed_trust_entries_are_rejected(value, message):
@@ -587,3 +598,30 @@ def test_signed_board_amendment_is_unchanged_and_triggers_no_verification(tmp_pa
         [SimpleNamespace(body=amendment)], flow="plan", issue_number=ISSUE
     )
     assert len(amendments) == 1
+
+
+@pytest.mark.parametrize("stdout", ["", "  \n"])
+@pytest.mark.parametrize("source", ["comments", "reviews", "issue-body"])
+def test_empty_successful_rest_output_fails_closed(tmp_path, source, stdout):
+    """#1022 review: a zero-exit empty REST reply is an incomplete read, not an empty history."""
+    body = "Keep the API stable." + SIGNATURE
+    if source == "comments":
+        runner = RoutedRunner(
+            projection=_pr_projection(comments=[_gql_comment(1, "maintainer", body)]),
+            rest={_comments_path(): RawOutput(stdout)},
+        )
+        load = lambda: get_pr_review_context(runner, config=_config(tmp_path), pr_number=PR)
+    elif source == "reviews":
+        runner = RoutedRunner(
+            projection=_pr_projection(reviews=[{"id": "PRR_1", "author": {"login": "maintainer"}, "body": body}]),
+            rest={f"repos/{REPO}/pulls/{PR}/reviews": RawOutput(stdout)},
+        )
+        load = lambda: get_pr_review_context(runner, config=_config(tmp_path), pr_number=PR)
+    else:
+        runner = RoutedRunner(
+            projection=_issue_projection(),
+            rest={f"repos/{REPO}/issues/{ISSUE}": RawOutput(stdout)},
+        )
+        load = lambda: get_issue_context(runner, config=_config(tmp_path), issue_number=ISSUE)
+    with pytest.raises(AgentLoopError, match="empty response|read is incomplete"):
+        load()

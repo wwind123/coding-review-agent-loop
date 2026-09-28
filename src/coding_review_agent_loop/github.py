@@ -1994,6 +1994,7 @@ def read_rest_issue_comments(
     config: AgentLoopConfig,
     issue_number: int,
     purpose: str,
+    reject_empty_output: bool = False,
 ) -> tuple[IssueComment, ...]:
     """Read an issue's complete comment history from REST, with numeric IDs.
 
@@ -2023,6 +2024,13 @@ def read_rest_issue_comments(
             raise AgentLoopError(
                 f"GitHub issue comment recovery for issue #{issue_number} is incomplete; "
                 f"{purpose}."
+            )
+        if reject_empty_output and not (result.stdout or "").strip():
+            # An empty successful response is not proof of an empty history;
+            # callers that must fail closed treat it as an incomplete read.
+            raise AgentLoopError(
+                f"GitHub issue comment recovery for issue #{issue_number} returned an empty "
+                f"response; {purpose}."
             )
         try:
             raw_page = json.loads(result.stdout or "[]")
@@ -2289,12 +2297,12 @@ def _gh_api_json(
         cwd=active_workdir(config),
         check=False,
     )
-    if result.returncode != 0:
+    if result.returncode != 0 or not (result.stdout or "").strip():
         raise AgentLoopError(
             f"GitHub {description} read is incomplete; {_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE}."
         )
     try:
-        return json.loads(result.stdout or "null")
+        return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise AgentLoopError(
             f"GitHub {description} read returned malformed JSON; "
@@ -2352,6 +2360,7 @@ def _read_rest_issue_comment_records(
         config=config,
         issue_number=number,
         purpose=_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE,
+        reject_empty_output=True,
     )
     index: dict[tuple[str, str], _RestSignedRecord] = {}
     for comment in comments:

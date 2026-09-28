@@ -1367,9 +1367,10 @@ def parse_human_reviewer_trusted_actors(
     login_by_id: dict[int, str] = {}
     for raw in values or ():
         entry = str(raw)
-        if ":" not in entry:
+        if entry.count(":") != 1:
+            # GitHub logins cannot contain ':', so exactly one separator is required.
             raise AgentLoopError(f"{option} {entry!r} must have the form LOGIN:ID.")
-        login, _, raw_id = entry.rpartition(":")
+        login, _, raw_id = entry.partition(":")
         login = login.strip()
         raw_id = raw_id.strip()
         if not login or any(ch.isspace() for ch in login):
