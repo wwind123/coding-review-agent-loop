@@ -15445,3 +15445,126 @@ def test_trust_set_change_on_resume_validates_against_current_surfaced_set(tmp_p
     assert not orchestrator._current_plan_has_complete_human_requirement_dispositions(
         historical_ack, surfaced_requirement_ids=()
     )
+
+
+def test_pr_loop_resume_with_trust_set_excludes_historically_acknowledged_requirement(tmp_path):
+    """#1022 review item-4: resume the real PR loop after the trust set changes.
+
+    An unconfigured run surfaced and acknowledged a signed comment from an
+    agent account.  The resumed run configures a trust set that excludes it:
+    the requirement is loaded through the real context/verification path,
+    is not surfaced to the coder or reviewer, the historical acknowledgement
+    records do not raise, and a coder response that omits the ID validates.
+    """
+    from coding_review_agent_loop.github import TrustedHumanActor
+    from coding_review_agent_loop.runner import CommandResult
+
+    signed_url = "https://github.com/OWNER/REPO/pull/77#issuecomment-1"
+    signed_body = "Relayed: widen the timeout.\n\n-- Human Reviewer"
+    excluded = HumanReviewRequirement(
+        source_type="PR comment",
+        author="agent-bot",
+        created_at="2026-05-18T10:00:00Z",
+        url=signed_url,
+        body="Relayed: widen the timeout.",
+    )
+    historical_review = _attach_round_metadata(
+        structured_pr_review(
+            state="approved",
+            summary="Codex approved under the unconfigured run.",
+            human_requirements_resolved=True,
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="OpenAI Codex",
+            round_number=1,
+            subject="abc000",
+            state="approved",
+            surfaced_reviewer_requirement_ids=(excluded.requirement_id,),
+        ),
+    )
+    historical_coder_ack = structured_coder_followup(
+        human_requirement_ids=[excluded.requirement_id],
+        human_requirement_dispositions=[{
+            "requirement_id": excluded.requirement_id,
+            "disposition": "addressed",
+            "evidence": "Timeout widened.",
+        }],
+    )
+
+    class TrustRunner(FakeRunner):
+        def run(self, args, *, cwd, input_text=None, check=True, env=None):
+            cmd = [str(arg) for arg in args]
+            if cmd[:2] == ["gh", "api"] and len(cmd) > 2 and re.fullmatch(
+                r"repos/OWNER/REPO/issues/77/comments\?per_page=100&page=\d+", cmd[2]
+            ):
+                self.commands.append((cmd, Path(cwd)))
+                page = [{
+                    "id": 1,
+                    "user": {"login": "agent-bot", "id": 555},
+                    "created_at": "2026-05-18T10:00:00Z",
+                    "html_url": signed_url,
+                    "body": signed_body,
+                }] if cmd[2].endswith("page=1") else []
+                return CommandResult(cmd, Path(cwd), json.dumps(page), "", 0)
+            return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+    runner = TrustRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            structured_pr_review(state="blocking", blocking_items=["Fix the retry bound."]),
+            structured_pr_review(
+                state="approved",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        pr_payload={
+            "number": 77,
+            "state": "OPEN",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+            "title": "Widen timeout",
+            "headRefName": "feature/timeout",
+            "baseRefName": "main",
+            "headRefOid": "abc123",
+            "comments": [
+                {
+                    "author": {"login": "agent-bot"},
+                    "createdAt": "2026-05-18T10:00:00Z",
+                    "url": signed_url,
+                    "body": signed_body,
+                },
+                {
+                    "author": {"login": "coding-review-agent-loop"},
+                    "createdAt": "2026-05-18T11:00:00Z",
+                    "url": "https://github.com/OWNER/REPO/pull/77#issuecomment-2",
+                    "body": str(historical_review),
+                },
+                {
+                    "author": {"login": "coding-review-agent-loop"},
+                    "createdAt": "2026-05-18T11:30:00Z",
+                    "url": "https://github.com/OWNER/REPO/pull/77#issuecomment-3",
+                    "body": historical_coder_ack,
+                },
+            ],
+            "reviews": [],
+        },
+    )
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        reviewer="codex",
+        max_rounds=2,
+        human_reviewer_trusted_actors=(TrustedHumanActor("maintainer", 101),),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    rest_reads = [cmd[2] for cmd, _cwd in runner.commands if cmd[:2] == ["gh", "api"]]
+    assert any("issues/77/comments?per_page=100" in path for path in rest_reads)
+    coder_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    review_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    assert coder_prompts and len(review_prompts) == 2
+    for prompt in (*coder_prompts, *review_prompts):
+        assert f"Requirement {excluded.requirement_id}:" not in prompt
+    assert "No signed human requirements were surfaced" in coder_prompts[-1]

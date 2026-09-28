@@ -625,3 +625,45 @@ def test_empty_successful_rest_output_fails_closed(tmp_path, source, stdout):
         load = lambda: get_issue_context(runner, config=_config(tmp_path), issue_number=ISSUE)
     with pytest.raises(AgentLoopError, match="empty response|read is incomplete"):
         load()
+
+
+def test_pr_review_without_node_id_or_url_is_excluded(tmp_path, capsys):
+    """#1022 review item-3: a review with neither URL nor node ID has no locator."""
+    body = "Keep the API stable." + SIGNATURE
+    runner = RoutedRunner(
+        projection=_pr_projection(reviews=[{"author": {"login": "maintainer"}, "body": body}]),
+        rest={f"repos/{REPO}/pulls/{PR}/reviews": [
+            {"id": 1, "node_id": "PRR_1", "user": {"login": "maintainer", "id": 101}, "body": body},
+        ]},
+    )
+    context = get_pr_review_context(runner, config=_config(tmp_path, quiet=False), pr_number=PR)
+    assert context.human_requirements == ()
+    assert "no verifiable record locator" in _logged(capsys)
+
+
+def test_duplicate_rest_review_node_id_fails_closed(tmp_path):
+    """#1022 review item-3: two REST reviews sharing a node ID never pick one."""
+    body = "Keep the API stable." + SIGNATURE
+    runner = RoutedRunner(
+        projection=_pr_projection(reviews=[{"id": "PRR_1", "author": {"login": "maintainer"}, "body": body}]),
+        rest={f"repos/{REPO}/pulls/{PR}/reviews": [
+            {"id": 1, "node_id": "PRR_1", "user": {"login": "maintainer", "id": 101}, "body": body},
+            {"id": 2, "node_id": "PRR_1", "user": {"login": "outsider", "id": 7}, "body": body},
+        ]},
+    )
+    with pytest.raises(AgentLoopError, match="sharing one locator"):
+        get_pr_review_context(runner, config=_config(tmp_path), pr_number=PR)
+
+
+def test_pr_review_node_id_never_joins_a_comment_record(tmp_path, capsys):
+    """#1022 review item-3: the node-ID join is scoped to the review source."""
+    body = "Keep the API stable." + SIGNATURE
+    runner = RoutedRunner(
+        projection=_pr_projection(reviews=[{"id": "PRR_1", "author": {"login": "maintainer"}, "body": body}]),
+        rest={f"repos/{REPO}/pulls/{PR}/reviews": [
+            {"id": 2, "node_id": "PRR_2", "user": {"login": "maintainer", "id": 101}, "body": body},
+        ]},
+    )
+    context = get_pr_review_context(runner, config=_config(tmp_path, quiet=False), pr_number=PR)
+    assert context.human_requirements == ()
+    assert "absent from the complete REST read" in _logged(capsys)
