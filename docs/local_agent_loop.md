@@ -4878,10 +4878,69 @@ unmet blocks, which dispatches the coder in the same PR; the coder must
 disposition the requirement and reviewers must mark it resolved before the loop
 approves again. The approval message and `agent-loop pr --help` name this path.
 
-Only a human may sign. The signature certifies human authorship and nothing
-verifies it, so an agent must never add it on its own initiative; when an
-operator instructs an agent to relay their decision, the comment must disclose
-the relay.
+Only a human may sign. An agent must never add the signature on its own
+initiative; when an operator instructs an agent to relay their decision, the
+comment must disclose the relay.
+
+**Who may sign: trusted human reviewer identities.** By default nothing
+verifies who wrote a signed comment. The signature is an honour-system
+convention, and anyone with write access to the repository (including the
+agent accounts, which often run with dangerous permissions) can create an
+approval-critical requirement. Coder and reviewer prompts say so: every
+requirement is shown with `Author verification: unverified`, and the authority
+wording says the author was not verified. Every surfaced requirement must still
+be dispositioned, and the reviewer approval gate is unchanged.
+
+To make the signature an attestation that agent-loop checks, configure the
+identities whose signed comments count:
+
+```bash
+agent-loop pr 99 \
+  --human-reviewer-trusted-actor maintainer:1234567 \
+  --human-reviewer-trusted-actor relay-bot:7654321
+```
+
+Each value is `LOGIN:ID`: a GitHub login and that account's immutable numeric
+user ID (`gh api users/LOGIN --jq .id`). The option is repeatable and is
+accepted by `issue`, `pr`, and `managed-pr`. Startup fails on a malformed entry:
+a missing colon, a blank login, a non-positive or non-numeric ID, or one ID
+listed with two different logins. Recovery and CI-rerun commands that
+agent-loop prints repeat every entry.
+
+With a trust set configured, agent-loop reads each signed candidate's live REST
+record: issue and PR conversation comments from `issues/{n}/comments`, the
+issue body from `issues/{n}`, and PR reviews from `pulls/{n}/reviews`. It joins
+each candidate to its REST record only by exact locator: the comment or issue
+URL, or the review node ID, since `gh`'s review projection has no URL. It never
+joins by timestamp or body. A candidate is admitted as `verified`, with its
+numeric author ID recorded as provenance, only when the REST login matches an
+entry (case-insensitively; an app's `slug` and `slug[bot]` spellings are one
+identity) and the numeric user ID equals that entry's ID. Every other candidate
+is excluded, and a diagnostic is logged naming the source, URL, observed
+login/ID, and reason:
+
+- no verifiable record locator;
+- the locator is absent from the complete REST read;
+- the REST record has no numeric author ID;
+- the login matches an entry but the ID differs (a renamed or reused login);
+- the ID matches an entry but the login differs;
+- the author is not in the trusted set.
+
+Excluded comments are not approval-critical. They never reach the requirement
+sections, surfaced IDs, disposition validation, or requirement gates, and they
+remain visible only as ordinary untrusted discussion. No GitHub comment is
+posted about an exclusion. The following fail closed with an error instead of
+admitting or silently dropping a requirement: a failed or incomplete REST read,
+two REST records that share one locator, or a REST record whose current body,
+signature, or author differs from the loaded context. In the last case the
+record changed during verification, so rerun the command. Requirement IDs do
+not depend on verification, so configuring or changing the trust set never
+renames a requirement. It can change which requirements are surfaced; a
+requirement excluded on resume is simply no longer required.
+
+This verification covers signed human requirements only. Reviewer-board
+amendments, child-disposition overrides, and child-plan supersessions still use
+the textual signature check alone and remain honour-system.
 
 When signed requirements are present, legacy coder markdown acknowledgement
 responses must include:

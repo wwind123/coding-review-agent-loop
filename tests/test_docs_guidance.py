@@ -770,3 +770,25 @@ def test_cli_help_and_docs_describe_the_exact_head_evidence_freeze():
         "signed-requirement identity",
     ):
         assert phrase in guide, phrase
+
+
+def test_docs_describe_trusted_human_reviewer_identities():
+    """#1022: the signature's trust model is documented plainly."""
+    readme = README.read_text(encoding="utf-8")
+    local = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    for text in (readme, local, architecture):
+        assert "--human-reviewer-trusted-actor" in text
+        assert "honour-system" in text or "honour system" in text
+    assert "LOGIN:ID" in readme and "gh api users/LOGIN --jq .id" in readme
+    assert "anyone with write access" in readme
+    for phrase in (
+        "Author verification: unverified",
+        "the login matches an entry but the ID differs",
+        "the ID matches an entry but the login differs",
+        "Reviewer-board",
+        "child-disposition overrides, and child-plan supersessions",
+    ):
+        assert phrase in local, phrase
+    help_text = build_parser()._subparsers._group_actions[0].choices["pr"].format_help()
+    assert "--human-reviewer-trusted-actor" in help_text

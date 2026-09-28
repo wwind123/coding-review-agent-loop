@@ -629,6 +629,19 @@ requirements and remain approval-critical. See
 [Human requirements](docs/local_agent_loop.md#human-requirements) for the exact
 contract.
 
+By default the signature is an honour system: agent-loop does not check who
+wrote a signed comment, so anyone with write access to the repository,
+including the agent accounts themselves, can create an authoritative
+requirement. Prompts then label every requirement's author as unverified. To
+admit only specific identities, pass one repeatable
+`--human-reviewer-trusted-actor LOGIN:ID` per trusted account (find the numeric
+ID with `gh api users/LOGIN --jq .id`). With a trust set configured, a signed
+issue body, issue comment, PR comment, or PR review counts only when its live
+REST author matches both the login and the numeric ID of one entry. Other
+signed comments are logged as excluded and stay ordinary discussion. An agent
+account that relays operator decisions must be listed explicitly if its relayed
+comments should count.
+
 ### What "review" and "approval" mean
 
 Agent-loop publishes model reviews as structured comments in the pull

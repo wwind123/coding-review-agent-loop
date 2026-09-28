@@ -50,6 +50,7 @@ from .protocol_markers import (
     TrustedBody,
     named_reserved_marker_tokens,
     record_shaped_untrusted_markers,
+    sanitize_untrusted_prose,
     stored_body_matches_posted,
     strip_known_host_footer,
 )
@@ -112,6 +113,21 @@ class FoundIssue:
     body: str | None
 
 
+HumanRequirementVerification = Literal["unverified", "verified"]
+
+
+@dataclass(frozen=True)
+class TrustedHumanActor:
+    """One configured identity whose signed comments count as requirements (#1022).
+
+    Both the login and the immutable numeric user ID must match, as managed CI
+    does for its trusted actor: a login alone can be renamed or reused.
+    """
+
+    login: str
+    user_id: int
+
+
 @dataclass(frozen=True)
 class HumanReviewRequirement:
     source_type: str
@@ -119,6 +135,14 @@ class HumanReviewRequirement:
     created_at: str | None
     url: str | None
     body: str
+    # Provenance only (#1022).  None of these fields participate in the
+    # canonical key or stable requirement ID, so an acknowledgement recorded
+    # before verification existed still names the same requirement.
+    author_id: int | None = None
+    author_verification: HumanRequirementVerification = "unverified"
+    # GraphQL node ID of the source record.  gh's review projection has no
+    # URL, so a PR review is located for REST verification by its node ID.
+    node_id: str | None = None
 
     @property
     def requirement_id(self) -> str:
@@ -1228,7 +1252,13 @@ def deduplicate_human_requirements(
         # The same URL/body can be surfaced by issue and PR API payloads with
         # slightly different metadata. Keep the deterministic earliest record;
         # its body and source locator remain the cross-surface identity.
-        if _human_requirement_sort_key(requirement) < _human_requirement_sort_key(previous):
+        requirement_sort = _human_requirement_sort_key(requirement)
+        previous_sort = _human_requirement_sort_key(previous)
+        if requirement_sort < previous_sort or (
+            requirement_sort == previous_sort
+            and requirement.author_verification == "verified"
+            and previous.author_verification != "verified"
+        ):
             found[key] = requirement
     return tuple(sorted(found.values(), key=_human_requirement_sort_key))
 
@@ -1308,7 +1338,12 @@ def get_pr_review_context(
     return PullRequestReviewContext(
         metadata=metadata,
         comments=comments,
-        human_requirements=_parse_pr_human_requirements(data),
+        human_requirements=verify_human_requirement_authors(
+            runner,
+            config=config,
+            number=pr_number,
+            candidates=_parse_pr_human_requirements(data),
+        ),
     )
 
 
@@ -1453,8 +1488,11 @@ def _parse_issue_comments(raw_comments: object) -> tuple[IssueComment, ...]:
                 body=_optional_str(raw_comment.get("body")),
                 comment_id=comment_id,
                 author_id=_author_id(author),
-                url=_optional_str(raw_comment.get("url"))
-                or _optional_str(raw_comment.get("html_url")),
+                # REST carries both the API ``url`` and the web ``html_url``;
+                # the permalink is ``html_url``.  GraphQL has only ``url``,
+                # which is already the web permalink (#1022).
+                url=_optional_str(raw_comment.get("html_url"))
+                or _optional_str(raw_comment.get("url")),
             )
         )
     return tuple(sorted(comments, key=_comment_sort_key))
@@ -1805,6 +1843,7 @@ def _parse_pr_human_requirements(data: dict[str, object]) -> tuple[HumanReviewRe
                 or raw_review.get("created_at"),
                 url=raw_review.get("url"),
                 body=body,
+                node_id=_optional_str(raw_review.get("id")),
             )
         )
     return deduplicate_human_requirements(requirements)
@@ -1958,6 +1997,7 @@ def read_rest_issue_comments(
     config: AgentLoopConfig,
     issue_number: int,
     purpose: str,
+    reject_empty_output: bool = False,
 ) -> tuple[IssueComment, ...]:
     """Read an issue's complete comment history from REST, with numeric IDs.
 
@@ -1987,6 +2027,13 @@ def read_rest_issue_comments(
             raise AgentLoopError(
                 f"GitHub issue comment recovery for issue #{issue_number} is incomplete; "
                 f"{purpose}."
+            )
+        if reject_empty_output and not (result.stdout or "").strip():
+            # An empty successful response is not proof of an empty history;
+            # callers that must fail closed treat it as an incomplete read.
+            raise AgentLoopError(
+                f"GitHub issue comment recovery for issue #{issue_number} returned an empty "
+                f"response; {purpose}."
             )
         try:
             raw_page = json.loads(result.stdout or "[]")
@@ -2150,7 +2197,12 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
         body=body,
         url=_optional_str(data.get("url")),
         comments=comments,
-        human_requirements=_parse_issue_human_requirements(data),
+        human_requirements=verify_human_requirement_authors(
+            runner,
+            config=config,
+            number=issue_number,
+            candidates=_parse_issue_human_requirements(data),
+        ),
     )
 
 
@@ -2184,6 +2236,313 @@ def _parse_issue_human_requirements(data: dict[str, object]) -> tuple[HumanRevie
             )
         )
     return deduplicate_human_requirements(requirements)
+
+
+_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE = (
+    "signed human requirement authors cannot be verified against the configured "
+    "trusted human reviewer set"
+)
+
+
+@dataclass(frozen=True)
+class _RestSignedRecord:
+    """The live REST identity and body of one requirement-bearing record."""
+
+    login: str | None
+    user_id: int | None
+    body: str | None
+
+
+def _identity_login_key(login: str | None) -> str:
+    """Normalize a login the way GraphQL and REST spellings are reconciled.
+
+    REST spells an app ``<slug>[bot]`` while GraphQL uses ``<slug>`` (or an
+    ``app/<slug>`` form in some projections); those name one identity.
+    """
+    value = (login or "").strip()
+    if value.casefold().startswith("app/"):
+        value = value[len("app/"):]
+    return (strip_bot_login_suffix(value) or "").casefold()
+
+
+def _safe_diagnostic_text(value: object) -> str:
+    text = "(none)" if value is None or value == "" else str(value)
+    text = "".join(ch if ch.isprintable() else "?" for ch in text)
+    return sanitize_untrusted_prose(text)[:200]
+
+
+def _human_requirement_locator(
+    requirement: HumanReviewRequirement,
+) -> tuple[str, str] | None:
+    if requirement.url:
+        return ("url", requirement.url.strip())
+    if requirement.node_id:
+        return ("node", requirement.node_id.strip())
+    return None
+
+
+def _requirement_source_group(source_type: str) -> str:
+    # PR conversation comments are issue comments in REST.
+    if source_type in {"Issue comment", "PR comment"}:
+        return "comments"
+    if source_type == "Issue body":
+        return "issue-body"
+    if source_type == "PR review":
+        return "reviews"
+    return "unknown"
+
+
+def _gh_api_json(
+    runner: Runner, *, config: AgentLoopConfig, path: str, description: str
+) -> object:
+    result = runner.run(
+        [config.gh_cmd, "api", path],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        raise AgentLoopError(
+            f"GitHub {description} read is incomplete; {_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE}."
+        )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(
+            f"GitHub {description} read returned malformed JSON; "
+            f"{_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE}."
+        ) from exc
+
+
+def _index_rest_record(
+    index: dict[tuple[str, str], _RestSignedRecord],
+    key: tuple[str, str],
+    record: _RestSignedRecord,
+    *,
+    description: str,
+) -> None:
+    if key in index:
+        raise AgentLoopError(
+            f"GitHub {description} read returned two records sharing one locator; "
+            f"{_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE}."
+        )
+    index[key] = record
+
+
+def _read_rest_issue_body_record(
+    runner: Runner, *, config: AgentLoopConfig, number: int
+) -> dict[tuple[str, str], _RestSignedRecord]:
+    description = f"issue #{number} body"
+    raw = _gh_api_json(
+        runner, config=config, path=f"repos/{config.repo}/issues/{number}", description=description
+    )
+    if not isinstance(raw, dict):
+        raise AgentLoopError(
+            f"GitHub {description} read returned a non-object payload; "
+            f"{_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE}."
+        )
+    record = _RestSignedRecord(
+        login=_author_login(raw.get("user")),
+        user_id=_author_id(raw.get("user")),
+        body=_optional_str(raw.get("body")),
+    )
+    index: dict[tuple[str, str], _RestSignedRecord] = {}
+    html_url = _optional_str(raw.get("html_url"))
+    if html_url:
+        index[("url", html_url.strip())] = record
+    node_id = _optional_str(raw.get("node_id"))
+    if node_id:
+        index[("node", node_id.strip())] = record
+    return index
+
+
+def _read_rest_issue_comment_records(
+    runner: Runner, *, config: AgentLoopConfig, number: int
+) -> dict[tuple[str, str], _RestSignedRecord]:
+    comments = read_rest_issue_comments(
+        runner,
+        config=config,
+        issue_number=number,
+        purpose=_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE,
+        reject_empty_output=True,
+    )
+    index: dict[tuple[str, str], _RestSignedRecord] = {}
+    for comment in comments:
+        if not comment.url:
+            continue
+        _index_rest_record(
+            index,
+            ("url", comment.url.strip()),
+            _RestSignedRecord(login=comment.author, user_id=comment.author_id, body=comment.body),
+            description=f"issue #{number} comment",
+        )
+    return index
+
+
+_REST_PR_REVIEW_PAGE_SIZE = 100
+
+
+def _read_rest_pr_review_records(
+    runner: Runner, *, config: AgentLoopConfig, number: int
+) -> dict[tuple[str, str], _RestSignedRecord]:
+    description = f"pull request #{number} review"
+    index: dict[tuple[str, str], _RestSignedRecord] = {}
+    page = 1
+    max_pages = 10_000
+    while page <= max_pages:
+        raw_page = _gh_api_json(
+            runner,
+            config=config,
+            path=(
+                f"repos/{config.repo}/pulls/{number}/reviews"
+                f"?per_page={_REST_PR_REVIEW_PAGE_SIZE}&page={page}"
+            ),
+            description=description,
+        )
+        if not isinstance(raw_page, list):
+            raise AgentLoopError(
+                f"GitHub {description} read returned a non-list page; "
+                f"{_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE}."
+            )
+        for raw_review in raw_page:
+            if not isinstance(raw_review, dict):
+                raise AgentLoopError(
+                    f"GitHub {description} read returned an incomplete page; "
+                    f"{_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE}."
+                )
+            record = _RestSignedRecord(
+                login=_author_login(raw_review.get("user")),
+                user_id=_author_id(raw_review.get("user")),
+                body=_optional_str(raw_review.get("body")),
+            )
+            html_url = _optional_str(raw_review.get("html_url"))
+            if html_url:
+                _index_rest_record(index, ("url", html_url.strip()), record, description=description)
+            node_id = _optional_str(raw_review.get("node_id"))
+            if node_id:
+                _index_rest_record(index, ("node", node_id.strip()), record, description=description)
+        if len(raw_page) < _REST_PR_REVIEW_PAGE_SIZE:
+            break
+        page += 1
+    else:
+        raise AgentLoopError(
+            f"GitHub {description} read exceeded its pagination bound; "
+            f"{_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE}."
+        )
+    return index
+
+
+def _trusted_actor_exclusion_reason(
+    trusted: Sequence[TrustedHumanActor], *, login: str | None, user_id: int | None
+) -> tuple[TrustedHumanActor | None, str | None]:
+    """Return the matching trusted entry, or the reason the author is excluded."""
+    login_key = _identity_login_key(login)
+    if user_id is None:
+        return None, "the REST record has no numeric author ID"
+    by_login = [actor for actor in trusted if _identity_login_key(actor.login) == login_key]
+    for actor in by_login:
+        if actor.user_id == user_id:
+            return actor, None
+    if by_login:
+        return None, (
+            "the login matches a trusted entry but the numeric user ID differs "
+            "(renamed or reused login)"
+        )
+    by_id = [actor for actor in trusted if actor.user_id == user_id]
+    if by_id:
+        return None, (
+            "the numeric user ID matches a trusted entry but the login differs "
+            f"(trusted login {_safe_diagnostic_text(by_id[0].login)})"
+        )
+    return None, "the author is not in the trusted human reviewer set"
+
+
+def verify_human_requirement_authors(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    number: int,
+    candidates: tuple[HumanReviewRequirement, ...],
+) -> tuple[HumanReviewRequirement, ...]:
+    """Admit signed requirements only from configured trusted identities (#1022).
+
+    With no trusted human reviewer identities configured this is a no-op: every
+    candidate is surfaced unverified and no GitHub call is made.  Otherwise each
+    candidate is joined to its live REST record by exact source locator (URL,
+    or node ID for a PR review) -- never by timestamp or body -- bound to that
+    record's current signed content, and admitted only when both the author
+    login and numeric user ID match one configured entry.  Excluded records are
+    logged and remain ordinary untrusted discussion.  An incomplete REST read,
+    a duplicate REST locator, or a projection/REST disagreement fails closed.
+    """
+    trusted = tuple(getattr(config, "human_reviewer_trusted_actors", ()) or ())
+    if not trusted or not candidates:
+        return candidates
+    groups = {_requirement_source_group(candidate.source_type) for candidate in candidates}
+    rest: dict[str, dict[tuple[str, str], _RestSignedRecord]] = {}
+    if "issue-body" in groups:
+        rest["issue-body"] = _read_rest_issue_body_record(runner, config=config, number=number)
+    if "comments" in groups:
+        rest["comments"] = _read_rest_issue_comment_records(runner, config=config, number=number)
+    if "reviews" in groups:
+        rest["reviews"] = _read_rest_pr_review_records(runner, config=config, number=number)
+
+    admitted: list[HumanReviewRequirement] = []
+    excluded = 0
+    for candidate in candidates:
+        locator = _human_requirement_locator(candidate)
+        group = _requirement_source_group(candidate.source_type)
+        record = rest.get(group, {}).get(locator) if locator is not None else None
+        observed_login: str | None = candidate.author
+        observed_id: int | None = None
+        reason: str | None = None
+        if locator is None:
+            reason = "the record has no verifiable record locator"
+        elif record is None:
+            reason = "the record locator is absent from the complete REST read"
+        else:
+            rest_body = parse_signed_human_requirement_body(record.body)
+            if (
+                rest_body is None
+                or _normalize_requirement_body(rest_body)
+                != _normalize_requirement_body(candidate.body)
+                or _identity_login_key(record.login) != _identity_login_key(candidate.author)
+            ):
+                raise AgentLoopError(
+                    f"The signed {candidate.source_type.lower()} at "
+                    f"{_safe_diagnostic_text(candidate.url or candidate.node_id)} changed during "
+                    "author verification (its REST body, signature, or author no longer matches "
+                    "the loaded context); rerun agent-loop to verify the current record."
+                )
+            observed_login = record.login
+            observed_id = record.user_id
+            match, reason = _trusted_actor_exclusion_reason(
+                trusted, login=record.login, user_id=record.user_id
+            )
+            if match is not None:
+                admitted.append(
+                    replace(
+                        candidate,
+                        author_id=record.user_id,
+                        author_verification="verified",
+                    )
+                )
+                continue
+        excluded += 1
+        log(
+            config,
+            "Signed human requirement excluded: "
+            f"{candidate.source_type} {_safe_diagnostic_text(candidate.url or candidate.node_id)} "
+            f"by {_safe_diagnostic_text(observed_login)} "
+            f"(user ID {_safe_diagnostic_text(observed_id)}): {reason}. "
+            "It remains ordinary untrusted discussion.",
+        )
+    if excluded:
+        log(
+            config,
+            f"Signed human requirement verification: {len(admitted)} admitted, "
+            f"{excluded} excluded (not from the configured trusted human reviewer set).",
+        )
+    return deduplicate_human_requirements(admitted)
 
 
 def post_pr_comment(

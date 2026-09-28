@@ -3492,6 +3492,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--architecture-path", "--architecture-read-size", "--architecture-snapshot-max-chars",
     "--architecture-aggregate-max-chars", "--managed-context-max-chars",
     "--coder", "--reviewer", "--max-rounds", "--managed-ci-trusted-actor", "--managed-ci-issue",
+    "--human-reviewer-trusted-actor",
     "--managed-ci-issue-number",
     "--implementation-coder", "--implementation-coder-model",
     "--implementation-codex-reasoning-effort", "--implementation-claude-effort",
@@ -3625,6 +3626,18 @@ def _issue_created_rendering_issue_number(
     return int(match.group(1)) if match is not None else None
 
 
+def _human_reviewer_trust_args(config: AgentLoopConfig) -> list[str]:
+    """Re-emit every configured trusted human reviewer entry, in order (#1022).
+
+    These govern which signed requirements are admitted, not managed CI, so a
+    rerun command must keep them whatever its managed-CI shape.
+    """
+    args: list[str] = []
+    for actor in getattr(config, "human_reviewer_trusted_actors", ()) or ():
+        args.extend(("--human-reviewer-trusted-actor", f"{actor.login}:{actor.user_id}"))
+    return args
+
+
 def _render_recovery_command(
     config: AgentLoopConfig,
     *,
@@ -3649,10 +3662,12 @@ def _render_recovery_command(
                 command.append("--auto-merge")
             elif config.watch_pending_ci:
                 command.append("--watch-pending-ci")
+            command.extend(_human_reviewer_trust_args(config))
             return shlex.join(command)
         command = ["agent-loop", target, str(identifier), "--repo", config.repo]
         if config.base:
             command.extend(("--base", config.base))
+        command.extend(_human_reviewer_trust_args(config))
         if config.auto_merge:
             command.append("--auto-merge")
         if config.watch_pending_ci and not config.auto_merge:
@@ -3681,6 +3696,7 @@ def _render_recovery_command(
         # deterministic fallback is safer than attaching options to an
         # unknown parser shape.
         command = ["agent-loop", target, str(identifier), "--repo", config.repo]
+        command.extend(_human_reviewer_trust_args(config))
     else:
         source = command[command_index]
         remove = set()

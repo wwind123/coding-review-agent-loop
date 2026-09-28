@@ -956,6 +956,17 @@ Key contracts to preserve when changing the implementation:
 - Validate acquisition, structured fields, footer state, IDs, and provenance
   before treating a response as an authoritative workflow result. Repair is
   bounded format correction and is revalidated, not a new substantive review.
+- Signed human requirements (`-- Human Reviewer`) are honour-system unless
+  `--human-reviewer-trusted-actor LOGIN:ID` entries are configured. With a
+  trust set, `github.py` admits a signed issue body, issue/PR comment, or PR
+  review only after joining it by exact locator (URL, or review node ID) to its
+  live REST record, binding the REST body/author to the loaded text, and
+  matching both login and numeric user ID. Otherwise the record is excluded
+  with a logged diagnostic, and an incomplete read or a drifted record fails
+  closed. Unconfigured, no extra reads happen and prompts label every author
+  unverified. Verification fields are provenance only, and requirement IDs do
+  not depend on them. Reviewer-board amendments, child-disposition overrides,
+  and child-plan supersessions are not covered and remain textual (#1022).
 - Keep untrusted issue/PR prose and model output separate from tool-owned
   protocol markers. A marker or model signature alone is not authentication.
   Untrusted text that merely names a reserved token is neutralized into the

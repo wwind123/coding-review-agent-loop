@@ -228,6 +228,19 @@ def build_parser() -> argparse.ArgumentParser:
                 "Actions variable AGENT_LOOP_MANAGED_ACTOR."
             ),
         )
+        subparser.add_argument(
+            "--human-reviewer-trusted-actor",
+            action="append",
+            default=None,
+            metavar="LOGIN:ID",
+            help=(
+                "GitHub login and numeric user ID whose signed human reviewer "
+                "comments become approval-critical requirements. Repeat for several "
+                "identities. When omitted, every signed comment is admitted but "
+                "labelled unverified (honour system). Find an ID with "
+                "`gh api users/LOGIN --jq .id`."
+            ),
+        )
         subparser.add_argument("--dry-run", action="store_true")
         subparser.add_argument(
             "--implementation-coder",

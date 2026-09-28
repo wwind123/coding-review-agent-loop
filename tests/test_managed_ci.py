@@ -11157,3 +11157,74 @@ def test_m1069_continuity_supersession_is_honored_and_round_trips():
     assert managed_ci._superseded_authorization_ids(
         [(40, base), (41, replace(base, head_sha="stray")), (43, continuity)]
     ) == frozenset({41})
+
+
+_TRUST_PAIRS = ["--human-reviewer-trusted-actor", "alice:5", "--human-reviewer-trusted-actor", "bob:6"]
+
+
+def _trust_config(tmp_path, **overrides):
+    from coding_review_agent_loop.github import TrustedHumanActor
+
+    return make_config(
+        tmp_path,
+        human_reviewer_trusted_actors=(TrustedHumanActor("alice", 5), TrustedHumanActor("bob", 6)),
+        **overrides,
+    )
+
+
+def _trust_values(argv):
+    return [argv[i + 1] for i, token in enumerate(argv) if token == "--human-reviewer-trusted-actor"]
+
+
+def test_recovery_invocation_replay_keeps_trusted_human_entries_as_option_values(tmp_path):
+    """#1022: LOGIN:ID values are option payloads, never the positional."""
+    parser = build_parser()
+    config = _trust_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "issue", "--human-reviewer-trusted-actor", "alice:5", "643",
+            "--human-reviewer-trusted-actor", "bob:6", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+        ),
+    )
+    for target, identifier in (("issue", 643), ("pr", 7)):
+        rendered = _render_recovery_command(
+            config, target=target, identifier=identifier, managed_ci=target == "issue",
+        )
+        argv = shlex.split(rendered)
+        args = parser.parse_args(argv[1:])
+        assert args.command == target
+        assert (args.issue_number if target == "issue" else args.pr_number) == identifier
+        assert args.human_reviewer_trusted_actor == ["alice:5", "bob:6"]
+
+
+@pytest.mark.parametrize("managed", [True, False])
+def test_recovery_config_fallback_keeps_trusted_human_entries(tmp_path, managed):
+    parser = build_parser()
+    config = _trust_config(tmp_path, managed_ci_trusted_actor="agent-loop")
+    rendered = _render_recovery_command(config, target="pr", identifier=7, managed_ci=managed)
+    argv = shlex.split(rendered)
+    assert _trust_values(argv) == ["alice:5", "bob:6"]
+    args = parser.parse_args(argv[1:])
+    assert args.pr_number == 7
+    assert args.human_reviewer_trusted_actor == ["alice:5", "bob:6"]
+
+
+@pytest.mark.parametrize("managed", [True, False])
+def test_ci_rerun_command_without_invocation_keeps_trusted_human_entries(tmp_path, managed):
+    parser = build_parser()
+    config = _trust_config(tmp_path, managed_ci=managed, auto_merge=True)
+    rendered = _render_ci_rerun_command(config, pr_number=7)
+    argv = shlex.split(rendered)
+    assert argv[:3] == ["agent-loop", "pr", "7"]
+    assert _trust_values(argv) == ["alice:5", "bob:6"]
+    args = parser.parse_args(argv[1:])
+    assert args.pr_number == 7
+    assert args.human_reviewer_trusted_actor == ["alice:5", "bob:6"]
+
+
+def test_recovery_renderer_emits_no_trust_options_when_unconfigured(tmp_path):
+    rendered = _render_recovery_command(
+        make_config(tmp_path), target="pr", identifier=7, managed_ci=False, include_context=False,
+    )
+    assert "--human-reviewer-trusted-actor" not in rendered
