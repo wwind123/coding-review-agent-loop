@@ -116,6 +116,9 @@ def _gql_comment(comment_id, login, body, *, url=None, created="2026-09-01T00:00
 def _rest_comment(comment_id, login, user_id, body, *, url=None, created="2026-09-01T00:00:00Z"):
     return {
         "id": comment_id,
+        # Real REST comment objects carry the API ``url`` as well as the web
+        # ``html_url``; only the latter matches the GraphQL locator.
+        "url": f"https://api.github.com/repos/{REPO}/issues/comments/{comment_id}",
         "user": {"login": login, "id": user_id},
         "created_at": created,
         "html_url": url if url is not None else _pr_comment_url(comment_id),
@@ -667,3 +670,32 @@ def test_pr_review_node_id_never_joins_a_comment_record(tmp_path, capsys):
     context = get_pr_review_context(runner, config=_config(tmp_path, quiet=False), pr_number=PR)
     assert context.human_requirements == ()
     assert "absent from the complete REST read" in _logged(capsys)
+
+
+@pytest.mark.parametrize("flow", ["pr", "issue"])
+def test_trusted_comment_with_api_url_and_html_url_is_admitted(tmp_path, flow):
+    """#1022 review item-5: REST comments carry both ``url`` and ``html_url``.
+
+    The join must use the web ``html_url``; keying on the API ``url`` would
+    exclude every trusted conversation comment as an absent locator.
+    """
+    body = "Use absolute URLs." + SIGNATURE
+    rest = _rest_comment(7, "maintainer", 101, body, url=(_pr_comment_url(7) if flow == "pr" else _issue_comment_url(7)))
+    assert rest["url"].startswith("https://api.github.com/")
+    if flow == "pr":
+        runner = RoutedRunner(
+            projection=_pr_projection(comments=[_gql_comment(7, "maintainer", body)]),
+            rest={_comments_path(): [rest]},
+        )
+        context = get_pr_review_context(runner, config=_config(tmp_path), pr_number=PR)
+    else:
+        runner = RoutedRunner(
+            projection=_issue_projection(body="plain", comments=[
+                _gql_comment(7, "maintainer", body, url=_issue_comment_url(7))
+            ]),
+            rest={_comments_path(ISSUE): [rest]},
+        )
+        context = get_issue_context(runner, config=_config(tmp_path), issue_number=ISSUE)
+    (requirement,) = context.human_requirements
+    assert requirement.author_verification == "verified"
+    assert requirement.author_id == 101

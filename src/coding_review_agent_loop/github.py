@@ -1488,8 +1488,11 @@ def _parse_issue_comments(raw_comments: object) -> tuple[IssueComment, ...]:
                 body=_optional_str(raw_comment.get("body")),
                 comment_id=comment_id,
                 author_id=_author_id(author),
-                url=_optional_str(raw_comment.get("url"))
-                or _optional_str(raw_comment.get("html_url")),
+                # REST carries both the API ``url`` and the web ``html_url``;
+                # the permalink is ``html_url``.  GraphQL has only ``url``,
+                # which is already the web permalink (#1022).
+                url=_optional_str(raw_comment.get("html_url"))
+                or _optional_str(raw_comment.get("url")),
             )
         )
     return tuple(sorted(comments, key=_comment_sort_key))

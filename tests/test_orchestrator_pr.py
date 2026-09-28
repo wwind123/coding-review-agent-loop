@@ -15502,6 +15502,7 @@ def test_pr_loop_resume_with_trust_set_excludes_historically_acknowledged_requir
                 self.commands.append((cmd, Path(cwd)))
                 page = [{
                     "id": 1,
+                    "url": "https://api.github.com/repos/OWNER/REPO/issues/comments/1",
                     "user": {"login": "agent-bot", "id": 555},
                     "created_at": "2026-05-18T10:00:00Z",
                     "html_url": signed_url,
