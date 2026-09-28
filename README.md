@@ -1195,10 +1195,16 @@ a reviewer-only round with no planner turn. Every required reviewer must still
 approve the exact final plan. Because each phase advance costs a planning round,
 raise `--max-rounds` when enabling it. `--plan-review-force-full` authorizes the
 complete plan board and recovers the two ownership-ambiguity diagnostics; it
-cannot recover an unreadable planning history. Omitting the flags keeps today's
+cannot recover an unreadable planning history. `--plan-primary-stall-rounds N`
+(default 8, `0` disables) stops the run with a diagnostic once the primary has
+blocked N consecutive completed primary-phase rounds with no exact-plan
+approval, instead of spending the rest of `--max-rounds`; the panel is never
+convened automatically, so rerun with `--plan-review-force-full` or a higher
+threshold to continue. An in-flight run already past eight such rounds stops at
+its next round after upgrading. Omitting the flags keeps today's
 full-board planning behavior unchanged, and discussion-mode cycles always stay
-full-board. A child-planning cycle inherits `--plan-review-policy` and
-`--primary-plan-reviewer` but never the parent's `--plan-review-force-full`
+full-board. A child-planning cycle inherits `--plan-review-policy`,
+`--primary-plan-reviewer`, and `--plan-primary-stall-rounds` but never the parent's `--plan-review-force-full`
 override or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board
 planning can be compared on calls, tokens, latency, overlap, severity-weighted

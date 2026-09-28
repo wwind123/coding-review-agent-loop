@@ -2742,7 +2742,9 @@ agent-loop issue 123 --repo OWNER/REPO --plan-first \
 `--plan-review-policy` accepts `all-reviewers` (the compatibility default) and
 `primary-then-panel`. `--primary-plan-reviewer` is required by the staged
 policy, must be on the configured `--reviewer` board, and needs at least one
-secondary. `--plan-review-force-full` is the operator override. All three
+secondary. `--plan-review-force-full` is the operator override, and
+`--plan-primary-stall-rounds` bounds the primary phase (see
+[Primary-phase stall stop](#primary-phase-stall-stop)). All of them
 validate independently of `--pr-review-policy`, `--primary-reviewer`, and
 `--pr-review-force-full`, so a run may stage planning with full-board PR review
 or the reverse. Omitting them preserves today's full-board planning behavior
@@ -2806,6 +2808,65 @@ planning obligation is a `blocking` **or** `same-plan` finding, so a Same-plan
 panel follow-up keeps its durable owner and routes the next round to
 `remediation` rather than falling through to a final sweep.
 
+The *execution-recommendation identity* the classifier compares is a
+contract identity, not a digest of the whole object. It digests the whole
+execution recommendation minus only its non-executable narrative: the top-level
+`rationale`, the top-level `caveats`, and the `rationale` inside each coupling
+constraint. Everything else stays in the identity, including scope-item
+requirements and acceptance criteria, `one_shot_delivery`, every child-stage
+field, both allocations, and any unknown key, because those are copied into
+execution and child-issue data. A semantic patch that replaces
+`execution_recommendation` is therefore `narrow` only when the contract
+identity is unchanged, which means a narrative-only edit. A same-ID acceptance-criteria
+edit is still `broad`. When the recommendation causes a broad classification,
+the reason names the changed components and IDs, for example
+`cross-cutting plan contract(s) changed: execution_recommendation_identity
+(scope_items, scope_items[scope-report])`. The exact-plan candidate key is
+unchanged and still digests the full recommendation, so any byte change,
+narrative included, invalidates carried approvals.
+
+Before a qualified panel opening, classification changes only the audit
+reason, never the board. Broad and narrow transitions both select the primary
+alone; a broad one is labelled `strict pre-panel fallback:`. Only an exact-key
+primary approval opens the panel.
+
+#### Primary-phase stall stop
+
+Under `primary-then-panel`, a primary reviewer that keeps blocking holds the
+run in the `primary` phase: every revision needs a fresh exact-plan primary
+approval before the panel can open. `--plan-primary-stall-rounds N` (default
+`8`, `0` disables) bounds that loop. Before scheduling a round, the loop counts
+consecutive *completed* primary reviews that ended `blocking`, newest first,
+from durable round records. A review counts only when it follows a valid
+`primary`-phase scheduler checkpoint of the same round. A round whose checkpoint
+was posted but whose primary review never completed is skipped, neither counted
+nor reset. Any primary approval resets the count, whatever key it approved,
+including a growth-gated approval that opened no panel. The count also ends at
+an invalid or missing checkpoint, at a non-primary phase, at a phase-advance
+record, and at a qualified panel opening.
+
+When the count reaches `N` with no qualified opening, no operator force-full,
+and no primary approval of the current key, the run stops before the next
+primary turn. It posts a plain `Plan review scheduling diagnostic` naming the
+streak, the threshold, and the current canonical plan size, and writes no
+scheduler checkpoint, latch, or panel-opening record. The stop is suppressed
+for any round whose planning history is degraded (`absent`, `invalid`, or
+`contradictory-key`), so the conservative primary-only fallback runs
+unchanged. The panel is never convened automatically. To continue:
+
+- rerun with `--plan-review-force-full` to authorize the complete board (an
+  operator-sourced opening);
+- rerun with a higher `--plan-primary-stall-rounds`, or `0`, to keep revising in
+  the primary phase; or
+- narrow the issue.
+
+Because the count is recomputed from durable records, rerunning with unchanged
+flags stops again at the same point before any agent turn.
+
+**Upgrade note:** an in-flight `primary-then-panel` run that already has eight
+or more trailing blocking primary rounds stops at its next round after
+upgrading. Pass a higher `--plan-primary-stall-rounds` or `0` to continue it.
+
 #### Qualified panel evidence
 
 A qualified panel opening is derived from comment order: an operator-sourced
@@ -2848,10 +2909,11 @@ primary, or with a different reviewer board stops with an actionable message
 naming the persisted contract instead of silently continuing on a different one.
 
 The run stops with a plain `Plan review scheduling diagnostic` comment, and no
-reviewer and no planner turn, in exactly three cases: an active plan finding
+reviewer and no planner turn, in exactly four cases: an active plan finding
 pending on a configured secondary with no qualified opening; an interrupted
-round holding a premature blocking secondary plan review; and the class-D
-transport extraction failure. `--plan-review-force-full` recovers the first two
+round holding a premature blocking secondary plan review; the primary-phase
+stall stop; and the class-D transport extraction failure.
+`--plan-review-force-full` recovers the first three
 only. It can never recover class D, because approval, ownership, and
 qualification accounting all depend on a readable record set — restore the
 missing planning round-metadata records and rerun instead.

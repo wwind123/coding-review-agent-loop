@@ -61,6 +61,8 @@ DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
     "Gemini 3.1 Pro (High)",
 )
 DEFAULT_MAX_ROUNDS = 10
+# Primary-phase plan stall stop threshold (#1103); 0 disables it.
+DEFAULT_PLAN_PRIMARY_STALL_ROUNDS = 8
 # `agy --print` otherwise defaults to five minutes, which is too short for
 # complex reviews and causes it to exit with "timeout waiting for response".
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
@@ -180,6 +182,11 @@ class AgentLoopConfig:
     plan_review_policy: str = "all-reviewers"
     primary_plan_reviewer: AgentName | None = None
     plan_review_force_full: bool = False
+    # Primary-phase stall stop (#1103): consecutive completed blocking primary
+    # plan reviews, with no exact-plan primary approval, after which a
+    # primary-then-panel run stops instead of re-invoking the primary.  0
+    # disables the stop.
+    plan_primary_stall_rounds: int = DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
     # Plan-growth gate (#886): structural thresholds above which a one-shot
     # plan needs a reviewed justification or a staged restructure.
     plan_growth_gate: str = "enforce"
@@ -574,6 +581,22 @@ class AgentLoopConfig:
         if self.plan_review_force_full and self.plan_review_policy != "primary-then-panel":
             raise AgentLoopError(
                 "--plan-review-force-full requires --plan-review-policy primary-then-panel."
+            )
+        stall_rounds = self.plan_primary_stall_rounds
+        if (
+            isinstance(stall_rounds, bool)
+            or not isinstance(stall_rounds, int)
+            or stall_rounds < 0
+        ):
+            raise AgentLoopError(
+                "--plan-primary-stall-rounds must be a non-negative integer (0 disables it)."
+            )
+        if (
+            stall_rounds != DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
+            and self.plan_review_policy != "primary-then-panel"
+        ):
+            raise AgentLoopError(
+                "--plan-primary-stall-rounds requires --plan-review-policy primary-then-panel."
             )
         if self.plan_growth_gate not in {"enforce", "off"}:
             raise AgentLoopError("--plan-growth-gate must be 'enforce' or 'off'.")
@@ -1676,6 +1699,9 @@ def config_from_args(
         plan_review_policy=getattr(args, "plan_review_policy", None) or "all-reviewers",
         primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
         plan_review_force_full=bool(getattr(args, "plan_review_force_full", False)),
+        plan_primary_stall_rounds=_arg_or_default(
+            args, "plan_primary_stall_rounds", DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
+        ),
         plan_growth_gate=getattr(args, "plan_growth_gate", None) or "enforce",
         plan_growth_max_chars=_arg_or_default(args, "plan_growth_max_chars", 120_000),
         plan_growth_max_revisions=_arg_or_default(args, "plan_growth_max_revisions", 6),

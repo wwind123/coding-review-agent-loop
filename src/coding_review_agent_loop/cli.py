@@ -833,6 +833,19 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--plan-primary-stall-rounds",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "Under --plan-review-policy primary-then-panel, stop the run with a "
+                "diagnostic once N consecutive completed primary plan reviews have "
+                "blocked with no exact-plan primary approval (default: 8; 0 disables). "
+                "The secondary panel is never convened automatically; rerun with "
+                "--plan-review-force-full or a higher threshold to continue."
+            ),
+        )
+        subparser.add_argument(
             "--plan-growth-gate",
             choices=("enforce", "off"),
             default="enforce",

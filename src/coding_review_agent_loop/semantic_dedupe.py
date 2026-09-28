@@ -191,6 +191,8 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
     isolated: Path | None = None
     try:
         isolated = Path(tempfile.mkdtemp(prefix="coding-review-followup-dedupe-"))
+        from .config import DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
+
         values: dict[str, object] = {
             "coder": backend,
             "reviewer": (backend,),
@@ -213,10 +215,11 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
             "primary_reviewer": None,
             "pr_review_force_full": False,
             # Planning scheduling is coupled to the same reviewer-count
-            # validation, so the planning trio is neutralized alongside it.
+            # validation, so the planning fields are neutralized alongside it.
             "plan_review_policy": "all-reviewers",
             "primary_plan_reviewer": None,
             "plan_review_force_full": False,
+            "plan_primary_stall_rounds": DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
         }
         if backend == "claude":
             values["claude_model"] = model

@@ -528,9 +528,17 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
         "--plan-review-policy",
         "--primary-plan-reviewer",
         "--plan-review-force-full",
+        "--plan-primary-stall-rounds",
     ):
         assert flag in text
         assert flag in readme
+    # #1103: the stall stop, its upgrade note, and the contract identity.
+    assert "#### Primary-phase stall stop" in text
+    assert "**Upgrade note:**" in text
+    assert "contract identity" in text
+    architecture = (root / "ARCHITECTURE.md").read_text()
+    assert "primary-phase stall stop" in architecture
+    assert "--plan-primary-stall-rounds" in architecture
     for phase in (
         "`primary`",
         "`secondary-audit`",
@@ -549,7 +557,7 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     # The four degraded-history classes and the override's recovery limits.
     for label in ("A `absent`", "B `invalid`", "C `contradictory-key`", "D transport failure"):
         assert label in text
-    assert "recovers the first two\nonly" in text
+    assert "recovers the first three\nonly" in text
     assert "never recover class D" in text
     # Carried approvals and the exclusions.
     assert "HUMAN_REQUIREMENTS_RESOLVED" in text

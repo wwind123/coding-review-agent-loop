@@ -629,6 +629,8 @@ from .plan_review_scheduling import (
     PlanSchedulingDecision,
     classify_plan_history,
     classify_plan_transition,
+    execution_recommendation_contract_identity,
+    execution_recommendation_contract_projection,
     make_plan_contract,
     plan_history_fallback_reason,
     plan_policy_capabilities,
@@ -13301,6 +13303,44 @@ def _run_plan_first_loop(
                 # A contradictory persisted key can supply neither an approval
                 # nor a panel opening.
                 plan_qualifying_approvals = ()
+            if (
+                config.plan_primary_stall_rounds > 0
+                and plan_primary_name is not None
+                and not plan_panel_evidence.opened
+                and not plan_operator_force_full
+                and plan_primary_name not in plan_qualifying_approvals
+                and not (
+                    current_resume is not None
+                    and any(
+                        record.metadata.agent == plan_primary_name
+                        for record in current_resume.completed_reviews
+                    )
+                )
+            ):
+                if plan_history_class != PLAN_HISTORY_INTACT:
+                    log(
+                        config,
+                        f"Planning round {round_number}: stall stop suppressed: degraded "
+                        f"planning history ({plan_history_class})",
+                    )
+                else:
+                    plan_primary_streak = plan_primary_blocking_streak(
+                        plan_records,
+                        primary=plan_primary_name,
+                        panel_opening_index=plan_panel_evidence.opening_index,
+                    )
+                    if plan_primary_streak >= config.plan_primary_stall_rounds:
+                        # Before the prelaunch checkpoint and every agent turn,
+                        # so the stop writes no record a resume could read as
+                        # a checkpoint, an approval, or a panel opening.
+                        stop_plan_pre_panel(
+                            plan_primary_stall_message(
+                                streak=plan_primary_streak,
+                                threshold=config.plan_primary_stall_rounds,
+                                plan_chars=len(current_plan),
+                            ),
+                            round_number=round_number,
+                        )
             plan_classification = classify_plan_transition(
                 plan_previous_key,
                 current_plan_key,
@@ -18789,6 +18829,101 @@ def _classify_staged_plan_history(
     )
 
 
+def plan_primary_blocking_streak(
+    records: Sequence[PostedRoundRecord],
+    *,
+    primary: str,
+    panel_opening_index: int | None = None,
+) -> int:
+    """Consecutive completed blocking primary plan reviews (#1103).
+
+    Counts, newest round first, the rounds whose primary review ended
+    ``blocking`` and follows a valid ``primary``-phase scheduler checkpoint of
+    the same round.  A round with a valid primary-phase checkpoint but no
+    primary review (interrupted, or the primary was unavailable) is skipped:
+    it neither counts nor resets.  Everything else ends the streak: any
+    primary approval (whatever its key), any other review state, a missing or
+    invalid checkpoint, a non-primary phase, an invalid scheduler record or a
+    phase-advance record positioned after the round's checkpoint, and anything
+    at or after a qualified panel opening.  Degraded history can therefore
+    only shorten the streak, never lengthen it.
+    """
+    ordered = sorted(records, key=lambda item: item.index)
+    # The newest history boundary: nothing at or before it may count.
+    boundary_index = max(
+        (
+            record.index
+            for record in ordered
+            if record.metadata.scheduler_metadata_status == "invalid"
+            or (
+                record.metadata.role == "summary"
+                and record.metadata.phase == "plan-phase-advance"
+            )
+        ),
+        default=-1,
+    )
+    checkpoints: dict[int, list[PostedRoundRecord]] = {}
+    reviews: dict[int, PostedRoundRecord] = {}
+    for record in ordered:
+        metadata = record.metadata
+        if metadata.role == "summary" and metadata.phase == "scheduler-prelaunch":
+            checkpoints.setdefault(metadata.round_number, []).append(record)
+        elif metadata.role == "reviewer" and metadata.agent == primary:
+            # A later record for the same round supersedes an earlier one.
+            reviews[metadata.round_number] = record
+
+    def usable_primary_checkpoint(checkpoint: PostedRoundRecord | None) -> bool:
+        return (
+            checkpoint is not None
+            and checkpoint.index > boundary_index
+            and (panel_opening_index is None or checkpoint.index < panel_opening_index)
+            and checkpoint.metadata.scheduler_metadata_status == "valid"
+            and checkpoint.metadata.scheduler_phase == "primary"
+        )
+
+    streak = 0
+    for number in sorted(set(checkpoints) | set(reviews), reverse=True):
+        review = reviews.get(number)
+        round_checkpoints = checkpoints.get(number, [])
+        if review is None:
+            if usable_primary_checkpoint(
+                round_checkpoints[-1] if round_checkpoints else None
+            ):
+                continue
+            break
+        if panel_opening_index is not None and review.index >= panel_opening_index:
+            break
+        checkpoint = next(
+            (
+                record
+                for record in reversed(round_checkpoints)
+                if record.index < review.index
+            ),
+            None,
+        )
+        if not usable_primary_checkpoint(checkpoint) or review.metadata.state != "blocking":
+            break
+        streak += 1
+    return streak
+
+
+def plan_primary_stall_message(
+    *, streak: int, threshold: int, plan_chars: int
+) -> str:
+    """Operator diagnostic for the primary-phase stall stop (#1103)."""
+    return (
+        f"the primary plan reviewer has blocked {streak} consecutive primary-phase "
+        f"planning round(s) with no exact-plan primary approval, reaching "
+        f"--plan-primary-stall-rounds {threshold} (current canonical plan: "
+        f"{plan_chars} characters). The secondary plan panel was not convened, "
+        "because it opens only after an exact-plan primary approval; no reviewer and "
+        "no planner turn were invoked. To continue, rerun with "
+        "--plan-review-force-full to authorize the complete plan board, raise "
+        "--plan-primary-stall-rounds (or pass 0 to disable this stop), or narrow the "
+        "issue."
+    )
+
+
 def _planner_candidate_rounds(comments: Sequence[object]) -> set[int]:
     """Round numbers of authenticated planner-authored plan candidates (#886).
 
@@ -19061,8 +19196,17 @@ def _plan_cross_cutting_contracts(
     status = (
         architecture.get("status") if isinstance(architecture, dict) else None
     )
+    recommendation = payload.get("execution_recommendation")
     return PlanCrossCuttingContracts(
-        execution_recommendation_identity=digest(payload.get("execution_recommendation")),
+        # The executable contract only: narrative-only edits (rationale,
+        # caveats, coupling rationale) keep the identity (#1103).  The
+        # candidate key still digests the full content.
+        execution_recommendation_identity=execution_recommendation_contract_identity(
+            recommendation
+        ),
+        execution_recommendation_projection=execution_recommendation_contract_projection(
+            recommendation
+        ),
         human_requirement_disposition_digest=digest(
             payload.get("human_requirement_dispositions", [])
         ),
