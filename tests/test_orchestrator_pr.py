@@ -14546,6 +14546,11 @@ def test_clean_board_with_evidence_publishes_one_freeze_and_exits_at_decision_bo
     body = freezes[0].body
     assert "Evidence requested at `abc123`. No further code changes will be accepted" in body
     assert _EVIDENCE_TEXT in body and "-- Human Reviewer" in body
+    # The freeze notice is the first public comment that shows the request.
+    first_public = next(
+        index for index, comment in enumerate(runner.comments) if _EVIDENCE_TEXT in comment
+    )
+    assert "## Exact-head evidence freeze" in runner.comments[first_public]
     commands = [cmd for cmd, _cwd in runner.commands]
     assert not any(cmd[:1] == ["claude"] for cmd in commands)
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in commands)
@@ -14674,6 +14679,9 @@ def test_evidence_stays_deferred_across_heads_while_code_findings_remain(tmp_pat
     prompts = _claude_prompts(runner)
     assert len(prompts) == 1
     assert _EVIDENCE_TEXT not in prompts[0]
+    # The deferred request stays in round metadata only: no public comment
+    # (reviewer, coder, or stop message) shows its text before a freeze.
+    assert not any(_EVIDENCE_TEXT in comment for comment in runner.comments)
     # One deduplicated obligation, still deferred, carried to the new head.
     records = _pr_records(runner)
     latest = [record for record in records if record.metadata.subject == "abc123-coder-1"][-1]
@@ -14721,6 +14729,7 @@ def test_pending_checks_stop_names_deferred_evidence_and_restart_rederives_it(tm
     assert "Human-only exact-head evidence remains the final barrier" in out
     assert any("final barrier" in comment for comment in runner.comments)
     assert "evidence-freeze" not in _phases(runner)
+    assert not any(_EVIDENCE_TEXT in comment for comment in runner.comments)
 
     # Restart once checks pass: the deferred obligation is re-derived from the
     # reviewer record alone, so the freeze is published without a new review.

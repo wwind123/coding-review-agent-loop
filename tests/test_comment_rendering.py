@@ -3040,3 +3040,22 @@ def test_out_of_checkout_broker_failure_renders_as_context_not_authoritative():
     assert "out-of-checkout context (not evidence) `failed`" in baseline_line
     assert "authoritative" not in baseline_line
     assert "uncited authoritative `failed`" in real_line
+
+
+def test_deferred_evidence_request_text_is_withheld_from_public_labels():
+    """#1068: only the freeze notice may publish a deferred request's text."""
+    from coding_review_agent_loop.comment_rendering import _format_unresolved_item_label
+    from coding_review_agent_loop.unresolved_items import (
+        _upsert_evidence_obligation,
+        freeze_evidence_obligations,
+    )
+
+    ledger, _ = _upsert_evidence_obligation(
+        [], item_number=1, reviewer="Codex", text="Attach the secret live run output",
+        source_round=1, current_head_sha="abc123",
+    )
+    deferred = _format_unresolved_item_label(ledger[0])
+    assert "Attach the secret live run output" not in deferred
+    assert "deferred" in deferred
+    frozen = freeze_evidence_obligations(ledger, head_sha="abc123")
+    assert "Attach the secret live run output" in _format_unresolved_item_label(frozen[0])
