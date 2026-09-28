@@ -4052,13 +4052,25 @@ def _report_failed_activation_state(
             runner, config=config, pr_number=pr_number, context=context
         )
     except Exception as exc:
+        # Remedy (C) even here: the non-mutating inspection plus the resume
+        # command, each rendered independently so neither can mask the other.
         try:
-            resume = f" Resume with `{_failed_activation_resume_command(config, pr_number, context)}`."
+            inspect = (
+                f" Do not ready or unlabel the PR. Inspect it with "
+                f"`{_pr_inspection_command(config, pr_number)}`"
+            )
         except Exception:
-            resume = ""
+            inspect = ""
+        try:
+            resume_command = _failed_activation_resume_command(config, pr_number, context)
+            resume = (
+                f", then rerun `{resume_command}`." if inspect else f" Resume with `{resume_command}`."
+            )
+        except Exception:
+            resume = "." if inspect else ""
         text = (
             f"Post-failure state report unavailable ({type(exc).__name__}); "
-            f"the current state of PR #{pr_number} could not be re-read.{resume}"
+            f"the current state of PR #{pr_number} could not be re-read.{inspect}{resume}"
         )
     context.report = text
     return text
@@ -4109,25 +4121,12 @@ def _build_failed_activation_report(
             "changed or could not be verified; its owner is not asserted."
         )
 
-    if context.label_release_attempted:
-        if context.label_released:
-            lines.append(
-                "The label release is the deliberate fail-closed return to ordinary CI "
-                f"(#663/#667); this run does not reapply `{MANAGED_LABEL}`, because reapplying "
-                "it would suppress ordinary CI on an unqualified head and mint a new label event."
-            )
-        if measured is not None and measured.labeled is True:
-            # Only an acknowledged DELETE followed by a labeled read is an
-            # observed re-add; an unconfirmed DELETE proves no transition.
-            presence = "is present again" if context.label_released else "is present"
-            lines.append(
-                f"`{MANAGED_LABEL}` {presence}; suppression is still active and ordinary "
-                "CI has not resumed."
-            )
-        elif measured is not None and measured.labeled is False and context.recovery_capable:
-            lines.append(
-                "Ordinary CI can resume through the base workflow's unlabeled recovery route."
-            )
+    if context.label_released:
+        lines.append(
+            "The label release is the deliberate fail-closed return to ordinary CI "
+            f"(#663/#667); this run does not reapply `{MANAGED_LABEL}`, because reapplying "
+            "it would suppress ordinary CI on an unqualified head and mint a new label event."
+        )
 
     mismatches = _entry_tuple_mismatches(entry, measured) if measured is not None else []
     safe_manual_ready = (
@@ -4141,14 +4140,21 @@ def _build_failed_activation_report(
     )
     remedy = "C"
     if entry.draft is False:
-        restoration, remedy, after = _evaluate_ready_restoration(
+        restoration, remedy, after, readiness_attempted = _evaluate_ready_restoration(
             runner, config=config, pr_number=pr_number, context=context,
             measured=measured, mismatches=mismatches, integrity=integrity,
             safe_manual_ready=safe_manual_ready,
         )
         lines.append(restoration)
-        if after is not None:
+        if readiness_attempted:
+            # The readiness command may have changed the PR: the read-back is
+            # the current state, and an unreadable read-back is unknown.
             measured = after
+            mismatches = _entry_tuple_mismatches(entry, after) if after is not None else []
+            if after is None:
+                lines.append(
+                    "After the readiness attempt the current state could not be re-read."
+                )
     elif (
         not integrity
         and measured is not None
@@ -4157,6 +4163,21 @@ def _build_failed_activation_report(
         and measured.labeled is False
     ):
         remedy = "resume"
+
+    if context.label_release_attempted and measured is not None:
+        # Claims about suppression use the final measured state only.
+        if measured.labeled is True:
+            # Only an acknowledged DELETE followed by a labeled read is an
+            # observed re-add; an unconfirmed DELETE proves no transition.
+            presence = "is present again" if context.label_released else "is present"
+            lines.append(
+                f"`{MANAGED_LABEL}` {presence}; suppression is still active and ordinary "
+                "CI has not resumed."
+            )
+        elif measured.labeled is False and context.recovery_capable:
+            lines.append(
+                "Ordinary CI can resume through the base workflow's unlabeled recovery route."
+            )
 
     lines.extend(_lifecycle_sentences(entry, measured))
 
@@ -4197,11 +4218,11 @@ def _evaluate_ready_restoration(
     mismatches: list[str],
     integrity: bool,
     safe_manual_ready: bool,
-) -> tuple[str, str, _PrStateSnapshot | None]:
-    """Return (restoration sentence, remedy kind, post-restoration state)."""
+) -> tuple[str, str, _PrStateSnapshot | None, bool]:
+    """Return (restoration sentence, remedy kind, read-back state, readiness attempted)."""
     entry = context.entry
     if measured is None:
-        return "Readiness was not restored: the current state is unknown.", "C", None
+        return "Readiness was not restored: the current state is unknown.", "C", None, False
     if measured.draft is False and not context.drafted_by_this_run:
         # No acknowledged conversion: nothing to restore, and no readiness
         # change is attributed to this run.
@@ -4213,6 +4234,7 @@ def _evaluate_ready_restoration(
             # A nonzero ready-to-draft exit is ambiguous: always inspect.
             "resume" if clean and not context.ready_undo_ambiguous else "C",
             None,
+            False,
         )
     if measured.draft is False:
         return (
@@ -4222,15 +4244,17 @@ def _evaluate_ready_restoration(
             + "), and this run does not know who made it ready.",
             "C",
             None,
+            False,
         )
     if integrity:
-        return "Automatic readiness restoration was refused for ownership integrity.", "C", None
+        return "Automatic readiness restoration was refused for ownership integrity.", "C", None, False
     if context.recovery_incapable_fallback:
         return (
             "Automatic readiness restoration was refused: the base workflow has no unlabeled "
             "recovery route, so this run released no label and makes no readiness write.",
             "C",
             None,
+            False,
         )
     if not context.drafted_by_this_run:
         if context.ready_undo_ambiguous:
@@ -4239,20 +4263,22 @@ def _evaluate_ready_restoration(
                 "ready-to-draft request was not confirmed.",
                 "A" if safe_manual_ready else "C",
                 None,
+                False,
             )
-        return "Readiness was not restored: this run made no acknowledged draft conversion.", "C", None
+        return "Readiness was not restored: this run made no acknowledged draft conversion.", "C", None, False
     if entry.labeled is not False or entry.unknown_fields():
-        return "Readiness was not restored: the entry state was not fully known.", "C", None
+        return "Readiness was not restored: the entry state was not fully known.", "C", None, False
     unknown = measured.unknown_fields()
     if unknown:
-        return f"Readiness was not restored: the state is unknown ({', '.join(unknown)}).", "C", None
+        return f"Readiness was not restored: the state is unknown ({', '.join(unknown)}).", "C", None, False
     if measured.labeled:
-        return "Readiness was not restored: the PR is still labeled.", "C", None
+        return "Readiness was not restored: the PR is still labeled.", "C", None, False
     if mismatches:
         return (
             f"Readiness was not restored: tuple fields changed ({', '.join(mismatches)}).",
             "C",
             None,
+            False,
         )
     ready = runner.run(
         [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
@@ -4273,6 +4299,7 @@ def _evaluate_ready_restoration(
             + ".",
             "A" if after_safe else "C",
             after,
+            True,
         )
     after_changed = (
         _entry_tuple_mismatches(entry, after) + after.unknown_fields() if after is not None else []
@@ -4282,6 +4309,7 @@ def _evaluate_ready_restoration(
             "Restored to ready/unlabeled as found; no qualification is claimed for this head.",
             "restored",
             after,
+            True,
         )
     if after is None:
         detail = "the state could not be re-read"
@@ -4296,6 +4324,7 @@ def _evaluate_ready_restoration(
         f"Readiness command acknowledged; restoration not verified ({detail}).",
         "C",
         after,
+        True,
     )
 
 

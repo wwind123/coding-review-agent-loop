@@ -11511,6 +11511,28 @@ def test_m1067_acknowledged_readiness_with_mismatched_read_back_is_unverified(
     assert "Do not ready or unlabel the PR." in text
     assert "gh pr ready 7" not in text
     assert len(_m1067_ready_calls(runner)) == 1
+    if field == "labels (labeled)":
+        # Review item-5: suppression claims use the read-back, not the
+        # pre-restoration measurement.
+        assert "Ordinary CI can resume" not in text
+        assert "is present again; suppression is still active" in text
+
+
+def test_m1067_unreadable_read_back_after_readiness_attempt_is_unknown(tmp_path):
+    runner = _m1067_ready_runner(
+        unreadable_issue_events_after_label=True,
+        hooks={"ready": lambda r: r.read_queue.append(("", 1))},
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "Readiness command acknowledged; restoration not verified (the state could not be re-read)" in text
+    assert "After the readiness attempt the current state could not be re-read." in text
+    assert "draft/unlabeled re-entry state" not in text
+    assert "manual-merge state is suspended" not in text
+    assert "Ordinary CI can resume" not in text
+    assert "Do not ready or unlabel the PR." in text
+    assert len(_m1067_ready_calls(runner)) == 1
 
 
 @pytest.mark.parametrize(
@@ -11712,6 +11734,26 @@ def test_m1067_report_rendering_failure_keeps_original_error(tmp_path, monkeypat
     assert type(error) is AgentLoopError
     assert text.startswith("--managed-ci requested qualification, but activation failed")
     assert "Post-failure state report unavailable (RuntimeError)" in text
+    assert "gh pr ready 7" not in text
+    # Review item-6: the fixed fallback still gives remedy (C).
+    assert "Do not ready or unlabel the PR. Inspect it with `gh api repos/OWNER/REPO/pulls/7 --jq" in text
+    assert "then rerun `agent-loop pr 7" in text
+
+
+def test_m1067_report_fallback_survives_inspection_rendering_failure(tmp_path, monkeypatch):
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(managed_ci, "_build_failed_activation_report", broken)
+    monkeypatch.setattr(managed_ci, "_pr_inspection_command", broken)
+    runner = _m1067_ready_runner(unreadable_issue_events_after_label=True)
+
+    error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert type(error) is AgentLoopError
+    assert text.startswith("--managed-ci requested qualification, but activation failed")
+    assert "Post-failure state report unavailable (RuntimeError)" in text
+    assert "Resume with `agent-loop pr 7" in text
     assert "gh pr ready 7" not in text
 
 
