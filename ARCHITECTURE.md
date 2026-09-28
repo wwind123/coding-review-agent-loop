@@ -555,6 +555,31 @@ planning consumes strictly more rounds than full-board planning, and exhausting
 `--max-rounds` during a pending advance is reported distinctly from reviewer
 blocking issues.
 
+The transition classifier compares cross-cutting contracts, not prose. Its
+execution-recommendation contract identity digests the whole recommendation
+minus only its non-executable narrative: the top-level rationale, the caveats,
+and each coupling constraint's rationale. Scope-item acceptance criteria, stage
+fields, allocations, and any unknown key stay in the identity, because they are
+copied into execution and child-issue data. A semantic patch that replaces the
+recommendation is narrow only when that identity is unchanged, and a broad
+reason names the changed components. The identity is recomputed from sidecars
+on both the live and the resume path and is never persisted. The exact-plan
+candidate key stays full-content, so a narrative edit still invalidates carried
+approvals. Before a qualified opening, classification changes only the audit
+reason, never the primary-only board. A primary reviewer that never approves
+can therefore hold a run in the primary phase indefinitely. The
+**primary-phase stall stop** (`--plan-primary-stall-rounds`, default 8, `0`
+disables) bounds that. Before a round is scheduled, the loop derives from
+durable records how many consecutive completed primary reviews ended blocking.
+Each counted review must follow a valid primary-phase checkpoint of its round.
+Any approval, an invalid or missing checkpoint, a non-primary phase, a
+phase-advance record, or a panel opening ends the count, and a round with no
+completed primary review is skipped. At the threshold the run stops with a
+plain diagnostic before the prelaunch checkpoint. The stop is suppressed while
+planning history is degraded, writes no scheduler record, and never opens the
+panel. `--plan-review-force-full` stays the only way to convene the panel
+without an exact-plan primary approval.
+
 Planning scheduler metadata is a flow-discriminated branch of the same durable
 round-metadata transport. A planning record carries the candidate key in place
 of the PR-only SHA pair and omits the PR-only broad-rule and scope-digest state,

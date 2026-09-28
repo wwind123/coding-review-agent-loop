@@ -13893,3 +13893,609 @@ def test_1087_decision_with_a_child_issue_still_refuses(tmp_path):
         run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True)
 
     assert _m1087_posted_decisions(runner) == []
+
+
+# --- Primary-phase stall stop and contract identity (#1103) ------------------
+
+from coding_review_agent_loop.plan_assembly import assemble_plan_revision  # noqa: E402
+from coding_review_agent_loop.round_state import PostedRoundRecord  # noqa: E402
+
+
+def _m1103_blocking_chain(first_round, last_round, *, base, resolve_first=True):
+    """Primary blocking reviews and chained planner patches for a round range.
+
+    Round ``n``'s primary review blocks with a fresh finding ``item-n`` (and
+    resolves ``item-(n-1)``); the planner's revision after it is an
+    authenticated patch bound to the round-``n`` state that resolves
+    ``item-n``.  Returns the scripted outputs and the next base.
+    """
+    codex, claude = [], []
+    for n in range(first_round, last_round + 1):
+        codex.append(
+            structured_plan_review(
+                state="blocking",
+                summary=f"Gap {n} remains.",
+                blocking_plan_issues=[f"Close gap {n}."],
+                prior_plan_item_dispositions=(
+                    [{"item_id": f"item-{n - 1}", "disposition": "resolved"}]
+                    if n > 1 and (resolve_first or n > first_round)
+                    else None
+                ),
+            )
+        )
+        patch_payload = {
+            "schema_version": 1,
+            "kind": "plan_revision_patch",
+            "semantic_patch_contract_version": 1,
+            "state": "blocking",
+            "summary": f"Close gap {n}.",
+            "prior_plan_item_dispositions": [
+                {"item_id": f"item-{n}", "disposition": "resolved"}
+            ],
+            "base_round_number": n,
+            "base_state_identity": base.state_identity,
+            "operations": [
+                {
+                    "op": "replace",
+                    "field": "plan_steps",
+                    "value": [f"Implement the reviewed scope, revision {n}."],
+                }
+            ],
+        }
+        base = AuthenticatedPlanState.from_plan(
+            assemble_plan_revision(base, patch_payload), round_number=n + 1
+        )
+        claude.append(
+            json.dumps(patch_payload)
+            + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+        )
+    return codex, claude, base
+
+
+def _m1103_fresh_base():
+    fresh = structured_v1_plan_state()
+    return fresh, AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(fresh), round_number=1
+    )
+
+
+def _m1103_agent_calls(runner):
+    return [cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"claude", "codex", "gemini"}]
+
+
+def _m1103_stalled_runner(tmp_path, *, threshold=2, rounds=2):
+    """A live run whose primary blocks every round until the stall stop."""
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, rounds, base=base)
+    runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
+    config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=threshold)
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner, config, excinfo.value
+
+
+def test_primary_stall_stop_fires_before_the_next_primary_turn(tmp_path):
+    """`stall-stop-threshold`: plain diagnostic, no secondary, no checkpoint."""
+    runner, _config, error = _m1103_stalled_runner(tmp_path, threshold=2)
+
+    message = str(error)
+    assert "blocked 2 consecutive primary-phase" in message
+    assert "--plan-primary-stall-rounds 2" in message
+    assert "--plan-review-force-full" in message
+    assert "secondary plan panel was not convened" in message
+    # Two primary turns, two planner revisions after the fresh plan, and no
+    # secondary reviewer ever.
+    assert _m1103_agent_calls(runner) == [
+        "claude", "codex", "claude", "codex", "claude",
+    ]
+    records = _plan_round_records(runner)
+    prelaunch = [record for record in records if record.phase == "scheduler-prelaunch"]
+    assert [record.round_number for record in prelaunch] == [1, 2]
+    assert all(record.scheduler_phase == "primary" for record in prelaunch)
+    assert not any(record.scheduler_force_full for record in prelaunch)
+    diagnostics = [
+        comment["body"]
+        for comment in runner.issue_comments
+        if comment["body"].startswith("Plan review scheduling diagnostic (round 3)")
+    ]
+    assert len(diagnostics) == 1
+    # Plain audit text: no round metadata a resume could read as a checkpoint.
+    assert "AGENT_LOOP_META" not in diagnostics[0]
+
+
+def test_primary_stall_stop_rerun_is_deterministic_and_overridable(tmp_path):
+    """`stall-resume-deterministic`: same flags stop again; overrides proceed."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+
+    rerun = _FakeRunner(issue_comments=list(history))
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    assert _m1103_agent_calls(rerun) == []
+    # The rerun wrote no new checkpoint; only the stopped run's two remain.
+    assert [
+        record.round_number
+        for record in _plan_round_records(rerun)
+        if record.phase == "scheduler-prelaunch"
+    ] == [1, 2]
+
+    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
+    for overrides, expected_phase in (
+        ({"plan_primary_stall_rounds": 3}, "primary"),
+        ({"plan_primary_stall_rounds": 0}, "primary"),
+        ({"plan_review_force_full": True}, "full-board"),
+    ):
+        proceeding = _FakeRunner(
+            issue_comments=list(history),
+            codex_outputs=[
+                structured_plan_review(
+                    state="approved", prior_plan_item_dispositions=resolved
+                )
+            ],
+            gemini_outputs=[
+                structured_plan_review(
+                    state="approved",
+                    reviewer="Google Gemini",
+                    prior_plan_item_dispositions=resolved,
+                )
+            ],
+        )
+        try:
+            run_issue_loop(
+                proceeding,
+                issue_number=56,
+                config=replace(config, **overrides),
+                plan_first=True,
+            )
+        except AgentLoopError:
+            pass
+        round_three = [
+            record
+            for record in _plan_round_records(proceeding)
+            if record.phase == "scheduler-prelaunch" and record.round_number == 3
+        ]
+        assert round_three, overrides
+        assert round_three[0].scheduler_phase == expected_phase, overrides
+        assert "codex" in _m1103_agent_calls(proceeding)
+        if expected_phase == "primary":
+            # The panel is never auto-convened: round 3 is primary-only.
+            assert round_three[0].scheduler_selected_reviewers == ("Codex",)
+        else:
+            assert round_three[0].scheduler_force_full_source == "operator"
+
+
+def test_primary_stall_stop_does_not_count_an_interrupted_round(tmp_path):
+    """`stall-interrupted-round-not-counted`: the prelaunch checkpoint is not a turn."""
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, 2, base=base)
+    runner = _FakeRunner(claude_outputs=[fresh, claude[0]], codex_outputs=[codex[0]])
+    config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=2)
+    real_post = orchestrator_module.post_issue_comment
+
+    def interrupt_after_round_two_checkpoint(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        metadata = _m943_decoded(kwargs["body"])
+        if (
+            metadata is not None
+            and metadata.phase == "scheduler-prelaunch"
+            and metadata.round_number == 2
+        ):
+            raise KeyboardInterrupt
+        return result
+
+    with patch.object(
+        orchestrator_module,
+        "post_issue_comment",
+        side_effect=interrupt_after_round_two_checkpoint,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert _m1103_agent_calls(runner) == ["claude", "codex", "claude"]
+
+    runner.codex_outputs = [codex[1]]
+    runner.claude_outputs = [claude[1]]
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    # The interrupted round's primary turn ran before the stop fired.
+    assert _m1103_agent_calls(runner) == ["claude", "codex", "claude", "codex", "claude"]
+    assert any(
+        comment["body"].startswith("Plan review scheduling diagnostic (round 3)")
+        for comment in runner.issue_comments
+    )
+
+
+def test_primary_stall_stop_is_suppressed_across_degraded_history(tmp_path):
+    """`stall-degraded-history-boundary`: an invalid record resets the streak."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    subject = next(
+        record.subject
+        for record in reversed(_plan_round_records(runner))
+        if record.role == "coder"
+    )
+    # Ordered after every posted comment and before anything the rerun posts.
+    from coding_review_agent_loop.round_transport import (
+        decode_mapping,
+        encode_mapping,
+    )
+
+    invalid = _invalid_plan_scheduler_comment(
+        subject, created_at=f"2026-05-23T00:00:{len(history):02d}Z"
+    )
+    payload_text = re.search(r"AGENT_LOOP_META: (\S+) -->", invalid["body"]).group(1)
+    payload = dict(decode_mapping(payload_text), round_number=3)
+    invalid["body"] = invalid["body"].replace(payload_text, encode_mapping(payload))
+    history.append(invalid)
+
+    _fresh, base = _m1103_fresh_base()
+    _codex, _claude, base = _m1103_blocking_chain(1, 2, base=base)
+    # The degraded round's ledger carries no prior item to disposition.
+    codex, claude, _base = _m1103_blocking_chain(3, 4, base=base, resolve_first=False)
+    rerun = _FakeRunner(issue_comments=history, codex_outputs=codex, claude_outputs=claude)
+    with patch.object(
+        orchestrator_module,
+        "log",
+        wraps=orchestrator_module.log,
+    ) as logged:
+        with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+            run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    assert any(
+        "stall stop suppressed: degraded planning history (invalid)" in str(call.args[-1])
+        for call in logged.call_args_list
+    )
+    # The degraded round ran the conservative primary-only fallback, and the
+    # stop needed two further valid blocking rounds after the boundary.
+    assert _m1103_agent_calls(rerun) == ["codex", "claude", "codex", "claude"]
+    prelaunch = {
+        record.round_number: record
+        for record in _plan_round_records(rerun)
+        if record.phase == "scheduler-prelaunch"
+        and record.scheduler_metadata_status == "valid"
+    }
+    assert prelaunch[3].scheduler_phase == "primary"
+    assert prelaunch[3].scheduler_selected_reviewers == ("Codex",)
+    assert "strict pre-panel fallback:" in " ".join(prelaunch[3].scheduler_reasons)
+    assert prelaunch[4].scheduler_phase == "primary"
+    assert 5 not in prelaunch
+    assert any(
+        comment["body"].startswith("Plan review scheduling diagnostic (round 5)")
+        for comment in rerun.issue_comments
+    )
+
+
+def test_primary_approval_at_the_threshold_opens_the_panel(tmp_path):
+    """`stall-approval-precedence`: N-1 blocking reviews then an approval."""
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, 2, base=base)
+    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
+    runner = _FakeRunner(
+        claude_outputs=[fresh, *claude],
+        codex_outputs=[
+            *codex,
+            structured_plan_review(state="approved", prior_plan_item_dispositions=resolved),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=resolved,
+            )
+        ],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=3)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    prelaunch = [
+        record
+        for record in _plan_round_records(runner)
+        if record.phase == "scheduler-prelaunch"
+    ]
+    assert [record.scheduler_phase for record in prelaunch] == [
+        "primary",
+        "primary",
+        "primary",
+        "secondary-audit",
+    ]
+    assert prelaunch[3].scheduler_selected_reviewers == ("Gemini",)
+    assert prelaunch[2].plan_candidate_key == prelaunch[3].plan_candidate_key
+    assert not any(
+        comment["body"].startswith("Plan review scheduling diagnostic")
+        for comment in runner.issue_comments
+    )
+
+
+def test_zero_stall_threshold_runs_to_the_round_budget(tmp_path):
+    """0 disables the stop: the run exhausts --max-rounds as before."""
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, 3, base=base)
+    runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
+    config = _staged_plan_config(tmp_path, max_rounds=3, plan_primary_stall_rounds=0)
+
+    with pytest.raises(AgentLoopError, match="still reported blocking plan issues") as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not isinstance(excinfo.value, orchestrator_module.PlanPrePanelSafetyError)
+    assert _m1103_agent_calls(runner).count("codex") == 3
+    assert "gemini" not in _m1103_agent_calls(runner)
+
+
+# Streak derivation over synthetic records.
+
+
+def _m1103_checkpoint(index, round_number, *, phase="primary", status="valid"):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="plan",
+            role="summary",
+            agent="Orchestrator",
+            round_number=round_number,
+            subject="s",
+            phase="scheduler-prelaunch",
+            scheduler_phase=phase if status == "valid" else None,
+            scheduler_metadata_status=status,
+        ),
+        body="",
+    )
+
+
+def _m1103_review(index, round_number, state="blocking", *, agent="Codex"):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="plan",
+            role="reviewer",
+            agent=agent,
+            round_number=round_number,
+            subject="s",
+            state=state,
+        ),
+        body="",
+    )
+
+
+def _m1103_rounds(*states, start=1):
+    records = []
+    for offset, state in enumerate(states):
+        number = start + offset
+        records.append(_m1103_checkpoint(len(records), number))
+        if state is not None:
+            records.append(_m1103_review(len(records), number, state))
+    return records
+
+
+def _m1103_streak(records, **kwargs):
+    return orchestrator_module.plan_primary_blocking_streak(
+        records, primary="Codex", **kwargs
+    )
+
+
+def test_stall_streak_counts_trailing_blocking_primary_reviews():
+    assert _m1103_streak(_m1103_rounds("blocking", "blocking", "blocking")) == 3
+    assert _m1103_streak([]) == 0
+
+
+@pytest.mark.parametrize("state", ["approved", "unavailable", None])
+def test_stall_streak_resets_on_any_non_blocking_primary_review(state):
+    """`stall-growth-gated-approval-resets`: any approval, any key, resets."""
+    if state is None:
+        records = _m1103_rounds("blocking", "blocking")
+        records.append(_m1103_checkpoint(len(records), 3))
+        records.append(_m1103_review(len(records), 3, "blocking"))
+        # An absent state on the primary's record is not evidence of a block.
+        records[-1] = PostedRoundRecord(
+            index=records[-1].index,
+            metadata=replace(records[-1].metadata, state=None),
+            body="",
+        )
+        assert _m1103_streak(records) == 0
+        return
+    records = _m1103_rounds("blocking", state, "blocking", "blocking")
+    assert _m1103_streak(records) == 2
+
+
+def test_stall_streak_skips_a_round_with_no_primary_review():
+    records = _m1103_rounds("blocking", "blocking", None)
+    assert _m1103_streak(records) == 2
+    records = _m1103_rounds("blocking", None, "blocking")
+    assert _m1103_streak(records) == 2
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        {"phase": "secondary-audit"},
+        {"phase": "remediation"},
+        {"phase": "full-board"},
+        {"phase": "final-secondary-sweep"},
+        {"status": "invalid"},
+    ],
+)
+def test_stall_streak_ends_at_a_non_primary_or_invalid_checkpoint(checkpoint):
+    records = _m1103_rounds("blocking", "blocking")
+    records.append(_m1103_checkpoint(len(records), 3, **checkpoint))
+    records.append(_m1103_review(len(records), 3, "blocking"))
+    records.extend(_m1103_rounds("blocking", start=4))
+    records = [
+        PostedRoundRecord(index=i, metadata=r.metadata, body="")
+        for i, r in enumerate(records)
+    ]
+    assert _m1103_streak(records) == 1
+
+
+def test_stall_streak_ends_at_a_missing_checkpoint_and_ignores_secondaries():
+    records = _m1103_rounds("blocking")
+    records.append(_m1103_review(len(records), 2, "blocking"))
+    records.extend(_m1103_rounds("blocking", start=3))
+    records = [
+        PostedRoundRecord(index=i, metadata=r.metadata, body="")
+        for i, r in enumerate(records)
+    ]
+    assert _m1103_streak(records) == 1
+    with_secondary = _m1103_rounds("blocking", "blocking")
+    with_secondary.append(_m1103_review(len(with_secondary), 2, "approved", agent="Gemini"))
+    assert _m1103_streak(with_secondary) == 2
+
+
+def test_stall_streak_ends_at_invalid_records_phase_advances_and_openings():
+    records = _m1103_rounds("blocking", "blocking")
+    records.append(
+        PostedRoundRecord(
+            index=len(records),
+            metadata=PostedRoundMetadata(
+                flow="plan",
+                role="summary",
+                agent="Orchestrator",
+                round_number=3,
+                subject="s",
+                phase="plan-phase-advance",
+            ),
+            body="",
+        )
+    )
+    tail = _m1103_rounds("blocking", start=3)
+    records.extend(
+        PostedRoundRecord(index=len(records) + i, metadata=r.metadata, body="")
+        for i, r in enumerate(tail)
+    )
+    assert _m1103_streak(records) == 1
+    # A trailing invalid scheduler record ends the streak even when it is not
+    # the checkpoint any primary review is bound to.
+    degraded = _m1103_rounds("blocking", "blocking")
+    degraded.append(_m1103_checkpoint(len(degraded), 1, status="invalid"))
+    assert _m1103_streak(degraded) == 0
+    # Anything at or after a qualified panel opening is excluded.
+    opened = _m1103_rounds("blocking", "blocking")
+    assert _m1103_streak(opened, panel_opening_index=2) == 0
+
+
+def test_stall_streak_keeps_the_last_record_of_a_repeated_round():
+    records = _m1103_rounds("blocking")
+    records.append(_m1103_checkpoint(len(records), 2))
+    records.append(_m1103_review(len(records), 2, "approved"))
+    records.append(_m1103_checkpoint(len(records), 2))
+    records.append(_m1103_review(len(records), 2, "blocking"))
+    assert _m1103_streak(records) == 2
+
+
+def _m1103_narrative_runner():
+    """Primary gate, panel blocker, then a narrative-only recommendation patch."""
+    fresh = structured_v1_plan_state()
+    base = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(fresh), round_number=1
+    )
+    recommendation = json.loads(fresh.split("\n<!--", 1)[0])["execution_recommendation"]
+    recommendation = dict(
+        recommendation,
+        rationale="The reviewed scope is one coherent delivery; reworded.",
+        caveats=["A narrative caveat."],
+    )
+    patch_payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Reword the recommendation rationale.",
+        "prior_plan_item_dispositions": [
+            {"item_id": "item-1", "disposition": "resolved"}
+        ],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "execution_recommendation", "value": recommendation}
+        ],
+    }
+    patch_text = (
+        json.dumps(patch_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}]
+    return _FakeRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_plan_review(state="approved", prior_plan_item_dispositions=resolved),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking",
+                reviewer="Google Gemini",
+                summary="The rationale is unclear.",
+                blocking_plan_issues=["Reword the recommendation rationale."],
+            ),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+        antigravity_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Antigravity"),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Antigravity",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+    )
+
+
+def _m1103_assert_narrative_remediation(runner):
+    prelaunch = {
+        record.round_number: record
+        for record in _plan_round_records(runner)
+        if record.phase == "scheduler-prelaunch"
+    }
+    remediation = prelaunch[3]
+    assert remediation.scheduler_phase == "remediation"
+    assert set(remediation.scheduler_selected_reviewers) == {"Gemini", "Codex"}
+    assert remediation.scheduler_force_full is False
+    assert "narrow plan remediation" in " ".join(remediation.scheduler_reasons)
+    # The candidate key still changed, so no approval was carried across it:
+    # the final sweep re-covers the secondary lacking an exact-key approval.
+    assert remediation.plan_candidate_key != prelaunch[2].plan_candidate_key
+    assert prelaunch[4].scheduler_phase == "final-secondary-sweep"
+    assert prelaunch[4].scheduler_selected_reviewers == ("Antigravity",)
+    assert not any(
+        record.scheduler_phase == "full-board" for record in prelaunch.values()
+    )
+
+
+def test_narrative_only_recommendation_patch_stays_owner_scoped_after_the_panel(tmp_path):
+    """`postpanel-prose-remediation`: no full board and no automatic latch."""
+    runner = _m1103_narrative_runner()
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    _m1103_assert_narrative_remediation(runner)
+
+
+def test_resume_after_a_narrative_only_patch_reconstructs_the_narrow_classification(tmp_path):
+    """`resume-reconstructs-narrow`: the restart classifies as the live run does."""
+    runner = _m1103_narrative_runner()
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+    real_post = orchestrator_module.post_issue_comment
+    audits = {"count": 0}
+
+    def interrupt_before_remediation_checkpoint(*args, **kwargs):
+        if kwargs["body"].startswith("Plan review scheduling audit."):
+            audits["count"] += 1
+            if audits["count"] == 3:
+                raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    with patch.object(
+        orchestrator_module,
+        "post_issue_comment",
+        side_effect=interrupt_before_remediation_checkpoint,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    _m1103_assert_narrative_remediation(runner)

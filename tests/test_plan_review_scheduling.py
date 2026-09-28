@@ -1144,3 +1144,452 @@ def test_module_is_pure_and_imports_no_github_or_agent_module():
         "subprocess",
         "requests",
     }
+
+
+# --------------------------------------------------------------------------
+# Execution-recommendation contract identity (#1103)
+# --------------------------------------------------------------------------
+
+import copy as _copy
+import hashlib as _hashlib
+import json as _json
+
+from coding_review_agent_loop.plan_review_scheduling import (  # noqa: E402
+    NARROW_PLAN_CONTRACT_BOUND_PATCH_FIELDS,
+    execution_recommendation_changed_components,
+    execution_recommendation_contract_identity,
+    execution_recommendation_contract_projection,
+)
+
+
+def _recommendation() -> dict:
+    return {
+        "strategy": "staged",
+        "staging_feasibility": "separable",
+        "rationale": "Why this is staged.",
+        "caveats": ["A caveat."],
+        "scope_items": [
+            {
+                "scope_item_id": "scope-report",
+                "requirement": "Report the thing.",
+                "acceptance_criteria": ["It reports."],
+            },
+            {
+                "scope_item_id": "scope-undo",
+                "requirement": "Undo the thing.",
+                "acceptance_criteria": ["It undoes."],
+            },
+        ],
+        "coupling_constraints": [
+            {
+                "constraint_id": "c-1",
+                "scope_item_ids": ["scope-report", "scope-undo"],
+                "rationale": "They share state.",
+            }
+        ],
+        "one_shot_delivery": None,
+        "child_stages": [
+            {
+                "stage_id": "stage-1",
+                "title": "Stage one",
+                "summary": "First stage.",
+                "deliverables": ["d-1"],
+                "non_goals": [],
+                "acceptance_criteria": ["a-1"],
+                "dependency_notes": [],
+                "rollout_risk": "low",
+                "compatibility_constraints": [],
+                "execution_disposition": {"mode": "separate", "rationale": "Own PR."},
+            }
+        ],
+        "retained_parent_work": {
+            "status": "none",
+            "deliverables": [],
+            "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "required",
+            "deliverables": ["integrate"],
+            "acceptance_criteria": ["integrated"],
+            "covered_scope_item_ids": ["scope-undo"],
+        },
+    }
+
+
+def _edited(mutate) -> dict:
+    value = _copy.deepcopy(_recommendation())
+    mutate(value)
+    return value
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda v: v.__setitem__("rationale", "Reworded rationale."),
+        lambda v: v.__setitem__("caveats", ["Another caveat.", "And more."]),
+        lambda v: v.pop("caveats"),
+        lambda v: v["coupling_constraints"][0].__setitem__("rationale", "Reworded."),
+    ],
+    ids=["rationale", "caveats", "caveats-removed", "coupling-rationale"],
+)
+def test_narrative_only_recommendation_edits_keep_the_contract_identity(mutate):
+    assert execution_recommendation_contract_identity(
+        _edited(mutate)
+    ) == execution_recommendation_contract_identity(_recommendation())
+
+
+@pytest.mark.parametrize(
+    ("mutate", "components"),
+    [
+        (
+            lambda v: v["scope_items"][0]["acceptance_criteria"].append("More."),
+            ("scope_items", "scope_items[scope-report]"),
+        ),
+        (
+            lambda v: v["scope_items"][1].__setitem__("requirement", "Undo more."),
+            ("scope_items", "scope_items[scope-undo]"),
+        ),
+        (
+            lambda v: v.__setitem__(
+                "one_shot_delivery", {"deliverables": ["x"], "acceptance_criteria": []}
+            ),
+            ("one_shot_delivery",),
+        ),
+        (
+            lambda v: v["child_stages"][0].__setitem__("summary", "Changed."),
+            ("child_stages", "child_stages[stage-1]"),
+        ),
+        (
+            lambda v: v["child_stages"][0]["acceptance_criteria"].append("a-2"),
+            ("child_stages", "child_stages[stage-1]"),
+        ),
+        (
+            lambda v: v["child_stages"][0]["execution_disposition"].__setitem__(
+                "rationale", "Different."
+            ),
+            ("child_stages", "child_stages[stage-1]"),
+        ),
+        (
+            lambda v: v["final_integration_work"]["acceptance_criteria"].append("more"),
+            ("final_integration_work",),
+        ),
+        (
+            lambda v: v["retained_parent_work"].__setitem__("status", "required"),
+            ("retained_parent_work",),
+        ),
+        (lambda v: v.__setitem__("strategy", "one-shot"), ("strategy",)),
+        (
+            lambda v: v["child_stages"].append(
+                dict(v["child_stages"][0], stage_id="stage-2")
+            ),
+            ("child_stages", "child_stages[stage-2]"),
+        ),
+        (
+            lambda v: v["coupling_constraints"][0]["scope_item_ids"].pop(),
+            ("coupling_constraints",),
+        ),
+        (lambda v: v.__setitem__("unknown_future_key", 1), ("unknown_future_key",)),
+    ],
+    ids=[
+        "scope-criteria",
+        "scope-requirement",
+        "one-shot-delivery",
+        "stage-summary",
+        "stage-criteria",
+        "stage-disposition-rationale",
+        "final-integration-criteria",
+        "retained-parent-status",
+        "strategy",
+        "stage-added",
+        "coupling-scope",
+        "unknown-key",
+    ],
+)
+def test_executable_recommendation_edits_change_the_identity(mutate, components):
+    before = _recommendation()
+    after = _edited(mutate)
+    assert execution_recommendation_contract_identity(
+        after
+    ) != execution_recommendation_contract_identity(before)
+    assert execution_recommendation_changed_components(
+        execution_recommendation_contract_projection(before),
+        execution_recommendation_contract_projection(after),
+    ) == components
+
+
+@pytest.mark.parametrize("value", [None, [], "text", 3])
+def test_missing_or_non_dict_recommendation_is_unobserved(value):
+    assert execution_recommendation_contract_identity(value) is None
+    assert execution_recommendation_contract_projection(value) is None
+    contracts = PlanCrossCuttingContracts(
+        execution_recommendation_identity=execution_recommendation_contract_identity(value),
+        human_requirement_disposition_digest="disp-1",
+        architecture_impact_status="unchanged",
+    )
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(operation_fields=("execution_recommendation",)),
+        previous_contracts=contracts,
+        current_contracts=contracts,
+    )
+    assert classification.broad
+    assert "execution_recommendation_identity" in classification.reason
+    assert "could not be observed" in classification.reason
+
+
+def test_legacy_stage_is_digested_as_is_and_odd_coupling_entries_are_kept():
+    legacy = _edited(lambda v: v["child_stages"][0].pop("execution_disposition"))
+    first = execution_recommendation_contract_identity(legacy)
+    assert first == execution_recommendation_contract_identity(_copy.deepcopy(legacy))
+    assert first != execution_recommendation_contract_identity(_recommendation())
+    odd = _edited(lambda v: v["coupling_constraints"].append("not-a-dict"))
+    projection = execution_recommendation_contract_projection(odd)
+    assert projection["coupling_constraints"][-1] == "not-a-dict"
+    assert execution_recommendation_contract_identity(
+        odd
+    ) != execution_recommendation_contract_identity(_recommendation())
+    # Keyless lists still report the bare key rather than raising.
+    keyless = _edited(lambda v: v["scope_items"].append("loose"))
+    assert execution_recommendation_changed_components(
+        execution_recommendation_contract_projection(_recommendation()),
+        execution_recommendation_contract_projection(keyless),
+    ) == ("scope_items",)
+
+
+def test_contract_identity_is_domain_tagged_and_never_the_whole_object_digest():
+    value = _recommendation()
+    legacy_digest = _hashlib.sha256(
+        _json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:32]
+    identity = execution_recommendation_contract_identity(value)
+    assert identity is not None and len(identity) == 32
+    assert identity != legacy_digest
+    # The projection never mutates the caller's recommendation.
+    assert value == _recommendation()
+
+
+def _er_contracts(recommendation: dict) -> PlanCrossCuttingContracts:
+    return _contracts(
+        execution_recommendation_identity=execution_recommendation_contract_identity(
+            recommendation
+        ),
+        execution_recommendation_projection=execution_recommendation_contract_projection(
+            recommendation
+        ),
+    )
+
+
+def test_projection_is_diagnostic_only_and_never_compared():
+    first = _er_contracts(_recommendation())
+    reworded = _er_contracts(_edited(lambda v: v.__setitem__("rationale", "New.")))
+    assert first == reworded
+    assert first.differences(reworded) == ()
+    assert "execution_recommendation_projection" not in first.REQUIRED_IDENTITY_FIELDS
+
+
+def test_narrative_only_recommendation_patch_is_narrow():
+    assert "execution_recommendation" in NARROW_PLAN_CONTRACT_BOUND_PATCH_FIELDS
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2", strategy="strategy-2"),
+        _revision(operation_fields=("execution_recommendation",), matrix_operations=()),
+        previous_contracts=_er_contracts(_recommendation()),
+        current_contracts=_er_contracts(
+            _edited(lambda v: v.__setitem__("caveats", ["Rewritten caveat."]))
+        ),
+    )
+    assert classification.narrow
+
+
+def test_contract_changing_recommendation_patch_is_broad_and_names_components():
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2", strategy="strategy-2"),
+        _revision(operation_fields=("execution_recommendation",), matrix_operations=()),
+        previous_contracts=_er_contracts(_recommendation()),
+        current_contracts=_er_contracts(
+            _edited(lambda v: v["scope_items"][0]["acceptance_criteria"].append("x"))
+        ),
+    )
+    assert classification.broad
+    assert classification.reason == (
+        "cross-cutting plan contract(s) changed: execution_recommendation_identity "
+        "(scope_items, scope_items[scope-report])"
+    )
+
+
+def test_recommendation_patch_with_another_contract_change_is_broad():
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2", strategy="strategy-2"),
+        _revision(operation_fields=("execution_recommendation",), matrix_operations=()),
+        previous_contracts=_er_contracts(_recommendation()),
+        current_contracts=_contracts(
+            execution_recommendation_identity=execution_recommendation_contract_identity(
+                _recommendation()
+            ),
+            architecture_impact_status="changed",
+        ),
+    )
+    assert classification.broad
+    assert "architecture_impact_status" in classification.reason
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        _revision(
+            response_form="legacy-full-state",
+            operation_fields=("execution_recommendation",),
+        ),
+        _revision(base="plan-0", operation_fields=("execution_recommendation",)),
+        _revision(sidecar_bound=False, operation_fields=("execution_recommendation",)),
+    ],
+    ids=["unauthenticated", "unbound-base", "unbound-sidecar"],
+)
+def test_unauthenticated_or_unbound_recommendation_patch_is_broad(revision):
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        revision,
+        previous_contracts=_er_contracts(_recommendation()),
+        current_contracts=_er_contracts(
+            _edited(lambda v: v.__setitem__("rationale", "New."))
+        ),
+    )
+    assert classification.broad
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "architecture_impact",
+        "additional_closing_issue_ids",
+        "human_requirement_dispositions",
+        "deferred_stages",
+        "one_shot_growth_justification",
+    ],
+)
+def test_other_contract_fields_stay_outside_narrow_admission(field_name):
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(operation_fields=("execution_recommendation", field_name)),
+        previous_contracts=_er_contracts(_recommendation()),
+        current_contracts=_er_contracts(_recommendation()),
+    )
+    assert classification.broad
+    assert field_name in classification.reason
+
+
+def test_contract_check_precedes_the_contract_bound_field_admission():
+    """A structural recommendation change is broad on the contract, not the field."""
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2"),
+        _revision(operation_fields=("execution_recommendation",)),
+        previous_contracts=_er_contracts(_recommendation()),
+        current_contracts=_er_contracts(
+            _edited(lambda v: v.__setitem__("strategy", "one-shot"))
+        ),
+    )
+    assert classification.broad
+    assert classification.reason.startswith("cross-cutting plan contract(s) changed")
+
+
+def test_pre_panel_broad_and_narrow_select_the_same_primary_only_board():
+    snapshot = PlanSchedulerSnapshot(
+        contract=_contract(),
+        previous_key=_key(),
+        current_key=_key(plan="plan-2"),
+        obligations=(_obligation(),),
+    )
+    broad = select_plan_reviewers(
+        snapshot,
+        PlanTransitionClassification(
+            "broad",
+            "cross-cutting plan contract(s) changed: execution_recommendation_identity",
+        ),
+    )
+    narrow = select_plan_reviewers(
+        snapshot, PlanTransitionClassification("narrow", "narrow plan remediation")
+    )
+    for decision in (broad, narrow):
+        assert decision.selected_reviewers == (PRIMARY,)
+        assert decision.phase == "primary"
+        assert not decision.latches_force_full
+        assert not decision.records_panel_opening
+    assert broad.reason.startswith(STRICT_PRE_PANEL_PREFIX)
+    assert not narrow.reason.startswith(STRICT_PRE_PANEL_PREFIX)
+    assert broad.paused_reviewers == narrow.paused_reviewers
+
+
+def test_post_panel_narrative_only_patch_routes_to_owner_scoped_remediation():
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2", strategy="strategy-2"),
+        _revision(operation_fields=("execution_recommendation",), matrix_operations=()),
+        previous_contracts=_er_contracts(_recommendation()),
+        current_contracts=_er_contracts(
+            _edited(lambda v: v.__setitem__("rationale", "Reworded."))
+        ),
+    )
+    decision = select_plan_reviewers(
+        PlanSchedulerSnapshot(
+            contract=_contract(),
+            previous_key=_key(),
+            current_key=_key(plan="plan-2", strategy="strategy-2"),
+            panel_evidence=True,
+            obligations=(_obligation(owners=("Claude",)),),
+        ),
+        classification,
+        # An approval of the previous key is never carried by the caller.
+        qualifying_approvals=(),
+    )
+    assert decision.phase == "remediation"
+    assert set(decision.selected_reviewers) == {PRIMARY, "Claude"}
+    assert not decision.latches_force_full
+    # After clearance the final sweep still covers every secondary lacking an
+    # exact-key approval.
+    sweep = select_plan_reviewers(
+        PlanSchedulerSnapshot(
+            contract=_contract(),
+            previous_key=_key(plan="plan-2", strategy="strategy-2"),
+            current_key=_key(plan="plan-2", strategy="strategy-2"),
+            panel_evidence=True,
+        ),
+        _recheck(),
+        qualifying_approvals=(PRIMARY, "Claude"),
+    )
+    assert sweep.phase == "final-secondary-sweep"
+    assert sweep.selected_reviewers == ("Antigravity",)
+
+
+def test_post_panel_structural_patch_selects_the_full_board_and_latches():
+    classification = classify_plan_transition(
+        _key(),
+        _key(plan="plan-2", strategy="strategy-2"),
+        _revision(operation_fields=("execution_recommendation",), matrix_operations=()),
+        previous_contracts=_er_contracts(_recommendation()),
+        current_contracts=_er_contracts(
+            _edited(lambda v: v["child_stages"][0].__setitem__("stage_id", "stage-9"))
+        ),
+    )
+    decision = select_plan_reviewers(
+        PlanSchedulerSnapshot(
+            contract=_contract(),
+            previous_key=_key(),
+            current_key=_key(plan="plan-2", strategy="strategy-2"),
+            panel_evidence=True,
+        ),
+        classification,
+    )
+    assert decision.phase == "full-board"
+    assert decision.selected_reviewers == BOARD
+    assert decision.latches_force_full
+    assert "child_stages[stage-1]" in decision.reason
+    assert "child_stages[stage-9]" in decision.reason

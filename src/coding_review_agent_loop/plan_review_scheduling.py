@@ -16,9 +16,10 @@ reviewed decision interface that the plan-first loop consumes in stage 2.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 from .errors import AgentLoopError
@@ -118,8 +119,18 @@ NARROW_PLAN_PATCH_FIELDS = frozenset(
     {"summary", "plan_steps", "deferred_work", "plan_actions", "external_dependencies"}
 )
 
+# Patch fields admitted as narrow only because a cross-cutting contract identity
+# already binds their executable content (#1103).  The contract check runs
+# before the field check, so a replace of ``execution_recommendation`` is narrow
+# only when its contract identity is unchanged: a narrative-only edit.
+NARROW_PLAN_CONTRACT_BOUND_PATCH_FIELDS = frozenset({"execution_recommendation"})
+
 # Risk-matrix row operations a narrow planning remediation may carry.
 NARROW_PLAN_MATRIX_OPERATIONS = frozenset({"matrix_add", "matrix_edit"})
+
+# Domain tag of the execution-recommendation contract identity, so it can never
+# equal the historical whole-object digest.
+EXECUTION_RECOMMENDATION_CONTRACT_DOMAIN = "er-contract-v1"
 
 # ``architecture_impact_status`` carries the status itself, not a digest, so its
 # domain is the same two values the architecture-impact contract accepts.
@@ -237,6 +248,105 @@ def surfaced_requirement_id_digest(requirement_ids: Sequence[str] | None) -> str
         cleaned.add(value.strip())
     payload = json.dumps(sorted(cleaned), separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def execution_recommendation_contract_projection(value: object) -> dict | None:
+    """The execution recommendation minus its non-executable narrative.
+
+    Removes only the top-level ``rationale``, the top-level ``caveats``, and
+    ``rationale`` inside each coupling-constraint entry that is a dict.  Every
+    other field, including scope-item requirements and acceptance criteria,
+    one-shot delivery, every child-stage field, allocations, and any unknown
+    key, stays: those are copied into execution and child-issue data, so they
+    are executable contract.  ``None`` for a missing or non-dict value.
+    """
+    if not isinstance(value, dict):
+        return None
+    projection = copy.deepcopy(value)
+    projection.pop("rationale", None)
+    projection.pop("caveats", None)
+    constraints = projection.get("coupling_constraints")
+    if isinstance(constraints, list):
+        for entry in constraints:
+            if isinstance(entry, dict):
+                entry.pop("rationale", None)
+    return projection
+
+
+def execution_recommendation_contract_identity(value: object) -> str | None:
+    """Digest of the executable execution-recommendation contract (#1103).
+
+    ``None`` (unobserved) for a missing or non-dict recommendation, so the
+    classifier keeps the transition broad instead of comparing two defaults.
+    """
+    projection = execution_recommendation_contract_projection(value)
+    if projection is None:
+        return None
+    payload = json.dumps(
+        {"domain": EXECUTION_RECOMMENDATION_CONTRACT_DOMAIN, "contract": projection},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _entries_by_id(value: object, id_field: str) -> dict[str, str] | None:
+    """Canonical entries keyed by their string ID, or ``None`` if not keyable."""
+    if not isinstance(value, list):
+        return None
+    keyed: dict[str, str] = {}
+    for entry in value:
+        if not isinstance(entry, dict):
+            return None
+        entry_id = entry.get(id_field)
+        if not isinstance(entry_id, str) or not entry_id or entry_id in keyed:
+            return None
+        keyed[entry_id] = _canonical(entry)
+    return keyed
+
+
+_EXECUTION_RECOMMENDATION_ID_FIELDS = {
+    "scope_items": "scope_item_id",
+    "child_stages": "stage_id",
+}
+
+
+def execution_recommendation_changed_components(
+    previous: object, current: object
+) -> tuple[str, ...]:
+    """Diagnostic names of the changed executable recommendation components.
+
+    Compares narrative-stripped projections.  Returns the sorted top-level keys
+    whose values differ; for ``scope_items`` and ``child_stages`` it adds
+    ``scope_items[<id>]`` / ``child_stages[<id>]`` for each added, removed, or
+    modified entry when every entry is a dict with a unique string ID.
+    Diagnostics only: never used to decide a classification.
+    """
+    before = previous if isinstance(previous, dict) else {}
+    after = current if isinstance(current, dict) else {}
+    names: list[str] = []
+    for key in sorted(set(before) | set(after), key=str):
+        if key in before and key in after and _canonical(before[key]) == _canonical(
+            after[key]
+        ):
+            continue
+        names.append(str(key))
+        id_field = _EXECUTION_RECOMMENDATION_ID_FIELDS.get(key)
+        if id_field is None:
+            continue
+        before_entries = _entries_by_id(before.get(key, []), id_field)
+        after_entries = _entries_by_id(after.get(key, []), id_field)
+        if before_entries is None or after_entries is None:
+            continue
+        for entry_id in sorted(set(before_entries) | set(after_entries)):
+            if before_entries.get(entry_id) != after_entries.get(entry_id):
+                names.append(f"{key}[{entry_id}]")
+    return tuple(names)
 
 
 @dataclass(frozen=True)
@@ -394,6 +504,12 @@ class PlanCrossCuttingContracts:
     human_requirement_disposition_digest: str | None = None
     additional_closing_issue_ids: tuple[str, ...] = ()
     architecture_impact_status: str | None = None
+    # Diagnostics only (#1103): the narrative-stripped recommendation used to
+    # name changed components in a broad reason.  Never compared, never
+    # required, never persisted.
+    execution_recommendation_projection: dict | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         ids = tuple(self.additional_closing_issue_ids)
@@ -694,8 +810,9 @@ def classify_plan_transition(
     ``recheck`` when the candidate key is unchanged, ``narrow`` for an
     authenticated ``semantic-patch-v1`` revision bound to the immediately
     preceding base identity that touches only plan prose, plan steps, deferred
-    allocations, and risk-matrix row add/edit operations while every
-    cross-cutting contract is unchanged, and ``broad`` for everything else.
+    allocations, risk-matrix row add/edit operations, and the narrative of the
+    execution recommendation while every cross-cutting contract is unchanged,
+    and ``broad`` for everything else.
     """
     if not ledger_reconstructible:
         return PlanTransitionClassification(
@@ -755,8 +872,22 @@ def classify_plan_transition(
         )
     changed = previous_contracts.differences(current_contracts)
     if changed:
+        rendered: list[str] = []
+        for name in changed:
+            if (
+                name == "execution_recommendation_identity"
+                and previous_contracts.execution_recommendation_projection is not None
+                and current_contracts.execution_recommendation_projection is not None
+            ):
+                components = execution_recommendation_changed_components(
+                    previous_contracts.execution_recommendation_projection,
+                    current_contracts.execution_recommendation_projection,
+                )
+                if components:
+                    name = f"{name} ({', '.join(components)})"
+            rendered.append(name)
         return PlanTransitionClassification(
-            "broad", f"cross-cutting plan contract(s) changed: {', '.join(changed)}"
+            "broad", f"cross-cutting plan contract(s) changed: {', '.join(rendered)}"
         )
     if not revision.operation_fields and not revision.matrix_operations:
         # An authenticated patch always carries at least one operation, so an
@@ -774,6 +905,10 @@ def classify_plan_transition(
                 field_name
                 for field_name in revision.operation_fields
                 if field_name not in NARROW_PLAN_PATCH_FIELDS
+                # Reached only after every cross-cutting contract, including
+                # the execution-recommendation contract identity, compared
+                # unchanged above.
+                and field_name not in NARROW_PLAN_CONTRACT_BOUND_PATCH_FIELDS
             }
         )
     )

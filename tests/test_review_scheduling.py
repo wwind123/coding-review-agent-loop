@@ -1587,6 +1587,54 @@ def test_non_staged_policies_ignore_pre_panel_rules():
 
 
 # ---------------------------------------------------------------------------
+# #1103: primary-phase plan stall stop configuration
+
+
+def test_plan_primary_stall_rounds_defaults_and_validates(tmp_path):
+    from coding_review_agent_loop.config import (
+        DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
+        config_from_args,
+    )
+
+    staged = dict(
+        reviewer=("codex", "gemini"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+    assert DEFAULT_PLAN_PRIMARY_STALL_ROUNDS == 8
+    assert make_config(tmp_path, **staged).plan_primary_stall_rounds == 8
+    # The default is accepted under the compatibility policy, where it is inert.
+    assert make_config(tmp_path, reviewer=("codex", "gemini")).plan_primary_stall_rounds == 8
+    assert make_config(tmp_path, plan_primary_stall_rounds=0, **staged).plan_primary_stall_rounds == 0
+    assert make_config(tmp_path, plan_primary_stall_rounds=3, **staged).plan_primary_stall_rounds == 3
+    for invalid in (-1, True, "3", 2.5):
+        with pytest.raises(AgentLoopError, match="--plan-primary-stall-rounds must be"):
+            make_config(tmp_path, plan_primary_stall_rounds=invalid, **staged)
+    for value in (0, 3):
+        with pytest.raises(
+            AgentLoopError,
+            match="--plan-primary-stall-rounds requires --plan-review-policy primary-then-panel",
+        ):
+            make_config(tmp_path, reviewer=("codex", "gemini"), plan_primary_stall_rounds=value)
+
+    base_argv = [
+        "issue", "56", "--repo", "OWNER/REPO", "--plan-first",
+        "--reviewer", "codex", "--reviewer", "gemini",
+        "--codex-dir", str(tmp_path / "codex"), "--gemini-dir", str(tmp_path / "gemini"),
+        "--dangerous-agent-permissions",
+        "--plan-review-policy", "primary-then-panel", "--primary-plan-reviewer", "codex",
+    ]
+    parser = build_parser()
+    assert parser.parse_args(base_argv).plan_primary_stall_rounds is None
+    assert config_from_args(parser.parse_args(base_argv), FakeRunner()).plan_primary_stall_rounds == 8
+    args = parser.parse_args([*base_argv, "--plan-primary-stall-rounds", "0"])
+    assert config_from_args(args, FakeRunner()).plan_primary_stall_rounds == 0
+    args = parser.parse_args([*base_argv, "--plan-primary-stall-rounds", "-2"])
+    with pytest.raises(AgentLoopError, match="non-negative integer"):
+        config_from_args(args, FakeRunner())
+
+
+# ---------------------------------------------------------------------------
 # #905 (from #841): independent planning-policy configuration surface
 
 
