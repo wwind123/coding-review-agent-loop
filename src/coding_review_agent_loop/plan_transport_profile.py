@@ -15,9 +15,17 @@ under the limit whatever its size; the anchor size itself says little.  What
 transport cannot spill is the anchor's visible text (the rendered plan outside
 round metadata, with large recommendation and matrix sections already
 compacted) plus the metadata floor left once every spillable field is a
-reference.  A plan round fails closed when those two exceed
-``MAX_GITHUB_BODY_CHARS``.  ``projected_cliff_chars`` extrapolates each sample
-linearly to that point.
+reference.  When the full plan comment no longer fits, the orchestrator posts
+a bounded visible digest instead (#948), whose size does not grow with the
+plan.  There are therefore two points:
+
+* the digest transition, where the full comment stops fitting and readers see
+  only the digest.  ``projected_digest_transition_chars`` extrapolates a
+  full-comment sample linearly to it;
+* the digest's own overflow, when digest text plus the metadata floor exceed
+  ``MAX_GITHUB_BODY_CHARS``.  Neither term grows with canonical text, which
+  spills, so no canonical size predicts it; ``digest_headroom_chars`` reports
+  how far a digest sample is from it.
 
 The measurement functions are pure.  ``main`` fetches a repository's issue
 comments with ``gh`` so the corpus can be re-measured:
@@ -51,6 +59,10 @@ from .round_transport import (
     hydrate_mapping,
 )
 
+# Leading words of comment_rendering.COMPACT_PLAN_DIGEST_NOTICE, which every
+# digest anchor carries; a test pins the two together.
+_DIGEST_NOTICE_LEAD = "> **Compact plan digest.**"
+
 _REFERENCE_KEYS = (
     "$round_transport_spill",
     "$round_transport_execution_recommendation",
@@ -75,6 +87,8 @@ class PlanTransportSample:
     # already a transport reference, so its section is compacted and the
     # visible text is the residual transport cannot shrink further.
     transport_settled: bool = True
+    # The anchor shows the bounded compact digest, not the full plan.
+    digest: bool = False
 
     @property
     def anchor_visible_chars(self) -> int:
@@ -91,19 +105,28 @@ class PlanTransportSample:
         return self.anchor_visible_chars / self.canonical_chars
 
     @property
-    def projected_cliff_chars(self) -> int | None:
-        """Canonical size at which this plan's anchor would stop fitting.
+    def projected_digest_transition_chars(self) -> int | None:
+        """Canonical size at which this plan's full comment would stop fitting.
 
-        Assumes the visible text grows in proportion to the canonical text
-        while the metadata floor stays fixed: every field that grows with the
-        plan is spillable.  ``None`` for an unsettled anchor, whose visible
-        text still holds an inline recommendation or matrix that transport
-        would spill and compact as the plan grows.
+        Past it the round still publishes, as the bounded digest.  Assumes the
+        visible text grows in proportion to the canonical text while the
+        metadata floor stays fixed: every field that grows with the plan is
+        spillable.  ``None`` for a digest anchor, which is already past the
+        transition, and for an unsettled anchor, whose visible text still
+        holds an inline recommendation or matrix that transport would spill
+        and compact as the plan grows.
         """
-        if not self.transport_settled:
+        if self.digest or not self.transport_settled:
             return None
         budget = MAX_GITHUB_BODY_CHARS - self.metadata_floor_chars
         return self.canonical_chars * budget // max(self.anchor_visible_chars, 1)
+
+    @property
+    def digest_headroom_chars(self) -> int | None:
+        """Characters left before a digest anchor itself would overflow."""
+        if not self.digest:
+            return None
+        return MAX_GITHUB_BODY_CHARS - self.anchor_visible_chars - self.metadata_floor_chars
 
 
 def _reference_anchors(value: object) -> set[str]:
@@ -221,6 +244,7 @@ def measure_plan_rounds(
                 spilled_fields=spilled,
                 sidecar_comments=sum(1 for found in sidecar_anchors if found & anchors),
                 transport_settled=settled,
+                digest=_DIGEST_NOTICE_LEAD in body[: match.start()],
             )
         )
     return samples
@@ -232,23 +256,28 @@ class PlanTransportSummary:
     largest_published_chars: int
     median_canonical_chars: int
     median_compression_ratio: float
-    median_visible_ratio: float
     largest_metadata_floor_chars: int
-    # Projections come from transport-settled samples only; ``None`` when
-    # there are none.
-    settled_samples: int
-    lowest_projected_cliff_chars: int | None
-    median_projected_cliff_chars: int | None
+    # Visible ratio and transitions come from settled full-comment samples
+    # only; ``None`` when there are none.
+    projected_samples: int
+    median_visible_ratio: float | None
+    lowest_projected_digest_transition_chars: int | None
+    median_projected_digest_transition_chars: int | None
+    # Digest anchors are past the transition; their headroom is how far each
+    # is from the digest's own overflow.
+    digest_samples: int
+    largest_digest_visible_chars: int | None
+    lowest_digest_headroom_chars: int | None
 
 
 def summarize(samples: Sequence[PlanTransportSample]) -> PlanTransportSummary:
     if not samples:
         raise AgentLoopError("No measurable planner rounds.")
-    cliffs = [
-        sample.projected_cliff_chars
-        for sample in samples
-        if sample.projected_cliff_chars is not None
+    projected = [
+        sample for sample in samples if sample.projected_digest_transition_chars is not None
     ]
+    transitions = [sample.projected_digest_transition_chars or 0 for sample in projected]
+    digests = [sample for sample in samples if sample.digest]
     return PlanTransportSummary(
         samples=len(samples),
         largest_published_chars=max(sample.canonical_chars for sample in samples),
@@ -256,13 +285,24 @@ def summarize(samples: Sequence[PlanTransportSample]) -> PlanTransportSummary:
         median_compression_ratio=round(
             statistics.median(sample.compression_ratio for sample in samples), 3
         ),
-        median_visible_ratio=round(
-            statistics.median(sample.visible_ratio for sample in samples), 3
-        ),
         largest_metadata_floor_chars=max(sample.metadata_floor_chars for sample in samples),
-        settled_samples=len(cliffs),
-        lowest_projected_cliff_chars=min(cliffs) if cliffs else None,
-        median_projected_cliff_chars=int(statistics.median(cliffs)) if cliffs else None,
+        projected_samples=len(projected),
+        median_visible_ratio=(
+            round(statistics.median(sample.visible_ratio for sample in projected), 3)
+            if projected
+            else None
+        ),
+        lowest_projected_digest_transition_chars=min(transitions) if transitions else None,
+        median_projected_digest_transition_chars=(
+            int(statistics.median(transitions)) if transitions else None
+        ),
+        digest_samples=len(digests),
+        largest_digest_visible_chars=(
+            max(sample.anchor_visible_chars for sample in digests) if digests else None
+        ),
+        lowest_digest_headroom_chars=(
+            min(sample.digest_headroom_chars or 0 for sample in digests) if digests else None
+        ),
     )
 
 
@@ -332,7 +372,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "spilled_fields": list(sample.spilled_fields),
                     "sidecar_comments": sample.sidecar_comments,
                     "transport_settled": sample.transport_settled,
-                    "projected_cliff_chars": sample.projected_cliff_chars,
+                    "digest": sample.digest,
+                    "projected_digest_transition_chars": (
+                        sample.projected_digest_transition_chars
+                    ),
+                    "digest_headroom_chars": sample.digest_headroom_chars,
                 }
             )
         )

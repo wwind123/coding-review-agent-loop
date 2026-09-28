@@ -13,7 +13,11 @@ from coding_review_agent_loop.plan_growth import (
     DEFAULT_PLAN_GROWTH_MAX_REVISIONS,
     PLAN_TRANSPORT_MEASURED_METADATA_FLOOR_CHARS,
     PLAN_TRANSPORT_MEASURED_VISIBLE_RATIO,
-    PLAN_TRANSPORT_PROJECTED_CLIFF_CHARS,
+    PLAN_TRANSPORT_PROJECTED_DIGEST_TRANSITION_CHARS,
+)
+from coding_review_agent_loop.comment_rendering import (
+    COMPACT_PLAN_DIGEST_BUDGET_CHARS,
+    COMPACT_PLAN_DIGEST_NOTICE,
 )
 from coding_review_agent_loop.plan_transport_profile import (
     PlanTransportSample,
@@ -40,14 +44,14 @@ def _publish(payload: dict[str, object], body: str) -> list[str]:
     return [str(item) for item in transport.prepare_round_comment(_comment(payload, body))]
 
 
-def test_default_size_threshold_is_derived_from_the_measured_cliff():
+def test_default_size_threshold_is_derived_from_the_digest_transition():
     assert PLAN_TRANSPORT_MEASURED_VISIBLE_RATIO == 17_791 / 68_956
     assert PLAN_TRANSPORT_MEASURED_METADATA_FLOOR_CHARS == 24_995
-    assert 135_000 < PLAN_TRANSPORT_PROJECTED_CLIFF_CHARS < 136_500
+    assert 135_000 < PLAN_TRANSPORT_PROJECTED_DIGEST_TRANSITION_CHARS < 136_500
     assert DEFAULT_PLAN_GROWTH_MAX_CHARS == 120_000
-    # At least 10% under the cliff, and the combining revision signal starts
-    # below the known-good #886 plan (68,956 characters, 7 candidates).
-    assert DEFAULT_PLAN_GROWTH_MAX_CHARS <= PLAN_TRANSPORT_PROJECTED_CLIFF_CHARS * 0.9
+    # At least 10% under the transition, and the combining revision signal
+    # starts below the known-good #886 plan (68,956 characters, 7 candidates).
+    assert DEFAULT_PLAN_GROWTH_MAX_CHARS <= PLAN_TRANSPORT_PROJECTED_DIGEST_TRANSITION_CHARS * 0.9
     assert DEFAULT_PLAN_GROWTH_MAX_CHARS // 2 <= 68_956
     assert DEFAULT_PLAN_GROWTH_MAX_REVISIONS <= 7
     assert AgentLoopConfig.__dataclass_fields__["plan_growth_max_chars"].default == (
@@ -74,7 +78,8 @@ def test_spilled_plan_round_measures_visible_text_floor_and_sidecars():
     # Random text does not compress, so encoding inflates it.
     assert sample.compression_ratio > 1
     assert sample.metadata_floor_chars <= sample.anchor_metadata_chars + 200
-    assert sample.projected_cliff_chars == (
+    assert sample.digest is False and sample.digest_headroom_chars is None
+    assert sample.projected_digest_transition_chars == (
         len(canonical)
         * (transport.MAX_GITHUB_BODY_CHARS - sample.metadata_floor_chars)
         // sample.anchor_visible_chars
@@ -142,13 +147,59 @@ def test_inline_recommendation_or_matrix_leaves_the_anchor_unsettled():
     [settled_sample] = measure_plan_rounds([_comment(payload, settled)])
 
     assert unsettled_sample.transport_settled is False
-    assert unsettled_sample.projected_cliff_chars is None
+    assert unsettled_sample.projected_digest_transition_chars is None
     assert settled_sample.transport_settled is True
-    assert settled_sample.projected_cliff_chars is not None
+    assert settled_sample.projected_digest_transition_chars is not None
     summary = summarize([unsettled_sample, settled_sample])
-    assert summary.samples == 2 and summary.settled_samples == 1
-    assert summary.lowest_projected_cliff_chars == settled_sample.projected_cliff_chars
-    assert summarize([unsettled_sample]).lowest_projected_cliff_chars is None
+    assert summary.samples == 2 and summary.projected_samples == 1
+    assert summary.lowest_projected_digest_transition_chars == (
+        settled_sample.projected_digest_transition_chars
+    )
+    only_unsettled = summarize([unsettled_sample])
+    assert only_unsettled.lowest_projected_digest_transition_chars is None
+    assert only_unsettled.median_visible_ratio is None
+
+
+def test_digest_notice_lead_matches_the_renderer():
+    assert COMPACT_PLAN_DIGEST_NOTICE.startswith(profile._DIGEST_NOTICE_LEAD)
+
+
+def test_digest_anchor_is_past_the_transition_and_reports_its_headroom():
+    """A plan whose full comment overflows publishes as a bounded digest.
+
+    The digest's visible text does not grow with the plan, so the sample
+    projects no transition; it reports how far the digest is from its own
+    overflow instead.
+    """
+    canonical = _random_text(150_000)
+    digest_body = (
+        "## Revised plan\n\n"
+        + COMPACT_PLAN_DIGEST_NOTICE
+        + "\n\n"
+        + "Digest step. " * (COMPACT_PLAN_DIGEST_BUDGET_CHARS // 20)
+    )
+    full_body = "## Revised plan\n\n" + "Step detail. " * 3_000
+    payload = _plan_payload(canonical)
+    digest_bodies = _publish(payload, digest_body)
+
+    [digest_sample] = measure_plan_rounds(digest_bodies)
+    [full_sample] = measure_plan_rounds(_publish(payload, full_body))
+
+    assert digest_sample.digest is True and full_sample.digest is False
+    assert digest_sample.projected_digest_transition_chars is None
+    assert full_sample.projected_digest_transition_chars is not None
+    assert digest_sample.digest_headroom_chars == (
+        transport.MAX_GITHUB_BODY_CHARS
+        - digest_sample.anchor_visible_chars
+        - digest_sample.metadata_floor_chars
+    ) > 0
+    # Same canonical size, bounded visible text: the digest is far smaller.
+    assert digest_sample.anchor_visible_chars < full_sample.anchor_visible_chars
+    summary = summarize([digest_sample, full_sample])
+    assert summary.digest_samples == 1 and summary.projected_samples == 1
+    assert summary.largest_digest_visible_chars == digest_sample.anchor_visible_chars
+    assert summary.lowest_digest_headroom_chars == digest_sample.digest_headroom_chars
+    assert summary.median_visible_ratio == round(full_sample.visible_ratio, 3)
 
 
 def test_paginated_pages_parse_without_slurp():
@@ -171,7 +222,7 @@ def test_fetch_does_not_pass_slurp(monkeypatch):
     assert "--slurp" not in calls[0] and "--paginate" in calls[0]
 
 
-def test_summary_reports_the_lowest_projected_cliff():
+def test_summary_reports_the_lowest_projected_transition():
     def sample(canonical: int, visible: int, floor: int) -> PlanTransportSample:
         return PlanTransportSample(
             issue_number=None,
@@ -190,5 +241,6 @@ def test_summary_reports_the_lowest_projected_cliff():
     assert summary.samples == 2
     assert summary.largest_published_chars == 68_956
     assert summary.largest_metadata_floor_chars == 24_995
-    assert summary.lowest_projected_cliff_chars == 100_000
+    assert summary.lowest_projected_digest_transition_chars == 100_000
     assert summary.median_compression_ratio == 0.5
+    assert summary.digest_samples == 0 and summary.lowest_digest_headroom_chars is None

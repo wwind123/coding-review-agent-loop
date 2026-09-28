@@ -86,24 +86,35 @@ that grows with the plan (canonical text, raw response, assembled sidecar,
 recommendation and matrix records) into sidecar comments, stopping as soon as
 the anchor fits. So a published anchor's size says little about the plan's
 size. What cannot spill is the anchor's visible plan text plus the metadata
-floor left once the growing fields are references. A plan round fails closed
-when those two exceed 60000 characters. Measured on this repository's plan
-anchors:
+floor left once the growing fields are references. When those two exceed 60000
+characters, the full plan comment no longer fits. The orchestrator then posts
+the bounded compact digest instead (#948). The round still publishes, but
+readers see a summary rather than the plan. That digest transition is what the
+default is anchored to.
+
+There is no canonical-size publication cliff behind the transition. The
+digest's visible text is bounded, and the canonical text spills, so the digest
+overflows only if unspillable metadata grows. Canonical size does not drive
+that. Measured on this repository's plan anchors:
 
 | Quantity | Measured | Source |
 | --- | --- | --- |
-| Visible characters per canonical character | 0.258 | #886's approved plan: 17,791 visible for 68,956 canonical, with its recommendation and matrix already spilled and compacted |
+| Visible characters per canonical character (full comment) | 0.258 | #886's approved plan: 17,791 visible for 68,956 canonical, with its recommendation and matrix already spilled and compacted |
 | Metadata floor with canonical text spilled | 24,995 (largest) | #871's final candidate; 10.7-17.1k on #894, #943, #1040, #1043 |
-| Largest visible plan text published | 42,495 | #1040's final candidate, 6,850 characters of headroom |
-| Tightest anchor headroom | 3,422 | #871's final candidate |
+| Largest full-comment visible text published | 42,495 | #1040's final candidate, 6,850 characters of headroom |
+| Tightest full-comment anchor headroom | 3,422 | #871's final candidate |
+| Digest visible text | 9.1-10.5k | Digest anchors on #946 and #1035 |
 
-The projected cliff is (60000 - 24995) / 0.258, about 135,700 canonical
-characters. The default is that cliff less 10%, rounded down to 10,000. The
-derivation lives next to `DEFAULT_PLAN_GROWTH_MAX_CHARS` in `plan_growth.py`.
-It rests on one visible-ratio sample. Plans that outgrew one delivery measured
-120-195k canonical characters (PR #1072) and still published, so their visible
-ratio was lower than #886's. Prose-heavy plans have a higher ratio and so a
-lower cliff. The default stays provisional until more plans are measured. To re-measure, run the profile over the issues' comments:
+The projected digest transition is (60000 - 24995) / 0.258, about 135,700
+canonical characters. The default is that transition less 10%, rounded down to
+10,000, so a plan can cross the size signal while it can still be shown in
+full. The derivation lives next to `DEFAULT_PLAN_GROWTH_MAX_CHARS` in
+`plan_growth.py`. It rests on one visible-ratio sample. Plans that outgrew one
+delivery measured 120-195k canonical characters (PR #1072) and still
+published, either with a lower visible ratio than #886's or as a digest.
+Prose-heavy plans have a higher ratio and reach the transition sooner. The
+default stays provisional until more plans are measured. To re-measure, run the
+profile over the issues' comments:
 
 ```bash
 python -m coding_review_agent_loop.plan_transport_profile --repo OWNER/NAME 886 871 1040
@@ -112,10 +123,12 @@ python -m coding_review_agent_loop.plan_transport_profile --repo OWNER/NAME 886 
 It prints, per published planner round, the canonical size, the compression
 ratio `encode_mapping` achieves on it, the visible and metadata split of the
 anchor, the metadata floor, the spilled fields and sidecar comment count, and
-the projected cliff, followed by a summary. A cliff is projected only for a
-transport-settled anchor, one whose recommendation and matrix markers are
-already spill references. Otherwise its visible text still holds sections that
-transport would spill and compact as the plan grows.
+either the projected digest transition or, for a digest anchor, its headroom
+before the digest itself would overflow. A summary follows. A transition is
+projected only for a full-comment anchor that is transport-settled, meaning its
+recommendation and matrix markers are already spill references. Otherwise its
+visible text still holds sections that transport would spill and compact as
+the plan grows.
 
 Revision count is only a combining signal: it crosses only while the plan is at
 least half the size threshold. Reviewer-only phase-advance rounds and resumed
