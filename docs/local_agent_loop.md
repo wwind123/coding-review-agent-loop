@@ -726,17 +726,20 @@ Supervision runs in both directions. The shim inherits the read end of a
 supervisor pipe (`--supervisor-fd`) whose write end is non-inheritable and
 held only by the orchestrator's invocation handle. When that write end closes
 -- the orchestrator exits, is killed, or has its own scope stopped -- the shim
-writes a `supervisor-lost` report and kills the whole scope through
-`cgroup.kill` (falling back to signalling each `cgroup.procs` member) with
-SIGKILL and no graceful wind-down, so the unsupervised turn stops with its work
-uncommitted rather than publishing it. The kill never depends on a report
-write succeeding, and any shim failure after the target starts kills the scope.
-The watch also cannot end early: when the direct target exits, the shim kills
-any descendant still in the scope (background or new-session processes) before
-it exits itself, and kills the whole scope if it cannot confirm it empty. The
-check fails closed: a missing, invalid, non-pipe, or already-closed
-descriptor, or a shim not running in the scope named by `--unit`, means the
-target is never started (`target-exec-error`, shim exit 125). The process-group fallback has no
+SIGKILLs every process in the scope with no graceful wind-down, so the
+unsupervised turn stops with its work uncommitted rather than publishing it.
+Only after the scope is empty does it try to write a `supervisor-lost` report,
+so a failed or stalled report write cannot delay the kill. The shim empties
+the scope with a member sweep over `cgroup.procs`. If the sweep cannot prove
+the scope empty, the shim escalates through `cgroup.kill` and
+`systemctl --user kill`, which also kill the shim. If neither works it keeps
+sweeping rather than exiting. Any shim failure after the target starts takes
+the same path. The watch also cannot end early: when the direct target exits,
+the shim empties the scope of background or new-session descendants before it
+exits itself. The check fails closed: a missing, invalid, non-pipe, or
+already-closed descriptor, or a shim not running in the scope named by
+`--unit`, means the target is never started (`target-exec-error`, shim exit
+125). The process-group fallback has no
 shim and does not provide this guarantee.
 
 The managed test wrapper also locks a lane by canonical cwd, normalized argv,

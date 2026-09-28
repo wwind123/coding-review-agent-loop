@@ -1066,43 +1066,51 @@ def _sweep_scope(cgroup: Path) -> bool:
     return False
 
 
-def _kill_scope(child: subprocess.Popen, scope: Path | None, unit_name: str | None) -> None:
-    """SIGKILL every process in this shim's scope, including the shim itself.
+def _escalate_scope_kill(scope: Path, unit_name: str | None) -> None:
+    """Kill the whole scope, this shim included, by every available route."""
+    try:
+        (scope / "cgroup.kill").write_text("1", encoding="ascii")
+    except OSError:
+        pass
+    systemctl = shutil.which("systemctl")
+    if unit_name and systemctl:
+        try:
+            subprocess.run(
+                (systemctl, "--user", "kill", "--kill-who=all", "--signal", "KILL", unit_name),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _empty_scope(child: subprocess.Popen, scope: Path | None, unit_name: str | None) -> None:
+    """SIGKILL the target and return only once nothing but the shim remains.
 
     No graceful wind-down: a target without a supervisor must not get the
-    chance to commit, push or open a pull request.  Nothing here depends on a
-    report write succeeding.
+    chance to commit, push or open a pull request.  Nothing here writes a
+    report, so a failed or stalled filesystem cannot delay the kill.
+
+    The member sweep runs first because it spares the shim.  When it cannot
+    prove the scope empty (``cgroup.procs`` unreadable, or members still
+    appearing after a bounded sweep) the shim escalates to killing the whole
+    scope, itself included, through ``cgroup.kill`` and systemd.  If both are
+    unavailable it keeps sweeping and never exits with a descendant still
+    alive, so its supervisor watch cannot end early (fail closed).
     """
-    if scope is not None:
-        try:
-            (scope / "cgroup.kill").write_text("1", encoding="ascii")
-        except OSError:
-            pass
-        # Kernels without cgroup.kill (<5.14) fall back to a member sweep.
-        _sweep_scope(scope)
     try:
         child.kill()
     except OSError:
         pass
+    if scope is not None:
+        delay = 0.05
+        while not _sweep_scope(scope):
+            _escalate_scope_kill(scope, unit_name)
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
     try:
         child.wait()
     except BaseException:
         pass
-    if unit_name and os.getpgrp() == os.getpid():
-        # The launcher made the shim a session leader, so the target's
-        # process group is the shim's own; take the stragglers with it.
-        os.killpg(os.getpgrp(), signal.SIGKILL)
-
-
-def _reap_scope_after_target_exit(child: subprocess.Popen, scope: Path | None, unit_name: str | None) -> None:
-    """Leave no scoped process behind once the target itself has exited.
-
-    Otherwise a background or new-session descendant would outlive the shim
-    and with it the supervisor watch.  If the scope cannot be confirmed empty
-    the shim kills it outright, itself included -- fail closed.
-    """
-    if scope is not None and not _sweep_scope(scope):
-        _kill_scope(child, scope, unit_name)
 
 
 def _try_write_report(path: Path, payload: Mapping[str, object]) -> None:
@@ -1150,19 +1158,21 @@ def _shim(argv: Sequence[str]) -> int:
             except (OSError, ValueError):
                 ready = [supervisor_fd]
             if ready and child.poll() is None:
+                # Kill first; the diagnostic report is written only once the
+                # scope is empty, so a stalled write cannot delay the kill.
+                _empty_scope(child, scope, unit_name)
                 _try_write_report(report_path, {
                     "state": "supervisor-lost", "pid": child.pid,
                     "cgroup_path": str(target_cgroup) if target_cgroup else None,
                 })
-                _kill_scope(child, scope, unit_name)
                 return SUPERVISOR_LOST_EXIT_CODE
     except BaseException:
-        _kill_scope(child, scope, unit_name)
+        _empty_scope(child, scope, unit_name)
         raise
-    try:
-        _write_report(report_path, {"state": "target-exited", "pid": child.pid, "returncode": code, "cgroup_path": str(target_cgroup) if target_cgroup else None})
-    finally:
-        _reap_scope_after_target_exit(child, scope, unit_name)
+    # The direct target has exited; any background or new-session descendant
+    # is killed before the shim (and with it the supervisor watch) exits.
+    _empty_scope(child, scope, unit_name)
+    _write_report(report_path, {"state": "target-exited", "pid": child.pid, "returncode": code, "cgroup_path": str(target_cgroup) if target_cgroup else None})
     return int(code if code >= 0 else 128 + (-code))
 
 

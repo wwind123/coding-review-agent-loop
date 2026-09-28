@@ -332,6 +332,99 @@ def test_shim_kill_on_supervisor_loss_does_not_depend_on_report_write(monkeypatc
             kill_if_same_instance(pid, start)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="process liveness probes use /proc")
+def test_supervisor_loss_kills_before_a_blocked_report_write(monkeypatch, tmp_path):
+    """Review item: a stalled supervisor-lost write cannot delay the kill."""
+    pid_file = tmp_path / "target.pid"
+    published = tmp_path / "published"
+    read_fd, write_fd = open_supervisor_pipe()
+    real = containment_module._write_report
+    observed = {}
+    release = threading.Event()
+
+    def write(path, payload):
+        if payload.get("state") == "supervisor-lost":
+            (pid, start), = read_pid_record(pid_file)
+            observed["target_gone"] = wait_until_gone(pid, start_time=start, timeout=0.5)
+            # Simulate a hung filesystem; the kill must already be done.
+            release.wait(timeout=5)
+            raise OSError(errno.EIO, "stalled")
+        real(path, payload)
+
+    monkeypatch.setattr(containment_module, "_write_report", write)
+
+    def lose_supervisor():
+        _wait_for(pid_file)
+        os.close(write_fd)
+        time.sleep(0.5)
+        release.set()
+
+    closer = threading.Thread(target=lose_supervisor)
+    closer.start()
+    try:
+        code = _shim(
+            ["--shim", "--report", str(tmp_path / "report.json"),
+             "--supervisor-fd", str(read_fd), "--",
+             sys.executable, "-c", _PUBLISH_LATE_TARGET, str(pid_file), str(published)]
+        )
+    finally:
+        release.set()
+        closer.join()
+        os.close(read_fd)
+    assert code == containment_module.SUPERVISOR_LOST_EXIT_CODE
+    assert observed == {"target_gone": True}
+    time.sleep(4.5)
+    assert not published.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process liveness probes use /proc")
+def test_scope_emptying_escalates_and_never_returns_with_a_live_descendant(monkeypatch, tmp_path):
+    """Review items: with cgroup.kill unavailable and an incomplete sweep, the
+    shim escalates and keeps sweeping; it returns only once a new-session
+    descendant (unreachable by child or process-group kills) is dead."""
+    import subprocess
+
+    scope = tmp_path / "agent-loop-fake.scope"
+    scope.mkdir()
+    (scope / "cgroup.kill").mkdir()  # writing it raises, as on kernels < 5.14
+    published = tmp_path / "published"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    descendant = subprocess.Popen(
+        [sys.executable, "-c",
+         f"import time; time.sleep(3); open({str(published)!r}, 'w').write('published')"],
+        start_new_session=True,
+    )
+    calls = {"members": 0, "escalations": 0}
+
+    def members(_cgroup):
+        calls["members"] += 1
+        if calls["members"] <= 3:
+            return None  # cgroup.procs transiently unreadable: sweep incomplete
+        descendant.poll()
+        return [descendant.pid] if descendant.returncode is None else []
+
+    real_escalate = containment_module._escalate_scope_kill
+
+    def escalate(cgroup, unit_name):
+        calls["escalations"] += 1
+        real_escalate(cgroup, None)  # never touch a real systemd unit here
+
+    monkeypatch.setattr(containment_module, "_scope_members", members)
+    monkeypatch.setattr(containment_module, "_escalate_scope_kill", escalate)
+    try:
+        containment_module._empty_scope(child, scope, "agent-loop-fake.scope")
+        assert calls["escalations"] >= 3
+        assert descendant.wait(timeout=1) is not None
+        assert child.returncode is not None
+        time.sleep(3.5)
+        assert not published.exists(), "a descendant survived scope emptying"
+    finally:
+        for proc in (child, descendant):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
 def test_managed_binding_passes_supervisor_pipe_and_close_releases_it(tmp_path):
     policy = default_policy(mode="auto", cache_dir=tmp_path)
     handle = InvocationHandle.prepare(
