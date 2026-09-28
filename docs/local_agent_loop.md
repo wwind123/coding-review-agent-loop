@@ -107,6 +107,23 @@ authorization re-apply the same check and fail closed. Legacy unversioned plans
 are never gated, and `--plan-growth-gate off` disables the gate while still
 logging measurements.
 
+**Handoff verdict (#1074).** The approved-plan handoff record that binds an
+issue to its implementation PR carries the gate's approval-time verdict: the
+gate mode in force, the thresholds, the crossed signals, and a status of
+`compliant`, `non-compliant` or `not-applicable` (a legacy or free-form plan
+the gate exempts). The status is computed whatever the mode, so a plan approved
+with the gate off still records whether it would have passed. Handoff-backed
+resume (managed-CI fresh authorization, ordinary managed resume and ordinary PR
+recovery) re-validates against that recorded verdict, never against today's
+thresholds: a plan judged compliant when approved stays compliant after the
+thresholds are lowered, and a recorded `non-compliant` verdict refuses while the
+gate is enforced; `--plan-growth-gate off` still accepts it. A closing-ID
+superset keeps its plan's verdict, and a signed rebind records the replacement
+plan's own verdict. **Compatibility rule:** a handoff record without a verdict
+predates it and is accepted as legacy. This is intended: such a plan crossed the
+approval boundary before its gate state was recorded, and re-judging it now
+would force a re-plan of in-flight work that no reviewer can fix inside the PR.
+
 **Reviewer lever.** Plan reviewers may block with a finding that says "this
 detail belongs in a child plan; restructure as staged" rather than pushing more
 detail into the parent. They evaluate any growth justification as a semantic

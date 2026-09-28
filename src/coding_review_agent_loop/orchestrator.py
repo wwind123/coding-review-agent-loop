@@ -177,6 +177,7 @@ from .github import (
 )
 from .issue_pr_handoff import (
     AGENT_ISSUE_PR_HANDOFF_RE,
+    IssuePrHandoffMetadata,
     decode_issue_pr_handoff_record,
     find_latest_issue_pr_handoff,
     authenticate_canonical_issue_pr,
@@ -595,12 +596,15 @@ from .plan_assembly import (
 )
 from .plan_growth import (
     STRUCTURAL_SIGNALS,
+    PlanGrowthApprovalVerdict,
     PlanGrowthAssessment,
     PlanGrowthThresholds,
     assess_plan_growth,
     check_growth_justification,
     check_scope_ledger_preservation,
     growth_justification_violation,
+    handoff_growth_verdict_violation,
+    plan_growth_approval_verdict,
     plan_growth_gate_enforced,
     plan_justification,
     plan_strategy,
@@ -9562,6 +9566,7 @@ def _implement_approved_issue(
     approved_plan_context: ApprovedPlanContext | None = None,
     parent_issue_context: IssueContext | None = None,
     execution_recommendation=None,
+    plan_growth_verdict: PlanGrowthApprovalVerdict | None = None,
 ) -> int:
     implementation_config, reuse_planning_session = _approved_implementation_config(config)
     coder_name = agent_display_name(implementation_config.coder)
@@ -9571,6 +9576,17 @@ def _implement_approved_issue(
         if approved_plan_context is not None and approved_plan_context.plan_hash
         else approved_plan_hash(approved_plan)
     )
+    if plan_growth_verdict is None:
+        # Callers without the planning loop's own approval-time assessment
+        # measure the approved candidate from its authenticated plan round.
+        plan_growth_verdict = _plan_growth_verdict_for_hash(
+            config,
+            plan_hash=plan_hash,
+            comment_sources=(
+                issue_context.comments,
+                parent_issue_context.comments if parent_issue_context is not None else None,
+            ),
+        )
     execution_identity = (
         execution_recommendation.identity()
         if execution_recommendation is not None else None
@@ -9709,6 +9725,7 @@ def _implement_approved_issue(
                     plan_hash=plan_hash,
                     expected_closing_issue_ids=closing_contract.issue_ids,
                     supersedes_hash=closing_contract.supersedes_hash,
+                    plan_growth_verdict=plan_growth_verdict,
                 )
         if one_shot_parent_issue is not None:
             post_one_shot_impl_handoff_comment(
@@ -9986,6 +10003,7 @@ def _implement_approved_issue(
         plan_hash=plan_hash,
         expected_closing_issue_ids=closing_contract.issue_ids,
         supersedes_hash=closing_contract.supersedes_hash,
+        plan_growth_verdict=plan_growth_verdict,
     )
     if one_shot_parent_issue is not None:
         post_one_shot_impl_handoff_comment(
@@ -11389,6 +11407,9 @@ def _rebind_superseded_child_plan(
         # The annotation the same-PR approved-plan replacement rule requires.
         # It never identifies the replacement: unchanged-ID rebinds all share it.
         supersedes_hash=current.contract_hash,
+        plan_growth_verdict=_plan_growth_verdict_for_hash(
+            config, plan_hash=plan_hash, comment_sources=(issue_context.comments,)
+        ),
     ).split("\n")
     marker_position = next(
         index
@@ -14486,6 +14507,13 @@ def _run_plan_first_loop(
             ]
             plan_hash = approved_plan_hash(current_plan)
             plan_subject = _plan_subject(current_plan)
+            # The gate's own judgement of the candidate it just let through,
+            # recorded in the handoff so resume re-validates against it (#1074).
+            approval_growth_verdict = plan_growth_approval_verdict(
+                config,
+                current_plan_sidecar.canonical_json if current_plan_sidecar is not None else None,
+                plan_growth_assessment,
+            )
             approved_plan_context = make_approved_plan_context(
                 current_plan,
                 source_locator=f"issue #{issue_number} approved-plan round",
@@ -14917,6 +14945,7 @@ def _run_plan_first_loop(
                             pr_head_sha=pr_head_sha,
                             flow="approved-plan-implementation",
                             plan_hash=plan_hash,
+                            plan_growth_verdict=approval_growth_verdict,
                         )
                     return run_pr_loop(
                         runner,
@@ -15027,6 +15056,7 @@ def _run_plan_first_loop(
                     plan_subject=plan_subject,
                     staged_parent_issue=staged_parent_issue,
                     execution_recommendation=recommendation,
+                    plan_growth_verdict=approval_growth_verdict,
                 )
             raise AgentLoopError(f"Unknown plan execution mode: {mode}")
 
@@ -16061,6 +16091,15 @@ def run_issue_loop(
                         plan_hash=recovered_plan_hash if plan_first else None,
                         expected_closing_issue_ids=closing_contract.issue_ids,
                         supersedes_hash=closing_contract.supersedes_hash,
+                        plan_growth_verdict=(
+                            _plan_growth_verdict_for_hash(
+                                config,
+                                plan_hash=recovered_plan_hash,
+                                comment_sources=(issue_context.comments,),
+                            )
+                            if plan_first and recovered_plan_hash is not None
+                            else None
+                        ),
                     )
             return run_pr_loop(
                 runner,
@@ -18391,6 +18430,77 @@ def _require_plan_growth_compliance(
         )
 
 
+def _plan_growth_verdict_for_hash(
+    config: AgentLoopConfig,
+    *,
+    plan_hash: str,
+    comment_sources: Sequence[Sequence[object] | None],
+) -> PlanGrowthApprovalVerdict:
+    """Approval-time growth verdict of the plan ``plan_hash`` names (#1074).
+
+    Measured exactly as the approval gate measures it: the authenticated
+    coder round's stored canonical text and assembled state, and the
+    planner-candidate count up to the round that published it.  The first
+    comment source holding that candidate wins (the issue, then a staged
+    parent).  With no authenticated v1 candidate the plan is legacy or
+    free-form, which the gate itself exempts, so the verdict says
+    ``not-applicable``.
+    """
+    for comments in comment_sources:
+        if comments is None:
+            continue
+        for record in reversed(_extract_round_metadata_records(comments, flow="plan")):
+            metadata = record.metadata
+            if (
+                metadata.role != "coder"
+                or metadata.canonical_plan is None
+                or metadata.assembled_plan_sidecar is None
+                or approved_plan_hash(metadata.canonical_plan) != plan_hash
+            ):
+                continue
+            sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+            assessment, _violation = _plan_growth_gate_violation(
+                config,
+                plan_payload=sidecar.canonical_json,
+                plan_text=metadata.canonical_plan,
+                revision_count=_plan_growth_candidate_count(
+                    _planner_candidate_rounds(comments), sidecar.round_number
+                ),
+            )
+            return plan_growth_approval_verdict(config, sidecar.canonical_json, assessment)
+    return plan_growth_approval_verdict(config, None, None)
+
+
+def _require_handoff_plan_growth_verdict(
+    config: AgentLoopConfig,
+    handoff: IssuePrHandoffMetadata,
+    *,
+    context: str,
+) -> None:
+    """Re-validate a handoff-backed resume against its recorded verdict (#1074).
+
+    Never against today's thresholds: a plan judged compliant when approved
+    stays compliant.  A record with no verdict predates it and is accepted
+    as legacy by definition.
+    """
+    if handoff.flow != "approved-plan-implementation":
+        return
+    verdict = handoff.plan_growth_verdict
+    if verdict is None:
+        log(
+            config,
+            f"{context}: approved-plan handoff for PR #{handoff.pr_number} predates the recorded "
+            "plan-growth verdict; accepted as a legacy handoff",
+        )
+        return
+    violation = handoff_growth_verdict_violation(verdict, config)
+    if violation is not None:
+        raise AgentLoopError(
+            f"{context}: approved plan {handoff.plan_hash} handed off to PR "
+            f"#{handoff.pr_number} cannot resume: {violation}"
+        )
+
+
 def _require_complete_canonical_plan_approval(
     comments: Sequence[object],
     *,
@@ -19607,6 +19717,11 @@ def run_pr_loop(
                             "Managed-CI fresh authorization found an approved-plan handoff "
                             "without a canonical plan identity."
                         )
+                    _require_handoff_plan_growth_verdict(
+                        config,
+                        canonical_handoff,
+                        context="Managed-CI fresh authorization",
+                    )
                     recovered = _recover_managed_ci_approved_plan(
                         issue_context.comments,
                         expected_hash=canonical_handoff.plan_hash,
@@ -19765,6 +19880,11 @@ def run_pr_loop(
                         and canonical_handoff.flow == "approved-plan-implementation"
                         and canonical_handoff.plan_hash
                     ):
+                        _require_handoff_plan_growth_verdict(
+                            config,
+                            canonical_handoff,
+                            context="Managed-CI ordinary resume",
+                        )
                         candidate_scope = _recover_managed_ci_approved_plan(
                             issue_context.comments,
                             expected_hash=canonical_handoff.plan_hash,
@@ -20191,6 +20311,11 @@ def run_pr_loop(
                         raise AgentLoopError(
                             f"Approved-plan handoff for issue #{issue_context.number} has no plan hash."
                         )
+                    _require_handoff_plan_growth_verdict(
+                        config,
+                        issue_handoff,
+                        context=f"PR #{pr_number} recovery",
+                    )
                     if approved_plan_context is not None and approved_plan_context.plan_hash != issue_handoff.plan_hash:
                         raise AgentLoopError(
                             f"PR #{pr_number} received approved plan {approved_plan_context.plan_hash}, "
@@ -20755,6 +20880,13 @@ def run_pr_loop(
                     plan_hash=issue_handoff_to_update.plan_hash,
                     expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
                     supersedes_hash=closing_contract.supersedes_hash,
+                    # A closing-ID superset keeps the plan, so it keeps the
+                    # plan's approval-time verdict (or its legacy absence).
+                    plan_growth_verdict=(
+                        issue_handoff_to_update.plan_growth_verdict
+                        if recorded_pr_contract.origin_flow == "approved-plan-implementation"
+                        else None
+                    ),
                 )
         def managed_ci_active(metadata: PullRequestMetadata) -> bool:
             """Drop adopted filtering immediately when its live handshake changes."""

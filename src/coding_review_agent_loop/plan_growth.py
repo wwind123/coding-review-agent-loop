@@ -260,6 +260,135 @@ def check_growth_justification(plan: PlanLike, assessment: PlanGrowthAssessment)
         raise AgentLoopError(f"Plan growth gate: {violation}")
 
 
+VERDICT_COMPLIANT = "compliant"
+VERDICT_NON_COMPLIANT = "non-compliant"
+VERDICT_NOT_APPLICABLE = "not-applicable"
+PLAN_GROWTH_VERDICT_STATUSES = (VERDICT_COMPLIANT, VERDICT_NON_COMPLIANT, VERDICT_NOT_APPLICABLE)
+_THRESHOLD_KEYS = ("max_chars", "max_revisions", "max_scope_items", "max_matrix_rows")
+
+
+@dataclass(frozen=True)
+class PlanGrowthApprovalVerdict:
+    """The growth gate's judgement of a plan when it crossed into implementation (#1074).
+
+    Recorded in the approved-plan handoff record so handoff-backed resume can
+    re-validate against what was in force at approval instead of today's
+    thresholds.  ``status`` is computed whatever the gate mode, so a plan
+    approved with the gate off still records whether it would have passed.
+    ``not-applicable`` is the gate's own exemption: a legacy unversioned or
+    free-form plan with no authenticated v1 execution recommendation.
+    """
+
+    gate: str
+    status: str
+    crossed_signals: tuple[str, ...]
+    thresholds: PlanGrowthThresholds
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "gate": self.gate,
+            "status": self.status,
+            "crossed_signals": list(self.crossed_signals),
+            "thresholds": {key: getattr(self.thresholds, key) for key in _THRESHOLD_KEYS},
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object, *, context: str) -> "PlanGrowthApprovalVerdict":
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "gate", "status", "crossed_signals", "thresholds"
+        }:
+            raise AgentLoopError(
+                f"{context}: expected exactly gate, status, crossed_signals and thresholds."
+            )
+        gate = payload["gate"]
+        if gate not in PLAN_GROWTH_GATE_MODES:
+            raise AgentLoopError(f"{context}: unknown gate mode {gate!r}.")
+        status = payload["status"]
+        if status not in PLAN_GROWTH_VERDICT_STATUSES:
+            raise AgentLoopError(f"{context}: unknown status {status!r}.")
+        crossed = payload["crossed_signals"]
+        if (
+            not isinstance(crossed, list)
+            or any(not isinstance(item, str) for item in crossed)
+            or crossed != [signal for signal in PLAN_GROWTH_SIGNALS if signal in crossed]
+        ):
+            raise AgentLoopError(
+                f"{context}: `crossed_signals` must list known signals once each, in canonical order."
+            )
+        if status == VERDICT_NOT_APPLICABLE and crossed:
+            raise AgentLoopError(f"{context}: a not-applicable verdict crosses no signal.")
+        thresholds = payload["thresholds"]
+        if not isinstance(thresholds, Mapping) or set(thresholds) != set(_THRESHOLD_KEYS):
+            raise AgentLoopError(
+                f"{context}: `thresholds` must carry exactly {', '.join(_THRESHOLD_KEYS)}."
+            )
+        for key in _THRESHOLD_KEYS:
+            value = thresholds[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise AgentLoopError(f"{context}: threshold `{key}` must be a positive integer.")
+        return cls(
+            gate=str(gate),
+            status=str(status),
+            crossed_signals=tuple(crossed),
+            thresholds=PlanGrowthThresholds(**{key: thresholds[key] for key in _THRESHOLD_KEYS}),
+        )
+
+    def describe(self) -> str:
+        crossed = ", ".join(self.crossed_signals) or "none"
+        return f"gate {self.gate}, {self.status} (crossed: {crossed})"
+
+
+def plan_growth_approval_verdict(
+    config: object,
+    plan: PlanLike | None,
+    assessment: PlanGrowthAssessment | None,
+) -> PlanGrowthApprovalVerdict:
+    """The verdict to record for ``plan`` under ``config`` at approval time."""
+    gate = getattr(config, "plan_growth_gate", "enforce")
+    if plan is None or assessment is None or plan_strategy(plan) is None:
+        return PlanGrowthApprovalVerdict(
+            gate=gate,
+            status=VERDICT_NOT_APPLICABLE,
+            crossed_signals=(),
+            thresholds=PlanGrowthThresholds.from_config(config),
+        )
+    violation = growth_justification_violation(plan, assessment)
+    return PlanGrowthApprovalVerdict(
+        gate=gate,
+        status=VERDICT_COMPLIANT if violation is None else VERDICT_NON_COMPLIANT,
+        crossed_signals=tuple(
+            signal for signal in PLAN_GROWTH_SIGNALS if signal in assessment.crossed
+        ),
+        thresholds=assessment.thresholds,
+    )
+
+
+def handoff_growth_verdict_violation(
+    verdict: PlanGrowthApprovalVerdict | None, config: object
+) -> str | None:
+    """Why a handoff-backed resume must refuse its recorded plan, or ``None``.
+
+    Re-validates against the recorded approval-time verdict, never against
+    today's thresholds, so a plan judged compliant when approved stays
+    compliant.  A handoff record without a verdict predates it and is
+    accepted as legacy by definition: that is an intended compatibility
+    allowance, not an omission.  A recorded non-compliant verdict refuses
+    while the gate is enforced now; ``--plan-growth-gate off`` keeps the
+    explicit operator opt-out it has everywhere else.
+    """
+    if verdict is None or verdict.status != VERDICT_NON_COMPLIANT:
+        return None
+    if not plan_growth_gate_enforced(config):
+        return None
+    crossed = ", ".join(f"`{signal}`" for signal in verdict.crossed_signals) or "none"
+    return (
+        "the handoff record says the approved plan failed the plan-growth gate when it was "
+        f"approved ({verdict.describe()}; crossed signals {crossed}), and the gate is enforced "
+        "now. Re-plan so a revision restructures the plan as staged or carries a reviewed "
+        "`one_shot_growth_justification`, or rerun with `--plan-growth-gate off` to accept it."
+    )
+
+
 def _normalize(text: object) -> str:
     return " ".join(str(text).split())
 

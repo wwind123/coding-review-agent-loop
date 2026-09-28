@@ -34,6 +34,7 @@ from .github import (
     post_issue_comment,
     post_trusted_issue_comment,
 )
+from .plan_growth import PlanGrowthApprovalVerdict
 from .pr_contract import PrExpectedClosingContract, find_latest_pr_contract
 from .runner import Runner
 from .protocol_markers import TrustedBody
@@ -63,6 +64,10 @@ class IssuePrHandoffMetadata:
     contract_hash: str | None = None
     supersedes_hash: str | None = None
     legacy_contract: bool = False
+    # Approval-time plan-growth gate verdict (#1074).  ``None`` means the
+    # record predates it; handoff-backed resume accepts such a record as
+    # legacy by definition.  Only approved-plan records carry one.
+    plan_growth_verdict: PlanGrowthApprovalVerdict | None = None
 
     def __post_init__(self) -> None:
         # Handoff records are issue-origin records, so the primary issue is
@@ -133,20 +138,23 @@ def _decode_json_payload(encoded: str) -> dict[str, object]:
 
 
 def _encode_issue_pr_handoff_metadata(metadata: IssuePrHandoffMetadata) -> str:
-    return _encode_json_payload(
-        {
-            "schema_version": metadata.schema_version,
-            "issue_number": metadata.issue_number,
-            "pr_number": metadata.pr_number,
-            "pr_url": metadata.pr_url,
-            "pr_head_sha": metadata.pr_head_sha,
-            "flow": metadata.flow,
-            "plan_hash": metadata.plan_hash,
-            "expected_closing_issue_ids": list(metadata.expected_closing_issue_ids),
-            "contract_hash": metadata.contract_hash,
-            "supersedes_hash": metadata.supersedes_hash,
-        }
-    )
+    payload: dict[str, object] = {
+        "schema_version": metadata.schema_version,
+        "issue_number": metadata.issue_number,
+        "pr_number": metadata.pr_number,
+        "pr_url": metadata.pr_url,
+        "pr_head_sha": metadata.pr_head_sha,
+        "flow": metadata.flow,
+        "plan_hash": metadata.plan_hash,
+        "expected_closing_issue_ids": list(metadata.expected_closing_issue_ids),
+        "contract_hash": metadata.contract_hash,
+        "supersedes_hash": metadata.supersedes_hash,
+    }
+    # Emitted only when present, so every pre-verdict record keeps its exact
+    # canonical encoding.
+    if metadata.plan_growth_verdict is not None:
+        payload["plan_growth_verdict"] = metadata.plan_growth_verdict.to_payload()
+    return _encode_json_payload(payload)
 
 
 def _require_non_empty_str(payload: dict[str, object], key: str) -> str:
@@ -237,6 +245,17 @@ def _decode_issue_pr_handoff_metadata(encoded: str) -> IssuePrHandoffMetadata:
         raise AgentLoopError(
             "Invalid AGENT_ISSUE_PR_HANDOFF payload: `supersedes_hash` is invalid."
         )
+    plan_growth_verdict = None
+    if "plan_growth_verdict" in payload:
+        if flow != "approved-plan-implementation":
+            raise AgentLoopError(
+                "Invalid AGENT_ISSUE_PR_HANDOFF payload: `plan_growth_verdict` is only "
+                "valid for approved-plan-implementation flow."
+            )
+        plan_growth_verdict = PlanGrowthApprovalVerdict.from_payload(
+            payload["plan_growth_verdict"],
+            context="Invalid AGENT_ISSUE_PR_HANDOFF payload: `plan_growth_verdict`",
+        )
     return IssuePrHandoffMetadata(
         schema_version=schema_version,
         issue_number=issue_number,
@@ -249,6 +268,7 @@ def _decode_issue_pr_handoff_metadata(encoded: str) -> IssuePrHandoffMetadata:
         contract_hash=handoff_contract_hash,
         supersedes_hash=supersedes_hash if isinstance(supersedes_hash, str) else None,
         legacy_contract=legacy_contract,
+        plan_growth_verdict=plan_growth_verdict,
     )
 
 
@@ -585,6 +605,7 @@ def format_issue_pr_handoff_comment(
     plan_hash: str | None,
     expected_closing_issue_ids: Sequence[int] | None = None,
     supersedes_hash: str | None = None,
+    plan_growth_verdict: PlanGrowthApprovalVerdict | None = None,
 ) -> str:
     expected_ids = normalize_issue_ids(
         expected_closing_issue_ids or (issue_number,),
@@ -606,6 +627,7 @@ def format_issue_pr_handoff_comment(
         expected_closing_issue_ids=expected_ids,
         contract_hash=contract_hash(expected_ids),
         supersedes_hash=supersedes_hash,
+        plan_growth_verdict=plan_growth_verdict,
     )
     encoded_metadata = _encode_issue_pr_handoff_metadata(metadata)
     if _encode_issue_pr_handoff_metadata(_decode_issue_pr_handoff_metadata(encoded_metadata)) != encoded_metadata:
@@ -619,6 +641,8 @@ def format_issue_pr_handoff_comment(
     ]
     if plan_hash:
         lines.append(f"Plan hash: {plan_hash}")
+    if plan_growth_verdict is not None:
+        lines.append(f"Plan-growth gate at approval: {plan_growth_verdict.describe()}.")
     lines.append(
         "Expected closing issues: "
         + (", ".join(f"#{item}" for item in expected_ids) or "(none)")
@@ -649,6 +673,7 @@ def post_issue_pr_handoff_comment(
     plan_hash: str | None,
     expected_closing_issue_ids: Sequence[int] | None = None,
     supersedes_hash: str | None = None,
+    plan_growth_verdict: PlanGrowthApprovalVerdict | None = None,
 ) -> None:
     post_trusted_issue_comment(
         runner,
@@ -664,6 +689,7 @@ def post_issue_pr_handoff_comment(
                 plan_hash=plan_hash,
                 expected_closing_issue_ids=expected_closing_issue_ids,
                 supersedes_hash=supersedes_hash,
+                plan_growth_verdict=plan_growth_verdict,
             ),
             expected_tokens=("AGENT_ISSUE_PR_HANDOFF",),
         ),
