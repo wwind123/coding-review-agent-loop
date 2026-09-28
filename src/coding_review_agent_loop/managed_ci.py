@@ -4399,16 +4399,39 @@ def _restore_ordinary_ci_after_v2_fallback(
     pr_number: int,
     reason: str,
     report_context: _FailedActivationContext | None = None,
+    recovery_capable: bool = True,
 ) -> None:
     """Remove the issue-created suppression label before returning to ordinary CI.
 
     Operator text states only acknowledged or unconfirmed requests; the
     post-failure state comes from the activation guard's measured report
-    (or, without a context, from a context-free measured line).
+    (or, without a context, from a context-free measured line).  On a base
+    without the unlabeled recovery route the label is retained: removing it
+    would start no CI and would discard the only evidence of managed entry.
     """
     if report_context is not None:
-        report_context.label_release_attempted = True
         report_context.release_reason = reason
+        report_context.recovery_capable = recovery_capable
+    if not recovery_capable:
+        if report_context is not None:
+            report_context.recovery_incapable_fallback = True
+        message = (
+            f"Managed-CI v2 could not activate ({reason}); `{MANAGED_LABEL}` was retained and no "
+            "label DELETE was made because the base workflow does not prove an unlabeled "
+            "pull_request recovery route. "
+            + _measured_state_line(runner, config, pr_number)
+        )
+        if config.managed_ci:
+            command = render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
+            raise AgentLoopError(
+                f"--managed-ci requested qualification, but activation failed. {message} "
+                f"This run did NOT qualify the head of PR #{pr_number}. Restore the base "
+                f"workflow's unlabeled recovery route, then rerun `{command}`."
+            )
+        log(config, f"PR #{pr_number}: {message}")
+        return
+    if report_context is not None:
+        report_context.label_release_attempted = True
     result = runner.run(
         [
             config.gh_cmd, "api", "--method", "DELETE",
@@ -5758,6 +5781,7 @@ def _activate_v2_managed_ci(
                         runner, config=config, pr_number=pr_number,
                         reason="strict protection or the explicit override is unavailable",
                         report_context=context,
+                        recovery_capable=ordinary_recovery_capable,
                     )
                     _fallback_state_report(runner, config=config, pr_number=pr_number, context=context)
                     return None
@@ -5778,6 +5802,7 @@ def _activate_v2_managed_ci(
                         runner, config=config, pr_number=pr_number,
                         reason=str(error),
                         report_context=context,
+                        recovery_capable=ordinary_recovery_capable,
                     )
                     _fallback_state_report(runner, config=config, pr_number=pr_number, context=context)
                     return None
@@ -5812,6 +5837,7 @@ def _activate_v2_managed_ci(
                         runner, config=config, pr_number=pr_number,
                         reason="the override audit comment could not be recorded and verified",
                         report_context=context,
+                        recovery_capable=ordinary_recovery_capable,
                     )
                     _fallback_state_report(runner, config=config, pr_number=pr_number, context=context)
                     return None

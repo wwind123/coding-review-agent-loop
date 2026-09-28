@@ -12305,6 +12305,30 @@ def test_m1067_implicit_fallback_helper_variants_make_no_ordinary_claim(tmp_path
     assert "Ordinary CI can resume" not in err
     if variant == "relabel":
         assert "suppression is still active and ordinary CI has not resumed" in err
+    else:
+        # Review item-4: a base without the unlabeled recovery route keeps
+        # the label; the fallback helper makes no DELETE.
+        assert _m1067_label_deletes(runner) == []
+        assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+        assert f"`{MANAGED_LABEL}` was retained and no label DELETE was made" in err
+        assert "PR #7 is now draft/labeled." in err
+        assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_explicit_fallback_helper_on_recovery_incapable_base_retains_label(tmp_path):
+    runner = _m1067_plan_limited_runner(workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY)
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    with pytest.raises(AgentLoopError) as raised:
+        _m1067_implicit_activation(runner, config)
+
+    text = str(raised.value)
+    _m1067_assert_text(text)
+    assert f"`{MANAGED_LABEL}` was retained and no label DELETE was made" in text
+    assert "PR #7 is now draft/labeled." in text
+    assert "did NOT qualify" in text
+    assert _m1067_label_deletes(runner) == []
+    assert _m1067_ready_calls(runner) == []
 
 
 @pytest.mark.parametrize("delete_returncode", [0, 1])
