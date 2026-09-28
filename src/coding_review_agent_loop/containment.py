@@ -1020,52 +1020,96 @@ def _validate_supervisor_fd(value: str | None) -> tuple[int | None, str | None]:
     return fd, None
 
 
-def _kill_scope_after_supervisor_loss(child: subprocess.Popen, unit_name: str | None) -> None:
+def _verified_scope(unit_name: str | None) -> tuple[Path | None, str | None]:
+    """Return this shim's own scope cgroup when it is provably ``unit_name``.
+
+    A shim launched with ``--unit`` must be running in exactly that scope,
+    otherwise it could not reach the target's descendants on supervisor loss;
+    that is a startup failure.  Without ``--unit`` (in-process callers) no
+    cgroup is ever touched, so an unrelated cgroup can never be killed.
+    """
+    if not unit_name:
+        return None, None
+    cgroup = cgroup_path_for_pid(os.getpid())
+    if cgroup is None or cgroup.name != unit_name:
+        return None, f"shim is not running in its scope {unit_name!r}"
+    return cgroup, None
+
+
+def _scope_members(cgroup: Path) -> list[int] | None:
+    try:
+        return [
+            int(line) for line in (cgroup / "cgroup.procs").read_text(encoding="ascii").split()
+            if line.strip().isdigit()
+        ]
+    except (OSError, ValueError):
+        return None
+
+
+def _sweep_scope(cgroup: Path) -> bool:
+    """SIGKILL every scope member except this shim; True once only it remains."""
+    own = os.getpid()
+    # Repeat to catch processes forked mid-sweep; TasksMax bounds the fan-out.
+    for _ in range(50):
+        members = _scope_members(cgroup)
+        if members is None:
+            return False
+        others = [pid for pid in members if pid != own]
+        if not others:
+            return True
+        for pid in others:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.02)
+    return False
+
+
+def _kill_scope(child: subprocess.Popen, scope: Path | None, unit_name: str | None) -> None:
     """SIGKILL every process in this shim's scope, including the shim itself.
 
     No graceful wind-down: a target without a supervisor must not get the
-    chance to commit, push or open a pull request.  The cgroup is only killed
-    when it is provably the scope created for this invocation, so an
-    in-process caller can never take down an unrelated cgroup.
+    chance to commit, push or open a pull request.  Nothing here depends on a
+    report write succeeding.
     """
-    cgroup = cgroup_path_for_pid(os.getpid())
-    if unit_name and cgroup is not None and cgroup.name == unit_name:
+    if scope is not None:
         try:
-            (cgroup / "cgroup.kill").write_text("1", encoding="ascii")
+            (scope / "cgroup.kill").write_text("1", encoding="ascii")
         except OSError:
             pass
-        # Kernels without cgroup.kill (<5.14): signal members until only the
-        # shim remains.  Repeat to catch processes forked mid-sweep.
-        own = os.getpid()
-        for _ in range(50):
-            try:
-                members = [
-                    int(line) for line in (cgroup / "cgroup.procs").read_text(encoding="ascii").split()
-                    if line.strip().isdigit() and int(line) != own
-                ]
-            except (OSError, ValueError):
-                break
-            if not members:
-                break
-            for pid in members:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            time.sleep(0.02)
-    try:
-        os.killpg(child.pid, signal.SIGKILL)
-    except OSError:
-        pass
+        # Kernels without cgroup.kill (<5.14) fall back to a member sweep.
+        _sweep_scope(scope)
     try:
         child.kill()
     except OSError:
         pass
-    child.wait()
+    try:
+        child.wait()
+    except BaseException:
+        pass
     if unit_name and os.getpgrp() == os.getpid():
         # The launcher made the shim a session leader, so the target's
         # process group is the shim's own; take the stragglers with it.
         os.killpg(os.getpgrp(), signal.SIGKILL)
+
+
+def _reap_scope_after_target_exit(child: subprocess.Popen, scope: Path | None, unit_name: str | None) -> None:
+    """Leave no scoped process behind once the target itself has exited.
+
+    Otherwise a background or new-session descendant would outlive the shim
+    and with it the supervisor watch.  If the scope cannot be confirmed empty
+    the shim kills it outright, itself included -- fail closed.
+    """
+    if scope is not None and not _sweep_scope(scope):
+        _kill_scope(child, scope, unit_name)
+
+
+def _try_write_report(path: Path, payload: Mapping[str, object]) -> None:
+    try:
+        _write_report(path, payload)
+    except BaseException:
+        pass
 
 
 def _shim(argv: Sequence[str]) -> int:
@@ -1081,7 +1125,10 @@ def _shim(argv: Sequence[str]) -> int:
     # Fail closed: without a live supervisor there is nobody to review what
     # the target produces, so it is never started (issue #1092).
     supervisor_fd, problem = _validate_supervisor_fd(options.get("--supervisor-fd"))
-    if supervisor_fd is None:
+    scope = None
+    if supervisor_fd is not None:
+        scope, problem = _verified_scope(unit_name)
+    if problem is not None:
         _write_report(report_path, {"state": "target-exec-error", "errno": errno.EPIPE, "error": f"supervisor liveness check failed: {problem}"})
         return 125
     try:
@@ -1090,8 +1137,10 @@ def _shim(argv: Sequence[str]) -> int:
         _write_report(report_path, {"state": "target-exec-error", "errno": exc.errno, "error": str(exc)})
         return 127 if exc.errno == errno.ENOENT else 126
     target_cgroup = cgroup_path_for_pid(child.pid)
-    _write_report(report_path, {"state": "target-started", "pid": child.pid, "cgroup_path": str(target_cgroup) if target_cgroup else None})
+    # From here on every exit path, including a failed report write, must
+    # leave no target process running without its supervisor watch.
     try:
+        _write_report(report_path, {"state": "target-started", "pid": child.pid, "cgroup_path": str(target_cgroup) if target_cgroup else None})
         while True:
             code = child.poll()
             if code is not None:
@@ -1101,17 +1150,19 @@ def _shim(argv: Sequence[str]) -> int:
             except (OSError, ValueError):
                 ready = [supervisor_fd]
             if ready and child.poll() is None:
-                _write_report(report_path, {
+                _try_write_report(report_path, {
                     "state": "supervisor-lost", "pid": child.pid,
                     "cgroup_path": str(target_cgroup) if target_cgroup else None,
                 })
-                _kill_scope_after_supervisor_loss(child, unit_name)
+                _kill_scope(child, scope, unit_name)
                 return SUPERVISOR_LOST_EXIT_CODE
     except BaseException:
-        child.kill()
-        child.wait()
+        _kill_scope(child, scope, unit_name)
         raise
-    _write_report(report_path, {"state": "target-exited", "pid": child.pid, "returncode": code, "cgroup_path": str(target_cgroup) if target_cgroup else None})
+    try:
+        _write_report(report_path, {"state": "target-exited", "pid": child.pid, "returncode": code, "cgroup_path": str(target_cgroup) if target_cgroup else None})
+    finally:
+        _reap_scope_after_target_exit(child, scope, unit_name)
     return int(code if code >= 0 else 128 + (-code))
 
 

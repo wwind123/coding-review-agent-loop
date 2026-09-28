@@ -729,9 +729,14 @@ held only by the orchestrator's invocation handle. When that write end closes
 writes a `supervisor-lost` report and kills the whole scope through
 `cgroup.kill` (falling back to signalling each `cgroup.procs` member) with
 SIGKILL and no graceful wind-down, so the unsupervised turn stops with its work
-uncommitted rather than publishing it. The check fails closed: a missing,
-invalid, non-pipe, or already-closed descriptor means the target is never
-started (`target-exec-error`, shim exit 125). The process-group fallback has no
+uncommitted rather than publishing it. The kill never depends on a report
+write succeeding, and any shim failure after the target starts kills the scope.
+The watch also cannot end early: when the direct target exits, the shim kills
+any descendant still in the scope (background or new-session processes) before
+it exits itself, and kills the whole scope if it cannot confirm it empty. The
+check fails closed: a missing, invalid, non-pipe, or already-closed
+descriptor, or a shim not running in the scope named by `--unit`, means the
+target is never started (`target-exec-error`, shim exit 125). The process-group fallback has no
 shim and does not provide this guarantee.
 
 The managed test wrapper also locks a lane by canonical cwd, normalized argv,

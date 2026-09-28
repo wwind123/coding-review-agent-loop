@@ -202,7 +202,7 @@ def test_shim_kills_target_when_supervisor_dies(tmp_path):
     shim = subprocess.Popen(
         [
             sys.executable, "-m", "coding_review_agent_loop.containment",
-            "--shim", "--report", str(report), "--unit", "agent-loop-not-this-cgroup.scope",
+            "--shim", "--report", str(report),
             "--supervisor-fd", str(read_fd), "--",
             sys.executable, "-c", _PUBLISH_LATE_TARGET, str(pid_file), str(published),
         ],
@@ -229,6 +229,105 @@ def test_shim_kills_target_when_supervisor_dies(tmp_path):
         if shim.poll() is None:
             shim.kill()
             shim.wait()
+        for pid, start in records:
+            kill_if_same_instance(pid, start)
+
+
+def test_shim_refuses_to_start_outside_its_named_scope(tmp_path):
+    """A shim that could not reach the scope's descendants never starts one."""
+    report = tmp_path / "report.json"
+    marker = tmp_path / "ran"
+    read_fd, write_fd = open_supervisor_pipe()
+    try:
+        assert _shim(
+            ["--shim", "--report", str(report), "--unit", "agent-loop-not-this-cgroup.scope",
+             "--supervisor-fd", str(read_fd), "--", *_never_started_target(marker)]
+        ) == 125
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+    assert "not running in its scope" in json.loads(report.read_text(encoding="utf-8"))["error"]
+    assert not marker.exists()
+
+
+def _failing_report_writer(monkeypatch, failing_state):
+    real = containment_module._write_report
+
+    def write(path, payload):
+        if payload.get("state") == failing_state:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real(path, payload)
+
+    monkeypatch.setattr(containment_module, "_write_report", write)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process liveness probes use /proc")
+def test_shim_kills_target_when_start_report_write_fails(monkeypatch, tmp_path):
+    """Review item: a failed target-started report must not orphan the target."""
+    _failing_report_writer(monkeypatch, "target-started")
+    pid_file = tmp_path / "target.pid"
+    published = tmp_path / "published"
+    read_fd, write_fd = open_supervisor_pipe()
+    real_popen = containment_module.subprocess.Popen
+    started = []
+
+    def popen(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        started.append(child)
+        return child
+
+    monkeypatch.setattr(containment_module.subprocess, "Popen", popen)
+    try:
+        with pytest.raises(OSError):
+            _shim(
+                ["--shim", "--report", str(tmp_path / "report.json"),
+                 "--supervisor-fd", str(read_fd), "--",
+                 sys.executable, "-c", _PUBLISH_LATE_TARGET, str(pid_file), str(published)]
+            )
+        (child,) = started
+        assert child.returncode is not None, "the target was left running"
+        time.sleep(4.5)
+        assert not published.exists()
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+        for child in started:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process liveness probes use /proc")
+def test_shim_kill_on_supervisor_loss_does_not_depend_on_report_write(monkeypatch, tmp_path):
+    """Review item: a failed supervisor-lost report still kills the target."""
+    _failing_report_writer(monkeypatch, "supervisor-lost")
+    pid_file = tmp_path / "target.pid"
+    published = tmp_path / "published"
+    read_fd, write_fd = open_supervisor_pipe()
+    records: list[tuple[int, str]] = []
+
+    def lose_supervisor():
+        _wait_for(pid_file)
+        os.close(write_fd)
+
+    closer = threading.Thread(target=lose_supervisor)
+    closer.start()
+    try:
+        code = _shim(
+            ["--shim", "--report", str(tmp_path / "report.json"),
+             "--supervisor-fd", str(read_fd), "--",
+             sys.executable, "-c", _PUBLISH_LATE_TARGET, str(pid_file), str(published)]
+        )
+        closer.join()
+        records = read_pid_record(pid_file)
+        assert code == containment_module.SUPERVISOR_LOST_EXIT_CODE
+        for pid, start in records:
+            assert wait_until_gone(pid, start_time=start), "target outlived its supervisor"
+        time.sleep(4.5)
+        assert not published.exists()
+    finally:
+        closer.join()
+        os.close(read_fd)
         for pid, start in records:
             kill_if_same_instance(pid, start)
 
@@ -263,12 +362,15 @@ def test_managed_binding_passes_supervisor_pipe_and_close_releases_it(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="systemd containment is Linux-only")
-def test_systemd_scope_target_dies_with_its_orchestrator(monkeypatch, tmp_path):
-    """Issue #1092 regression: SIGKILL the orchestrator; the scoped target dies.
+@pytest.mark.parametrize("target_exits_first", [False, True], ids=["target-running", "target-exited"])
+def test_systemd_scope_target_dies_with_its_orchestrator(monkeypatch, tmp_path, target_exits_first):
+    """Issue #1092 regression: SIGKILL the orchestrator; nothing scoped survives.
 
-    The target double-forks a descendant into a new session, which neither a
+    The target forks a descendant into a new session, which neither a
     process-group kill nor a parent-death signal would reach; only the scope
-    kill does.
+    kill does.  With ``target-exited`` the direct target returns at once and
+    leaves that descendant behind: the shim must not exit (ending its watch)
+    while the descendant still runs.
     """
     import signal
     import subprocess
@@ -280,13 +382,15 @@ def test_systemd_scope_target_dies_with_its_orchestrator(monkeypatch, tmp_path):
         pytest.skip(manifest.reason or "systemd cgroup preflight unavailable")
     pid_file = tmp_path / "scoped.pid"
     published = tmp_path / "published"
+    shim_exited = tmp_path / "shim-exited"
     target_code = (
         PUBLISH_SNIPPET
         + "import os, subprocess, sys, time\n"
         "late = 'import sys, time; time.sleep(4); open(sys.argv[1], \"w\").write(\"published\")'\n"
         "escaped = subprocess.Popen([sys.executable, '-c', late, sys.argv[2]], start_new_session=True)\n"
         "_publish(sys.argv[1], [os.getpid(), escaped.pid])\n"
-        "time.sleep(4)\n"
+        + ("raise SystemExit(0)\n" if target_exits_first else "")
+        + "time.sleep(4)\n"
         "open(sys.argv[2], 'w').write('published')\n"
     )
     orchestrator_code = (
@@ -298,14 +402,16 @@ def test_systemd_scope_target_dies_with_its_orchestrator(monkeypatch, tmp_path):
         "argv = build_scope_argv(policy, [sys.executable, '-c', sys.argv[2], sys.argv[3], sys.argv[4]],\n"
         "    report_path=Path(sys.argv[5]), unit_name='agent-loop-t1092-' + uuid.uuid4().hex[:12] + '.scope',\n"
         "    limits=policy.role_limits('coder'), supervisor_fd=read_fd)\n"
-        "subprocess.Popen(argv, pass_fds=(read_fd,), start_new_session=True)\n"
+        "launcher = subprocess.Popen(argv, pass_fds=(read_fd,), start_new_session=True)\n"
         "os.close(read_fd)\n"
+        "launcher.wait()\n"
+        "Path(sys.argv[6]).write_text(str(launcher.returncode))\n"
         "time.sleep(60)\n"
     )
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(Path(__file__).resolve().parents[1] / "src"), os.environ.get("PYTHONPATH")]))}
     orchestrator = subprocess.Popen(
         [sys.executable, "-c", orchestrator_code, str(tmp_path / "runtime"), target_code,
-         str(pid_file), str(published), str(tmp_path / "report.json")],
+         str(pid_file), str(published), str(tmp_path / "report.json"), str(shim_exited)],
         env=env, start_new_session=True,
     )
     records: list[tuple[int, str]] = []
@@ -313,6 +419,14 @@ def test_systemd_scope_target_dies_with_its_orchestrator(monkeypatch, tmp_path):
         _wait_for(pid_file, timeout=15)
         records = read_pid_record(pid_file)
         assert len(records) == 2
+        if target_exits_first:
+            # The launcher returns only after the shim has reaped the scope.
+            _wait_for(shim_exited, timeout=10)
+            assert shim_exited.read_text() == "0"
+            for pid, start in records:
+                assert wait_until_gone(pid, start_time=start, timeout=0.5), (
+                    f"scoped process {pid} outlived the shim's watch"
+                )
         orchestrator.send_signal(signal.SIGKILL)
         orchestrator.wait(timeout=5)
         for pid, start in records:
