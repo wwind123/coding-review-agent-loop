@@ -620,6 +620,19 @@ obligation. Human requirements and approved plans are separate from that ledger.
 Original requirements, valid later human instructions, and safety constraints
 outrank the plan; plan conflicts must be surfaced explicitly.
 
+Human-only exact-head evidence (#1068) is a separate channel from findings.
+Reviewers list it in `exact_head_evidence_requests`, and the ledger records it
+as a `human-exact-head-evidence` machine obligation. The obligation is owned by
+the requesting reviewer and never goes to the coder or the review scheduler. It
+stays deferred across heads while any finding or machine gate remains. Once
+everything else is clean at a head H, the finalization gate re-reads the live
+head and signed input and posts one freeze comment at H. That comment is a
+review-and-feedback decision boundary (exit code 4): no coder, qualification,
+or merge runs while it stands. A signed human response re-runs the full board
+at H inside the same round, so it spends no round budget. Only the requester
+can clear its evidence there. New findings or a failing machine gate release
+the freeze with one release comment, and an external push breaks it.
+
 ### CI and Merge
 
 Ordinary CI observes the current-head check board. Known failures can join
@@ -894,6 +907,15 @@ sessions; #1043). The one byte-exact suffix `KNOWN_HOST_COMMENT_FOOTER` in
   terminal, recovery-exempt error. That is `pre-dispatch` unless a dispatch was
   issued or a run attached.
 - Observation is logged once per owned usage context.
+
+An evidence freeze or release comment is a PR-round handoff boundary like a
+qualification checkpoint. Its round metadata carries the ledger, round number,
+round budget, signed-requirement baseline, and head-scoped clearances.
+Reviewer records from an evidence-response pass count only once a terminal
+freeze or release record follows them, so an interrupted pass is replayed in
+full. A deferred request is re-derived from the reviewer record that raised
+it. A malformed evidence record becomes the non-bypassable `unknown`
+obligation.
 
 Resume reconstructs state from recorded evidence and then checks it against the
 live PR, issue, plan, requirements, and policy. GitHub metadata is durable but

@@ -117,7 +117,10 @@ _PR_SIGNED_REQUIREMENT_EPILOG = (
     "invalidates carried approvals, so reviewers re-check the PR against it and any "
     "unmet part is sent to the coder. Unsigned comments are not read as requirements, "
     "and --pr-review-force-full changes who reviews, not what must be fixed. Only a "
-    "human may sign; an agent relaying an operator decision must disclose the relay."
+    "human may sign; an agent relaying an operator decision must disclose the relay. "
+    "The same signed comment answers an exact-head evidence freeze: supply the "
+    "requested evidence for exactly the frozen head, or withdraw the request, and "
+    "rerun; the requesting reviewer re-reviews that head without a code change."
 )
 
 

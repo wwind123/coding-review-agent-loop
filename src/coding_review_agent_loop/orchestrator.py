@@ -540,6 +540,11 @@ from .followups import (
 )
 from .round_state import (
     ApprovedPlanContext,
+    EVIDENCE_FREEZE_PHASE,
+    EVIDENCE_RELEASE_PHASE,
+    EVIDENCE_RESPONSE_PHASE,
+    EvidenceFreezeRecord,
+    EvidenceReleaseRecord,
     QualificationCheckpoint,
     PostedRoundMetadata,
     _is_followup_dispatch_head,
@@ -683,6 +688,12 @@ from .unresolved_items import (
     _raise_if_maintained_disputed_items,
     select_coder_followup_items,
     coder_followup_is_ci_repair,
+    _frozen_evidence_obligations,
+    _is_evidence_obligation,
+    _pending_evidence_obligations,
+    _upsert_evidence_obligation,
+    freeze_evidence_obligations,
+    release_evidence_freeze,
     _upsert_human_requirements_ack_item,
     _validate_coder_followup_response,
     _validate_plan_review_response,
@@ -17195,6 +17206,11 @@ def _scheduler_obligations(
     for item in items:
         if item.status not in active_statuses:
             continue
+        if _is_evidence_obligation(item):
+            # No coder round can resolve human-only evidence, and its
+            # unscoped owner would otherwise make every later code transition
+            # broad (#1068).  Evidence passes run the full board by design.
+            continue
         owners = item.resolution_owners or (item.reviewer,)
         raw_states = item.owner_states
         states = dict(raw_states or ((owner, "pending") for owner in owners))
@@ -17240,11 +17256,16 @@ def _partition_unresolved_items(
     repair_required: list[UnresolvedReviewItem] = []
     revalidation_candidates: list[UnresolvedReviewItem] = []
     finalization_blockers: list[UnresolvedReviewItem] = []
+    evidence_obligations: list[UnresolvedReviewItem] = []
     for item in items:
         if item.status not in {"blocking", "same-pr"}:
             continue
         finalization_blockers.append(item)
-        if not _is_machine_obligation(item):
+        if _is_evidence_obligation(item):
+            # Human-only exact-head evidence is a final barrier (#1068): it
+            # blocks finalization but is never coder or repair work.
+            evidence_obligations.append(item)
+        elif not _is_machine_obligation(item):
             reviewer_blockers.append(item)
         elif _machine_obligation_requires_repair(item, current_head_sha=current_head_sha):
             repair_required.append(item)
@@ -17261,6 +17282,7 @@ def _partition_unresolved_items(
         "revalidation_candidates": tuple(revalidation_candidates),
         "finalization_blockers": tuple(finalization_blockers),
         "coder_blockers": tuple(coder_blockers),
+        "evidence_obligations": tuple(evidence_obligations),
     }
 
 
@@ -17428,6 +17450,10 @@ def _round_limit_diagnostic(
     reviewer_blockers = partitions["reviewer_blockers"]
     repair = partitions["repair_required_machine_obligations"]
     candidates = partitions["revalidation_candidates"]
+    evidence = partitions["evidence_obligations"]
+    # Code and machine blockers are named first; deferred human-only evidence
+    # is described as the remaining final barrier, never as the blocker.
+    evidence_suffix = _evidence_barrier_note(evidence)
     if reviewer_blockers:
         names = ", ".join(
             f"{item.reviewer} ({item.item_id})" for item in reviewer_blockers
@@ -17436,6 +17462,7 @@ def _round_limit_diagnostic(
             f"PR #{pr_number} still reported blocking issues after round {round_number}: "
             f"reviewer-owned findings: {names}. "
             "The named reviewer/owner must provide actionable resolution evidence."
+            + evidence_suffix
         )
     if repair:
         details = ", ".join(
@@ -17447,6 +17474,7 @@ def _round_limit_diagnostic(
             "awaiting a new repair head: "
             f"{details}. Reviewer approval cannot clear them; push a strictly "
             "different corrected head."
+            + evidence_suffix
         )
     if candidates:
         details = ", ".join(
@@ -17456,6 +17484,16 @@ def _round_limit_diagnostic(
         return (
             f"PR #{pr_number} has a unanimously reviewed correction awaiting authoritative "
             f"qualification after round {round_number}: {details}."
+            + evidence_suffix
+        )
+    if evidence and len(evidence) == len(
+        [item for item in items if item.status in {"blocking", "same-pr"}]
+    ):
+        return (
+            f"PR #{pr_number} has no open code or machine findings after round {round_number}; "
+            "the remaining barrier is human-only exact-head evidence: "
+            + ", ".join(f"{item.reviewer} ({item.item_id})" for item in evidence)
+            + ". It is requested only at the clean head through an evidence freeze."
         )
     active = [item for item in items if item.status in {"blocking", "same-pr"}]
     if active:
@@ -17502,6 +17540,414 @@ def _ensure_finalization_ready(
         raise AgentLoopError(
             f"PR #{pr_number} cannot finalize: {diagnostic} No approval or merge was attempted."
         )
+
+
+class _RepeatableRoundSequence:
+    """Round numbers for the PR loop; the current round may run again (#1068).
+
+    Evidence-response and same-head refresh passes re-run the review board
+    inside the current round, so they never advance ``round_number`` and the
+    pre-round budget guard cannot reject them.  Each repeat is triggered only
+    by a signed requirement ID no reviewer has seen, and a hard cap backs that
+    bound so a misbehaving source cannot spin the loop.
+    """
+
+    MAX_REPEATS_PER_ROUND = 8
+
+    def __init__(self, start: int, stop: int) -> None:
+        self._next = start
+        self._stop = stop
+        self._current: int | None = None
+        self._repeat = False
+        self._repeats = 0
+
+    def __iter__(self) -> "_RepeatableRoundSequence":
+        return self
+
+    def __next__(self) -> int:
+        if self._repeat and self._current is not None:
+            self._repeat = False
+            return self._current
+        if self._next >= self._stop:
+            raise StopIteration
+        self._current = self._next
+        self._next += 1
+        self._repeats = 0
+        return self._current
+
+    def repeat_current(self) -> None:
+        self._repeats += 1
+        if self._repeats > self.MAX_REPEATS_PER_ROUND:
+            raise HumanDecisionRequiredError(
+                f"Round {self._current} was re-run {self.MAX_REPEATS_PER_ROUND} times for new "
+                "signed human input without settling; human review required."
+            )
+        self._repeat = True
+
+
+def _evidence_barrier_note(items: Sequence[UnresolvedReviewItem]) -> str:
+    """Name pending human-only evidence as the remaining final barrier."""
+    evidence = _pending_evidence_obligations(items)
+    if not evidence:
+        return ""
+    return (
+        " Human-only exact-head evidence remains the final barrier ("
+        + ", ".join(f"{item.item_id} from {item.reviewer}" for item in evidence)
+        + "); it is requested only once every code finding and machine gate is clean."
+    )
+
+
+def _append_evidence_barrier_note(body: str, items: Sequence[UnresolvedReviewItem]) -> str:
+    """Add the evidence note to a clean-stop comment, before its signature."""
+    note = _evidence_barrier_note(items).strip()
+    if not note:
+        return body
+    text = str(body)
+    if "\n-- " in text:
+        prefix, signature = text.rsplit("\n-- ", 1)
+        return f"{prefix.rstrip()}\n\n{note}\n\n-- {signature}"
+    return f"{text.rstrip()}\n\n{note}"
+
+
+def _evidence_item_lines(items: Sequence[UnresolvedReviewItem]) -> list[str]:
+    return [
+        f"- [{item.item_id}] requested by {item.reviewer}: {item.text}"
+        for item in items
+    ]
+
+
+def _evidence_freeze_diagnostic(
+    *, pr_number: int, head_sha: str | None, items: Sequence[UnresolvedReviewItem]
+) -> str:
+    evidence = _pending_evidence_obligations(items)
+    return (
+        f"PR #{pr_number} is frozen at head {head_sha or 'unknown'} awaiting human-only "
+        "exact-head evidence: "
+        + "; ".join(f"{item.item_id} from {item.reviewer}" for item in evidence)
+        + ". No coder, CI qualification, or merge was started. Supply the evidence for "
+        "exactly this head, or withdraw the request, in a PR comment whose last line is "
+        f"exactly `-- Human Reviewer`, then rerun `agent-loop pr {pr_number}`. Pushing a new "
+        "commit breaks the freeze and the new head needs full review and fresh evidence."
+    )
+
+
+def _render_evidence_freeze_notice(
+    *,
+    pr_number: int,
+    head_sha: str,
+    items: Sequence[UnresolvedReviewItem],
+    still_frozen: bool,
+) -> str:
+    evidence = _pending_evidence_obligations(items)
+    heading = (
+        "## Exact-head evidence freeze (still in effect)"
+        if still_frozen
+        else "## Exact-head evidence freeze"
+    )
+    return "\n".join(
+        [
+            heading,
+            "",
+            f"Every reviewer reports no code findings at head `{head_sha}` and every machine "
+            "gate is clean. The remaining barrier is evidence that an agent session cannot "
+            "produce:",
+            "",
+            *_evidence_item_lines(evidence),
+            "",
+            f"Evidence requested at `{head_sha}`. No further code changes will be accepted "
+            "until the authenticated live evidence for this head is supplied or the request "
+            "is withdrawn.",
+            "",
+            "To respond, post a PR comment that supplies the evidence for exactly this head "
+            "(or withdraws the request) and ends with a line containing exactly "
+            f"`-- Human Reviewer`, then rerun `agent-loop pr {pr_number}`. The requesting "
+            "reviewer re-reviews this same head. Pushing a new commit breaks the freeze; the "
+            "new head then needs full review and fresh evidence.",
+            "",
+            "-- coding-review-agent-loop",
+        ]
+    )
+
+
+_EVIDENCE_RELEASE_MESSAGES = {
+    "machine-gate": (
+        "a machine gate failed at the frozen head ({detail}). The requested evidence returns "
+        "to deferred; the failure is repaired first and the evidence is requested again at "
+        "the next clean head."
+    ),
+    "findings": (
+        "a reviewer raised new findings at the frozen head. The requested evidence returns "
+        "to deferred and is requested again at the next clean head; evidence for this head "
+        "does not carry forward."
+    ),
+    "evidence-cleared": (
+        "the requesting reviewer(s) accepted the supplied evidence or its withdrawal. The PR "
+        "proceeds to final validation at the same head."
+    ),
+    "refresh-clean": (
+        "a same-head refresh for new signed input found no findings and no pending evidence. "
+        "The PR proceeds to final validation at the same head."
+    ),
+}
+
+
+def _publish_evidence_freeze(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    head_sha: str,
+    items: Sequence[UnresolvedReviewItem],
+    signed_requirement_ids: Sequence[str],
+    allowed_rounds: int,
+    watch_failure_extension_used: bool,
+    watch_head_extension_used: bool,
+    clearances: Sequence[tuple[str, str]] = (),
+    still_frozen: bool = False,
+) -> list[UnresolvedReviewItem]:
+    """Publish and persist a freeze with exactly one comment (#1068).
+
+    The frozen ledger exists only in memory until this single write; the
+    comment body is the human notice and its round metadata is the only
+    persistence.  A failed write therefore leaves no freeze behind.
+    """
+    frozen = freeze_evidence_obligations(items, head_sha=head_sha)
+    identities = tuple(
+        item.obligation_identity or item.item_id for item in _frozen_evidence_obligations(frozen)
+    )
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=_attach_round_metadata(
+            _render_evidence_freeze_notice(
+                pr_number=pr_number,
+                head_sha=head_sha,
+                items=frozen,
+                still_frozen=still_frozen,
+            ),
+            PostedRoundMetadata(
+                flow="pr",
+                role="summary",
+                agent="Orchestrator",
+                round_number=round_number,
+                subject=head_sha,
+                prior_items=tuple(frozen),
+                state="blocking",
+                phase=EVIDENCE_FREEZE_PHASE,
+                evidence_freeze=EvidenceFreezeRecord(
+                    frozen_head=head_sha,
+                    evidence_identities=identities,
+                    signed_requirement_ids_at_freeze=tuple(sorted(set(signed_requirement_ids))),
+                    allowed_rounds=allowed_rounds,
+                    watch_failure_extension_used=watch_failure_extension_used,
+                    watch_head_extension_used=watch_head_extension_used,
+                ),
+                evidence_clearances=tuple(clearances),
+                **_architecture_metadata_fields(config),
+            ),
+        ),
+    )
+    return frozen
+
+
+def _publish_evidence_release(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    head_sha: str,
+    items: Sequence[UnresolvedReviewItem],
+    reason: str,
+    surfaced_requirement_ids: Sequence[str],
+    allowed_rounds: int,
+    watch_failure_extension_used: bool,
+    watch_head_extension_used: bool,
+    clearances: Sequence[tuple[str, str]] = (),
+    detail: str = "",
+) -> list[UnresolvedReviewItem]:
+    """Post the single terminal release comment carrying the released ledger."""
+    released = release_evidence_freeze(items)
+    message = _EVIDENCE_RELEASE_MESSAGES[reason].format(detail=detail or "see the checks comment")
+    heading = (
+        "## Exact-head evidence accepted"
+        if reason in {"evidence-cleared", "refresh-clean"}
+        else "## Exact-head evidence freeze released"
+    )
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=_attach_round_metadata(
+            f"{heading}\n\nAt head `{head_sha}`: {message}"
+            + _evidence_barrier_note(released)
+            + "\n\n-- coding-review-agent-loop",
+            PostedRoundMetadata(
+                flow="pr",
+                role="summary",
+                agent="Orchestrator",
+                round_number=round_number,
+                subject=head_sha,
+                prior_items=tuple(released),
+                state="blocking",
+                phase=EVIDENCE_RELEASE_PHASE,
+                evidence_release=EvidenceReleaseRecord(
+                    released_head=head_sha,
+                    reason=reason,
+                    signed_requirement_ids_surfaced=tuple(sorted(set(surfaced_requirement_ids))),
+                    allowed_rounds=allowed_rounds,
+                    watch_failure_extension_used=watch_failure_extension_used,
+                    watch_head_extension_used=watch_head_extension_used,
+                ),
+                evidence_clearances=tuple(clearances),
+                **_architecture_metadata_fields(config),
+            ),
+        ),
+    )
+    return released
+
+
+@dataclass(frozen=True)
+class _EvidenceGateOutcome:
+    """What the finalization-point evidence gate decided (#1068)."""
+
+    action: str  # "proceed" | "head_changed" | "refresh"
+    context: PullRequestReviewContext | None = None
+
+
+def _evidence_freeze_gate(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    head_sha: str | None,
+    items: Sequence[UnresolvedReviewItem],
+    surfaced_requirement_ids: Sequence[str] | None,
+    collect_requirement_ids: Callable[[PullRequestReviewContext], Sequence[str]],
+    allowed_rounds: int,
+    watch_failure_extension_used: bool,
+    watch_head_extension_used: bool,
+    clearances: Sequence[tuple[str, str]] = (),
+) -> _EvidenceGateOutcome:
+    """Final revalidation and, when evidence is pending, the single freeze write.
+
+    Runs immediately before ``_ensure_finalization_ready`` and any merge, after
+    every machine gate.  The two reads are the last before the write:
+
+    * a live head other than ``head_sha`` returns ``head_changed`` without
+      posting anything about evidence;
+    * a live signed requirement ID outside the set surfaced to this round's
+      reviewers returns ``refresh`` so the board re-runs at the same head
+      before any freeze or approval (a missing baseline counts as empty).
+
+    With both matching and evidence pending, the freeze is published and the
+    run stops at the human decision boundary.  With nothing pending the
+    caller proceeds to finalization.
+    """
+    fresh = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    if not head_sha or fresh.metadata.head_sha != head_sha:
+        return _EvidenceGateOutcome("head_changed", fresh)
+    live_ids = tuple(collect_requirement_ids(fresh))
+    if set(live_ids) - set(surfaced_requirement_ids or ()):
+        return _EvidenceGateOutcome("refresh", fresh)
+    if not _pending_evidence_obligations(items):
+        return _EvidenceGateOutcome("proceed", fresh)
+    still_frozen = bool(_frozen_evidence_obligations(items))
+    frozen = _publish_evidence_freeze(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        round_number=round_number,
+        head_sha=head_sha,
+        items=items,
+        signed_requirement_ids=live_ids,
+        allowed_rounds=allowed_rounds,
+        watch_failure_extension_used=watch_failure_extension_used,
+        watch_head_extension_used=watch_head_extension_used,
+        clearances=clearances,
+        still_frozen=still_frozen,
+    )
+    raise HumanDecisionRequiredError(
+        _evidence_freeze_diagnostic(pr_number=pr_number, head_sha=head_sha, items=frozen)
+    )
+
+
+def _refuse_dispatch_while_evidence_frozen(
+    items: Sequence[UnresolvedReviewItem], *, pr_number: int, operation: str
+) -> None:
+    """Choke point before any head-changing dispatch (#1068).
+
+    Every legitimate path releases a freeze before dispatching, so this only
+    catches bugs: a frozen head must never move under a human evidence run.
+    """
+    frozen = _frozen_evidence_obligations(items)
+    if not frozen:
+        return
+    raise AgentLoopError(
+        f"Refusing to dispatch {operation} while exact-head evidence is frozen. "
+        + _evidence_freeze_diagnostic(
+            pr_number=pr_number, head_sha=frozen[0].candidate_head_sha, items=frozen
+        )
+    )
+
+
+def _is_evidence_only_blocking_review(
+    parsed: ParsedReview, prior_items: Sequence[UnresolvedReviewItem]
+) -> bool:
+    """A blocking review whose only open items are evidence requests.
+
+    Missing human evidence is not a code blocker, so such a review approves
+    the code while the evidence obligations stay in the ledger.
+    """
+    if parsed.state != "blocking" or parsed.blocking_items or parsed.followups.same_pr:
+        return False
+    evidence_ids = {item.item_id for item in prior_items if _is_evidence_obligation(item)}
+    active = [
+        disposition
+        for disposition in parsed.dispositions
+        if disposition.disposition in {"blocking", "same-pr"}
+    ]
+    if any(disposition.item_id not in evidence_ids for disposition in active):
+        return False
+    return bool(active) or bool(parsed.exact_head_evidence_requests)
+
+
+def _evidence_review_context(
+    items: Sequence[UnresolvedReviewItem], *, response_head: str | None
+) -> str:
+    """Reviewer context for carried evidence obligations and response passes."""
+    evidence = _pending_evidence_obligations(items)
+    if not evidence:
+        return ""
+    lines = ["", "Human-only exact-head evidence obligations (not code findings):"]
+    for item in evidence:
+        state = (
+            f"frozen at head `{item.candidate_head_sha}`"
+            if item.lifecycle == "evidence_frozen"
+            else "deferred until every code finding and machine gate is clean"
+        )
+        lines.append(f"- [{item.item_id}] requested by {item.reviewer}; {state}: {item.text}")
+    lines.append(
+        "These are machine-owned records. Disposition each one: `blocking` with a short "
+        "note keeps a request that is still needed; `resolved` is only a note unless the "
+        "response rule below applies. A review whose only open items are kept evidence "
+        "requests uses `state: blocking` with empty `blocking_items` and is treated as "
+        "approving the code. Never list missing human evidence in `blocking_items`."
+    )
+    if response_head:
+        lines.append(
+            f"This is an evidence-response re-review at frozen head `{response_head}` after "
+            "new signed human input. If you requested an item, dispose it `resolved` only "
+            "when the signed input supplies adequate evidence for exactly this head or "
+            "withdraws the request; otherwise keep it `blocking` with a note. Other "
+            "reviewers' dispositions on your item are notes only. Do not re-emit a request "
+            "you just resolved. Report any code defect the evidence reveals in "
+            "`blocking_items`."
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _finalize_ordinary_recovery_checked(
@@ -21203,12 +21649,148 @@ def run_pr_loop(
             else:
                 request_automatic_scheduler_fallback("qualification checkpoint is invalid")
                 final_sweep_pending = True
+        # Exact-head evidence state (#1068).  A freeze or release record is a
+        # handoff boundary that carries the round budget; restore it under the
+        # same bound as a qualification checkpoint before the pre-round guard.
+        evidence_boundary = (
+            resumed_round.evidence_boundary if resumed_round is not None else None
+        )
+        evidence_clearances: list[tuple[str, str]] = list(
+            resumed_round.evidence_clearances if resumed_round is not None else ()
+        )
+        evidence_budget_correction_pending = False
+        if evidence_boundary is not None:
+            boundary_payload = (
+                evidence_boundary.evidence_freeze
+                if evidence_boundary.phase == EVIDENCE_FREEZE_PHASE
+                else evidence_boundary.evidence_release
+            )
+            if (
+                boundary_payload is not None
+                and boundary_payload.valid
+                and boundary_payload.budget_valid
+                and boundary_payload.allowed_rounds is not None
+                and config.max_rounds <= boundary_payload.allowed_rounds <= config.max_rounds + 2
+            ):
+                allowed_rounds = boundary_payload.allowed_rounds
+                watch_failure_extension_used = bool(boundary_payload.watch_failure_extension_used)
+                watch_head_extension_used = bool(boundary_payload.watch_head_extension_used)
+            else:
+                # Invalid-checkpoint defaults: the persisted ceiling is never an
+                # authorization to mint rounds.
+                allowed_rounds = config.max_rounds
+                watch_failure_extension_used = False
+                watch_head_extension_used = False
+                request_automatic_scheduler_fallback("evidence record budget is invalid or out of bound")
+                final_sweep_pending = True
+                evidence_budget_correction_pending = bool(
+                    evidence_boundary.phase == EVIDENCE_FREEZE_PHASE
+                    and boundary_payload is not None
+                    and boundary_payload.valid
+                    and resumed_round is not None
+                    and resumed_round.broken_evidence_freeze_head is None
+                )
+        # Set by the finalization gate to re-run the board at the same head
+        # inside the current round: ``response`` when frozen evidence can be
+        # answered, ``refresh`` for signed input that arrived before a freeze.
+        pending_evidence_pass: str | None = None
+        # The signed-requirement IDs surfaced to the reviewers whose verdict the
+        # next finalization relies on; ``None`` is an unverifiable baseline.
+        evidence_surfaced_baseline: tuple[str, ...] | None = None
+        evidence_revalidation_required = False
+        if (
+            evidence_boundary is not None
+            and evidence_boundary.phase == EVIDENCE_RELEASE_PHASE
+            and resumed_round is not None
+            and resumed_round.broken_evidence_freeze_head is None
+            and not resumed_round.unrecorded_head_advance
+        ):
+            release_payload = evidence_boundary.evidence_release
+            evidence_revalidation_required = True
+            evidence_surfaced_baseline = (
+                release_payload.signed_requirement_ids_surfaced
+                if release_payload is not None and release_payload.valid
+                else None
+            )
+
+        def collect_live_requirement_ids(context: PullRequestReviewContext) -> tuple[str, ...]:
+            """Re-collect signed requirement identities for the final revalidation."""
+            live_issue = (
+                get_issue_context(runner, config=config, issue_number=issue_context.number)
+                if issue_context is not None
+                else None
+            )
+            live_parent = (
+                get_issue_context(runner, config=config, issue_number=parent_issue_context.number)
+                if parent_issue_context is not None
+                else None
+            )
+            return _reviewer_requirement_identity_ids(
+                _build_requirements_context(
+                    target_issue_context=live_issue,
+                    pr_context=context,
+                    parent_issue_context=live_parent,
+                ).effective_requirements
+            )
+
         # The two independent one-shot watcher allowances below can extend the
         # effective ceiling by two rounds in one invocation. Keep the static
         # range large enough to reach both; ``allowed_rounds`` remains the
         # authoritative guard and prevents either slot from being used unless
-        # its corresponding watcher transition grants it.
-        for round_number in range(start_round_number, config.max_rounds + 3):
+        # its corresponding watcher transition grants it.  An evidence pass
+        # re-runs the current round number without advancing it.
+        round_sequence = _RepeatableRoundSequence(start_round_number, config.max_rounds + 3)
+
+        def stage_same_head_evidence_pass(
+            context: PullRequestReviewContext, *, current_round: int
+        ) -> None:
+            """Re-run the board at the same head inside ``current_round`` (#1068)."""
+            nonlocal initial_pr_context, prefetched_pr_context, resumed_round
+            nonlocal pending_evidence_pass, issue_context_refreshed
+            nonlocal parent_issue_context_refreshed
+            pending_evidence_pass = (
+                "response"
+                if any(
+                    item.candidate_head_sha == context.metadata.head_sha
+                    for item in _frozen_evidence_obligations(unresolved_items)
+                )
+                else "refresh"
+            )
+            resumed_round = None
+            issue_context_refreshed = False
+            parent_issue_context_refreshed = False
+            if current_round == start_round_number:
+                initial_pr_context = context
+            else:
+                prefetched_pr_context = context
+            log(
+                config,
+                f"Round {current_round}: new signed human input reached PR #{pr_number} at "
+                f"head {context.metadata.head_sha}; re-running the full review board at the "
+                f"same head as an evidence {pending_evidence_pass} pass without advancing the round",
+            )
+            round_sequence.repeat_current()
+
+        def stage_evidence_head_change(context: PullRequestReviewContext) -> None:
+            """Hand a head that moved before the freeze to the new-head path."""
+            nonlocal unresolved_items, prefetched_pr_context, resumed_round
+            nonlocal final_sweep_pending
+            unresolved_items = _advance_machine_obligations_for_head(
+                release_evidence_freeze(unresolved_items),
+                current_head_sha=context.metadata.head_sha,
+            )
+            prefetched_pr_context = context
+            resumed_round = None
+            final_sweep_pending = True
+            log(
+                config,
+                f"PR #{pr_number} head changed to {context.metadata.head_sha} before the evidence "
+                "gate; no freeze was published and the new head needs review",
+            )
+
+        for round_number in round_sequence:
+            evidence_pass = pending_evidence_pass
+            pending_evidence_pass = None
             if round_number > allowed_rounds:
                 raise AgentLoopError(
                     _round_limit_diagnostic(
@@ -21422,11 +22004,201 @@ def run_pr_loop(
                     f"{round_start_mergeability.base_branch or config.base or 'the base branch'}; "
                     f"skipping reviewers and routing to {agent_display_name(config.coder)}",
                 )
+            # Exact-head evidence recovery (#1068).  A freeze or release record
+            # is the handoff boundary; an external push breaks a freeze.
+            evidence_skip_reviewers = False
+            broken_freeze_head = (
+                current_resume.broken_evidence_freeze_head
+                if current_resume is not None
+                else None
+            )
+            if broken_freeze_head is not None:
+                post_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=(
+                        "## Exact-head evidence freeze broken\n\n"
+                        f"The evidence freeze at `{broken_freeze_head}` was broken by an external "
+                        f"push: the PR head is now `{pr_metadata.head_sha}`. Evidence recorded for "
+                        "the old head does not carry forward. The requested evidence returns to "
+                        "deferred and the new head gets a full review."
+                        + _evidence_barrier_note(unresolved_items)
+                        + "\n\n-- coding-review-agent-loop"
+                    ),
+                )
+                log(
+                    config,
+                    f"Round {round_number}: evidence freeze at {broken_freeze_head} was broken by "
+                    f"an external push to {pr_metadata.head_sha}; reviewing the new head in full",
+                )
+                final_sweep_pending = True
+                request_automatic_scheduler_fallback("an external push broke an evidence freeze")
+            live_evidence_boundary = (
+                current_resume.evidence_boundary
+                if current_resume is not None
+                and broken_freeze_head is None
+                and not current_resume.unrecorded_head_advance
+                and current_resume.evidence_boundary is not None
+                and current_resume.evidence_boundary.subject == pr_metadata.head_sha
+                else None
+            )
+            if live_evidence_boundary is not None:
+                if any(
+                    item.obligation_identity == "invalid-evidence-record"
+                    for item in unresolved_items
+                ):
+                    raise AgentLoopError(
+                        f"PR #{pr_number} has a malformed or contradictory persisted exact-head "
+                        "evidence record at head "
+                        f"{pr_metadata.head_sha}; it is kept as a non-bypassable blocker. No "
+                        "coder, qualification, or merge was attempted. "
+                        + _round_limit_diagnostic(
+                            pr_number=pr_number,
+                            round_number=round_number,
+                            items=unresolved_items,
+                            current_head_sha=pr_metadata.head_sha,
+                        )
+                    )
+                freeze_payload = live_evidence_boundary.evidence_freeze
+                if (
+                    live_evidence_boundary.phase == EVIDENCE_FREEZE_PHASE
+                    and freeze_payload is not None
+                    and _frozen_evidence_obligations(unresolved_items)
+                ):
+                    # Frozen rerun: one check snapshot and one mergeability
+                    # observation (the round-start probe above) at H, with no
+                    # CI wait and no qualification dispatch.
+                    rerun_checks = get_pr_checks(runner, config=config, metadata=pr_metadata)
+                    if managed_ci_active(pr_metadata):
+                        rerun_checks = intermediate_managed_checks(rerun_checks)
+                    rerun_stalled = {
+                        (check.kind, check.name) for check in rerun_checks.infrastructure_stalls
+                    }
+                    rerun_failures = tuple(
+                        check for check in rerun_checks.failing
+                        if (check.kind, check.name) not in rerun_stalled
+                    )
+                    gate_reasons: list[str] = []
+                    if rerun_failures:
+                        failure_snapshot = dataclasses_replace(
+                            rerun_checks, state="failing", failing=rerun_failures,
+                            pending=(), missing_required=(), infrastructure_stalls=(),
+                            required_checks=(), branch_protection_note=None,
+                        )
+                        details = _pr_check_details(failure_snapshot)
+                        details.append(f"Frozen head: {pr_metadata.head_sha}")
+                        had_ordinary_obligation = any(
+                            _is_machine_obligation(item)
+                            and item.obligation_kind == "github-pr-checks"
+                            for item in unresolved_items
+                        )
+                        unresolved_items = _upsert_machine_obligation(
+                            unresolved_items,
+                            item_number=next_unresolved_item_number,
+                            kind="github-pr-checks",
+                            source_round=round_number,
+                            text=_pr_check_blocking_review(pr_number, "failing", details),
+                            failed_head_sha=pr_metadata.head_sha,
+                        )
+                        if not had_ordinary_obligation:
+                            next_unresolved_item_number += 1
+                        post_pr_comment(
+                            runner, config=config, pr_number=pr_number,
+                            body=_format_pr_checks_comment(pr_number, "failing", details),
+                        )
+                        gate_reasons.append("failing GitHub checks")
+                    if conflict_pending:
+                        gate_reasons.append("a merge conflict with the base branch")
+                    if gate_reasons:
+                        # Release before any budget check or dispatch; the
+                        # repair then runs as round R+1 under the ordinary guard.
+                        unresolved_items = _publish_evidence_release(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            round_number=round_number,
+                            head_sha=str(pr_metadata.head_sha),
+                            items=unresolved_items,
+                            reason="machine-gate",
+                            surfaced_requirement_ids=freeze_payload.signed_requirement_ids_at_freeze,
+                            allowed_rounds=allowed_rounds,
+                            watch_failure_extension_used=watch_failure_extension_used,
+                            watch_head_extension_used=watch_head_extension_used,
+                            clearances=evidence_clearances,
+                            detail="; ".join(gate_reasons),
+                        )
+                        log(
+                            config,
+                            f"Round {round_number}: evidence freeze released at "
+                            f"{pr_metadata.head_sha}: {'; '.join(gate_reasons)}",
+                        )
+                        evidence_skip_reviewers = True
+                    else:
+                        if evidence_budget_correction_pending:
+                            # Only the budget was invalid: keep the frozen
+                            # ledger and re-persist one corrected record.
+                            _publish_evidence_freeze(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                round_number=round_number,
+                                head_sha=str(pr_metadata.head_sha),
+                                items=unresolved_items,
+                                signed_requirement_ids=freeze_payload.signed_requirement_ids_at_freeze,
+                                allowed_rounds=allowed_rounds,
+                                watch_failure_extension_used=watch_failure_extension_used,
+                                watch_head_extension_used=watch_head_extension_used,
+                                clearances=evidence_clearances,
+                                still_frozen=True,
+                            )
+                            evidence_budget_correction_pending = False
+                        # New human input is detected by signed-requirement
+                        # identity: an edit yields a new ID, a deletion none.
+                        new_signed_ids = set(
+                            _reviewer_requirement_identity_ids(human_requirements)
+                        ) - set(freeze_payload.signed_requirement_ids_at_freeze)
+                        if not new_signed_ids:
+                            log(
+                                config,
+                                f"Round {round_number}: PR #{pr_number} remains frozen at "
+                                f"{pr_metadata.head_sha}; no new signed human input",
+                            )
+                            raise HumanDecisionRequiredError(
+                                _evidence_freeze_diagnostic(
+                                    pr_number=pr_number,
+                                    head_sha=pr_metadata.head_sha,
+                                    items=unresolved_items,
+                                )
+                            )
+                        evidence_pass = "response"
+                        log(
+                            config,
+                            f"Round {round_number}: new signed human input at frozen head "
+                            f"{pr_metadata.head_sha}; re-invoking the full review board",
+                        )
+                elif live_evidence_boundary.phase == EVIDENCE_RELEASE_PHASE:
+                    # The releasing pass already reviewed this head; resume at
+                    # the boundary without re-invoking reviewers.
+                    evidence_skip_reviewers = True
+            evidence_response_head = (
+                pr_metadata.head_sha
+                if evidence_pass is not None
+                and any(
+                    item.candidate_head_sha == pr_metadata.head_sha
+                    for item in _frozen_evidence_obligations(unresolved_items)
+                )
+                else None
+            )
+            if evidence_pass is not None:
+                evidence_skip_reviewers = False
             prior_unresolved_items = tuple(unresolved_items)
             prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
                 item.item_id: [] for item in prior_unresolved_items
             }
             round_new_unresolved_items: list[UnresolvedReviewItem] = []
+            # (reviewer, requests) pairs from this round's reviews (#1068).
+            round_evidence_requests: list[tuple[str, tuple[str, ...]]] = []
             current_pr_subject = str(pr_metadata.head_sha or "unknown")
             round_ledger_incomplete = _round_ledger_may_be_incomplete(
                 current_resume=current_resume,
@@ -21456,12 +22228,16 @@ def run_pr_loop(
                 latest_coder_metadata,
                 head_sha=pr_metadata.head_sha,
                 assigned_workdir=active_workdir(config),
+            ) + _evidence_review_context(
+                prior_unresolved_items, response_head=evidence_response_head
             )
             # Persist the same digest identities surfaced in reviewer prompts.
             # An edited signed comment must not inherit the old approval.
             surfaced_reviewer_requirement_ids = _reviewer_requirement_identity_ids(
                 human_requirements
             )
+            if not evidence_skip_reviewers:
+                evidence_surfaced_baseline = surfaced_reviewer_requirement_ids
             approved_review_outputs: list[tuple[str, str]] = []
             # The accepted carrier beside each approved text, keyed by reviewer, so
             # an acknowledgement repair can pin its assessment and records (#925).
@@ -21666,7 +22442,16 @@ def run_pr_loop(
             skip_reviewers_for_recovery = bool(
                 current_resume is not None
                 and (
-                    current_resume.unrecorded_head_advance
+                    (
+                        current_resume.unrecorded_head_advance
+                        # A broken freeze, or a recovered ledger holding only
+                        # evidence, has nothing for the coder: review in full.
+                        and broken_freeze_head is None
+                        and any(
+                            not _is_evidence_obligation(item)
+                            for item in current_resume.prior_items
+                        )
+                    )
                     or (
                         qualification_checkpoint is not None
                         and qualification_checkpoint.valid
@@ -21692,7 +22477,16 @@ def run_pr_loop(
             scheduler_previous_sha: str | None = None
             scheduler_diff_context = ""
             latest_reviewer_records: dict[str, PostedRoundRecord] = {}
-            external_recovery_full_board = skip_reviewers_for_recovery
+            external_recovery_full_board = (
+                skip_reviewers_for_recovery or broken_freeze_head is not None
+            )
+            if evidence_skip_reviewers and not skip_reviewers_for_recovery:
+                log(
+                    config,
+                    f"Round {round_number}: resuming at the persisted exact-head evidence "
+                    "record without redispatching completed reviewer work",
+                )
+            skip_reviewers_for_recovery = skip_reviewers_for_recovery or evidence_skip_reviewers
             scheduler_metadata_recovery_full_board = False
             metadata_recovery_reasons: list[str] = []
             if selective_policy:
@@ -22069,6 +22863,12 @@ def run_pr_loop(
                 scheduler_calls_avoided += scheduler_decision.calls_avoided
                 final_sweep_pending = False
                 selected_reviewer_names = set(scheduler_decision.selected_reviewers)
+                if evidence_pass is not None:
+                    # Evidence-response and refresh passes always run the
+                    # complete board at the same head (#1068).
+                    selected_reviewer_names = {
+                        agent_display_name(reviewer) for reviewer in configured_reviewers
+                    }
                 log(
                     config,
                     f"Round {round_number}: {scheduler_contract.policy} scheduler phase="
@@ -22095,6 +22895,9 @@ def run_pr_loop(
                     (scheduler_decision.selected_reviewers or amendment_checkpoint_due)
                     and not skip_reviewers_for_recovery
                     and not conflict_pending
+                    # An evidence pass writes only its reviewer records and
+                    # one terminal record, so an interrupted pass is ignorable.
+                    and evidence_pass is None
                 ):
                     pr_amendment_checkpoint_pending = False
                     post_pr_comment(
@@ -22175,9 +22978,13 @@ def run_pr_loop(
                 acquisition_outcome: str = "success",
                 acquisition_returncode: int | None = None,
                 new_items: tuple[UnresolvedReviewItem, ...] = (),
-                phase: str = "authoritative",
+                phase: str | None = None,
             ) -> None:
                 """Post one PR review using the same rendering and durable record."""
+                if phase is None:
+                    phase = (
+                        EVIDENCE_RESPONSE_PHASE if evidence_pass is not None else "authoritative"
+                    )
                 post_pr_comment(
                     runner, config=config, pr_number=pr_number,
                     body=_attach_round_metadata(
@@ -22208,6 +23015,7 @@ def run_pr_loop(
                                 else None
                             ),
                             phase=phase,
+                            evidence_requests=parsed.exact_head_evidence_requests,
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
                             scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
                             reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
@@ -22258,7 +23066,8 @@ def run_pr_loop(
                     return "skip"
                 prior_approval = unchanged_head_approvals.get(reviewer_name)
                 if (
-                    prior_approval is not None
+                    evidence_pass is None
+                    and prior_approval is not None
                     and prior_approval.metadata.round_number < round_number
                     and (
                         not human_requirements
@@ -22317,8 +23126,10 @@ def run_pr_loop(
             # A round that holds withheld outcomes began as a parallel round;
             # finish it through the same withhold-then-publish launcher even
             # when this run is sequential (#1025).
-            pr_round_parallel = config.review_parallel or pr_round_spool.has_records()
-            if not pr_round_parallel and not skip_reviewers_this_round:
+            pr_round_parallel = (
+                config.review_parallel or pr_round_spool.has_records()
+            ) and evidence_pass is None
+            if not pr_round_parallel and not skip_reviewers_this_round and evidence_pass is None:
                 _refuse_partial_round_before_sequential_turns(
                     spool=pr_round_spool,
                     fresh_turn_reviewers=[
@@ -22490,6 +23301,8 @@ def run_pr_loop(
                                     pr_checks=shared_reviewer_pr_checks,
                                     current_head_sha=current_pr_subject,
                                 )
+                            if _is_evidence_only_blocking_review(parsed, prior_unresolved_items):
+                                parsed = dataclasses_replace(parsed, state="approved")
                             return parsed
 
                         def _pr_failure_is_fatal(error: AgentLoopError) -> bool:
@@ -22618,12 +23431,14 @@ def run_pr_loop(
                         dispositions=resumed_record.metadata.dispositions,
                         architecture_impact=resumed_impact,
                         architecture_impact_degradations=resumed_records,
+                        exact_head_evidence_requests=resumed_record.metadata.evidence_requests,
                     )
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)
                     log(config, f"Round {round_number}: resuming {reviewer_name}'s completed review")
                 elif (
-                    (prior_approval := unchanged_head_approvals.get(reviewer_name)) is not None
+                    evidence_pass is None
+                    and (prior_approval := unchanged_head_approvals.get(reviewer_name)) is not None
                     and prior_approval.metadata.round_number < round_number
                     and (
                         not human_requirements
@@ -22883,6 +23698,20 @@ def run_pr_loop(
                         parsed_review = normalized_review
                         review_state = parsed_review.state
 
+                if review_state == "blocking" and _is_evidence_only_blocking_review(
+                    parsed_review, prior_unresolved_items
+                ):
+                    # Missing human evidence is not a code blocker (#1068): the
+                    # code review approves and the evidence stays in the ledger.
+                    log(
+                        config,
+                        f"Round {round_number}: {reviewer_name} blocks only on human-only "
+                        "exact-head evidence; treating the code review as approved and keeping "
+                        "the evidence as a deferred final barrier",
+                    )
+                    parsed_review = dataclasses_replace(parsed_review, state="approved")
+                    review_state = parsed_review.state
+
                 if _is_incomplete_pr_review(parsed_review):
                     if len(configured_reviewers) == 1:
                         incomplete_pr_review_error = _incomplete_pr_review_error(reviewer_name)
@@ -22921,6 +23750,10 @@ def run_pr_loop(
                         round_number=round_number,
                         subject=current_pr_subject,
                         reviewer_name=reviewer_name,
+                    )
+                if carried_approval_record is None and parsed_review.exact_head_evidence_requests:
+                    round_evidence_requests.append(
+                        (reviewer_name, parsed_review.exact_head_evidence_requests)
                     )
                 blocking_summary = parsed_review.summary
                 has_structured_blocking_content = bool(
@@ -23041,6 +23874,7 @@ def run_pr_loop(
                 (pr_round_parallel or selective_policy)
                 and not skip_reviewers_this_round
                 and not (current_resume is not None and current_resume.reconciled)
+                and evidence_pass is None
             ):
                 settled_reviewers = (
                     tuple(sorted(selected_reviewer_names))
@@ -23114,6 +23948,14 @@ def run_pr_loop(
                         raise error
                 raise pr_fatal_errors[0][1]
 
+            round_evidence_clearances: list[tuple[str, str]] = []
+            evidence_reconciliation_kwargs = {
+                "evidence_response_head": evidence_response_head,
+                "configured_reviewers": tuple(
+                    agent_display_name(reviewer) for reviewer in configured_reviewers
+                ),
+                "evidence_clearances": round_evidence_clearances,
+            }
             if use_compact_pr_context:
                 unresolved_items, future_from_prior_items = _apply_unresolved_item_dispositions(
                     pr_ledger_view(prior_unresolved_items),
@@ -23124,6 +23966,7 @@ def run_pr_loop(
                         if scheduler_capabilities.owner_scoped_reconciliation
                         else "aggregate"
                     ),
+                    **evidence_reconciliation_kwargs,
                 )
                 pr_compact_prior_summaries = list(
                     bound_compact_prior_summaries(
@@ -23146,11 +23989,41 @@ def run_pr_loop(
                         if scheduler_capabilities.owner_scoped_reconciliation
                         else "aggregate"
                     ),
+                    **evidence_reconciliation_kwargs,
                 )
                 future_from_prior_items = []
             unresolved_items = list(
                 pr_ledger_view([*unresolved_items, *round_new_unresolved_items])
             )
+            # Dispositions first, then newly emitted evidence requests, so a
+            # same-response re-emission of a just-cleared request hits its
+            # head-scoped clearance entry instead of recreating it (#1068).
+            evidence_clearances.extend(
+                clearance
+                for clearance in round_evidence_clearances
+                if clearance not in evidence_clearances
+            )
+            for requesting_reviewer, requests in round_evidence_requests:
+                for request_text in requests:
+                    unresolved_items, consumed_item_number = _upsert_evidence_obligation(
+                        unresolved_items,
+                        item_number=next_unresolved_item_number,
+                        reviewer=requesting_reviewer,
+                        text=request_text,
+                        source_round=round_number,
+                        current_head_sha=pr_metadata.head_sha,
+                        clearances=evidence_clearances,
+                    )
+                    if consumed_item_number:
+                        next_unresolved_item_number += 1
+            if round_evidence_clearances:
+                evidence_revalidation_required = True
+                log(
+                    config,
+                    f"Round {round_number}: exact-head evidence cleared at "
+                    f"{pr_metadata.head_sha} by its requesting reviewer(s): "
+                    + ", ".join(identity for identity, _head in round_evidence_clearances),
+                )
             # Human-requirement acknowledgement is a structured reviewer/coder
             # contract, not a reviewer-item ownership decision. Once every
             # required reviewer has emitted the explicit acknowledgement on
@@ -23211,6 +24084,76 @@ def run_pr_loop(
             # repair go to the coder.  A current, fully reviewed CI candidate
             # proceeds to source-authoritative qualification instead.
             must_fix_items = list(item_partitions["coder_blockers"])
+            if evidence_pass is not None:
+                # Every evidence-response or refresh pass ends with exactly one
+                # terminal record at this round and head (#1068).
+                pass_head = str(pr_metadata.head_sha)
+                if must_fix_items:
+                    unresolved_items = _publish_evidence_release(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        round_number=round_number,
+                        head_sha=pass_head,
+                        items=unresolved_items,
+                        reason="findings",
+                        surfaced_requirement_ids=surfaced_reviewer_requirement_ids,
+                        allowed_rounds=allowed_rounds,
+                        watch_failure_extension_used=watch_failure_extension_used,
+                        watch_head_extension_used=watch_head_extension_used,
+                        clearances=evidence_clearances,
+                    )
+                    log(
+                        config,
+                        f"Round {round_number}: evidence {evidence_pass} pass at {pass_head} "
+                        "raised findings; the freeze is released and the coder repairs them",
+                    )
+                elif not _pending_evidence_obligations(unresolved_items):
+                    unresolved_items = _publish_evidence_release(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        round_number=round_number,
+                        head_sha=pass_head,
+                        items=unresolved_items,
+                        reason=("evidence-cleared" if round_evidence_clearances else "refresh-clean"),
+                        surfaced_requirement_ids=surfaced_reviewer_requirement_ids,
+                        allowed_rounds=allowed_rounds,
+                        watch_failure_extension_used=watch_failure_extension_used,
+                        watch_head_extension_used=watch_head_extension_used,
+                        clearances=evidence_clearances,
+                    )
+                    evidence_revalidation_required = True
+                elif evidence_response_head is not None:
+                    # Evidence kept at the frozen head: no CI wait or
+                    # qualification; revalidate and re-persist the freeze.
+                    gate_outcome = _evidence_freeze_gate(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        round_number=round_number,
+                        head_sha=pr_metadata.head_sha,
+                        items=unresolved_items,
+                        surfaced_requirement_ids=surfaced_reviewer_requirement_ids,
+                        collect_requirement_ids=collect_live_requirement_ids,
+                        allowed_rounds=allowed_rounds,
+                        watch_failure_extension_used=watch_failure_extension_used,
+                        watch_head_extension_used=watch_head_extension_used,
+                        clearances=evidence_clearances,
+                    )
+                    assert gate_outcome.context is not None
+                    if gate_outcome.action == "head_changed":
+                        stage_evidence_head_change(gate_outcome.context)
+                        continue
+                    if gate_outcome.action == "refresh":
+                        stage_same_head_evidence_pass(
+                            gate_outcome.context, current_round=round_number
+                        )
+                        continue
+                    raise AgentLoopError(
+                        f"PR #{pr_number} evidence gate proceeded while evidence is pending; "
+                        "no approval or merge was attempted."
+                    )
 
             if must_fix_items:
                 try:
@@ -23481,6 +24424,14 @@ def run_pr_loop(
                     if plan_identity_changed or set(fresh_requirement_ids) != {
                         requirement.requirement_id for requirement in human_requirements
                     }:
+                        # Signed input that reaches a PR carrying exact-head evidence is
+                        # answered at the same head inside this round (#1068).
+                        if not plan_identity_changed and (
+                            evidence_revalidation_required
+                            or _pending_evidence_obligations(unresolved_items)
+                        ):
+                            stage_same_head_evidence_pass(fresh_context, current_round=round_number)
+                            continue
                         log(
                             config,
                             f"Round {round_number}: signed human-requirement identity changed; "
@@ -23621,7 +24572,10 @@ def run_pr_loop(
                         runner,
                         config=config,
                         pr_number=pr_number,
-                        body=_ci_infrastructure_stop_message(pr_number, stall, []),
+                        body=_append_evidence_barrier_note(
+                            _ci_infrastructure_stop_message(pr_number, stall, []),
+                            unresolved_items,
+                        ),
                     )
                     log(
                         config,
@@ -23643,6 +24597,31 @@ def run_pr_loop(
                             f"PR #{pr_number} was released to ordinary CI, but recovery provenance "
                             "could not be correlated; no merge attempted."
                         )
+                    # Exact-head evidence gate (#1068): the last reads before any
+                    # finalization side effect; publishes the single freeze when evidence
+                    # is pending, and otherwise revalidates head and signed input.
+                    if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                        gate_outcome = _evidence_freeze_gate(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            round_number=round_number,
+                            head_sha=pr_metadata.head_sha,
+                            items=unresolved_items,
+                            surfaced_requirement_ids=evidence_surfaced_baseline,
+                            collect_requirement_ids=collect_live_requirement_ids,
+                            allowed_rounds=allowed_rounds,
+                            watch_failure_extension_used=watch_failure_extension_used,
+                            watch_head_extension_used=watch_head_extension_used,
+                            clearances=evidence_clearances,
+                        )
+                        assert gate_outcome.context is not None
+                        if gate_outcome.action == "head_changed":
+                            stage_evidence_head_change(gate_outcome.context)
+                            continue
+                        if gate_outcome.action == "refresh":
+                            stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
+                            continue
                     recheck_pending_child_plan_supersession()
                     merged = _finalize_ordinary_recovery_checked(
                         runner,
@@ -23838,6 +24817,14 @@ def run_pr_loop(
                             if plan_identity_changed or set(fresh_requirement_ids) != {
                                 requirement.requirement_id for requirement in human_requirements
                             }:
+                                # Signed input that reaches a PR carrying exact-head evidence is
+                                # answered at the same head inside this round (#1068).
+                                if not plan_identity_changed and (
+                                    evidence_revalidation_required
+                                    or _pending_evidence_obligations(unresolved_items)
+                                ):
+                                    stage_same_head_evidence_pass(fresh_context, current_round=round_number)
+                                    continue
                                 final_sweep_pending = True
                                 prefetched_pr_context = fresh_context
                                 continue
@@ -23874,6 +24861,31 @@ def run_pr_loop(
                         unresolved_items = _clear_machine_obligations(
                             unresolved_items, kind="github-pr-checks"
                         )
+                        # Exact-head evidence gate (#1068): the last reads before any
+                        # finalization side effect; publishes the single freeze when evidence
+                        # is pending, and otherwise revalidates head and signed input.
+                        if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                            gate_outcome = _evidence_freeze_gate(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                round_number=round_number,
+                                head_sha=pr_metadata.head_sha,
+                                items=unresolved_items,
+                                surfaced_requirement_ids=evidence_surfaced_baseline,
+                                collect_requirement_ids=collect_live_requirement_ids,
+                                allowed_rounds=allowed_rounds,
+                                watch_failure_extension_used=watch_failure_extension_used,
+                                watch_head_extension_used=watch_head_extension_used,
+                                clearances=evidence_clearances,
+                            )
+                            assert gate_outcome.context is not None
+                            if gate_outcome.action == "head_changed":
+                                stage_evidence_head_change(gate_outcome.context)
+                                continue
+                            if gate_outcome.action == "refresh":
+                                stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
+                                continue
                         recheck_pending_child_plan_supersession()
                         _ensure_finalization_ready(
                             pr_number=pr_number,
@@ -23953,8 +24965,11 @@ def run_pr_loop(
                             runner,
                             config=config,
                             pr_number=pr_number,
-                            body=_ci_infrastructure_stop_message(
-                                pr_number, watch_outcome.stall, []
+                            body=_append_evidence_barrier_note(
+                                _ci_infrastructure_stop_message(
+                                    pr_number, watch_outcome.stall, []
+                                ),
+                                unresolved_items,
                             ),
                         )
                         print(f"PR #{pr_number} CI watch stopped: external CI infrastructure is stalled.")
@@ -24118,7 +25133,10 @@ def run_pr_loop(
                                 runner,
                                 config=config,
                                 pr_number=pr_number,
-                                body=_pending_ci_stop_message(pr_number, pr_checks.state, details),
+                                body=_append_evidence_barrier_note(
+                                    _pending_ci_stop_message(pr_number, pr_checks.state, details),
+                                    unresolved_items,
+                                ),
                             )
                             log(
                                 config,
@@ -24131,6 +25149,7 @@ def run_pr_loop(
                                 f"{format_agent_list(configured_reviewers)}, but "
                                 f"{_pending_ci_status_summary(pr_checks.state)}. "
                                 f"{_pending_ci_stop_guidance(pr_checks.state)}"
+                                + _evidence_barrier_note(unresolved_items)
                             )
                             return 0
                         # Managed qualification and --auto-merge: post the
@@ -24236,6 +25255,14 @@ def run_pr_loop(
                         if plan_identity_changed or set(fresh_requirement_ids) != {
                             requirement.requirement_id for requirement in human_requirements
                         }:
+                            # Signed input that reaches a PR carrying exact-head evidence is
+                            # answered at the same head inside this round (#1068).
+                            if not plan_identity_changed and (
+                                evidence_revalidation_required
+                                or _pending_evidence_obligations(unresolved_items)
+                            ):
+                                stage_same_head_evidence_pass(fresh_context, current_round=round_number)
+                                continue
                             final_sweep_pending = True
                             prefetched_pr_context = fresh_context
                             continue
@@ -24294,6 +25321,14 @@ def run_pr_loop(
                         if plan_identity_changed or set(fresh_requirement_ids) != {
                             requirement.requirement_id for requirement in human_requirements
                         }:
+                            # Signed input that reaches a PR carrying exact-head evidence is
+                            # answered at the same head inside this round (#1068).
+                            if not plan_identity_changed and (
+                                evidence_revalidation_required
+                                or _pending_evidence_obligations(unresolved_items)
+                            ):
+                                stage_same_head_evidence_pass(fresh_context, current_round=round_number)
+                                continue
                             log(
                                 config,
                                 f"Round {round_number}: qualification contract changed before managed CI; "
@@ -24421,6 +25456,31 @@ def run_pr_loop(
                                         f"PR #{pr_number} managed resume could not be correlated to ordinary "
                                         "recovery CI; no merge attempted."
                                     )
+                                # Exact-head evidence gate (#1068): the last reads before any
+                                # finalization side effect; publishes the single freeze when evidence
+                                # is pending, and otherwise revalidates head and signed input.
+                                if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                                    gate_outcome = _evidence_freeze_gate(
+                                        runner,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        round_number=round_number,
+                                        head_sha=pr_metadata.head_sha,
+                                        items=unresolved_items,
+                                        surfaced_requirement_ids=evidence_surfaced_baseline,
+                                        collect_requirement_ids=collect_live_requirement_ids,
+                                        allowed_rounds=allowed_rounds,
+                                        watch_failure_extension_used=watch_failure_extension_used,
+                                        watch_head_extension_used=watch_head_extension_used,
+                                        clearances=evidence_clearances,
+                                    )
+                                    assert gate_outcome.context is not None
+                                    if gate_outcome.action == "head_changed":
+                                        stage_evidence_head_change(gate_outcome.context)
+                                        continue
+                                    if gate_outcome.action == "refresh":
+                                        stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
+                                        continue
                                 recheck_pending_child_plan_supersession()
                                 merged = _finalize_ordinary_recovery_checked(
                                     runner,
@@ -24511,12 +25571,45 @@ def run_pr_loop(
                                     if plan_identity_changed or set(fresh_requirement_ids) != {
                                         requirement.requirement_id for requirement in human_requirements
                                     }:
+                                        # Signed input that reaches a PR carrying exact-head evidence is
+                                        # answered at the same head inside this round (#1068).
+                                        if not plan_identity_changed and (
+                                            evidence_revalidation_required
+                                            or _pending_evidence_obligations(unresolved_items)
+                                        ):
+                                            stage_same_head_evidence_pass(fresh_context, current_round=round_number)
+                                            continue
                                         prefetched_pr_context = fresh_context
                                         final_sweep_pending = True
                                         continue
                                 unresolved_items = _clear_machine_obligations(
                                     unresolved_items, kind="managed-exact-head-ci"
                                 )
+                                # Exact-head evidence gate (#1068): the last reads before any
+                                # finalization side effect; publishes the single freeze when evidence
+                                # is pending, and otherwise revalidates head and signed input.
+                                if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                                    gate_outcome = _evidence_freeze_gate(
+                                        runner,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        round_number=round_number,
+                                        head_sha=pr_metadata.head_sha,
+                                        items=unresolved_items,
+                                        surfaced_requirement_ids=evidence_surfaced_baseline,
+                                        collect_requirement_ids=collect_live_requirement_ids,
+                                        allowed_rounds=allowed_rounds,
+                                        watch_failure_extension_used=watch_failure_extension_used,
+                                        watch_head_extension_used=watch_head_extension_used,
+                                        clearances=evidence_clearances,
+                                    )
+                                    assert gate_outcome.context is not None
+                                    if gate_outcome.action == "head_changed":
+                                        stage_evidence_head_change(gate_outcome.context)
+                                        continue
+                                    if gate_outcome.action == "refresh":
+                                        stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
+                                        continue
                                 recheck_pending_child_plan_supersession()
                                 _ensure_finalization_ready(
                                     pr_number=pr_number,
@@ -24641,8 +25734,11 @@ def run_pr_loop(
                                     runner,
                                     config=config,
                                     pr_number=pr_number,
-                                    body=_ci_infrastructure_stop_message(
-                                        pr_number, managed_outcome.stall, []
+                                    body=_append_evidence_barrier_note(
+                                        _ci_infrastructure_stop_message(
+                                            pr_number, managed_outcome.stall, []
+                                        ),
+                                        unresolved_items,
                                     ),
                                 )
                                 log(
@@ -24712,6 +25808,31 @@ def run_pr_loop(
                                     f"PR #{pr_number} ordinary recovery provenance is unavailable; "
                                     "no merge attempted."
                                 )
+                            # Exact-head evidence gate (#1068): the last reads before any
+                            # finalization side effect; publishes the single freeze when evidence
+                            # is pending, and otherwise revalidates head and signed input.
+                            if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                                gate_outcome = _evidence_freeze_gate(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    round_number=round_number,
+                                    head_sha=pr_metadata.head_sha,
+                                    items=unresolved_items,
+                                    surfaced_requirement_ids=evidence_surfaced_baseline,
+                                    collect_requirement_ids=collect_live_requirement_ids,
+                                    allowed_rounds=allowed_rounds,
+                                    watch_failure_extension_used=watch_failure_extension_used,
+                                    watch_head_extension_used=watch_head_extension_used,
+                                    clearances=evidence_clearances,
+                                )
+                                assert gate_outcome.context is not None
+                                if gate_outcome.action == "head_changed":
+                                    stage_evidence_head_change(gate_outcome.context)
+                                    continue
+                                if gate_outcome.action == "refresh":
+                                    stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
+                                    continue
                             recheck_pending_child_plan_supersession()
                             merged = _finalize_ordinary_recovery_checked(
                                 runner,
@@ -24745,6 +25866,31 @@ def run_pr_loop(
                             )["coder_blockers"]
                         )
                     if not must_fix_items:
+                        # Exact-head evidence gate (#1068): the last reads before any
+                        # finalization side effect; publishes the single freeze when evidence
+                        # is pending, and otherwise revalidates head and signed input.
+                        if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                            gate_outcome = _evidence_freeze_gate(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                round_number=round_number,
+                                head_sha=pr_metadata.head_sha,
+                                items=unresolved_items,
+                                surfaced_requirement_ids=evidence_surfaced_baseline,
+                                collect_requirement_ids=collect_live_requirement_ids,
+                                allowed_rounds=allowed_rounds,
+                                watch_failure_extension_used=watch_failure_extension_used,
+                                watch_head_extension_used=watch_head_extension_used,
+                                clearances=evidence_clearances,
+                            )
+                            assert gate_outcome.context is not None
+                            if gate_outcome.action == "head_changed":
+                                stage_evidence_head_change(gate_outcome.context)
+                                continue
+                            if gate_outcome.action == "refresh":
+                                stage_same_head_evidence_pass(gate_outcome.context, current_round=round_number)
+                                continue
                         recheck_pending_child_plan_supersession()
                         _ensure_finalization_ready(
                             pr_number=pr_number,
@@ -24980,6 +26126,36 @@ def run_pr_loop(
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             repair_unresolved_item_ids = tuple(
                 item.item_id for item in coder_followup_items
+            )
+            if (
+                evidence_pass is not None
+                and _frozen_evidence_obligations(unresolved_items)
+            ):
+                # A machine gate failed after the pass settled: the pass still
+                # ends with exactly one terminal record, released before any
+                # head-changing dispatch (#1068).
+                unresolved_items = _publish_evidence_release(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    round_number=round_number,
+                    head_sha=str(pr_metadata.head_sha),
+                    items=unresolved_items,
+                    reason="machine-gate",
+                    surfaced_requirement_ids=surfaced_reviewer_requirement_ids,
+                    allowed_rounds=allowed_rounds,
+                    watch_failure_extension_used=watch_failure_extension_used,
+                    watch_head_extension_used=watch_head_extension_used,
+                    clearances=evidence_clearances,
+                )
+            _refuse_dispatch_while_evidence_frozen(
+                unresolved_items,
+                pr_number=pr_number,
+                operation=(
+                    "a merge-conflict resolution"
+                    if has_merge_conflict_item
+                    else "a coder follow-up or CI repair"
+                ),
             )
             # Persist the exact machine state and any consumed watcher budget
             # before invoking the coder. If the agent process is interrupted

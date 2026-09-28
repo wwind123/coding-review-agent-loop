@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -23,6 +24,7 @@ from .protocol import (
     StructuredIssueImplementation,
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
+    EVIDENCE_OBLIGATION_KIND,
     MACHINE_AUTHORITY,
     MACHINE_OBLIGATION_KINDS,
     UNKNOWN_MACHINE_AUTHORITY,
@@ -37,6 +39,7 @@ from .protocol import (
     validate_structured_human_requirements_acknowledgement,
     validate_structured_issue_implementation,
     validate_human_requirement_dispositions,
+    _normalized_review_item_text,
 )
 
 HUMAN_REQUIREMENTS_ACK_ITEM_ID = "item-human-requirements-acknowledgement"
@@ -71,6 +74,8 @@ def select_coder_followup_items(
         item
         for item in unresolved_items
         if item.item_id not in CODER_NON_CLASSIFIABLE_ITEM_IDS
+        # Human-only exact-head evidence is never coder work (#1068).
+        and not _is_evidence_obligation(item)
     )
 
 
@@ -168,10 +173,127 @@ def _machine_obligation_is_ci(item: UnresolvedReviewItem) -> bool:
     return _is_machine_obligation(item) and item.obligation_kind in CI_MACHINE_OBLIGATION_KINDS
 
 
+def _is_evidence_obligation(item: UnresolvedReviewItem) -> bool:
+    """Whether this record is a human-only exact-head evidence request (#1068)."""
+    return _is_machine_obligation(item) and item.obligation_kind == EVIDENCE_OBLIGATION_KIND
+
+
+def _pending_evidence_obligations(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> tuple[UnresolvedReviewItem, ...]:
+    return tuple(
+        item
+        for item in unresolved_items
+        if _is_evidence_obligation(item)
+        and item.status in {"blocking", "same-pr"}
+        and item.lifecycle in {"evidence_deferred", "evidence_frozen"}
+    )
+
+
+def _frozen_evidence_obligations(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> tuple[UnresolvedReviewItem, ...]:
+    return tuple(
+        item
+        for item in _pending_evidence_obligations(unresolved_items)
+        if item.lifecycle == "evidence_frozen"
+    )
+
+
+def evidence_obligation_identity(text: str, reviewer: str) -> str:
+    """Stable identity of one reviewer's request, independent of item numbering."""
+    digest = hashlib.sha256(
+        json.dumps(
+            [_normalized_review_item_text(text), reviewer], ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"{EVIDENCE_OBLIGATION_KIND}:{digest}"
+
+
+def _upsert_evidence_obligation(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    *,
+    item_number: int,
+    reviewer: str,
+    text: str,
+    source_round: int,
+    current_head_sha: str | None,
+    clearances: Sequence[tuple[str, str]] = (),
+) -> tuple[list[UnresolvedReviewItem], bool]:
+    """Upsert one reviewer's evidence request by identity.
+
+    Returns the ledger and whether a new item number was consumed.  A request
+    whose identity was cleared at ``current_head_sha`` is ignored, so a
+    re-emission in the same response that cleared it cannot recreate it; at
+    any other head the same request is a new deferred obligation.
+    """
+    identity = evidence_obligation_identity(text, reviewer)
+    if current_head_sha and (identity, current_head_sha) in set(clearances):
+        return list(unresolved_items), False
+    for index, existing in enumerate(unresolved_items):
+        if _is_evidence_obligation(existing) and existing.obligation_identity == identity:
+            result = list(unresolved_items)
+            if existing.status not in {"blocking", "same-pr"} or existing.lifecycle not in {
+                "evidence_deferred", "evidence_frozen"
+            }:
+                result[index] = replace(
+                    existing,
+                    status="blocking",
+                    source_status="blocking",
+                    lifecycle="evidence_deferred",
+                    candidate_head_sha=None,
+                )
+            return result, False
+    item = UnresolvedReviewItem(
+        item_id=f"item-{item_number}",
+        reviewer=reviewer,
+        source_round=source_round,
+        text=text,
+        status="blocking",
+        source_status="blocking",
+        resolution_owners=(reviewer,),
+        owner_states=((reviewer, "pending"),),
+        authority=MACHINE_AUTHORITY,
+        obligation_kind=EVIDENCE_OBLIGATION_KIND,
+        lifecycle="evidence_deferred",
+        obligation_identity=identity,
+    )
+    return [*unresolved_items, item], True
+
+
+def freeze_evidence_obligations(
+    unresolved_items: Sequence[UnresolvedReviewItem], *, head_sha: str
+) -> list[UnresolvedReviewItem]:
+    """Freeze every pending evidence obligation at the clean head ``head_sha``."""
+    return [
+        replace(item, lifecycle="evidence_frozen", candidate_head_sha=head_sha)
+        if _is_evidence_obligation(item)
+        and item.status in {"blocking", "same-pr"}
+        and item.lifecycle in {"evidence_deferred", "evidence_frozen"}
+        else item
+        for item in unresolved_items
+    ]
+
+
+def release_evidence_freeze(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> list[UnresolvedReviewItem]:
+    """Return every frozen evidence obligation to the deferred state."""
+    return [
+        replace(item, lifecycle="evidence_deferred", candidate_head_sha=None)
+        if _is_evidence_obligation(item) and item.lifecycle == "evidence_frozen"
+        else item
+        for item in unresolved_items
+    ]
+
+
 def _machine_obligation_requires_repair(
     item: UnresolvedReviewItem, *, current_head_sha: str | None
 ) -> bool:
     if not _is_machine_obligation(item) or item.status not in {"blocking", "same-pr"}:
+        return False
+    if _is_evidence_obligation(item):
+        # No coder round can produce human-only evidence.
         return False
     if item.obligation_kind == UNKNOWN_OBLIGATION_KIND:
         return True
@@ -195,6 +317,7 @@ def _machine_obligation_is_revalidation_candidate(
 ) -> bool:
     return (
         _is_machine_obligation(item)
+        and not _is_evidence_obligation(item)
         and item.obligation_kind in CI_MACHINE_OBLIGATION_KINDS
         and item.lifecycle in {"awaiting_current_head_review", "qualification_ready", "qualifying"}
         and bool(item.candidate_head_sha)
@@ -219,6 +342,12 @@ def _upsert_machine_obligation(
     failed_head_sha: str | None,
 ) -> list[UnresolvedReviewItem]:
     """Upsert one stable source-specific obligation instead of accumulating items."""
+    if kind == EVIDENCE_OBLIGATION_KIND:
+        # Evidence obligations are keyed per request identity, never per kind.
+        raise AgentLoopError(
+            "Evidence obligations must be upserted by identity with "
+            "_upsert_evidence_obligation, not as a kind singleton."
+        )
     if kind not in MACHINE_OBLIGATION_KINDS or kind == UNKNOWN_OBLIGATION_KIND:
         kind = UNKNOWN_OBLIGATION_KIND
         failed_head_sha = None
@@ -276,7 +405,12 @@ def _advance_machine_obligations_for_head(
         return list(unresolved_items)
     result: list[UnresolvedReviewItem] = []
     for item in unresolved_items:
-        if not _is_machine_obligation(item) or item.lifecycle == "cleared":
+        if (
+            not _is_machine_obligation(item)
+            or item.lifecycle == "cleared"
+            # Head handling for evidence is owned by the freeze logic.
+            or _is_evidence_obligation(item)
+        ):
             result.append(item)
             continue
         if item.lifecycle == "repair_required":
@@ -329,6 +463,10 @@ def _set_machine_obligation_lifecycle(
 ) -> list[UnresolvedReviewItem]:
     if lifecycle not in {"repair_required", "awaiting_current_head_review", "qualification_ready", "qualifying", "cleared"}:
         raise AgentLoopError(f"Unknown machine-obligation lifecycle: {lifecycle}.")
+    if kind == EVIDENCE_OBLIGATION_KIND:
+        raise AgentLoopError(
+            "Evidence obligation lifecycles are owned by the evidence freeze helpers."
+        )
     return [
         replace(item, lifecycle=lifecycle)
         if _is_machine_obligation(item) and item.obligation_kind == kind
@@ -824,7 +962,19 @@ def _apply_unresolved_item_dispositions(
     same_status: str = "same-pr",
     retain_future: bool = True,
     reconciliation_mode: str = "aggregate",
+    evidence_response_head: str | None = None,
+    configured_reviewers: Sequence[str] | None = None,
+    evidence_clearances: list[tuple[str, str]] | None = None,
 ) -> tuple[list[UnresolvedReviewItem], list[UnresolvedReviewItem]]:
+    """Reconcile carried items with this round's reviewer dispositions.
+
+    ``evidence_response_head`` is set only for a re-review at a frozen head
+    after new signed human input (#1068).  Only then may the requesting
+    reviewer's ``resolved`` disposition clear its own evidence obligation;
+    each clearance is appended to ``evidence_clearances`` as
+    ``(obligation_identity, head)``.  Every other evidence disposition is a
+    note, like any other machine record.
+    """
     if reconciliation_mode not in {"aggregate", "owner-scoped"}:
         raise AgentLoopError(
             "reconciliation_mode must be `aggregate` or `owner-scoped`."
@@ -835,6 +985,29 @@ def _apply_unresolved_item_dispositions(
         dispositions = dispositions_by_item.get(item.item_id, [])
         if not dispositions:
             next_unresolved.append(item)
+            continue
+        if _is_evidence_obligation(item):
+            notes = list(item.notes)
+            for disposition in dispositions:
+                if disposition.note:
+                    note = f"{disposition.reviewer}: {disposition.note}"
+                    if note not in notes:
+                        notes.append(note)
+            preserved = replace(item, notes=tuple(notes)) if tuple(notes) != item.notes else item
+            if (
+                evidence_response_head is not None
+                and item.lifecycle == "evidence_frozen"
+                and item.candidate_head_sha == evidence_response_head
+                and _evidence_clearance_authorized(
+                    item, dispositions, configured_reviewers=configured_reviewers
+                )
+            ):
+                if evidence_clearances is not None and item.obligation_identity:
+                    evidence_clearances.append(
+                        (item.obligation_identity, evidence_response_head)
+                    )
+                continue
+            next_unresolved.append(preserved)
             continue
         if _is_machine_obligation(item):
             # Reviewers must still disposition machine records so the durable
@@ -983,6 +1156,28 @@ def _apply_unresolved_item_dispositions(
             else:
                 future_items.append(future_item)
     return next_unresolved, future_items
+
+
+def _evidence_clearance_authorized(
+    item: UnresolvedReviewItem,
+    dispositions: Sequence[ReviewItemDisposition],
+    *,
+    configured_reviewers: Sequence[str] | None,
+) -> bool:
+    """Only the requester may clear its evidence; a non-owner vote is a note.
+
+    When the requester is no longer on the configured board, every configured
+    reviewer must resolve the request, so no single reviewer can waive it.
+    """
+    owner = item.reviewer
+    resolved_by = {
+        disposition.reviewer
+        for disposition in dispositions
+        if disposition.disposition == "resolved"
+    }
+    if configured_reviewers is not None and owner not in set(configured_reviewers):
+        return bool(configured_reviewers) and set(configured_reviewers) <= resolved_by
+    return owner in resolved_by
 
 
 def _collect_prior_compact_summaries(

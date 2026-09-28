@@ -664,6 +664,16 @@ requirement invalidates every carried approval, so reviewers re-check the same
 head against it and any unmet part becomes a coder obligation in that PR. The
 approval message and `agent-loop pr --help` name this path.
 
+A signed comment is also how an operator answers an **exact-head evidence
+freeze**. Some approved plans require evidence that no agent can produce, such
+as an authenticated live-CLI run at the exact head. Reviewers request it
+separately from code findings. The loop requests it only once the board and
+every machine gate are clean at a head: it posts one freeze comment naming that
+head and stops with exit code 4, and it pushes nothing while frozen. Supply the
+evidence for that head, or withdraw the request, in a signed comment and rerun.
+The requesting reviewer then re-reviews the same head without spending a round.
+See [the evidence freeze](docs/local_agent_loop.md#exact-head-human-evidence-freeze).
+
 The signature certifies that a human wrote the requirement, and nothing verifies
 authorship. An agent must not apply it on its own initiative; when an operator
 tells an agent to relay a decision, the relay must be disclosed in the comment.

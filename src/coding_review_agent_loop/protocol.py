@@ -144,9 +144,15 @@ MACHINE_OBLIGATION_KINDS = frozenset(
         "alembic-migration",
         "merge-conflict",
         "human-requirements-acknowledgement",
+        "human-exact-head-evidence",
         "unknown",
     }
 )
+# Human-only exact-head evidence (#1068) is a final barrier with its own
+# lifecycle: deferred while any other must-fix work remains, frozen at the
+# clean head H once it is the only open item, and cleared by its requester.
+EVIDENCE_OBLIGATION_KIND = "human-exact-head-evidence"
+EVIDENCE_LIFECYCLE_STATES = frozenset({"evidence_deferred", "evidence_frozen"})
 MACHINE_LIFECYCLE_STATES = frozenset(
     {
         "repair_required",
@@ -154,6 +160,7 @@ MACHINE_LIFECYCLE_STATES = frozenset(
         "qualification_ready",
         "qualifying",
         "cleared",
+        *EVIDENCE_LIFECYCLE_STATES,
     }
 )
 MACHINE_OBLIGATION_FIELDS = frozenset(
@@ -230,6 +237,15 @@ class UnresolvedReviewItem:
             raise ValueError("machine obligations require a known obligation kind")
         if lifecycle not in MACHINE_LIFECYCLE_STATES:
             raise ValueError("machine obligations require a known lifecycle")
+        if kind == EVIDENCE_OBLIGATION_KIND:
+            if lifecycle not in EVIDENCE_LIFECYCLE_STATES | {"cleared"}:
+                raise ValueError("evidence obligations require an evidence lifecycle")
+            if lifecycle == "evidence_frozen" and not self.candidate_head_sha:
+                raise ValueError("a frozen evidence obligation needs its frozen head")
+            if not self.obligation_identity:
+                raise ValueError("evidence obligations need a stable identity")
+        elif lifecycle in EVIDENCE_LIFECYCLE_STATES:
+            raise ValueError("evidence lifecycles are valid only for evidence obligations")
         if (
             lifecycle == "repair_required"
             and not self.failed_head_sha
@@ -267,6 +283,9 @@ class ParsedReview:
     raw_dispositions_text: str = ""
     architecture_impact: ArchitectureImpact | None = None
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
+    # Human-only evidence an agent session cannot produce (#1068).  These are
+    # never blocking code findings and are never routed to the coder.
+    exact_head_evidence_requests: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -316,6 +335,7 @@ class StructuredPrReview:
     future_followups: tuple[str, ...]
     prior_item_dispositions: tuple[ReviewItemDisposition, ...]
     architecture_impact: ArchitectureImpact | None = None
+    exact_head_evidence_requests: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -5728,7 +5748,13 @@ def parse_structured_pr_review(
             "summary",
             "prior_item_dispositions",
         },
-        optional={"blocking_items", "same_pr_followups", "future_followups", "architecture_impact"},
+        optional={
+            "blocking_items",
+            "same_pr_followups",
+            "future_followups",
+            "architecture_impact",
+            "exact_head_evidence_requests",
+        },
     )
     state = _expect_state(payload["state"], context="pr_review.state")  # shape-check: fatal:no-conservative-reading
     summary = review_freeform_summary_text(
@@ -5753,6 +5779,15 @@ def parse_structured_pr_review(
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(  # shape-check: fatal:no-conservative-reading
         payload, mode=architecture_status_mode, context="pr_review.architecture_impact"
     )
+    evidence_requests = _expect_evidence_request_list(  # shape-check: fatal:no-conservative-reading
+        payload, context="pr_review.exact_head_evidence_requests"
+    )
+    _reject_evidence_request_overlap(  # shape-check: fatal:no-conservative-reading
+        evidence_requests,
+        blocking_items=blocking_items,
+        same_pr_followups=same_pr_followups,
+        future_followups=future_followups,
+    )
     structured_blocking_items = blocking_items
     followups = _dedupe_pr_review_items(
         structured_blocking_items,
@@ -5761,7 +5796,7 @@ def parse_structured_pr_review(
             future=future_followups,
         ),
     )
-    return _finalize_parsed_review(  # shape-check: fatal:no-conservative-reading
+    parsed = _finalize_parsed_review(  # shape-check: fatal:no-conservative-reading
         state=state,
         summary=summary,
         blocking_items=structured_blocking_items,
@@ -5770,6 +5805,71 @@ def parse_structured_pr_review(
         architecture_impact=architecture_impact,
         architecture_impact_degradations=architecture_impact_degradations,
     )
+    if not evidence_requests:
+        return parsed
+    return dataclasses.replace(parsed, exact_head_evidence_requests=evidence_requests)
+
+
+def _expect_evidence_request_list(
+    payload: dict[str, object], *, context: str
+) -> tuple[str, ...]:
+    """Strictly parse the optional human-only exact-head evidence list (#1068)."""
+    value = payload.get("exact_head_evidence_requests", [])
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array of strings.")  # shape-check: fatal:no-conservative-reading
+    requests: list[str] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(value):
+        if not isinstance(raw, str):
+            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                f"{context} at index {index} must be a non-empty string."
+            )
+        text = _expect_non_empty_string(raw, context=f"{context} at index {index}")  # shape-check: fatal:no-conservative-reading
+        normalized = _normalized_review_item_text(text)
+        if not normalized:
+            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                f"{context} at index {index} must be a non-empty string."
+            )
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        requests.append(text.strip())
+    return tuple(requests)
+
+
+def _reject_evidence_request_overlap(
+    evidence_requests: tuple[str, ...],
+    *,
+    blocking_items: tuple[ApprovedFollowup, ...],
+    same_pr_followups: tuple[ApprovedFollowup, ...],
+    future_followups: tuple[ApprovedFollowup, ...],
+) -> None:
+    """Reject a request that is also listed as a coder-routed finding.
+
+    Silently keeping either copy would be wrong: dropping the typed request
+    loses the final barrier, and dropping the finding hides a code defect.
+    The bounded format repair asks the reviewer to choose exactly one field.
+    """
+    if not evidence_requests:
+        return
+    finding_texts = {
+        _normalized_review_item_text(item.text): field
+        for field, group in (
+            ("future_followups", future_followups),
+            ("same_pr_followups", same_pr_followups),
+            ("blocking_items", blocking_items),
+        )
+        for item in group
+    }
+    for request in evidence_requests:
+        field = finding_texts.get(_normalized_review_item_text(request))
+        if field is not None:
+            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                "pr_review.exact_head_evidence_requests repeats an entry that is also listed "
+                f"in `{field}`. List human-only exact-head evidence only in "
+                "`exact_head_evidence_requests` and code defects only in the finding lists; "
+                "each concern belongs in exactly one field."
+            )
 
 
 def parse_structured_plan_review(

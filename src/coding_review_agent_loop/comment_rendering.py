@@ -1369,6 +1369,17 @@ def _render_public_pr_review_comment(
                 ]
             )
         )
+    if parsed_review.exact_head_evidence_requests:
+        # Human-only exact-head evidence (#1068) is shown separately from code
+        # findings; the orchestrator defers it until the board is clean.
+        sections.append(
+            "\n".join(
+                [
+                    "### Exact-head evidence requests (human-only; deferred until the board is clean)",
+                    *[f"- {text}" for text in parsed_review.exact_head_evidence_requests],
+                ]
+            )
+        )
     if prior_items:
         sections.append(
             _render_prior_dispositions_section(
