@@ -836,7 +836,7 @@ def build_parser() -> argparse.ArgumentParser:
             metavar="N",
             help=(
                 "Canonical plan size (characters) at which the rendered-size growth signal "
-                "crosses (default: 120000, 10%% under the measured canonical size at which the "
+                "crosses (default: 120000, 10%% under the projected canonical size at which the "
                 "full plan comment stops fitting the 60000-character comment limit and a "
                 "bounded digest is posted instead; see docs/local_agent_loop.md)."
             ),

@@ -97,10 +97,10 @@ canonical size. The digest's visible text is bounded, and the canonical text
 spills, so the digest overflows only if unspillable metadata grows. The one
 canonical-size limit left is the metadata codec. The complete round metadata
 is encoded before any spill, and `encode_mapping` refuses a compressed form
-above 8,000,000 bytes. The metadata carries the plan at most about four times.
-Assuming four copies at up to four UTF-8 bytes per character and no compression
-gives a conservative codec floor of 500,000 canonical characters, over four
-times the default. Measured on this repository's plan anchors:
+above 8,000,000 bytes. The largest plan measured, #871's final candidate, used
+about 132,000 compressed bytes of complete metadata, about 1.7% of that cap.
+That figure is estimated from its spill sidecars and residual anchor metadata.
+Measured on this repository's plan anchors with the read-only GitHub API:
 
 | Quantity | Measured | Source |
 | --- | --- | --- |
@@ -110,10 +110,12 @@ times the default. Measured on this repository's plan anchors:
 | Tightest full-comment anchor headroom | 3,422 | #871's final candidate |
 | Digest visible text | 9.1-10.5k | Digest anchors on #946 and #1035 |
 
-The projected digest transition is (60000 - 24995) / 0.258, about 135,700
-canonical characters. The default is that transition less 10%, rounded down to
-10,000, so a plan can cross the size signal while it can still be shown in
-full. The derivation lives next to `DEFAULT_PLAN_GROWTH_MAX_CHARS` in
+The digest transition is **projected, not measured**: (60000 - 24995) / 0.258,
+about 135,700 canonical characters. It deliberately pairs #886's ratio (the
+only plan with a known canonical size) with the largest floor seen. It also
+assumes visible text grows in proportion to canonical text. No plan has been
+observed crossing it. The default is that projection less 10%, rounded down to
+10,000. The derivation lives next to `DEFAULT_PLAN_GROWTH_MAX_CHARS` in
 `plan_growth.py`. It rests on one visible-ratio sample. Plans that outgrew one
 delivery measured 120-195k canonical characters (PR #1072) and still
 published, either with a lower visible ratio than #886's or as a digest.

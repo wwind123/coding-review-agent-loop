@@ -19,7 +19,7 @@ from coding_review_agent_loop.config import AgentLoopConfig
 from coding_review_agent_loop.plan_growth import (
     DEFAULT_PLAN_GROWTH_MAX_CHARS,
     DEFAULT_PLAN_GROWTH_MAX_REVISIONS,
-    PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS,
+    PLAN_TRANSPORT_MEASURED_LARGEST_METADATA_COMPRESSED_BYTES,
     PLAN_TRANSPORT_MEASURED_METADATA_FLOOR_CHARS,
     PLAN_TRANSPORT_MEASURED_VISIBLE_RATIO,
     PLAN_TRANSPORT_PROJECTED_DIGEST_TRANSITION_CHARS,
@@ -66,18 +66,19 @@ def test_default_size_threshold_is_derived_from_the_digest_transition():
     )
 
 
-def test_codec_floor_is_far_above_the_default_and_encodes():
-    """The metadata codec is the only canonical-size publication limit.
+def test_measured_codec_usage_is_far_below_the_codec_cap():
+    """#871's final candidate, the largest plan measured, against the cap.
 
-    Four copies of a plan at the conservative floor still encode under
-    the codec's compressed-size cap.
+    Its complete metadata is estimated from its nine spill sidecar comment
+    lengths and its residual anchor metadata: strip the sidecar label and
+    marker framing and the JSON envelope, then undo two base64 layers.
     """
-    assert PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS == transport._MAX_COMPRESSED // 16
-    assert PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS >= 4 * DEFAULT_PLAN_GROWTH_MAX_CHARS
-    plan = _random_text(PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS * 3 // 4)
-    assert len(plan) == PLAN_TRANSPORT_CODEC_CANONICAL_FLOOR_CHARS
-    encoded = transport.encode_mapping({f"copy_{index}": plan for index in range(4)})
-    assert len(encoded) * 3 // 4 < transport._MAX_COMPRESSED
+    sidecar_lengths = [10_379, 10_690, 53_869, 3_085, 25_375, 25_908, 53_853, 12_877, 10_371]
+    framing, envelope, residual_metadata = 180, 260, 24_995
+    packed = sum(((length - framing) * 3 // 4 - envelope) * 3 // 4 for length in sidecar_lengths)
+    estimate = packed + residual_metadata * 3 // 4
+    assert abs(estimate - PLAN_TRANSPORT_MEASURED_LARGEST_METADATA_COMPRESSED_BYTES) < 1_000
+    assert PLAN_TRANSPORT_MEASURED_LARGEST_METADATA_COMPRESSED_BYTES * 50 < transport._MAX_COMPRESSED
 
 
 def _long_plan(config, steps: int):
