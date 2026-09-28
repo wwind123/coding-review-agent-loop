@@ -233,3 +233,155 @@ def test_bodies_differing_only_by_the_exact_footer_are_not_a_conflict():
     )
 
     assert selected is not None and selected.server_comment_id == 900
+
+
+# --- Human-only exact-head evidence records (#1068) --------------------------
+
+from coding_review_agent_loop.round_state import (  # noqa: E402
+    EvidenceFreezeRecord,
+    EvidenceReleaseRecord,
+    _attach_round_metadata,
+    _deserialize_unresolved_item,
+    _drop_unterminated_evidence_response_records,
+    _extract_round_metadata_records,
+    _resume_pr_round,
+)
+from coding_review_agent_loop.unresolved_items import (  # noqa: E402
+    _upsert_evidence_obligation,
+    freeze_evidence_obligations,
+)
+
+_FROZEN_HEAD = "abc123"
+
+
+def _evidence_ledger(*, frozen=True):
+    ledger, _ = _upsert_evidence_obligation(
+        [], item_number=1, reviewer="Codex", text="Attach the live run.",
+        source_round=1, current_head_sha=_FROZEN_HEAD,
+    )
+    return tuple(freeze_evidence_obligations(ledger, head_sha=_FROZEN_HEAD) if frozen else ledger)
+
+
+def _freeze_metadata(ledger, **payload_overrides):
+    payload = dict(
+        frozen_head=_FROZEN_HEAD,
+        evidence_identities=tuple(item.obligation_identity for item in ledger),
+        signed_requirement_ids_at_freeze=(),
+        allowed_rounds=5,
+        watch_failure_extension_used=False,
+        watch_head_extension_used=False,
+    )
+    payload.update(payload_overrides)
+    return PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=1,
+        subject=_FROZEN_HEAD, prior_items=tuple(ledger), state="blocking",
+        phase="evidence-freeze", evidence_freeze=EvidenceFreezeRecord(**payload),
+    )
+
+
+def _comments(*metadata):
+    return [SimpleNamespace(body=_attach_round_metadata("record", item)) for item in metadata]
+
+
+@pytest.mark.parametrize(
+    "overrides, reason",
+    [
+        ({"lifecycle": "evidence_unknown"}, "unknown lifecycle"),
+        ({"lifecycle": "evidence_frozen", "candidate_head_sha": None}, "frozen without head"),
+    ],
+)
+def test_malformed_persisted_evidence_record_becomes_unknown_blocker(overrides, reason):
+    """Row malformed-evidence-record: never dropped, never a reviewer finding."""
+    payload = {
+        "item_id": "item-1", "reviewer": "Codex", "source_round": 1,
+        "text": "Attach the live run.", "status": "blocking", "source_status": "blocking",
+        "notes": [], "authority": "machine", "obligation_kind": "human-exact-head-evidence",
+        "lifecycle": "evidence_deferred", "obligation_identity": "human-exact-head-evidence:x",
+        **overrides,
+    }
+    payload = {key: value for key, value in payload.items() if value is not None}
+    item = _deserialize_unresolved_item(payload)
+    assert item.obligation_kind == "unknown", reason
+    assert item.is_machine_obligation
+    assert item.status == "blocking"
+
+
+def test_evidence_metadata_round_trips_and_legacy_records_omit_it():
+    ledger = _evidence_ledger()
+    metadata = _freeze_metadata(ledger)
+    metadata = PostedRoundMetadata(
+        **{**metadata.__dict__, "evidence_clearances": (("id-x", _FROZEN_HEAD),)}
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.evidence_freeze == metadata.evidence_freeze
+    assert decoded.evidence_clearances == (("id-x", _FROZEN_HEAD),)
+    assert decoded.prior_items == metadata.prior_items
+    reviewer = PostedRoundMetadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=1, subject=_FROZEN_HEAD,
+        evidence_requests=("Attach the live run.",),
+    )
+    assert _decode_round_metadata(_encode_round_metadata(reviewer)).evidence_requests == (
+        "Attach the live run.",
+    )
+    plain = decode_mapping(_encode_round_metadata(_checkpoint()))
+    for key in ("evidence_requests", "evidence_freeze", "evidence_release", "evidence_clearances"):
+        assert key not in plain
+    release = EvidenceReleaseRecord.from_mapping(
+        {"released_head": _FROZEN_HEAD, "reason": "findings", "allowed_rounds": 3,
+         "watch_failure_extension_used": False, "watch_head_extension_used": False}
+    )
+    assert release.valid and release.signed_requirement_ids_surfaced is None
+    assert not EvidenceReleaseRecord.from_mapping({"released_head": "x", "reason": "nope"}).valid
+    budget_only = EvidenceFreezeRecord.from_mapping(
+        {**_freeze_metadata(ledger).evidence_freeze.as_dict(), "allowed_rounds": True}
+    )
+    assert budget_only.valid and not budget_only.budget_valid
+
+
+def test_resume_at_a_contradictory_freeze_record_adds_unknown_blocker():
+    ledger = _evidence_ledger()
+    comments = _comments(_freeze_metadata(ledger, evidence_identities=("someone-else",)))
+    resumed = _resume_pr_round(comments, head_sha=_FROZEN_HEAD, configured_reviewers=("codex",))
+    assert resumed is not None and resumed.evidence_boundary is not None
+    unknown = [item for item in resumed.prior_items if item.obligation_kind == "unknown"]
+    assert unknown and unknown[0].obligation_identity == "invalid-evidence-record"
+    # The frozen ledger itself is kept, never treated as absent.
+    assert any(item.lifecycle == "evidence_frozen" for item in resumed.prior_items)
+
+
+def test_unterminated_evidence_response_records_are_ignored_by_recovery():
+    """Row evidence-response-interrupted (recovery unit)."""
+    ledger = _evidence_ledger()
+    freeze = _freeze_metadata(ledger)
+    response = PostedRoundMetadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=1, subject=_FROZEN_HEAD,
+        prior_items=tuple(ledger), state="approved", phase="evidence-response",
+    )
+    records = _extract_round_metadata_records(_comments(freeze, response), flow="pr")
+    assert [record.metadata.phase for record in _drop_unterminated_evidence_response_records(records)] == [
+        "evidence-freeze"
+    ]
+    resumed = _resume_pr_round(
+        _comments(freeze, response), head_sha=_FROZEN_HEAD, configured_reviewers=("codex",)
+    )
+    assert resumed.evidence_boundary.phase == "evidence-freeze"
+    assert resumed.completed_reviews == ()
+    assert resumed.prior_items == tuple(ledger)
+    # Once a terminal record follows, the pass's records are kept.
+    terminated = _extract_round_metadata_records(
+        _comments(freeze, response, freeze), flow="pr"
+    )
+    assert len(_drop_unterminated_evidence_response_records(terminated)) == 3
+
+
+def test_external_push_after_freeze_releases_evidence_and_marks_broken_head():
+    """Row external-push-breaks-freeze (recovery unit)."""
+    ledger = _evidence_ledger()
+    resumed = _resume_pr_round(
+        _comments(_freeze_metadata(ledger)), head_sha="def456", configured_reviewers=("codex",)
+    )
+    assert resumed is not None
+    assert resumed.unrecorded_head_advance is True
+    assert resumed.broken_evidence_freeze_head == _FROZEN_HEAD
+    assert [item.lifecycle for item in resumed.prior_items] == ["evidence_deferred"]
+    assert resumed.evidence_boundary.evidence_freeze.allowed_rounds == 5

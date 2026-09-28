@@ -8,6 +8,7 @@ import re
 
 from .errors import AgentLoopError
 from .protocol import (
+    _normalized_review_item_text,
     ParseDegradation,
     _extract_json_object_prefix,
     _flatten_plan_review_finding,
@@ -1359,6 +1360,28 @@ def validate_repair_preservation(
         or (source["kind"] == "plan_review" and isinstance(entry, dict))
     ]
     available.sort(key=len)
+    # A typed human-only evidence request (#1068) must survive repair.  When the
+    # source listed the same text both as a request and as a finding, the
+    # repair resolves that overlap by keeping the typed request: the finding
+    # copy may be dropped only when the request itself was preserved.
+    moved_to_evidence: set[str] = set()
+    if source["kind"] == "pr_review" and isinstance(
+        source.get("exact_head_evidence_requests"), list
+    ):
+        target_requests = target.get("exact_head_evidence_requests", [])
+        require(isinstance(target_requests, list), "exact_head_evidence_requests")
+        for entry in source["exact_head_evidence_requests"]:
+            fragments = _fragments(entry)
+            if not isinstance(entry, str) or not fragments:
+                continue
+            require(
+                any(
+                    isinstance(candidate, str) and _contains_fragments(candidate, fragments)
+                    for candidate in target_requests
+                ),
+                "exact_head_evidence_requests",
+            )
+            moved_to_evidence.add(_normalized_review_item_text(entry))
     for field in finding_fields:
         entries = source.get(field)
         if not isinstance(entries, list):
@@ -1366,6 +1389,11 @@ def validate_repair_preservation(
         for entry in entries:
             fragments = _fragments(entry)
             if not fragments:
+                continue
+            if (
+                isinstance(entry, str)
+                and _normalized_review_item_text(entry) in moved_to_evidence
+            ):
                 continue
             match = next(
                 (i for i, candidate in enumerate(available)

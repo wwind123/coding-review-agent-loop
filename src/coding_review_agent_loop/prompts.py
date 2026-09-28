@@ -1214,6 +1214,21 @@ reason that you explicitly accept before approving.
 """ if require_plan_dispositions else "")
 
 
+PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE = """`exact_head_evidence_requests` is optional and only for evidence that an agent
+session cannot produce but an approved contract requires at the exact reviewed
+head (for example an authenticated live-CLI run that only a human can perform).
+Never list missing human evidence in `blocking_items`, and never list a code
+defect in `exact_head_evidence_requests`: each concern belongs in exactly one
+field. The orchestrator defers these requests until every code finding and
+machine gate is clean, then publishes one evidence freeze at that head. When the
+carried items show a frozen evidence item you requested together with new signed
+human input, dispose it `resolved` only if that input supplies adequate evidence
+for that exact head or withdraws the request; otherwise keep it `blocking` with a
+note. When your only open items are evidence requests you keep, use
+`"state": "blocking"` with empty `blocking_items`; the orchestrator treats that
+as approving the code. Do not re-emit a request you just resolved."""
+
+
 def _agent_unavailable_guidance(signature: str) -> str:
     return f"""If an internal environment, permission, provider, or tooling problem makes it impossible to complete this assigned operation after safe recovery attempts, do not invent a blocking code finding or claim approval. Return this instead of the normal response schema:
 
@@ -3952,6 +3967,7 @@ exactly one top-level JSON object and no prose or code fences before it:
   "blocking_items": ["render-only blocking bullet", "..."],
   "same_pr_followups": ["same-PR fix still required", "..."],
   "future_followups": ["future work after approval", "..."],
+  "exact_head_evidence_requests": [],
   "architecture_impact": {{"status": "unchanged", "rationale": "No architectural contract changed.", "affected_components": [], "dependencies": [], "execution_data_flows": [], "persistence": [], "public_contracts": [], "security_boundaries": [], "canonical_document_action": "no-change", "canonical_document_path": null, "canonical_document_rationale": ""}},
   "prior_item_dispositions": [
     {{"item_id": "item-1", "disposition": "resolved"}},
@@ -3975,6 +3991,8 @@ For scheduler-enabled PR policies, a finding may be an object instead
 of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
 optional `fix_scope` must contain only exact normalized repository-relative
 POSIX paths. Never use globs, directories, absolute paths, or traversal.
+
+{PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}
 
 After the JSON object, include only:
 1. optional `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`
@@ -4673,6 +4691,7 @@ exactly one top-level JSON object and no prose or code fences before it:
   "blocking_items": ["render-only blocking bullet", "..."],
   "same_pr_followups": ["same-PR fix still required", "..."],
   "future_followups": ["future work after approval", "..."],
+  "exact_head_evidence_requests": [],
   "architecture_impact": {{"status": "unchanged", "rationale": "No architectural contract changed.", "affected_components": [], "dependencies": [], "execution_data_flows": [], "persistence": [], "public_contracts": [], "security_boundaries": [], "canonical_document_action": "no-change", "canonical_document_path": null, "canonical_document_rationale": ""}},
   "prior_item_dispositions": [
     {{"item_id": "item-1", "disposition": "resolved"}},
@@ -4696,6 +4715,8 @@ For scheduler-enabled PR policies, a finding may be an object instead
 of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
 optional `fix_scope` must contain only exact normalized repository-relative
 POSIX paths. Never use globs, directories, absolute paths, or traversal.
+
+{PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}
 
 After the JSON object, include only:
 1. optional `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`

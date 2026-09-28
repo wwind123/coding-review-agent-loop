@@ -765,6 +765,7 @@ The active planning human-requirements context above is authoritative. Do not us
 - If the same PR-review concern or paraphrase appears in blocking_items and same_pr_followups, keep blocking_items and drop the duplicate same_pr_followups entry.
 - If the same PR-review concern or paraphrase appears in same_pr_followups and future_followups, keep same_pr_followups/current-PR work and drop the duplicate future_followups entry.
 - If the same PR-review concern or paraphrase appears in blocking_items and future_followups, keep blocking_items and drop the duplicate future_followups entry.
+- If the same text appears in exact_head_evidence_requests and in blocking_items, same_pr_followups, or future_followups, keep it only in exact_head_evidence_requests (human-only exact-head evidence), drop the duplicate finding entry, and keep the original `state`. Never drop or reword an exact_head_evidence_requests entry.
 
 ## STATE RULES (Format C):
 ### APPROVED: remaining_items=[]

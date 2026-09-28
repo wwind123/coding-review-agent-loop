@@ -6099,3 +6099,113 @@ def test_citation_key_and_claim_previews_neutralize_reserved_tokens_only_1016():
         protocol_1016.CITATION_CLAIM_RULE,
     )
     assert observed_claim == "see Review·7 and planreview-2"
+
+
+# --- Human-only exact-head evidence requests (#1068) -------------------------
+
+_EVIDENCE_REQUEST = "Attach the authenticated live-CLI suite output for this exact head"
+
+
+def _evidence_review(**overrides) -> str:
+    payload = {
+        "schema_version": 1,
+        "kind": "pr_review",
+        "state": "approved",
+        "summary": "The code is complete; live evidence is still required.",
+        "blocking_items": [],
+        "same_pr_followups": [],
+        "future_followups": [],
+        "prior_item_dispositions": [],
+        "exact_head_evidence_requests": [_EVIDENCE_REQUEST],
+    }
+    payload.update(overrides)
+    state = payload["state"]
+    return json.dumps(payload) + f"\n<!-- AGENT_STATE: {state} -->\n-- OpenAI Codex"
+
+
+def test_structured_pr_review_returns_evidence_requests_separately():
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    parsed = parse_structured_pr_review(_evidence_review(), reviewer="OpenAI Codex")
+    assert parsed is not None
+    assert parsed.state == "approved"
+    assert parsed.exact_head_evidence_requests == (_EVIDENCE_REQUEST,)
+    assert parsed.blocking_items == ()
+    assert parsed.followups.same_pr == ()
+
+
+def test_structured_pr_review_without_evidence_field_parses_unchanged():
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    legacy = json.loads(_evidence_review().split("\n", 1)[0])
+    del legacy["exact_head_evidence_requests"]
+    text = json.dumps(legacy) + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+    parsed = parse_structured_pr_review(text, reviewer="OpenAI Codex")
+    assert parsed is not None
+    assert parsed.exact_head_evidence_requests == ()
+    assert parsed.state == "approved"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not a list", [""], ["   "], [7], [{"text": _EVIDENCE_REQUEST}]],
+)
+def test_structured_pr_review_rejects_malformed_evidence_requests(value):
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    with pytest.raises(AgentLoopError, match="exact_head_evidence_requests"):
+        parse_structured_pr_review(
+            _evidence_review(exact_head_evidence_requests=value), reviewer="OpenAI Codex"
+        )
+
+
+@pytest.mark.parametrize("field", ["blocking_items", "same_pr_followups", "future_followups"])
+def test_evidence_request_listed_as_a_finding_is_invalid_and_repairable(field):
+    from coding_review_agent_loop.repair_preservation import validate_repair_preservation
+    from coding_review_agent_loop.unresolved_items import _validate_review_response
+
+    state = "approved" if field == "future_followups" else "blocking"
+    source = _evidence_review(state=state, **{field: [_EVIDENCE_REQUEST.lower() + "."]})
+    with pytest.raises(AgentLoopError, match=f"also listed in `{field}`"):
+        _validate_review_response(
+            source, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
+        )
+
+    # The bounded format repair keeps the typed request and drops the
+    # coder-routed duplicate; the repaired response validates.
+    repaired = _evidence_review(state=state)
+    validate_repair_preservation(source, repaired, allowed_prior_item_ids=())
+    parsed = _validate_review_response(
+        repaired, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
+    )
+    assert parsed.exact_head_evidence_requests == (_EVIDENCE_REQUEST,)
+    assert parsed.blocking_items == ()
+
+    # A repair that drops the typed request in favour of the finding is refused.
+    dropped = _evidence_review(
+        state=state, exact_head_evidence_requests=[], **{field: [_EVIDENCE_REQUEST]}
+    )
+    with pytest.raises(AgentLoopError, match="exact_head_evidence_requests"):
+        validate_repair_preservation(source, dropped, allowed_prior_item_ids=())
+
+
+def test_evidence_obligation_lifecycle_is_validated():
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+
+    base = dict(
+        item_id="item-1", reviewer="Codex", source_round=1, text="x",
+        status="blocking", authority="machine", obligation_kind="human-exact-head-evidence",
+        obligation_identity="human-exact-head-evidence:abc",
+    )
+    UnresolvedReviewItem(**base, lifecycle="evidence_deferred")
+    UnresolvedReviewItem(**base, lifecycle="evidence_frozen", candidate_head_sha="abc123")
+    with pytest.raises(ValueError, match="frozen head"):
+        UnresolvedReviewItem(**base, lifecycle="evidence_frozen")
+    with pytest.raises(ValueError, match="evidence lifecycle"):
+        UnresolvedReviewItem(**base, lifecycle="repair_required")
+    with pytest.raises(ValueError, match="only for evidence"):
+        UnresolvedReviewItem(
+            item_id="item-2", reviewer="GitHub PR checks", source_round=1, text="x",
+            status="blocking", authority="machine", obligation_kind="github-pr-checks",
+            lifecycle="evidence_deferred", failed_head_sha="abc123",
+        )

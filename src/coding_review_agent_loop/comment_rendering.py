@@ -32,6 +32,7 @@ from .protocol import (
     DeferredStage,
     TypedPlanStages,
     HumanRequirementDisposition,
+    EVIDENCE_OBLIGATION_KIND,
     MACHINE_AUTHORITY,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
@@ -320,6 +321,14 @@ def _format_unresolved_item_label(
         return f"Human-requirements acknowledgement item, round {item.source_round}: {summary}"
     if item.item_id == MERGE_CONFLICT_ITEM_ID:
         return f"Merge conflict item, round {item.source_round}: {summary}"
+    if item.obligation_kind == EVIDENCE_OBLIGATION_KIND and item.lifecycle != "evidence_frozen":
+        # A deferred request must not reach a human before the freeze asks
+        # for it at a clean head (#1068).
+        return (
+            f"Human-only exact-head evidence request from {item.reviewer}, round "
+            f"{item.source_round}: deferred; the request text is published only by "
+            "the evidence freeze notice at a clean head"
+        )
     if item.authority == MACHINE_AUTHORITY or item.obligation_kind is not None:
         return (
             f"Machine obligation ({item.obligation_kind or 'unknown'}), "
@@ -1369,6 +1378,9 @@ def _render_public_pr_review_comment(
                 ]
             )
         )
+    # Human-only exact-head evidence requests (#1068) are deliberately not
+    # rendered here: they persist in round metadata only, and the request text
+    # is first shown to a human by the single freeze notice at a clean head.
     if prior_items:
         sections.append(
             _render_prior_dispositions_section(

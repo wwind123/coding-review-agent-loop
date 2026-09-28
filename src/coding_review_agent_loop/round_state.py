@@ -52,6 +52,7 @@ from .protocol import (
     ParsedDiscussReview,
     ReviewItemDisposition,
     UnresolvedReviewItem,
+    EVIDENCE_OBLIGATION_KIND,
     MACHINE_AUTHORITY,
     MACHINE_OBLIGATION_FIELDS,
     MACHINE_LIFECYCLE_STATES,
@@ -79,7 +80,12 @@ from .protocol import (
 )
 from .plan_assembly import decode_assembled_plan_sidecar, rendered_plan_identity
 from .review_scheduling import FORCE_FULL_SOURCES, ReviewSchedulingContract, SCHEDULER_PHASES
-from .unresolved_items import _apply_unresolved_item_dispositions, _is_machine_obligation
+from .unresolved_items import (
+    _apply_unresolved_item_dispositions,
+    _is_machine_obligation,
+    _upsert_evidence_obligation,
+    release_evidence_freeze,
+)
 
 
 @dataclass(frozen=True)
@@ -260,6 +266,16 @@ class PostedRoundMetadata:
     # on PR coder follow-up records and omitted from the encoding when None,
     # so historical records decode unchanged and re-encode byte-identically.
     followup_dispatch_head: str | None = None
+    # Human-only exact-head evidence (#1068).  ``evidence_requests`` is the
+    # reviewer's parsed request list, written on the reviewer record itself so
+    # a deferred request is durable from the moment that record is posted.
+    # The freeze/release payloads and head-scoped clearances ride only on the
+    # orchestrator's single freeze or release comment.  All are omitted from
+    # the encoding when empty so historical records stay byte-stable.
+    evidence_requests: tuple[str, ...] = ()
+    evidence_freeze: "EvidenceFreezeRecord | None" = None
+    evidence_release: "EvidenceReleaseRecord | None" = None
+    evidence_clearances: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -703,6 +719,12 @@ class ResumedReviewRound:
     # numbers. A settled reconciliation record carries the authoritative
     # items; preserve them on resume instead of minting duplicate IDs.
     current_round_new_items: tuple[UnresolvedReviewItem, ...] = ()
+    # The latest evidence freeze or release record that anchors this resume
+    # (#1068), and the frozen head when an external push broke a freeze.
+    evidence_boundary: PostedRoundMetadata | None = None
+    broken_evidence_freeze_head: str | None = None
+    # Head-scoped evidence clearances carried by the latest terminal record.
+    evidence_clearances: tuple[tuple[str, str], ...] = ()
 
 
 PLAN_VALIDATION_DIAGNOSTIC_SUFFIX = "[diagnostic truncated]"
@@ -1159,6 +1181,172 @@ def recover_plan_validation_diagnostic(
     return highest[0]
 
 
+EVIDENCE_FREEZE_PHASE = "evidence-freeze"
+EVIDENCE_RESPONSE_PHASE = "evidence-response"
+EVIDENCE_RELEASE_PHASE = "evidence-release"
+EVIDENCE_TERMINAL_PHASES = frozenset({EVIDENCE_FREEZE_PHASE, EVIDENCE_RELEASE_PHASE})
+EVIDENCE_RELEASE_REASONS = frozenset(
+    {"evidence-cleared", "findings", "machine-gate", "refresh-clean"}
+)
+
+
+def _decode_evidence_budget(value: Mapping[str, object]) -> tuple[int | None, bool | None, bool | None, bool]:
+    """Decode the round-budget triple; a missing or mistyped field is invalid."""
+    allowed = value.get("allowed_rounds")
+    failure = value.get("watch_failure_extension_used")
+    head = value.get("watch_head_extension_used")
+    valid = (
+        isinstance(allowed, int)
+        and not isinstance(allowed, bool)
+        and allowed >= 1
+        and isinstance(failure, bool)
+        and isinstance(head, bool)
+    )
+    if not valid:
+        return None, None, None, False
+    return allowed, failure, head, True
+
+
+def _decode_string_list(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        return None
+    return tuple(value)
+
+
+@dataclass(frozen=True)
+class EvidenceFreezeRecord:
+    """Durable payload of the single freeze comment (#1068).
+
+    ``valid`` covers the non-budget fields; a record whose only defect is its
+    budget keeps the freeze in effect with ``budget_valid=False`` so recovery
+    can fall back to the conservative defaults and re-persist a corrected
+    still-frozen record instead of treating the frozen ledger as absent.
+    """
+
+    frozen_head: str
+    evidence_identities: tuple[str, ...]
+    signed_requirement_ids_at_freeze: tuple[str, ...]
+    allowed_rounds: int | None
+    watch_failure_extension_used: bool | None
+    watch_head_extension_used: bool | None
+    valid: bool = True
+    budget_valid: bool = True
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "frozen_head": self.frozen_head,
+            "evidence_identities": list(self.evidence_identities),
+            "signed_requirement_ids_at_freeze": list(self.signed_requirement_ids_at_freeze),
+            "allowed_rounds": self.allowed_rounds,
+            "watch_failure_extension_used": self.watch_failure_extension_used,
+            "watch_head_extension_used": self.watch_head_extension_used,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "EvidenceFreezeRecord":
+        if not isinstance(value, Mapping):
+            return cls.invalid()
+        head = value.get("frozen_head")
+        identities = _decode_string_list(value.get("evidence_identities"))
+        signed = _decode_string_list(value.get("signed_requirement_ids_at_freeze"))
+        if not isinstance(head, str) or not head or not identities or signed is None:
+            return cls.invalid()
+        allowed, failure, head_ext, budget_valid = _decode_evidence_budget(value)
+        return cls(
+            frozen_head=head,
+            evidence_identities=identities,
+            signed_requirement_ids_at_freeze=signed,
+            allowed_rounds=allowed,
+            watch_failure_extension_used=failure,
+            watch_head_extension_used=head_ext,
+            valid=True,
+            budget_valid=budget_valid,
+        )
+
+    @classmethod
+    def invalid(cls) -> "EvidenceFreezeRecord":
+        return cls(
+            frozen_head="",
+            evidence_identities=(),
+            signed_requirement_ids_at_freeze=(),
+            allowed_rounds=None,
+            watch_failure_extension_used=None,
+            watch_head_extension_used=None,
+            valid=False,
+            budget_valid=False,
+        )
+
+
+@dataclass(frozen=True)
+class EvidenceReleaseRecord:
+    """Durable payload of a terminal release comment (#1068).
+
+    ``signed_requirement_ids_surfaced`` is the signed-requirement ID set the
+    reviewers of the releasing pass saw.  ``None`` means the baseline is
+    missing or invalid; revalidation then treats it as empty, which forces a
+    same-head refresh pass whenever any signed input exists.
+    """
+
+    released_head: str
+    reason: str
+    signed_requirement_ids_surfaced: tuple[str, ...] | None
+    allowed_rounds: int | None
+    watch_failure_extension_used: bool | None
+    watch_head_extension_used: bool | None
+    valid: bool = True
+    budget_valid: bool = True
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "released_head": self.released_head,
+            "reason": self.reason,
+            "signed_requirement_ids_surfaced": (
+                list(self.signed_requirement_ids_surfaced)
+                if self.signed_requirement_ids_surfaced is not None
+                else None
+            ),
+            "allowed_rounds": self.allowed_rounds,
+            "watch_failure_extension_used": self.watch_failure_extension_used,
+            "watch_head_extension_used": self.watch_head_extension_used,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "EvidenceReleaseRecord":
+        if not isinstance(value, Mapping):
+            return cls.invalid()
+        head = value.get("released_head")
+        reason = value.get("reason")
+        if not isinstance(head, str) or not head or reason not in EVIDENCE_RELEASE_REASONS:
+            return cls.invalid()
+        allowed, failure, head_ext, budget_valid = _decode_evidence_budget(value)
+        signed = _decode_string_list(value.get("signed_requirement_ids_surfaced"))
+        return cls(
+            released_head=head,
+            reason=str(reason),
+            signed_requirement_ids_surfaced=signed,
+            allowed_rounds=allowed,
+            watch_failure_extension_used=failure,
+            watch_head_extension_used=head_ext,
+            valid=True,
+            budget_valid=budget_valid,
+        )
+
+    @classmethod
+    def invalid(cls) -> "EvidenceReleaseRecord":
+        return cls(
+            released_head="",
+            reason="machine-gate",
+            signed_requirement_ids_surfaced=None,
+            allowed_rounds=None,
+            watch_failure_extension_used=None,
+            watch_head_extension_used=None,
+            valid=False,
+            budget_valid=False,
+        )
+
+
 @dataclass(frozen=True)
 class QualificationCheckpoint:
     """Bounded durable state for a machine-obligation qualification attempt."""
@@ -1183,9 +1371,9 @@ class QualificationCheckpoint:
     def __post_init__(self) -> None:
         if not self.valid:
             return
-        if self.obligation_kind not in MACHINE_OBLIGATION_KINDS - {"unknown"}:
+        if self.obligation_kind not in MACHINE_OBLIGATION_KINDS - {"unknown", EVIDENCE_OBLIGATION_KIND}:
             raise ValueError("qualification checkpoints require a known machine kind")
-        if self.lifecycle not in MACHINE_LIFECYCLE_STATES - {"cleared"}:
+        if self.lifecycle not in MACHINE_LIFECYCLE_STATES - {"cleared", "evidence_deferred", "evidence_frozen"}:
             raise ValueError("qualification checkpoints require an active lifecycle")
         if self.lifecycle == "repair_required" and self.obligation_kind in {
             "managed-exact-head-ci", "github-pr-checks"
@@ -1240,9 +1428,9 @@ class QualificationCheckpoint:
         )
         if any(value[key] is not None and not isinstance(value[key], str) for key in strings):
             return cls.invalid("checkpoint contains a non-string identity")
-        if value["obligation_kind"] not in MACHINE_OBLIGATION_KINDS - {"unknown"}:
+        if value["obligation_kind"] not in MACHINE_OBLIGATION_KINDS - {"unknown", EVIDENCE_OBLIGATION_KIND}:
             return cls.invalid("checkpoint has an unknown obligation kind")
-        if value["lifecycle"] not in MACHINE_LIFECYCLE_STATES - {"cleared"}:
+        if value["lifecycle"] not in MACHINE_LIFECYCLE_STATES - {"cleared", "evidence_deferred", "evidence_frozen"}:
             return cls.invalid("checkpoint has an unknown lifecycle")
         if value["lifecycle"] in {"qualification_ready", "qualifying"}:
             required_identities = (
@@ -2051,6 +2239,14 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             if isinstance(metadata.qualification_checkpoint, QualificationCheckpoint)
             else metadata.qualification_checkpoint
         )
+    if metadata.evidence_requests:
+        payload["evidence_requests"] = list(metadata.evidence_requests)
+    if metadata.evidence_freeze is not None:
+        payload["evidence_freeze"] = metadata.evidence_freeze.as_dict()
+    if metadata.evidence_release is not None:
+        payload["evidence_release"] = metadata.evidence_release.as_dict()
+    if metadata.evidence_clearances:
+        payload["evidence_clearances"] = [list(pair) for pair in metadata.evidence_clearances]
     return encode_mapping(payload)
 
 
@@ -2085,6 +2281,37 @@ def _decode_followup_dispatch_head(payload: Mapping[str, object]) -> str | None:
     if not _is_followup_dispatch_head(value):
         raise ValueError("followup_dispatch_head must be a hex Git commit SHA")
     return str(value)
+
+
+def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
+    """Decode the optional #1068 evidence fields; absent is legacy.
+
+    A present request list or clearance list that is malformed rejects the
+    record rather than decoding as absence, so a persisted request can never be
+    silently dropped.  Freeze/release payloads never raise: a malformed payload
+    decodes as an invalid record that recovery turns into a blocker.
+    """
+    fields: dict[str, object] = {}
+    if "evidence_requests" in payload:
+        requests = _decode_string_list(payload["evidence_requests"])
+        if requests is None:
+            raise ValueError("evidence_requests must be a list of non-empty strings")
+        fields["evidence_requests"] = requests
+    if "evidence_freeze" in payload:
+        fields["evidence_freeze"] = EvidenceFreezeRecord.from_mapping(payload["evidence_freeze"])
+    if "evidence_release" in payload:
+        fields["evidence_release"] = EvidenceReleaseRecord.from_mapping(payload["evidence_release"])
+    if "evidence_clearances" in payload:
+        raw = payload["evidence_clearances"]
+        if not isinstance(raw, list) or any(
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(value, str) and value for value in pair)
+            for pair in raw
+        ):
+            raise ValueError("evidence_clearances must be a list of [identity, head] pairs")
+        fields["evidence_clearances"] = tuple((pair[0], pair[1]) for pair in raw)
+    return fields
 
 
 def _decode_plan_supersession_field(payload: Mapping[str, object], key: str) -> str | None:
@@ -2362,6 +2589,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 payload, "reviewer_board_amendment_digest"
             ),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
+            **_decode_evidence_fields(payload),
             **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),
         )
@@ -2959,6 +3187,44 @@ def _append_active_pr_new_items(
             seen_item_ids.add(item.item_id)
 
 
+def _append_recorded_evidence_requests(
+    active_items: list[UnresolvedReviewItem],
+    reviewer_records: Sequence[PostedRoundRecord],
+    *,
+    records: Sequence[PostedRoundRecord],
+) -> None:
+    """Re-derive deferred evidence from the reviewer records that requested it.
+
+    Applied after dispositions and new items, in the same order as the live
+    loop, so a deferred request is durable from the moment its reviewer record
+    was posted (#1068).
+    """
+    next_number = max(
+        _max_unresolved_item_number_from_records(records),
+        max(
+            (
+                int(match.group(1))
+                for item in active_items
+                if (match := re.fullmatch(r"item-(\d+)", item.item_id))
+            ),
+            default=0,
+        ),
+    ) + 1
+    for record in reviewer_records:
+        for request in record.metadata.evidence_requests:
+            updated, consumed = _upsert_evidence_obligation(
+                active_items,
+                item_number=next_number,
+                reviewer=record.metadata.agent,
+                text=request,
+                source_round=record.metadata.round_number,
+                current_head_sha=record.metadata.subject,
+            )
+            active_items[:] = updated
+            if consumed:
+                next_number += 1
+
+
 def _aggregate_record_dispositions(
     records: Sequence[PostedRoundRecord],
 ) -> dict[str, list[ReviewItemDisposition]]:
@@ -3063,16 +3329,149 @@ def _live_round_resolved_item_ids(
     return frozenset(resolved)
 
 
+def _drop_unterminated_evidence_response_records(
+    records: Sequence[PostedRoundRecord],
+) -> tuple[PostedRoundRecord, ...]:
+    """Ignore an interrupted evidence-response pass (#1068).
+
+    Every evidence-response or refresh pass ends with exactly one terminal
+    freeze or release record at the same round and head.  Reviewer records of
+    a pass with no following terminal record are a partial transcript: they
+    must neither anchor recovery nor clear evidence, so the rerun restores the
+    prior state and repeats the whole pass.
+    """
+    terminal: list[tuple[int, str, int]] = [
+        (record.index, record.metadata.subject, record.metadata.round_number)
+        for record in records
+        if record.metadata.phase in EVIDENCE_TERMINAL_PHASES
+    ]
+    kept: list[PostedRoundRecord] = []
+    for record in records:
+        metadata = record.metadata
+        if metadata.phase == EVIDENCE_RESPONSE_PHASE and not any(
+            index > record.index
+            and subject == metadata.subject
+            and round_number == metadata.round_number
+            for index, subject, round_number in terminal
+        ):
+            continue
+        kept.append(record)
+    return tuple(kept)
+
+
+def _invalid_evidence_record_item(
+    items: Sequence[UnresolvedReviewItem],
+    *,
+    records: Sequence[PostedRoundRecord],
+    round_number: int,
+    reason: str,
+) -> UnresolvedReviewItem:
+    """The non-bypassable blocker for a malformed evidence record."""
+    return UnresolvedReviewItem(
+        item_id=f"item-{_max_unresolved_item_number_from_records(records) + 1}",
+        reviewer="Orchestrator",
+        source_round=round_number,
+        text=(
+            f"The persisted exact-head evidence record is malformed or contradictory ({reason}). "
+            "No approval, qualification, or merge is permitted until an operator repairs it."
+        ),
+        status="blocking",
+        source_status="blocking",
+        authority=UNKNOWN_MACHINE_AUTHORITY,
+        obligation_kind="unknown",
+        lifecycle="repair_required",
+        obligation_identity="invalid-evidence-record",
+    )
+
+
+def _evidence_boundary_ledger(
+    record: PostedRoundRecord,
+    *,
+    records: Sequence[PostedRoundRecord],
+) -> tuple[UnresolvedReviewItem, ...]:
+    """Return a terminal record's ledger, failing closed on contradictions."""
+    metadata = record.metadata
+    ledger = tuple(metadata.prior_items)
+    reason: str | None = None
+    if metadata.phase == EVIDENCE_FREEZE_PHASE:
+        freeze = metadata.evidence_freeze
+        if freeze is None or not freeze.valid:
+            reason = "the freeze payload is missing or malformed"
+        else:
+            frozen = {
+                item.obligation_identity
+                for item in ledger
+                if item.is_machine_obligation
+                and item.obligation_kind == EVIDENCE_OBLIGATION_KIND
+                and item.lifecycle == "evidence_frozen"
+                and item.candidate_head_sha == freeze.frozen_head
+            }
+            if freeze.frozen_head != metadata.subject:
+                reason = "the frozen head does not match the record head"
+            elif frozen != set(freeze.evidence_identities):
+                reason = "the frozen identities do not match the frozen ledger"
+    else:
+        release = metadata.evidence_release
+        if release is None or not release.valid:
+            reason = "the release payload is missing or malformed"
+        elif release.released_head != metadata.subject:
+            reason = "the released head does not match the record head"
+        elif any(
+            item.is_machine_obligation
+            and item.obligation_kind == EVIDENCE_OBLIGATION_KIND
+            and item.lifecycle == "evidence_frozen"
+            for item in ledger
+        ):
+            reason = "a released ledger still holds frozen evidence"
+    if reason is None:
+        return ledger
+    return (
+        *ledger,
+        _invalid_evidence_record_item(
+            ledger, records=records, round_number=metadata.round_number, reason=reason
+        ),
+    )
+
+
 def _recover_unrecorded_pr_head_advance(
     records: Sequence[PostedRoundRecord],
     *,
     head_sha: str,
     reconciliation_mode: str = "aggregate",
 ) -> ResumedReviewRound | None:
+    records = _drop_unterminated_evidence_response_records(records)
     prior_records = [record for record in records if record.metadata.subject != head_sha]
     if not prior_records:
         return None
     latest_prior_subject = prior_records[-1].metadata.subject
+    latest_prior_record = prior_records[-1]
+    if latest_prior_record.metadata.phase in EVIDENCE_TERMINAL_PHASES:
+        # A freeze or release was the last handoff before someone pushed a
+        # new head.  The old head's evidence does not carry forward: frozen
+        # evidence returns to deferred and the new head needs full review.
+        boundary = latest_prior_record.metadata
+        ledger = _evidence_boundary_ledger(latest_prior_record, records=records)
+        broken_head = (
+            boundary.evidence_freeze.frozen_head
+            if boundary.phase == EVIDENCE_FREEZE_PHASE
+            and boundary.evidence_freeze is not None
+            and boundary.evidence_freeze.valid
+            else (boundary.subject if boundary.phase == EVIDENCE_FREEZE_PHASE else None)
+        )
+        recovered = _active_pr_items(release_evidence_freeze(ledger))
+        if not recovered:
+            return None
+        return ResumedReviewRound(
+            round_number=boundary.round_number,
+            prior_items=tuple(recovered),
+            coder_output=None,
+            completed_reviews=(),
+            next_unresolved_item_number=_max_unresolved_item_number_from_records(records) + 1,
+            ledger_may_be_incomplete=False,
+            unrecorded_head_advance=True,
+            evidence_boundary=boundary,
+            broken_evidence_freeze_head=broken_head,
+        )
     selection = _select_current_round_records(records, subject=latest_prior_subject)
     if selection is None:
         return None
@@ -3123,6 +3522,9 @@ def _recover_unrecorded_pr_head_advance(
         )
         recovered_items = _active_pr_items(recovered_items)
         _append_active_pr_new_items(recovered_items, new_item_records_after_coder)
+        _append_recorded_evidence_requests(
+            recovered_items, reviewer_records_after_coder, records=records
+        )
         coder_output = latest_coder_record.metadata.raw_structured_coder_response or latest_coder_record.body
         compact_prior_summaries = latest_coder_record.metadata.compact_prior_summaries
     elif all_reviewer_records:
@@ -3135,6 +3537,9 @@ def _recover_unrecorded_pr_head_advance(
         )
         recovered_items = _active_pr_items(recovered_items)
         _append_active_pr_new_items(recovered_items, all_new_item_records)
+        _append_recorded_evidence_requests(
+            recovered_items, all_reviewer_records, records=records
+        )
         coder_output = None
         compact_prior_summaries = ()
     else:
@@ -3165,6 +3570,10 @@ def _recover_unrecorded_pr_head_advance(
 def _latest_prior_pr_subject_is_coherent(records: Sequence[PostedRoundRecord], *, head_sha: str) -> bool:
     prior_records = [record for record in records if record.metadata.subject != head_sha]
     if not prior_records:
+        return True
+    if prior_records[-1].metadata.phase in EVIDENCE_TERMINAL_PHASES:
+        # A terminal evidence record is a complete handoff even when its
+        # released ledger holds no active item.
         return True
     latest_prior_subject = prior_records[-1].metadata.subject
     selection = _select_current_round_records(records, subject=latest_prior_subject)
@@ -3684,9 +4093,29 @@ def _resume_pr_round(
 ) -> ResumedReviewRound | None:
     if not head_sha:
         return None
-    records = _extract_round_metadata_records(comments, flow="pr")
+    records = _drop_unterminated_evidence_response_records(
+        _extract_round_metadata_records(comments, flow="pr")
+    )
     if not records:
         return None
+    current_head_records = [record for record in records if record.metadata.subject == head_sha]
+    if current_head_records and current_head_records[-1].metadata.phase in EVIDENCE_TERMINAL_PHASES:
+        # The latest current-head record is the single freeze or release
+        # comment of #1068: it is the handoff boundary, carrying the ledger,
+        # round number, budget and signed-input baseline.
+        boundary_record = current_head_records[-1]
+        boundary = boundary_record.metadata
+        return ResumedReviewRound(
+            round_number=boundary.round_number,
+            prior_items=_evidence_boundary_ledger(boundary_record, records=records),
+            coder_output=None,
+            completed_reviews=(),
+            next_unresolved_item_number=_max_unresolved_item_number_from_records(records) + 1,
+            reconciled=True,
+            qualification_checkpoint=None,
+            evidence_boundary=boundary,
+            evidence_clearances=boundary.evidence_clearances,
+        )
     selection = _select_current_round_records(records, subject=head_sha)
     if selection is None:
         recovered = _recover_unrecorded_pr_head_advance(

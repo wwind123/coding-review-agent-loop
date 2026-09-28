@@ -5030,3 +5030,17 @@ def test_reviewer_prompt_has_no_parallel_worker_guidance(tmp_path):
     prompt = build_review_prompt(77, 1, config, reviewer="codex")
     assert "Parallel test workers" not in prompt
     assert "AGENT_LOOP_TEST_WORKERS" not in prompt
+
+
+def test_review_prompt_explains_human_only_exact_head_evidence_requests(tmp_path):
+    # #1068: the typed field is only for evidence an agent cannot produce.
+    config = make_config(tmp_path)
+    for prompt in (
+        build_review_prompt(77, 1, config, reviewer="codex"),
+        build_review_prompt(77, 1, config, reviewer="codex", compact_context=True),
+    ):
+        normalized = " ".join(prompt.split())
+        assert '"exact_head_evidence_requests": []' in prompt
+        assert "only for evidence that an agent session cannot produce" in normalized
+        assert "Never list missing human evidence in `blocking_items`" in normalized
+        assert "Do not re-emit a request you just resolved" in normalized

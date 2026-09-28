@@ -561,6 +561,27 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "rather than a claim."
         ),
     ),
+    "_expect_evidence_request_list": ShapeCheckClassification(
+        "fatal",
+        frozenset({"no-conservative-reading"}),
+        (
+            "A dropped human-only exact-head evidence request would silently remove a "
+            "final merge barrier (#1068). Fatal sites: no-conservative-reading: removing "
+            "the element would weaken an obligation, finding, disposition, approved "
+            "topology or discussion answer rather than a claim."
+        ),
+    ),
+    "_reject_evidence_request_overlap": ShapeCheckClassification(
+        "fatal",
+        frozenset({"no-conservative-reading"}),
+        (
+            "Keeping either copy of a request listed both as evidence and as a finding "
+            "would drop a barrier or hide a defect, so the response is rejected for "
+            "bounded format repair (#1068). Fatal sites: no-conservative-reading: removing "
+            "the element would weaken an obligation, finding, disposition, approved "
+            "topology or discussion answer rather than a claim."
+        ),
+    ),
     "_expect_review_finding_list": ShapeCheckClassification(
         "fatal",
         frozenset({"no-conservative-reading"}),

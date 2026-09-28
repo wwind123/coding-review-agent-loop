@@ -568,6 +568,72 @@ correction awaiting qualification, migration or mergeability validation, an
 unknown persisted obligation, or external infrastructure recovery. The loop
 does not describe a unanimous reviewer board as blocking when only CI remains.
 
+### Exact-head human evidence freeze
+
+Some approved-plan contracts require evidence that no agent session can
+produce, such as an authenticated live-CLI run at the exact PR head. Reviewers
+report it in the optional `exact_head_evidence_requests` list of the structured
+`pr_review` response, separately from `blocking_items`. A request is never a
+code finding and is never sent to the coder. Listing the same text as both a
+request and a finding is invalid and goes through the bounded format repair,
+which must keep the typed request.
+
+Each request becomes a `human-exact-head-evidence` obligation owned by the
+reviewer that asked for it. Its identity comes from the normalized request text
+and that reviewer, so repeating the request updates one obligation. The request
+is persisted on the reviewer's own round record, so it survives a restart even
+when the run stops cleanly for pending checks.
+
+The obligation is a final barrier:
+
+1. **Deferred.** While any reviewer finding, same-PR follow-up, CI, migration,
+   merge-conflict, or acknowledgement obligation remains, the evidence stays
+   deferred. Coder rounds proceed normally, heads change, and no evidence is
+   requested. Clean-stop messages for pending checks name the deferred
+   evidence as the remaining barrier.
+2. **Frozen.** At the point the loop would otherwise finalize (after the check
+   snapshot and wait, migration validation, mergeability, and managed
+   exact-head qualification), the loop re-reads the live head and the signed
+   human requirements. It then posts one freeze comment that names the head and
+   each request, and stops at the human decision boundary with exit code 4. The
+   comment's round metadata is the only persistence of the freeze. If the post
+   fails, no freeze exists and a rerun tries again.
+3. **Answered.** While frozen, the loop never pushes. A rerun first takes one
+   check snapshot and one mergeability reading at the frozen head. A failing
+   check or merge conflict releases the freeze with one release comment, and
+   the repair runs as the next round. With no new signed input the rerun exits
+   with the same diagnostic, invokes no agent, and posts nothing. New signed
+   input is detected by signed-requirement identity, not by timestamps. An
+   edited signed comment counts as new input and a deleted one does not.
+
+To supply or withdraw evidence, post a PR comment for exactly the frozen head
+whose last line is `-- Human Reviewer`, then rerun `agent-loop pr <number>`.
+The full board re-reviews the same head without advancing the round, so these
+passes never consume the round budget. Only the requesting reviewer can clear
+its request, by disposing it `resolved`. Other reviewers' dispositions are
+notes. If the requester has left the board, every configured reviewer must
+resolve it. The pass then ends with one of three records:
+
+- **Cleared.** An `evidence-cleared` release record is posted. The loop
+  re-checks the live head and signed input once more and proceeds to
+  approval, qualification, or merge at the same head.
+- **Kept.** A still-frozen record is posted and the run exits again.
+- **New findings.** The findings release the freeze. The evidence returns to
+  deferred and the coder repairs the findings.
+
+Signed input posted after reviewers ran but before a freeze or approval
+triggers a same-head refresh pass inside the current round, so no signed
+comment is approved past unseen.
+
+If someone pushes while the PR is frozen, the next run posts a notice that the
+freeze was broken, returns the evidence to deferred, and reviews the new head
+in full. Evidence for the old head never carries forward. Freeze and release
+records carry the round budget (`allowed_rounds` and both watcher extensions)
+under the same bound as qualification checkpoints. A freeze record whose only
+defect is its budget stays in effect with the conservative defaults and is
+re-persisted once. Any other malformed evidence record becomes a non-bypassable
+`unknown` obligation.
+
 Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick a single model via `--antigravity-model`, or an ordered fallback chain via `--antigravity-models`; default chain `Gemini 3.8 Flash (High)` → `Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)`). Enterprise / API-key Gemini CLI paths may remain available for organizations that still have access, so the `gemini` backend is retained for those users. Direct Gemini CLI support is best-effort: maintainers without enterprise Gemini CLI access need reporter-provided `.agent-loop-logs/*gemini.log` output, response-file contents, CLI version, and any sharable account/access context to debug live `gemini` failures. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
 
 Every `agy --print` call passes `--print-timeout` from

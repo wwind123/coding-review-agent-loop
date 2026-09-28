@@ -748,3 +748,25 @@ def test_docs_document_the_plan_growth_gate():
         "a managed-CI\ncycle per child",
     ):
         assert phrase in section, phrase
+
+
+def test_cli_help_and_docs_describe_the_exact_head_evidence_freeze():
+    # #1068: the evidence freeze is answered through the signed-comment path.
+    parser = build_parser()
+    pr_help = "".join(parser._subparsers._group_actions[0].choices["pr"].format_help().split())
+    assert "answersanexact-headevidencefreeze" in pr_help
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    assert "**exact-head evidence freeze**" in readme
+    architecture = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    assert "`human-exact-head-evidence`" in architecture
+    assert "review-and-feedback decision boundary" in architecture
+    guide = " ".join(
+        (ARCHITECTURE.parent / "docs" / "local_agent_loop.md").read_text(encoding="utf-8").split()
+    )
+    for phrase in (
+        "### Exact-head human evidence freeze",
+        "`exact_head_evidence_requests`",
+        "broken",
+        "signed-requirement identity",
+    ):
+        assert phrase in guide, phrase
