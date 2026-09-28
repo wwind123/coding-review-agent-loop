@@ -4242,8 +4242,15 @@ def _evaluate_ready_restoration(
             f"No readiness restoration is needed: the PR is measured {measured.render()}"
             + (f" (changed fields: {', '.join(mismatches)})" if mismatches else "")
             + " and no ready-to-draft conversion by this run was acknowledged.",
-            # A nonzero ready-to-draft exit is ambiguous: always inspect.
-            "resume" if clean and not context.ready_undo_ambiguous else "C",
+            # A nonzero ready-to-draft exit is ambiguous, an integrity reason
+            # vetoes the bare resume, and a base without the unlabeled
+            # recovery route always gets inspection.
+            "resume"
+            if clean
+            and not context.ready_undo_ambiguous
+            and not integrity
+            and not context.recovery_incapable_fallback
+            else "C",
             None,
             False,
         )

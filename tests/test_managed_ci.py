@@ -12493,6 +12493,41 @@ def test_m1067_recovery_incapable_fallback_helper_measures_concurrent_unlabel(tm
     assert _m1067_ready_calls(runner) == []
 
 
+def test_m1067_recovery_incapable_ready_labeled_entry_concurrent_unlabel_keeps_inspection(
+    tmp_path, monkeypatch
+):
+    # Review item-11: a ready entry on a base without the unlabeled recovery
+    # route gets remedy (C) even when the PR measures ready/unlabeled.
+    runner = _m1067_draft_labeled_runner(
+        workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY, events_unreadable=True,
+        rest_pr={"draft": False},
+    )
+    original = managed_ci._read_failed_activation_state
+
+    def unlabel_elsewhere(runner_, config_, pr_number):
+        runner_.rest_pr["labels"] = []  # another actor removes the label
+        return original(runner_, config_, pr_number)
+
+    monkeypatch.setattr(managed_ci, "_read_failed_activation_state", unlabel_elsewhere)
+
+    contract = _m1067_activate(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
+
+    assert contract is not None and contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is None
+    report = contract.state_report
+    assert report is not None
+    _m1067_assert_text(report)
+    assert "Before this run PR #7 was ready/labeled; it is now ready/unlabeled." in report
+    assert "No readiness restoration is needed" in report
+    assert "Do not ready or unlabel the PR." in report
+    assert "Inspect it with `gh api repos/OWNER/REPO/pulls/7" in report
+    assert "--managed-ci" in report
+    assert "Resume with `" not in report
+    assert "gh pr ready 7" not in report
+    assert _m1067_label_deletes(runner) == [] and _m1067_ready_calls(runner) == []
+    assert _m1067_label_posts(runner) == [] and _m1067_undo_calls(runner) == []
+
+
 @pytest.mark.parametrize("concurrent", ["none", "readied", "unlabeled"])
 def test_m1067_recovery_incapable_draft_labeled_resume_reports_measured_state(
     tmp_path, monkeypatch, capsys, concurrent
