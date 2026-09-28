@@ -4107,6 +4107,11 @@ def _build_failed_activation_report(
         facts.append("its label DELETE was not confirmed")
     if facts:
         lines.append("This run's recorded requests: " + "; ".join(facts) + ".")
+    if context.recovery_incapable_fallback and not context.label_release_attempted:
+        lines.append(
+            f"This run made no `{MANAGED_LABEL}` label DELETE because the base workflow does not "
+            "prove an unlabeled pull_request recovery route."
+        )
 
     integrity = context.release_reason_kind in _INTEGRITY_RELEASE_REASONS
     if context.release_reason_kind == "foreign-actor":
@@ -4369,8 +4374,13 @@ def _fallback_state_report(
     pr_number: int,
     context: _FailedActivationContext,
 ) -> str | None:
-    """Log the measured report for a non-raising fallback after a recorded mutation."""
-    if not context.mutated:
+    """Log the measured report for a non-raising fallback.
+
+    A report is produced after a recorded mutation, and also when a release
+    was skipped on a recovery-incapable base: the caller then prints a
+    lifecycle outcome, which must come from a measurement (#1067).
+    """
+    if not context.mutated and not context.recovery_incapable_fallback:
         return None
     report = _report_failed_activation_state(
         runner, config=config, pr_number=pr_number, context=context

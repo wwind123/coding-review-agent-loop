@@ -12491,3 +12491,60 @@ def test_m1067_recovery_incapable_fallback_helper_measures_concurrent_unlabel(tm
     assert "retained" not in text
     assert _m1067_label_deletes(runner) == []
     assert _m1067_ready_calls(runner) == []
+
+
+@pytest.mark.parametrize("readied", [False, True])
+def test_m1067_recovery_incapable_draft_labeled_resume_reports_measured_state(
+    tmp_path, monkeypatch, capsys, readied
+):
+    # Review item-9: a draft/labeled resume on a base without the unlabeled
+    # recovery route makes no DELETE, yet the fallback still carries a
+    # measured report, which run_pr_loop prints instead of an unmeasured line.
+    runner = _m1067_draft_labeled_runner(
+        workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY, events_unreadable=True,
+    )
+    if readied:
+        original = managed_ci._read_failed_activation_state
+
+        def ready_elsewhere(runner_, config_, pr_number):
+            runner_.rest_pr["draft"] = False  # another actor readies the PR
+            return original(runner_, config_, pr_number)
+
+        monkeypatch.setattr(managed_ci, "_read_failed_activation_state", ready_elsewhere)
+
+    contract = _m1067_activate(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
+
+    assert contract is not None and contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is None
+    report = contract.state_report
+    assert report is not None
+    _m1067_assert_text(report)
+    assert f"This run made no `{MANAGED_LABEL}` label DELETE" in report
+    assert "draft/unlabeled re-entry state" not in report
+    assert "Ordinary CI can resume" not in report
+    assert "Do not ready or unlabel the PR." in report
+    assert "gh pr ready 7" not in report
+    if readied:
+        assert "Before this run PR #7 was draft/labeled; it is now ready/labeled." in report
+        assert "this run made no readiness change" in report
+        assert "claims no qualification" in report
+        assert "remains draft" not in report
+    else:
+        assert "Before this run PR #7 was draft/labeled; it is now draft/labeled." in report
+        assert "It remains draft/labeled and managed qualification was abandoned." in report
+    assert _m1067_label_deletes(runner) == [] and _m1067_ready_calls(runner) == []
+    assert _m1067_label_posts(runner) == []
+
+    # The orchestrator prints this measured report, not the unmeasured line.
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
+    loop_runner = FakeRunner()
+    assert orchestrator.run_pr_loop(
+        loop_runner, pr_number=7, config=make_config(tmp_path / "loop", auto_merge=True),
+    ) == 0
+    out = capsys.readouterr().out
+    assert report in out
+    assert "remains draft and unmerged" not in out
+    assert not any(
+        command[:3] == ["gh", "pr", "ready"] or "DELETE" in command
+        for command, _cwd in loop_runner.commands
+    )
