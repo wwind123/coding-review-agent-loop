@@ -4158,6 +4158,7 @@ def _build_failed_activation_report(
             mismatches = _entry_tuple_mismatches(entry, after) if after is not None else []
     elif (
         not integrity
+        and not context.recovery_incapable_fallback
         and measured is not None
         and not mismatches
         and measured.draft is True

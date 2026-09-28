@@ -12493,9 +12493,9 @@ def test_m1067_recovery_incapable_fallback_helper_measures_concurrent_unlabel(tm
     assert _m1067_ready_calls(runner) == []
 
 
-@pytest.mark.parametrize("readied", [False, True])
+@pytest.mark.parametrize("concurrent", ["none", "readied", "unlabeled"])
 def test_m1067_recovery_incapable_draft_labeled_resume_reports_measured_state(
-    tmp_path, monkeypatch, capsys, readied
+    tmp_path, monkeypatch, capsys, concurrent
 ):
     # Review item-9: a draft/labeled resume on a base without the unlabeled
     # recovery route makes no DELETE, yet the fallback still carries a
@@ -12503,14 +12503,17 @@ def test_m1067_recovery_incapable_draft_labeled_resume_reports_measured_state(
     runner = _m1067_draft_labeled_runner(
         workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY, events_unreadable=True,
     )
-    if readied:
+    if concurrent != "none":
         original = managed_ci._read_failed_activation_state
 
-        def ready_elsewhere(runner_, config_, pr_number):
-            runner_.rest_pr["draft"] = False  # another actor readies the PR
+        def change_elsewhere(runner_, config_, pr_number):
+            if concurrent == "readied":
+                runner_.rest_pr["draft"] = False  # another actor readies the PR
+            else:
+                runner_.rest_pr["labels"] = []  # another actor removes the label
             return original(runner_, config_, pr_number)
 
-        monkeypatch.setattr(managed_ci, "_read_failed_activation_state", ready_elsewhere)
+        monkeypatch.setattr(managed_ci, "_read_failed_activation_state", change_elsewhere)
 
     contract = _m1067_activate(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
 
@@ -12520,11 +12523,18 @@ def test_m1067_recovery_incapable_draft_labeled_resume_reports_measured_state(
     assert report is not None
     _m1067_assert_text(report)
     assert f"This run made no `{MANAGED_LABEL}` label DELETE" in report
-    assert "draft/unlabeled re-entry state" not in report
+    if concurrent != "unlabeled":
+        assert "draft/unlabeled re-entry state" not in report
     assert "Ordinary CI can resume" not in report
     assert "Do not ready or unlabel the PR." in report
     assert "gh pr ready 7" not in report
-    if readied:
+    # Review item-10: remedy (C) holds whatever the measured label state.
+    assert "Inspect it with `gh api repos/OWNER/REPO/pulls/7" in report
+    assert "--managed-ci" in report
+    if concurrent == "unlabeled":
+        assert "Before this run PR #7 was draft/labeled; it is now draft/unlabeled." in report
+        assert "Resume with `" not in report
+    elif concurrent == "readied":
         assert "Before this run PR #7 was draft/labeled; it is now ready/labeled." in report
         assert "this run made no readiness change" in report
         assert "claims no qualification" in report
