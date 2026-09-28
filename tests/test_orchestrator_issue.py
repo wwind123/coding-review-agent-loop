@@ -13901,24 +13901,28 @@ from coding_review_agent_loop.plan_assembly import assemble_plan_revision  # noq
 from coding_review_agent_loop.round_state import PostedRoundRecord  # noqa: E402
 
 
-def _m1103_blocking_chain(first_round, last_round, *, base, resolve_first=True):
+def _m1103_blocking_chain(
+    first_round, last_round, *, base, resolve_first=True, item_offset=0
+):
     """Primary blocking reviews and chained planner patches for a round range.
 
-    Round ``n``'s primary review blocks with a fresh finding ``item-n`` (and
-    resolves ``item-(n-1)``); the planner's revision after it is an
-    authenticated patch bound to the round-``n`` state that resolves
-    ``item-n``.  Returns the scripted outputs and the next base.
+    Round ``n``'s primary review blocks with a fresh finding ``item-k`` (and
+    resolves ``item-(k-1)``), where ``k`` is ``n - item_offset``; the
+    planner's revision after it is an authenticated patch bound to the
+    round-``n`` state that resolves ``item-k``.  Returns the scripted outputs
+    and the next base.
     """
     codex, claude = [], []
     for n in range(first_round, last_round + 1):
+        k = n - item_offset
         codex.append(
             structured_plan_review(
                 state="blocking",
                 summary=f"Gap {n} remains.",
                 blocking_plan_issues=[f"Close gap {n}."],
                 prior_plan_item_dispositions=(
-                    [{"item_id": f"item-{n - 1}", "disposition": "resolved"}]
-                    if n > 1 and (resolve_first or n > first_round)
+                    [{"item_id": f"item-{k - 1}", "disposition": "resolved"}]
+                    if k > 1 and (resolve_first or n > first_round)
                     else None
                 ),
             )
@@ -13930,7 +13934,7 @@ def _m1103_blocking_chain(first_round, last_round, *, base, resolve_first=True):
             "state": "blocking",
             "summary": f"Close gap {n}.",
             "prior_plan_item_dispositions": [
-                {"item_id": f"item-{n}", "disposition": "resolved"}
+                {"item_id": f"item-{k}", "disposition": "resolved"}
             ],
             "base_round_number": n,
             "base_state_identity": base.state_identity,
@@ -14203,6 +14207,141 @@ def test_primary_approval_at_the_threshold_opens_the_panel(tmp_path):
         comment["body"].startswith("Plan review scheduling diagnostic")
         for comment in runner.issue_comments
     )
+
+
+def test_growth_gated_primary_approval_resets_the_stall_streak(tmp_path):
+    """`stall-growth-gated-approval-resets` through the live loop.
+
+    Rounds 1-2 block and round 3's primary approves under default growth
+    thresholds; the run stops before the panel.  The rerun lowers the
+    scope-item threshold, so the approved candidate now fails the growth
+    gate: round 4 opens no panel and starts with a planner revision.  With a
+    threshold of 2, the two earlier blocking reviews would already stop the
+    run, so the primary turns in rounds 4 and 5 prove the approval reset the
+    streak; the stop fires before round 6.
+    """
+    fresh, base = _m1103_fresh_base()
+    codex, claude, base = _m1103_blocking_chain(1, 2, base=base)
+    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
+    history_runner = _FakeRunner(
+        claude_outputs=[fresh, *claude],
+        codex_outputs=[
+            *codex,
+            structured_plan_review(state="approved", prior_plan_item_dispositions=resolved),
+        ],
+    )
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(
+            history_runner,
+            issue_number=56,
+            config=_staged_plan_config(tmp_path, max_rounds=3, plan_primary_stall_rounds=3),
+            plan_first=True,
+        )
+    assert _m1103_agent_calls(history_runner) == [
+        "claude", "codex", "claude", "codex", "claude", "codex",
+    ]
+    history = list(history_runner.issue_comments)
+    history_records = _plan_round_records(history_runner)
+    assert not any(record.phase == "plan-phase-advance" for record in history_records)
+
+    justify_payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Justify one-shot.",
+        "prior_plan_item_dispositions": [],
+        "base_round_number": 3,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {
+                "op": "replace",
+                "field": "one_shot_growth_justification",
+                "value": {
+                    "crossed_signals": ["scope-items"],
+                    "rationale": "The scope items share one seam and cannot ship separately.",
+                },
+            }
+        ],
+    }
+    base = AuthenticatedPlanState.from_plan(
+        assemble_plan_revision(base, justify_payload), round_number=4
+    )
+    # Item IDs continue from the history: round 4's finding is item-3.
+    codex, claude, _base = _m1103_blocking_chain(
+        4, 5, base=base, resolve_first=False, item_offset=1
+    )
+    # The approved round's ledger still carries item-2 into the next review.
+    codex[0] = structured_plan_review(
+        state="blocking",
+        summary="Gap 4 remains.",
+        blocking_plan_issues=["Close gap 4."],
+        prior_plan_item_dispositions=resolved,
+    )
+    rerun = _FakeRunner(
+        issue_comments=history,
+        claude_outputs=[
+            json.dumps(justify_payload)
+            + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            *claude,
+        ],
+        codex_outputs=codex,
+    )
+    config = _staged_plan_config(
+        tmp_path,
+        max_rounds=8,
+        plan_primary_stall_rounds=2,
+        plan_growth_max_scope_items=1,
+    )
+    with patch.object(orchestrator_module, "log", wraps=orchestrator_module.log) as logged:
+        with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+            run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+
+    # Round 4 opened with the growth-gated approval: no reviewer and no panel
+    # ran on it, only a planner revision carrying the growth notice.
+    assert any(
+        "the primary approved a candidate that fails the plan-growth gate" in str(call.args[-1])
+        for call in logged.call_args_list
+    )
+    planner_prompts = [cmd[-1] for cmd, _cwd in rerun.commands if cmd[0] == "claude"]
+    assert "Orchestrator plan-growth notice" in planner_prompts[0]
+    # Two primary turns the pre-approval streak alone would have prevented,
+    # and never a secondary.
+    assert _m1103_agent_calls(rerun) == ["claude", "codex", "claude", "codex", "claude"]
+    new_records = _plan_round_records(rerun)[len(history_records):]
+    assert [record.round_number for record in new_records if record.role == "coder"] == [
+        4, 5, 6,
+    ]
+    reviews = [record for record in new_records if record.role == "reviewer"]
+    assert [(record.round_number, record.agent, record.state) for record in reviews] == [
+        (4, "Codex", "blocking"),
+        (5, "Codex", "blocking"),
+    ]
+    # The growth-gated candidate got no checkpoint of its own: the round-4
+    # checkpoint follows the revision, and no panel phase was ever scheduled.
+    first_coder = next(i for i, r in enumerate(new_records) if r.role == "coder")
+    prelaunch = [
+        (index, record)
+        for index, record in enumerate(new_records)
+        if record.phase == "scheduler-prelaunch"
+    ]
+    assert [record.round_number for _index, record in prelaunch] == [4, 5]
+    assert all(index > first_coder for index, _record in prelaunch)
+    assert all(record.scheduler_phase == "primary" for _index, record in prelaunch)
+    assert all(
+        record.scheduler_selected_reviewers == ("Codex",) for _index, record in prelaunch
+    )
+    assert not any(record.scheduler_force_full for _index, record in prelaunch)
+    assert not any(record.phase == "plan-phase-advance" for record in new_records)
+    # The stop fired only after two further blocking primary reviews.
+    diagnostics = [
+        comment["body"]
+        for comment in rerun.issue_comments
+        if comment["body"].startswith("Plan review scheduling diagnostic")
+    ]
+    assert len(diagnostics) == 1
+    assert diagnostics[0].startswith("Plan review scheduling diagnostic (round 6)")
+    assert "AGENT_LOOP_META" not in diagnostics[0]
 
 
 def test_zero_stall_threshold_runs_to_the_round_budget(tmp_path):
