@@ -378,6 +378,51 @@ def test_supervisor_loss_kills_before_a_blocked_report_write(monkeypatch, tmp_pa
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="process liveness probes use /proc")
+def test_shim_kills_target_when_the_supervisor_watch_cannot_start(monkeypatch, tmp_path):
+    """Review item: a watcher that fails to start (e.g. TasksMax exhausted)
+    after the target was spawned must not leave the target running."""
+    pid_file = tmp_path / "target.pid"
+    published = tmp_path / "published"
+    read_fd, write_fd = open_supervisor_pipe()
+    real_popen = containment_module.subprocess.Popen
+    started = []
+
+    def popen(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        started.append(child)
+        _wait_for(pid_file)  # the target is demonstrably running
+        return child
+
+    def refuse_start(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(containment_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(containment_module.threading.Thread, "start", refuse_start)
+    records: list[tuple[int, str]] = []
+    try:
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            _shim(
+                ["--shim", "--report", str(tmp_path / "report.json"),
+                 "--supervisor-fd", str(read_fd), "--",
+                 sys.executable, "-c", _PUBLISH_LATE_TARGET, str(pid_file), str(published)]
+            )
+        records = read_pid_record(pid_file)
+        (child,) = started
+        assert child.returncode is not None, "the target was left running"
+        for pid, start in records:
+            assert wait_until_gone(pid, start_time=start), "target outlived a failed watch start"
+        time.sleep(4.5)
+        assert not published.exists(), "an unsupervised target published its work"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+        for child in started:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process liveness probes use /proc")
 def test_supervisor_loss_during_a_blocked_start_report_still_kills(monkeypatch, tmp_path):
     """Review item: the watch runs while the target-started write is stalled."""
     pid_file = tmp_path / "target.pid"

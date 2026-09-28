@@ -1168,11 +1168,14 @@ def _shim(argv: Sequence[str]) -> int:
                 return
 
     watcher = threading.Thread(target=watch, name="agent-loop-supervisor-watch", daemon=True)
-    watcher.start()
+    watcher_started = False
     target_cgroup: Path | None = None
-    # From here on every exit path, including a failed report write, must
-    # leave no target process running without its supervisor watch.
+    # From here on every exit path, including a watcher that cannot start
+    # (for example TasksMax exhausted) or a failed report write, must leave
+    # no target process running without its supervisor watch.
     try:
+        watcher.start()
+        watcher_started = True
         target_cgroup = cgroup_path_for_pid(child.pid)
         _write_report(report_path, {"state": "target-started", "pid": child.pid, "cgroup_path": str(target_cgroup) if target_cgroup else None})
         code = child.wait()
@@ -1184,7 +1187,8 @@ def _shim(argv: Sequence[str]) -> int:
         raise
     finally:
         stop.set()
-        watcher.join()
+        if watcher_started:
+            watcher.join()
     if lost.is_set():
         # The kill already happened; the diagnostic report is best effort.
         _try_write_report(report_path, {
