@@ -696,9 +696,17 @@ preservation. The label is removed when the event is owned or unprovable
 The next agent-loop invocation removes a retained label from an open ready PR
 at PR-loop entry, in the bootstrap directory, before lifecycle authentication
 and workdir setup. Every lifecycle classifier therefore still sees only the
-draft/labeled and ready/unlabeled states. If a re-entered run aborts before
-publication, it is kept draft/labeled for exact resume, like any other
-interrupted managed run. Residual: if a human converts a qualified PR back to
+draft/labeled and ready/unlabeled states. A re-entered run that aborts before
+publication is kept draft/labeled for exact resume, like any other interrupted
+managed run, except when managed-CI activation itself fails. In that case the
+label may be released under the fail-closed rule, and a ready/unlabeled PR that
+this run's acknowledged draft conversion drafted is restored to ready/unlabeled
+only under the guarded, read-back-verified restoration rule. Only an activation
+failure that follows a mutation recorded by this run (a label release attempt,
+a draft conversion, or a label POST attempt) carries the measured before/now
+report. Pre-write refusals (identity or adoption `None` returns, the strict
+pre-write gate, and the strict draft/unlabeled re-entry refusal) make no write,
+carry no report, and leave the PR as found. Residual: if a human converts a qualified PR back to
 draft and pushes, that push is suppressed until the label is removed. Strict
 protection still requires `final-ci/exact-head` for the new head.
 

@@ -3953,6 +3953,40 @@ base, that state is reauthenticated from the strict PR tuple plus the
 actor-owned historical label event; it does not require or create the
 unprotected authorization record. Other mixed states stop before agents run.
 
+A failed managed-CI activation reports what it measured rather than what it
+assumes (#1067). Before any label, draft, or readiness write, an authenticated
+managed PR must be exactly `open` with labels and draft state that parse
+strictly; otherwise activation stops and makes no write. PRs that are not
+authenticated managed candidates keep the ordinary or adoption route. Every
+activation failure that follows a mutation by this run (a label release
+attempt, including the preflight releases, a ready-to-draft conversion, or a
+label POST attempt) carries one measured before/now report: the entry state,
+the live state re-read after the failure (or "could not be re-read"), this
+run's acknowledged or unconfirmed requests, what was restored and why or why
+not, and the rendered resume command. The rules are:
+
+- A failed activation never reapplies `agent-loop-managed`. Releasing it is the
+  deliberate fail-closed return to ordinary CI; reapplying it would suppress
+  ordinary CI on an unqualified head and mint a new label event. The report
+  says ordinary CI can resume only when the PR is measured strictly unlabeled
+  and the base workflow has the unlabeled recovery route.
+- Readiness is restored automatically only when this run's own ready-to-draft
+  conversion was acknowledged, no label-ownership integrity failure was
+  recorded, the PR is measured draft and strictly unlabeled, and the full entry
+  tuple (head repository, head ref, head SHA, base ref, author login and id,
+  open state) is unchanged. The restoration is verified by a second read and
+  claims no qualification for the head.
+- A manual readiness command is printed only for a strictly unlabeled,
+  tuple-unchanged draft, after a confirmation command that reads the same REST
+  `pulls/{n}` fields as the run's own snapshot, including the numeric author
+  id. A failure report never tells you to remove the label, because no label
+  event can be attributed to this run. Otherwise only a non-mutating inspection
+  and the resume command are printed.
+- On a base without the unlabeled recovery route, the run makes no further
+  change and reports its recorded requests.
+- A dispatch-time release outside activation keeps its behavior and reports
+  only the measured current state.
+
 Base resolution records whether the value came from an explicit `--base`, the
 repository default, or live PR metadata. This base provenance crosses the
 issue-to-PR boundary unchanged. If an inherited repository default differs

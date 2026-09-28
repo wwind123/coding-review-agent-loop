@@ -800,3 +800,21 @@ def test_docs_describe_trusted_human_reviewer_identities():
         assert phrase in local, phrase
     help_text = build_parser()._subparsers._group_actions[0].choices["pr"].format_help()
     assert "--human-reviewer-trusted-actor" in help_text
+
+
+def test_failed_managed_activation_state_report_is_documented():
+    # #1067: the re-entry abort sentence is qualified for a failed activation,
+    # the report is limited to post-mutation failures, and pre-write refusals
+    # are explicitly reportless.
+    arch = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    assert "except when managed-CI activation itself fails" in arch
+    assert "only under the guarded, read-back-verified restoration rule" in arch
+    assert (
+        "Only an activation failure that follows a mutation recorded by this run" in arch
+    )
+    assert "make no write, carry no report, and leave the PR as found" in arch
+    doc = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
+    assert "A failed activation never reapplies `agent-loop-managed`" in doc
+    assert "Readiness is restored automatically only when this run's own ready-to-draft" in doc
+    assert "A failure report never tells you to remove the label" in doc
+    assert "reports only the measured current state" in doc

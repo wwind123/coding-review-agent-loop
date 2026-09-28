@@ -15569,3 +15569,36 @@ def test_pr_loop_resume_with_trust_set_excludes_historically_acknowledged_requir
     for prompt in (*coder_prompts, *review_prompts):
         assert f"Requirement {excluded.requirement_id}:" not in prompt
     assert "No signed human requirements were surfaced" in coder_prompts[-1]
+
+
+
+@pytest.mark.parametrize("state_report", [None, "measured"])
+def test_m1067_run_pr_loop_prints_fallback_state_report(tmp_path, monkeypatch, capsys, state_report):
+    # #1067 review item-8: an ordinary fallback with no recovery capability
+    # stops before agents and prints the measured report when one exists.
+    report = (
+        "Before this run PR #77 was ready/unlabeled; it is now draft/labeled. Do not ready "
+        "or unlabel the PR."
+    )
+    activation = ManagedCiContract(
+        activation_path="ordinary_fallback",
+        ordinary_recovery=None,
+        state_report=report if state_report else None,
+    )
+    runner = FakeRunner()
+    config = make_config(tmp_path, auto_merge=True)
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: activation)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    out = capsys.readouterr().out
+    if state_report:
+        assert f"PR #77 was not merged because managed recovery provenance or an unlabeled CI route is unavailable. {report}" in out
+        assert "remains draft and unmerged" not in out
+    else:
+        assert "PR #77 remains draft and unmerged because managed recovery provenance" in out
+    commands = [command for command, _cwd in runner.commands]
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command in commands)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command in commands)
+    assert not any("DELETE" in command or "POST" in command for command in commands)
+    assert not any(command[:1] in (["codex"], ["claude"], ["gemini"]) for command in commands)

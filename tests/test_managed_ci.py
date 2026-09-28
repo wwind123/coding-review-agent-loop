@@ -3,6 +3,7 @@ import copy
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import replace
@@ -229,6 +230,7 @@ class V2ManagedRunner(ManagedRunner):
             "user": {"login": actor_login, "id": actor_id},
             "labels": [{"name": MANAGED_LABEL}],
             "draft": True,
+            "state": "open",
         }
         if rest_pr:
             self.rest_pr.update(rest_pr)
@@ -11245,3 +11247,1377 @@ def test_recovery_renderer_emits_no_trust_options_when_unconfigured(tmp_path):
         make_config(tmp_path), target="pr", identifier=7, managed_ci=False, include_context=False,
     )
     assert "--human-reviewer-trusted-actor" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# #1067: failed managed-CI activation reports its measured state and restores
+# readiness only when this run's own draft conversion is proven.
+# ---------------------------------------------------------------------------
+
+
+class M1067Runner(ManualQualificationRunner):
+    """Scriptable GitHub model for failed-activation state reporting."""
+
+    def __init__(
+        self,
+        *,
+        undo_returncode=0,
+        undo_applies=True,
+        ready_returncode=0,
+        ready_applies=True,
+        delete_returncode=0,
+        delete_applies=True,
+        post_returncode=0,
+        post_applies=True,
+        events_script=None,
+        events_unreadable=False,
+        base_commit_stdout=None,
+        hooks=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.undo_returncode = undo_returncode
+        self.undo_applies = undo_applies
+        self.ready_returncode = ready_returncode
+        self.ready_applies = ready_applies
+        self.delete_returncode = delete_returncode
+        self.delete_applies = delete_applies
+        self.post_returncode = post_returncode
+        self.post_applies = post_applies
+        self.events_script = list(events_script or [])
+        self.events_unreadable = events_unreadable
+        self.base_commit_stdout = base_commit_stdout
+        self.hooks = dict(hooks or {})
+        # Queued results for plain ``pulls/7`` reads: (stdout, returncode) or
+        # an exception to raise at launch.
+        self.read_queue = []
+
+    def _hook(self, name):
+        hook = self.hooks.get(name)
+        if hook is not None:
+            hook(self)
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = list(args)
+        endpoint = next(
+            (part for part in cmd if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if cmd[:3] == ["gh", "pr", "ready"]:
+            cmd, cwd_path = self._record_command(args, cwd)
+            undo = "--undo" in cmd
+            if (undo and self.undo_applies) or (not undo and self.ready_applies):
+                self.rest_pr["draft"] = undo
+            self._hook("undo" if undo else "ready")
+            returncode = self.undo_returncode if undo else self.ready_returncode
+            return CommandResult(cmd, cwd_path, "", "" if returncode == 0 else "HTTP 502", returncode)
+        if cmd == ["gh", "api", "repos/OWNER/REPO/pulls/7"] and self.read_queue:
+            item = self.read_queue.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            cmd, cwd_path = self._record_command(args, cwd)
+            stdout, returncode = item
+            return CommandResult(cmd, cwd_path, stdout, "", returncode)
+        if endpoint.startswith("repos/OWNER/REPO/issues/7/events?") and (
+            self.events_unreadable or self.events_script
+        ):
+            cmd, cwd_path = self._record_command(args, cwd)
+            events = self.events_script.pop(0) if self.events_script else None
+            if events is None:
+                return CommandResult(cmd, cwd_path, "", "events unavailable", 1)
+            return CommandResult(cmd, cwd_path, json.dumps(events), "", 0)
+        if endpoint == "repos/OWNER/REPO/issues/7/labels" and "POST" in cmd and self.post_returncode:
+            cmd, cwd_path = self._record_command(args, cwd)
+            if self.post_applies:
+                self.rest_pr["labels"] = [{"name": MANAGED_LABEL}]
+            self._hook("post")
+            return CommandResult(cmd, cwd_path, "", "HTTP 502", self.post_returncode)
+        if (
+            endpoint == f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"
+            and "DELETE" in cmd
+            and self.delete_returncode
+        ):
+            cmd, cwd_path = self._record_command(args, cwd)
+            if self.delete_applies:
+                self.rest_pr["labels"] = []
+            self._hook("delete")
+            return CommandResult(cmd, cwd_path, "", "HTTP 502", self.delete_returncode)
+        if endpoint == "repos/OWNER/REPO/commits/main" and self.base_commit_stdout is not None:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, self.base_commit_stdout, "", 0)
+        result = super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+        if endpoint == "repos/OWNER/REPO/issues/7/labels" and "POST" in cmd:
+            self._hook("post")
+        if endpoint == f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}" and "DELETE" in cmd:
+            self._hook("delete")
+        return result
+
+
+_M1067_FORBIDDEN_TEXT = (
+    "Remove the label",
+    "could not be removed",
+    "continuing with ordinary CI",
+    "is now draft and unlabeled",
+    "applied the label",
+    "this run applied",
+    "--method DELETE",
+    "gh pr view",
+)
+
+
+def _m1067_assert_text(text):
+    """Operator-text audit (#1067 step 14) for every post-mutation exit."""
+    for phrase in _M1067_FORBIDDEN_TEXT:
+        assert phrase not in text, phrase
+    assert text.count("Before this run PR #7 was") <= 1
+
+
+def _m1067_commands(runner):
+    return [command for command, _cwd in runner.commands]
+
+
+def _m1067_ready_calls(runner):
+    return [c for c in _m1067_commands(runner) if c[:3] == ["gh", "pr", "ready"] and "--undo" not in c]
+
+
+def _m1067_undo_calls(runner):
+    return [c for c in _m1067_commands(runner) if c[:3] == ["gh", "pr", "ready"] and "--undo" in c]
+
+
+def _m1067_label_posts(runner):
+    return [
+        index for index, c in enumerate(_m1067_commands(runner))
+        if c[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]
+    ]
+
+
+def _m1067_label_deletes(runner):
+    return [
+        index for index, c in enumerate(_m1067_commands(runner))
+        if c[:4] == ["gh", "api", "--method", "DELETE"] and c[-1].endswith(f"/labels/{MANAGED_LABEL}")
+    ]
+
+
+def _m1067_config(tmp_path, **overrides):
+    return make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
+        ),
+        **overrides,
+    )
+
+
+def _m1067_ready_runner(**kwargs):
+    rest_pr = {"state": "open", "draft": False, "labels": [], "body": "Fixes #643"}
+    rest_pr.update(kwargs.pop("rest_pr", {}))
+    kwargs.setdefault("workflow", SUPPRESSING_V2_WORKFLOW)
+    kwargs.setdefault("issue_events", [])
+    kwargs.setdefault("pr_branch_protection_payload", {"contexts": [FINAL_CONTEXT]})
+    return M1067Runner(rest_pr=rest_pr, **kwargs)
+
+
+def _m1067_draft_labeled_runner(**kwargs):
+    rest_pr = {"state": "open", "draft": True, "labels": [{"name": MANAGED_LABEL}], "body": "Fixes #643"}
+    rest_pr.update(kwargs.pop("rest_pr", {}))
+    kwargs.setdefault("workflow", SUPPRESSING_V2_WORKFLOW)
+    kwargs.setdefault("pr_branch_protection_payload", {"contexts": [FINAL_CONTEXT]})
+    return M1067Runner(rest_pr=rest_pr, **kwargs)
+
+
+def _m1067_activate(runner, config, *, lifecycle="ready-unlabeled-reentry", metadata_override=None):
+    return activate_managed_ci(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=metadata_override or _ready_issue_metadata(),
+        managed_resume=AuthenticatedManagedResume(origin="issue-created", lifecycle=lifecycle),
+    )
+
+
+def _m1067_fail(runner, config, **kwargs):
+    with pytest.raises(AgentLoopError) as raised:
+        _m1067_activate(runner, config, **kwargs)
+    text = str(raised.value)
+    _m1067_assert_text(text)
+    return raised.value, text
+
+
+def test_m1067_ready_reentry_restores_readiness_after_release(tmp_path):
+    runner = _m1067_ready_runner(unreadable_issue_events_after_label=True)
+
+    error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert type(error) is AgentLoopError
+    assert text.startswith("--managed-ci requested qualification, but activation failed")
+    # Review item-5: the opening current state is the post-restoration read.
+    assert (
+        "Before this run PR #7 was ready/unlabeled; after the failure and before the readiness "
+        "attempt it was draft/unlabeled; it is now ready/unlabeled."
+    ) in text
+    assert "it is now draft/unlabeled" not in text
+    assert "its ready-to-draft request was acknowledged" in text
+    assert f"its `{MANAGED_LABEL}` label request was acknowledged" in text
+    assert "Restored to ready/unlabeled as found; no qualification is claimed for this head." in text
+    assert "deliberate fail-closed return to ordinary CI" in text
+    assert len(_m1067_ready_calls(runner)) == 1
+    assert runner.rest_pr["draft"] is False and runner.rest_pr["labels"] == []
+    posts = _m1067_label_posts(runner)
+    deletes = _m1067_label_deletes(runner)
+    assert len(posts) == 1 and len(deletes) == 1 and posts[0] < deletes[0]
+    assert "gh pr ready 7" not in text
+
+
+def test_m1067_failed_readiness_command_prints_full_tuple_manual_undo(tmp_path):
+    runner = _m1067_ready_runner(
+        unreadable_issue_events_after_label=True, ready_returncode=1, ready_applies=False,
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "Readiness was not restored: the readiness command failed" in text
+    assert "Manual undo: confirm every field with `gh api repos/OWNER/REPO/pulls/7 --jq" in text
+    assert "`gh pr ready 7 --repo OWNER/REPO`" in text
+    assert "no qualification is implied" in text
+    for expected in (
+        "head_repo=OWNER/REPO", "head_ref=agent-loop/managed-643", "head_sha=abc123",
+        "base_ref=main", "author_login=agent-loop", "author_id=1", "state=open",
+    ):
+        assert expected in text
+    assert "author_id: (.user.id? // null)" in text
+    # The printed confirmation exposes exactly the snapshot field set.
+    query = managed_ci._pr_inspection_command(_m1067_config(tmp_path), 7)
+    names = re.findall(r"[{,] (\w+): ", shlex.split(query)[-1].replace("{", "{ ", 1))
+    assert names == [name for name, _path in managed_ci._ACTIVATION_TUPLE_FIELDS]
+    assert len(_m1067_ready_calls(runner)) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    [
+        ("head_sha", lambda r: r.rest_pr["head"].__setitem__("sha", "moved")),
+        ("base_ref", lambda r: r.rest_pr.__setitem__("base", {"ref": "release"})),
+        ("author_id", lambda r: r.rest_pr.__setitem__("user", {"login": "agent-loop", "id": "x"})),
+        ("labels (labeled)", lambda r: r.rest_pr.__setitem__("labels", [{"name": MANAGED_LABEL}])),
+    ],
+)
+def test_m1067_acknowledged_readiness_with_mismatched_read_back_is_unverified(
+    tmp_path, field, mutate
+):
+    runner = _m1067_ready_runner(unreadable_issue_events_after_label=True, hooks={"ready": mutate})
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "Readiness command acknowledged; restoration not verified" in text
+    assert field in text
+    assert "as found" not in text
+    assert "Do not ready or unlabel the PR." in text
+    assert "gh pr ready 7" not in text
+    assert len(_m1067_ready_calls(runner)) == 1
+    if field == "labels (labeled)":
+        # Review item-5: suppression claims use the read-back, not the
+        # pre-restoration measurement.
+        assert "Ordinary CI can resume" not in text
+        assert "is present again; suppression is still active" in text
+
+
+def test_m1067_unreadable_read_back_after_readiness_attempt_is_unknown(tmp_path):
+    runner = _m1067_ready_runner(
+        unreadable_issue_events_after_label=True,
+        hooks={"ready": lambda r: r.read_queue.append(("", 1))},
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "Readiness command acknowledged; restoration not verified (the state could not be re-read)" in text
+    assert (
+        "Before this run PR #7 was ready/unlabeled; after the failure and before the readiness "
+        "attempt it was draft/unlabeled; it is now unknown: the current state could not be re-read."
+    ) in text
+    assert "it is now draft/unlabeled" not in text
+    assert "draft/unlabeled re-entry state" not in text
+    assert "manual-merge state is suspended" not in text
+    assert "Ordinary CI can resume" not in text
+    assert "Do not ready or unlabel the PR." in text
+    assert len(_m1067_ready_calls(runner)) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    [
+        ("head_sha", lambda r: r.rest_pr["head"].__setitem__("sha", "moved")),
+        ("head_ref", lambda r: r.rest_pr["head"].__setitem__("ref", "agent-loop/managed-999")),
+        ("base_ref", lambda r: r.rest_pr.__setitem__("base", {"ref": "release"})),
+        ("author_login", lambda r: r.rest_pr.__setitem__("user", {"login": "other", "id": 1})),
+        ("head_repo", lambda r: r.rest_pr["head"].__setitem__("repo", {"full_name": "FORK/REPO"})),
+        ("state", lambda r: r.rest_pr.__setitem__("state", "closed")),
+    ],
+)
+def test_m1067_changed_tuple_blocks_restoration(tmp_path, field, mutate):
+    runner = _m1067_ready_runner(unreadable_issue_events_after_label=True, hooks={"delete": mutate})
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert f"Readiness was not restored: tuple fields changed ({field}" in text
+    assert "Do not ready or unlabel the PR." in text
+    assert f"changed, unreadable, or labeled: {field}" in text
+    assert "gh pr ready 7" not in text
+    assert _m1067_ready_calls(runner) == []
+
+
+@pytest.mark.parametrize("labeled", [False, True])
+def test_m1067_pr_readied_by_another_actor_is_not_claimed_as_restored(tmp_path, labeled):
+    def ready_elsewhere(runner):
+        runner.rest_pr["draft"] = False
+        if labeled:
+            runner.rest_pr["labels"] = [{"name": MANAGED_LABEL}]
+
+    runner = _m1067_ready_runner(
+        unreadable_issue_events_after_label=True, hooks={"delete": ready_elsewhere}
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "the PR is already ready" in text
+    assert "does not know who made it ready" in text
+    assert "Restored" not in text and "as found" not in text
+    assert "Do not ready or unlabel the PR." in text
+    assert ("labels (labeled)" in text) is labeled
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_foreign_label_event_preflight_refuses_restoration(tmp_path):
+    runner = _m1067_draft_labeled_runner(
+        issue_events=[label_event(login="someone", actor_id=9)]
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
+
+    assert "ownership was not the trusted actor's" in text
+    assert "Before this run PR #7 was draft/labeled; it is now draft/unlabeled." in text
+    assert "Do not ready or unlabel the PR." in text
+    assert _m1067_ready_calls(runner) == []
+    assert _m1067_label_posts(runner) == []
+    assert len(_m1067_label_deletes(runner)) == 1
+
+
+def test_m1067_foreign_event_after_reentry_draft_vetoes_restoration(tmp_path):
+    foreign = [label_event(login="someone", actor_id=9)]
+    runner = _m1067_ready_runner(events_script=[foreign, foreign])
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    # The post-state looks restorable, but the integrity failure vetoes it.
+    assert "it is now draft/unlabeled" in text
+    assert "ownership was not the trusted actor's" in text
+    assert "Automatic readiness restoration was refused for ownership integrity" in text
+    assert "Do not ready or unlabel the PR." in text
+    assert "gh pr ready 7" not in text
+    assert _m1067_ready_calls(runner) == []
+    posts = _m1067_label_posts(runner)
+    deletes = _m1067_label_deletes(runner)
+    assert len(posts) == 1 and len(deletes) == 1 and posts[0] < deletes[0]
+
+
+def test_m1067_label_event_changed_before_delete_reports_owner_not_asserted(tmp_path):
+    runner = _m1067_ready_runner(
+        events_script=[[label_event(101)], [label_event(102)], [label_event(103)]]
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "managed-label ownership changed before ordinary release" in text
+    assert "changed or could not be verified; its owner is not asserted" in text
+    assert "not the trusted actor's" not in text
+    assert "it is now draft/labeled" in text
+    assert "Do not ready or unlabel the PR." in text
+    assert _m1067_label_deletes(runner) == []
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_labeled_first_read_back_after_acknowledged_undo(tmp_path):
+    runner = _m1067_ready_runner(
+        hooks={"undo": lambda r: r.rest_pr.__setitem__("labels", [{"name": MANAGED_LABEL}])}
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "re-entry could not make PR #7 provably draft and unlabeled" in text
+    assert "unchanged" not in text
+    assert "Readiness was not restored: the PR is still labeled." in text
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_failed_first_read_back_restores_after_measured_read(tmp_path):
+    runner = _m1067_ready_runner(hooks={"undo": lambda r: r.read_queue.append(("", 1))})
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "unchanged" not in text
+    assert "Restored to ready/unlabeled as found" in text
+    assert len(_m1067_ready_calls(runner)) == 1
+
+
+def test_m1067_nonzero_undo_never_licenses_automatic_readiness(tmp_path):
+    runner = _m1067_ready_runner(undo_returncode=1, undo_applies=True)
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "its ready-to-draft request was not confirmed" in text
+    assert "attribution is ambiguous" in text
+    assert "`gh pr ready 7 --repo OWNER/REPO`" in text
+    assert "confirm every field" in text
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_label_create_failure_after_draft_restores_readiness(tmp_path, monkeypatch):
+    monkeypatch.setattr(managed_ci, "ensure_managed_label", lambda *_a, **_k: False)
+    runner = _m1067_ready_runner()
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert text.startswith(f"Unable to create the `{MANAGED_LABEL}` label.")
+    assert "Restored to ready/unlabeled as found" in text
+    assert len(_m1067_ready_calls(runner)) == 1
+    assert _m1067_label_posts(runner) == []
+
+
+def test_m1067_label_post_failure_after_draft_restores_readiness(tmp_path):
+    runner = _m1067_ready_runner(post_returncode=1, post_applies=False)
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "the label request was not confirmed" in text
+    assert f"its `{MANAGED_LABEL}` label request was not confirmed" in text
+    assert "Restored to ready/unlabeled as found" in text
+    assert len(_m1067_label_posts(runner)) == 1
+    assert len(_m1067_ready_calls(runner)) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [("", 1), ("not json", 0), ("[]", 0), ("42", 0), OSError("gh could not be launched")],
+)
+def test_m1067_unreadable_post_failure_state_keeps_original_error(tmp_path, failure):
+    runner = _m1067_ready_runner(
+        unreadable_issue_events_after_label=True,
+        hooks={"delete": lambda r: r.read_queue.append(failure)},
+    )
+
+    error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert type(error) is AgentLoopError
+    assert text.startswith("--managed-ci requested qualification, but activation failed")
+    assert "it is now unknown: the current state could not be re-read" in text
+    assert "Readiness was not restored: the current state is unknown." in text
+    assert "Do not ready or unlabel the PR." in text
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_empty_object_read_renders_every_field_unreadable(tmp_path):
+    runner = _m1067_ready_runner(
+        unreadable_issue_events_after_label=True,
+        hooks={"delete": lambda r: r.read_queue.append(("{}", 0))},
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "could not be re-read" not in text
+    assert "of unknown draft state, with unreadable labels" in text
+    for name in ("head_repo", "head_ref", "head_sha", "base_ref", "author_login", "author_id", "state"):
+        assert f"{name} unreadable" in text
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_report_rendering_failure_keeps_original_error(tmp_path, monkeypatch):
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(managed_ci, "_build_failed_activation_report", broken)
+    runner = _m1067_ready_runner(unreadable_issue_events_after_label=True)
+
+    error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert type(error) is AgentLoopError
+    assert text.startswith("--managed-ci requested qualification, but activation failed")
+    assert "Post-failure state report unavailable (RuntimeError)" in text
+    assert "gh pr ready 7" not in text
+    # Review item-6: the fixed fallback still gives remedy (C).
+    assert "Do not ready or unlabel the PR. Inspect it with `gh api repos/OWNER/REPO/pulls/7 --jq" in text
+    assert "then rerun `agent-loop pr 7" in text
+
+
+def test_m1067_report_fallback_survives_inspection_rendering_failure(tmp_path, monkeypatch):
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(managed_ci, "_build_failed_activation_report", broken)
+    monkeypatch.setattr(managed_ci, "_pr_inspection_command", broken)
+    runner = _m1067_ready_runner(unreadable_issue_events_after_label=True)
+
+    error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert type(error) is AgentLoopError
+    assert text.startswith("--managed-ci requested qualification, but activation failed")
+    assert "Post-failure state report unavailable (RuntimeError)" in text
+    assert "Resume with `agent-loop pr 7" in text
+    assert "gh pr ready 7" not in text
+
+
+def test_m1067_recovery_incapable_base_reports_without_release(tmp_path):
+    runner = _m1067_ready_runner(
+        workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY,
+        unreadable_issue_events_after_label=True,
+    )
+
+    contract = _m1067_activate(runner, _m1067_config(tmp_path))
+
+    assert contract is not None
+    assert contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is None
+    report = contract.state_report
+    assert report is not None
+    _m1067_assert_text(report)
+    assert f"its `{MANAGED_LABEL}` label request was acknowledged" in report
+    assert "Ordinary CI can resume" not in report
+    assert "base workflow has no unlabeled recovery route" in report
+    assert "Do not ready or unlabel the PR." in report
+    assert _m1067_label_deletes(runner) == []
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_state_report_default_keeps_contract_equality():
+    report = "Before this run PR #7 was ready/unlabeled; it is now draft/labeled."
+    contract = ManagedCiContract(activation_path="ordinary_fallback", state_report=report)
+    assert contract.state_report == report
+    # The default keeps every existing constructor and equality; the
+    # orchestrator print is exercised through run_pr_loop in
+    # tests/test_orchestrator_pr.py.
+    assert ManagedCiContract(activation_path="ordinary_fallback") == ManagedCiContract(
+        activation_path="ordinary_fallback", state_report=None
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"labels": [5]},
+        {"labels": [{"name": MANAGED_LABEL}, "junk"]},
+        {"labels": [{"name": 3}]},
+        {"labels": None},
+        {"draft": "yes"},
+        {"draft": None},
+    ],
+)
+def test_m1067_malformed_entry_fails_closed_before_any_write(tmp_path, payload):
+    runner = _m1067_ready_runner(rest_pr=payload)
+
+    with pytest.raises(AgentLoopError, match="could not be read strictly") as raised:
+        managed_ci._activate_v2_managed_ci(
+            runner, config=_m1067_config(tmp_path), pr_number=7, metadata=_ready_issue_metadata(),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created", lifecycle="ready-unlabeled-reentry"
+            ),
+        )
+
+    assert "Before this run" not in str(raised.value)
+    assert _m1067_undo_calls(runner) == [] and _m1067_ready_calls(runner) == []
+    assert _m1067_label_posts(runner) == [] and _m1067_label_deletes(runner) == []
+
+
+def test_m1067_malformed_snapshot_never_renders_as_unlabeled_or_ready():
+    snapshot = managed_ci._PrStateSnapshot.from_payload({"labels": [1], "draft": "x"})
+    rendered = snapshot.render()
+    assert "with unreadable labels" in rendered and "of unknown draft state" in rendered
+    assert "unlabeled" not in rendered and "ready" not in rendered
+    partial = managed_ci._PrStateSnapshot.from_payload({
+        "labels": [{"name": MANAGED_LABEL}, 7], "draft": True, "state": "open",
+        "head": {"repo": {"full_name": "OWNER/REPO"}, "ref": "r", "sha": "s"},
+        "base": {"ref": "main"}, "user": {"login": "agent-loop", "id": 1},
+    })
+    assert partial.render() == "draft, with unreadable labels"
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["missing", None, "merged", "OPEN", [], ["open"], {}, {"value": "open"}],
+)
+def test_m1067_authenticated_pr_not_provably_open_is_refused(tmp_path, state):
+    runner = _m1067_ready_runner()
+    if state == "missing":
+        runner.rest_pr.pop("state")
+    else:
+        runner.rest_pr["state"] = state
+
+    with pytest.raises(AgentLoopError, match="is not provably open") as raised:
+        managed_ci._activate_v2_managed_ci(
+            runner, config=_m1067_config(tmp_path), pr_number=7, metadata=_ready_issue_metadata(),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created", lifecycle="ready-unlabeled-reentry"
+            ),
+        )
+
+    assert "does not match the authenticated issue-created" not in str(raised.value)
+    assert _m1067_undo_calls(runner) == [] and _m1067_ready_calls(runner) == []
+    assert _m1067_label_posts(runner) == [] and _m1067_label_deletes(runner) == []
+
+
+def test_m1067_closed_pr_keeps_none_route(tmp_path):
+    runner = _m1067_ready_runner(rest_pr={"state": "closed"})
+
+    assert managed_ci._activate_v2_managed_ci(
+        runner, config=_m1067_config(tmp_path), pr_number=7, metadata=_ready_issue_metadata(),
+        managed_resume=AuthenticatedManagedResume(
+            origin="issue-created", lifecycle="ready-unlabeled-reentry"
+        ),
+    ) is None
+    assert _m1067_undo_calls(runner) == [] and _m1067_label_posts(runner) == []
+
+
+_M1067_MALFORMED = {"labels": [3], "draft": "x"}
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"user": {"login": "someone", "id": 55}},
+        {"head": {"repo": None, "sha": "abc123", "ref": "agent-loop/managed-643"}},
+        {"head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "abc123", "ref": "feature"}},
+        {"user": {"login": "agent-loop", "id": True}},
+    ],
+)
+@pytest.mark.parametrize("state", ["missing", [], {}, {"value": "open"}])
+@pytest.mark.parametrize("managed", [True, False])
+def test_m1067_non_managed_prs_keep_none_route(tmp_path, identity, state, managed):
+    runner = _m1067_ready_runner(rest_pr={**_M1067_MALFORMED, **identity})
+    if state == "missing":
+        runner.rest_pr.pop("state")
+    else:
+        runner.rest_pr["state"] = state
+    config = _m1067_config(tmp_path) if managed else make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+    )
+
+    assert managed_ci._activate_v2_managed_ci(
+        runner, config=config, pr_number=7, metadata=_ready_issue_metadata(),
+    ) is None
+    assert _m1067_undo_calls(runner) == [] and _m1067_ready_calls(runner) == []
+    assert _m1067_label_posts(runner) == [] and _m1067_label_deletes(runner) == []
+    assert not any("comments" in " ".join(c) and "POST" in c for c in _m1067_commands(runner))
+
+
+def test_m1067_non_managed_pr_implicit_caller_keeps_ordinary_outcome(tmp_path):
+    runner = _m1067_ready_runner(rest_pr={**_M1067_MALFORMED, "user": {"login": "someone", "id": 55}})
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+
+    assert activate_managed_ci(
+        runner, config=config, pr_number=7, metadata=_ready_issue_metadata(),
+    ) is None
+    assert _m1067_label_posts(runner) == [] and _m1067_label_deletes(runner) == []
+
+
+def test_m1067_explicit_adoption_is_not_preempted_by_the_gate(tmp_path):
+    runner = _m1067_ready_runner(rest_pr=_M1067_MALFORMED)
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+
+    assert managed_ci._activate_v2_managed_ci(
+        runner, config=config, pr_number=7, metadata=_ready_issue_metadata(),
+    ) is None
+
+
+def test_m1067_boolean_actor_id_never_authenticates(tmp_path):
+    runner = _m1067_ready_runner(actor_id=True, rest_pr={"user": {"login": "agent-loop", "id": True}})
+
+    assert managed_ci._activate_v2_managed_ci(
+        runner, config=_m1067_config(tmp_path), pr_number=7, metadata=_ready_issue_metadata(),
+        managed_resume=AuthenticatedManagedResume(
+            origin="issue-created", lifecycle="ready-unlabeled-reentry"
+        ),
+    ) is None
+    assert _m1067_undo_calls(runner) == [] and _m1067_label_posts(runner) == []
+
+
+def test_m1067_strict_int_and_tuple_mismatch_reject_booleans():
+    assert managed_ci._strict_int(True) is None
+    assert managed_ci._strict_int(False) is None
+    assert managed_ci._strict_int(7) == 7
+    payload = {
+        "head": {"repo": {"full_name": "OWNER/REPO"}, "ref": "r", "sha": "s"},
+        "base": {"ref": "main"}, "user": {"login": "agent-loop", "id": 1},
+        "state": "open", "draft": True, "labels": [],
+    }
+    entry = managed_ci._PrStateSnapshot.from_payload(payload)
+    live = managed_ci._PrStateSnapshot.from_payload(
+        {**payload, "user": {"login": "AGENT-LOOP", "id": True}}
+    )
+    assert managed_ci._entry_tuple_mismatches(entry, live) == ["author_id"]
+
+
+def test_m1067_draft_labeled_preflight_release_reports_once(tmp_path):
+    runner = _m1067_draft_labeled_runner(events_unreadable=True)
+
+    error, text = _m1067_fail(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
+
+    assert type(error) is AgentLoopError
+    assert "the active managed-label event is temporarily unreadable" in text
+    assert "Before this run PR #7 was draft/labeled; it is now draft/unlabeled." in text
+    assert "deliberate fail-closed return to ordinary CI" in text
+    assert "Ordinary CI can resume through the base workflow's unlabeled recovery route." in text
+    assert "The PR is in the documented draft/unlabeled re-entry state." in text
+    assert "Resume with `agent-loop pr 7" in text
+    assert "gh pr ready" not in text
+    assert _m1067_label_posts(runner) == [] and _m1067_ready_calls(runner) == []
+    assert not runner.audit_comments and not runner.intent_comments
+
+
+def test_m1067_relabel_after_release_reports_active_suppression(tmp_path):
+    runner = _m1067_draft_labeled_runner(
+        events_unreadable=True,
+        hooks={"delete": lambda r: r.rest_pr.__setitem__("labels", [{"name": MANAGED_LABEL}])},
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
+
+    assert "is present again; suppression is still active and ordinary CI has not resumed" in text
+    assert "Ordinary CI can resume" not in text
+    assert "draft/unlabeled re-entry state" not in text
+    assert "Do not ready or unlabel the PR." in text
+    assert _m1067_label_posts(runner) == []
+
+
+def test_m1067_missing_authorization_preflight_release_reports_once(tmp_path):
+    stale = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="older-head", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="old",
+        label_event_id=101,
+    )
+    runner = _m1067_draft_labeled_runner(
+        rest_pr={"head": {
+            "repo": {"full_name": "OWNER/REPO"}, "sha": "new-head", "ref": "agent-loop/managed-643",
+        }},
+        pr_branch_protection_payload=None,
+        issue_events=[label_event()],
+        intent_comments=[{
+            "id": 41,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": str(format_issue_created_authorization_comment(stale)),
+        }],
+    )
+    config = _m1067_config(tmp_path, allow_unprotected_managed_ci=True)
+
+    with pytest.raises(AgentLoopError, match="no fully bound actor-owned") as raised:
+        activate_managed_ci(
+            runner, config=config, pr_number=7,
+            metadata=replace(_ready_issue_metadata(), head_sha="new-head"),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created", lifecycle="draft-labeled",
+                issue_created_handoff=_authorization_handoff(head="new-head"),
+            ),
+        )
+
+    text = str(raised.value)
+    _m1067_assert_text(text)
+    assert text.count("Before this run PR #7 was draft/labeled; it is now draft/unlabeled.") == 1
+    command = text.split("fresh issue-created authorization command: `", 1)[1].split("`", 1)[0]
+    parsed = build_parser().parse_args(shlex.split(command)[1:])
+    assert parsed.managed_ci_fresh_authorization is True
+    assert parsed.managed_ci_issue == 643
+    assert f"Resume with `{command}`" in text
+    assert _m1067_label_posts(runner) == [] and _m1067_ready_calls(runner) == []
+
+
+def test_m1067_preflight_failure_without_mutation_keeps_original_message(tmp_path):
+    runner = _m1067_draft_labeled_runner(
+        rest_pr={"labels": []},
+        pr_branch_protection_payload=None,
+        repo_payload={"private": True},
+        pr_branch_protection_returncode=1,
+        pr_branch_protection_stderr="HTTP 403: Upgrade to GitHub Pro or make this repository public",
+        pr_effective_rules_returncode=1,
+        pr_effective_rules_stderr="HTTP 403: Upgrade to GitHub Pro or make this repository public",
+    )
+
+    with pytest.raises(AgentLoopError, match="was left unchanged") as raised:
+        _m1067_activate(runner, _m1067_config(tmp_path), lifecycle="draft-unlabeled-reentry")
+
+    assert "Before this run" not in str(raised.value)
+    assert _m1067_label_deletes(runner) == [] and _m1067_label_posts(runner) == []
+
+
+@pytest.mark.parametrize("readied", [False, True])
+def test_m1067_failed_delete_on_draft_labeled_entry(tmp_path, readied):
+    hooks = {"delete": lambda r: r.rest_pr.__setitem__("draft", False)} if readied else {}
+    runner = _m1067_draft_labeled_runner(
+        events_unreadable=True, delete_returncode=1, delete_applies=False, hooks=hooks,
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
+
+    assert "the label DELETE was not confirmed" in text
+    assert "its label DELETE was not confirmed" in text
+    assert "draft/unlabeled re-entry state" not in text
+    assert "Do not ready or unlabel the PR." in text
+    if readied:
+        assert "it is now ready/labeled" in text
+        assert "this run made no readiness change" in text
+        assert "claims no qualification" in text
+        assert "remains draft" not in text
+    else:
+        assert "It remains draft/labeled and managed qualification was abandoned." in text
+    # An unconfirmed DELETE proves no removal, so no re-add is claimed.
+    assert f"`{MANAGED_LABEL}` is present; suppression is still active" in text
+    assert "present again" not in text
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_unconfirmed_delete_that_took_effect_is_measured(tmp_path):
+    runner = _m1067_draft_labeled_runner(events_unreadable=True, delete_returncode=1)
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
+
+    assert "the label DELETE was not confirmed" in text
+    assert "it is now draft/unlabeled" in text
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_m1067_dispatch_time_release_reports_measured_state_only(tmp_path, capsys, managed):
+    runner = _m1067_draft_labeled_runner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=managed, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop",
+        quiet=False,
+    )
+
+    if managed:
+        with pytest.raises(AgentLoopError) as raised:
+            _release_for_ordinary_recovery(
+                runner, config=config, pr_number=7, base_ref="main", expected_head_sha="abc123",
+                active_event=(101, "agent-loop", 1), reason="fresh intent ledger could not be reconciled",
+                recovery_capable=True,
+            )
+        text = str(raised.value)
+        _m1067_assert_text(text)
+        assert "PR #7 is now draft/unlabeled." in text
+        assert "Before this run" not in text
+    else:
+        recovery = _release_for_ordinary_recovery(
+            runner, config=config, pr_number=7, base_ref="main", expected_head_sha="abc123",
+            active_event=(101, "agent-loop", 1), reason="fresh intent ledger could not be reconciled",
+            recovery_capable=True,
+        )
+        assert isinstance(recovery, OrdinaryRecoveryCapability)
+        assert recovery.released_label_event_id == 101
+        err = capsys.readouterr().err
+        assert "label DELETE acknowledged; ordinary unlabeled recovery selected" in err
+        # Review item-12: the returned-capability path logs the measured state.
+        assert "PR #7 is now draft/unlabeled." in err
+        assert "Before this run" not in err
+    assert len(_m1067_label_deletes(runner)) == 1
+    assert _m1067_ready_calls(runner) == []
+
+
+@pytest.mark.parametrize("labeled", [True, False])
+def test_m1067_dispatch_time_recovery_incapable_release_logs_measured_state(tmp_path, capsys, labeled):
+    # Review item-12: the context-free recovery-incapable return makes no
+    # DELETE and logs the measured current state.
+    runner = _m1067_draft_labeled_runner(issue_events=[label_event()])
+    if not labeled:
+        runner.rest_pr["labels"] = []  # another actor removed the label
+    config = make_config(
+        tmp_path, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop", quiet=False,
+    )
+
+    recovery = _release_for_ordinary_recovery(
+        runner, config=config, pr_number=7, base_ref="main", expected_head_sha="abc123",
+        active_event=(101, "agent-loop", 1), reason="ledger", recovery_capable=False,
+    )
+
+    assert recovery is None
+    err = capsys.readouterr().err
+    _m1067_assert_text(err)
+    assert "ordinary recovery was not selected" in err
+    assert f"PR #7 is now draft/{'labeled' if labeled else 'unlabeled'}." in err
+    assert "Before this run" not in err
+    assert _m1067_label_deletes(runner) == [] and _m1067_ready_calls(runner) == []
+
+
+@pytest.mark.parametrize("applies", [True, False])
+def test_m1067_dispatch_time_unconfirmed_delete_measures_label(tmp_path, applies):
+    runner = _m1067_draft_labeled_runner(
+        issue_events=[label_event()], delete_returncode=1, delete_applies=applies,
+    )
+    config = make_config(tmp_path, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop")
+
+    with pytest.raises(AgentLoopError) as raised:
+        _release_for_ordinary_recovery(
+            runner, config=config, pr_number=7, base_ref="main", expected_head_sha="abc123",
+            active_event=(101, "agent-loop", 1), reason="ledger", recovery_capable=True,
+        )
+
+    text = str(raised.value)
+    _m1067_assert_text(text)
+    assert "the label DELETE was not confirmed" in text
+    assert f"PR #7 is now draft/{'unlabeled' if applies else 'labeled'}." in text
+    assert _m1067_ready_calls(runner) == []
+
+
+def _m1067_guard(runner, config, context):
+    return managed_ci._failed_activation_guard(runner, config=config, pr_number=7, context=context)
+
+
+def _m1067_context(runner):
+    return managed_ci._FailedActivationContext(
+        entry=managed_ci._PrStateSnapshot.from_payload(runner.rest_pr), recovery_capable=True,
+    )
+
+
+def test_m1067_guard_preserves_terminal_subclass_and_reports_once(tmp_path):
+    runner = _m1067_draft_labeled_runner()
+    config = _m1067_config(tmp_path)
+    context = _m1067_context(runner)
+    context.label_post_attempted = True
+    original = managed_ci.ManagedCiHostFooterIncompatibleError(pr_number=7, phase="pre-dispatch")
+
+    with pytest.raises(managed_ci.ManagedCiHostFooterIncompatibleError) as raised:
+        with _m1067_guard(runner, config, context):
+            raise original
+
+    assert raised.value is original
+    assert str(raised.value).count("Before this run PR #7 was") == 1
+    # An already-reported exception passes through a second guard untouched.
+    with pytest.raises(managed_ci.ManagedCiHostFooterIncompatibleError):
+        with _m1067_guard(runner, config, context):
+            raise original
+    assert str(original).count("Before this run PR #7 was") == 1
+
+
+def test_m1067_guard_notes_other_exceptions_and_skips_base_exceptions(tmp_path):
+    runner = _m1067_draft_labeled_runner()
+    config = _m1067_config(tmp_path)
+    context = _m1067_context(runner)
+    context.drafted_by_this_run = True
+    original = ValueError("boom")
+
+    with pytest.raises(ValueError) as raised:
+        with _m1067_guard(runner, config, context):
+            raise original
+
+    assert raised.value is original and str(original) == "boom"
+    assert any("Before this run PR #7 was" in note for note in original.__notes__)
+    interrupt = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        with _m1067_guard(runner, config, managed_ci._FailedActivationContext(
+            entry=context.entry, drafted_by_this_run=True,
+        )):
+            raise interrupt
+    assert not getattr(interrupt, "__notes__", None)
+    untouched = AgentLoopError("left unchanged")
+    with pytest.raises(AgentLoopError):
+        with _m1067_guard(runner, config, managed_ci._FailedActivationContext(entry=context.entry)):
+            raise untouched
+    assert str(untouched) == "left unchanged"
+
+
+@pytest.mark.parametrize("repo", [None, {"full_name": 5}, "OWNER/REPO"])
+def test_m1067_malformed_reconstruction_head_repo_is_a_tuple_mismatch(tmp_path, repo):
+    runner = _m1067_ready_runner(
+        hooks={"undo": lambda r: r.rest_pr["head"].__setitem__("repo", repo)}
+    )
+
+    error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert type(error) is AgentLoopError
+    assert "reconstruction for PR #7 failed after the ready-to-draft transition" in text
+    assert "head_repo" in text
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_invalid_base_commit_json_reports_labeled_state(tmp_path):
+    runner = _m1067_ready_runner(base_commit_stdout="not json")
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert text.startswith("Managed-CI API response was invalid JSON: repos/OWNER/REPO/commits/main.")
+    assert "it is now draft/labeled" in text
+    assert f"its `{MANAGED_LABEL}` label request was acknowledged" in text
+    assert "Readiness was not restored: the PR is still labeled." in text
+    assert "Do not ready or unlabel the PR." in text
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_concurrent_same_actor_label_is_never_attributed_to_this_run(tmp_path):
+    # A concurrent invocation under the same trusted actor already labeled
+    # the PR after this run's entry read; this run's POST is idempotent.
+    runner = _m1067_ready_runner(
+        base_commit_stdout="not json",
+        hooks={"undo": lambda r: r.issue_events.append(label_event(90))},
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "label request was acknowledged" in text
+    assert "owns" not in text
+    assert "gh pr ready 7" not in text
+
+
+def _m1067_strict_draft_unlabeled_runner(**kwargs):
+    return M1067Runner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={
+            "state": "open", "draft": True, "labels": [],
+            "head": {
+                "repo": {"full_name": "OWNER/REPO"}, "sha": "coder-round-head",
+                "ref": "agent-loop/managed-643",
+            },
+        },
+        intent_comments=[],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        **kwargs,
+    )
+
+
+def _m1067_strict_reentry(runner, tmp_path):
+    return activate_managed_ci(
+        runner, config=_m1067_config(tmp_path), pr_number=7,
+        metadata=replace(_ready_issue_metadata(), head_sha="coder-round-head"),
+        managed_resume=AuthenticatedManagedResume(
+            origin="issue-created", lifecycle="draft-unlabeled-reentry",
+            issue_created_handoff=replace(
+                _authorization_handoff(head="coder-round-head"), protection_mode="strict",
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("applies", [True, False])
+def test_m1067_ambiguous_label_post_on_strict_reentry_is_measured(tmp_path, applies):
+    runner = _m1067_strict_draft_unlabeled_runner(
+        issue_events=[label_event()], post_returncode=1, post_applies=applies,
+    )
+
+    with pytest.raises(AgentLoopError) as raised:
+        _m1067_strict_reentry(runner, tmp_path)
+
+    text = str(raised.value)
+    _m1067_assert_text(text)
+    assert f"its `{MANAGED_LABEL}` label request was not confirmed" in text
+    if applies:
+        assert "Before this run PR #7 was draft/unlabeled; it is now draft/labeled." in text
+        assert "Do not ready or unlabel the PR." in text
+    else:
+        assert "it is now draft/unlabeled." in text
+        assert "Resume with `" in text
+    assert _m1067_ready_calls(runner) == [] and _m1067_label_deletes(runner) == []
+
+
+def test_m1067_strict_reentry_refusal_is_an_explicit_exclusion(tmp_path):
+    runner = _m1067_strict_draft_unlabeled_runner(issue_events=[])
+
+    with pytest.raises(AgentLoopError) as raised:
+        _m1067_strict_reentry(runner, tmp_path)
+
+    text = str(raised.value)
+    # Pre-mutation refusal: keeps its reviewed trusted-actor prerequisite.
+    assert f"Reapply `{MANAGED_LABEL}` as the configured trusted actor" in text
+    assert "Before this run" not in text
+    assert _m1067_label_posts(runner) == [] and _m1067_label_deletes(runner) == []
+    assert _m1067_undo_calls(runner) == [] and _m1067_ready_calls(runner) == []
+    assert runner.dispatch_count == 0
+
+
+def _m1067_plan_limited_runner(**kwargs):
+    return _m1067_draft_labeled_runner(
+        pr_branch_protection_payload=None,
+        repo_payload={"private": True},
+        pr_branch_protection_returncode=1,
+        pr_branch_protection_stderr="HTTP 403: Upgrade to GitHub Pro or make this repository public",
+        pr_effective_rules_returncode=1,
+        pr_effective_rules_stderr="HTTP 403: Upgrade to GitHub Pro or make this repository public",
+        issue_events=[label_event()],
+        **kwargs,
+    )
+
+
+def _m1067_implicit_activation(runner, config):
+    return managed_ci._activate_v2_managed_ci(
+        runner, config=config, pr_number=7, metadata=_ready_issue_metadata(),
+    )
+
+
+def test_m1067_implicit_fallback_helper_logs_measured_report(tmp_path, capsys):
+    runner = _m1067_plan_limited_runner()
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop", quiet=False,
+    )
+
+    assert _m1067_implicit_activation(runner, config) is None
+
+    err = capsys.readouterr().err
+    _m1067_assert_text(err)
+    assert "label DELETE acknowledged (strict protection or the explicit override is unavailable)" in err
+    assert "Before this run PR #7 was draft/labeled; it is now draft/unlabeled." in err
+    assert "Ordinary CI can resume" in err
+    assert len(_m1067_label_deletes(runner)) == 1
+
+
+@pytest.mark.parametrize("variant", ["relabel", "no-recovery"])
+def test_m1067_implicit_fallback_helper_variants_make_no_ordinary_claim(tmp_path, capsys, variant):
+    kwargs = (
+        {"hooks": {"delete": lambda r: r.rest_pr.__setitem__("labels", [{"name": MANAGED_LABEL}])}}
+        if variant == "relabel"
+        else {"workflow": SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY}
+    )
+    runner = _m1067_plan_limited_runner(**kwargs)
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop", quiet=False,
+    )
+
+    assert _m1067_implicit_activation(runner, config) is None
+
+    err = capsys.readouterr().err
+    _m1067_assert_text(err)
+    assert "Ordinary CI can resume" not in err
+    if variant == "relabel":
+        assert "suppression is still active and ordinary CI has not resumed" in err
+    else:
+        # Review item-4: a base without the unlabeled recovery route keeps
+        # the label; the fallback helper makes no DELETE.
+        assert _m1067_label_deletes(runner) == []
+        assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+        assert f"this run made no `{MANAGED_LABEL}` label DELETE" in err
+        assert "PR #7 is now draft/labeled." in err
+        assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_explicit_fallback_helper_on_recovery_incapable_base_retains_label(tmp_path):
+    runner = _m1067_plan_limited_runner(workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY)
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    with pytest.raises(AgentLoopError) as raised:
+        _m1067_implicit_activation(runner, config)
+
+    text = str(raised.value)
+    _m1067_assert_text(text)
+    assert f"this run made no `{MANAGED_LABEL}` label DELETE" in text
+    assert "PR #7 is now draft/labeled." in text
+    assert "did NOT qualify" in text
+    assert _m1067_label_deletes(runner) == []
+    assert _m1067_ready_calls(runner) == []
+
+
+@pytest.mark.parametrize("delete_returncode", [0, 1])
+def test_m1067_explicit_fallback_helper_raise_carries_report(tmp_path, delete_returncode):
+    runner = _m1067_plan_limited_runner(delete_returncode=delete_returncode, delete_applies=False)
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    with pytest.raises(AgentLoopError) as raised:
+        _m1067_implicit_activation(runner, config)
+
+    text = str(raised.value)
+    _m1067_assert_text(text)
+    assert text.count("Before this run PR #7 was draft/labeled") == 1
+    if delete_returncode:
+        assert "label DELETE was not confirmed" in text
+        assert "it is now draft/labeled" in text
+        assert "Do not ready or unlabel the PR." in text
+    else:
+        assert "did NOT qualify" in text
+
+
+def test_m1067_printed_inspection_query_tolerates_malformed_payloads(tmp_path):
+    jq = shutil.which("jq")
+    if jq is None:
+        pytest.skip("jq is not installed")
+    query = shlex.split(managed_ci._pr_inspection_command(_m1067_config(tmp_path), 7))[-1]
+
+    def evaluate(payload):
+        result = subprocess.run(
+            [jq, "-c", query], input=json.dumps(payload), capture_output=True, text=True, check=True,
+        )
+        return json.loads(result.stdout)
+
+    assert evaluate({"head": {"repo": None}, "labels": [1, {"name": "x"}]})["labels"] == [
+        {"malformed": 1}, "x",
+    ]
+    assert evaluate({"head": {"repo": None}, "labels": []})["head_repo"] is None
+    for labels in ({}, None):
+        assert evaluate({"labels": labels})["labels"] == {"malformed_container": labels}
+    assert evaluate({})["labels"] == {"malformed_container": None}
+
+
+def test_m1067_recovery_incapable_fallback_never_readies_after_concurrent_unlabel(tmp_path):
+    # Another actor removes the label before the report read; the skipped
+    # release still vetoes any automatic readiness write (review item-1).
+    runner = _m1067_ready_runner(
+        workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY,
+        unreadable_issue_events_after_label=True,
+        hooks={"post": lambda r: r.rest_pr.__setitem__("labels", [])},
+    )
+
+    contract = _m1067_activate(runner, _m1067_config(tmp_path))
+
+    assert contract is not None and contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is None
+    report = contract.state_report
+    _m1067_assert_text(report)
+    assert "it is now draft/unlabeled" in report
+    assert "base workflow has no unlabeled recovery route" in report
+    assert "Do not ready or unlabel the PR." in report
+    assert "gh pr ready 7" not in report
+    assert _m1067_ready_calls(runner) == []
+    assert _m1067_label_deletes(runner) == []
+
+
+def test_m1067_nonzero_undo_with_pr_still_ready_gives_inspection_remedy(tmp_path):
+    # Review item-3: an ambiguous ready-to-draft exit always gets remedy (C).
+    runner = _m1067_ready_runner(undo_returncode=1, undo_applies=False)
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "its ready-to-draft request was not confirmed" in text
+    assert "No readiness restoration is needed: the PR is measured ready/unlabeled" in text
+    assert "Do not ready or unlabel the PR. Inspect it with `gh api repos/OWNER/REPO/pulls/7" in text
+    assert "Resume with `" not in text
+    assert "gh pr ready 7" not in text
+    assert _m1067_ready_calls(runner) == []
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_m1067_recovery_incapable_fallback_helper_measures_concurrent_unlabel(tmp_path, capsys, managed):
+    # Review item-7: label presence comes only from the measured read; the
+    # helper states just that this run made no DELETE.
+    runner = _m1067_plan_limited_runner(workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY)
+    runner.rest_pr["labels"] = [{"name": MANAGED_LABEL}]
+    config = make_config(
+        tmp_path, managed_ci=managed, auto_merge=not managed,
+        managed_ci_trusted_actor="agent-loop", quiet=False,
+    )
+    original = managed_ci._measured_state_line
+
+    def unlabel_then_measure(runner_, config_, pr_number):
+        runner_.rest_pr["labels"] = []  # another actor removed the label
+        return original(runner_, config_, pr_number)
+
+    import unittest.mock as mock
+    with mock.patch.object(managed_ci, "_measured_state_line", unlabel_then_measure):
+        if managed:
+            with pytest.raises(AgentLoopError) as raised:
+                _m1067_implicit_activation(runner, config)
+            text = str(raised.value)
+        else:
+            assert _m1067_implicit_activation(runner, config) is None
+            text = capsys.readouterr().err
+
+    _m1067_assert_text(text)
+    assert f"this run made no `{MANAGED_LABEL}` label DELETE" in text
+    assert "PR #7 is now draft/unlabeled." in text
+    assert "retained" not in text
+    assert _m1067_label_deletes(runner) == []
+    assert _m1067_ready_calls(runner) == []
+
+
+def test_m1067_recovery_incapable_ready_labeled_entry_concurrent_unlabel_keeps_inspection(
+    tmp_path, monkeypatch
+):
+    # Review item-11: a ready entry on a base without the unlabeled recovery
+    # route gets remedy (C) even when the PR measures ready/unlabeled.
+    runner = _m1067_draft_labeled_runner(
+        workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY, events_unreadable=True,
+        rest_pr={"draft": False},
+    )
+    original = managed_ci._read_failed_activation_state
+
+    def unlabel_elsewhere(runner_, config_, pr_number):
+        runner_.rest_pr["labels"] = []  # another actor removes the label
+        return original(runner_, config_, pr_number)
+
+    monkeypatch.setattr(managed_ci, "_read_failed_activation_state", unlabel_elsewhere)
+
+    contract = _m1067_activate(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
+
+    assert contract is not None and contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is None
+    report = contract.state_report
+    assert report is not None
+    _m1067_assert_text(report)
+    assert "Before this run PR #7 was ready/labeled; it is now ready/unlabeled." in report
+    assert "No readiness restoration is needed" in report
+    assert "Do not ready or unlabel the PR." in report
+    assert "Inspect it with `gh api repos/OWNER/REPO/pulls/7" in report
+    assert "--managed-ci" in report
+    assert "Resume with `" not in report
+    assert "gh pr ready 7" not in report
+    assert _m1067_label_deletes(runner) == [] and _m1067_ready_calls(runner) == []
+    assert _m1067_label_posts(runner) == [] and _m1067_undo_calls(runner) == []
+
+
+@pytest.mark.parametrize("concurrent", ["none", "readied", "unlabeled"])
+def test_m1067_recovery_incapable_draft_labeled_resume_reports_measured_state(
+    tmp_path, monkeypatch, capsys, concurrent
+):
+    # Review item-9: a draft/labeled resume on a base without the unlabeled
+    # recovery route makes no DELETE, yet the fallback still carries a
+    # measured report, which run_pr_loop prints instead of an unmeasured line.
+    runner = _m1067_draft_labeled_runner(
+        workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY, events_unreadable=True,
+    )
+    if concurrent != "none":
+        original = managed_ci._read_failed_activation_state
+
+        def change_elsewhere(runner_, config_, pr_number):
+            if concurrent == "readied":
+                runner_.rest_pr["draft"] = False  # another actor readies the PR
+            else:
+                runner_.rest_pr["labels"] = []  # another actor removes the label
+            return original(runner_, config_, pr_number)
+
+        monkeypatch.setattr(managed_ci, "_read_failed_activation_state", change_elsewhere)
+
+    contract = _m1067_activate(runner, _m1067_config(tmp_path), lifecycle="draft-labeled")
+
+    assert contract is not None and contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is None
+    report = contract.state_report
+    assert report is not None
+    _m1067_assert_text(report)
+    assert f"This run made no `{MANAGED_LABEL}` label DELETE" in report
+    if concurrent != "unlabeled":
+        assert "draft/unlabeled re-entry state" not in report
+    assert "Ordinary CI can resume" not in report
+    assert "Do not ready or unlabel the PR." in report
+    assert "gh pr ready 7" not in report
+    # Review item-10: remedy (C) holds whatever the measured label state.
+    assert "Inspect it with `gh api repos/OWNER/REPO/pulls/7" in report
+    assert "--managed-ci" in report
+    if concurrent == "unlabeled":
+        assert "Before this run PR #7 was draft/labeled; it is now draft/unlabeled." in report
+        assert "Resume with `" not in report
+    elif concurrent == "readied":
+        assert "Before this run PR #7 was draft/labeled; it is now ready/labeled." in report
+        assert "this run made no readiness change" in report
+        assert "claims no qualification" in report
+        assert "remains draft" not in report
+    else:
+        assert "Before this run PR #7 was draft/labeled; it is now draft/labeled." in report
+        assert "It remains draft/labeled and managed qualification was abandoned." in report
+    assert _m1067_label_deletes(runner) == [] and _m1067_ready_calls(runner) == []
+    assert _m1067_label_posts(runner) == []
+
+    # The orchestrator prints this measured report, not the unmeasured line.
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
+    loop_runner = FakeRunner()
+    assert orchestrator.run_pr_loop(
+        loop_runner, pr_number=7, config=make_config(tmp_path / "loop", auto_merge=True),
+    ) == 0
+    out = capsys.readouterr().out
+    assert report in out
+    assert "remains draft and unmerged" not in out
+    assert not any(
+        command[:3] == ["gh", "pr", "ready"] or "DELETE" in command
+        for command, _cwd in loop_runner.commands
+    )

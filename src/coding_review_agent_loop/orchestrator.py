@@ -21410,9 +21410,18 @@ def run_pr_loop(
             log(
                 config,
                 f"PR #{pr_number}: ordinary recovery selected; "
-                "the previous managed activation is not being resumed",
+                "the previous managed activation is not being resumed"
+                + (f". {activation.state_report}" if activation.state_report else ""),
             )
             if ordinary_recovery is None:
+                if activation.state_report:
+                    # #1067: after a mutation by this run, print the measured
+                    # state instead of asserting that the PR is still draft.
+                    print(
+                        f"PR #{pr_number} was not merged because managed recovery provenance or "
+                        f"an unlabeled CI route is unavailable. {activation.state_report}"
+                    )
+                    return 0
                 command = render_managed_ci_resume_command(
                     config, pr_number=pr_number, managed_ci=True,
                 )
