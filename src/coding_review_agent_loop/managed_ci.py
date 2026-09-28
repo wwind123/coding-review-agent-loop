@@ -4561,6 +4561,8 @@ def _release_for_ordinary_recovery(
             f"PR #{pr_number}: ordinary recovery was not selected because the base workflow "
             "does not prove an unlabeled pull_request trigger",
         )
+        if report_context is None:
+            log(config, _measured_state_line(runner, config, pr_number))
         return None
     prior_run_ids: set[int] = set()
     try:
@@ -4634,6 +4636,8 @@ def _release_for_ordinary_recovery(
             f"--managed-ci requested qualification, but activation failed ({reason}). "
             f"{state}This run did NOT qualify the head of PR #{pr_number}. " + remedy
         )
+    if report_context is None:
+        log(config, _measured_state_line(runner, config, pr_number))
     return OrdinaryRecoveryCapability(
         pr_number=pr_number,
         repository=config.repo,

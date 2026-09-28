@@ -12114,8 +12114,36 @@ def test_m1067_dispatch_time_release_reports_measured_state_only(tmp_path, capsy
         assert recovery.released_label_event_id == 101
         err = capsys.readouterr().err
         assert "label DELETE acknowledged; ordinary unlabeled recovery selected" in err
+        # Review item-12: the returned-capability path logs the measured state.
+        assert "PR #7 is now draft/unlabeled." in err
+        assert "Before this run" not in err
     assert len(_m1067_label_deletes(runner)) == 1
     assert _m1067_ready_calls(runner) == []
+
+
+@pytest.mark.parametrize("labeled", [True, False])
+def test_m1067_dispatch_time_recovery_incapable_release_logs_measured_state(tmp_path, capsys, labeled):
+    # Review item-12: the context-free recovery-incapable return makes no
+    # DELETE and logs the measured current state.
+    runner = _m1067_draft_labeled_runner(issue_events=[label_event()])
+    if not labeled:
+        runner.rest_pr["labels"] = []  # another actor removed the label
+    config = make_config(
+        tmp_path, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop", quiet=False,
+    )
+
+    recovery = _release_for_ordinary_recovery(
+        runner, config=config, pr_number=7, base_ref="main", expected_head_sha="abc123",
+        active_event=(101, "agent-loop", 1), reason="ledger", recovery_capable=False,
+    )
+
+    assert recovery is None
+    err = capsys.readouterr().err
+    _m1067_assert_text(err)
+    assert "ordinary recovery was not selected" in err
+    assert f"PR #7 is now draft/{'labeled' if labeled else 'unlabeled'}." in err
+    assert "Before this run" not in err
+    assert _m1067_label_deletes(runner) == [] and _m1067_ready_calls(runner) == []
 
 
 @pytest.mark.parametrize("applies", [True, False])
