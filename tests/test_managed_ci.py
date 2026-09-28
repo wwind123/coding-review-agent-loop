@@ -11452,7 +11452,12 @@ def test_m1067_ready_reentry_restores_readiness_after_release(tmp_path):
 
     assert type(error) is AgentLoopError
     assert text.startswith("--managed-ci requested qualification, but activation failed")
-    assert "Before this run PR #7 was ready/unlabeled; it is now draft/unlabeled." in text
+    # Review item-5: the opening current state is the post-restoration read.
+    assert (
+        "Before this run PR #7 was ready/unlabeled; after the failure and before the readiness "
+        "attempt it was draft/unlabeled; it is now ready/unlabeled."
+    ) in text
+    assert "it is now draft/unlabeled" not in text
     assert "its ready-to-draft request was acknowledged" in text
     assert f"its `{MANAGED_LABEL}` label request was acknowledged" in text
     assert "Restored to ready/unlabeled as found; no qualification is claimed for this head." in text
@@ -11527,7 +11532,11 @@ def test_m1067_unreadable_read_back_after_readiness_attempt_is_unknown(tmp_path)
     _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
 
     assert "Readiness command acknowledged; restoration not verified (the state could not be re-read)" in text
-    assert "After the readiness attempt the current state could not be re-read." in text
+    assert (
+        "Before this run PR #7 was ready/unlabeled; after the failure and before the readiness "
+        "attempt it was draft/unlabeled; it is now unknown: the current state could not be re-read."
+    ) in text
+    assert "it is now draft/unlabeled" not in text
     assert "draft/unlabeled re-entry state" not in text
     assert "manual-merge state is suspended" not in text
     assert "Ordinary CI can resume" not in text

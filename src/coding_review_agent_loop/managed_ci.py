@@ -4087,10 +4087,9 @@ def _build_failed_activation_report(
     measured = _read_failed_activation_state(runner, config, pr_number)
     resume = _failed_activation_resume_command(config, pr_number, context)
     inspect = _pr_inspection_command(config, pr_number)
-    lines = [
-        f"Before this run PR #{pr_number} was {entry.render()}; it is now "
-        f"{measured.render() if measured is not None else 'unknown: the current state could not be re-read'}."
-    ]
+    first_measured = measured
+    # The opening sentence is filled in last, from the final measured state.
+    lines = [""]
     facts = []
     if context.drafted_by_this_run:
         facts.append("its ready-to-draft request was acknowledged")
@@ -4139,6 +4138,7 @@ def _build_failed_activation_report(
         and not mismatches
     )
     remedy = "C"
+    readiness_attempted = False
     if entry.draft is False:
         restoration, remedy, after, readiness_attempted = _evaluate_ready_restoration(
             runner, config=config, pr_number=pr_number, context=context,
@@ -4151,10 +4151,6 @@ def _build_failed_activation_report(
             # the current state, and an unreadable read-back is unknown.
             measured = after
             mismatches = _entry_tuple_mismatches(entry, after) if after is not None else []
-            if after is None:
-                lines.append(
-                    "After the readiness attempt the current state could not be re-read."
-                )
     elif (
         not integrity
         and measured is not None
@@ -4180,6 +4176,15 @@ def _build_failed_activation_report(
             )
 
     lines.extend(_lifecycle_sentences(entry, measured))
+
+    now = measured.render() if measured is not None else "unknown: the current state could not be re-read"
+    if entry.draft is False and readiness_attempted:
+        lines[0] = (
+            f"Before this run PR #{pr_number} was {entry.render()}; after the failure and before "
+            f"the readiness attempt it was {first_measured.render()}; it is now {now}."
+        )
+    else:
+        lines[0] = f"Before this run PR #{pr_number} was {entry.render()}; it is now {now}."
 
     changed = mismatches + [
         name for name in (measured.unknown_fields() if measured is not None else [])
