@@ -42,6 +42,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -1144,34 +1145,53 @@ def _shim(argv: Sequence[str]) -> int:
     except OSError as exc:
         _write_report(report_path, {"state": "target-exec-error", "errno": exc.errno, "error": str(exc)})
         return 127 if exc.errno == errno.ENOENT else 126
-    target_cgroup = cgroup_path_for_pid(child.pid)
-    # From here on every exit path, including a failed report write, must
-    # leave no target process running without its supervisor watch.
-    try:
-        _write_report(report_path, {"state": "target-started", "pid": child.pid, "cgroup_path": str(target_cgroup) if target_cgroup else None})
-        while True:
-            code = child.poll()
-            if code is not None:
-                break
+    # The supervisor watch starts before anything that can block (report
+    # writes, cgroup reads), in its own thread, so a stalled filesystem can
+    # never keep an unsupervised target alive.
+    lost = threading.Event()
+    stop = threading.Event()
+    kill_lock = threading.Lock()
+
+    def empty_scope() -> None:
+        with kill_lock:
+            _empty_scope(child, scope, unit_name)
+
+    def watch() -> None:
+        while not stop.is_set():
             try:
                 ready, _, _ = select.select([supervisor_fd], [], [], SUPERVISOR_POLL_SECONDS)
             except (OSError, ValueError):
                 ready = [supervisor_fd]
-            if ready and child.poll() is None:
-                # Kill first; the diagnostic report is written only once the
-                # scope is empty, so a stalled write cannot delay the kill.
-                _empty_scope(child, scope, unit_name)
-                _try_write_report(report_path, {
-                    "state": "supervisor-lost", "pid": child.pid,
-                    "cgroup_path": str(target_cgroup) if target_cgroup else None,
-                })
-                return SUPERVISOR_LOST_EXIT_CODE
+            if ready:
+                lost.set()
+                empty_scope()
+                return
+
+    watcher = threading.Thread(target=watch, name="agent-loop-supervisor-watch", daemon=True)
+    watcher.start()
+    target_cgroup: Path | None = None
+    # From here on every exit path, including a failed report write, must
+    # leave no target process running without its supervisor watch.
+    try:
+        target_cgroup = cgroup_path_for_pid(child.pid)
+        _write_report(report_path, {"state": "target-started", "pid": child.pid, "cgroup_path": str(target_cgroup) if target_cgroup else None})
+        code = child.wait()
+        # The direct target has exited; any background or new-session
+        # descendant is killed before the watch ends and the shim exits.
+        empty_scope()
     except BaseException:
-        _empty_scope(child, scope, unit_name)
+        empty_scope()
         raise
-    # The direct target has exited; any background or new-session descendant
-    # is killed before the shim (and with it the supervisor watch) exits.
-    _empty_scope(child, scope, unit_name)
+    finally:
+        stop.set()
+        watcher.join()
+    if lost.is_set():
+        # The kill already happened; the diagnostic report is best effort.
+        _try_write_report(report_path, {
+            "state": "supervisor-lost", "pid": child.pid,
+            "cgroup_path": str(target_cgroup) if target_cgroup else None,
+        })
+        return SUPERVISOR_LOST_EXIT_CODE
     _write_report(report_path, {"state": "target-exited", "pid": child.pid, "returncode": code, "cgroup_path": str(target_cgroup) if target_cgroup else None})
     return int(code if code >= 0 else 128 + (-code))
 

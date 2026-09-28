@@ -378,6 +378,56 @@ def test_supervisor_loss_kills_before_a_blocked_report_write(monkeypatch, tmp_pa
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="process liveness probes use /proc")
+def test_supervisor_loss_during_a_blocked_start_report_still_kills(monkeypatch, tmp_path):
+    """Review item: the watch runs while the target-started write is stalled."""
+    pid_file = tmp_path / "target.pid"
+    published = tmp_path / "published"
+    read_fd, write_fd = open_supervisor_pipe()
+    real = containment_module._write_report
+    release = threading.Event()
+
+    def write(path, payload):
+        if payload.get("state") == "target-started":
+            release.wait(timeout=20)  # a hung filesystem
+        real(path, payload)
+
+    monkeypatch.setattr(containment_module, "_write_report", write)
+    result = {}
+
+    def run_shim():
+        result["code"] = _shim(
+            ["--shim", "--report", str(tmp_path / "report.json"),
+             "--supervisor-fd", str(read_fd), "--",
+             sys.executable, "-c", _PUBLISH_LATE_TARGET, str(pid_file), str(published)]
+        )
+
+    shim_thread = threading.Thread(target=run_shim)
+    shim_thread.start()
+    records: list[tuple[int, str]] = []
+    try:
+        _wait_for(pid_file)
+        records = read_pid_record(pid_file)
+        os.close(write_fd)
+        write_fd = None
+        for pid, start in records:
+            assert wait_until_gone(pid, start_time=start, timeout=5), (
+                "target kept running while the start report was stalled"
+            )
+        assert not release.is_set() and shim_thread.is_alive()
+        time.sleep(4.5)
+        assert not published.exists(), "an unsupervised target published its work"
+    finally:
+        release.set()
+        shim_thread.join(timeout=10)
+        if write_fd is not None:
+            os.close(write_fd)
+        os.close(read_fd)
+        for pid, start in records:
+            kill_if_same_instance(pid, start)
+    assert result == {"code": containment_module.SUPERVISOR_LOST_EXIT_CODE}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process liveness probes use /proc")
 def test_scope_emptying_escalates_and_never_returns_with_a_live_descendant(monkeypatch, tmp_path):
     """Review items: with cgroup.kill unavailable and an incomplete sweep, the
     shim escalates and keeps sweeping; it returns only once a new-session
