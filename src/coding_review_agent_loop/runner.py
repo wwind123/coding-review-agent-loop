@@ -930,6 +930,7 @@ def _run_foreground_test_body(
             )
     finally:
         lane_lock.close()
+        tel.released()
     outcome = "interrupted" if interrupted else ("timed_out" if timed_out else ("passed" if returncode == 0 else "failed"))
     inner_exec = "started"
     suite_start = "verified" if inner_probe_state == "verified" else "unknown"

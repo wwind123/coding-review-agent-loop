@@ -160,13 +160,22 @@ class ReservationTelemetry:
     def finish(self, test_outcome: str | None) -> None:
         self.data["test_outcome"] = test_outcome
 
-    def emit(self) -> None:
-        if not self.begun or self.path is None:
+    def released(self) -> None:
+        """Stamp the release right after the locks close; later calls are no-ops."""
+        if not self.begun or self.data.get("released_at") is not None:
             return
         try:
             self.data["released_at"] = time.time()
             path = self.reservation_path
             self.data["retained"] = bool(path is not None and path.exists())
+        except Exception:
+            pass
+
+    def emit(self) -> None:
+        if not self.begun or self.path is None:
+            return
+        try:
+            self.released()
             append_record(
                 self.path,
                 {

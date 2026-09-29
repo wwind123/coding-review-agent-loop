@@ -650,3 +650,50 @@ def test_telemetry_configuration_refusal_writes_no_record(tmp_path, monkeypatch)
     result = _run(tmp_path, tmp_path / "locks", tel)
     assert result.outcome == "worker-budget-refused"
     assert not log.exists()
+
+
+def test_telemetry_release_time_is_stamped_before_post_release_work(tmp_path):
+    import time
+
+    log, tel = _telemetry(tmp_path)
+    tel.begin(2)
+    tel.reserved(2, None)
+    tel.released()
+    stamped = tel.data["released_at"]
+    time.sleep(0.05)  # e.g. a slow output_callback delivering notices after close
+    tel.emit()
+    (rec,) = _attempts(log)
+    assert rec["released_at"] == stamped
+    assert time.time() - stamped >= 0.05
+
+
+def test_telemetry_run_foreground_test_stamps_release_before_notices(tmp_path):
+    import time
+
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    stamps = []
+
+    def slow_notice(msg):
+        if "late notice" in msg:
+            stamps.append(tel.data["released_at"])
+            time.sleep(0.2)
+
+    from coding_review_agent_loop import runner
+
+    real = runner.analyze_worker_report
+
+    def with_notice(*a, **k):
+        analysis = real(*a, **k)
+        import dataclasses
+
+        return dataclasses.replace(analysis, notices=("late notice",))
+
+    orig = runner.analyze_worker_report
+    runner.analyze_worker_report = with_notice
+    try:
+        _run(tmp_path, root, tel, output_callback=slow_notice)
+    finally:
+        runner.analyze_worker_report = orig
+    (rec,) = _attempts(log)
+    assert stamps and rec["released_at"] == stamps[0]
