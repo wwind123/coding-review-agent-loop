@@ -1789,6 +1789,7 @@ class TestBrokerServer:
         containment_policy: object | None = None,
         execute: Any | None = None,
         environment_registry: EnvironmentIdentityRegistry | None = None,
+        telemetry_attribution: dict | None = None,
     ) -> None:
         if root.is_symlink():
             raise BrokerProtocolError("broker root may not be a symlink")
@@ -1827,6 +1828,8 @@ class TestBrokerServer:
         self._pinned_root: Any | None = None
         self._worker_budget: Any | None = None
         self._worker_lock_root: Path | None = None
+        # Runner-supplied at turn start; never read from a coder request (#1107).
+        self._telemetry_attribution = dict(telemetry_attribution) if telemetry_attribution else None
 
     def set_execution_context(
         self,
@@ -2199,8 +2202,16 @@ class TestBrokerServer:
                     if self._process_finished is not None:
                         self._process_finished(proc)
 
+                from .worker_telemetry import ReservationTelemetry, telemetry_log_path
+
+                telemetry = ReservationTelemetry(
+                    telemetry_log_path(),
+                    self._telemetry_attribution
+                    or {"attribution_source": "none", "lane": "broker"},
+                )
                 result = run_foreground_test(
                     argv,
+                    reservation_telemetry=telemetry,
                     worker_budget=self.effective_worker_budget(environment),
                     worker_lock_root=self._worker_lock_root,
                     cwd=cwd,

@@ -15602,3 +15602,23 @@ def test_m1067_run_pr_loop_prints_fallback_state_report(tmp_path, monkeypatch, c
     assert not any(command[:3] == ["gh", "pr", "merge"] for command in commands)
     assert not any("DELETE" in command or "POST" in command for command in commands)
     assert not any(command[:1] in (["codex"], ["claude"], ["gemini"]) for command in commands)
+
+
+def test_owning_pr_loop_writes_run_window_on_normal_exit(tmp_path):
+    """Reservation telemetry (#1107): the real run_pr_loop, normal return."""
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    runner = FakeRunner(
+        codex_outputs=[
+            "LGTM.\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+        issue_payload={"number": 56, "title": "T", "body": "B\n\n-- Human Reviewer"},
+        issue_comments=[],
+        pr_payload={"body": "Fixes #56"},
+    )
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, quiet=False)) == 0
+    records = list(load_records(telemetry_log_path()))
+    assert [r["record"] for r in records] == ["run-start", "run-end"]
+    assert records[0]["pr_number"] == 77 and records[0]["run_id"] == records[1]["run_id"]
+    assert runner.telemetry_attribution is None

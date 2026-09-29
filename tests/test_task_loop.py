@@ -234,3 +234,21 @@ def test_codex_task_loop_rejects_empty_task_text(tmp_path):
         run_task_loop(runner, task_text="   ", config=config)
 
     assert runner.commands == []
+
+
+def test_task_loop_writes_one_run_window_on_normal_exit(tmp_path):
+    """Reservation telemetry (#1107): real task loop -> nested PR loop, one window."""
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    runner = FakeRunner(
+        claude_outputs=["Implemented.\n<!-- AGENT_PR: 91 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=[
+            "LGTM.\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+        pr_payload={"number": 91, "state": "OPEN", "url": "https://github.com/OWNER/REPO/pull/91"},
+    )
+    assert run_task_loop(runner, task_text="Add a /healthz endpoint.", config=make_config(tmp_path)) == 0
+    records = list(load_records(telemetry_log_path()))
+    assert [r["record"] for r in records] == ["run-start", "run-end"]
+    assert records[0]["run_id"] == records[1]["run_id"]
+    assert runner.telemetry_attribution is None

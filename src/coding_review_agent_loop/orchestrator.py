@@ -448,6 +448,7 @@ from .transient import (
     looks_like_backgrounded_completion,
 )
 from .usage import RunUsageContext, UsageMetadata, estimate_usage
+from .worker_telemetry import append_record, run_record, telemetry_log_path
 from .workdirs import active_workdir
 from .workdir_guard import (
     read_workdir_head,
@@ -2592,6 +2593,50 @@ def _new_usage_context(config: AgentLoopConfig) -> RunUsageContext:
     reset_host_footer_log_latch()
     run_id = new_run_id()
     return RunUsageContext(run_id=run_id, summary_path=run_usage_summary_path(config, run_id))
+
+
+def _begin_run_telemetry(
+    runner: Runner,
+    config: AgentLoopConfig,
+    usage_context: RunUsageContext,
+    owned: bool,
+    *,
+    issue_number: int | None = None,
+    pr_number: int | None = None,
+) -> tuple[bool, dict | None, dict | None]:
+    """Attribute reservation telemetry to this run (#1107); never raises.
+
+    An owning loop opens the run window.  A nested loop that received a usage
+    context only adds its PR number to the outer attribution.  Returns a token
+    for ``_end_run_telemetry``.
+    """
+    previous = getattr(runner, "telemetry_attribution", None)
+    try:
+        if owned:
+            attribution = {
+                "repo": config.repo,
+                "run_id": usage_context.run_id,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+            }
+            runner.telemetry_attribution = attribution
+            append_record(telemetry_log_path(), run_record("run-start", attribution))
+            return (True, previous, attribution)
+        if previous is not None and pr_number is not None:
+            runner.telemetry_attribution = {**previous, "pr_number": pr_number}
+    except Exception:
+        pass
+    return (False, previous, None)
+
+
+def _end_run_telemetry(runner: Runner, token: tuple[bool, dict | None, dict | None]) -> None:
+    owned, previous, attribution = token
+    try:
+        if owned and attribution is not None:
+            append_record(telemetry_log_path(), run_record("run-end", attribution))
+        runner.telemetry_attribution = previous
+    except Exception:
+        pass
 
 
 def _resolve_usage_metadata(
@@ -15669,6 +15714,9 @@ def run_issue_loop(
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     reset_authenticated_github_actor(runner)
+    telemetry_token = _begin_run_telemetry(
+        runner, config, usage_context, owned_usage_context, issue_number=issue_number
+    )
     try:
         requested_policy = _normalize_requested_execution_policy(
             config,
@@ -16530,6 +16578,7 @@ def run_issue_loop(
             managed_ci_handoff=managed_ci_handoff,
         )
     finally:
+        _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)
 
@@ -16564,6 +16613,7 @@ def run_task_loop(
 ) -> int:
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
+    telemetry_token = _begin_run_telemetry(runner, config, usage_context, owned_usage_context)
     try:
         if not task_text.strip():
             raise AgentLoopError("Task text is empty; provide a non-empty description.")
@@ -16709,6 +16759,7 @@ def run_task_loop(
 
         raise AgentLoopError("run_task_loop exited unexpectedly without producing a PR.")
     finally:
+        _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)
 
@@ -20297,6 +20348,9 @@ def run_pr_loop(
         )
 
     unchanged_head_tracker = _UnchangedHeadTracker()
+    telemetry_token = _begin_run_telemetry(
+        runner, config, usage_context, owned_usage_context, pr_number=pr_number
+    )
     try:
         bootstrap_cwd = github_bootstrap_cwd(config)
         initial_pr_context = get_pr_review_context(
@@ -26972,29 +27026,32 @@ def run_pr_loop(
                 f"PR #{pr_number}: retaining `{MANAGED_LABEL}` after interrupted managed run; "
                 "resume the exact PR after correcting the reported condition",
             )
-        if (
-            managed_ci is not None
-            and not managed_ci_qualified
-            and not preserve_issue_created_suppression
-        ):
-            should_release = (
-                managed_ci.adopted_existing_pr
-                or managed_ci.origin in {"issue-created", "source-managed"}
-                or config.managed_ci
-            )
-            if should_release and not release_adopted_managed_ci(
-                runner,
-                config=config,
-                pr_number=pr_number,
-                contract=managed_ci,
-                force=config.managed_ci,
+        try:
+            if (
+                managed_ci is not None
+                and not managed_ci_qualified
+                and not preserve_issue_created_suppression
             ):
-                message = f"PR #{pr_number}: unable to release invocation-owned managed-CI label"
-                if config.managed_ci:
-                    cleanup_failure = AgentLoopError(
-                        message + "; the PR remains suppressed and requires manual label removal."
-                    )
-                log(config, message)
+                should_release = (
+                    managed_ci.adopted_existing_pr
+                    or managed_ci.origin in {"issue-created", "source-managed"}
+                    or config.managed_ci
+                )
+                if should_release and not release_adopted_managed_ci(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    contract=managed_ci,
+                    force=config.managed_ci,
+                ):
+                    message = f"PR #{pr_number}: unable to release invocation-owned managed-CI label"
+                    if config.managed_ci:
+                        cleanup_failure = AgentLoopError(
+                            message + "; the PR remains suppressed and requires manual label removal."
+                        )
+                    log(config, message)
+        finally:
+            _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)
         if cleanup_failure is not None:
@@ -29206,6 +29263,9 @@ def run_discuss_loop(
 ) -> int:
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
+    telemetry_token = _begin_run_telemetry(
+        runner, config, usage_context, owned_usage_context, issue_number=issue_number
+    )
     try:
         if config.discuss_parallel:
             _ensure_parallel_discuss_workdirs(config)
@@ -29221,5 +29281,6 @@ def run_discuss_loop(
             discuss_max_rounds=discuss_max_rounds,
         )
     finally:
+        _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)

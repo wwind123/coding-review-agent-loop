@@ -1275,3 +1275,35 @@ def test_setsid_descendant_is_documented_exclusion_and_off_mode_terminates_nothi
         child = int(pid_file.read_text())
         os.kill(child, 0)  # still alive: outside the process group
         os.kill(child, 9)
+
+
+def test_run_tests_fallback_records_environment_attribution(tmp_path):
+    """Standalone lane (#1107): attribution is self-reported and labeled so."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from coding_review_agent_loop.worker_telemetry import load_records
+
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    log = tmp_path / "telemetry.jsonl"
+    base = {
+        **os.environ, "PYTHONPATH": src, "AGENT_LOOP_WORKER_TELEMETRY_LOG": str(log),
+        "AGENT_LOOP_TEST_WORKER_HOST_SHARING": "off",
+    }
+
+    def run(extra):
+        subprocess.run(
+            [sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests", "--timeout-seconds", "60",
+             "--", sys.executable, "-c", "pass"],
+            cwd=tmp_path, env={**base, **extra}, check=True, capture_output=True,
+        )
+
+    run({"AGENT_LOOP_RUN_REPO": "o/r", "AGENT_LOOP_RUN_ID": "r9", "AGENT_LOOP_RUN_PR": "4"})
+    run({})
+    first, second = [r for r in load_records(log) if r["record"] == "attempt"]
+    assert (first["repo"], first["run_id"], first["pr_number"]) == ("o/r", "r9", 4)
+    assert first["lane"] == "standalone" and first["attribution_source"] == "environment"
+    assert first["test_outcome"] == "passed"
+    assert second["attribution_source"] == "none" and second["repo"] is None

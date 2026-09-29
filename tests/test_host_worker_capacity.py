@@ -383,3 +383,317 @@ def test_post_spawn_failure_keeps_reservation_while_target_runs(tmp_path):
         except ProcessLookupError:
             pass
     assert _records(root) == []
+
+
+# --- reservation telemetry (#1107) -------------------------------------------------
+
+
+def _telemetry(tmp_path, name="t.jsonl"):
+    from coding_review_agent_loop.worker_telemetry import ReservationTelemetry
+
+    log = tmp_path / name
+    return log, ReservationTelemetry(log, {"repo": "o/r", "run_id": "r1", "attribution_source": "runner", "lane": "broker"})
+
+
+def _attempts(log):
+    from coding_review_agent_loop.worker_telemetry import load_records
+
+    return [r for r in load_records(log) if r["record"] == "attempt"]
+
+
+def _run(tmp_path, root, telemetry, *, budget=None, env=None, cmd=None, **extra):
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    return run_foreground_test(
+        cmd or [sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout_seconds=30,
+        env=env or _env("mine"), environment_is_complete=True, echo_output=False,
+        worker_budget=budget if budget is not None else _budget(4), worker_lock_root=root,
+        reservation_telemetry=telemetry, **extra,
+    )
+
+
+def test_telemetry_clean_grant(tmp_path):
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    result = _run(tmp_path, root, tel)
+    assert result.returncode == 0
+    (clean,) = _attempts(log)
+    assert clean["outcome"] == "granted" and clean["workers_granted"] == clean["workers_requested"]
+    assert clean["others_count"] == 0 and clean["retained"] is False
+    assert clean["command_seconds"] is not None and clean["released_at"] >= clean["reserved_at"]
+    assert clean["repo"] == "o/r" and clean["attribution_source"] == "runner"
+    assert _records(root) == []
+
+
+def test_telemetry_degraded_grant_keeps_notice_and_lowered_budget(tmp_path):
+    root = tmp_path / "locks"
+    other = _lock(root, "other-loop")
+    notices = []
+    try:
+        assert other.reserve_host_workers(3, _cpus(4)) == 3
+        log, tel = _telemetry(tmp_path)
+        result = _run(
+            tmp_path, root, tel, output_callback=notices.append,
+            cmd=[sys.executable, "-c", "import os; print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS'])"],
+        )
+        assert "workers=1" in result.output_tail
+        (row,) = _attempts(log)
+        assert row["outcome"] == "degraded"
+        assert (row["workers_requested"], row["workers_granted"]) == (4, 1)
+        assert (row["others_count"], row["others_workers"]) == (1, 3)
+        assert "4 CPU(s)" in row["capacity"]
+        assert any("other agent-loop runs on this host hold part" in text for text in notices)
+    finally:
+        other.close()
+
+
+def test_telemetry_refused_does_not_spawn_or_leave_a_reservation(tmp_path):
+    root = tmp_path / "locks"
+    marker = tmp_path / "spawned"
+    other = _lock(root, "other-loop")
+    try:
+        assert other.reserve_host_workers(4, _cpus(4)) == 4
+        log, tel = _telemetry(tmp_path)
+        result = _run(
+            tmp_path, root, tel, cmd=[sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"],
+        )
+        assert result.returncode == 125 and "other agent-loop runs on this host" in result.output_tail
+        assert not marker.exists()
+        assert len(_records(root)) == 1  # only the foreign holder
+        (row,) = _attempts(log)
+        assert row["outcome"] == "refused" and row["workers_granted"] == 0
+        assert row["reserved_at"] is None and row["command_seconds"] is None
+        assert row["target_started_at"] is None
+    finally:
+        other.close()
+    assert _records(root) == []
+
+
+def test_telemetry_overlap_rejection_writes_no_record(tmp_path):
+    from coding_review_agent_loop.test_runtime import acquire_command_lane
+
+    root = tmp_path / "locks"
+    env = _env("mine")
+    command = [sys.executable, "-c", "pass"]
+    first = acquire_command_lane(command, cwd=tmp_path, env=env)
+    assert first is not None
+    try:
+        log, tel = _telemetry(tmp_path)
+        result = _run(tmp_path, root, tel, env=env, cmd=command)
+    finally:
+        first.close()
+    assert result.outcome == "overlap-rejected"
+    assert not log.exists()
+
+
+def test_telemetry_reservation_start_excludes_wait(tmp_path, monkeypatch):
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    real = WorkerBudgetLock.reserve_host_workers
+
+    def slow(self, requested, capacity):
+        time.sleep(0.3)
+        return real(self, requested, capacity)
+
+    monkeypatch.setattr(WorkerBudgetLock, "reserve_host_workers", slow)
+    _run(tmp_path, root, tel)
+    (row,) = _attempts(log)
+    assert row["reserved_at"] - row["requested_at"] >= 0.3
+
+
+def test_telemetry_unshared_records_command_interval(tmp_path):
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    _run(tmp_path, root, tel, env=_env("mine", "off"))
+    log2, tel2 = _telemetry(tmp_path, "t2.jsonl")
+    _run(tmp_path, root, tel2, budget=WorkerBudget(4, "inherited", "off", "cpu", {}, False))
+    log3, tel3 = _telemetry(tmp_path, "t3.jsonl")
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    run_foreground_test(
+        [sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout_seconds=30,
+        env=_env("mine"), environment_is_complete=True, echo_output=False, reservation_telemetry=tel3,
+    )
+    for path in (log, log2, log3):
+        (row,) = _attempts(path)
+        assert row["outcome"] == "unshared" and row["reserved_at"] is None
+        assert row["target_started_at"] is not None and row["command_seconds"] is not None
+    assert _records(root) == []
+
+
+def test_telemetry_invocation_busy_error_and_dry_run(tmp_path, monkeypatch):
+    root = tmp_path / "locks"
+    holder = _lock(root, "mine")
+    try:
+        log, tel = _telemetry(tmp_path)
+        result = _run(tmp_path, root, tel)
+        assert result.outcome == "worker-budget-busy"
+        (row,) = _attempts(log)
+        assert row["outcome"] == "invocation-busy"
+    finally:
+        holder.close()
+
+    def boom(self, requested, capacity):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(WorkerBudgetLock, "reserve_host_workers", boom)
+    log2, tel2 = _telemetry(tmp_path, "t2.jsonl")
+    with pytest.raises(RuntimeError, match="boom"):
+        _run(tmp_path, root, tel2)
+    (row,) = _attempts(log2)
+    assert row["outcome"] == "error"
+    assert _records(root) == []
+
+    log3, tel3 = _telemetry(tmp_path, "t3.jsonl")
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    run_foreground_test(["true"], cwd=tmp_path, timeout_seconds=5, dry_run=True, reservation_telemetry=tel3)
+    assert not log3.exists()
+
+
+def test_telemetry_launch_failed_probe_emits_once(tmp_path):
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    result = _run(tmp_path, root, tel, cmd=["/nonexistent/binary-1107"])
+    assert result.outcome == "launch-failed"
+    assert len(_attempts(log)) == 1
+
+
+def test_telemetry_does_not_change_grants_or_reservation_bytes(tmp_path):
+    """The reservation file the target sees is identical with telemetry on and off."""
+    script = (
+        "import glob, json, os, sys; "
+        "d = sys.argv[1]; "
+        "token = os.environ['AGENT_LOOP_WORKER_RESERVATION']; "
+        "own = [f for f in glob.glob(d + '/*.reservation') if token in f]; "
+        "data = json.load(open(own[0])); data.pop('token'); data.pop('pgid'); "
+        "print(json.dumps({'workers': os.environ['AGENT_LOOP_TEST_WORKERS'], 'file': data}, sort_keys=True))"
+    )
+    seen = []
+    for enabled in (True, False):
+        root = tmp_path / f"locks-{enabled}"
+        other = _lock(root, "other-loop")
+        try:
+            assert other.reserve_host_workers(2, _cpus(4)) == 2
+            tel = _telemetry(tmp_path, f"x{enabled}.jsonl")[1] if enabled else None
+            result = _run(tmp_path, root, tel, cmd=[sys.executable, "-c", script, str(root)])
+            assert result.returncode == 0, result.output_tail
+            seen.append(result.output_tail.strip().splitlines()[-1])
+        finally:
+            other.close()
+    assert seen[0] == seen[1]
+    assert json.loads(seen[0])["workers"] == "2"
+
+
+def test_telemetry_flags_retained_share(tmp_path):
+    root = tmp_path / "locks"
+    pid_file = tmp_path / "escaped.pid"
+    script = (
+        "import subprocess, sys; "
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True); "
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))"
+    )
+    log, tel = _telemetry(tmp_path)
+    _run(tmp_path, root, tel, cmd=[sys.executable, "-c", script])
+    escaped = int(pid_file.read_text())
+    try:
+        (row,) = _attempts(log)
+        assert row["retained"] is True and row["released_at"] is not None
+        assert len(_records(root)) == 1  # the watcher/carrier keeps the share, as before
+        from coding_review_agent_loop.worker_telemetry import run_duty_cycles
+
+        start, end = row["requested_at"] - 1, row["released_at"] + 100
+        duty = run_duty_cycles([
+            {"record": "run-start", "run_id": "r1", "at": start},
+            {"record": "run-end", "run_id": "r1", "at": end},
+            {**row, "run_id": "r1"},
+        ])["r1"]
+        assert duty["retained"] == 1 and duty["duty_low"] < duty["duty_high"] <= 1.0
+    finally:
+        os.kill(escaped, 9)
+
+
+def test_telemetry_failed_probe_emits_once_without_spawning_and_releases(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop import runner as runner_module
+    from coding_review_agent_loop.test_runtime import LauncherProbeResult
+
+    root = tmp_path / "locks"
+    marker = tmp_path / "spawned"
+    cmd = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+    monkeypatch.setattr(
+        runner_module, "probe_inner_launcher",
+        lambda argv, **_kw: LauncherProbeResult(tuple(argv), "failed", diagnostic="probe failed"),
+    )
+    log, tel = _telemetry(tmp_path)
+    result = _run(tmp_path, root, tel, cmd=cmd)
+    assert result.outcome == "launch-failed" and result.inner_exec == "failed"
+    assert not marker.exists()
+    (row,) = _attempts(log)
+    assert row["outcome"] == "granted" and row["test_outcome"] == "launch-failed"
+    assert row["target_started_at"] is None and row["command_seconds"] is None
+    assert row["retained"] is False
+    assert _records(root) == []  # reservation released as before
+
+
+def test_telemetry_configuration_refusal_writes_no_record(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop import runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "apply_worker_budget",
+        lambda *_a, **_k: SimpleNamespace(refused="refused by configuration", cleanup=lambda: None, notices=()),
+    )
+    log, tel = _telemetry(tmp_path)
+    result = _run(tmp_path, tmp_path / "locks", tel)
+    assert result.outcome == "worker-budget-refused"
+    assert not log.exists()
+
+
+def test_telemetry_release_time_is_stamped_before_post_release_work(tmp_path):
+    import time
+
+    log, tel = _telemetry(tmp_path)
+    tel.begin(2)
+    tel.reserved(2, None)
+    tel.released()
+    stamped = tel.data["released_at"]
+    time.sleep(0.05)  # e.g. a slow output_callback delivering notices after close
+    tel.emit()
+    (rec,) = _attempts(log)
+    assert rec["released_at"] == stamped
+    assert time.time() - stamped >= 0.05
+
+
+def test_telemetry_run_foreground_test_stamps_release_before_notices(tmp_path):
+    import time
+
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    stamps = []
+
+    def slow_notice(msg):
+        if "late notice" in msg:
+            stamps.append(tel.data["released_at"])
+            time.sleep(0.2)
+
+    from coding_review_agent_loop import runner
+
+    real = runner.analyze_worker_report
+
+    def with_notice(*a, **k):
+        analysis = real(*a, **k)
+        import dataclasses
+
+        return dataclasses.replace(analysis, notices=("late notice",))
+
+    orig = runner.analyze_worker_report
+    runner.analyze_worker_report = with_notice
+    try:
+        _run(tmp_path, root, tel, output_callback=slow_notice)
+    finally:
+        runner.analyze_worker_report = orig
+    (rec,) = _attempts(log)
+    assert stamps and rec["released_at"] == stamps[0]

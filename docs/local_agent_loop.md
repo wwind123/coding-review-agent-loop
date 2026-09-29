@@ -1077,6 +1077,31 @@ the accounting reclaims the entry, so a crashed loop cannot deadlock the host. S
 `AGENT_LOOP_TEST_WORKER_HOST_SHARING=off` in the wrapper's environment to opt
 out and keep the per-invocation-only behavior.
 
+**Reservation telemetry.** To measure how often loops actually contend for the
+pool, every test command that obtains its command lane appends one JSON line
+(`record: attempt`) to `<cache root>/telemetry/worker-reservations.jsonl`;
+each owning run loop also appends `run-start` and `run-end` lines carrying its
+`run_id`. Set `AGENT_LOOP_WORKER_TELEMETRY_LOG` to an absolute path to move the
+file, or to `off` to disable it. An attempt records `requested_at`,
+`reserved_at` (the grant; null when nothing was reserved), `released_at`,
+`retained` (the reservation file still existed when the wrapper returned),
+`workers_requested`/`workers_granted`, `capacity` plus `others_count` and
+`others_workers` (other live reservations at decision time), `outcome`
+(`granted`, `degraded`, `refused`, `invocation-busy`, `unshared` or `error`),
+`target_started_at`, `command_seconds` (target spawn to exit), `test_outcome`,
+and `repo`/`run_id`/`issue_number`/`pr_number` with `attribution_source`
+(`runner` for the broker lane, where the orchestrator supplies attribution;
+`environment` or `none` for the standalone `run-tests` fallback, which is
+self-reported). Duty cycle: `worker_telemetry.run_duty_cycles(load_records(path))`
+holds from `reserved_at`, so wait time is excluded, clips every interval to the
+run's `[run-start, run-end]` window and returns `duty_low`/`duty_high` (they
+differ only when a share was retained after the wrapper returned).
+`run_intervals` gives the clipped interval unions; `overlap_seconds` on two
+runs' unions is their overlap. Appends are best-effort, unlocked and never
+rotated, so the file is a disposable measurement artifact that grows by
+kilobytes per day: delete it with `rm` when done. It changes no grant, lock or
+threshold.
+
 **Runtime cohorts.** `test-runtime.json` cohorts are keyed on
 `(normalized command, environment fingerprint, workers)`. The normalized
 command never includes the injected plugin token. In clamp and refuse the
