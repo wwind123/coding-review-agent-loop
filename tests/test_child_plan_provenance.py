@@ -1397,6 +1397,39 @@ def test_child_planning_cycle_resets_the_staged_planning_scheduler_state(
     assert err.count("does not inherit --plan-review-force-full") == 1
 
 
+def test_child_planning_cycle_does_not_inherit_the_stall_streak_reset(
+    tmp_path, monkeypatch, capsys
+):
+    """#1112: the one-shot operator reset never crosses into child planning."""
+    _parent_config, child_config, err = _capture_child_planning_config(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+        plan_reset_stall_streak=True,
+    )
+
+    assert child_config.plan_reset_stall_streak is False
+    assert child_config.plan_review_policy == "primary-then-panel"
+    assert err.count("does not inherit --plan-reset-stall-streak") == 1
+
+
+def test_child_planning_cycle_is_silent_when_the_stall_streak_reset_is_unset(
+    tmp_path, monkeypatch, capsys
+):
+    _parent_config, child_config, err = _capture_child_planning_config(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+
+    assert child_config.plan_reset_stall_streak is False
+    assert "does not inherit --plan-reset-stall-streak" not in err
+
+
 def test_child_planning_cycle_inherits_the_operator_plan_review_policy(
     tmp_path, monkeypatch, capsys
 ):
