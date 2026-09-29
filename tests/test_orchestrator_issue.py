@@ -14846,3 +14846,93 @@ def test_owning_pr_loop_writes_run_end_on_exception(tmp_path, monkeypatch):
     assert [r["record"] for r in records] == ["run-start", "run-end"]
     assert records[0]["pr_number"] == 77 and records[0]["run_id"] == records[1]["run_id"]
     assert runner.telemetry_attribution is None
+
+
+def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monkeypatch):
+    """#1107: the PR phase's coder followup turn is a real launch with a real broker."""
+    import subprocess
+    import sys
+
+    from agent_loop_helpers import structured_coder_followup, structured_pr_review
+    from coding_review_agent_loop.runner import Runner
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    checkout = tmp_path / "coder-checkout"
+    checkout.mkdir()
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.email", "t@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.name", "T"], check=True)
+    (checkout / "f.txt").write_text("x\n")
+    subprocess.run(["git", "-C", str(checkout), "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "init"], check=True)
+    src = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src")
+    child = (
+        "import sys; from coding_review_agent_loop.local_test_evidence import broker_client_from_environment; "
+        "print('outcome=' + broker_client_from_environment().run("
+        "[sys.executable, '-c', 'pass'], timeout_seconds=30).outcome)"
+    )
+    real_launches = []
+
+    class HybridRunner(FakeRunner):
+        """Scripted agents, except the PR-phase coder turn also really launches."""
+
+        def run_with_log(self, args, *, cwd, log_path, label, progress_interval_seconds, **kwargs):
+            attribution = self.telemetry_attribution
+            if list(args[:1]) == ["claude"] and attribution and attribution.get("pr_number"):
+                real = Runner()
+                real.telemetry_attribution = dict(attribution)
+                launched = real.run_with_log(
+                    [sys.executable, "-c", child], cwd=checkout, log_path=tmp_path / "real-coder.log",
+                    label="coder", progress_interval_seconds=1,
+                    env={"PYTHONPATH": src},
+                )
+                real_launches.append((launched.returncode, (tmp_path / "real-coder.log").read_text()))
+            return super().run_with_log(
+                args, cwd=cwd, log_path=log_path, label=label,
+                progress_interval_seconds=progress_interval_seconds, **kwargs,
+            )
+
+    runner = HybridRunner(
+        claude_outputs=[
+            structured_plan_state(summary="Implement it."),
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            structured_coder_followup(addressed_items=["item-1"]),
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved", summary="Plan approved."),
+            structured_pr_review(state="blocking", summary="Fix it.", blocking_items=["Fix the edge case."]),
+            structured_pr_review(
+                state="approved", summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "abc123"},
+    )
+    config = make_config(tmp_path, max_rounds=3)
+    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "merge_pr", lambda *_a, **_k: None)
+    seen = {}
+    real_pr_loop = orchestrator_module.run_pr_loop
+
+    def observed(*args, **kwargs):
+        try:
+            return real_pr_loop(*args, **kwargs)
+        finally:
+            seen["after_nested"] = dict(runner.telemetry_attribution)
+
+    monkeypatch.setattr(orchestrator_module, "run_pr_loop", observed)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
+
+    assert real_launches and real_launches[0][0] == 0 and "outcome=passed" in real_launches[0][1]
+    records = list(load_records(telemetry_log_path()))
+    kinds = [r["record"] for r in records]
+    assert kinds.count("run-start") == 1 and kinds.count("run-end") == 1 and kinds[-1] == "run-end"
+    (attempt,) = [r for r in records if r["record"] == "attempt"]
+    run_id = next(r for r in records if r["record"] == "run-start")["run_id"]
+    assert attempt["run_id"] == run_id
+    assert (attempt["issue_number"], attempt["pr_number"], attempt["lane"]) == (56, 77, "broker")
+    assert seen["after_nested"]["pr_number"] is None
+    assert runner.telemetry_attribution is None

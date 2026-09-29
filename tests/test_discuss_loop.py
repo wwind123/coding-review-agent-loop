@@ -4066,3 +4066,16 @@ def test_discuss_loop_is_unaffected_by_the_staged_planning_policy(tmp_path):
         assert metadata.flow == "discuss"
         assert metadata.scheduler_metadata_status == "absent"
         assert metadata.plan_candidate_key is None
+
+
+def test_discuss_loop_writes_run_window_on_normal_exit(tmp_path, monkeypatch):
+    """Reservation telemetry (#1107): normal return of the owning discuss loop."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    monkeypatch.setattr(orchestrator, "_run_discuss_loop", lambda *_a, **_k: 0)
+    runner = FakeRunner()
+    assert run_discuss_loop(runner, issue_number=56, config=make_config(tmp_path)) == 0
+    records = list(load_records(telemetry_log_path()))
+    assert [r["record"] for r in records] == ["run-start", "run-end"]
+    assert records[0]["issue_number"] == 56 and runner.telemetry_attribution is None
