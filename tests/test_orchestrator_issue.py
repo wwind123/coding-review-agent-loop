@@ -14944,3 +14944,33 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
     assert (attempt["issue_number"], attempt["pr_number"], attempt["lane"]) == (56, 77, "broker")
     assert seen["after_nested"]["pr_number"] is None
     assert runner.telemetry_attribution is None
+
+
+def test_pr_loop_writes_run_end_when_managed_label_cleanup_raises(tmp_path, monkeypatch):
+    """Reservation telemetry (#1107): cleanup failure must not skip run-end."""
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    runner = _M1047LivePrRunner(
+        draft=True,
+        events_fail_from=0,
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop", max_rounds=1)
+    import dataclasses
+
+    contract = dataclasses.replace(_m1047_contract("issue-created"), origin=None, issue_created_pr=False)
+    _m1047_reach_publication(monkeypatch, runner, contract)
+    calls = []
+
+    def boom(*_a, **_k):
+        calls.append(1)
+        raise RuntimeError("label cleanup interrupted")
+
+    monkeypatch.setattr(orchestrator_module, "release_adopted_managed_ci", boom)
+
+    with pytest.raises(RuntimeError, match="label cleanup interrupted"):
+        _m1047_run_pr_loop(runner, pr_number=77, config=config)
+
+    assert calls
+    assert [r["record"] for r in load_records(telemetry_log_path())] == ["run-start", "run-end"]
+    assert runner.telemetry_attribution is None

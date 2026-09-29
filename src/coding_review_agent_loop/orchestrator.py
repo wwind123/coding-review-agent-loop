@@ -26838,30 +26838,32 @@ def run_pr_loop(
                 f"PR #{pr_number}: retaining `{MANAGED_LABEL}` after interrupted managed run; "
                 "resume the exact PR after correcting the reported condition",
             )
-        if (
-            managed_ci is not None
-            and not managed_ci_qualified
-            and not preserve_issue_created_suppression
-        ):
-            should_release = (
-                managed_ci.adopted_existing_pr
-                or managed_ci.origin in {"issue-created", "source-managed"}
-                or config.managed_ci
-            )
-            if should_release and not release_adopted_managed_ci(
-                runner,
-                config=config,
-                pr_number=pr_number,
-                contract=managed_ci,
-                force=config.managed_ci,
+        try:
+            if (
+                managed_ci is not None
+                and not managed_ci_qualified
+                and not preserve_issue_created_suppression
             ):
-                message = f"PR #{pr_number}: unable to release invocation-owned managed-CI label"
-                if config.managed_ci:
-                    cleanup_failure = AgentLoopError(
-                        message + "; the PR remains suppressed and requires manual label removal."
-                    )
-                log(config, message)
-        _end_run_telemetry(runner, telemetry_token)
+                should_release = (
+                    managed_ci.adopted_existing_pr
+                    or managed_ci.origin in {"issue-created", "source-managed"}
+                    or config.managed_ci
+                )
+                if should_release and not release_adopted_managed_ci(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    contract=managed_ci,
+                    force=config.managed_ci,
+                ):
+                    message = f"PR #{pr_number}: unable to release invocation-owned managed-CI label"
+                    if config.managed_ci:
+                        cleanup_failure = AgentLoopError(
+                            message + "; the PR remains suppressed and requires manual label removal."
+                        )
+                    log(config, message)
+        finally:
+            _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)
         if cleanup_failure is not None:
