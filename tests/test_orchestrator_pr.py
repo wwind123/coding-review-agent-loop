@@ -15622,3 +15622,644 @@ def test_owning_pr_loop_writes_run_window_on_normal_exit(tmp_path):
     assert [r["record"] for r in records] == ["run-start", "run-end"]
     assert records[0]["pr_number"] == 77 and records[0]["run_id"] == records[1]["run_id"]
     assert runner.telemetry_attribution is None
+
+
+# --- Amended board derived on PR runs, CRLF records, repost recovery (#1133) ---
+
+
+def _m1133_crlf(body):
+    return body.replace("\n", "\r\n")
+
+
+def _m1133_resume_with_amendment(tmp_path, monkeypatch, *, configured):
+    """Partial 3-reviewer round, a CRLF signed amendment, then a resume."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    resume_boards = []
+    real_resume = orchestrator._resume_pr_round
+
+    def spy_resume(*args, **kwargs):
+        resume_boards.append(tuple(kwargs["configured_reviewers"]))
+        return real_resume(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_resume_pr_round", spy_resume)
+    calls_before = len(runner.commands)
+    config = (
+        reduced
+        if configured == "reduced"
+        else _staged_config(tmp_path, auto_merge=True)
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    new_commands = runner.commands[calls_before:]
+    posted = [
+        (
+            tuple(item.scheduler_contract["required_reviewers"]),
+            item.reviewer_board_amendment_digest,
+            item.phase,
+            item.round_number,
+        )
+        for item in _posted_scheduler_metadata(runner)
+        if item.reviewer_board_amendment_digest is not None
+    ]
+    return runner, new_commands, posted, resume_boards
+
+
+@pytest.mark.parametrize("configured", ["original", "reduced"])
+def test_1133_amendment_board_used_whichever_board_is_configured(
+    tmp_path, monkeypatch, configured
+):
+    """Rows original-board-force-full-latch, prompt-board-matches-scheduler, crlf-record-parses."""
+    runner, new_commands, posted, boards = _m1133_resume_with_amendment(
+        tmp_path, monkeypatch, configured=configured
+    )
+    assert "agy" not in [cmd[0] for cmd, _cwd in new_commands if cmd]
+    assert posted and all(board == ("Codex", "Gemini") for board, *_ in posted)
+    # Every later board read (prompts, follow-ups, gate) hangs off this rebound board.
+    assert boards and all(board == ("codex", "gemini") for board in boards)
+    assert any("Reviewer board amendment applied." in comment for comment in runner.comments)
+
+
+def test_1133_original_and_reduced_boards_produce_identical_records(tmp_path, monkeypatch):
+    """Row reduced-board-equivalence."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _, _, posted_original, _ = _m1133_resume_with_amendment(
+        tmp_path / "a", monkeypatch, configured="original"
+    )
+    _, _, posted_reduced, _ = _m1133_resume_with_amendment(
+        tmp_path / "b", monkeypatch, configured="reduced"
+    )
+    assert posted_original and posted_original == posted_reduced
+
+
+def test_1133_other_configured_board_still_drifts(tmp_path, monkeypatch):
+    """Row other-board-still-drifts: only C0 or the amended board is accepted."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
+    reordered = _staged_config(tmp_path, reviewer=("codex", "antigravity"), auto_merge=True)
+    with pytest.raises(AgentLoopError, match="scheduler contract changed"):
+        run_pr_loop(runner, pr_number=77, config=reordered)
+
+
+def test_1133_stale_records_posted_after_unread_amendment_print_repost_round(
+    tmp_path, monkeypatch
+):
+    """Rows stale-records-repost-hint and stale-record-no-unread-hint (PR #1124 shape)."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    template = _m943_amendment_from_error(str(excinfo.value))
+    # Amendment comment first, then a scheduler record that still carries C0
+    # and no digest (a run that never read the amendment).
+    comments = runner.pr_payload["comments"]
+    round_records = list(comments)
+    comments.clear()
+    _m943_append(runner, template)
+    comments.extend(round_records)
+    for config in (
+        _staged_config(tmp_path, auto_merge=True),
+        reduced,
+    ):
+        with pytest.raises(AgentLoopError) as stale:
+            run_pr_loop(runner, pr_number=77, config=config)
+        message = str(stale.value)
+        assert "Delete the amendment comment at PR #77 comment" in message
+        assert re.search(r"effective_from_round \d+", message)
+        assert "was not recognized" not in message
+    # Delete the unread comment and repost at the printed round: the resume
+    # then proceeds on the amended board.
+    round_number = int(re.search(r"effective_from_round (\d+)", message).group(1))
+    comments.remove(next(c for c in comments if "Reviewer board amendment" in c["body"]))
+    fresh = template.replace('"effective_from_round": 2', f'"effective_from_round": {round_number}')
+    _m943_append(runner, fresh)
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    assert run_pr_loop(
+        runner, pr_number=77, config=_staged_config(tmp_path, auto_merge=True)
+    ) == 0
+
+
+def test_1133_unreadable_amendment_after_startup_is_logged_at_the_gate(
+    tmp_path, monkeypatch, capsys
+):
+    """Row gate-unreadable-diagnostic: logged, requirements unchanged, no board change."""
+    runner, _, _, _ = _m1133_resume_with_amendment(tmp_path, monkeypatch, configured="original")
+    amended = orchestrator.make_contract(("Codex", "Gemini"), "primary-then-panel", None, "Codex")
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    before = orchestrator._fresh_pr_qualification_snapshot(
+        runner, config=reduced, pr_number=77, issue_context=None,
+        parent_issue_context=None, scheduler_contract=amended,
+    )
+    unreadable = (
+        "Reviewer board amendment:\n\n~~~json\n"
+        '{"kind": "reviewer-board-amendment"}\n~~~\n-- Human Reviewer'
+    )
+    _m943_append(runner, unreadable)
+    capsys.readouterr()
+    after = orchestrator._fresh_pr_qualification_snapshot(
+        runner, config=dataclasses.replace(reduced, quiet=False), pr_number=77,
+        issue_context=None, parent_issue_context=None, scheduler_contract=amended,
+    )
+    assert "fence could not be read" in capsys.readouterr().err
+    assert after[1] == before[1]
+
+
+def _m1133_automatic_latch(payload):
+    if not payload.get("scheduler_force_full"):
+        return None
+    return {**payload, "scheduler_force_full_source": "automatic"}
+
+
+def _m1133_latch_run(tmp_path, monkeypatch, *, configured):
+    """Force-full latch in history and on the resume, CRLF amendment, real rounds.
+
+    The first run's latch is rewritten to the automatic source; the resume keeps
+    the full-board latch on, so every selection is a full-board selection.
+    """
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    runner = FakeRunner(
+        codex_outputs=[_unavailable("OpenAI Codex")],
+        gemini_outputs=[_unavailable("Google Gemini")],
+        antigravity_outputs=[_unavailable("Antigravity")],
+        claude_outputs=[],
+    )
+    original = _staged_config(
+        tmp_path, coder="claude", pr_review_force_full=True, auto_merge=True
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=original)
+    _rewrite_pr_metadata(runner, _m1133_automatic_latch)
+    latched = _posted_scheduler_metadata(runner)
+    assert latched and any(item.scheduler_force_full_source == "automatic" for item in latched)
+
+    reduced = _staged_config(
+        tmp_path, coder="claude", reviewer=("codex", "gemini"), auto_merge=True
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
+
+    runner.codex_outputs.extend(
+        [
+            _staged_review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[{"text": "worker cleanup gap", "fix_scope": ["src/worker.py"]}],
+            ),
+            _staged_review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ]
+    )
+    runner.gemini_outputs.extend(
+        [
+            _staged_review(reviewer="Google Gemini"),
+            _staged_review(
+                reviewer="Google Gemini",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ]
+    )
+    runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-1"]))
+    start = len(runner.commands)
+    seeded = len(runner.comments)
+    config = reduced if configured == "reduced" else original
+    config = dataclasses.replace(
+        config, pr_review_force_full=True, pr_review_context_mode="compact"
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    commands = runner.commands[start:]
+    prompts = [(command[0], command[-1]) for command, _cwd in commands if command[:1] != ["git"]]
+    records = [
+        (
+            tuple(item.scheduler_contract["required_reviewers"]),
+            item.reviewer_board_amendment_digest,
+            item.phase,
+            item.round_number,
+            item.scheduler_selected_reviewers,
+            item.scheduler_force_full,
+        )
+        for item in _posted_scheduler_metadata(runner)
+        if item.reviewer_board_amendment_digest is not None
+    ]
+    return runner, commands, prompts, records, runner.comments[seeded:]
+
+
+@pytest.mark.parametrize("configured", ["original", "reduced"])
+def test_1133_automatic_latch_with_original_board_never_reinstates_removed_reviewer(
+    tmp_path, monkeypatch, configured
+):
+    """Rows original-board-force-full-latch and prompt-board-matches-scheduler."""
+    runner, commands, prompts, records, new_comments = _m1133_latch_run(
+        tmp_path, monkeypatch, configured=configured
+    )
+    agents = [command[0] for command, _cwd in commands if command[0] in {"claude", "codex", "gemini", "agy"}]
+    assert "agy" not in agents
+    assert "gemini" in agents and "claude" in agents
+    assert records and all(board == ("Codex", "Gemini") for board, *_ in records)
+    assert all("Antigravity" not in selected for *_, selected, _latched in records)
+    assert any(latched for *_, latched in records)
+    assert not any("missing required input" in c for c in new_comments)
+    # Every rendered agent prompt that names the board (the run is configured for
+    # compact context; whether a prompt is compact depends on session reuse)
+    # names only the amended one.
+    boards = []
+    for _agent, prompt in prompts:
+        boards.extend(re.findall(r"All configured reviewers \(([^)]*)\)", prompt))
+    assert len(boards) >= 3, "reviewer prompts were not rendered"
+    assert all("Antigravity" not in board for board in boards)
+    assert set(boards) == {"Codex and Gemini"}
+    coder_prompts = [prompt for agent, prompt in prompts if agent == "claude"]
+    assert coder_prompts and all("Antigravity" not in prompt for prompt in coder_prompts)
+    assert any("Reviewer board amended" in c or "reduced reviewer board" in c for c in new_comments)
+
+
+def test_1133_latch_original_and_reduced_boards_are_equivalent(tmp_path, monkeypatch):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _, _, prompts_a, records_a, _ = _m1133_latch_run(tmp_path / "a", monkeypatch, configured="original")
+    _, _, prompts_b, records_b, _ = _m1133_latch_run(tmp_path / "b", monkeypatch, configured="reduced")
+    assert records_a == records_b
+    def boards(prompts):
+        return [re.findall(r"All configured reviewers \(([^)]*)\)", p) for _a, p in prompts]
+    assert boards(prompts_a) == boards(prompts_b)
+
+
+@pytest.mark.parametrize("configured", ["original", "reduced"])
+def test_1133_unreadable_amendment_posted_during_managed_ci_does_not_block_qualification(
+    tmp_path, monkeypatch, capsys, configured
+):
+    """Row gate-unreadable-diagnostic, driven through run_pr_loop to the merge."""
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
+    unreadable = (
+        "Reviewer board amendment:\n\n~~~json\n"
+        '{"kind": "reviewer-board-amendment"}\n~~~\n-- Human Reviewer'
+    )
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+
+    def wait_and_inject(*args, **kwargs):
+        _m943_append(runner, unreadable, login="operator")
+        return ManagedCiOutcome(status="passed", head_sha="abc123")
+
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait_and_inject)
+    merges = []
+    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator, "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
+    )
+    config = reduced if configured == "reduced" else _staged_config(tmp_path, auto_merge=True)
+    config = dataclasses.replace(config, quiet=False)
+    calls_before = len(runner.commands)
+    capsys.readouterr()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert merges, "qualification did not reach the merge"
+    assert "fence could not be read" in capsys.readouterr().err
+    assert "agy" not in [
+        command[0] for command, _cwd in runner.commands[calls_before:] if command
+    ]
+    assert not any("missing required input" in comment for comment in runner.comments)
+
+
+class _PlanCheckReached(Exception):
+    """Raised by a patched authorization step once every plan check passed."""
+
+
+def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
+    """Fresh managed-CI authorization through run_pr_loop, plan approved by three."""
+    plan_board = ("codex", "gemini", "antigravity")
+    monkeypatch.setattr(
+        orchestrator, "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    )
+
+    def require(*_args, config, error_message, **_kw):
+        if tuple(config.reviewer) != plan_board:
+            raise AgentLoopError(error_message)
+
+    monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+
+    def reached(*_args, **_kwargs):
+        raise _PlanCheckReached
+
+    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", reached)
+    runner = _m943_partial_pr_round(
+        tmp_path,
+        issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        pr_payload={"body": "Fixes #56"},
+    )
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
+    config = _staged_config(
+        tmp_path,
+        reviewer=supplied,
+        managed_ci=True,
+        managed_ci_fresh_authorization=True,
+        managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    return runner, config
+
+
+def test_1133_strict_plan_check_passes_with_the_original_board_despite_a_pr_amendment(
+    tmp_path, monkeypatch
+):
+    """Row strict-managed-plan-binding-keeps-plan-board, original board."""
+    runner, config = _m1133_strict_plan_run(
+        tmp_path, monkeypatch, supplied=("codex", "gemini", "antigravity")
+    )
+    with pytest.raises(_PlanCheckReached):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+
+def test_1133_strict_plan_check_refuses_the_reduced_board_with_a_rerun_hint(
+    tmp_path, monkeypatch
+):
+    """Row strict-managed-plan-binding-keeps-plan-board, reduced board."""
+    runner, config = _m1133_strict_plan_run(
+        tmp_path, monkeypatch, supplied=("codex", "gemini")
+    )
+    with pytest.raises(AgentLoopError, match="Rerun with the original reviewer board"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+
+def _m1133_post_panel_latch_run(tmp_path, monkeypatch, *, configured):
+    """Qualified panel opening, durable automatic latch, then a CRLF amendment.
+
+    No operator force-full flag: the full board is selected only by the
+    automatic latch raised after the panel opened.
+    """
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    merges = []
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: merges.append(kwargs)
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[
+            _staged_review(
+                reviewer="Google Gemini",
+                state="blocking",
+                blocking_items=[{"text": "panel regression", "fix_scope": ["src/worker.py"]}],
+            )
+        ],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    # primary -> panel -> coder; the remediation round then runs out of output.
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, auto_merge=True))
+    assert _agent_sequence(runner)[:4] == ["codex", "gemini", "agy", "claude"]
+
+    def latch_after_opening(payload):
+        if payload.get("role") != "coder" or "scheduler_contract" not in payload:
+            return None
+        return {
+            **payload,
+            "scheduler_force_full": True,
+            "scheduler_force_full_source": "automatic",
+        }
+
+    _rewrite_pr_metadata(runner, latch_after_opening)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
+
+    seeded_agents = len(_agent_sequence(runner))
+    seeded_commands = len(runner.commands)
+    seeded_comments = len(runner.comments)
+    runner.advance_pr_head_on_coder_followup = False
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}]
+    # Round 3 (full board): Gemini keeps the item open, so the coder runs again
+    # on the same head and round 4 reuses each reviewer's round-3 session
+    # (compact context).
+    runner.codex_outputs.extend(
+        [
+            _staged_review(reviewer="OpenAI Codex", dispositions=resolved),
+            _staged_review(reviewer="OpenAI Codex", dispositions=resolved),
+        ]
+    )
+    runner.gemini_outputs.extend(
+        [
+            _staged_review(
+                reviewer="Google Gemini",
+                state="blocking",
+                dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "still broken"}
+                ],
+            ),
+            _staged_review(reviewer="Google Gemini", dispositions=resolved),
+        ]
+    )
+    runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-1"]))
+    config = reduced if configured == "reduced" else _staged_config(tmp_path, auto_merge=True)
+    config = dataclasses.replace(config, pr_review_context_mode="compact")
+    assert not config.pr_review_force_full
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    prompts = [
+        (command[0], command[-1])
+        for command, _cwd in runner.commands[seeded_commands:]
+        if command[0] in {"codex", "gemini", "agy", "claude"}
+    ]
+    records = [
+        (
+            tuple(item.scheduler_contract["required_reviewers"]),
+            item.reviewer_board_amendment_digest,
+            item.phase,
+            item.scheduler_selected_reviewers,
+            item.scheduler_force_full,
+            item.scheduler_force_full_source,
+        )
+        for item in _posted_scheduler_metadata(runner)
+        if item.reviewer_board_amendment_digest is not None
+    ]
+    runner.merge_calls = merges
+    return (
+        runner,
+        _agent_sequence(runner)[seeded_agents:],
+        prompts,
+        records,
+        runner.comments[seeded_comments:],
+    )
+
+
+@pytest.mark.parametrize("configured", ["original", "reduced"])
+def test_1133_post_panel_automatic_latch_uses_the_amended_board(
+    tmp_path, monkeypatch, configured
+):
+    """Rows original-board-force-full-latch and prompt-board-matches-scheduler."""
+    runner, new_agents, prompts, records, new_comments = _m1133_post_panel_latch_run(
+        tmp_path, monkeypatch, configured=configured
+    )
+    assert set(new_agents) == {"codex", "gemini", "claude"}
+    assert new_agents.count("gemini") == 2 and "agy" not in new_agents
+    audits = [c for c in new_comments if c.startswith("PR review scheduling audit:")]
+    assert len(audits) >= 2
+    for audit in audits:
+        assert "phase: full-board" in audit
+        assert "force-full: True (source: automatic)" in audit
+        assert "selected Codex, Gemini; paused none;" in audit
+    assert records and all(board == ("Codex", "Gemini") for board, *_ in records)
+    assert all("Antigravity" not in selected for _b, _d, _p, selected, *_ in records)
+    assert any(latched and source == "automatic" for *_, latched, source in records)
+    assert not any("missing required input" in c for c in new_comments)
+    # Qualification: exactly one exact-head merge, after every latched review,
+    # followed by the durable reduced-board completion note.
+    assert runner.merge_calls == [{"expected_head_sha": "abc123-coder-1"}]
+    notes = [c for c in new_comments if c.startswith("Review completed on a reduced reviewer board.")]
+    assert len(notes) == 1 and "required board now Codex, Gemini" in notes[0]
+    last_review = max(i for i, c in enumerate(new_comments) if "Google Gemini review" in c)
+    assert new_comments.index(notes[0]) > last_review
+    reviewer_prompts = [prompt for agent, prompt in prompts if agent in {"codex", "gemini"}]
+    boards = [
+        board
+        for prompt in reviewer_prompts
+        for board in re.findall(r"All configured reviewers \(([^)]*)\)", prompt)
+    ]
+    assert boards and set(boards) == {"Codex and Gemini"}
+    compact = [p for p in reviewer_prompts if COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER in p]
+    assert compact, "no reviewer turn entered the compact branch"
+    assert all("Antigravity" not in prompt for prompt in compact)
+
+
+def test_1133_post_panel_latch_original_and_reduced_boards_are_equivalent(tmp_path, monkeypatch):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    *_, records_a, _ = _m1133_post_panel_latch_run(tmp_path / "a", monkeypatch, configured="original")
+    *_, records_b, _ = _m1133_post_panel_latch_run(tmp_path / "b", monkeypatch, configured="reduced")
+    assert records_a and records_a == records_b
+
+
+def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ordinary"):
+    """Managed-CI entry (ordinary resume or fresh authorization) of an issue-created strict PR."""
+    from coding_review_agent_loop.managed_ci import AuthenticatedIssueCreatedHandoff
+
+    runner = _m943_partial_pr_round(
+        tmp_path,
+        issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/managed-56"},
+    )
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
+    plan_board = ("codex", "gemini", "antigravity")
+    plan_checks = []
+    monkeypatch.setattr(
+        orchestrator, "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    )
+
+    def require(*_args, config, error_message, **_kw):
+        plan_checks.append(tuple(config.reviewer))
+        if tuple(config.reviewer) != plan_board:
+            raise AgentLoopError(error_message)
+
+    monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    recovered_plan = orchestrator.make_approved_plan_context(
+        "approved plan",
+        source_locator="issue #56 canonical approved plan",
+        expected_hash=orchestrator.approved_plan_hash("approved plan"),
+    )
+    monkeypatch.setattr(
+        orchestrator, "recover_approved_plan_context", lambda *a, **k: recovered_plan
+    )
+    handoff = AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
+        trusted_actor_id=1, protection_mode="strict", override_nonce=None,
+    )
+    monkeypatch.setattr(orchestrator, "recover_issue_created_handoff", lambda *a, **k: handoff)
+    monkeypatch.setattr(
+        orchestrator, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff
+    )
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *a, **k: handoff)
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *args, **kwargs: None)
+    merges = []
+    monkeypatch.setattr(
+        orchestrator, "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
+    )
+    fresh = (
+        {"managed_ci_fresh_authorization": True, "managed_ci_issue_number": 56}
+        if entry == "fresh"
+        else {}
+    )
+    config = _staged_config(
+        tmp_path, reviewer=supplied, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        auto_merge=True, **fresh,
+    )
+    return runner, config, plan_checks, merges
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_1133_managed_entry_and_qualification_use_the_supplied_board_for_the_plan(
+    tmp_path, monkeypatch, entry
+):
+    """Row strict-managed-plan-binding-keeps-plan-board, original board, to the merge."""
+    runner, config, plan_checks, merges = _m1133_ordinary_resume_strict(
+        tmp_path, monkeypatch, supplied=("codex", "gemini", "antigravity"), entry=entry
+    )
+    calls_before = len(runner.commands)
+    runner.codex_outputs.extend([_staged_review(reviewer="OpenAI Codex")] * 2)
+    runner.gemini_outputs.extend([_staged_review(reviewer="Google Gemini")] * 2)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # The ordinary-resume check and the qualification binding both saw the
+    # supplied three-reviewer board; the PR itself ran on the amended board.
+    assert len(plan_checks) >= 2
+    assert set(plan_checks) == {("codex", "gemini", "antigravity")}
+    assert merges
+    assert "agy" not in [c[0] for c, _cwd in runner.commands[calls_before:] if c]
+    amended = [
+        tuple(item.scheduler_contract["required_reviewers"])
+        for item in _posted_scheduler_metadata(runner)
+        if item.reviewer_board_amendment_digest is not None
+    ]
+    assert amended and set(amended) == {("Codex", "Gemini")}
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_1133_managed_entry_refuses_the_reduced_board_with_the_rerun_hint(
+    tmp_path, monkeypatch, entry
+):
+    runner, config, plan_checks, merges = _m1133_ordinary_resume_strict(
+        tmp_path, monkeypatch, supplied=("codex", "gemini"), entry=entry
+    )
+    with pytest.raises(AgentLoopError, match="Rerun with the original reviewer board"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert plan_checks == [("codex", "gemini")] and not merges

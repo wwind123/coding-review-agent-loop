@@ -53,6 +53,7 @@ from .board_amendment import (
     require_amendment_activation,
     resolve_contract_lineage,
     restoration_rounds_from_comments,
+    stale_unread_amendment_locator,
 )
 from .decomposition import (
     _decode_json_payload,
@@ -12685,6 +12686,7 @@ def _run_plan_first_loop(
             f"{persisted_contract.primary_reviewer or '(none)'} and reviewer board "
             f"{', '.join(persisted_contract.required_reviewers)} ({detail}). Rerun with the "
             "persisted planning policy, primary, and reviewer board."
+            + _stale_amendment_repost_clause(detail, template_round)
             + _board_amendment_route_clause(
                 flow="plan",
                 issue_number=issue_number,
@@ -12692,6 +12694,7 @@ def _run_plan_first_loop(
                 persisted=persisted_contract,
                 configured=plan_scheduler_contract,
                 start_round_number=template_round,
+                amendments_recognized=bool(plan_board_amendments),
             )
         )
 
@@ -18758,6 +18761,7 @@ def _board_amendment_route_clause(
     persisted: object,
     configured: object | None,
     start_round_number: Callable[[], int | None],
+    amendments_recognized: bool = False,
 ) -> str:
     """The amendment-route clause appended to a contract-drift error (#943, #984)."""
     removed = missing_from_config(persisted, configured)
@@ -18788,11 +18792,54 @@ def _board_amendment_route_clause(
             "placeholder and keep the effective round printed here:\n\n"
             + template
         )
+    if flow == "plan":
+        rerun = (
+            " Posting the record is what removes the reviewer; a planning rerun then uses "
+            "the reduced reviewer board with the same policy and primary."
+        )
+    else:
+        rerun = (
+            " Posting the record is what removes the reviewer. Rerun with the original "
+            "reviewer board still configured (recommended); the reduced board is also "
+            "accepted, except on an issue-created strict managed-CI PR, where the approved "
+            "plan is re-verified against the supplied flags and the original board is "
+            "required. Do not drop the reviewer from the command line instead of posting "
+            "the record."
+        )
+    not_recognized = (
+        ""
+        if amendments_recognized
+        else " If you already posted a record and still see this drift, it was not "
+        "recognized; check the log for an ignored-record diagnostic."
+    )
     return (
         " If a reviewer backend is unavailable, a human operator may instead remove it "
         f"with a signed reviewer-board amendment posted on {surface}; replace the "
-        "rationale placeholder and keep the effective round printed here:\n\n"
+        "rationale placeholder and keep the effective round printed here."
+        + rerun
+        + not_recognized
+        + "\n\n"
         + template
+    )
+
+
+def _stale_amendment_repost_clause(
+    detail: str, start_round_number: Callable[[], int | None]
+) -> str:
+    """Delete-and-repost instruction for records posted under an unread amendment (#1133)."""
+    locator = stale_unread_amendment_locator(detail)
+    if locator is None:
+        return ""
+    try:
+        round_number: int | str | None = start_round_number()
+    except Exception:  # noqa: BLE001 - advisory text only
+        round_number = None
+    if round_number is None:
+        round_number = "the round the next resume re-enters"
+    return (
+        f" Delete the amendment comment at {locator} and post a fresh signed record with "
+        f"effective_from_round {round_number}; the fresh record is read from the start of "
+        "the next run."
     )
 
 
@@ -19896,6 +19943,7 @@ def _pr_contract_drift_error(
     configured: ReviewSchedulingContract | None,
     start_round_number: Callable[[], int | None],
     during: str = "resume",
+    amendments_recognized: bool = False,
 ) -> AgentLoopError:
     """The fail-closed PR contract-drift error, with the amendment route (#943)."""
     return AgentLoopError(
@@ -19908,13 +19956,15 @@ def _pr_contract_drift_error(
         + (
             ""
             if during == "qualification"
-            else _board_amendment_route_clause(
+            else _stale_amendment_repost_clause(detail, start_round_number)
+            + _board_amendment_route_clause(
                 flow="pr",
                 issue_number=None,
                 pr_number=pr_number,
                 persisted=persisted,
                 configured=configured,
                 start_round_number=start_round_number,
+                amendments_recognized=amendments_recognized,
             )
         )
     )
@@ -20022,6 +20072,33 @@ def _managed_binding_protection_mode(
     return None
 
 
+_PR_AMENDMENT_PLAN_BOARD_HINT = (
+    " Rerun with the original reviewer board configured; the signed PR amendment still "
+    "removes the reviewer from PR review."
+)
+
+
+def _pr_amendment_plan_board_hint(
+    pr_comments: Sequence[object],
+    *,
+    pr_number: int,
+    supplied_reviewers: Sequence[AgentName],
+) -> str:
+    """Rerun hint when a PR-only amendment explains a reduced supplied board (#1133)."""
+    try:
+        amendments = collect_reviewer_board_amendments(
+            pr_comments, flow="pr", pr_number=pr_number
+        )
+    except AgentLoopError:
+        return ""
+    supplied = {agent_display_name(reviewer) for reviewer in supplied_reviewers}
+    for amendment in amendments:
+        original = set(amendment.original_required_reviewers)
+        if any(name not in supplied for name in amendment.removed_reviewers) and supplied <= original:
+            return _PR_AMENDMENT_PLAN_BOARD_HINT
+    return ""
+
+
 def _verify_strict_managed_plan_binding(
     *,
     config: AgentLoopConfig,
@@ -20029,6 +20106,7 @@ def _verify_strict_managed_plan_binding(
     issue_context: IssueContext,
     metadata: PullRequestMetadata,
     expected_plan_hash: str,
+    pr_comments: Sequence[object] = (),
 ) -> None:
     """Bind a strict-protection managed PR to the issue's canonical plan.
 
@@ -20045,6 +20123,9 @@ def _verify_strict_managed_plan_binding(
             "Approved-plan/handoff identity changed or disappeared during PR qualification; "
             f"the strict managed-CI binding does not tie PR #{pr_number} to approved plan "
             f"{expected_plan_hash} ({reason}). Stale approvals cannot be used for this head."
+            + _pr_amendment_plan_board_hint(
+                pr_comments, pr_number=pr_number, supplied_reviewers=reviewers(config)
+            )
         )
 
     if metadata.head_branch != f"agent-loop/managed-{issue_context.number}" or not metadata.head_sha:
@@ -20081,8 +20162,14 @@ def _fresh_pr_qualification_snapshot(
     planning_child_binding: _PlanningChildBinding | None = None,
     managed_protection_mode: str | None = None,
     managed_retired_plan_hashes: frozenset[str] = frozenset(),
+    plan_binding_reviewers: Sequence[AgentName] | None = None,
 ) -> tuple[PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None, AgentLoopConfig]:
-    """Refetch the PR-side qualification inputs immediately before a gate."""
+    """Refetch the PR-side qualification inputs immediately before a gate.
+
+    ``plan_binding_reviewers`` is the operator-supplied board the issue plan is
+    re-verified against; it differs from ``config.reviewer`` when a signed PR
+    amendment reduced the effective PR board (#1133).
+    """
     staged_owner = (
         approved_plan_context.risk_test_matrix_execution_owner
         if approved_plan_context is not None
@@ -20172,15 +20259,22 @@ def _fresh_pr_qualification_snapshot(
             # so a digest on a coder or reviewer record posted during managed
             # CI fails closed; only an invalid optimization record already
             # superseded by the recovery rule above is left out.
+            fresh_amendment_diagnostics: list[str] = []
+            fresh_amendments = collect_reviewer_board_amendments(
+                context.comments,
+                flow="pr",
+                pr_number=pr_number,
+                ignored_sink=fresh_amendment_diagnostics,
+            )
+            for diagnostic in fresh_amendment_diagnostics:
+                log(config, f"PR #{pr_number}: {diagnostic}")
             resolve_contract_lineage(
                 tuple(
                     record
                     for record in fresh_scheduler_records
                     if record.index not in superseded_invalid_indexes
                 ),
-                collect_reviewer_board_amendments(
-                    context.comments, flow="pr", pr_number=pr_number
-                ),
+                fresh_amendments,
                 scheduler_contract,
                 contract_from_metadata=_scheduler_contract_from_metadata,
                 drift_error=lambda persisted, detail: _pr_contract_drift_error(
@@ -20235,11 +20329,18 @@ def _fresh_pr_qualification_snapshot(
             # its resume was: reserved branch plus the issue's canonical plan.
             if managed_protection_mode == "strict":
                 _verify_strict_managed_plan_binding(
-                    config=config,
+                    config=(
+                        config
+                        if plan_binding_reviewers is None
+                        else dataclasses_replace(
+                            config, reviewer=tuple(plan_binding_reviewers)
+                        )
+                    ),
                     pr_number=pr_number,
                     issue_context=fresh_issue,
                     metadata=context.metadata,
                     expected_plan_hash=approved_plan_context.plan_hash,
+                    pr_comments=context.comments,
                 )
             else:
                 verify_managed_pr_plan_binding(
@@ -20644,6 +20745,11 @@ def run_pr_loop(
                         error_message=(
                             "Managed-CI fresh authorization found planning state without "
                             "a complete canonical reviewer approval."
+                            + _pr_amendment_plan_board_hint(
+                                initial_pr_context.comments,
+                                pr_number=pr_number,
+                                supplied_reviewers=reviewers(config),
+                            )
                         ),
                     )
                     recovered_plan_context = make_approved_plan_context(
@@ -20785,6 +20891,11 @@ def run_pr_loop(
                                 error_message=(
                                     "Managed-CI ordinary resume found incomplete canonical "
                                     "plan approval."
+                                    + _pr_amendment_plan_board_hint(
+                                        initial_pr_context.comments,
+                                        pr_number=pr_number,
+                                        supplied_reviewers=reviewers(config),
+                                    )
                                 ),
                             )
                             recovered_scope = make_approved_plan_context(
@@ -21887,6 +21998,7 @@ def run_pr_loop(
             startup_records,
             pr_board_amendments,
             scheduler_contract,
+            accept_base_configured=True,
             contract_from_metadata=_scheduler_contract_from_metadata,
             drift_error=lambda persisted, detail: _pr_contract_drift_error(
                 persisted,
@@ -21896,8 +22008,36 @@ def run_pr_loop(
                 start_round_number=lambda: _pr_amendment_start_round(
                     initial_pr_context, configured_reviewers, scheduler_capabilities
                 ),
+                amendments_recognized=bool(pr_board_amendments),
             ),
         )
+        # The operator may keep the original board configured and let the signed
+        # amendment do the removing (#1133).  Rebind every later board read to
+        # the amended board so scheduling, prompts, and the gate agree.
+        operator_reviewers = reviewers(config)
+        pr_effective_contract = pr_contract_lineage.contracts[-1]
+        if pr_effective_contract != scheduler_contract:
+            effective_names = set(pr_effective_contract.required_reviewers)
+            effective_reviewers = tuple(
+                reviewer
+                for reviewer in operator_reviewers
+                if agent_display_name(reviewer) in effective_names
+            )
+            log(
+                config,
+                f"PR #{pr_number}: configured reviewer board "
+                f"{', '.join(agent_display_name(r) for r in operator_reviewers)} differs from "
+                "the signed amended board "
+                f"{', '.join(pr_effective_contract.required_reviewers)}; using the amended board.",
+            )
+            config = dataclasses_replace(config, reviewer=effective_reviewers)
+            configured_reviewers = reviewers(config)
+            scheduler_contract = pr_effective_contract
+            reviewer_acquisition_contract = {
+                name: value
+                for name, value in reviewer_acquisition_contract.items()
+                if name in effective_names
+            }
         pr_amendment_digest = pr_contract_lineage.active_digest
         pr_amendment_checkpoint_pending = bool(pr_contract_lineage.pending_amendments)
         for record in startup_records:
@@ -24857,6 +24997,7 @@ def run_pr_loop(
                         planning_child_binding=planning_child_binding,
                         managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                         managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
+                        plan_binding_reviewers=operator_reviewers,
                     )
                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                         log(
@@ -25262,6 +25403,7 @@ def run_pr_loop(
                                 planning_child_binding=planning_child_binding,
                                 managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                                 managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
+                                plan_binding_reviewers=operator_reviewers,
                             )
                             if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                 unresolved_items = _advance_machine_obligations_for_head(
@@ -25729,6 +25871,7 @@ def run_pr_loop(
                             planning_child_binding=planning_child_binding,
                             managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                             managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
+                            plan_binding_reviewers=operator_reviewers,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             prefetched_pr_context = fresh_context
@@ -25764,6 +25907,7 @@ def run_pr_loop(
                             planning_child_binding=planning_child_binding,
                             managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                             managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
+                            plan_binding_reviewers=operator_reviewers,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             log(
@@ -26047,6 +26191,7 @@ def run_pr_loop(
                                         planning_child_binding=planning_child_binding,
                                         managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                                         managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
+                                        plan_binding_reviewers=operator_reviewers,
                                     )
                                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                         prefetched_pr_context = fresh_context

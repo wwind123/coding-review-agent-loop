@@ -482,6 +482,12 @@ a removed reviewer are reassigned in a derived ledger view that never rewrites
 persisted in-round `prior_items`, and approvals banked by the removed reviewer
 remain history only. A comment carrying only such a record is excluded from
 signed human requirements.
+On PR runs (#1133) the resolver may also accept the original (C0) board as the
+configured contract; startup then rebinds the run's config, scheduler contract,
+and reviewer set to the amended board, so every full-board selection, prompt, and
+gate check sees it. Strict managed-CI issue-plan checks keep the operator-supplied
+board. Amendment parsing normalizes CRLF, and an amendment-shaped comment whose
+fence cannot be read is logged and excluded from signed requirements.
 The opt-in `primary-then-panel` policy adds a phase-aware contract with one
 primary reviewer and a non-empty secondary panel. It keeps the primary as the
 only normal reviewer until exact-head approval, then dispatches an independent

@@ -234,7 +234,7 @@ def test_binding_rejects_an_uninspectable_comment_list(tmp_path):
 
 def _snapshot(
     tmp_path, monkeypatch, *, managed_ci, issue_comments=(), managed_protection_mode=None,
-    head_branch="agent-loop/managed-959",
+    head_branch="agent-loop/managed-959", reviewer=None, plan_binding_reviewers=None,
 ):
     issue = IssueContext(
         number=959, repo="OWNER/REPO", title="t", body="b", url=None,
@@ -261,11 +261,15 @@ def _snapshot(
     monkeypatch.setattr(
         orchestrator, "verify_managed_pr_plan_binding", lambda *a, **k: calls.append(k)
     )
-    config = make_config(tmp_path, managed_ci=managed_ci, managed_ci_trusted_actor="agent-loop")
+    extra = {"reviewer": reviewer} if reviewer is not None else {}
+    config = make_config(
+        tmp_path, managed_ci=managed_ci, managed_ci_trusted_actor="agent-loop", **extra
+    )
     result = orchestrator._fresh_pr_qualification_snapshot(
         object(), config=config, pr_number=7, issue_context=issue,
         parent_issue_context=None, approved_plan_context=plan,
         managed_protection_mode=managed_protection_mode,
+        plan_binding_reviewers=plan_binding_reviewers,
     )
     return result, calls
 
@@ -429,3 +433,24 @@ def test_retired_root_does_not_launder_a_mixed_chain(tmp_path):
             pr_number=7, issue_number=959, live_head="head-1", approved_plan_hash=PLAN,
             retired_plan_hashes=frozenset({OLD_PLAN}),
         )
+
+
+def test_strict_qualification_checks_the_plan_against_the_supplied_board_not_the_amended_one(
+    tmp_path, monkeypatch
+):
+    """#1133: a PR-only amendment narrows config.reviewer, never the plan-side board."""
+    _strict(monkeypatch)
+    seen = []
+
+    def require(*_a, config, error_message, **_k):
+        seen.append(tuple(config.reviewer))
+
+    monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    (_context, _ids, plan, returned), _calls = _snapshot(
+        tmp_path, monkeypatch, managed_ci=True, managed_protection_mode="strict",
+        reviewer=("codex", "claude"), plan_binding_reviewers=("codex", "claude", "gemini"),
+    )
+    assert plan.plan_hash == PLAN
+    assert seen == [("codex", "claude", "gemini")]
+    # The returned config keeps the amended PR board for scheduling.
+    assert tuple(returned.reviewer) == ("codex", "claude")

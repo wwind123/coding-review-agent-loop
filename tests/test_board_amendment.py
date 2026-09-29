@@ -786,3 +786,146 @@ def test_drift_error_offers_a_restore_template_when_config_adds_a_reviewer():
     assert record.restored_reviewers == ("Antigravity",)
     assert record.removed_reviewers == ()
     assert record.effective_from_round == 4
+
+
+# --- CRLF, unreadable records, base-board acceptance, repost hints (#1133) ------
+
+
+def _crlf(body):
+    return body.replace("\n", "\r\n")
+
+
+def test_crlf_signed_amendment_parses_with_the_lf_digest_and_is_not_a_requirement():
+    from coding_review_agent_loop.github import _parse_pr_human_requirements
+
+    lf = _amendment_body(flow="pr", issue=None, pr_number=77)
+    (lf_record,) = collect_reviewer_board_amendments(
+        [_comment(lf)], flow="pr", pr_number=77
+    )
+    (crlf_record,) = collect_reviewer_board_amendments(
+        [_comment(_crlf(lf))], flow="pr", pr_number=77
+    )
+    assert crlf_record.digest == lf_record.digest
+    ordinary = "Please keep the CLI flag stable.\n-- Human Reviewer"
+    parsed = _parse_pr_human_requirements(
+        {"comments": [{"body": _crlf(lf)}, {"body": ordinary}]}
+    )
+    assert [item.body for item in parsed] == ["Please keep the CLI flag stable."]
+
+
+def _tilde_body():
+    return _amendment_body().replace("```json", "~~~json").replace("\n```", "\n~~~")
+
+
+def test_amendment_shaped_unreadable_block_is_reported_and_not_a_requirement():
+    from coding_review_agent_loop.board_amendment import is_reviewer_board_amendment_only
+    from coding_review_agent_loop.github import _parse_pr_human_requirements
+    from coding_review_agent_loop.protocol import parse_signed_human_requirement_body
+
+    body = _tilde_body()
+    records, ignored = parse_reviewer_board_amendment_records(body, comment_locator="c1")
+    assert records == ()
+    assert len(ignored) == 1 and "fence could not be read" in ignored[0]
+    assert is_reviewer_board_amendment_only(parse_signed_human_requirement_body(body))
+    assert not _parse_pr_human_requirements({"comments": [{"body": body}]})
+
+
+def test_prose_mentioning_the_kind_stays_a_requirement_without_amendment_diagnostic():
+    from coding_review_agent_loop.board_amendment import is_reviewer_board_amendment_only
+    from coding_review_agent_loop.protocol import parse_signed_human_requirement_body
+
+    prose = "Do not use a reviewer-board-amendment here.\n-- Human Reviewer"
+    with_tilde = _tilde_body().replace(
+        "Reviewer board amendment:", "Please also rename the flag."
+    )
+    malformed_strict = _amendment_body().replace('"flow": "plan",', '"flow": "plan"').replace(
+        "Reviewer board amendment:", "Please also rename the flag."
+    )
+    for body, expected in ((prose, 0), (with_tilde, 0), (malformed_strict, 1)):
+        _records, ignored = parse_reviewer_board_amendment_records(body, comment_locator="c")
+        assert len(ignored) == expected
+        assert not is_reviewer_board_amendment_only(parse_signed_human_requirement_body(body))
+    assert "invalid JSON" in parse_reviewer_board_amendment_records(
+        malformed_strict, comment_locator="c"
+    )[1][0]
+
+
+def test_resolver_accepts_the_base_board_only_when_asked_and_never_other_boards():
+    (amendment,) = _plan_amendments([_comment(_amendment_body(effective_from_round=2))])
+    base = [_checkpoint(0, 1, C0)]
+    kwargs = dict(
+        contract_from_metadata=_plan_contract, drift_error=_drift, accept_base_configured=True
+    )
+    for configured in (C0, C1):
+        lineage = resolve_contract_lineage(base, [amendment], configured, **kwargs)
+        assert lineage.contracts[-1] == C1
+    reordered = make_plan_contract(("Claude", "Codex"), "primary-then-panel", "Codex")
+    with pytest.raises(AgentLoopError, match="does not match it"):
+        resolve_contract_lineage(base, [amendment], reordered, **kwargs)
+    with pytest.raises(AgentLoopError, match="does not match it"):
+        _resolve(base, [amendment], C0)
+
+
+def test_stale_record_detail_is_tagged_and_drift_builders_print_the_repost_round():
+    from coding_review_agent_loop import orchestrator
+    from coding_review_agent_loop.board_amendment import (
+        STALE_UNREAD_AMENDMENT_HINT,
+        stale_unread_amendment_locator,
+    )
+
+    comments = [_comment("x")] * 3 + [_comment(_amendment_body(effective_from_round=2))]
+    amendments = _plan_amendments(comments)
+    base = [_checkpoint(0, 1, C0), _checkpoint(5, 2, C0)]
+    with pytest.raises(AgentLoopError) as excinfo:
+        _resolve(base, amendments, C1)
+    assert STALE_UNREAD_AMENDMENT_HINT in str(excinfo.value)
+    locator = stale_unread_amendment_locator(str(excinfo.value))
+    assert locator == "issue #942 comment 4"
+    detail = str(excinfo.value)
+    text = orchestrator._stale_amendment_repost_clause(detail, lambda: 2)
+    assert f"Delete the amendment comment at {locator}" in text
+    assert "effective_from_round 2" in text
+    assert "the round the next resume re-enters" in orchestrator._stale_amendment_repost_clause(
+        detail, lambda: None
+    )
+    assert orchestrator._stale_amendment_repost_clause("no tag", lambda: 2) == ""
+
+
+def test_route_clause_names_rerun_rules_and_the_not_recognized_hint():
+    from coding_review_agent_loop import orchestrator
+
+    def clause(flow, recognized):
+        return orchestrator._board_amendment_route_clause(
+            flow=flow,
+            issue_number=942 if flow == "plan" else None,
+            pr_number=77 if flow == "pr" else None,
+            persisted=C0,
+            configured=C1,
+            start_round_number=lambda: 2,
+            amendments_recognized=recognized,
+        )
+
+    pr = clause("pr", False)
+    assert "Posting the record is what removes the reviewer" in pr
+    assert "original reviewer board still configured (recommended)" in pr
+    assert "issue-created strict managed-CI PR" in pr
+    assert "it was not recognized" in pr
+    assert "it was not recognized" not in clause("pr", True)
+    plan = clause("plan", False)
+    assert "planning rerun then uses the reduced reviewer board" in plan
+    assert '"effective_from_round": 2' in pr
+
+
+def test_plan_board_hint_only_when_a_pr_amendment_explains_the_reduced_flags():
+    from coding_review_agent_loop import orchestrator
+
+    body = _amendment_body(flow="pr", issue=None, pr_number=77)
+    comments = [_comment(body)]
+    hint = orchestrator._pr_amendment_plan_board_hint
+    assert "original reviewer board" in hint(
+        comments, pr_number=77, supplied_reviewers=("codex", "claude")
+    )
+    assert hint(comments, pr_number=77, supplied_reviewers=("codex", "claude", "antigravity")) == ""
+    assert hint([], pr_number=77, supplied_reviewers=("codex", "claude")) == ""
+    # A record naming another PR is undecodable for this surface: no hint.
+    assert hint(comments, pr_number=78, supplied_reviewers=("codex", "claude")) == ""
