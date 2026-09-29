@@ -12621,3 +12621,153 @@ def test_m1067_recovery_incapable_draft_labeled_resume_reports_measured_state(
         command[:3] == ["gh", "pr", "ready"] or "DELETE" in command
         for command, _cwd in loop_runner.commands
     )
+
+
+def test_waiter_returns_timeout_not_passed_for_final_success_with_nonfinal_failure(tmp_path):
+    """#1117: the real waiter never reports `passed` for this board; it times out with it."""
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1
+    )
+    runner = ManagedRunner(
+        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_status_payload={"statuses": [{"context": FINAL_CONTEXT, "state": "success", "target_url": None}]},
+        pr_check_runs_payload={
+            "total_count": 1,
+            "check_runs": [{"id": 3, "name": "lint", "status": "completed", "conclusion": "failure"}],
+        },
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+
+    outcome = wait_for_final_qualification(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert outcome.status == "timeout"
+    assert outcome.head_sha == "abc123"
+    assert [check.name for check in outcome.checks.failing] == ["lint"]
+
+
+def test_draft_labeled_state_left_by_supersession_stop_is_accepted_by_real_resume_paths(tmp_path):
+    """#1117: the side-effect-free draft stop leaves a lifecycle both resume entries accept."""
+    from coding_review_agent_loop.managed_ci import authenticate_source_managed_resume
+
+    runner = _recovery_runner([_unreadable_record()])
+    config = _cloud_config(tmp_path, managed_ci_pr_mode=True)
+
+    handoff = _recover(runner, config)
+    assert handoff is not None
+    assert _mutations(runner) == []
+
+    source_runner = _recovery_runner([_unreadable_record()])
+    resume = authenticate_source_managed_resume(
+        source_runner, config=_cloud_config(tmp_path), pr_number=7,
+        source_branch="feature", source_sha="abc123",
+        managed_branch="agent-loop/managed-643", override_nonce="opening-nonce",
+    )
+    assert resume.lifecycle == "draft-labeled"
+    assert _mutations(source_runner) == []
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+@pytest.mark.parametrize("auto_merge", [True, False], ids=["auto-merge", "manual"])
+def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligation(
+    tmp_path, monkeypatch, origin, auto_merge
+):
+    """#1117: stop a real draft-labeled managed PR carrying the persisted item, then resume it."""
+    import dataclasses
+    from test_orchestrator_pr import _carried_ci_obligations, _carried_ci_review_comment
+    from coding_review_agent_loop.github import PullRequestMergeability
+    from coding_review_agent_loop.managed_ci import ManagedCiOutcome
+
+    item = dataclasses.replace(
+        _carried_ci_obligations()[1], text="Failing checks: Python 3.12 full suite (failure)"
+    )
+    approval = structured_pr_review(
+        reviewer="OpenAI Codex", state="approved",
+        prior_item_dispositions=[{"item_id": item.item_id, "disposition": "resolved"}],
+    )
+    runner = _qualified_ready_labeled_runner(origin, codex_outputs=[approval, approval])
+    runner.rest_pr["draft"] = True
+    runner.pr_payload["comments"] = [
+        {"author": {"login": "coding-review-agent-loop"}, "body": _carried_ci_review_comment((item,))}
+    ]
+    kwargs = {"auto_merge": True} if auto_merge else {}
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", reviewer=("codex",),
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
+        ),
+        **kwargs,
+    )
+    monkeypatch.setattr(
+        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    )
+
+    def board(protection):
+        runs = [
+            PullRequestCheck(FINAL_CONTEXT, "check_run", "success"),
+            PullRequestCheck("Python 3.12 full suite", "check_run", "skipped"),
+        ]
+        return PullRequestChecks(
+            state="passing", required_checks=(), passing=tuple(runs), pending=(), failing=(),
+            missing_required=(), branch_protection_status=protection, listing_complete=True,
+        )
+
+    state = {"protection": "forbidden"}
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification",
+        lambda *a, **k: ManagedCiOutcome(
+            status="passed", checks=board(state["protection"]), head_sha="abc123"
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_mergeability_for_unreadable_protection",
+        lambda *a, **k: PullRequestMergeability(
+            state="mergeable", mergeable_raw="MERGEABLE", merge_state_raw="DRAFT",
+            head_sha="abc123", base_branch="main",
+        ),
+    )
+    finalized = []
+    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *a, **k: finalized.append("prepare"))
+    monkeypatch.setattr(orchestrator, "_merge_with_exact_head_proof", lambda *a, **k: finalized.append("merge"))
+    monkeypatch.setattr(
+        orchestrator, "publish_manual_v2_qualification",
+        lambda *a, **k: finalized.append("publish") or "abc123",
+    )
+    real_activate = orchestrator.activate_managed_ci
+    lifecycles = []
+
+    def activate(*args, **kwargs):
+        lifecycles.append(kwargs["managed_resume"].lifecycle)
+        return real_activate(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate)
+
+    with pytest.raises(AgentLoopError, match="administration: read"):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert lifecycles == ["draft-labeled"]
+    assert finalized == []
+    assert _lifecycle_writes(runner) == []  # no label, ready, or merge write
+    assert runner.rest_pr["draft"] is True
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+    # The persisted round metadata still holds the carried item, unchanged.
+    from types import SimpleNamespace
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    persisted = [
+        i
+        for record in _extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
+        )
+        for i in (*record.metadata.prior_items, *record.metadata.new_items)
+        if i.obligation_kind == "github-pr-checks"
+    ]
+    assert persisted and {(i.text, i.lifecycle, i.failed_head_sha, i.candidate_head_sha) for i in persisted} == {
+        (item.text, item.lifecycle, item.failed_head_sha, item.candidate_head_sha)
+    }
+
+    # Protection becomes readable: resume the SAME PR through the same real entry path.
+    state["protection"] = "configured"
+    assert orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True) == 0
+    assert lifecycles == ["draft-labeled", "draft-labeled"]
+    assert finalized == (["prepare", "merge"] if auto_merge else ["publish"])

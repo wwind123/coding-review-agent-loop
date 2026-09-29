@@ -4121,6 +4121,25 @@ re-review, qualification, and merge in one invocation instead of stopping for a
 PR-mode resume (#1024). An older binary resuming such a chain cannot
 reauthenticate the link and stops rather than granting anything.
 
+A correlated, successful exact-head qualification also retires a carried
+ordinary `github-pr-checks` obligation at the qualified head (#1117). The
+managed workflow requalifies the head and may skip the ordinary job, so the
+former failing check need not reappear. The obligation clears only when the
+full board at that head is complete and free of query errors, `final-ci/exact-head`
+succeeded, nothing required is failing, pending, or missing, no same-name
+observation the board display collapses is failing or pending, and every
+observation of a required check is a real success. When branch protection is
+unreadable (HTTP 403), the same-head `CLEAN` merge state is required; a draft
+reports `DRAFT`, so the run stops before any side effect. Grant the token read
+access to branch protection and resume; do not mark the PR ready by hand.
+Otherwise the run refuses with `cannot finalize`, naming the unsatisfied
+predicate. `repair_required` items at their own failed head, migration,
+evidence, and unknown obligations are never cleared this way. A repository that
+disagrees should not enable managed CI for that check. When the managed wait
+times out with the final context successful and a non-final check failing at
+the exact head, the failure is routed to repair like any CI failure; pending or
+missing required contexts are named in the timeout error.
+
 A head advance with none of an ordered review/coder pair, the merge-conflict
 obligation, or a CI obligation bound to exactly that transition still fails
 closed, and the board must still approve the exact final head before
