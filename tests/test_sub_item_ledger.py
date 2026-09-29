@@ -484,3 +484,33 @@ def test_note_less_completing_non_owner_added_this_round_gets_owner_evidence():
     assert "item-1.s4" in evidence and '"wire approved-plan"' in evidence
     assert 'Codex kept item-level blocking: "still broken here"' in evidence
     assert dict(out.owner_states)["Gemini"] == "pending"
+
+
+def test_deferral_explanation_does_not_blame_an_owner_that_resolved_this_round():
+    item = replace(
+        _item(resolved=ALL_BUT_LAST),
+        resolution_owners=("Codex",),
+        owner_states=(("Codex", "pending"),),
+    )
+    payload = {
+        "schema_version": 1, "kind": "pr_review", "state": "blocking", "summary": "s",
+        "prior_item_dispositions": [
+            {"item_id": "item-1", "disposition": "blocking",
+             "sub_item_dispositions": {"item-1.s4": "resolved"}}
+        ],
+    }
+    parsed = _validate_review_response(
+        json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Gemini",
+        reviewer="Gemini", unresolved_items=[item], architecture_status_mode="degradable",
+    )
+    (entry,) = parsed.dispositions
+    kept, cleared, _notes = _reconcile(
+        item, [_disp("Codex", "resolved"), entry], mode="owner-scoped"
+    )
+    (out,) = kept
+    assert _counts(out) == (3, 4) and not cleared
+    assert dict(out.owner_states) == {"Codex": "cleared", "Gemini": "pending"}
+    evidence = dict(out.owner_evidence)["Gemini"]
+    assert "item-1.s4" in evidence and "Gemini became an owner this round" in evidence
+    assert "Codex" not in evidence
+    assert not any("Codex has not concurred" in note for note in out.notes)

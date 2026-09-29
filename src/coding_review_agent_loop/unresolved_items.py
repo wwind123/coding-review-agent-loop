@@ -1181,9 +1181,21 @@ def _completion_explanation(
             detail = f': "{quoted}"' if quoted else " without an item-specific note"
             return prefix + f"{other.reviewer} kept item-level {other.disposition}{detail}"
     if reconciliation_mode == "owner-scoped":
+        # Judge pending owners by their post-round state: an owner that cleared
+        # itself with `resolved`/`future` in this same round has concurred.
+        post_round_states = dict(owner_states)
+        for other in dispositions:
+            if other.disposition in {"resolved", "future"} and other.reviewer in owners:
+                post_round_states[other.reviewer] = "cleared"
         for owner in owners:
-            if owner != entry.reviewer and owner_states.get(owner) != "cleared":
+            if owner != entry.reviewer and post_round_states.get(owner) != "cleared":
                 return prefix + f"pending owner {owner} has not concurred"
+        if entry.reviewer not in owners:
+            return prefix + (
+                f"{entry.reviewer} became an owner this round and its own item-level "
+                f"{entry.disposition} entry keeps the item pending; send item-level "
+                "`resolved` once the remaining sub-item is confirmed"
+            )
     return prefix + "another reviewer has not concurred"
 
 
