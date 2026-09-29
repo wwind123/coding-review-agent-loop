@@ -775,6 +775,7 @@ def test_incomplete_holder_metadata_is_reported_unidentified(tmp_path, monkeypat
     proc = start_holder([tmp_path], "issue", "1")
     try:
         meta_path = next(claim_root().glob("*.json"))
+        complete = json.loads(meta_path.read_text())
         for record in ({"pid": proc.pid, "run_id": "abc"}, {"pid": "x", "run_id": "abc", "repo": "R",
                        "command": "issue", "target": "issue #1", "started_at": "t"}, ["not", "a", "dict"]):
             meta_path.write_text(json.dumps(record))
@@ -784,6 +785,23 @@ def test_incomplete_holder_metadata_is_reported_unidentified(tmp_path, monkeypat
             assert "unidentified holder" in message
             assert str(next(claim_root().glob("*.lock"))) in message
             assert "None" not in message and "run_id abc" not in message
+        # a record that omits only the nullable number / agent / path is also unidentified
+        good = json.loads(json.dumps(complete))
+        assert workdir_claims._holder_record_complete(good)
+        for missing in ("number", "agent", "path"):
+            partial = {k: v for k, v in complete.items() if k != missing}
+            meta_path.write_text(json.dumps(partial))
+            with pytest.raises(WorkdirClaimedError) as exc:
+                claim_once(tmp_path)
+            assert "unidentified holder" in str(exc.value), missing
+            assert str(next(claim_root().glob("*.lock"))) in str(exc.value)
+        meta_path.write_text(json.dumps({**complete, "number": "7"}))
+        with pytest.raises(WorkdirClaimedError, match="unidentified holder"):
+            claim_once(tmp_path)
+        # a complete record (number may be null) identifies the holder
+        meta_path.write_text(json.dumps({**complete, "number": None}))
+        with pytest.raises(WorkdirClaimedError, match=f"pid {proc.pid}"):
+            claim_once(tmp_path)
     finally:
         stop(proc)
 

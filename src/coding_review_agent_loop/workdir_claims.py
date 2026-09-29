@@ -143,16 +143,22 @@ def _describe_holder(path: Path, lock_path: Path, agent: str, meta: dict | None)
     )
 
 
-_REQUIRED_HOLDER_FIELDS = ("pid", "run_id", "repo", "command", "target", "started_at")
+_REQUIRED_HOLDER_STRINGS = ("run_id", "repo", "command", "target", "agent", "path", "started_at")
 
 
 def _holder_record_complete(raw: object) -> bool:
     """True only for a structurally complete holder record (no fabricated fields)."""
     if not isinstance(raw, dict):
         return False
-    if isinstance(raw.get("pid"), bool) or not isinstance(raw.get("pid"), int):
+    pid = raw.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
         return False
-    return all(isinstance(raw.get(key), str) and raw[key] for key in _REQUIRED_HOLDER_FIELDS[1:])
+    if "number" not in raw:
+        return False
+    number = raw["number"]
+    if number is not None and (isinstance(number, bool) or not isinstance(number, int)):
+        return False
+    return all(isinstance(raw.get(key), str) and raw[key] for key in _REQUIRED_HOLDER_STRINGS)
 
 
 def _read_metadata(meta_path: Path) -> dict | None:
