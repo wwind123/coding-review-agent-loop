@@ -14755,3 +14755,94 @@ def test_other_owning_loops_write_run_end_on_exception(tmp_path, monkeypatch, lo
             orchestrator_module.run_discuss_loop(runner, issue_number=56, config=config)
     assert [r["record"] for r in load_records(telemetry_log_path())] == ["run-start", "run-end"]
     assert runner.telemetry_attribution is None
+
+
+def test_real_nested_pr_loop_runs_broker_attempt_with_outer_run_and_both_numbers(tmp_path, monkeypatch):
+    """Reservation telemetry (#1107): the real run_pr_loop under a real issue loop."""
+    import os
+    import sys
+
+    from coding_review_agent_loop.local_test_evidence import TestBrokerClient as BrokerClient
+    from coding_review_agent_loop.runner import Runner
+    from coding_review_agent_loop.test_workers import WorkerBudget
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_plan_state(summary="Implement it."),
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[structured_plan_review(state="approved", summary="Plan approved.")],
+        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "abc123"},
+    )
+    config = make_config(tmp_path)
+    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
+    seen = {}
+    real_pr_loop = orchestrator_module.run_pr_loop
+
+    real_pr_context = orchestrator_module.get_pr_review_context
+
+    def observed_pr_loop(*args, **kwargs):
+        seen["in_pr_loop"] = True
+        try:
+            return real_pr_loop(*args, **kwargs)
+        finally:
+            seen["after_nested"] = dict(runner.telemetry_attribution)
+
+    def first_pr_read(*a, **k):
+        if not seen.get("in_pr_loop"):
+            return real_pr_context(*a, **k)
+        # Inside the real run_pr_loop: run a coder-turn broker test request
+        # through the real Runner broker setup and attribution snapshot.
+        seen["during"] = dict(runner.telemetry_attribution)
+        real = Runner()
+        real.telemetry_attribution = dict(runner.telemetry_attribution)
+        broker, _turn = real._start_test_broker(cwd=tmp_path, role="coder", env=None)
+        assert broker is not None
+        broker._worker_lock_root = tmp_path / "locks"
+        broker.set_execution_context(
+            containment_handle=None, process_started=None, process_finished=None,
+            worker_budget=WorkerBudget(2, "derived", "clamp", "cpu", {}, False),
+        )
+        try:
+            client = BrokerClient({**os.environ, **broker.environment, "AGENT_LOOP_INVOCATION_ID": broker.turn_id})
+            assert client.run([sys.executable, "-c", "pass"], timeout_seconds=10, cwd=tmp_path).outcome == "passed"
+        finally:
+            broker.stop()
+        raise AgentLoopError("stop after broker attempt")
+
+    monkeypatch.setattr(orchestrator_module, "run_pr_loop", observed_pr_loop)
+    monkeypatch.setattr(orchestrator_module, "get_pr_review_context", first_pr_read)
+    with pytest.raises(AgentLoopError, match="stop after broker attempt"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
+
+    records = list(load_records(telemetry_log_path()))
+    assert [r["record"] for r in records].count("run-start") == 1
+    assert [r["record"] for r in records].count("run-end") == 1
+    (attempt,) = [r for r in records if r["record"] == "attempt"]
+    run_id = next(r for r in records if r["record"] == "run-start")["run_id"]
+    assert attempt["run_id"] == run_id and attempt["attribution_source"] == "runner"
+    assert (attempt["issue_number"], attempt["pr_number"], attempt["lane"]) == (56, 77, "broker")
+    assert seen["during"]["pr_number"] == 77
+    assert seen["after_nested"]["pr_number"] is None and seen["after_nested"]["issue_number"] == 56
+    assert runner.telemetry_attribution is None
+
+
+def test_owning_pr_loop_writes_run_end_on_exception(tmp_path, monkeypatch):
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    runner = _FakeRunner()
+
+    def boom(*_a, **_k):
+        raise AgentLoopError("pr stop")
+
+    monkeypatch.setattr(orchestrator_module, "get_pr_review_context", boom)
+    with pytest.raises(AgentLoopError, match="pr stop"):
+        orchestrator_module.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+    records = list(load_records(telemetry_log_path()))
+    assert [r["record"] for r in records] == ["run-start", "run-end"]
+    assert records[0]["pr_number"] == 77 and records[0]["run_id"] == records[1]["run_id"]
+    assert runner.telemetry_attribution is None

@@ -611,3 +611,42 @@ def test_telemetry_flags_retained_share(tmp_path):
         assert duty["retained"] == 1 and duty["duty_low"] < duty["duty_high"] <= 1.0
     finally:
         os.kill(escaped, 9)
+
+
+def test_telemetry_failed_probe_emits_once_without_spawning_and_releases(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop import runner as runner_module
+    from coding_review_agent_loop.test_runtime import LauncherProbeResult
+
+    root = tmp_path / "locks"
+    marker = tmp_path / "spawned"
+    cmd = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+    monkeypatch.setattr(
+        runner_module, "probe_inner_launcher",
+        lambda argv, **_kw: LauncherProbeResult(tuple(argv), "failed", diagnostic="probe failed"),
+    )
+    log, tel = _telemetry(tmp_path)
+    result = _run(tmp_path, root, tel, cmd=cmd)
+    assert result.outcome == "launch-failed" and result.inner_exec == "failed"
+    assert not marker.exists()
+    (row,) = _attempts(log)
+    assert row["outcome"] == "granted" and row["test_outcome"] == "launch-failed"
+    assert row["target_started_at"] is None and row["command_seconds"] is None
+    assert row["retained"] is False
+    assert _records(root) == []  # reservation released as before
+
+
+def test_telemetry_configuration_refusal_writes_no_record(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop import runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "apply_worker_budget",
+        lambda *_a, **_k: SimpleNamespace(refused="refused by configuration", cleanup=lambda: None, notices=()),
+    )
+    log, tel = _telemetry(tmp_path)
+    result = _run(tmp_path, tmp_path / "locks", tel)
+    assert result.outcome == "worker-budget-refused"
+    assert not log.exists()
