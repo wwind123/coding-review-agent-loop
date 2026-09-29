@@ -453,3 +453,34 @@ def test_deferral_reason_is_persisted_on_the_item_notes_even_with_a_reviewer_not
     # Re-running the same reconciliation never duplicates the note.
     again, _c, _n = _reconcile(out, [_disp("Claude", "blocking", "X")])
     assert sum(1 for n in again[0].notes if n.startswith("Orchestrator: deferred")) <= 1
+
+
+def test_note_less_completing_non_owner_added_this_round_gets_owner_evidence():
+    item = replace(
+        _item(resolved=ALL_BUT_LAST),
+        resolution_owners=("Codex",),
+        owner_states=(("Codex", "pending"),),
+    )
+    payload = {
+        "schema_version": 1, "kind": "pr_review", "state": "blocking", "summary": "s",
+        "prior_item_dispositions": [
+            {"item_id": "item-1", "disposition": "blocking",
+             "sub_item_dispositions": {"item-1.s4": "resolved"}}
+        ],
+    }
+    # Live validation accepts the note-less completing entry ...
+    parsed = _validate_review_response(
+        json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Gemini",
+        reviewer="Gemini", unresolved_items=[item], architecture_status_mode="degradable",
+    )
+    (entry,) = parsed.dispositions
+    # ... and owner-scoped reconciliation defers it with an explanation.
+    kept, cleared, _notes = _reconcile(
+        item, [_disp("Codex", "blocking", "still broken here"), entry], mode="owner-scoped"
+    )
+    (out,) = kept
+    assert _counts(out) == (3, 4) and not cleared
+    evidence = dict(out.owner_evidence)["Gemini"]
+    assert "item-1.s4" in evidence and '"wire approved-plan"' in evidence
+    assert 'Codex kept item-level blocking: "still broken here"' in evidence
+    assert dict(out.owner_states)["Gemini"] == "pending"

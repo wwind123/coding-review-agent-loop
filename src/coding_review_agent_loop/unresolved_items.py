@@ -1270,15 +1270,22 @@ def _reconcile_item_with_sub_items(
 
     open_before = {sub.sub_item_id for sub in item.sub_items if sub.status == "open"}
 
+    # Every eligible completing entry (including a reviewer added as an owner
+    # this round) needs an explanation if it does not take effect; only an
+    # existing owner's entry may derive to `resolved` in owner-scoped mode.
     completing_indexes = {
         index
         for index, entry in enumerate(dispositions)
         if _entry_completes_sub_items(entry, open_before, same_status=same_status)
         and eligible(entry)
-        and (reconciliation_mode != "owner-scoped" or entry.reviewer in owners)
+    }
+    derivable_indexes = {
+        index
+        for index in completing_indexes
+        if reconciliation_mode != "owner-scoped" or dispositions[index].reviewer in owners
     }
     derive_now = complete()
-    derived = set(completing_indexes) if derive_now else set()
+    derived = set(derivable_indexes) if derive_now else set()
 
     def first_open() -> ReviewSubItem:
         return next(sub for sub in item.sub_items if sub_status[sub.sub_item_id][0] == "open")
@@ -1288,7 +1295,13 @@ def _reconcile_item_with_sub_items(
         for index, entry in enumerate(dispositions):
             if index in indexes_derived:
                 result.append(replace(entry, disposition="resolved"))
-            elif index in completing_indexes and not (entry.note or "").strip():
+            elif (
+                index in completing_indexes
+                and not (entry.note or "").strip()
+                # With every sub-item resolved there is nothing to name yet; the
+                # deferral pass re-runs this with the deferred sub-item open.
+                and any(state == "open" for state, _round in sub_status.values())
+            ):
                 # A note-less completing entry that stays in force gets an
                 # actionable explanation instead of the bare status.
                 result.append(
