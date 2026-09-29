@@ -3166,7 +3166,16 @@ def test_coder_comment_separates_confirmed_counts_from_unverified_claims():
         "addressed this round (unverified)"
     ) in body
     assert "  - item-2.s2: open; coder claims addressed (unverified)" in body
-    assert "item-1: " not in body.split("### Sub-item progress")[1]
+    # A whole-item claim on a still-carried item keeps its confirmed count and is
+    # labelled as an unverified implication.
+    section = body.split("### Sub-item progress")[1]
+    assert (
+        "- item-1: 1/4 sub-items resolved (reviewer-confirmed); coder claims 3 more addressed "
+        "this round (unverified); coder reports the whole item addressed, which implies every "
+        "open sub-item (unverified)"
+    ) in section
+    assert "  - item-1.s1: resolved (round 2)" in section
+    assert "  - item-1.s2: open; coder claims addressed (unverified)" in section
     unchanged = _render_public_coder_followup_comment(
         _replace_959(followup, addressed_sub_items=()),
         agent="Claude",

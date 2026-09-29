@@ -7,6 +7,7 @@ import pytest
 import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
 from coding_review_agent_loop.comment_rendering import sub_item_progress_record_keys
+from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.protocol import parse_pr_review
 
 from agent_loop_helpers import (
@@ -473,3 +474,47 @@ def test_reviewer_context_shows_unverified_coder_claims_fresh_and_resumed(tmp_pa
     # The dropped claim is shown as a degradation, not as a claim.
     assert "sub_item_claim_degradations" in resumed_prompt
     assert "addressed_sub_items-unknown-or-already-resolved-sub-item" in resumed_prompt
+
+
+def test_malformed_sub_items_degradation_is_rendered_persisted_and_survives_resume(
+    tmp_path, monkeypatch
+):
+    runner = FakeRunner(
+        authenticated_actor=ACTOR,
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                blocking_items=[{"text": "One obligation.", "sub_items": ["only one"]}],
+            ),
+            _review(disposition="resolved", note=None, state="approved"),
+        ],
+        claude_outputs=[_coder()],
+    )
+    config = make_config(tmp_path, max_rounds=4)
+    _interrupt_role_once(monkeypatch, "coder", on_call=1)
+    with pytest.raises(_Interrupted):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    # Fresh path: the posted review shows the degraded element.
+    review_comment = next(
+        c["body"] for c in runner.pr_payload["comments"] if "Blocking issues" in c["body"]
+    )
+    assert "### Sub-item parse degradations" in review_comment
+    assert "sub_items-needs-at-least-two-entries" in review_comment
+    records = [r for r in _metadata_records(runner) if r.role == "reviewer"]
+    assert records and records[0].sub_item_degradations
+    assert [i.sub_items for i in records[0].new_items] == [()]
+
+    # Resumed path: the record is restored from round metadata, not dropped.
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    resumed = orchestrator._resume_pr_round(
+        runner.pr_payload["comments"] and [
+            IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=c["body"])
+            for c in runner.pr_payload["comments"][:2]
+        ],
+        head_sha=records[0].subject,
+        configured_reviewers=("codex",),
+    )
+    assert resumed is not None
+    (completed,) = resumed.completed_reviews[:1]
+    assert completed.metadata.sub_item_degradations == records[0].sub_item_degradations

@@ -6341,3 +6341,23 @@ def test_coder_sub_item_claims_absent_or_malformed_never_reject():
     assert validate_structured_coder_followup(_coder_followup()).addressed_sub_items == ()
     bad = validate_structured_coder_followup(_coder_followup(addressed_sub_items="item-2.s1"))
     assert bad.addressed_sub_items == () and bad.sub_item_claim_degradations
+
+
+@pytest.mark.parametrize("bad", [[], {"nested": 1}, 3, None, True])
+def test_non_string_sub_item_disposition_values_degrade_instead_of_crashing(bad):
+    parsed = parse_structured_pr_review(
+        _sub_item_review(
+            blocking_items=["new"],
+            prior_item_dispositions=[
+                {
+                    "item_id": "item-1",
+                    "disposition": "blocking",
+                    "note": "still broken on this head",
+                    "sub_item_dispositions": {"item-1.s1": bad, "item-1.s2": "resolved"},
+                }
+            ],
+        ),
+        reviewer="Codex",
+    )
+    assert parsed.dispositions[0].sub_item_dispositions == (("item-1.s2", "resolved"),)
+    assert len(parsed.sub_item_degradations) == 1

@@ -229,6 +229,8 @@ class PostedRoundMetadata:
     # ledger that may have advanced.
     addressed_sub_items: tuple[str, ...] = ()
     sub_item_claim_degradations: tuple[ParseDegradation, ...] = ()
+    # Reviewer-side sub-item parse degradations (#958), restored on resume.
+    sub_item_degradations: tuple[ParseDegradation, ...] = ()
     architecture_contract_version: int | None = None
     # Planning generation discriminator.  Absent is intentionally legacy
     # undecided; generation 1 is required to resume a fresh recommendation.
@@ -2033,6 +2035,7 @@ def _deserialize_sub_item_dispositions(payload: dict) -> tuple[tuple[str, str], 
         if isinstance(pair, (list, tuple))
         and len(pair) == 2
         and isinstance(pair[0], str)
+        and isinstance(pair[1], str)
         and pair[1] in {"resolved", "unresolved"}
     )
 
@@ -2327,6 +2330,10 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["sub_item_claim_degradations"] = [
             record.to_payload() for record in metadata.sub_item_claim_degradations
         ]
+    if metadata.sub_item_degradations:
+        payload["sub_item_degradations"] = [
+            record.to_payload() for record in metadata.sub_item_degradations
+        ]
     if metadata.qualification_checkpoint is not None:
         payload["qualification_checkpoint"] = (
             metadata.qualification_checkpoint.as_dict()
@@ -2550,6 +2557,9 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             sub_item_claim_degradations=_decode_parse_degradations(
                 payload.get("sub_item_claim_degradations")
             ),
+            sub_item_degradations=_decode_parse_degradations(
+                payload.get("sub_item_degradations")
+            ),
             architecture_contract_version=(
                 int(payload["architecture_contract_version"])
                 if payload.get("architecture_contract_version") is not None else None
@@ -2732,6 +2742,11 @@ def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
     )
     if citation_degradations is not None and citation_degradations not in str(body):
         body = _insert_before_trailing_markers(str(body), citation_degradations)
+    sub_item_records = render_parse_degradations_section(
+        metadata.sub_item_degradations, heading="### Sub-item parse degradations"
+    )
+    if sub_item_records is not None and sub_item_records not in str(body):
+        body = _insert_before_trailing_markers(str(body), sub_item_records)
     lines = body.splitlines()
     index = len(lines)
     while index > 0 and not lines[index - 1].strip():

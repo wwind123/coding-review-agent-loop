@@ -1320,6 +1320,10 @@ def _reconcile_item_with_sub_items(
         same_status=same_status,
         reconciliation_mode=reconciliation_mode,
     )
+    if result is not None and not is_open(result):
+        # Reclassified as future work: it is not cleared, so no cleared record
+        # is published and it is never treated as a stalled active finding.
+        return replace(result, sub_items=committed())
     if not is_open(result):
         # The item leaves the active ledger.
         resolved_count, total = _sub_item_count(committed())
@@ -1340,9 +1344,16 @@ def _reconcile_item_with_sub_items(
             )
         return None if result is None else replace(result, sub_items=committed())
 
+    deferred_note: str | None = None
     if complete() and closures:
         # Post-outcome invariant: never persist an open item at K/K.
         deferred = closures[-1]
+        deferred_text = next(s.text for s in item.sub_items if s.sub_item_id == deferred)
+        deferred_note = (
+            f'Orchestrator: deferred closing {deferred} ("{deferred_text}"): {item.item_id} '
+            "stays open because another reviewer or pending owner has not concurred, so "
+            "that sub-item stays open."
+        )
         sub_status[deferred] = ("open", None)
         closures.remove(deferred)
         note(f"deferred closing {deferred}: the item stays open, so its last sub-item stays open too")
@@ -1353,6 +1364,10 @@ def _reconcile_item_with_sub_items(
             reconciliation_mode=reconciliation_mode,
         )
     assert result is not None
+    if deferred_note is not None and deferred_note not in result.notes:
+        # The reason travels with the carried item so the coder and the next
+        # reviewers see why the sub-item stays open.
+        result = replace(result, notes=(*result.notes, deferred_note))
     return replace(result, sub_items=committed())
 
 
@@ -1863,7 +1878,11 @@ def sub_item_progress(
     """
     progress: list[SubItemProgress] = []
     for item in items:
-        if item.sub_items and not item.is_machine_obligation:
+        if (
+            item.sub_items
+            and not item.is_machine_obligation
+            and item.status in {"blocking", "same-pr"}
+        ):
             progress.append(
                 _classify_sub_item_progress(item, current_round=current_round, window=window)
             )

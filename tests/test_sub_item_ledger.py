@@ -406,3 +406,50 @@ def test_window_of_one_never_stalls_a_finding_minted_this_round():
     assert newly_stalled_items([fresh], current_round=4, window=1) == ()
     assert [e.item_id for e in newly_stalled_items([fresh], current_round=5, window=1)] == ["item-1"]
     assert newly_stalled_items([fresh], current_round=6, window=1) == ()
+
+
+def test_corrupt_persisted_disposition_pairs_are_dropped_not_fatal():
+    payload = _serialize_disposition(_disp("Codex", "blocking", "n", [("item-1.s1", "resolved")]))
+    payload["sub_item_dispositions"] = [
+        ["item-1.s1", []], ["item-1.s2", {"x": 1}], ["item-1.s3", "resolved"], [3, "resolved"], "junk",
+    ]
+    restored = _deserialize_disposition(payload)
+    assert restored.sub_item_dispositions == (("item-1.s3", "resolved"),)
+
+
+@pytest.mark.parametrize("retain_future", [True, False])
+def test_future_reclassification_is_not_published_as_cleared(retain_future):
+    item = _item(resolved=ALL_BUT_LAST)
+    cleared: list[ClearedItemProgress] = []
+    kept, future = _apply_unresolved_item_dispositions(
+        [item],
+        {"item-1": [_disp("Codex", "future", "later")]},
+        retain_future=retain_future,
+        round_number=5,
+        cleared_items_progress=cleared,
+    )
+    assert cleared == []
+    (out,) = kept if retain_future else future
+    assert out.status == "future" and out.sub_items == item.sub_items
+    assert sub_item_progress(kept, current_round=99, window=3) == ()
+    assert newly_stalled_items(kept, current_round=99, window=3) == ()
+
+
+def test_deferral_reason_is_persisted_on_the_item_notes_even_with_a_reviewer_note():
+    item = _item(resolved=ALL_BUT_LAST)
+    kept, _cleared, _notes = _reconcile(
+        item,
+        [
+            _disp("Codex", "blocking", "wrapped up s4", [("item-1.s4", "resolved")]),
+            _disp("Claude", "blocking", "X"),
+        ],
+    )
+    (out,) = kept
+    assert _counts(out) == (3, 4)
+    note = next(n for n in out.notes if n.startswith("Orchestrator: deferred closing item-1.s4"))
+    assert '"wire approved-plan"' in note and "item-1" in note
+    restored = _deserialize_unresolved_item(_serialize_unresolved_item(out))
+    assert note in restored.notes
+    # Re-running the same reconciliation never duplicates the note.
+    again, _c, _n = _reconcile(out, [_disp("Claude", "blocking", "X")])
+    assert sum(1 for n in again[0].notes if n.startswith("Orchestrator: deferred")) <= 1

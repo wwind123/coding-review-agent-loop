@@ -1690,20 +1690,25 @@ def _render_coder_sub_item_progress(
     claimed = set(parsed_followup.addressed_sub_items)
     lines: list[str] = []
     for item in prior_items:
-        if not item.sub_items or item.item_id in parsed_followup.addressed_items:
+        if not item.sub_items:
             continue
+        whole_item_claim = item.item_id in parsed_followup.addressed_items
         resolved = sum(1 for sub in item.sub_items if sub.status == "resolved")
         item_claims = [
-            sub for sub in item.sub_items if sub.sub_item_id in claimed and sub.status == "open"
+            sub
+            for sub in item.sub_items
+            if sub.status == "open" and (whole_item_claim or sub.sub_item_id in claimed)
         ]
         headline = f"- {item.item_id}: {resolved}/{len(item.sub_items)} sub-items resolved (reviewer-confirmed)"
         if item_claims:
             headline += f"; coder claims {len(item_claims)} more addressed this round (unverified)"
+        if whole_item_claim:
+            headline += "; coder reports the whole item addressed, which implies every open sub-item (unverified)"
         lines.append(headline)
         for sub in item.sub_items:
             if sub.status == "resolved":
                 state = f"resolved (round {sub.resolved_round})" if sub.resolved_round is not None else "resolved"
-            elif sub.sub_item_id in claimed:
+            elif sub.sub_item_id in claimed or whole_item_claim:
                 state = "open; coder claims addressed (unverified)"
             else:
                 state = "open"

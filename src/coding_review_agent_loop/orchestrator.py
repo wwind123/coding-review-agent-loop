@@ -23430,6 +23430,7 @@ def run_pr_loop(
                             round_number=round_number, subject=current_pr_subject,
                             prior_items=prior_unresolved_items, dispositions=parsed.dispositions,
                             new_items=new_items, state=parsed.state, model_used=model_used,
+                            sub_item_degradations=tuple(parsed.sub_item_degradations),
                             **(_metadata_identity_fields(identity) if identity is not None else {}),
                             acquisition_outcome=acquisition_outcome,
                             acquisition_returncode=acquisition_returncode,
@@ -23863,6 +23864,7 @@ def run_pr_loop(
                         architecture_impact=resumed_impact,
                         architecture_impact_degradations=resumed_records,
                         exact_head_evidence_requests=resumed_record.metadata.evidence_requests,
+                        sub_item_degradations=resumed_record.metadata.sub_item_degradations,
                     )
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)

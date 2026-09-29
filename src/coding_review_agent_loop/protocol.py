@@ -5683,7 +5683,7 @@ def _degradable_sub_item_dispositions(
         for key, entry in value.items():
             if not isinstance(key, str) or not key.strip():
                 defects.append(("sub_item_dispositions-key-not-a-string", key, context))
-            elif entry not in SUB_ITEM_DISPOSITIONS:
+            elif not isinstance(entry, str) or entry not in SUB_ITEM_DISPOSITIONS:
                 defects.append(
                     ("sub_item_dispositions-value-not-resolved-or-unresolved", entry, f"{context}.{key}")
                 )
