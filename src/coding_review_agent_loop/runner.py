@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Mapping, Sequence, TypeVar
+from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from .containment import (
     ContainmentEvidence,
@@ -28,6 +28,7 @@ from .containment import (
     sample_cgroup,
 )
 from .errors import AgentLoopError
+from .worker_telemetry import ReservationTelemetry, attribution_environment
 from .test_runtime import (
     INNER_EXEC_STATES,
     OVERLAP_REJECTED_EXIT_CODE,
@@ -329,6 +330,31 @@ class _HeldTestLocks:
 def run_foreground_test(
     args: Sequence[str],
     *,
+    reservation_telemetry: ReservationTelemetry | None = None,
+    **kwargs: Any,
+) -> ForegroundTestResult:
+    """Run a foreground test command; see ``_run_foreground_test_body``.
+
+    ``reservation_telemetry`` (#1107) records one attempt line for every
+    command that obtained its command lane.  ``None`` changes nothing.
+    """
+    telemetry = reservation_telemetry if reservation_telemetry is not None else ReservationTelemetry.disabled()
+    try:
+        result = _run_foreground_test_body(args, reservation_telemetry=telemetry, **kwargs)
+        telemetry.finish(result.outcome)
+        return result
+    except BaseException:
+        if telemetry.begun:
+            telemetry.set_outcome("error")
+        raise
+    finally:
+        telemetry.emit()
+
+
+def _run_foreground_test_body(
+    args: Sequence[str],
+    *,
+    reservation_telemetry: ReservationTelemetry,
     cwd: Path,
     timeout_seconds: float,
     env: Mapping[str, str] | None = None,
@@ -375,6 +401,7 @@ def run_foreground_test(
         if echo_output or output_callback is None:
             print(text, file=sys.stderr, flush=True)
 
+    tel = reservation_telemetry
     invocation_values = env if env is not None else os.environ
     handle: InvocationHandle | None = None
     decision: WorkerDecision | None = None
@@ -449,6 +476,7 @@ def run_foreground_test(
             wrapper_bootstrap, "not-attempted", "not-started", OVERLAP_REJECTED_MESSAGE,
             health_provenance,
         )
+    tel.begin(worker_budget.workers if worker_budget is not None else None)
     if worker_budget is not None and worker_budget.enforcing:
         worker_lock, lock_problem = WorkerBudgetLock.acquire(
             invocation_id=invocation_values.get("AGENT_LOOP_INVOCATION_ID"),
@@ -456,6 +484,7 @@ def run_foreground_test(
             root=worker_lock_root,
         )
         if worker_lock is None:
+            tel.set_outcome("invocation-busy")
             lane_lock.close()
             if handle is not None:
                 handle.close()
@@ -482,6 +511,9 @@ def run_foreground_test(
                 if decision is not None:
                     decision.cleanup()
                 raise
+            tel.decision(capacity=capacity.describe(), others=worker_lock.last_others)
+            tel.reserved(granted, worker_lock.reservation)
+            tel.set_outcome("refused" if granted == 0 else "granted")
             if granted == 0:
                 worker_lock.close()
                 lane_lock.close()
@@ -498,6 +530,7 @@ def run_foreground_test(
                     health_provenance,
                 )
             if granted < worker_budget.workers:
+                tel.set_outcome("degraded")
                 notify(
                     f"agent-loop worker budget: other agent-loop runs on this host hold part of "
                     f"the shared test-worker capacity ({capacity.describe()}); this command is "
@@ -660,6 +693,7 @@ def run_foreground_test(
                 timeout_seconds, str(exc), None, False,
                 wrapper_bootstrap, "failed", "not-started", str(exc), health_provenance,
             )
+        tel.target_started()
         lane_lock.record_process_group(proc.pid)
         if process_started is not None:
             process_started(proc)
@@ -806,6 +840,7 @@ def run_foreground_test(
         _terminate_process_group(proc)
         returncode = proc.wait()
     finally:
+        tel.target_finished()
         if process_finished is not None:
             process_finished(proc)
         if selector is not None:
@@ -1088,6 +1123,8 @@ class Runner:
         self.test_worker_memory: int | None = None
         self.test_worker_enforcement: str = "clamp"
         self.latest_worker_budget: WorkerBudget | None = None
+        # Run attribution for reservation telemetry (#1107); set by owning run loops.
+        self.telemetry_attribution: dict | None = None
 
     def set_containment_role(self, role: str | None) -> None:
         if role in {"coder", "reviewer", "repair", "test-gate"}:
@@ -1175,6 +1212,7 @@ class Runner:
         budget = self.derive_worker_budget(handle)
         # launch_env is consumed only at Popen, after admission.
         launch_env.update(budget.environment())
+        launch_env.update(attribution_environment(self.telemetry_attribution))
         self.latest_worker_budget = budget
         return budget
 
@@ -1222,6 +1260,11 @@ class Runner:
                 timeout_ceiling=ceiling,
                 containment_policy=self.containment_policy,
                 environment_registry=self._environment_registry,
+                telemetry_attribution=(
+                    {**self.telemetry_attribution, "attribution_source": "runner", "lane": "broker"}
+                    if self.telemetry_attribution
+                    else None
+                ),
             ).start()
         except (OSError, ValueError, AgentLoopError) as exc:
             # Broker setup is infrastructure telemetry. A coder can still use

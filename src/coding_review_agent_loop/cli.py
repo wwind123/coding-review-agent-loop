@@ -1693,8 +1693,13 @@ def _run_tests_command(args: argparse.Namespace) -> int:
             # test-gate limits; an inherited scope keeps the parent budget.
             return _resolve_run_tests_worker_budget(args, broker_present=False, handle=handle).budget
 
+        from .worker_telemetry import ReservationTelemetry, attribution_from_environment, telemetry_log_path
+
         result = run_foreground_test(
             raw_inner,
+            reservation_telemetry=ReservationTelemetry(
+                telemetry_log_path(), attribution_from_environment()
+            ),
             cwd=Path.cwd(),
             timeout_seconds=chosen,
             dry_run=False,

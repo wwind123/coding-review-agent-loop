@@ -383,3 +383,174 @@ def test_post_spawn_failure_keeps_reservation_while_target_runs(tmp_path):
         except ProcessLookupError:
             pass
     assert _records(root) == []
+
+
+# --- reservation telemetry (#1107) -------------------------------------------------
+
+
+def _telemetry(tmp_path, name="t.jsonl"):
+    from coding_review_agent_loop.worker_telemetry import ReservationTelemetry
+
+    log = tmp_path / name
+    return log, ReservationTelemetry(log, {"repo": "o/r", "run_id": "r1", "attribution_source": "runner", "lane": "broker"})
+
+
+def _attempts(log):
+    from coding_review_agent_loop.worker_telemetry import load_records
+
+    return [r for r in load_records(log) if r["record"] == "attempt"]
+
+
+def _run(tmp_path, root, telemetry, *, budget=None, env=None, cmd=None, **extra):
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    return run_foreground_test(
+        cmd or [sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout_seconds=30,
+        env=env or _env("mine"), environment_is_complete=True, echo_output=False,
+        worker_budget=budget if budget is not None else _budget(4), worker_lock_root=root,
+        reservation_telemetry=telemetry, **extra,
+    )
+
+
+def test_telemetry_clean_grant_degraded_and_refused(tmp_path):
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    result = _run(tmp_path, root, tel)
+    assert result.returncode == 0
+    (clean,) = _attempts(log)
+    assert clean["outcome"] == "granted" and clean["workers_granted"] == clean["workers_requested"]
+    assert clean["others_count"] == 0 and clean["retained"] is False
+    assert clean["command_seconds"] is not None and clean["released_at"] >= clean["reserved_at"]
+    assert clean["repo"] == "o/r" and clean["attribution_source"] == "runner"
+
+    other = _lock(root, "other-loop")
+    try:
+        assert other.reserve_host_workers(3, host_capacity(_budget(4))) >= 1
+        held = other.last_others
+        log2, tel2 = _telemetry(tmp_path, "t2.jsonl")
+        _run(tmp_path, root, tel2, budget=_budget(64))
+        (degraded,) = _attempts(log2)
+        assert degraded["outcome"] in {"degraded", "refused"}
+        assert degraded["others_count"] == 1
+        pool = host_worker_pool(_budget(64))
+        assert held is not None
+        # Take the whole pool so the next attempt is refused.
+        assert other.reserve_host_workers(pool, host_capacity(_budget(4))) == pool
+        log3, tel3 = _telemetry(tmp_path, "t3.jsonl")
+        busy = _run(tmp_path, root, tel3)
+        assert busy.returncode == 125
+        (refused,) = _attempts(log3)
+        assert refused["outcome"] == "refused" and refused["workers_granted"] == 0
+        assert refused["reserved_at"] is None and refused["command_seconds"] is None
+    finally:
+        other.close()
+    assert _records(root) == []
+
+
+def test_telemetry_reservation_start_excludes_wait(tmp_path, monkeypatch):
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    real = WorkerBudgetLock.reserve_host_workers
+
+    def slow(self, requested, capacity):
+        time.sleep(0.3)
+        return real(self, requested, capacity)
+
+    monkeypatch.setattr(WorkerBudgetLock, "reserve_host_workers", slow)
+    _run(tmp_path, root, tel)
+    (row,) = _attempts(log)
+    assert row["reserved_at"] - row["requested_at"] >= 0.3
+
+
+def test_telemetry_unshared_records_command_interval(tmp_path):
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    _run(tmp_path, root, tel, env=_env("mine", "off"))
+    log2, tel2 = _telemetry(tmp_path, "t2.jsonl")
+    _run(tmp_path, root, tel2, budget=WorkerBudget(4, "inherited", "off", "cpu", {}, False))
+    log3, tel3 = _telemetry(tmp_path, "t3.jsonl")
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    run_foreground_test(
+        [sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout_seconds=30,
+        env=_env("mine"), environment_is_complete=True, echo_output=False, reservation_telemetry=tel3,
+    )
+    for path in (log, log2, log3):
+        (row,) = _attempts(path)
+        assert row["outcome"] == "unshared" and row["reserved_at"] is None
+        assert row["target_started_at"] is not None and row["command_seconds"] is not None
+    assert _records(root) == []
+
+
+def test_telemetry_invocation_busy_error_and_dry_run(tmp_path, monkeypatch):
+    root = tmp_path / "locks"
+    holder = _lock(root, "mine")
+    try:
+        log, tel = _telemetry(tmp_path)
+        result = _run(tmp_path, root, tel)
+        assert result.outcome == "worker-budget-busy"
+        (row,) = _attempts(log)
+        assert row["outcome"] == "invocation-busy"
+    finally:
+        holder.close()
+
+    def boom(self, requested, capacity):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(WorkerBudgetLock, "reserve_host_workers", boom)
+    log2, tel2 = _telemetry(tmp_path, "t2.jsonl")
+    with pytest.raises(RuntimeError, match="boom"):
+        _run(tmp_path, root, tel2)
+    (row,) = _attempts(log2)
+    assert row["outcome"] == "error"
+    assert _records(root) == []
+
+    log3, tel3 = _telemetry(tmp_path, "t3.jsonl")
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    run_foreground_test(["true"], cwd=tmp_path, timeout_seconds=5, dry_run=True, reservation_telemetry=tel3)
+    assert not log3.exists()
+
+
+def test_telemetry_launch_failed_probe_emits_once(tmp_path):
+    root = tmp_path / "locks"
+    log, tel = _telemetry(tmp_path)
+    result = _run(tmp_path, root, tel, cmd=["/nonexistent/binary-1107"])
+    assert result.outcome == "launch-failed"
+    assert len(_attempts(log)) == 1
+
+
+def test_telemetry_does_not_change_grants_or_reservation_bytes(tmp_path):
+    root = tmp_path / "locks"
+    seen = []
+
+
+    for enabled in (True, False):
+        other = _lock(root, "other-loop")
+        try:
+            other.reserve_host_workers(2, _cpus(4))
+            cmd = [sys.executable, "-c", "import os; print(os.environ['AGENT_LOOP_TEST_WORKERS'])"]
+            tel = _telemetry(tmp_path, f"x{enabled}.jsonl")[1] if enabled else None
+            result = _run(tmp_path, root, tel, cmd=cmd)
+            seen.append(result.output_tail)
+        finally:
+            other.close()
+    assert seen[0] == seen[1]
+
+
+def test_telemetry_flags_retained_share(tmp_path):
+    root = tmp_path / "locks"
+    pid_file = tmp_path / "escaped.pid"
+    script = (
+        "import subprocess, sys; "
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True); "
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))"
+    )
+    log, tel = _telemetry(tmp_path)
+    _run(tmp_path, root, tel, cmd=[sys.executable, "-c", script])
+    escaped = int(pid_file.read_text())
+    try:
+        (row,) = _attempts(log)
+        assert row["retained"] is True and row["released_at"] is not None
+    finally:
+        os.kill(escaped, 9)

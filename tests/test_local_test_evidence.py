@@ -1645,3 +1645,41 @@ def test_in_checkout_broker_failure_with_outside_path_stays_authoritative(tmp_pa
     public = _render_test_observation_citations((), local_test_evidence=rendered)
     assert "uncited authoritative `failed`" in public
     assert "out-of-checkout context" not in public
+
+
+def test_broker_telemetry_uses_runner_attribution_and_ignores_request_env(tmp_path):
+    """Reservation telemetry (#1107): a coder cannot redirect or forge it."""
+    from coding_review_agent_loop.test_workers import WorkerBudget
+    from coding_review_agent_loop.worker_telemetry import load_records
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    forged_log = tmp_path / "forged.jsonl"
+    server = BrokerServer(
+        root=root, turn_id="turn-telemetry-" + str(os.getpid()),
+        telemetry_attribution={
+            "repo": "o/r", "run_id": "run-1", "issue_number": 5, "pr_number": None,
+            "attribution_source": "runner", "lane": "broker",
+        },
+    ).start()
+    server._worker_lock_root = tmp_path / "locks"
+    server.set_execution_context(
+        containment_handle=None, process_started=None, process_finished=None,
+        worker_budget=WorkerBudget(2, "derived", "clamp", "cpu", {}, False),
+    )
+    try:
+        client = BrokerClient({**os.environ, **server.environment, "AGENT_LOOP_INVOCATION_ID": server.turn_id})
+        result = client.run(
+            [sys.executable, "-c", "pass"], timeout_seconds=10, cwd=root,
+            environment_overrides={
+                "AGENT_LOOP_WORKER_TELEMETRY_LOG": str(forged_log),
+                "AGENT_LOOP_RUN_REPO": "evil/repo", "AGENT_LOOP_RUN_ID": "forged",
+            },
+        )
+        assert result.outcome == "passed"
+    finally:
+        server.stop()
+    assert not forged_log.exists()
+    (row,) = [r for r in load_records(Path(os.environ["AGENT_LOOP_WORKER_TELEMETRY_LOG"])) if r["record"] == "attempt"]
+    assert (row["repo"], row["run_id"], row["issue_number"]) == ("o/r", "run-1", 5)
+    assert row["attribution_source"] == "runner" and row["lane"] == "broker"

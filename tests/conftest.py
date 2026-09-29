@@ -43,11 +43,15 @@ _WORKER_BUDGET_ISOLATED_ENV = (
     "AGENT_LOOP_TEST_BROKER_ENDPOINT",
     "AGENT_LOOP_TEST_BROKER_CAPABILITY",
     "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+    "AGENT_LOOP_RUN_REPO",
+    "AGENT_LOOP_RUN_ID",
+    "AGENT_LOOP_RUN_ISSUE",
+    "AGENT_LOOP_RUN_PR",
 )
 
 
 @pytest.fixture(autouse=True)
-def _isolate_worker_budget_environment(monkeypatch):
+def _isolate_worker_budget_environment(monkeypatch, tmp_path_factory):
     """Never inherit an outer agent-loop invocation or worker budget (#848).
 
     When this suite runs through ``agent-loop run-tests`` inside a coder
@@ -60,3 +64,8 @@ def _isolate_worker_budget_environment(monkeypatch):
     # Host-wide worker sharing (#987) would otherwise count the real loops on
     # this host; tests that exercise it opt back in explicitly.
     monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", "off")
+    # Reservation telemetry (#1107) must never write the real host log.
+    monkeypatch.setenv(
+        "AGENT_LOOP_WORKER_TELEMETRY_LOG",
+        str(tmp_path_factory.mktemp("worker-telemetry") / "worker-reservations.jsonl"),
+    )

@@ -14638,3 +14638,44 @@ def test_resume_after_a_narrative_only_patch_reconstructs_the_narrow_classificat
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
     _m1103_assert_narrative_remediation(runner)
+
+
+def test_run_windows_are_written_once_per_owning_run_and_survive_exceptions(tmp_path, monkeypatch):
+    """Reservation telemetry (#1107): run-start/run-end bracket an owning run."""
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    runner = _FakeRunner()
+    seen = {}
+
+    def boom(*_args, **_kwargs):
+        seen["attribution"] = dict(runner.telemetry_attribution)
+        raise AgentLoopError("stop")
+
+    monkeypatch.setattr(orchestrator_module, "resolve_base_branch", boom)
+    with pytest.raises(AgentLoopError, match="stop"):
+        run_issue_loop(runner, issue_number=56, config=make_config(tmp_path))
+    records = list(load_records(telemetry_log_path()))
+    assert [r["record"] for r in records] == ["run-start", "run-end"]
+    assert {r["run_id"] for r in records} == {seen["attribution"]["run_id"]}
+    assert records[0]["issue_number"] == 56
+    assert runner.telemetry_attribution is None
+
+
+def test_nested_pr_phase_carries_pr_number_without_a_second_window(tmp_path):
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    runner = _FakeRunner()
+    config = make_config(tmp_path)
+    context = SimpleNamespace(run_id="outer-run")
+    outer = orchestrator_module._begin_run_telemetry(runner, config, context, True, issue_number=56)
+    inner = orchestrator_module._begin_run_telemetry(runner, config, context, False, pr_number=99)
+    assert runner.telemetry_attribution["run_id"] == "outer-run"
+    assert (runner.telemetry_attribution["issue_number"], runner.telemetry_attribution["pr_number"]) == (56, 99)
+    orchestrator_module._end_run_telemetry(runner, inner)
+    assert runner.telemetry_attribution["pr_number"] is None
+    orchestrator_module._end_run_telemetry(runner, outer)
+    assert runner.telemetry_attribution is None
+    kinds = [r["record"] for r in load_records(telemetry_log_path())]
+    assert kinds == ["run-start", "run-end"]

@@ -1030,6 +1030,8 @@ class WorkerBudgetLock:
         self.reservation: Path | None = None
         self.reservation_token: str | None = None
         self._reservation_data: dict | None = None
+        # Read-only observation for reservation telemetry (#1107).
+        self.last_others: tuple[int, int] | None = None
 
     @classmethod
     def acquire(
@@ -1100,6 +1102,7 @@ class WorkerBudgetLock:
                     data := _live_reservation(record, caller_lock=self.path.name)
                 ) is not None
             ]
+            self.last_others = (len(others), sum(int(data["workers"]) for data in others))
             if not others:
                 granted = requested
             else:
