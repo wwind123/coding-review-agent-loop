@@ -196,20 +196,27 @@ def test_shadowed_failure_refuses_in_both_api_orders(tmp_path, monkeypatch, orde
     assert not (effects.merges or effects.prepares or effects.publishes)
 
 
-def test_shadowed_skipped_required_check_refuses_but_optional_clears(tmp_path, monkeypatch):
-    runs = [_run(FINAL_CONTEXT), _run("X", "success", 2), _run("X", "skipped", 3)]
-    required = _board_from_payload(
-        tmp_path, runs, protection={"contexts": ["X"]}
-    )
+@pytest.mark.parametrize("order", ["success-first", "skipped-first"])
+@pytest.mark.parametrize("auto_merge", [True, False], ids=["auto-merge", "manual"])
+def test_shadowed_skipped_required_check_refuses_but_optional_clears(
+    tmp_path, monkeypatch, order, auto_merge
+):
+    pair = [_run("X", "success", 2), _run("X", "skipped", 3)]
+    if order == "skipped-first":
+        pair.reverse()
+    runs = [_run(FINAL_CONTEXT), *pair]
+    required = _board_from_payload(tmp_path, runs, protection={"contexts": ["X"]})
+    assert len(required.shadowed) == 1
     effects = _install(monkeypatch, _passed(required))
     with pytest.raises(AgentLoopError, match=r"cannot finalize.*`X`"):
-        run_pr_loop(_runner(_items()), pr_number=77, config=_config(tmp_path, auto_merge=True))
-    assert not effects.merges
+        run_pr_loop(_runner(_items()), pr_number=77, config=_config(tmp_path, auto_merge=auto_merge))
+    assert not (effects.merges or effects.prepares or effects.publishes)
 
     optional = _board_from_payload(tmp_path, runs)
     effects = _install(monkeypatch, _passed(optional))
-    assert run_pr_loop(_runner(_items()), pr_number=77, config=_config(tmp_path, auto_merge=True)) == 0
-    assert effects.merges
+    assert run_pr_loop(_runner(_items()), pr_number=77, config=_config(tmp_path, auto_merge=auto_merge)) == 0
+    assert bool(effects.merges) is auto_merge
+    assert bool(effects.publishes) is (not auto_merge)
 
 
 @pytest.mark.parametrize(

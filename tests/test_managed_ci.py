@@ -12750,6 +12750,21 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
     assert _lifecycle_writes(runner) == []  # no label, ready, or merge write
     assert runner.rest_pr["draft"] is True
     assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+    # The persisted round metadata still holds the carried item, unchanged.
+    from types import SimpleNamespace
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    persisted = [
+        i
+        for record in _extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
+        )
+        for i in (*record.metadata.prior_items, *record.metadata.new_items)
+        if i.obligation_kind == "github-pr-checks"
+    ]
+    assert persisted and {(i.text, i.lifecycle, i.failed_head_sha, i.candidate_head_sha) for i in persisted} == {
+        (item.text, item.lifecycle, item.failed_head_sha, item.candidate_head_sha)
+    }
 
     # Protection becomes readable: resume the SAME PR through the same real entry path.
     state["protection"] = "configured"
