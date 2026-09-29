@@ -1683,3 +1683,64 @@ def test_broker_telemetry_uses_runner_attribution_and_ignores_request_env(tmp_pa
     (row,) = [r for r in load_records(Path(os.environ["AGENT_LOOP_WORKER_TELEMETRY_LOG"])) if r["record"] == "attempt"]
     assert (row["repo"], row["run_id"], row["issue_number"]) == ("o/r", "run-1", 5)
     assert row["attribution_source"] == "runner" and row["lane"] == "broker"
+
+
+def _telemetry_attempts():
+    from coding_review_agent_loop.worker_telemetry import load_records
+
+    return [r for r in load_records(Path(os.environ["AGENT_LOOP_WORKER_TELEMETRY_LOG"])) if r["record"] == "attempt"]
+
+
+def test_real_coder_launch_broker_attempt_carries_nested_run_attribution(tmp_path):
+    """#1107: a real coder launch inside issue -> nested PR attribution."""
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop import orchestrator as orch
+
+    _git_checkout(tmp_path)
+    runner = _runner_with_budget(tmp_path, 2, "clamp")
+    context = SimpleNamespace(run_id="outer-run")
+    config = SimpleNamespace(repo="o/r")
+    outer = orch._begin_run_telemetry(runner, config, context, True, issue_number=56)
+    inner = orch._begin_run_telemetry(runner, config, context, False, pr_number=77)
+    script = (
+        "import sys; from coding_review_agent_loop.local_test_evidence import broker_client_from_environment; "
+        "print('outcome=' + broker_client_from_environment().run("
+        "[sys.executable, '-c', 'pass'], timeout_seconds=30).outcome)"
+    )
+    try:
+        result = runner.run_with_log(
+            [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / "coder.log",
+            label="coder", progress_interval_seconds=1, env=_src_env(),
+        )
+    finally:
+        orch._end_run_telemetry(runner, inner)
+        after_nested = dict(runner.telemetry_attribution)
+        orch._end_run_telemetry(runner, outer)
+    assert result.returncode == 0 and "outcome=passed" in (tmp_path / "coder.log").read_text()
+    (row,) = _telemetry_attempts()
+    assert (row["run_id"], row["issue_number"], row["pr_number"]) == ("outer-run", 56, 77)
+    assert row["lane"] == "broker" and row["attribution_source"] == "runner"
+    assert after_nested["pr_number"] is None and runner.telemetry_attribution is None
+
+
+@pytest.mark.parametrize("role", ["reviewer", "test-gate"])
+def test_non_coder_launch_exports_attribution_for_standalone_run_tests(tmp_path, role):
+    _git_checkout(tmp_path)
+    runner = _runner_with_budget(tmp_path, 2, "clamp")
+    runner.telemetry_attribution = {"repo": "o/r", "run_id": "run-9", "issue_number": 5, "pr_number": None}
+    script = (
+        "import subprocess, sys; "
+        "subprocess.run([sys.executable, '-m', 'coding_review_agent_loop.cli', 'run-tests', "
+        "'--timeout-seconds', '30', '--', sys.executable, '-c', 'pass'], check=True)"
+    )
+    env = {**_src_env(), "AGENT_LOOP_RUN_PR": "999", "AGENT_LOOP_RUN_ID": "stale"}
+    result = runner.run_with_log(
+        [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / f"{role}.log",
+        label=role, progress_interval_seconds=1, env=env, containment_role=role,
+    )
+    assert result.returncode == 0, (tmp_path / f"{role}.log").read_text()
+    (row,) = _telemetry_attempts()
+    assert (row["run_id"], row["repo"], row["issue_number"]) == ("run-9", "o/r", 5)
+    assert row["pr_number"] is None  # the stale inherited value was cleared
+    assert row["lane"] == "standalone" and row["attribution_source"] == "environment"

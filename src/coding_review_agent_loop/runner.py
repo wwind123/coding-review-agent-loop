@@ -28,7 +28,7 @@ from .containment import (
     sample_cgroup,
 )
 from .errors import AgentLoopError
-from .worker_telemetry import ReservationTelemetry, attribution_environment
+from .worker_telemetry import ATTRIBUTION_ENV, ReservationTelemetry, attribution_environment
 from .test_runtime import (
     INNER_EXEC_STATES,
     OVERLAP_REJECTED_EXIT_CODE,
@@ -1207,12 +1207,17 @@ class Runner:
     def _apply_worker_budget_env(
         self, role: str, handle: InvocationHandle | None, launch_env: dict[str, str]
     ) -> WorkerBudget | None:
+        # Run attribution (#1107) applies to every launch role: a reviewer or
+        # test-gate turn can call standalone run-tests too.  Absent fields
+        # are cleared so a stale inherited value never mislabels a run.
+        for name in ATTRIBUTION_ENV.values():
+            launch_env.pop(name, None)
+        launch_env.update(attribution_environment(self.telemetry_attribution))
         if role not in {"coder", "repair"}:
             return None
         budget = self.derive_worker_budget(handle)
         # launch_env is consumed only at Popen, after admission.
         launch_env.update(budget.environment())
-        launch_env.update(attribution_environment(self.telemetry_attribution))
         self.latest_worker_budget = budget
         return budget
 
