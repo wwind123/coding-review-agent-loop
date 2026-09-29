@@ -18148,6 +18148,18 @@ def _managed_success_supersedes_ordinary_checks(
                 "branch protection is unreadable (HTTP 403) and GitHub's merge state is "
                 f"{state or 'unavailable'} rather than CLEAN for {current_head_sha}"
             )
+        for observed in checks.passing:
+            if observed.name in required and observed.status.strip().lower() != "success":
+                return "unqualified", (
+                    f"required check `{observed.name}` is {observed.status.lower()} rather than a "
+                    "real success"
+                )
+        for name in sorted(required):
+            if not any(
+                observed.name == name and observed.status.strip().lower() == "success"
+                for observed in checks.passing
+            ):
+                return "unqualified", f"required check `{name}` has no real success at the qualified head"
         return "unqualified", "the exact-head board is not an authoritative success-only snapshot"
     return "cleared", ""
 

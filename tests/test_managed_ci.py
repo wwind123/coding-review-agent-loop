@@ -12643,3 +12643,24 @@ def test_waiter_returns_timeout_not_passed_for_final_success_with_nonfinal_failu
     assert outcome.status == "timeout"
     assert outcome.head_sha == "abc123"
     assert [check.name for check in outcome.checks.failing] == ["lint"]
+
+
+def test_draft_labeled_state_left_by_supersession_stop_is_accepted_by_real_resume_paths(tmp_path):
+    """#1117: the side-effect-free draft stop leaves a lifecycle both resume entries accept."""
+    from coding_review_agent_loop.managed_ci import authenticate_source_managed_resume
+
+    runner = _recovery_runner([_unreadable_record()])
+    config = _cloud_config(tmp_path, managed_ci_pr_mode=True)
+
+    handoff = _recover(runner, config)
+    assert handoff is not None
+    assert _mutations(runner) == []
+
+    source_runner = _recovery_runner([_unreadable_record()])
+    resume = authenticate_source_managed_resume(
+        source_runner, config=_cloud_config(tmp_path), pr_number=7,
+        source_branch="feature", source_sha="abc123",
+        managed_branch="agent-loop/managed-643", override_nonce="opening-nonce",
+    )
+    assert resume.lifecycle == "draft-labeled"
+    assert _mutations(source_runner) == []

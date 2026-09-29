@@ -122,8 +122,11 @@ def test_required_check_skipped_or_neutral_is_unqualified():
         required_checks=("lint",),
         passing=(_chk(FINAL_CONTEXT), _chk("lint", "skipped")),
     )
-    verdict, _ = _decide(board)
+    verdict, predicate = _decide(board)
     assert verdict == "unqualified"
+    assert "`lint`" in predicate and "skipped" in predicate
+    neutral = _board(required_checks=("lint",), passing=(_chk(FINAL_CONTEXT), _chk("lint", "neutral")))
+    assert "`lint`" in _decide(neutral)[1]
 
 
 def test_missing_required_and_pending_are_unqualified():

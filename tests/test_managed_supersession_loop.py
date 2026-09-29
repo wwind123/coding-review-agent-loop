@@ -1,5 +1,6 @@
 """run_pr_loop coverage for managed-success supersession and timeout routing (#1117)."""
-import json
+import dataclasses
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,19 +11,42 @@ from coding_review_agent_loop.github import PullRequestMergeability, get_pr_chec
 from coding_review_agent_loop.managed_ci import FINAL_CONTEXT, ManagedCiContract, ManagedCiOutcome
 from coding_review_agent_loop.orchestrator import run_pr_loop
 
-from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
+from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+from agent_loop_helpers import FakeRunner, make_config, structured_coder_followup, structured_pr_review
 from test_ci_health import NOW, _StubGhRunner, _metadata, _run
 from test_orchestrator_pr import _carried_ci_obligations, _carried_ci_review_comment
 
 H = "abc123"
 
 
+PERSISTED_TEXT = "Failing checks: Python 3.12 full suite (failure)"
+
+
 def _items():
-    return (_carried_ci_obligations()[1],)  # github-pr-checks, failed old-head, candidate H
+    # Modeled on #1115 item-10: github-pr-checks, qualification_ready at candidate H, failed head F.
+    return (dataclasses.replace(_carried_ci_obligations()[1], text=PERSISTED_TEXT),)
 
 
-def _runner(items):
+def _records(runner):
+    comments = [
+        SimpleNamespace(body=c["body"]) for c in runner.pr_payload.get("comments", [])
+    ]
+    return _extract_round_metadata_records(comments, flow="pr")
+
+
+def _checks_items(runner):
+    return [
+        item
+        for record in _records(runner)
+        for item in (*record.metadata.prior_items, *record.metadata.new_items)
+        if item.obligation_kind == "github-pr-checks"
+    ]
+
+
+def _runner(items, **extra):
     return FakeRunner(
+        **extra,
         codex_outputs=[
             structured_pr_review(
                 reviewer="OpenAI Codex",
@@ -116,23 +140,31 @@ def test_clean_managed_success_clears_carried_obligation_and_finalizes(tmp_path,
     board = _board_from_payload(tmp_path, _good_runs())
     effects = _install(monkeypatch, _passed(board))
 
-    assert run_pr_loop(_runner(items), pr_number=77, config=_config(tmp_path, auto_merge=auto_merge)) == 0
+    runner = _runner(items)
+    assert [i.text for i in _checks_items(runner)] == [PERSISTED_TEXT]
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=auto_merge)) == 0
 
     assert bool(effects.merges) is auto_merge
     assert bool(effects.publishes) is (not auto_merge)
     assert effects.mergeability_reads == 0
 
 
-def test_query_error_board_refuses_naming_predicate_without_finalizing(tmp_path, monkeypatch):
+@pytest.mark.parametrize("auto_merge", [True, False], ids=["auto-merge", "manual"])
+def test_query_error_board_refuses_naming_predicate_without_finalizing(tmp_path, monkeypatch, auto_merge):
     items = _items()
     board = _board_from_payload(tmp_path, _good_runs())
     board = PullRequestChecks(**{**board.__dict__, "check_query_errors": ("boom",)})
     effects = _install(monkeypatch, _passed(board))
 
+    runner = _runner(items)
     with pytest.raises(AgentLoopError, match=r"cannot finalize.*github-pr-checks.*boom"):
-        run_pr_loop(_runner(items), pr_number=77, config=_config(tmp_path, auto_merge=True))
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=auto_merge))
 
     assert not (effects.merges or effects.prepares or effects.publishes)
+    persisted = _checks_items(runner)
+    assert persisted and all(
+        item.text == PERSISTED_TEXT and item.lifecycle == "qualification_ready" for item in persisted
+    )
 
 
 @pytest.mark.parametrize("order", ["success-first", "failure-first"])
@@ -179,8 +211,9 @@ def test_shadowed_skipped_required_check_refuses_but_optional_clears(tmp_path, m
         {"status_total": 4},
         {"payload_override": {"check_runs": [_run(FINAL_CONTEXT), "junk"], "total_count": 2}},
         {"payload_override": {"check_runs": [_run(FINAL_CONTEXT), {"id": 9, "status": "completed"}], "total_count": 2}},
+        {"statuses": [{"state": "failure"}]},
     ],
-    ids=["truncated", "missing-total", "status-truncated", "non-object", "nameless"],
+    ids=["truncated", "missing-total", "status-truncated", "non-object", "nameless", "status-without-context"],
 )
 def test_incomplete_or_partially_parsed_listing_refuses(tmp_path, monkeypatch, kwargs):
     board = _board_from_payload(tmp_path, [_run(FINAL_CONTEXT)], **kwargs)
@@ -298,3 +331,50 @@ def test_timeout_with_nonfinal_failure_routes_to_repair_without_merge(tmp_path, 
     assert LEGACY not in str(excinfo.value)
     assert any("Failing checks: lint" in comment for comment in runner.comments)
     assert not (effects.merges or effects.prepares or effects.publishes)
+
+
+@pytest.mark.parametrize("conclusion", ["skipped", "neutral"])
+def test_required_check_without_real_success_refuses_naming_it(tmp_path, monkeypatch, conclusion):
+    board = _board_from_payload(
+        tmp_path, [_run(FINAL_CONTEXT), _run("lint", conclusion, 2)], protection={"contexts": ["lint"]}
+    )
+    effects = _install(monkeypatch, _passed(board))
+    with pytest.raises(AgentLoopError, match=r"cannot finalize.*`lint`.*"):
+        run_pr_loop(_runner(_items()), pr_number=77, config=_config(tmp_path, auto_merge=True))
+    assert not (effects.merges or effects.prepares or effects.publishes)
+
+
+def test_timeout_repair_dispatches_coder_persists_repair_required_and_extends_budget(tmp_path, monkeypatch):
+    board = _timeout_board(tmp_path, [_run(FINAL_CONTEXT), _run("lint", "failure", 4)])
+    items = _items()
+    runner = _runner(items, claude_outputs=[structured_coder_followup(addressed_items=[items[0].item_id])])
+    effects = _install(monkeypatch, _timeout(board))
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=True))
+
+    # The coder ran (claude consumed its scripted turn); the next reviewer round then began,
+    # which is only possible because the one-round budget extension applied (max_rounds=1).
+    assert "claude" in [c[0] for c, _cwd in runner.commands if c]
+    assert "scripted agent output exhausted" in str(excinfo.value)
+    assert LEGACY not in str(excinfo.value) and "review budget" not in str(excinfo.value)
+    assert not (effects.merges or effects.prepares or effects.publishes)
+    repaired = [
+        item for item in _checks_items(runner)
+        if item.lifecycle == "repair_required" and item.failed_head_sha == H
+    ]
+    assert repaired and "Failing checks: lint" in repaired[-1].text
+    assert any("Failing checks: lint" in comment for comment in runner.comments)
+
+
+def test_timeout_pending_or_missing_retains_obligation_without_persisting_change(tmp_path, monkeypatch):
+    runs = [_run(FINAL_CONTEXT), {"id": 5, "name": "slow", "status": "in_progress", "conclusion": None}]
+    board = _timeout_board(tmp_path, runs)
+    runner = _runner(_items())
+    effects = _install(monkeypatch, _timeout(board))
+    with pytest.raises(AgentLoopError, match="pending: slow"):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=True))
+    assert not (effects.merges or effects.prepares or effects.publishes)
+    assert all(
+        item.text == PERSISTED_TEXT and item.lifecycle == "qualification_ready"
+        for item in _checks_items(runner)
+    )
