@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -738,7 +739,11 @@ def _run_foreground_test_body(
         if proc is not None and process_finished is not None:
             process_finished(proc)
         lane_lock.close()
-        raise AgentLoopError(f"Could not start test command: {exc}") from exc
+        origin = ""
+        if exc.__traceback__ is not None:
+            frame = traceback.extract_tb(exc.__traceback__)[-1]
+            origin = f" [{type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno} in {frame.name}]"
+        raise AgentLoopError(f"Could not start test command: {exc}{origin}") from exc
 
     tail: deque[str] = deque(maxlen=80)
     pending = ""

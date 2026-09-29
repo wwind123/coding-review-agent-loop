@@ -14877,6 +14877,11 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
     # differ between developer machines and CI runners.
     from coding_review_agent_loop import test_workers as _test_workers
 
+    # Likewise pin the runtime directory the command lane and broker use.
+    runtime_dir = tmp_path / "xdg-runtime"
+    runtime_dir.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+
     lock_dir = tmp_path / "worker-locks"
     real_lock_root = _test_workers._ensure_private_directory
     monkeypatch.setattr(
