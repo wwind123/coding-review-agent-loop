@@ -12621,3 +12621,25 @@ def test_m1067_recovery_incapable_draft_labeled_resume_reports_measured_state(
         command[:3] == ["gh", "pr", "ready"] or "DELETE" in command
         for command, _cwd in loop_runner.commands
     )
+
+
+def test_waiter_returns_timeout_not_passed_for_final_success_with_nonfinal_failure(tmp_path):
+    """#1117: the real waiter never reports `passed` for this board; it times out with it."""
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1
+    )
+    runner = ManagedRunner(
+        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_status_payload={"statuses": [{"context": FINAL_CONTEXT, "state": "success", "target_url": None}]},
+        pr_check_runs_payload={
+            "total_count": 1,
+            "check_runs": [{"id": 3, "name": "lint", "status": "completed", "conclusion": "failure"}],
+        },
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+
+    outcome = wait_for_final_qualification(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert outcome.status == "timeout"
+    assert outcome.head_sha == "abc123"
+    assert [check.name for check in outcome.checks.failing] == ["lint"]
