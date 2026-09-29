@@ -16,7 +16,7 @@ def test_path_resolution(tmp_path, monkeypatch):
     assert wt.telemetry_log_path({}) == tmp_path / "coding-review-agent-loop" / "telemetry" / "worker-reservations.jsonl"
     absolute = tmp_path / "x.jsonl"
     assert wt.telemetry_log_path({wt.LOG_ENV: str(absolute)}) == absolute
-    for value in ("off", "0", "false", "No", "relative/path.jsonl"):
+    for value in ("off", "0", "false", "No", "relative/path.jsonl", "", "   "):
         assert wt.telemetry_log_path({wt.LOG_ENV: value}) is None
 
 
@@ -109,3 +109,16 @@ def test_attribution_environment_round_trip():
     assert wt.attribution_environment({"repo": "o/r", "run_id": "r1", "issue_number": 7, "pr_number": None}) == {
         "AGENT_LOOP_RUN_REPO": "o/r", "AGENT_LOOP_RUN_ID": "r1", "AGENT_LOOP_RUN_ISSUE": "7",
     }
+
+
+def test_error_outcome_after_reap_still_counts_command_interval():
+    records = _run("a", 0, 100) + [
+        {"record": "attempt", "run_id": "a", "outcome": "error", "reserved_at": None,
+         "target_started_at": 10, "command_seconds": 20, "released_at": 31, "retained": False},
+    ]
+    assert wt.run_duty_cycles(records)["a"]["duty_low"] == pytest.approx(0.2)
+
+
+def test_run_end_without_run_start_or_attempts_is_reported():
+    out = wt.run_duty_cycles([{"record": "run-end", "run_id": "z", "at": 5}])
+    assert out["z"]["incomplete"] == ["no run-start"] and out["z"]["window_seconds"] is None

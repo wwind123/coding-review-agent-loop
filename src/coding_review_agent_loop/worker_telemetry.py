@@ -31,7 +31,7 @@ def telemetry_log_path(environ: Mapping[str, str] | None = None) -> Path | None:
     """The log path, or None when telemetry is disabled or misconfigured."""
     values = os.environ if environ is None else environ
     configured = values.get(LOG_ENV)
-    if configured is None or not configured.strip():
+    if configured is None:
         from .config import default_cache_root
 
         return default_cache_root() / "telemetry" / "worker-reservations.jsonl"
@@ -247,7 +247,7 @@ def run_intervals(records: Iterable[Mapping[str, object]]) -> dict[str, dict]:
             if isinstance(value, (int, float)):
                 last_seen[run_id] = max(last_seen.get(run_id, float(value)), float(value))
     result: dict[str, dict] = {}
-    for run_id in sorted(set(starts) | set(attempts)):
+    for run_id in sorted(set(starts) | set(attempts) | set(ends)):
         rows = attempts.get(run_id, [])
         incomplete: list[str] = []
         if run_id not in starts:
@@ -271,7 +271,9 @@ def run_intervals(records: Iterable[Mapping[str, object]]) -> dict[str, dict]:
         for row in rows:
             reserved = row.get("reserved_at")
             released = row.get("released_at")
-            if row.get("outcome") == "unshared":
+            if not isinstance(reserved, (int, float)):
+                # No reservation held: the command interval is the usage,
+                # whatever the final outcome (an error after reaping included).
                 began, seconds = row.get("target_started_at"), row.get("command_seconds")
                 if isinstance(began, (int, float)) and isinstance(seconds, (int, float)):
                     interval = (float(began), float(began) + float(seconds))

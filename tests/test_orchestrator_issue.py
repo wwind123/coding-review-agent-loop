@@ -14679,3 +14679,79 @@ def test_nested_pr_phase_carries_pr_number_without_a_second_window(tmp_path):
     assert runner.telemetry_attribution is None
     kinds = [r["record"] for r in load_records(telemetry_log_path())]
     assert kinds == ["run-start", "run-end"]
+
+
+def test_issue_to_pr_workflow_carries_outer_run_and_pr_number_through_a_real_attempt(tmp_path, monkeypatch):
+    """Reservation telemetry (#1107): issue -> nested PR phase, one run window."""
+    import sys
+
+    from coding_review_agent_loop.runner import run_foreground_test
+    from coding_review_agent_loop.worker_telemetry import (
+        ReservationTelemetry, load_records, run_duty_cycles, telemetry_log_path,
+    )
+
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_plan_state(summary="Implement it."),
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[structured_plan_review(state="approved", summary="Plan approved.")],
+        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "abc123"},
+    )
+    config = make_config(tmp_path)
+    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
+    seen = {}
+
+    def nested_pr_phase(inner_runner, *, pr_number, config, usage_context, **_kwargs):
+        # The real run_pr_loop attributes its phase exactly like this and then
+        # its coder turn's broker runs the test command with the runner's
+        # attribution snapshot.
+        token = orchestrator_module._begin_run_telemetry(
+            inner_runner, config, usage_context, False, pr_number=pr_number
+        )
+        try:
+            attribution = {**inner_runner.telemetry_attribution, "attribution_source": "runner", "lane": "broker"}
+            run_foreground_test(
+                [sys.executable, "-c", "pass"], cwd=tmp_path, timeout_seconds=30, echo_output=False,
+                reservation_telemetry=ReservationTelemetry(telemetry_log_path(), attribution),
+            )
+        finally:
+            orchestrator_module._end_run_telemetry(inner_runner, token)
+        seen["after_nested"] = dict(inner_runner.telemetry_attribution)
+        return 0
+
+    monkeypatch.setattr(orchestrator_module, "run_pr_loop", nested_pr_phase)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
+
+    records = list(load_records(telemetry_log_path()))
+    kinds = [r["record"] for r in records]
+    assert kinds == ["run-start", "attempt", "run-end"]
+    attempt = records[1]
+    assert (attempt["issue_number"], attempt["pr_number"]) == (56, 77)
+    assert attempt["run_id"] == records[0]["run_id"] == records[2]["run_id"]
+    assert seen["after_nested"]["pr_number"] is None and seen["after_nested"]["issue_number"] == 56
+    assert runner.telemetry_attribution is None
+    assert run_duty_cycles(records)[attempt["run_id"]]["attempts"] == 1
+
+
+@pytest.mark.parametrize("loop", ["task", "discuss"])
+def test_other_owning_loops_write_run_end_on_exception(tmp_path, monkeypatch, loop):
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    runner = _FakeRunner()
+    config = make_config(tmp_path)
+
+    def boom(*_a, **_k):
+        raise AgentLoopError("stop")
+
+    monkeypatch.setattr(orchestrator_module, "resolve_base_branch", boom)
+    with pytest.raises(AgentLoopError, match="stop"):
+        if loop == "task":
+            orchestrator_module.run_task_loop(runner, task_text="do it", config=config)
+        else:
+            orchestrator_module.run_discuss_loop(runner, issue_number=56, config=config)
+    assert [r["record"] for r in load_records(telemetry_log_path())] == ["run-start", "run-end"]
+    assert runner.telemetry_attribution is None

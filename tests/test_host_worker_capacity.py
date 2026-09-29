@@ -412,7 +412,7 @@ def _run(tmp_path, root, telemetry, *, budget=None, env=None, cmd=None, **extra)
     )
 
 
-def test_telemetry_clean_grant_degraded_and_refused(tmp_path):
+def test_telemetry_clean_grant(tmp_path):
     root = tmp_path / "locks"
     log, tel = _telemetry(tmp_path)
     result = _run(tmp_path, root, tel)
@@ -422,29 +422,68 @@ def test_telemetry_clean_grant_degraded_and_refused(tmp_path):
     assert clean["others_count"] == 0 and clean["retained"] is False
     assert clean["command_seconds"] is not None and clean["released_at"] >= clean["reserved_at"]
     assert clean["repo"] == "o/r" and clean["attribution_source"] == "runner"
+    assert _records(root) == []
 
+
+def test_telemetry_degraded_grant_keeps_notice_and_lowered_budget(tmp_path):
+    root = tmp_path / "locks"
+    other = _lock(root, "other-loop")
+    notices = []
+    try:
+        assert other.reserve_host_workers(3, _cpus(4)) == 3
+        log, tel = _telemetry(tmp_path)
+        result = _run(
+            tmp_path, root, tel, output_callback=notices.append,
+            cmd=[sys.executable, "-c", "import os; print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS'])"],
+        )
+        assert "workers=1" in result.output_tail
+        (row,) = _attempts(log)
+        assert row["outcome"] == "degraded"
+        assert (row["workers_requested"], row["workers_granted"]) == (4, 1)
+        assert (row["others_count"], row["others_workers"]) == (1, 3)
+        assert "4 CPU(s)" in row["capacity"]
+        assert any("other agent-loop runs on this host hold part" in text for text in notices)
+    finally:
+        other.close()
+
+
+def test_telemetry_refused_does_not_spawn_or_leave_a_reservation(tmp_path):
+    root = tmp_path / "locks"
+    marker = tmp_path / "spawned"
     other = _lock(root, "other-loop")
     try:
-        assert other.reserve_host_workers(3, host_capacity(_budget(4))) >= 1
-        held = other.last_others
-        log2, tel2 = _telemetry(tmp_path, "t2.jsonl")
-        _run(tmp_path, root, tel2, budget=_budget(64))
-        (degraded,) = _attempts(log2)
-        assert degraded["outcome"] in {"degraded", "refused"}
-        assert degraded["others_count"] == 1
-        pool = host_worker_pool(_budget(64))
-        assert held is not None
-        # Take the whole pool so the next attempt is refused.
-        assert other.reserve_host_workers(pool, host_capacity(_budget(4))) == pool
-        log3, tel3 = _telemetry(tmp_path, "t3.jsonl")
-        busy = _run(tmp_path, root, tel3)
-        assert busy.returncode == 125
-        (refused,) = _attempts(log3)
-        assert refused["outcome"] == "refused" and refused["workers_granted"] == 0
-        assert refused["reserved_at"] is None and refused["command_seconds"] is None
+        assert other.reserve_host_workers(4, _cpus(4)) == 4
+        log, tel = _telemetry(tmp_path)
+        result = _run(
+            tmp_path, root, tel, cmd=[sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"],
+        )
+        assert result.returncode == 125 and "other agent-loop runs on this host" in result.output_tail
+        assert not marker.exists()
+        assert len(_records(root)) == 1  # only the foreign holder
+        (row,) = _attempts(log)
+        assert row["outcome"] == "refused" and row["workers_granted"] == 0
+        assert row["reserved_at"] is None and row["command_seconds"] is None
+        assert row["target_started_at"] is None
     finally:
         other.close()
     assert _records(root) == []
+
+
+def test_telemetry_overlap_rejection_writes_no_record(tmp_path):
+    from coding_review_agent_loop.test_runtime import acquire_command_lane
+
+    root = tmp_path / "locks"
+    env = _env("mine")
+    command = [sys.executable, "-c", "pass"]
+    first = acquire_command_lane(command, cwd=tmp_path, env=env)
+    assert first is not None
+    try:
+        log, tel = _telemetry(tmp_path)
+        result = _run(tmp_path, root, tel, env=env, cmd=command)
+    finally:
+        first.close()
+    assert result.outcome == "overlap-rejected"
+    assert not log.exists()
 
 
 def test_telemetry_reservation_start_excludes_wait(tmp_path, monkeypatch):
@@ -521,21 +560,29 @@ def test_telemetry_launch_failed_probe_emits_once(tmp_path):
 
 
 def test_telemetry_does_not_change_grants_or_reservation_bytes(tmp_path):
-    root = tmp_path / "locks"
+    """The reservation file the target sees is identical with telemetry on and off."""
+    script = (
+        "import glob, json, os, sys; "
+        "d = sys.argv[1]; "
+        "token = os.environ['AGENT_LOOP_WORKER_RESERVATION']; "
+        "own = [f for f in glob.glob(d + '/*.reservation') if token in f]; "
+        "data = json.load(open(own[0])); data.pop('token'); data.pop('pgid'); "
+        "print(json.dumps({'workers': os.environ['AGENT_LOOP_TEST_WORKERS'], 'file': data}, sort_keys=True))"
+    )
     seen = []
-
-
     for enabled in (True, False):
+        root = tmp_path / f"locks-{enabled}"
         other = _lock(root, "other-loop")
         try:
-            other.reserve_host_workers(2, _cpus(4))
-            cmd = [sys.executable, "-c", "import os; print(os.environ['AGENT_LOOP_TEST_WORKERS'])"]
+            assert other.reserve_host_workers(2, _cpus(4)) == 2
             tel = _telemetry(tmp_path, f"x{enabled}.jsonl")[1] if enabled else None
-            result = _run(tmp_path, root, tel, cmd=cmd)
-            seen.append(result.output_tail)
+            result = _run(tmp_path, root, tel, cmd=[sys.executable, "-c", script, str(root)])
+            assert result.returncode == 0, result.output_tail
+            seen.append(result.output_tail.strip().splitlines()[-1])
         finally:
             other.close()
     assert seen[0] == seen[1]
+    assert json.loads(seen[0])["workers"] == "2"
 
 
 def test_telemetry_flags_retained_share(tmp_path):
@@ -552,5 +599,15 @@ def test_telemetry_flags_retained_share(tmp_path):
     try:
         (row,) = _attempts(log)
         assert row["retained"] is True and row["released_at"] is not None
+        assert len(_records(root)) == 1  # the watcher/carrier keeps the share, as before
+        from coding_review_agent_loop.worker_telemetry import run_duty_cycles
+
+        start, end = row["requested_at"] - 1, row["released_at"] + 100
+        duty = run_duty_cycles([
+            {"record": "run-start", "run_id": "r1", "at": start},
+            {"record": "run-end", "run_id": "r1", "at": end},
+            {**row, "run_id": "r1"},
+        ])["r1"]
+        assert duty["retained"] == 1 and duty["duty_low"] < duty["duty_high"] <= 1.0
     finally:
         os.kill(escaped, 9)
