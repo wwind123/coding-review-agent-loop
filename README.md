@@ -1200,7 +1200,8 @@ cannot recover an unreadable planning history. `--plan-primary-stall-rounds N`
 blocked N consecutive completed primary-phase rounds with no exact-plan
 approval, instead of spending the rest of `--max-rounds`; the panel is never
 convened automatically. Editing the issue title or body retires rounds reviewed
-against earlier text (a comment alone does not), and the one-shot
+against earlier text (a comment alone does not, and rounds recorded before
+issue-text tracking carry no digest, so an edit cannot retire them), and the one-shot
 `--plan-reset-stall-streak` durably retires the counted rounds; otherwise rerun
 with `--plan-review-force-full` or a higher threshold. An in-flight run already past eight such rounds stops at
 its next round after upgrading. Omitting the flags keeps today's

@@ -582,7 +582,9 @@ panel. Two optional planning-only checkpoint fields retire the streak (#1112):
 count, an absent one counts as legacy) and `scheduler_stall_reset` (set by the
 one-shot `--plan-reset-stall-streak` on the invocation's first primary
 checkpoint; a durable boundary even without a completed review). Both are omitted
-when unset and invalid on PR-flow records. `--plan-review-force-full` stays the only way to convene the panel
+when unset and invalid on PR-flow records. Comment-only narrowing never retires
+the streak, because loop-posted comments share the operator's account and cannot
+be authenticated as operator intent; it is routed to the reset flag. `--plan-review-force-full` stays the only way to convene the panel
 without an exact-plan primary approval.
 
 Planning scheduler metadata is a flow-discriminated branch of the same durable

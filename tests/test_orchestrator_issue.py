@@ -15112,41 +15112,114 @@ def test_legacy_undigested_rounds_keep_counting_and_name_the_reset_flag(tmp_path
     assert "--plan-reset-stall-streak" in str(error)
 
 
+def _m1112_crash_at_checkpoint(history, config, *, after_post):
+    """A flagged run killed at its first scheduler checkpoint post."""
+    runner = _FakeRunner(issue_comments=list(history), **_m1112_approvals())
+    real_post = orchestrator_module.post_issue_comment
+
+    def crashing_post(*args, **kwargs):
+        if "Plan review scheduling audit" in str(kwargs.get("body", "")):
+            if after_post:
+                real_post(*args, **kwargs)
+            raise KeyboardInterrupt("simulated crash at the prelaunch checkpoint")
+        return real_post(*args, **kwargs)
+
+    with patch.object(orchestrator_module, "post_issue_comment", crashing_post):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner
+
+
+def _m1112_no_panel_or_force_full(runner):
+    records = _plan_round_records(runner)
+    assert not any(r.scheduler_force_full for r in records)
+    assert not any(
+        r.scheduler_phase in {"secondary-audit", "full-board"} for r in records
+    )
+    assert "gemini" not in _m1103_agent_calls(runner)
+
+
 def test_reset_flag_durably_retires_the_streak(tmp_path):
-    """`reset-flag-durable`."""
+    """`reset-flag-durable`: the reset checkpoint bounds later flagless reruns."""
     runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
     history = list(runner.issue_comments)
+    _fresh, base = _m1103_fresh_base()
+    _codex, _claude, base = _m1103_blocking_chain(1, 2, base=base)
+    codex, claude, _base = _m1103_blocking_chain(3, 4, base=base)
 
-    flagged, _error = _m1112_rerun(
-        history, replace(config, plan_reset_stall_streak=True), **_m1112_approvals()
+    flagged = _FakeRunner(
+        issue_comments=list(history), codex_outputs=codex, claude_outputs=claude
     )
-    assert "codex" in _m1103_agent_calls(flagged)
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        run_issue_loop(
+            flagged,
+            issue_number=56,
+            config=replace(config, plan_reset_stall_streak=True),
+            plan_first=True,
+        )
+    # The flagged run gets rounds 3 and 4 (two new blocking rounds), and only
+    # the invocation's first primary checkpoint carries the marker.
+    assert _m1103_agent_calls(flagged) == ["codex", "claude", "codex", "claude"]
     marked = [r for r in _plan_round_records(flagged) if r.scheduler_stall_reset]
-    assert len(marked) == 1 and marked[0].round_number == 3
+    assert [r.round_number for r in marked] == [3]
     assert marked[0].scheduler_phase == "primary"
-    assert not any(r.scheduler_force_full for r in _plan_round_records(flagged))
+    _m1112_no_panel_or_force_full(flagged)
 
-    # A later flagless rerun over only the reset checkpoint does not stop.
-    reset_only = [c for c in flagged.issue_comments if c not in history]
-    reset_checkpoint = next(
-        c for c in reset_only if "scheduler-prelaunch" in c["body"] or "AGENT_LOOP_META" in c["body"]
-    )
-    later, error = _m1112_rerun(
-        [*history, reset_checkpoint], config, **_m1112_approvals()
-    )
-    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError) or (
-        "blocked" not in str(error)
-    )
+    # A flagless rerun of that history stops again only because N new blocking
+    # rounds followed the reset checkpoint, never the two older ones.
+    later = _FakeRunner(issue_comments=list(flagged.issue_comments))
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        run_issue_loop(later, issue_number=56, config=config, plan_first=True)
+    assert _m1103_agent_calls(later) == []
 
 
 def test_reset_interrupted_before_checkpoint_stops_again(tmp_path):
     """`reset-interrupted-before-checkpoint`: nothing durable, still stops."""
     runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
     history = list(runner.issue_comments)
-    # A flagged run that died before posting anything leaves history untouched.
-    rerun, error = _m1112_rerun(history, config)
+    crashed = _m1112_crash_at_checkpoint(
+        history, replace(config, plan_reset_stall_streak=True), after_post=False
+    )
+    assert crashed.issue_comments == history
+    assert not any(r.scheduler_stall_reset for r in _plan_round_records(crashed))
+
+    rerun, error = _m1112_rerun(crashed.issue_comments, config)
     assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert "blocked 2" in str(error)
     assert _m1103_agent_calls(rerun) == []
+
+
+def test_reset_interrupted_after_checkpoint_resumes_the_primary_review(tmp_path):
+    """`reset-interrupted-after-checkpoint`: the posted marker is a boundary."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    crashed = _m1112_crash_at_checkpoint(
+        history, replace(config, plan_reset_stall_streak=True), after_post=True
+    )
+    marked = [r for r in _plan_round_records(crashed) if r.scheduler_stall_reset]
+    assert [r.round_number for r in marked] == [3]
+    assert _m1103_agent_calls(crashed) == []
+
+    rerun, error = _m1112_rerun(crashed.issue_comments, config, **_m1112_approvals())
+    assert not (
+        isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+        and "blocked" in str(error)
+    )
+    assert "codex" in _m1103_agent_calls(rerun)
+    # No second reset marker and no panel or force-full before primary approval.
+    assert [
+        r.round_number for r in _plan_round_records(rerun) if r.scheduler_stall_reset
+    ] == [3]
+    records = _plan_round_records(rerun)
+    assert not any(r.scheduler_force_full for r in records)
+    # The resumed round runs primary-only; the panel opens only after the
+    # primary's own approval, never on the reset.
+    round_three = [
+        r for r in records
+        if r.phase == "scheduler-prelaunch" and r.round_number == 3
+    ]
+    assert round_three
+    assert all(r.scheduler_phase == "primary" for r in round_three)
 
 
 def test_streak_ends_at_a_digest_mismatch_and_reaccumulates():
