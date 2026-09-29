@@ -892,6 +892,24 @@ Reviewer board amendment:
   partly recorded or already reconciled, and it is not always the latest
   visible round number. Any other value stops before any agent turn or comment
   and prints the corrected template.
+- **Which board to rerun with.** Posting the record is what removes the
+  reviewer. For a PR run, keep the original reviewer board configured
+  (recommended); the run derives the amended board from the signed record and
+  never selects, invokes, or requires the removed reviewer, including under an
+  automatic force-full latch. The reduced board is also accepted, except on an
+  issue-created strict managed-CI PR, where the approved plan is re-verified
+  against the flags you supply and the original board is required. Planning
+  reruns use the reduced board. Any other board fails closed with the
+  contract-drift error; if you posted a record and still see drift, the record
+  was not recognized, so look for an ignored-record diagnostic in the log.
+- **Record format.** Line endings may be LF or CRLF (a lone CR is not
+  supported). A comment that consists only of one fenced block naming the
+  record kind but not written as a ```` ```json ```` fence is reported as an ignored
+  record and is never applied.
+- **Records posted under an unread amendment.** If a run posted scheduler
+  records after an amendment comment it could not read, those records are never
+  reinterpreted. The drift error then tells you to delete the unread amendment
+  comment and post a fresh signed record with the printed `effective_from_round`.
 - **Retroactive use.** The record rescues runs whose contract was persisted
   before this feature existed. Earlier rounds are never rewritten. Inside the
   re-entered round, reviews already posted by the remaining reviewers are

@@ -273,8 +273,12 @@ and then inspects phase 1:
   the reviewer silently or refile the issue. Report the error to the human; the
   error prints a filled-in signed `reviewer-board-amendment` record. Only a
   human may post it (on the issue for planning, on the PR for PR review),
-  keeping the printed `effective_from_round`; then rerun with the reduced
-  reviewer list. Policy and primary stay immutable. See "Removing an
+  keeping the printed `effective_from_round`; then rerun. For PR review keep
+  the original reviewer list (the amendment does the removing; the reduced list
+  is also accepted, except on issue-created strict managed-CI PRs); for planning
+  use the reduced list. If the error says to delete an unread amendment comment,
+  the human must repost it at the printed round. Policy and primary stay
+  immutable. See "Removing an
   unavailable reviewer from an in-flight run" in `docs/local_agent_loop.md`.
 - If phase 1 is `human-action` or `manual-close`, it prints JSON identifying the
   child issue and stops without posting a phase handoff or running the coder.

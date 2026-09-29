@@ -339,6 +339,36 @@ def _amendment_record_problem(payload: dict[str, object]) -> str | None:
     return None
 
 
+def _normalize_newlines(body: str | None) -> str | None:
+    """CRLF -> LF; a lone CR stays unsupported (the signature parser ignores it)."""
+    return body.replace("\r\n", "\n") if isinstance(body, str) else body
+
+
+_AMENDMENT_HEADING_RE = re.compile(r"(?im)^[ \t]*reviewer board amendment:?[ \t]*$")
+_ANY_FENCE_RE = re.compile(
+    r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n(?P<body>.*?)\n[ \t]{0,3}(?P=fence)[ \t]*$",
+    re.S | re.M,
+)
+
+
+def _amendment_shaped_block(signed_body: str) -> str | None:
+    """The block text when a comment is exactly one unreadable amendment fence.
+
+    Matches only when the strict ``json`` fence path found no fence at all and
+    the body, minus an optional heading line, is a single fenced block naming
+    the record kind.  Records are never applied from such a block; the shape is
+    only used to report the comment and keep it out of signed requirements.
+    Prose alongside the block, or a strict fence anywhere, never matches.
+    """
+    if _FENCED_JSON_RE.search(signed_body):
+        return None
+    remainder = _AMENDMENT_HEADING_RE.sub("", signed_body, count=1).strip()
+    match = _ANY_FENCE_RE.fullmatch(remainder)
+    if match is None or REVIEWER_BOARD_AMENDMENT_KIND not in match.group("body"):
+        return None
+    return match.group("body")
+
+
 def parse_reviewer_board_amendment_records(
     body: str | None, *, comment_locator: str, comment_index: int = -1
 ) -> tuple[tuple[ReviewerBoardAmendment, ...], tuple[str, ...]]:
@@ -347,11 +377,19 @@ def parse_reviewer_board_amendment_records(
     Only a body with the standalone human reviewer signature counts, and a
     malformed record is reported and ignored so it can never be applied.
     """
-    signed = parse_signed_human_requirement_body(body)
+    # GitHub hands CRLF bodies back verbatim; the signature parser and the fence
+    # regex only understand LF, so normalize before either runs (#1133).
+    signed = parse_signed_human_requirement_body(_normalize_newlines(body))
     if signed is None:
         return (), ()
     records: list[ReviewerBoardAmendment] = []
     ignored: list[str] = []
+    if _amendment_shaped_block(signed) is not None:
+        ignored.append(
+            f"{comment_locator}: reviewer-board amendment record found but its fence could "
+            "not be read; use a ```json fence on its own lines, and delete and repost the "
+            "record if it was posted under a different fence"
+        )
     for match in _FENCED_JSON_RE.finditer(signed):
         try:
             payload = json.loads(match.group("body"))
@@ -403,6 +441,9 @@ def is_reviewer_board_amendment_only(signed_body: str | None) -> bool:
     """
     if not signed_body:
         return False
+    signed_body = _normalize_newlines(signed_body) or ""
+    if _amendment_shaped_block(signed_body) is not None:
+        return True
     found = False
 
     def strip(match: re.Match[str]) -> str:
@@ -689,11 +730,27 @@ def _describe_contract(contract: object) -> str:
     )
 
 
+# Tag carried by the drift detail when scheduler records were posted after an
+# amendment comment without reading it; drift builders key their repost
+# instruction on it (#1133).
+STALE_UNREAD_AMENDMENT_HINT = "stale-unread-amendment-record"
+_STALE_UNREAD_AMENDMENT_RE = re.compile(
+    rf"\[{STALE_UNREAD_AMENDMENT_HINT} at (?P<locator>[^\]]+)\]"
+)
+
+
+def stale_unread_amendment_locator(detail: str) -> str | None:
+    """The amendment comment locator tagged in a stale-record drift detail."""
+    match = _STALE_UNREAD_AMENDMENT_RE.search(detail)
+    return match.group("locator") if match else None
+
+
 def resolve_contract_lineage(
     records: Sequence[PostedRoundRecord],
     amendments: Sequence[ReviewerBoardAmendment],
     configured_contract: ContractT | None,
     *,
+    accept_base_configured: bool = False,
     contract_from_metadata: Callable[[object], ContractT | None],
     drift_error: Callable[[ContractT, str], AgentLoopError],
 ) -> ContractLineage:
@@ -706,8 +763,9 @@ def resolve_contract_lineage(
     precedes the record and whose effective round is at or before the
     record's round.  It must carry exactly that link's contract and digest
     (link 0 carries C0 and no digest).  The configured contract must equal
-    Cn.  ``drift_error(persisted_contract, detail)`` builds the fail-closed
-    error for any mismatch.
+    Cn (``accept_base_configured`` also accepts C0, for PR runs that derive
+    the amended board themselves).  ``drift_error(persisted_contract, detail)``
+    builds the fail-closed error for any mismatch.
     """
     ordered = sorted(records, key=lambda record: record.index)
     bearing: list[tuple[PostedRoundRecord, ContractT]] = []
@@ -756,6 +814,19 @@ def resolve_contract_lineage(
                     f"round {record.metadata.round_number} scheduler record (comment "
                     f"{record.index + 1}) carries an unknown reviewer-board amendment digest"
                 )
+            elif (
+                governing
+                and contract == contracts[governing - 1]
+                and digest == (chain[governing - 2].digest if governing > 1 else None)
+            ):
+                detail = (
+                    f"round {record.metadata.round_number} scheduler record (comment "
+                    f"{record.index + 1}) was posted under the amendment at "
+                    f"{chain[governing - 1].comment_locator} but does not carry its amended "
+                    "contract and digest: it was posted after that amendment comment without "
+                    "the run reading it, and such records are never reinterpreted "
+                    f"[{STALE_UNREAD_AMENDMENT_HINT} at {chain[governing - 1].comment_locator}]"
+                )
             elif governing:
                 detail = (
                     f"round {record.metadata.round_number} scheduler record (comment "
@@ -771,7 +842,9 @@ def resolve_contract_lineage(
             raise drift_error(contract, detail)
         if digest is not None:
             used.add(digest)
-    if configured_contract != contracts[-1]:
+    if configured_contract != contracts[-1] and not (
+        accept_base_configured and chain and configured_contract == contracts[0]
+    ):
         raise drift_error(contracts[-1], "the configured contract does not match it")
     return ContractLineage(
         contracts=tuple(contracts),
