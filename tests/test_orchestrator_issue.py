@@ -14874,17 +14874,21 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
     real_launches = []
 
     class HybridRunner(FakeRunner):
-        """Scripted agents, except the PR-phase coder turn also really launches."""
+        """Scripted agents, but the PR-phase coder turn is launched by the real
+        ``Runner.run_with_log`` on this very object, so its attribution and
+        broker come from the state the orchestrator loops set on it."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            Runner.__init__(self)
 
         def run_with_log(self, args, *, cwd, log_path, label, progress_interval_seconds, **kwargs):
             attribution = self.telemetry_attribution
             if list(args[:1]) == ["claude"] and attribution and attribution.get("pr_number"):
-                real = Runner()
-                real.telemetry_attribution = dict(attribution)
-                launched = real.run_with_log(
-                    [sys.executable, "-c", child], cwd=checkout, log_path=tmp_path / "real-coder.log",
-                    label="coder", progress_interval_seconds=1,
-                    env={"PYTHONPATH": src},
+                launched = Runner.run_with_log(
+                    self, [sys.executable, "-c", child], cwd=checkout,
+                    log_path=tmp_path / "real-coder.log", label="coder",
+                    progress_interval_seconds=1, env={"PYTHONPATH": src},
                 )
                 real_launches.append((launched.returncode, (tmp_path / "real-coder.log").read_text()))
             return super().run_with_log(
