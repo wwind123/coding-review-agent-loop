@@ -14873,6 +14873,16 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
     )
     real_launches = []
 
+    # Keep worker-budget locks off the host's runtime directories, which
+    # differ between developer machines and CI runners.
+    from coding_review_agent_loop import test_workers as _test_workers
+
+    lock_dir = tmp_path / "worker-locks"
+    real_lock_root = _test_workers._ensure_private_directory
+    monkeypatch.setattr(
+        _test_workers, "worker_budget_lock_root", lambda: real_lock_root(lock_dir)
+    )
+
     class HybridRunner(FakeRunner):
         """Scripted agents, but the PR-phase coder turn is launched by the real
         ``Runner.run_with_log`` on this very object, so its attribution and
@@ -14892,7 +14902,8 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
                 launched = Runner.run_with_log(
                     self, [sys.executable, "-c", child], cwd=checkout,
                     log_path=tmp_path / "real-coder.log", label="coder",
-                    progress_interval_seconds=1, env={"PYTHONPATH": src},
+                    progress_interval_seconds=1,
+                    env={"PYTHONPATH": src, "AGENT_LOOP_TEST_WORKER_HOST_SHARING": "off"},
                 )
                 real_launches.append((launched.returncode, (tmp_path / "real-coder.log").read_text()))
             return super().run_with_log(
