@@ -14880,7 +14880,11 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
 
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
-            Runner.__init__(self)
+            from coding_review_agent_loop.containment import default_policy
+
+            # Containment off: the host's systemd/cgroup setup must not decide
+            # whether the broker can start the test command.
+            Runner.__init__(self, containment_policy=default_policy(mode="off", cache_dir=tmp_path / ".runtime"))
 
         def run_with_log(self, args, *, cwd, log_path, label, progress_interval_seconds, **kwargs):
             attribution = self.telemetry_attribution
