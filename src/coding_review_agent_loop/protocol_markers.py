@@ -285,6 +285,8 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
         _b64_definition("AGENT_PLAN_EXPECTED_CLOSING_ISSUES", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_LOOP_META", surfaces=_COMMENT, codec="compressed-mapping"),
         _b64_definition("AGENT_LOOP_SIDECAR", surfaces=_COMMENT),
+        # Orchestrator-authored sub-item progress audit record (#958).
+        _b64_definition("AGENT_SUB_ITEM_PROGRESS", surfaces=_PR),
         _b64_definition(
             "AGENT_PLAN_VALIDATION_DIAGNOSTIC",
             surfaces=_ISSUE_ONLY,

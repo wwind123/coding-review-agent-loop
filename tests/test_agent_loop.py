@@ -6886,3 +6886,34 @@ def test_host_footer_log_latch_resets_with_each_owned_usage_context(tmp_path, mo
     # With no footer observed, an owning invocation logs nothing.
     orchestrator_module._new_usage_context(config)
     assert len(lines) == 3
+
+
+def _sub_item_stall_args(tmp_path, *extra):
+    return build_parser().parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        *extra,
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+    ])
+
+
+def test_sub_item_stall_rounds_defaults_to_three_and_zero_disables(tmp_path):
+    from coding_review_agent_loop.config import DEFAULT_SUB_ITEM_STALL_ROUNDS
+
+    omitted = _sub_item_stall_args(tmp_path)
+    assert omitted.sub_item_stall_rounds == DEFAULT_SUB_ITEM_STALL_ROUNDS == 3
+    assert config_from_args(omitted, FakeRunner()).sub_item_stall_rounds == 3
+    disabled = _sub_item_stall_args(tmp_path, "--sub-item-stall-rounds", "0")
+    assert config_from_args(disabled, FakeRunner()).sub_item_stall_rounds == 0
+    assert config_from_args(disabled, FakeRunner()).max_rounds == omitted.max_rounds
+
+
+def test_sub_item_stall_rounds_rejects_negative_values(tmp_path):
+    args = _sub_item_stall_args(tmp_path, "--sub-item-stall-rounds", "-1")
+    with pytest.raises(AgentLoopError, match="--sub-item-stall-rounds must be zero or greater"):
+        config_from_args(args, FakeRunner())

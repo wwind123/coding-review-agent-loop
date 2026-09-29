@@ -3059,3 +3059,126 @@ def test_deferred_evidence_request_text_is_withheld_from_public_labels():
     assert "deferred" in deferred
     frozen = freeze_evidence_obligations(ledger, head_sha="abc123")
     assert "Attach the secret live run output" in _format_unresolved_item_label(frozen[0])
+
+
+# --- Sub-item progress rendering (#958) --------------------------------------
+
+
+def _sub_item(item_id="item-1", *, resolved=(), source_round=1):
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.unresolved_items import _next_unresolved_item
+
+    item = _next_unresolved_item(
+        item_number=int(item_id.split("-")[1]),
+        reviewer="Codex",
+        source_round=source_round,
+        text="Four writer paths are unwired.",
+        status="blocking",
+        sub_items=("a", "b", "c", "d"),
+    )
+    return _replace(
+        item,
+        sub_items=tuple(
+            _replace(sub, status="resolved", resolved_round=2)
+            if sub.sub_item_id in resolved
+            else sub
+            for sub in item.sub_items
+        ),
+    )
+
+
+def test_progress_comment_lists_cleared_and_stalled_with_record():
+    from coding_review_agent_loop.comment_rendering import (
+        render_sub_item_progress_comment,
+        sub_item_progress_digest,
+        sub_item_progress_record_keys,
+    )
+    from coding_review_agent_loop.unresolved_items import (
+        ClearedItemProgress,
+        newly_stalled_items,
+    )
+
+    cleared = [
+        ClearedItemProgress("item-1", 4, 4, "all-sub-items-resolved", 5, ("item-1.s4",)),
+        ClearedItemProgress("item-3", 2, 4, "item-level-resolved", 5),
+    ]
+    stalled = newly_stalled_items([_sub_item("item-2")], current_round=3, window=3)
+    body = render_sub_item_progress_comment(
+        pr_number=9, round_number=5, cleared=cleared, stalled=stalled
+    )
+    assert "### Sub-item progress — review round 5" in body
+    assert "- item-1: 4/4 — cleared (all sub-items resolved)" in body
+    assert "- item-3: cleared by item-level resolution at 2/4" in body
+    assert "### Stalled findings" in body
+    assert "- item-2: 0/4 sub-items resolved, none closed in the last 3 rounds" in body
+    assert body.rstrip().endswith("-- Orchestrator")
+    digest = sub_item_progress_digest(cleared, stalled)
+    assert sub_item_progress_record_keys(body) == ((9, 5, digest),)
+    assert sub_item_progress_digest(cleared, []) != digest
+
+
+def test_reviewer_comment_projection_is_labelled_and_not_the_outcome():
+    from coding_review_agent_loop.comment_rendering import _render_prior_dispositions_section
+    from coding_review_agent_loop.protocol import ReviewItemDisposition
+
+    item = _sub_item(resolved=("item-1.s1", "item-1.s2", "item-1.s3"))
+    disposition = ReviewItemDisposition(
+        "item-1", "Codex", "blocking", "n", (("item-1.s4", "resolved"),)
+    )
+    section = _render_prior_dispositions_section(
+        heading="### Prior unresolved item dispositions",
+        prior_items=[item],
+        dispositions=[disposition],
+    )
+    assert "per this review only, not the round outcome" in section
+    assert "resolves s4 → 4/4" in section
+    plain = ReviewItemDisposition("item-1", "Codex", "blocking", "n")
+    assert "Sub-items" not in _render_prior_dispositions_section(
+        heading="### h", prior_items=[item], dispositions=[plain]
+    )
+
+
+def test_coder_comment_separates_confirmed_counts_from_unverified_claims():
+    from coding_review_agent_loop.comment_rendering import _render_public_coder_followup_comment
+    from coding_review_agent_loop.protocol import StructuredCoderFollowup, StructuredHumanRequirementsPayload
+
+    carried = _sub_item("item-2", resolved=("item-2.s1",))
+    cleared_elsewhere = _sub_item("item-1", resolved=("item-1.s1",))
+    followup = StructuredCoderFollowup(
+        schema_version=1,
+        kind="coder_followup",
+        state="blocking",
+        summary="did some",
+        addressed_items=("item-1",),
+        remaining_items=("item-2",),
+        human_requirements=StructuredHumanRequirementsPayload((), False),
+        addressed_item_notes={},
+        remaining_item_notes={},
+        addressed_sub_items=("item-2.s2",),
+    )
+    body = _render_public_coder_followup_comment(
+        followup, agent="Claude", prior_items=[carried, cleared_elsewhere]
+    )
+    assert "### Sub-item progress" in body
+    assert (
+        "- item-2: 1/4 sub-items resolved (reviewer-confirmed); coder claims 1 more "
+        "addressed this round (unverified)"
+    ) in body
+    assert "  - item-2.s2: open; coder claims addressed (unverified)" in body
+    # A whole-item claim on a still-carried item keeps its confirmed count and is
+    # labelled as an unverified implication.
+    section = body.split("### Sub-item progress")[1]
+    assert (
+        "- item-1: 1/4 sub-items resolved (reviewer-confirmed); coder claims 3 more addressed "
+        "this round (unverified); coder reports the whole item addressed, which implies every "
+        "open sub-item (unverified)"
+    ) in section
+    assert "  - item-1.s1: resolved (round 2)" in section
+    assert "  - item-1.s2: open; coder claims addressed (unverified)" in section
+    unchanged = _render_public_coder_followup_comment(
+        _replace_959(followup, addressed_sub_items=()),
+        agent="Claude",
+        prior_items=[],
+    )
+    assert "Sub-item progress" not in unchanged

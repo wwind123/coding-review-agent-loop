@@ -404,7 +404,7 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
         ),
     ),
     "_expect_disposition_list": ShapeCheckClassification(
-        "fatal",
+        "mixed",
         frozenset({"no-conservative-reading"}),
         (
             "Fatal sites: no-conservative-reading: removing the element would weaken an "
@@ -583,14 +583,44 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
         ),
     ),
     "_expect_review_finding_list": ShapeCheckClassification(
-        "fatal",
-        frozenset({"no-conservative-reading"}),
+        "mixed",
+        frozenset({"authentication-or-forgery", "no-conservative-reading"}),
         (
             "A dropped finding changes a verdict non-monotonically; the rewrapped "
             "normalize_fix_scope call and its re-raise both propagate. Fatal sites: "
             "no-conservative-reading: removing the element would weaken an obligation, "
             "finding, disposition, approved topology or discussion answer rather than a "
             "claim."
+        ),
+    ),
+    "_degradable_sub_item_claims": ShapeCheckClassification(
+        "mixed",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Sub-item content (#958) degrades to a plain finding, dropping only the malformed element; record construction reaches marker neutralization. "
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
+    "_degradable_sub_item_dispositions": ShapeCheckClassification(
+        "mixed",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Sub-item content (#958) degrades to a plain finding, dropping only the malformed element; record construction reaches marker neutralization. "
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
+    "_degradable_sub_items": ShapeCheckClassification(
+        "mixed",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Sub-item content (#958) degrades to a plain finding, dropping only the malformed element; record construction reaches marker neutralization. "
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
         ),
     ),
     "_expect_state": ShapeCheckClassification(
@@ -992,8 +1022,8 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
         ),
     ),
     "_parse_review_item_disposition_payload": ShapeCheckClassification(
-        "fatal",
-        frozenset({"no-conservative-reading"}),
+        "mixed",
+        frozenset({"authentication-or-forgery", "no-conservative-reading"}),
         (
             "Fatal sites: no-conservative-reading: removing the element would weaken an "
             "obligation, finding, disposition, approved topology or discussion answer "
@@ -1319,7 +1349,7 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
         ),
     ),
     "parse_plan_revision_patch": ShapeCheckClassification(
-        "fatal",
+        "mixed",
         frozenset({"authentication-or-forgery", "kind-or-version-mismatch", "no-conservative-reading", "payload-bound"}),
         (
             "The base-state identity digest is authentication-or-forgery; every "
@@ -1724,7 +1754,7 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
         ),
     ),
     "validate_structured_plan_revision_patch": ShapeCheckClassification(
-        "fatal",
+        "mixed",
         frozenset({"no-conservative-reading", "unparseable-envelope"}),
         (
             "Fatal sites: no-conservative-reading: removing the element would weaken an "

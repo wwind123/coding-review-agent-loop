@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from .errors import (
     AgentLoopError,
@@ -17,9 +17,11 @@ from .errors import (
 from .github import PullRequestMergeability
 from .prompts import render_coder_human_requirements_prompt_context
 from .protocol import (
+    ParseDegradation,
     ParsedPlanReview,
     ParsedReview,
     ReviewItemDisposition,
+    ReviewSubItem,
     StructuredCoderFollowup,
     StructuredIssueImplementation,
     UnresolvedReviewItem,
@@ -133,6 +135,7 @@ def _next_unresolved_item(
     failed_head_sha: str | None = None,
     candidate_head_sha: str | None = None,
     obligation_identity: str | None = None,
+    sub_items: Sequence[str] = (),
 ) -> UnresolvedReviewItem:
     if obligation_kind is not None and authority is None:
         authority = MACHINE_AUTHORITY
@@ -162,6 +165,11 @@ def _next_unresolved_item(
         obligation_identity=obligation_identity or (
             f"{obligation_kind}:item-{item_number}" if obligation_kind else None
         ),
+        # Reviewer findings only; machine obligations never carry sub-items.
+        sub_items=tuple(
+            ReviewSubItem(sub_item_id=f"item-{item_number}.s{position}", text=statement)
+            for position, statement in enumerate(sub_items, 1)
+        ) if authority not in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY} else (),
     )
 
 
@@ -612,10 +620,50 @@ def _validate_review_response(
             raise AgentLoopError(
                 "Review did not evaluate all prior unresolved items: " + ", ".join(missing)
             )
+    # Sub-item keys must name sub-items of that entry's carried item; anything
+    # else (including any key on an item without sub-items or on a machine
+    # obligation) is dropped with a degradation instead of rejecting the
+    # response (#958).
+    sub_item_records: list[ParseDegradation] = list(parsed.sub_item_degradations)
+    validated: list[ReviewItemDisposition] = []
+    for disposition in dispositions:
+        if disposition.sub_item_dispositions:
+            carried = unresolved_by_id[disposition.item_id]
+            allowed = (
+                set()
+                if _is_machine_obligation(carried)
+                else {sub.sub_item_id for sub in carried.sub_items}
+            )
+            kept_pairs = tuple(
+                pair for pair in disposition.sub_item_dispositions if pair[0] in allowed
+            )
+            for key, _verdict in disposition.sub_item_dispositions:
+                if key not in allowed and len(sub_item_records) < 16:
+                    sub_item_records.append(
+                        ParseDegradation.build(
+                            element_path=f"prior_item_dispositions[{disposition.item_id}].sub_item_dispositions",
+                            rule="sub-item-key-is-not-a-sub-item-of-this-item",
+                            observed=key,
+                            outcome="claim-dropped",
+                        )
+                    )
+            disposition = replace(disposition, sub_item_dispositions=kept_pairs)
+        validated.append(disposition)
+    dispositions = tuple(validated)
     # This is the live-response boundary. Historical comments still use the
     # permissive protocol parser so a resume does not invalidate older reviews.
     for disposition in dispositions:
         if disposition.disposition not in {"blocking", "same-pr"}:
+            continue
+        carried = unresolved_by_id[disposition.item_id]
+        if carried.sub_items and _entry_completes_sub_items(
+            disposition,
+            {sub.sub_item_id for sub in carried.sub_items if sub.status == "open"},
+            same_status="same-pr",
+        ):
+            # Resolving every remaining sub-item needs no remaining-defect
+            # note; reconciliation derives `resolved` or, if the completion
+            # does not take effect, synthesizes the explanation.
             continue
         note = " ".join((disposition.note or "").strip().split())
         if not note or re.fullmatch(
@@ -631,7 +679,9 @@ def _validate_review_response(
             )
     # Replace only the dispositions: the assessment, its degradation records
     # and every other parsed field survive a carried-item round (#925).
-    return replace(parsed, dispositions=dispositions)
+    return replace(
+        parsed, dispositions=dispositions, sub_item_degradations=tuple(sub_item_records)
+    )
 
 
 def _upsert_human_requirements_ack_item(
@@ -932,6 +982,15 @@ def _validate_coder_followup_response(
         delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
         execution_catalog=execution_catalog,
         architecture_status_mode=architecture_status_mode,
+        # Advisory sub-item claims may name only sub-items still open on the
+        # carried items (#958); invalid claims are dropped, never rejected.
+        expected_sub_item_ids={
+            item.item_id: tuple(
+                sub.sub_item_id for sub in item.sub_items if sub.status == "open"
+            )
+            for item in unresolved_items
+            if item.sub_items
+        },
     )
     if structured_followup is not None:
         _validate_structured_coder_followup_items(
@@ -965,8 +1024,16 @@ def _apply_unresolved_item_dispositions(
     evidence_response_head: str | None = None,
     configured_reviewers: Sequence[str] | None = None,
     evidence_clearances: list[tuple[str, str]] | None = None,
+    round_number: int | None = None,
+    cleared_items_progress: list["ClearedItemProgress"] | None = None,
+    sub_item_degradations: list[str] | None = None,
 ) -> tuple[list[UnresolvedReviewItem], list[UnresolvedReviewItem]]:
     """Reconcile carried items with this round's reviewer dispositions.
+
+    ``round_number``, ``cleared_items_progress`` and ``sub_item_degradations``
+    serve the sub-item contract (#958): the round stamps closures, each item
+    that leaves the ledger with sub-items appends a ``ClearedItemProgress``,
+    and deferrals or ignored sub-item input append a one-line explanation.
 
     ``evidence_response_head`` is set only for a re-review at a frozen head
     after new signed human input (#1068).  Only then may the requesting
@@ -986,6 +1053,12 @@ def _apply_unresolved_item_dispositions(
         if not dispositions:
             next_unresolved.append(item)
             continue
+        if any(d.sub_item_dispositions for d in dispositions) and _is_machine_obligation(item):
+            # Reviewer sub-item input can never touch a machine obligation.
+            if sub_item_degradations is not None:
+                sub_item_degradations.append(
+                    f"{item.item_id}: ignored sub-item dispositions for a machine obligation"
+                )
         if _is_evidence_obligation(item):
             notes = list(item.notes)
             for disposition in dispositions:
@@ -1028,134 +1101,389 @@ def _apply_unresolved_item_dispositions(
             elif preserved.status == "future":
                 future_items.append(preserved)
             continue
-        # `text` is the item’s canonical claim.  Dispositions may add evidence
-        # for that claim, but must never rewrite it: a reviewer that discovers a
-        # different concern must file a fresh item rather than silently changing
-        # what this stable ID means.
-        text = item.text
-        notes = list(item.notes)
-        outcomes = {disposition.disposition for disposition in dispositions}
-        owners = item.resolution_owners or (item.reviewer,)
-        owner_states = dict(item.owner_states or ((owner, "pending") for owner in owners))
-        owner_evidence = dict(item.owner_evidence)
-        owner_dispositions = dict(item.owner_dispositions)
-        if reconciliation_mode == "owner-scoped":
-            # A reviewer who was not an owner may supply evidence, but only a
-            # blocking/same-PR disposition creates a durable new obligation.
-            # A non-owner resolved disposition is never a waiver.
-            for disposition in dispositions:
-                if disposition.disposition in {"blocking", same_status}:
-                    if disposition.reviewer not in owners:
-                        owners = (*owners, disposition.reviewer)
-                    owner_states[disposition.reviewer] = "pending"
-                    owner_dispositions[disposition.reviewer] = disposition.disposition
-                elif (
-                    disposition.disposition in {"resolved", "future"}
-                    and disposition.reviewer in owners
-                ):
-                    # `future` is a valid approving disposition for a carried
-                    # item. In owner-scoped mode it clears only this owner's
-                    # obligation; other owners must still provide their own
-                    # clearing disposition before the item can leave the
-                    # active ledger.
-                    owner_states[disposition.reviewer] = "cleared"
-                    owner_dispositions[disposition.reviewer] = disposition.disposition
-                if disposition.note:
-                    owner_evidence[disposition.reviewer] = disposition.note
-            owners = tuple(dict.fromkeys(owners))
-            for owner in owners:
-                owner_states.setdefault(owner, "pending")
-        for disposition in dispositions:
-            if disposition.note:
-                note_text = f"{disposition.reviewer}: {disposition.note}"
-                if note_text not in notes:
-                    notes.append(note_text)
-            elif same_status == "same-pr" and disposition.disposition in {"blocking", "same-pr"}:
-                note_text = (
-                    f"{disposition.reviewer}: saved review kept this item "
-                    f"{disposition.disposition} without an item-specific explanation. "
-                    "Consult the review summary; do not infer a new claim."
-                )
-                if note_text not in notes:
-                    notes.append(note_text)
-        if "blocking" in outcomes:
-            next_unresolved.append(
-                UnresolvedReviewItem(
-                    item_id=item.item_id,
-                    reviewer=item.reviewer,
-                    source_round=item.source_round,
-                    text=text,
-                    status="blocking",
-                    source_status=item.source_status,
-                    notes=tuple(notes),
-                    fix_scope=item.fix_scope,
-                    resolution_owners=owners,
-                    owner_states=tuple((owner, owner_states[owner]) for owner in owners),
-                    owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
-                    owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
-                )
-            )
+        kept_item = _reconcile_item_with_sub_items(
+            item,
+            dispositions,
+            same_status=same_status,
+            reconciliation_mode=reconciliation_mode,
+            round_number=round_number,
+            cleared_items_progress=cleared_items_progress,
+            sub_item_degradations=sub_item_degradations,
+        )
+        if kept_item is None:
             continue
-        if same_status in outcomes:
-            next_unresolved.append(
-                UnresolvedReviewItem(
-                    item_id=item.item_id,
-                    reviewer=item.reviewer,
-                    source_round=item.source_round,
-                    text=text,
-                    status=same_status,
-                    source_status=item.source_status,
-                    notes=tuple(notes),
-                    fix_scope=item.fix_scope,
-                    resolution_owners=owners,
-                    owner_states=tuple((owner, owner_states[owner]) for owner in owners),
-                    owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
-                    owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
-                )
+        if kept_item.status == "future" and not retain_future:
+            future_items.append(kept_item)
+        else:
+            next_unresolved.append(kept_item)
+    return next_unresolved, future_items
+
+
+@dataclass(frozen=True)
+class ClearedItemProgress:
+    """Confirmed record that a carried item with sub-items left the ledger (#958)."""
+
+    item_id: str
+    resolved: int
+    total: int
+    # ``all-sub-items-resolved`` or ``item-level-resolved``.
+    cause: str
+    round_number: int | None = None
+    # Sub-items whose closure was recorded in this round.
+    closed_sub_item_ids: tuple[str, ...] = ()
+
+
+def _entry_completes_sub_items(
+    entry: ReviewItemDisposition, open_ids: set[str], *, same_status: str
+) -> bool:
+    """A ``blocking``/same-status entry that resolves every open sub-item (#958)."""
+    if entry.disposition not in {"blocking", same_status} or not open_ids:
+        return False
+    mapped = dict(entry.sub_item_dispositions)
+    if any(verdict == "unresolved" for verdict in mapped.values()):
+        return False
+    return open_ids <= {key for key, verdict in mapped.items() if verdict == "resolved"}
+
+
+def _sub_item_count(sub_items: Sequence[ReviewSubItem]) -> tuple[int, int]:
+    return sum(1 for sub in sub_items if sub.status == "resolved"), len(sub_items)
+
+
+def _completion_explanation(
+    *,
+    item: UnresolvedReviewItem,
+    sub_item: ReviewSubItem,
+    entry: ReviewItemDisposition,
+    dispositions: Sequence[ReviewItemDisposition],
+    same_status: str,
+    owners: Sequence[str],
+    owner_states: dict[str, str],
+    reconciliation_mode: str,
+    derived: set[int],
+    reopeners: dict[str, list[str]],
+) -> str:
+    """Actionable reason a note-less completing entry did not take effect."""
+    prefix = (
+        f"completion of {item.item_id} did not take effect: sub-item "
+        f'{sub_item.sub_item_id} ("{sub_item.text}") remains open because '
+    )
+    reopened_by = [name for name in reopeners.get(sub_item.sub_item_id, []) if name != entry.reviewer]
+    if reopened_by:
+        return prefix + f"{reopened_by[0]} reopened it"
+    for index, other in enumerate(dispositions):
+        if (
+            other is not entry
+            and index not in derived
+            and other.reviewer != entry.reviewer
+            and other.disposition in {"blocking", same_status}
+        ):
+            quoted = " ".join((other.note or "").split())
+            detail = f': "{quoted}"' if quoted else " without an item-specific note"
+            return prefix + f"{other.reviewer} kept item-level {other.disposition}{detail}"
+    if reconciliation_mode == "owner-scoped":
+        # Judge pending owners by their post-round state: an owner that cleared
+        # itself with `resolved`/`future` in this same round has concurred.
+        post_round_states = dict(owner_states)
+        for other in dispositions:
+            if other.disposition in {"resolved", "future"} and other.reviewer in owners:
+                post_round_states[other.reviewer] = "cleared"
+        for owner in owners:
+            if owner != entry.reviewer and post_round_states.get(owner) != "cleared":
+                return prefix + f"pending owner {owner} has not concurred"
+        if entry.reviewer not in owners:
+            return prefix + (
+                f"{entry.reviewer} became an owner this round and its own item-level "
+                f"{entry.disposition} entry keeps the item pending; send item-level "
+                "`resolved` once the remaining sub-item is confirmed"
             )
-            continue
-        if reconciliation_mode == "owner-scoped":
-            pending_owners = [owner for owner in owners if owner_states.get(owner) != "cleared"]
-            if pending_owners:
-                next_unresolved.append(
-                    UnresolvedReviewItem(
-                        item_id=item.item_id,
-                        reviewer=item.reviewer,
-                        source_round=item.source_round,
-                        text=text,
-                        status=item.status,
-                        source_status=item.source_status,
-                        notes=tuple(notes),
-                        fix_scope=item.fix_scope,
-                        resolution_owners=owners,
-                        owner_states=tuple((owner, owner_states[owner]) for owner in owners),
-                        owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
-                        owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
+    return prefix + "another reviewer has not concurred"
+
+
+def _reconcile_item_with_sub_items(
+    item: UnresolvedReviewItem,
+    dispositions: Sequence[ReviewItemDisposition],
+    *,
+    same_status: str,
+    reconciliation_mode: str,
+    round_number: int | None,
+    cleared_items_progress: list[ClearedItemProgress] | None,
+    sub_item_degradations: list[str] | None,
+) -> UnresolvedReviewItem | None:
+    """Item-level reconciliation plus reviewer-authoritative sub-item status (#958).
+
+    Today's item-level outcome logic runs unchanged on the effective
+    dispositions.  Sub-item status changes only through eligible reviewers'
+    ``sub_item_dispositions``; coder claims never reach this function.  An item
+    that stays open never ends at K/K sub-items resolved: the completing
+    closure is deferred and the item-level outcome is recomputed from the
+    literal dispositions so no owner is cleared on its strength.
+    """
+
+    def note(text: str) -> None:
+        if sub_item_degradations is not None:
+            sub_item_degradations.append(f"{item.item_id}: {text}")
+
+    if not item.sub_items:
+        if any(d.sub_item_dispositions for d in dispositions):
+            note("ignored sub-item dispositions for an item without sub-items")
+        return _reconcile_reviewer_item(
+            item, dispositions, same_status=same_status, reconciliation_mode=reconciliation_mode
+        )
+
+    owners = item.resolution_owners or (item.reviewer,)
+    owner_states = dict(item.owner_states or ((owner, "pending") for owner in owners))
+    stamp = round_number if round_number is not None else 0
+
+    def eligible(entry: ReviewItemDisposition) -> bool:
+        if reconciliation_mode != "owner-scoped":
+            return True
+        return entry.reviewer in owners or entry.disposition in {"blocking", same_status}
+
+    known = {sub.sub_item_id for sub in item.sub_items}
+    resolved_by: dict[str, list[str]] = {}
+    reopeners: dict[str, list[str]] = {}
+    for entry in dispositions:
+        for key, verdict in entry.sub_item_dispositions:
+            if key not in known:
+                note(f"ignored unknown sub-item key `{key}` from {entry.reviewer}")
+            elif not eligible(entry):
+                note(
+                    f"ignored {entry.reviewer}'s disposition of `{key}`: only owners may change "
+                    "sub-item status"
+                )
+            elif verdict == "unresolved":
+                reopeners.setdefault(key, []).append(entry.reviewer)
+            else:
+                resolved_by.setdefault(key, []).append(entry.reviewer)
+
+    sub_status: dict[str, tuple[str, int | None]] = {}
+    closures: list[str] = []
+    for sub in item.sub_items:
+        sid = sub.sub_item_id
+        if reopeners.get(sid):
+            sub_status[sid] = ("open", None)
+        elif resolved_by.get(sid) and sub.status == "open":
+            sub_status[sid] = ("resolved", stamp)
+            closures.append(sid)
+        else:
+            sub_status[sid] = (sub.status, sub.resolved_round)
+
+    def committed() -> tuple[ReviewSubItem, ...]:
+        return tuple(
+            replace(sub, status=sub_status[sub.sub_item_id][0], resolved_round=sub_status[sub.sub_item_id][1])
+            for sub in item.sub_items
+        )
+
+    def complete() -> bool:
+        return all(state == "resolved" for state, _round in sub_status.values())
+
+    def is_open(result: UnresolvedReviewItem | None) -> bool:
+        return result is not None and result.status in {"blocking", same_status}
+
+    open_before = {sub.sub_item_id for sub in item.sub_items if sub.status == "open"}
+
+    # Every eligible completing entry (including a reviewer added as an owner
+    # this round) needs an explanation if it does not take effect; only an
+    # existing owner's entry may derive to `resolved` in owner-scoped mode.
+    completing_indexes = {
+        index
+        for index, entry in enumerate(dispositions)
+        if _entry_completes_sub_items(entry, open_before, same_status=same_status)
+        and eligible(entry)
+    }
+    derivable_indexes = {
+        index
+        for index in completing_indexes
+        if reconciliation_mode != "owner-scoped" or dispositions[index].reviewer in owners
+    }
+    derive_now = complete()
+    derived = set(derivable_indexes) if derive_now else set()
+
+    def first_open() -> ReviewSubItem:
+        return next(sub for sub in item.sub_items if sub_status[sub.sub_item_id][0] == "open")
+
+    def effective(indexes_derived: set[int]) -> list[ReviewItemDisposition]:
+        result: list[ReviewItemDisposition] = []
+        for index, entry in enumerate(dispositions):
+            if index in indexes_derived:
+                result.append(replace(entry, disposition="resolved"))
+            elif (
+                index in completing_indexes
+                and not (entry.note or "").strip()
+                # With every sub-item resolved there is nothing to name yet; the
+                # deferral pass re-runs this with the deferred sub-item open.
+                and any(state == "open" for state, _round in sub_status.values())
+            ):
+                # A note-less completing entry that stays in force gets an
+                # actionable explanation instead of the bare status.
+                result.append(
+                    replace(
+                        entry,
+                        note=_completion_explanation(
+                            item=item,
+                            sub_item=first_open(),
+                            entry=entry,
+                            dispositions=dispositions,
+                            same_status=same_status,
+                            owners=owners,
+                            owner_states=owner_states,
+                            reconciliation_mode=reconciliation_mode,
+                            derived=indexes_derived,
+                            reopeners=reopeners,
+                        ),
                     )
                 )
-                continue
-        if "future" in outcomes or any(
-            outcome == "future" for outcome in owner_dispositions.values()
-        ):
-            future_item = UnresolvedReviewItem(
-                item_id=item.item_id,
-                reviewer=item.reviewer,
-                source_round=item.source_round,
-                text=text,
-                status="future",
-                source_status=item.source_status,
-                notes=tuple(notes),
-                fix_scope=item.fix_scope,
-                resolution_owners=owners,
-                owner_states=tuple((owner, owner_states[owner]) for owner in owners),
-                owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
-                owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
-            )
-            if retain_future:
-                next_unresolved.append(future_item)
             else:
-                future_items.append(future_item)
-    return next_unresolved, future_items
+                result.append(entry)
+        return result
+
+    # A completing entry that stays literal is explained even when the
+    # candidate set is incomplete (reopened by another reviewer).
+    result = _reconcile_reviewer_item(
+        item,
+        effective(derived),
+        same_status=same_status,
+        reconciliation_mode=reconciliation_mode,
+    )
+    if result is not None and not is_open(result):
+        # Reclassified as future work: it is not cleared, so no cleared record
+        # is published and it is never treated as a stalled active finding.
+        return replace(result, sub_items=committed())
+    if not is_open(result):
+        # The item leaves the active ledger.
+        resolved_count, total = _sub_item_count(committed())
+        if complete():
+            cause = "all-sub-items-resolved"
+        else:
+            cause = "item-level-resolved"
+        if cleared_items_progress is not None:
+            cleared_items_progress.append(
+                ClearedItemProgress(
+                    item_id=item.item_id,
+                    resolved=resolved_count,
+                    total=total,
+                    cause=cause,
+                    round_number=round_number,
+                    closed_sub_item_ids=tuple(closures),
+                )
+            )
+        return None if result is None else replace(result, sub_items=committed())
+
+    deferred_note: str | None = None
+    if complete() and closures:
+        # Post-outcome invariant: never persist an open item at K/K.
+        deferred = closures[-1]
+        deferred_text = next(s.text for s in item.sub_items if s.sub_item_id == deferred)
+        deferred_note = (
+            f'Orchestrator: deferred closing {deferred} ("{deferred_text}"): {item.item_id} '
+            "stays open because another reviewer or pending owner has not concurred, so "
+            "that sub-item stays open."
+        )
+        sub_status[deferred] = ("open", None)
+        closures.remove(deferred)
+        note(f"deferred closing {deferred}: the item stays open, so its last sub-item stays open too")
+        result = _reconcile_reviewer_item(
+            item,
+            effective(set()),
+            same_status=same_status,
+            reconciliation_mode=reconciliation_mode,
+        )
+    assert result is not None
+    if deferred_note is not None and deferred_note not in result.notes:
+        # The reason travels with the carried item so the coder and the next
+        # reviewers see why the sub-item stays open.
+        result = replace(result, notes=(*result.notes, deferred_note))
+    return replace(result, sub_items=committed())
+
+
+def _reconcile_reviewer_item(
+    item: UnresolvedReviewItem,
+    dispositions: Sequence[ReviewItemDisposition],
+    *,
+    same_status: str,
+    reconciliation_mode: str,
+) -> UnresolvedReviewItem | None:
+    """Item-level outcome for one non-machine item.
+
+    Returns the item that stays in the ledger (status ``blocking``, the
+    same-status value, unchanged while owners are pending, or ``future``), or
+    ``None`` when every obligation is cleared.  Sub-item status is never
+    touched here; ``item.sub_items`` rides through ``replace`` unchanged.
+    """
+    # `text` is the item’s canonical claim.  Dispositions may add evidence
+    # for that claim, but must never rewrite it: a reviewer that discovers a
+    # different concern must file a fresh item rather than silently changing
+    # what this stable ID means.
+    notes = list(item.notes)
+    outcomes = {disposition.disposition for disposition in dispositions}
+    owners = item.resolution_owners or (item.reviewer,)
+    owner_states = dict(item.owner_states or ((owner, "pending") for owner in owners))
+    owner_evidence = dict(item.owner_evidence)
+    owner_dispositions = dict(item.owner_dispositions)
+    if reconciliation_mode == "owner-scoped":
+        # A reviewer who was not an owner may supply evidence, but only a
+        # blocking/same-PR disposition creates a durable new obligation.
+        # A non-owner resolved disposition is never a waiver.
+        for disposition in dispositions:
+            if disposition.disposition in {"blocking", same_status}:
+                if disposition.reviewer not in owners:
+                    owners = (*owners, disposition.reviewer)
+                owner_states[disposition.reviewer] = "pending"
+                owner_dispositions[disposition.reviewer] = disposition.disposition
+            elif (
+                disposition.disposition in {"resolved", "future"}
+                and disposition.reviewer in owners
+            ):
+                # `future` is a valid approving disposition for a carried
+                # item. In owner-scoped mode it clears only this owner's
+                # obligation; other owners must still provide their own
+                # clearing disposition before the item can leave the
+                # active ledger.
+                owner_states[disposition.reviewer] = "cleared"
+                owner_dispositions[disposition.reviewer] = disposition.disposition
+            if disposition.note:
+                owner_evidence[disposition.reviewer] = disposition.note
+        owners = tuple(dict.fromkeys(owners))
+        for owner in owners:
+            owner_states.setdefault(owner, "pending")
+    for disposition in dispositions:
+        if disposition.note:
+            note_text = f"{disposition.reviewer}: {disposition.note}"
+            if note_text not in notes:
+                notes.append(note_text)
+        elif same_status == "same-pr" and disposition.disposition in {"blocking", "same-pr"}:
+            note_text = (
+                f"{disposition.reviewer}: saved review kept this item "
+                f"{disposition.disposition} without an item-specific explanation. "
+                "Consult the review summary; do not infer a new claim."
+            )
+            if note_text not in notes:
+                notes.append(note_text)
+
+    def kept(status: str) -> UnresolvedReviewItem:
+        return replace(
+            item,
+            status=status,
+            notes=tuple(notes),
+            resolution_owners=owners,
+            owner_states=tuple((owner, owner_states[owner]) for owner in owners),
+            owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
+            owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
+        )
+
+    if "blocking" in outcomes:
+        return kept("blocking")
+    if same_status in outcomes:
+        return kept(same_status)
+    if reconciliation_mode == "owner-scoped":
+        pending_owners = [owner for owner in owners if owner_states.get(owner) != "cleared"]
+        if pending_owners:
+            return kept(item.status)
+    if "future" in outcomes or any(
+        outcome == "future" for outcome in owner_dispositions.values()
+    ):
+        return kept("future")
+    return None
 
 
 def _evidence_clearance_authorized(
@@ -1384,6 +1712,18 @@ def _record_prior_item_disposition(
     prior_dispositions[disposition.item_id].append(disposition)
 
 
+def format_sub_item_lines(item: UnresolvedReviewItem) -> list[str]:
+    """Per-sub-item lines with a ``k/K resolved`` count; empty without sub-items."""
+    if not item.sub_items:
+        return []
+    resolved, total = _sub_item_count(item.sub_items)
+    lines = [f"Sub-items ({resolved}/{total} resolved):"]
+    for sub in item.sub_items:
+        suffix = f" (round {sub.resolved_round})" if sub.resolved_round is not None else ""
+        lines.append(f"- [{sub.sub_item_id}] {sub.status}{suffix}: {sub.text}")
+    return lines
+
+
 def _format_same_pr_unresolved_items(items: Sequence[UnresolvedReviewItem]) -> str:
     lines: list[str] = []
     for item in select_coder_followup_items(items):
@@ -1391,6 +1731,7 @@ def _format_same_pr_unresolved_items(items: Sequence[UnresolvedReviewItem]) -> s
             f"{item.reviewer} same-PR follow-up [{item.item_id}] from round {item.source_round}:"
         )
         lines.append(f"- {item.text}")
+        lines.extend(format_sub_item_lines(item))
         if item.fix_scope:
             lines.append("Reviewer fix scope: " + ", ".join(item.fix_scope))
         if item.resolution_owners:
@@ -1442,6 +1783,7 @@ def _format_unresolved_items_for_coder(items: Sequence[UnresolvedReviewItem]) ->
                 "wait for authoritative source-specific validation."
             )
         lines.append(f"- {item.text}")
+        lines.extend(format_sub_item_lines(item))
         if item.notes:
             lines.append("Latest reviewer updates:")
             lines.extend(f"- {note}" for note in item.notes)
@@ -1481,3 +1823,143 @@ def format_coder_followup_context(
         _format_human_requirements_ack_for_coder(unresolved_items),
     ]
     return "\n\n".join(section for section in sections if section)
+
+
+# --- Sub-item progress signal (#958) ------------------------------------
+
+SUB_ITEM_PROGRESS_CLASSES = ("new", "converging", "stalled", "complete", "cleared")
+
+
+@dataclass(frozen=True)
+class SubItemProgress:
+    item_id: str
+    resolved: int
+    total: int
+    # Sub-items closed within the stall window.
+    closed_in_window: int
+    classification: str
+    window: int
+    # First round in which the item satisfied the stall rule, else None.
+    stalled_since_round: int | None = None
+
+
+def _closure_rounds(item: UnresolvedReviewItem) -> list[int]:
+    return [sub.resolved_round for sub in item.sub_items if sub.resolved_round is not None]
+
+
+def _classify_sub_item_progress(
+    item: UnresolvedReviewItem, *, current_round: int, window: int
+) -> SubItemProgress:
+    resolved, total = _sub_item_count(item.sub_items)
+    closures = _closure_rounds(item)
+    if window > 0:
+        closed = sum(1 for closed_round in closures if closed_round > current_round - window)
+    else:
+        # Stall check disabled: report overall closure, never `stalled`.
+        closed = len(closures)
+    if resolved == total:
+        classification = "complete"
+    elif closed:
+        classification = "converging"
+    elif (
+        window > 0
+        # A finding minted this very round has not been re-reviewed yet.
+        and current_round > item.source_round
+        and current_round - item.source_round + 1 >= window
+    ):
+        classification = "stalled"
+    else:
+        classification = "new"
+    stalled_since: int | None = None
+    if classification == "stalled":
+        # The stall rule first held when ``window`` rounds had passed since
+        # the later of the source round and the latest closure.
+        anchor = max([item.source_round - 1, *closures]) if closures else item.source_round - 1
+        stalled_since = max(anchor + window, item.source_round + 1)
+    return SubItemProgress(
+        item_id=item.item_id,
+        resolved=resolved,
+        total=total,
+        closed_in_window=closed,
+        classification=classification,
+        window=window,
+        stalled_since_round=stalled_since,
+    )
+
+
+def sub_item_progress(
+    items: Sequence[UnresolvedReviewItem],
+    cleared_items_progress: Sequence[ClearedItemProgress] = (),
+    *,
+    current_round: int,
+    window: int,
+) -> tuple[SubItemProgress, ...]:
+    """Classify every carried or just-cleared item that has sub-items.
+
+    ``window`` is ``--sub-item-stall-rounds``; 0 disables the stall check, so
+    no item is ever ``stalled``.  A pure function of persisted state: the same
+    ledger and cleared records always give the same signal, which is what
+    keeps the published notices idempotent across resume.
+    """
+    progress: list[SubItemProgress] = []
+    for item in items:
+        if (
+            item.sub_items
+            and not item.is_machine_obligation
+            and item.status in {"blocking", "same-pr"}
+        ):
+            progress.append(
+                _classify_sub_item_progress(item, current_round=current_round, window=window)
+            )
+    for cleared in cleared_items_progress:
+        progress.append(
+            SubItemProgress(
+                item_id=cleared.item_id,
+                resolved=cleared.resolved,
+                total=cleared.total,
+                closed_in_window=len(cleared.closed_sub_item_ids),
+                classification="cleared",
+                window=window,
+            )
+        )
+    return tuple(progress)
+
+
+def newly_stalled_items(
+    items: Sequence[UnresolvedReviewItem], *, current_round: int, window: int
+) -> tuple[SubItemProgress, ...]:
+    """Items whose stall rule first held in ``current_round``.
+
+    Derived only from persisted ``resolved_round``/``source_round`` values, so
+    an interrupted round recomputes the same notice and later rounds do not
+    repeat it.
+    """
+    if window <= 0:
+        return ()
+    return tuple(
+        entry
+        for entry in sub_item_progress(items, (), current_round=current_round, window=window)
+        if entry.classification == "stalled" and entry.stalled_since_round == current_round
+    )
+
+
+def render_sub_item_progress_summary(progress: Sequence[SubItemProgress]) -> tuple[str, ...]:
+    """One line per carried item with sub-items, for the budget-exit message."""
+    lines: list[str] = []
+    for entry in progress:
+        if entry.classification == "cleared":
+            continue
+        line = f"{entry.item_id}: {entry.resolved}/{entry.total} sub-items resolved"
+        if entry.classification == "complete":
+            line += "; all sub-items resolved; awaiting item clearance"
+        elif entry.classification == "stalled":
+            line += f", none closed in the last {entry.window} rounds (stalled)"
+        elif entry.classification == "converging":
+            line += (
+                f", {entry.closed_in_window} closed in last {entry.window} rounds "
+                "(converging); consider raising --max-rounds"
+            )
+        else:
+            line += " (new)"
+        lines.append(line)
+    return tuple(lines)

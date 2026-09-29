@@ -63,6 +63,7 @@ DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
 DEFAULT_MAX_ROUNDS = 10
 # Primary-phase plan stall stop threshold (#1103); 0 disables it.
 DEFAULT_PLAN_PRIMARY_STALL_ROUNDS = 8
+DEFAULT_SUB_ITEM_STALL_ROUNDS = 3
 # `agy --print` otherwise defaults to five minutes, which is too short for
 # complex reviews and causes it to exit with "timeout waiting for response".
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
@@ -194,6 +195,8 @@ class AgentLoopConfig:
     plan_growth_max_revisions: int = 6
     plan_growth_max_scope_items: int = 12
     plan_growth_max_matrix_rows: int = 18
+    # Advisory stall window for conjunctive findings' sub-items (#958); 0 disables.
+    sub_item_stall_rounds: int = DEFAULT_SUB_ITEM_STALL_ROUNDS
     auto_agent_dirs: tuple[AgentName, ...] = ()
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
@@ -597,6 +600,14 @@ class AgentLoopConfig:
         ):
             raise AgentLoopError(
                 "--plan-primary-stall-rounds requires --plan-review-policy primary-then-panel."
+            )
+        if (
+            isinstance(self.sub_item_stall_rounds, bool)
+            or not isinstance(self.sub_item_stall_rounds, int)
+            or self.sub_item_stall_rounds < 0
+        ):
+            raise AgentLoopError(
+                "--sub-item-stall-rounds must be zero or greater (0 disables it)."
             )
         if self.plan_growth_gate not in {"enforce", "off"}:
             raise AgentLoopError("--plan-growth-gate must be 'enforce' or 'off'.")
@@ -1518,6 +1529,8 @@ def config_from_args(
     test_command = _split_command(args.test_command)
     if args.max_rounds <= 0:
         raise AgentLoopError("--max-rounds must be greater than zero.")
+    if getattr(args, "sub_item_stall_rounds", DEFAULT_SUB_ITEM_STALL_ROUNDS) < 0:
+        raise AgentLoopError("--sub-item-stall-rounds must be zero or greater (0 disables it).")
     if args.ci_timeout_seconds <= 0:
         raise AgentLoopError("--ci-timeout-seconds must be greater than zero.")
     if args.ci_poll_interval_seconds <= 0:
@@ -1707,6 +1720,9 @@ def config_from_args(
         plan_growth_max_revisions=_arg_or_default(args, "plan_growth_max_revisions", 6),
         plan_growth_max_scope_items=_arg_or_default(args, "plan_growth_max_scope_items", 12),
         plan_growth_max_matrix_rows=_arg_or_default(args, "plan_growth_max_matrix_rows", 18),
+        sub_item_stall_rounds=_arg_or_default(
+            args, "sub_item_stall_rounds", DEFAULT_SUB_ITEM_STALL_ROUNDS
+        ),
         auto_agent_dirs=auto_agent_dirs,
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),
