@@ -177,6 +177,15 @@ def test_shadowed_failure_refuses_in_both_api_orders(tmp_path, monkeypatch, orde
         # The deduplicated board keeps the first observation, so it shows failing and
         # the real waiter would never return `passed`; the shadowed success is inert.
         assert board.state == "failing" and board.shadowed[0].status == "success"
+        # The waiter-realistic outcome for this board is `timeout` (final context succeeded,
+        # X failing): it must route to repair and never clear or merge.
+        runner = _runner(_items())
+        effects = _install(monkeypatch, ManagedCiOutcome(status="timeout", checks=board, head_sha=H))
+        with pytest.raises(AgentLoopError):
+            run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=True))
+        assert not (effects.merges or effects.prepares or effects.publishes)
+        assert any("Failing checks: X" in comment for comment in runner.comments)
+        assert any(i.lifecycle == "repair_required" for i in _checks_items(runner))
         return
     assert board.state == "passing" and len(board.shadowed) == 1
     effects = _install(monkeypatch, _passed(board))
@@ -259,7 +268,13 @@ def test_forbidden_protection_without_same_head_clean_refuses(tmp_path, monkeypa
 def test_draft_under_forbidden_protection_stops_side_effect_free_then_readable_resume_finalizes(
     tmp_path, monkeypatch, auto_merge
 ):
-    runner = _runner(_items())
+    items = _items()
+    approval = structured_pr_review(
+        reviewer="OpenAI Codex", state="approved",
+        prior_item_dispositions=[{"item_id": i.item_id, "disposition": "resolved"} for i in items],
+    )
+    runner = _runner(items)
+    runner.codex_outputs.append(approval)  # scripted second approval for the resumed run
     effects = _install(monkeypatch, _passed(_forbidden_board(tmp_path)), mergeability=_mergeability("DRAFT"))
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=auto_merge))
@@ -272,12 +287,18 @@ def test_draft_under_forbidden_protection_stops_side_effect_free_then_readable_r
         for cmd, _cwd in runner.commands
     )
 
-    # Resume once protection is readable: the same persisted item now clears.
+    # Every persisted copy of the item (reviewer round records included) is unchanged.
+    assert {(i.text, i.lifecycle, i.failed_head_sha) for i in _checks_items(runner)} == {
+        (PERSISTED_TEXT, "qualification_ready", "old-head")
+    }
+
+    # Resume the SAME refused PR (its persisted round metadata) once protection is readable.
     readable = _board_from_payload(tmp_path, _good_runs(), protection={"contexts": []})
     effects = _install(monkeypatch, _passed(readable))
-    assert run_pr_loop(_runner(_items()), pr_number=77, config=_config(tmp_path, auto_merge=auto_merge)) == 0
+    assert run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=auto_merge)) == 0
     assert effects.mergeability_reads == 0
     assert bool(effects.merges) is auto_merge
+    assert bool(effects.publishes) is (not auto_merge)
 
 
 # --- timeout routing ------------------------------------------------------------
