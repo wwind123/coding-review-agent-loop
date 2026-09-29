@@ -286,7 +286,8 @@ def workdir_claim_scope(
     if active is not None:
         yield active
         return
-    command = command or "library"
+    if command is None:
+        command = "library"
     owner = ClaimOwner(
         run_id=uuid.uuid4().hex,
         command=command,
