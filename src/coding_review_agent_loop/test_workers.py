@@ -1001,6 +1001,11 @@ def _ensure_private_directory(path: Path, *, allow_shared_mode: bool = False) ->
 
 def worker_budget_lock_root() -> Path:
     """Resolve the worker-budget lock directory without reading any environment."""
+    return host_lock_root(WORKER_BUDGET_LOCK_DIR)
+
+
+def host_lock_root(subdir: str) -> Path:
+    """Resolve a private per-user host lock directory without reading any environment."""
     uid = os.getuid() if hasattr(os, "getuid") else 0
     runtime = Path(f"/run/user/{uid}")
     try:
@@ -1014,10 +1019,10 @@ def worker_budget_lock_root() -> Path:
         # directory itself must be private.
         base = runtime / "agent-loop"
         _ensure_private_directory(base, allow_shared_mode=True)
-        return _ensure_private_directory(base / WORKER_BUDGET_LOCK_DIR)
+        return _ensure_private_directory(base / subdir)
     base = Path("/tmp") / f"coding-review-agent-loop-{uid}"
     _ensure_private_directory(base)
-    return _ensure_private_directory(base / WORKER_BUDGET_LOCK_DIR)
+    return _ensure_private_directory(base / subdir)
 
 
 class WorkerBudgetLock:

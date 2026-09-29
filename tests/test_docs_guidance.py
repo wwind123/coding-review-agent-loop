@@ -106,8 +106,11 @@ def test_readme_documents_same_repo_concurrency_limit():
     section_end = readme_text.index("## Planning and Decomposition", section_start)
     section = " ".join(readme_text[section_start:section_end].split())
 
-    assert "one active `agent-loop` invocation per repository per machine" in section
-    assert "does not currently enforce a repository-wide process lock" in section
+    assert "claims every agent checkout it uses" in section
+    assert "refused by name" in section
+    assert "explicit `--{agent}-dir`" in section
+    assert "repo-scoped local state" in section
+    assert "never lets a second run use a claimed one" in section
     assert "`--review-parallel` is supported within one orchestrator run" in section
     assert "system temporary directory (`/tmp` on Linux)" in section
 

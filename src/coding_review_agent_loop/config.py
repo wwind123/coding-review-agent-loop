@@ -764,6 +764,11 @@ def required_agents(config: AgentLoopConfig) -> set[AgentName]:
 
 
 def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
+    """Reject two agents of one run sharing a checkout.
+
+    ``--allow-shared-dir`` is intra-run only: it never lets a second run use a
+    checkout claimed by another live run (#1127).
+    """
     if config.allow_shared_dir:
         return
     required = required_agents(config)
@@ -1308,6 +1313,16 @@ def sync_checkout_to_pr(
 
 
 def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner) -> None:
+    # Claim before any clone, rmtree, reset or clean (#1127).  Outside a run
+    # scope this opens a "library" scope and releases on return.
+    from .workdir_claims import claim_agent_workdirs, workdir_claim_scope
+
+    with workdir_claim_scope():
+        claim_agent_workdirs(config)
+        _prepare_agent_workdirs(config, runner)
+
+
+def _prepare_agent_workdirs(config: AgentLoopConfig, runner: Runner) -> None:
     required = required_agents(config)
     paths = {
         "claude": (config.claude_dir, "--claude-dir"),

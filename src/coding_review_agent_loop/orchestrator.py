@@ -25,6 +25,7 @@ from .agents.base import AgentName, AgentResult
 from .agents.antigravity import AntigravityAttemptState
 from .agents.registry import agent_display_name, agent_signature, get_backend, run_agent_result
 from .architecture_context import architecture_material, freeze_architecture_context
+from .workdir_claims import claimed_run
 from .config import (
     AgentLoopConfig,
     configured_model_for,
@@ -15717,6 +15718,7 @@ def _run_plan_first_loop(
     )
 
 
+@claimed_run("issue", "issue_number")
 def run_issue_loop(
     runner: Runner,
     *,
@@ -16617,6 +16619,7 @@ def _read_clarification_from_stdin() -> str:
     return "\n".join(lines)
 
 
+@claimed_run("task")
 def run_task_loop(
     runner: Runner,
     *,
@@ -20442,6 +20445,7 @@ def _recover_managed_ci_approved_plan(
     return candidate
 
 
+@claimed_run("pr", "pr_number")
 def run_pr_loop(
     runner: Runner,
     *,
@@ -29431,6 +29435,7 @@ def _run_discuss_loop(
     return 0
 
 
+@claimed_run("discuss", "issue_number")
 def run_discuss_loop(
     runner: Runner,
     *,

@@ -3416,6 +3416,29 @@ agent-loop pr 123 \
 
 ## Workdirs
 
+### Checkout claims
+
+Each run claims every agent checkout it uses (`required_agents`) before any
+clone, reset, clean or dispatch, and releases the claims when the outermost run
+scope ends (`cli.main`, a `run_*` loop, or a standalone `ensure_agent_workdirs`).
+Claims live in `<lock root>/workdir-claims/` (`/run/user/<uid>/agent-loop/` or
+`/tmp/coding-review-agent-loop-<uid>/`), keyed by the resolved checkout path and
+independent of `TMPDIR`; nothing is written inside the checkout. A claim is an
+`flock` plus a JSON holder record (pid, run id, repo, command, number, target,
+agent, start time).
+
+A live holder causes a refusal such as:
+
+```text
+Agent checkout /tmp/.../claude/repo (claude) is already claimed by another agent-loop run: pid 1234, run_id ..., repo OWNER/REPO, command issue, target issue #958, started ...; lock file: ...
+```
+
+Targets are `issue #N`, `PR #N`, `discuss #N`, `task`, `managed-pr from <head>`
+or `library`. Unreadable holder metadata is reported as an unidentified holder.
+A holder that crashed leaves a free lock, so the next run takes it over. Pass an
+explicit `--{agent}-dir` per run to work concurrently. `--allow-shared-dir` is
+intra-run only.
+
 Explicit `--claude-dir`, `--codex-dir`, and `--gemini-dir` values are used
 exactly as provided. Missing explicit directories are still created for
 backwards compatibility.

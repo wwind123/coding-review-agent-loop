@@ -705,12 +705,16 @@ tells an agent to relay a decision, the relay must be disclosed in the comment.
 
 ## Current Limitations
 
-- Run only one active `agent-loop` invocation per repository per machine. The
-  default workdirs and repo-scoped local state are shared, and the tool does not
-  currently enforce a repository-wide process lock. Separate concurrent runs
-  against the same repository can interfere with each other's checkouts and
-  artifacts. `--review-parallel` is supported within one orchestrator run; it
-  does not make multiple same-repository invocations safe.
+- Each run claims every agent checkout it uses for its duration (a `flock` lock
+  file under a private per-user lock root, outside the checkout). A second run
+  that resolves to a claimed checkout is refused by name (pid, run id, repo,
+  command and target) before any reset or clean; a claim left by a crashed run
+  is taken over. To run several `agent-loop` invocations concurrently against
+  one repository, give each explicit `--{agent}-dir` checkouts. Other
+  repo-scoped local state (the memory cache, subprocess-log root) is still
+  shared. `--allow-shared-dir` only lets agents within one run share a
+  checkout; it never lets a second run use a claimed one. `--review-parallel`
+  is supported within one orchestrator run.
 - Agent-loop is a local process, not a hosted service. The machine must remain
   available for the run, and an interrupted in-flight agent turn may need to be
   repeated. Once a PR exists, resume with `agent-loop pr <number>`.
