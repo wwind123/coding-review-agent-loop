@@ -535,6 +535,36 @@ helpers accept `--require-risk-test-matrix-contract` for fresh contract checks.
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
+### Sub-items for conjunctive review findings
+
+A PR-review `blocking_items` or `same_pr_followups` finding that bundles several
+separately checkable obligations may declare them as an ordered `sub_items`
+array (2 to 12 distinct statements) on the finding object:
+`{"text": "...", "sub_items": ["first obligation", "second obligation"]}`. The
+loop mints stable IDs `item-N.s1`..`item-N.sK`. A reviewer then dispositions
+carried sub-items with an optional `sub_item_dispositions` object on the
+item's `prior_item_dispositions` entry (`{"item-1.s1": "resolved",
+"item-1.s2": "unresolved"}`), and the coder classifies open sub-items of its
+`remaining_items` with an optional `addressed_sub_items` array. Coder entries
+are advisory claims that the next reviewer verifies; only reviewer
+dispositions change sub-item status. A finding without `sub_items` behaves
+exactly as before, and malformed `sub_items` degrade to a plain finding with a
+visible record instead of rejecting the review.
+
+While any sub-item is open, keep the item-level `blocking`/`same-pr` with the
+usual actionable note. When the last open sub-item is resolved, send item-level
+`resolved`; a `blocking` entry that resolves every remaining sub-item is also
+treated as resolved and needs no note. Another reviewer or pending owner who
+keeps the item open defers that completion, and the item notes explain why.
+
+Progress is reported as counts (`item-1: 3/4 sub-items resolved`) in reviewer
+and coder prompts, the coder follow-up comment, and one orchestrator
+`### Sub-item progress` comment per round that cleared or newly stalled a
+finding. `--sub-item-stall-rounds N` (default 3, `0` disables) warns when no
+sub-item of a finding closes for `N` rounds, and the max-rounds message
+includes a converging/stalled summary per finding. The signal is advisory: it
+never changes `--max-rounds`.
+
 ### Machine obligations and resumable qualification
 
 The review ledger distinguishes reviewer-owned findings from machine-owned

@@ -1275,6 +1275,24 @@ reason that you explicitly accept before approving.
 """ if require_plan_dispositions else "")
 
 
+PR_REVIEW_SUB_ITEM_GUIDANCE = """A `blocking_items` or `same_pr_followups` object may also carry an optional
+ordered `sub_items` array of 2 to 12 distinct statements:
+`{"text": "...", "sub_items": ["first obligation", "second obligation"]}`.
+Use it only when the finding is a conjunction of separately checkable
+obligations; never decompose a single-obligation finding, and never put
+`sub_items` on `future_followups`. When a carried item lists sub-items, add an
+optional `sub_item_dispositions` object to its `prior_item_dispositions` entry
+mapping each sub-item ID you checked to `resolved` or `unresolved`, for example
+`{"item_id": "item-1", "disposition": "blocking", "note": "...", "sub_item_dispositions": {"item-1.s1": "resolved", "item-1.s2": "unresolved"}}`.
+Disposition every sub-item you checked and verify each coder sub-item claim
+with a sub-item disposition. While any sub-item remains open, keep the
+item-level `blocking`/`same-pr` with the usual actionable note. When you
+resolve the last open sub-item, send item-level `resolved`; a `blocking` entry
+that resolves every remaining sub-item is treated as resolved and needs no
+remaining-defect note. If a concern remains, keep or reopen a sub-item as
+`unresolved`, or file a new finding."""
+
+
 PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE = """`exact_head_evidence_requests` is optional and only for evidence that an agent
 session cannot produce but an approved contract requires at the exact reviewed
 head (for example an authenticated live-CLI run that only a human can perform).
@@ -1385,6 +1403,7 @@ def _structured_coder_followup_guidance(
         "After the JSON object, add exactly one footer `<!-- AGENT_STATE: approved|blocking -->`, then only your standalone signature. The JSON `state` must match the `AGENT_STATE` footer exactly.",
         "Use `addressed_items`, `remaining_items`, and `disputed_items` to classify every unresolved reviewer item ID shown in this prompt. Do not omit any listed reviewer item ID and do not list any item ID more than once.",
         "Use `addressed_item_notes` to summarize how each addressed item was resolved, and use `remaining_item_notes` to give a visible reason for each intentionally deferred remaining item.",
+        "When a listed item shows sub-items and you leave it in `remaining_items`, classify each open sub-item you addressed in the optional `addressed_sub_items` array (for example `[\"item-2.s1\"]`); the rest stay remaining. Listing an item in `addressed_items` implies every open sub-item is addressed. `addressed_sub_items` entries are advisory claims that the reviewer verifies; invalid entries are dropped, never rejected.",
         "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) or when the reviewer requests a change that is mutually incompatible with a verified approved-plan decision and you have counter-evidence. For a plan conflict, `dispute_evidence` must name the conflicting approved decision, concrete counter-evidence, and why the requested change is incompatible. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`; never park a verified plan conflict in `remaining_items`, whose retry semantics would silently recycle it. Ordinary implementation defects and evidence-backed correctness, security, compatibility, or test defects must be fixed and classified as addressed or genuinely remaining, never disputed merely because the implementation followed the plan. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
         "When you use the managed `agent-loop run-tests` wrapper, report the exact command, outcome, caveats, test identifiers, and locations. The wrapper prints an invocation-local `execution_ref`; use that selector only in semantic coverage claims. Never copy a receipt ID into a risk claim, and never infer a selector from command text, test identifiers, list position, or outcome.",
         "If the approved plan delivered an applicable risk matrix, include `risk_test_matrix_claims` as a bounded JSON array of semantic claims. "
@@ -1523,6 +1542,12 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
             )
         if item.fix_scope:
             details.append("  Reviewer fix scope: " + ", ".join(f"`{path}`" for path in item.fix_scope))
+        if item.sub_items:
+            resolved_count = sum(1 for sub in item.sub_items if sub.status == "resolved")
+            details.append(f"  Sub-items ({resolved_count}/{len(item.sub_items)} resolved):")
+            details.extend(
+                f"  - [{sub.sub_item_id}] {sub.status}: {sub.text}" for sub in item.sub_items
+            )
         if item.resolution_owners:
             owner_states = dict(item.owner_states)
             details.append(
@@ -4053,6 +4078,8 @@ of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
 optional `fix_scope` must contain only exact normalized repository-relative
 POSIX paths. Never use globs, directories, absolute paths, or traversal.
 
+{PR_REVIEW_SUB_ITEM_GUIDANCE}
+
 {PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}
 
 After the JSON object, include only:
@@ -4776,6 +4803,8 @@ For scheduler-enabled PR policies, a finding may be an object instead
 of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
 optional `fix_scope` must contain only exact normalized repository-relative
 POSIX paths. Never use globs, directories, absolute paths, or traversal.
+
+{PR_REVIEW_SUB_ITEM_GUIDANCE}
 
 {PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}
 

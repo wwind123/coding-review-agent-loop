@@ -26,6 +26,7 @@ from .agent_permissions import establish_sandboxed_run
 from .config import (
     DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS,
     DEFAULT_MAX_ROUNDS,
+    DEFAULT_SUB_ITEM_STALL_ROUNDS,
     DEFAULT_REPAIR_MODELS,
     DEFAULT_FLAT_CHILD_LIMIT,
     DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
@@ -208,6 +209,17 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=DEFAULT_MAX_ROUNDS,
             help=f"Maximum review/revision rounds (default: {DEFAULT_MAX_ROUNDS}).",
+        )
+        subparser.add_argument(
+            "--sub-item-stall-rounds",
+            type=int,
+            default=DEFAULT_SUB_ITEM_STALL_ROUNDS,
+            metavar="ROUNDS",
+            help=(
+                "Warn when no sub-item of a conjunctive review finding closes for this "
+                "many rounds; advisory only, the round budget never changes "
+                f"(default: {DEFAULT_SUB_ITEM_STALL_ROUNDS}; 0 disables)."
+            ),
         )
         subparser.add_argument(
             "--flat-child-limit",

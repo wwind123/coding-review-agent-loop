@@ -51,6 +51,8 @@ from .protocol import (
     ParsedDiscussResponse,
     ParsedDiscussReview,
     ReviewItemDisposition,
+    ReviewSubItem,
+    SUB_ITEM_STATUSES,
     UnresolvedReviewItem,
     EVIDENCE_OBLIGATION_KIND,
     MACHINE_AUTHORITY,
@@ -222,6 +224,11 @@ class PostedRoundMetadata:
     # Records of malformed follow-up citations dropped by the degradable
     # citation parser (#927); restored onto the coder carrier on resume.
     test_observation_degradations: tuple[ParseDegradation, ...] = ()
+    # Validated advisory coder sub-item claims and the records of dropped ones
+    # (#958).  Restored verbatim on resume rather than re-validated against a
+    # ledger that may have advanced.
+    addressed_sub_items: tuple[str, ...] = ()
+    sub_item_claim_degradations: tuple[ParseDegradation, ...] = ()
     architecture_contract_version: int | None = None
     # Planning generation discriminator.  Absent is intentionally legacy
     # undecided; generation 1 is required to resume a fresh recommendation.
@@ -695,9 +702,18 @@ def rebuild_resumed_coder_carrier(
             return None
     if carrier is None or metadata is None:
         return carrier
-    return replace(
+    carrier = replace(
         carrier, test_observation_degradations=tuple(metadata.test_observation_degradations)
     )
+    if isinstance(carrier, StructuredCoderFollowup) and (
+        metadata.addressed_sub_items or metadata.sub_item_claim_degradations
+    ):
+        carrier = replace(
+            carrier,
+            addressed_sub_items=tuple(metadata.addressed_sub_items),
+            sub_item_claim_degradations=tuple(metadata.sub_item_claim_degradations),
+        )
+    return carrier
 
 
 @dataclass(frozen=True)
@@ -1530,7 +1546,59 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
         "obligation_identity": item.obligation_identity,
     }
     payload.update({key: value for key, value in machine_fields.items() if value is not None})
+    if item.sub_items:
+        payload["sub_items"] = [_serialize_sub_item(sub) for sub in item.sub_items]
     return payload
+
+
+def _serialize_sub_item(sub: ReviewSubItem) -> dict[str, object]:
+    return {
+        "sub_item_id": sub.sub_item_id,
+        "text": sub.text,
+        "status": sub.status,
+        "resolved_round": sub.resolved_round,
+    }
+
+
+def _deserialize_sub_items(payload: dict) -> tuple[ReviewSubItem, ...]:
+    """Decode persisted sub-items; a malformed payload yields none (#958).
+
+    Dropping the sub-items loses only progress detail: the carried item stays
+    open, so a corrupted record can never clear or weaken it.
+    """
+    raw = payload.get("sub_items")
+    if not raw or not isinstance(raw, list):
+        return ()
+    decoded: list[ReviewSubItem] = []
+    try:
+        for entry in raw:
+            if not isinstance(entry, dict):
+                return ()
+            status = entry["status"]
+            resolved_round = entry.get("resolved_round")
+            if (
+                status not in SUB_ITEM_STATUSES
+                or not isinstance(entry["sub_item_id"], str)
+                or not isinstance(entry["text"], str)
+                or (resolved_round is not None and (
+                    isinstance(resolved_round, bool) or not isinstance(resolved_round, int)
+                ))
+                or (status == "open" and resolved_round is not None)
+            ):
+                return ()
+            decoded.append(
+                ReviewSubItem(
+                    sub_item_id=entry["sub_item_id"],
+                    text=entry["text"],
+                    status=status,
+                    resolved_round=resolved_round,
+                )
+            )
+    except (KeyError, TypeError):
+        return ()
+    if len({sub.sub_item_id for sub in decoded}) != len(decoded):
+        return ()
+    return tuple(decoded)
 
 
 def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
@@ -1617,7 +1685,7 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
                 lifecycle="repair_required",
                 obligation_identity="invalid-machine-record",
             )
-    return UnresolvedReviewItem(**core)
+    return UnresolvedReviewItem(**core, sub_items=_deserialize_sub_items(payload))
 
 
 _SCHEDULER_METADATA_KEYS = frozenset(
@@ -1930,12 +1998,17 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
 
 
 def _serialize_disposition(disposition: ReviewItemDisposition) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "item_id": disposition.item_id,
         "reviewer": disposition.reviewer,
         "disposition": disposition.disposition,
         "note": disposition.note,
     }
+    if disposition.sub_item_dispositions:
+        payload["sub_item_dispositions"] = [
+            list(pair) for pair in disposition.sub_item_dispositions
+        ]
+    return payload
 
 
 def _deserialize_disposition(payload: object) -> ReviewItemDisposition:
@@ -1946,6 +2019,21 @@ def _deserialize_disposition(payload: object) -> ReviewItemDisposition:
         reviewer=str(payload["reviewer"]),
         disposition=str(payload["disposition"]),
         note=str(payload["note"]) if payload.get("note") is not None else None,
+        sub_item_dispositions=_deserialize_sub_item_dispositions(payload),
+    )
+
+
+def _deserialize_sub_item_dispositions(payload: dict) -> tuple[tuple[str, str], ...]:
+    raw = payload.get("sub_item_dispositions")
+    if not raw or not isinstance(raw, list):
+        return ()
+    return tuple(
+        (pair[0], pair[1])
+        for pair in raw
+        if isinstance(pair, (list, tuple))
+        and len(pair) == 2
+        and isinstance(pair[0], str)
+        and pair[1] in {"resolved", "unresolved"}
     )
 
 
@@ -2233,6 +2321,12 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["test_observation_degradations"] = [
             record.to_payload() for record in metadata.test_observation_degradations
         ]
+    if metadata.addressed_sub_items:
+        payload["addressed_sub_items"] = list(metadata.addressed_sub_items)
+    if metadata.sub_item_claim_degradations:
+        payload["sub_item_claim_degradations"] = [
+            record.to_payload() for record in metadata.sub_item_claim_degradations
+        ]
     if metadata.qualification_checkpoint is not None:
         payload["qualification_checkpoint"] = (
             metadata.qualification_checkpoint.as_dict()
@@ -2446,6 +2540,15 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             ),
             test_observation_degradations=_decode_parse_degradations(
                 payload.get("test_observation_degradations")
+            ),
+            addressed_sub_items=(
+                tuple(
+                    entry for entry in payload["addressed_sub_items"] if isinstance(entry, str)
+                )
+                if isinstance(payload.get("addressed_sub_items"), list) else ()
+            ),
+            sub_item_claim_degradations=_decode_parse_degradations(
+                payload.get("sub_item_claim_degradations")
             ),
             architecture_contract_version=(
                 int(payload["architecture_contract_version"])
@@ -3059,6 +3162,18 @@ def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple
             item.failed_head_sha,
             item.candidate_head_sha,
             item.obligation_identity,
+            # Appended only for items with sub-items, so a legacy item keeps
+            # its pre-#958 signature tuple exactly.
+            *(
+                (
+                    tuple(
+                        (sub.sub_item_id, sub.text, sub.status, sub.resolved_round)
+                        for sub in item.sub_items
+                    ),
+                )
+                if item.sub_items
+                else ()
+            ),
         )
         for item in items
     )
@@ -3519,6 +3634,7 @@ def _recover_unrecorded_pr_head_advance(
             _aggregate_record_dispositions(reviewer_records_after_coder),
             retain_future=False,
             reconciliation_mode=reconciliation_mode,
+            round_number=round_number,
         )
         recovered_items = _active_pr_items(recovered_items)
         _append_active_pr_new_items(recovered_items, new_item_records_after_coder)
@@ -3534,6 +3650,7 @@ def _recover_unrecorded_pr_head_advance(
             _aggregate_record_dispositions(all_reviewer_records),
             retain_future=False,
             reconciliation_mode=reconciliation_mode,
+            round_number=round_number,
         )
         recovered_items = _active_pr_items(recovered_items)
         _append_active_pr_new_items(recovered_items, all_new_item_records)

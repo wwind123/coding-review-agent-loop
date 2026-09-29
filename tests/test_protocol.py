@@ -6209,3 +6209,135 @@ def test_evidence_obligation_lifecycle_is_validated():
             status="blocking", authority="machine", obligation_kind="github-pr-checks",
             lifecycle="evidence_deferred", failed_head_sha="abc123",
         )
+
+
+# --- Sub-items for conjunctive findings (#958) ------------------------------
+
+
+def _sub_item_review(**overrides):
+    payload = {
+        "schema_version": 1,
+        "kind": "pr_review",
+        "state": "blocking",
+        "summary": "s",
+        "prior_item_dispositions": [],
+    }
+    payload.update(overrides)
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex"
+
+
+def test_pr_finding_sub_items_parse_and_string_findings_are_unchanged():
+    parsed = parse_structured_pr_review(
+        _sub_item_review(
+            blocking_items=[{"text": "conj", "sub_items": ["a", "b", "c"]}, "plain"],
+            same_pr_followups=[{"text": "same", "sub_items": ["x", "y"]}],
+        ),
+        reviewer="Codex",
+    )
+    assert parsed.blocking_items[0].sub_items == ("a", "b", "c")
+    assert parsed.blocking_items[1].sub_items == ()
+    assert parsed.followups.same_pr[0].sub_items == ("x", "y")
+    assert parsed.sub_item_degradations == ()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [["only one"], ["a", ""], ["a", 3], "not a list", ["a", "A"], [f"s{i}" for i in range(13)]],
+)
+def test_malformed_pr_sub_items_degrade_to_a_plain_finding(value):
+    parsed = parse_structured_pr_review(
+        _sub_item_review(blocking_items=[{"text": "conj", "sub_items": value}]),
+        reviewer="Codex",
+    )
+    assert parsed.blocking_items[0].text == "conj"
+    assert parsed.blocking_items[0].sub_items == ()
+    (record,) = parsed.sub_item_degradations
+    assert record.element_path.endswith(".sub_items") and record.outcome == "claim-dropped"
+
+
+def test_sub_items_on_future_followups_are_dropped_with_degradation():
+    parsed = parse_structured_pr_review(
+        _sub_item_review(
+            state="approved",
+            future_followups=[{"text": "later", "sub_items": ["a", "b"]}],
+        ).replace("blocking", "approved"),
+        reviewer="Codex",
+    )
+    assert parsed.followups.future[0].sub_items == ()
+    assert parsed.sub_item_degradations
+
+
+def test_reviewer_sub_item_dispositions_parse_and_degrade():
+    parsed = parse_structured_pr_review(
+        _sub_item_review(
+            blocking_items=["new"],
+            prior_item_dispositions=[
+                {
+                    "item_id": "item-1",
+                    "disposition": "blocking",
+                    "note": "still broken on this head",
+                    "sub_item_dispositions": {"item-1.s1": "resolved", "item-1.s2": "maybe"},
+                },
+                {"item_id": "item-2", "disposition": "resolved", "sub_item_dispositions": ["x"]},
+            ],
+        ),
+        reviewer="Codex",
+    )
+    assert parsed.dispositions[0].sub_item_dispositions == (("item-1.s1", "resolved"),)
+    assert parsed.dispositions[1].sub_item_dispositions == ()
+    assert len(parsed.sub_item_degradations) == 2
+
+
+def test_plan_review_flattens_well_formed_sub_items_and_rejects_others():
+    ok = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "plan_review",
+            "state": "blocking",
+            "summary": "s",
+            "prior_plan_item_dispositions": [],
+            "blocking_plan_issues": [{"text": "gap", "sub_items": ["first", "second"]}],
+        }
+    ) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Codex"
+    parsed = parse_structured_plan_review(ok, reviewer="Codex")
+    assert parsed.items.blocking[0].text == "gap Sub-items: (1) first (2) second"
+    bad = ok.replace('["first", "second"]', '"nope"')
+    with pytest.raises(AgentLoopError):
+        parse_structured_plan_review(bad, reviewer="Codex")
+
+
+def _coder_followup(**overrides):
+    payload = {
+        "schema_version": 1,
+        "kind": "coder_followup",
+        "state": "blocking",
+        "summary": "s",
+        "addressed_items": ["item-1"],
+        "remaining_items": ["item-2"],
+        "disputed_items": ["item-3"],
+        "dispute_evidence": {"item-3": "evidence"},
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+    }
+    payload.update(overrides)
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Claude"
+
+
+def test_coder_sub_item_claims_validate_against_remaining_parents():
+    parsed = validate_structured_coder_followup(
+        _coder_followup(
+            addressed_sub_items=["item-2.s1", "item-2.s1", "item-3.s1", "item-2.s9", "item-2.s2", 4]
+        ),
+        expected_sub_item_ids={"item-2": ("item-2.s1", "item-2.s2"), "item-3": ("item-3.s1",)},
+    )
+    assert parsed.addressed_sub_items == ("item-2.s1", "item-2.s2")
+    rules = {record.rule for record in parsed.sub_item_claim_degradations}
+    assert "addressed_sub_items-parent-not-in-remaining_items" in rules
+    assert "addressed_sub_items-unknown-or-already-resolved-sub-item" in rules
+    assert "addressed_sub_items-entry-not-a-non-empty-string" in rules
+
+
+def test_coder_sub_item_claims_absent_or_malformed_never_reject():
+    assert validate_structured_coder_followup(_coder_followup()).addressed_sub_items == ()
+    bad = validate_structured_coder_followup(_coder_followup(addressed_sub_items="item-2.s1"))
+    assert bad.addressed_sub_items == () and bad.sub_item_claim_degradations

@@ -116,6 +116,9 @@ class ApprovedFollowup:
     # Optional reviewer-authored exact paths used only by selective PR
     # scheduling.  None means the finding is not classifiable as narrow.
     fix_scope: tuple[str, ...] | None = None
+    # Optional ordered statements of a conjunctive finding (#958).  Empty for
+    # every single-obligation finding.
+    sub_items: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,8 @@ class ReviewItemDisposition:
     reviewer: str
     disposition: str
     note: str | None = None
+    # (sub_item_id, "resolved" | "unresolved") pairs in reviewer order (#958).
+    sub_item_dispositions: tuple[tuple[str, str], ...] = ()
 
 
 # Machine-owned obligations are deliberately distinct from reviewer findings.
@@ -178,6 +183,22 @@ CI_MACHINE_OBLIGATION_KINDS = frozenset(
 )
 
 
+SUB_ITEM_MIN_COUNT = 2
+SUB_ITEM_MAX_COUNT = 12
+SUB_ITEM_STATUSES = frozenset({"open", "resolved"})
+SUB_ITEM_DISPOSITIONS = frozenset({"resolved", "unresolved"})
+
+
+@dataclass(frozen=True)
+class ReviewSubItem:
+    """One separately checkable obligation of a conjunctive finding (#958)."""
+
+    sub_item_id: str
+    text: str
+    status: str = "open"
+    resolved_round: int | None = None
+
+
 @dataclass(frozen=True)
 class UnresolvedReviewItem:
     item_id: str
@@ -210,8 +231,16 @@ class UnresolvedReviewItem:
     failed_head_sha: str | None = None
     candidate_head_sha: str | None = None
     obligation_identity: str | None = None
+    # Reviewer-declared sub-items; never carried by machine obligations.
+    sub_items: tuple[ReviewSubItem, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.sub_items:
+            ids = [sub.sub_item_id for sub in self.sub_items]
+            if len(set(ids)) != len(ids):
+                raise ValueError("sub-item IDs must be unique")
+            if any(sub.status not in SUB_ITEM_STATUSES for sub in self.sub_items):
+                raise ValueError("sub-item status must be open or resolved")
         authority = self.authority
         kind = self.obligation_kind
         lifecycle = self.lifecycle
@@ -254,6 +283,8 @@ class UnresolvedReviewItem:
             raise ValueError("repair-required machine obligations need a failed head")
         if self.candidate_head_sha and self.failed_head_sha == self.candidate_head_sha:
             raise ValueError("a qualification candidate must differ from the failed head")
+        if self.sub_items:
+            raise ValueError("machine obligations cannot carry sub-items")
 
     @property
     def is_machine_obligation(self) -> bool:
@@ -286,6 +317,8 @@ class ParsedReview:
     # Human-only evidence an agent session cannot produce (#1068).  These are
     # never blocking code findings and are never routed to the coder.
     exact_head_evidence_requests: tuple[str, ...] = ()
+    # Parser-derived records of malformed sub-item content (#958).
+    sub_item_degradations: tuple["ParseDegradation", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1009,6 +1042,9 @@ class StructuredCoderFollowup:
     # Orchestrator-derived, never parsed: reported runs outside the assigned
     # checkout (e.g. a clean-base baseline). Visible context, never evidence.
     out_of_checkout_tests_run: tuple[str, ...] = ()
+    # Advisory sub-item claims (#958): never change persisted sub-item status.
+    addressed_sub_items: tuple[str, ...] = ()
+    sub_item_claim_degradations: tuple[ParseDegradation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4513,9 +4549,9 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
     if not isinstance(raw, dict):
         raise AgentLoopError(f"{item_context} must be a string or a finding object.")  # shape-check: fatal:no-conservative-reading
     text_fields = {name for name, _label in PLAN_REVIEW_FINDING_TEXT_FIELDS}
-    unknown = sorted(set(raw) - text_fields - PLAN_REVIEW_FINDING_ID_FIELDS)
+    unknown = sorted(set(raw) - text_fields - PLAN_REVIEW_FINDING_ID_FIELDS - {"sub_items"})
     if unknown:
-        allowed = ", ".join(sorted(text_fields | PLAN_REVIEW_FINDING_ID_FIELDS))
+        allowed = ", ".join(sorted(text_fields | PLAN_REVIEW_FINDING_ID_FIELDS | {"sub_items"}))
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             f"{item_context} has unsupported finding key(s) {', '.join(unknown)}; "
             f"use a string or an object with only: {allowed}."
@@ -4531,6 +4567,20 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
         parts.append(f"{label}: {value}" if label else value)
     if not parts:
         raise AgentLoopError(f"{item_context} finding object has no text field.")  # shape-check: fatal:no-conservative-reading
+    if "sub_items" in raw:
+        # Plan reviews get no ledger structure (#958): well-formed statements
+        # are flattened into the finding text with nothing lost.
+        sub_items = raw["sub_items"]
+        if not isinstance(sub_items, list) or not sub_items:
+            raise AgentLoopError(f"{item_context}.sub_items must be a non-empty JSON array of strings.")  # shape-check: fatal:no-conservative-reading
+        statements = [
+            _expect_non_empty_string(entry, context=f"{item_context}.sub_items[{position}]").strip()  # shape-check: fatal:no-conservative-reading
+            for position, entry in enumerate(sub_items)
+        ]
+        parts.append(
+            "Sub-items: "
+            + " ".join(f"({number}) {statement}" for number, statement in enumerate(statements, 1))
+        )
     return " ".join(parts)
 
 
@@ -4550,12 +4600,48 @@ def _expect_plan_review_finding_list(
     )
 
 
+def _degradable_sub_items(
+    value: object, *, context: str
+) -> tuple[tuple[str, ...], ParseDegradation | None]:
+    """Read optional finding sub-items, degrading any defect to a plain finding (#958)."""
+    rule: str | None = None
+    statements: list[str] = []
+    if not isinstance(value, list):
+        rule = "sub_items-not-an-array"
+    elif len(value) < SUB_ITEM_MIN_COUNT:
+        rule = "sub_items-needs-at-least-two-entries"
+    elif len(value) > SUB_ITEM_MAX_COUNT:
+        rule = "sub_items-more-than-twelve-entries"
+    else:
+        seen: set[str] = set()
+        for entry in value:
+            if not isinstance(entry, str) or not entry.strip():
+                rule = "sub_items-entry-not-a-non-empty-string"
+                break
+            normalized = _normalized_review_item_text(entry)
+            if not normalized or normalized in seen:
+                rule = "sub_items-duplicate-or-blank-statement"
+                break
+            seen.add(normalized)
+            statements.append(entry.strip())
+    if rule is None:
+        return tuple(statements), None
+    return (), ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+        element_path=f"{context}.sub_items",
+        rule=rule,
+        observed=value,
+        outcome="claim-dropped",
+    )
+
+
 def _expect_review_finding_list(
     payload: dict[str, object],
     field_name: str,
     *,
     context: str,
     reviewer: str,
+    degradations: list[ParseDegradation] | None = None,
+    allow_sub_items: bool = True,
 ) -> tuple[ApprovedFollowup, ...]:
     """Accept legacy strings and the scoped PR finding representation."""
     value = payload.get(field_name, [])
@@ -4564,18 +4650,38 @@ def _expect_review_finding_list(
     findings: list[ApprovedFollowup] = []
     for index, raw in enumerate(value):
         item_context = f"{context} at index {index}"
+        sub_items: tuple[str, ...] = ()
         if isinstance(raw, str):
             text = _expect_non_empty_string(raw, context=item_context)  # shape-check: fatal:no-conservative-reading
             scope = None
         else:
             item = _expect_object(raw, context=item_context)  # shape-check: fatal:no-conservative-reading
-            _expect_exact_keys(item, context=item_context, required={"text"}, optional={"fix_scope"})  # shape-check: fatal:no-conservative-reading
+            _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+                item, context=item_context, required={"text"}, optional={"fix_scope", "sub_items"}
+            )
             text = _expect_non_empty_string(item["text"], context=f"{item_context}.text")  # shape-check: fatal:no-conservative-reading
             try:
                 scope = normalize_fix_scope(item.get("fix_scope")) if "fix_scope" in item else None  # shape-check: fatal:no-conservative-reading
             except AgentLoopError as exc:
                 raise AgentLoopError(f"{item_context}.fix_scope is invalid: {exc}") from exc  # shape-check: fatal:no-conservative-reading
-        findings.append(ApprovedFollowup(reviewer=reviewer, text=text, fix_scope=scope))
+            if "sub_items" in item:
+                if allow_sub_items:
+                    sub_items, record = _degradable_sub_items(  # shape-check: fatal:authentication-or-forgery
+                        item["sub_items"], context=item_context
+                    )
+                else:
+                    sub_items = ()
+                    record = ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+                        element_path=f"{item_context}.sub_items",
+                        rule="sub_items-not-supported-on-this-finding-list",
+                        observed=item["sub_items"],
+                        outcome="claim-dropped",
+                    )
+                if record is not None and degradations is not None:
+                    degradations.append(record)
+        findings.append(
+            ApprovedFollowup(reviewer=reviewer, text=text, fix_scope=scope, sub_items=sub_items)
+        )
     return tuple(findings)
 
 
@@ -5518,13 +5624,14 @@ def _parse_review_item_disposition_payload(
     reviewer: str,
     allowed_same_status: str,
     is_plan_review: bool,
+    degradations: list[ParseDegradation] | None = None,
 ) -> ReviewItemDisposition:
     payload = _expect_object(value, context=field_name)  # shape-check: fatal:no-conservative-reading
     _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
         payload,
         context=field_name,
         required={"item_id", "disposition"},
-        optional={"note"},
+        optional={"note"} if is_plan_review else {"note", "sub_item_dispositions"},
     )
     item_id = _expect_item_id(payload["item_id"], context=f"{field_name}.item_id")  # shape-check: fatal:no-conservative-reading
     disposition = _expect_non_empty_string(payload["disposition"], context=f"{field_name}.disposition")  # shape-check: fatal:no-conservative-reading
@@ -5545,12 +5652,51 @@ def _parse_review_item_disposition_payload(
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             f"{field_name}.note cannot be an empty placeholder for active disposition `{disposition}`."
         )
+    sub_item_dispositions: tuple[tuple[str, str], ...] = ()
+    if "sub_item_dispositions" in payload:
+        sub_item_dispositions = _degradable_sub_item_dispositions(  # shape-check: fatal:authentication-or-forgery
+            payload["sub_item_dispositions"],
+            context=f"{field_name}.sub_item_dispositions",
+            degradations=degradations,
+        )
     return ReviewItemDisposition(
         item_id=item_id,
         reviewer=reviewer,
         disposition=disposition,
         note=note,
+        sub_item_dispositions=sub_item_dispositions,
     )
+
+
+def _degradable_sub_item_dispositions(
+    value: object,
+    *,
+    context: str,
+    degradations: list[ParseDegradation] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Read a sub-item disposition map, dropping malformed pairs (#958)."""
+    pairs: list[tuple[str, str]] = []
+    defects: list[tuple[str, object, str]] = []
+    if not isinstance(value, dict):
+        defects.append(("sub_item_dispositions-not-an-object", value, context))
+    else:
+        for key, entry in value.items():
+            if not isinstance(key, str) or not key.strip():
+                defects.append(("sub_item_dispositions-key-not-a-string", key, context))
+            elif entry not in SUB_ITEM_DISPOSITIONS:
+                defects.append(
+                    ("sub_item_dispositions-value-not-resolved-or-unresolved", entry, f"{context}.{key}")
+                )
+            else:
+                pairs.append((key.strip(), entry))
+    if degradations is not None:
+        for rule, observed, path in defects[:PARSE_DEGRADATION_RENDER_LIMIT]:
+            degradations.append(
+                ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+                    element_path=path, rule=rule, observed=observed, outcome="claim-dropped"
+                )
+            )
+    return tuple(pairs)
 
 
 def _expect_disposition_list(
@@ -5560,6 +5706,7 @@ def _expect_disposition_list(
     reviewer: str,
     allowed_same_status: str,
     is_plan_review: bool,
+    degradations: list[ParseDegradation] | None = None,
 ) -> tuple[ReviewItemDisposition, ...]:
     if not isinstance(value, list):
         raise AgentLoopError(f"{context} must be a JSON array.")  # shape-check: fatal:no-conservative-reading
@@ -5570,6 +5717,7 @@ def _expect_disposition_list(
             reviewer=reviewer,
             allowed_same_status=allowed_same_status,
             is_plan_review=is_plan_review,
+            degradations=degradations,
         )
         for index, item in enumerate(value)
     )
@@ -5610,6 +5758,7 @@ def _finalize_parsed_review(
     raw_dispositions_text: str = "",
     architecture_impact: ArchitectureImpact | None = None,
     architecture_impact_degradations: tuple[ParseDegradation, ...] = (),
+    sub_item_degradations: tuple[ParseDegradation, ...] = (),
 ) -> ParsedReview:
     if state == "blocking" and followups.future:
         followups = ApprovedFollowups(same_pr=followups.same_pr, future=())
@@ -5636,6 +5785,7 @@ def _finalize_parsed_review(
         raw_dispositions_text=raw_dispositions_text,
         architecture_impact=architecture_impact,
         architecture_impact_degradations=architecture_impact_degradations,
+        sub_item_degradations=sub_item_degradations,
     )
 
 
@@ -5760,14 +5910,18 @@ def parse_structured_pr_review(
     summary = review_freeform_summary_text(
         _expect_non_empty_string(payload["summary"], context="pr_review.summary")  # shape-check: fatal:no-conservative-reading
     )
+    sub_item_degradations: list[ParseDegradation] = []
     blocking_items = _expect_review_finding_list(  # shape-check: fatal:no-conservative-reading
-        payload, "blocking_items", context="pr_review.blocking_items", reviewer=reviewer
+        payload, "blocking_items", context="pr_review.blocking_items", reviewer=reviewer,
+        degradations=sub_item_degradations,
     )
     same_pr_followups = _expect_review_finding_list(  # shape-check: fatal:no-conservative-reading
-        payload, "same_pr_followups", context="pr_review.same_pr_followups", reviewer=reviewer
+        payload, "same_pr_followups", context="pr_review.same_pr_followups", reviewer=reviewer,
+        degradations=sub_item_degradations,
     )
     future_followups = _expect_review_finding_list(  # shape-check: fatal:no-conservative-reading
-        payload, "future_followups", context="pr_review.future_followups", reviewer=reviewer
+        payload, "future_followups", context="pr_review.future_followups", reviewer=reviewer,
+        degradations=sub_item_degradations, allow_sub_items=False,
     )
     dispositions = _expect_disposition_list(  # shape-check: fatal:no-conservative-reading
         payload["prior_item_dispositions"],
@@ -5775,6 +5929,7 @@ def parse_structured_pr_review(
         reviewer=reviewer,
         allowed_same_status="same-pr",
         is_plan_review=False,
+        degradations=sub_item_degradations,
     )
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(  # shape-check: fatal:no-conservative-reading
         payload, mode=architecture_status_mode, context="pr_review.architecture_impact"
@@ -5804,6 +5959,7 @@ def parse_structured_pr_review(
         dispositions=dispositions,
         architecture_impact=architecture_impact,
         architecture_impact_degradations=architecture_impact_degradations,
+        sub_item_degradations=tuple(sub_item_degradations),
     )
     if not evidence_requests:
         return parsed
@@ -5955,6 +6111,7 @@ def validate_structured_coder_followup(
     execution_catalog: Sequence[object] | None = None,
     allow_historical_canonical_evidence: bool = False,
     architecture_status_mode: str = "strict",
+    expected_sub_item_ids: Mapping[str, Sequence[str]] | None = None,
 ) -> StructuredCoderFollowup | None:
     payload = _extract_structured_coder_followup_payload(text)  # shape-check: fatal:unparseable-envelope
     if payload is None:
@@ -5972,6 +6129,7 @@ def validate_structured_coder_followup(
         "disputed_items",
         "dispute_evidence",
         "architecture_impact",
+        "addressed_sub_items",
     }
     if allow_historical_canonical_evidence:
         optional_fields.add("risk_test_matrix_evidence")
@@ -6090,6 +6248,11 @@ def validate_structured_coder_followup(
             "Coder follow-up listed unresolved reviewer item IDs more than once: "
             + ", ".join(duplicates)
         )
+    sub_item_claims, sub_item_claim_degradations = _degradable_sub_item_claims(  # shape-check: fatal:authentication-or-forgery
+        payload.get("addressed_sub_items", []),
+        remaining_items=remaining_items,
+        expected_sub_item_ids=expected_sub_item_ids,
+    )
     state = _expect_state(payload["state"], context="coder_followup.state")  # shape-check: fatal:no-conservative-reading
     if state == "approved" and any(
         item.disposition == "blocked" for item in human_requirement_dispositions
@@ -6127,7 +6290,64 @@ def validate_structured_coder_followup(
         risk_test_matrix_evidence=risk_evidence,
         architecture_impact_contract=architecture_impact_contract,
         architecture_impact_degradations=architecture_impact_degradations,
+        addressed_sub_items=sub_item_claims,
+        sub_item_claim_degradations=sub_item_claim_degradations,
     )
+
+
+def sub_item_parent_id(sub_item_id: str) -> str:
+    """The item ID a minted sub-item ID (``item-N.sK``) belongs to."""
+    return sub_item_id.rsplit(".s", 1)[0] if ".s" in sub_item_id else sub_item_id
+
+
+def _degradable_sub_item_claims(
+    value: object,
+    *,
+    remaining_items: Sequence[str],
+    expected_sub_item_ids: Mapping[str, Sequence[str]] | None,
+) -> tuple[tuple[str, ...], tuple[ParseDegradation, ...]]:
+    """Read advisory coder sub-item claims; every defect drops the claim (#958)."""
+    context = "coder_followup.addressed_sub_items"
+    if not isinstance(value, list):
+        return (), (
+            ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+                element_path=context,
+                rule="addressed_sub_items-not-an-array",
+                observed=value,
+                outcome="claim-dropped",
+            ),
+        )
+    claims: list[str] = []
+    records: list[ParseDegradation] = []
+    remaining = set(remaining_items)
+    for index, entry in enumerate(value):
+        rule: str | None = None
+        if not isinstance(entry, str) or not entry.strip():
+            rule = "addressed_sub_items-entry-not-a-non-empty-string"
+        else:
+            entry = entry.strip()
+            parent = sub_item_parent_id(entry)
+            if entry in claims:
+                continue
+            if parent not in remaining:
+                rule = "addressed_sub_items-parent-not-in-remaining_items"
+            elif expected_sub_item_ids is not None and entry not in set(
+                expected_sub_item_ids.get(parent, ())
+            ):
+                rule = "addressed_sub_items-unknown-or-already-resolved-sub-item"
+        if rule is not None:
+            if len(records) < PARSE_DEGRADATION_RENDER_LIMIT:
+                records.append(
+                    ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+                        element_path=f"{context}[{index}]",
+                        rule=rule,
+                        observed=entry,
+                        outcome="claim-dropped",
+                    )
+                )
+            continue
+        claims.append(entry)
+    return tuple(claims), tuple(records)
 
 
 def validate_structured_issue_implementation(
@@ -6876,7 +7096,7 @@ def _parse_unresolved_item_dispositions(
         if (
             parent_indent is not None
             and indent > parent_indent
-            and entry.startswith("Original finding:")
+            and entry.startswith(("Original finding:", "Sub-items (per this review only"))
         ):
             continue
         if empty_item_re.match(entry):

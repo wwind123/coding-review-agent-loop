@@ -488,6 +488,9 @@ from .comment_rendering import (
     render_refused_decomposition_comment,
     render_plan_phase_advance,
     render_plan_scheduling_audit,
+    render_sub_item_progress_comment,
+    sub_item_progress_digest,
+    sub_item_progress_record_keys,
     EXECUTION_RECOMMENDATION_MARKER_RE,
     RISK_TEST_MATRIX_MARKER_RE,
     ITEM_SUMMARY_LIMIT,
@@ -664,6 +667,10 @@ from .review_scheduling import (
 from .review_spool import ReviewRoundSpool, review_spool_root
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
+    ClearedItemProgress,
+    newly_stalled_items,
+    render_sub_item_progress_summary,
+    sub_item_progress,
     CODER_DISPUTE_NOTE_PREFIX,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     MERGE_CONFLICT_ITEM_ID,
@@ -849,7 +856,16 @@ def _test_observation_degradation_fields(result: object | None) -> dict[str, obj
     """
     result = _unwrap_architecture_result(result)
     if isinstance(result, (StructuredCoderFollowup, StructuredIssueImplementation)):
-        return {"test_observation_degradations": tuple(result.test_observation_degradations)}
+        fields: dict[str, object] = {
+            "test_observation_degradations": tuple(result.test_observation_degradations)
+        }
+        if isinstance(result, StructuredCoderFollowup):
+            # Advisory sub-item claims (#958), emitted only when present.
+            if result.addressed_sub_items:
+                fields["addressed_sub_items"] = tuple(result.addressed_sub_items)
+            if result.sub_item_claim_degradations:
+                fields["sub_item_claim_degradations"] = tuple(result.sub_item_claim_degradations)
+        return fields
     return {}
 
 
@@ -16836,6 +16852,15 @@ def _coder_followup_review_context(
         payload["test_observation_degradations"] = [
             record.to_payload() for record in parsed.test_observation_degradations
         ]
+    if isinstance(parsed, StructuredCoderFollowup):
+        if parsed.addressed_sub_items:
+            # Advisory claims only: the reviewer verifies each with a sub-item
+            # disposition; nothing here changes persisted sub-item status.
+            payload["claimed_addressed_sub_items_unverified"] = list(parsed.addressed_sub_items)
+        if parsed.sub_item_claim_degradations:
+            payload["sub_item_claim_degradations"] = [
+                record.to_payload() for record in parsed.sub_item_claim_degradations
+            ]
     if not isinstance(parsed, StructuredCoderFollowup) and summary is None and tests is None:
         return "Latest coder explanation: no valid structured resolution details are available.\n"
     unchanged_head = followup_head_unchanged_sha(metadata)
@@ -17530,7 +17555,124 @@ def approved_pr_reopen_hint(pr_number: int) -> str:
     )
 
 
+def _sub_item_progress_already_posted(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    digest: str,
+) -> bool:
+    """Whether a trusted orchestrator comment already carries this round's record.
+
+    Only comments written by the authenticated actor count; the same record in
+    anyone else's comment is ordinary text and grants nothing (#958).
+    """
+    try:
+        actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    except AgentLoopError:
+        return False
+    comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        author_id = getattr(comment, "author_id", None)
+        if author_id is not None:
+            if author_id != actor_id:
+                continue
+        elif getattr(comment, "author", None) != actor_login:
+            continue
+        if (pr_number, round_number, digest) in sub_item_progress_record_keys(body):
+            return True
+    return False
+
+
+def _publish_sub_item_progress(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    items: Sequence[UnresolvedReviewItem],
+    cleared: Sequence[ClearedItemProgress],
+    notes: Sequence[str] = (),
+) -> None:
+    """Log the sub-item signal and post the once-per-round confirmed outcome (#958).
+
+    Advisory only: nothing here changes the round budget.  The comment is a
+    pure function of the reconciled ledger, so a resumed round recomputes the
+    same digest and the trusted-record check keeps the post exactly-once.
+    """
+    for note in notes:
+        log(config, f"Round {round_number}: sub-item note: {note}")
+    window = config.sub_item_stall_rounds
+    for entry in sub_item_progress(items, (), current_round=round_number, window=window):
+        if entry.classification == "stalled":
+            log(
+                config,
+                f"Round {round_number}: WARNING: {entry.item_id} has "
+                f"{entry.resolved}/{entry.total} sub-items resolved and none closed in the "
+                f"last {entry.window} rounds (stalled; advisory, the round budget is unchanged).",
+            )
+    stalled = newly_stalled_items(items, current_round=round_number, window=window)
+    if not cleared and not stalled:
+        return
+    digest = sub_item_progress_digest(cleared, stalled)
+    if _sub_item_progress_already_posted(
+        runner, config=config, pr_number=pr_number, round_number=round_number, digest=digest
+    ):
+        return
+    body = render_sub_item_progress_comment(
+        pr_number=pr_number, round_number=round_number, cleared=cleared, stalled=stalled
+    )
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=TrustedBody.canonical(body, expected_tokens=("AGENT_SUB_ITEM_PROGRESS",)),
+    )
+
+
+def _sub_item_progress_block(
+    items: Sequence[UnresolvedReviewItem], *, round_number: int, window: int
+) -> str:
+    """Per-item converging/stalled summary for a budget-exit message (#958).
+
+    Empty when no carried item has sub-items, so every diagnostic stays
+    byte-identical for findings without them.
+    """
+    lines = render_sub_item_progress_summary(
+        sub_item_progress(items, (), current_round=round_number, window=window)
+    )
+    if not lines:
+        return ""
+    return "\nSub-item progress:\n" + "\n".join(f"- {line}" for line in lines)
+
+
 def _round_limit_diagnostic(
+    *,
+    pr_number: int,
+    round_number: int,
+    items: Sequence[UnresolvedReviewItem],
+    current_head_sha: str | None,
+    sub_item_stall_rounds: int | None = None,
+) -> str:
+    """Describe the blocker plus, when items have sub-items, their progress (#958)."""
+    message = _round_limit_blocker_message(
+        pr_number=pr_number,
+        round_number=round_number,
+        items=items,
+        current_head_sha=current_head_sha,
+    )
+    if sub_item_stall_rounds is None:
+        return message
+    return message + _sub_item_progress_block(
+        items, round_number=round_number, window=sub_item_stall_rounds
+    )
+
+
+def _round_limit_blocker_message(
     *,
     pr_number: int,
     round_number: int,
@@ -17603,6 +17745,7 @@ def _ensure_finalization_ready(
     items: Sequence[UnresolvedReviewItem],
     current_head_sha: str | None,
     ignored_machine_kinds: frozenset[str] = frozenset(),
+    sub_item_stall_rounds: int | None = None,
 ) -> None:
     """Fail closed unless every non-ignored obligation is actually cleared.
 
@@ -17628,6 +17771,7 @@ def _ensure_finalization_ready(
             round_number=round_number,
             items=blockers,
             current_head_sha=current_head_sha,
+            sub_item_stall_rounds=sub_item_stall_rounds,
         )
         raise AgentLoopError(
             f"PR #{pr_number} cannot finalize: {diagnostic} No approval or merge was attempted."
@@ -22087,6 +22231,7 @@ def run_pr_loop(
                             if prefetched_pr_context is not None
                             else initial_pr_context.metadata.head_sha
                         ),
+                        sub_item_stall_rounds=config.sub_item_stall_rounds,
                     )
                 )
             coder_name = agent_display_name(config.coder)
@@ -22343,6 +22488,7 @@ def run_pr_loop(
                             round_number=round_number,
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
+                            sub_item_stall_rounds=config.sub_item_stall_rounds,
                         )
                     )
                 freeze_payload = live_evidence_boundary.evidence_freeze
@@ -24073,6 +24219,7 @@ def run_pr_loop(
                                     text=blocking_item.text,
                                     status="blocking",
                                     fix_scope=blocking_item.fix_scope,
+                                    sub_items=blocking_item.sub_items,
                                 )
                                 round_new_unresolved_items.append(tracked_item)
                                 reviewer_new_unresolved_items.append(tracked_item)
@@ -24102,6 +24249,7 @@ def run_pr_loop(
                                     text=followup.text,
                                     status="same-pr",
                                     fix_scope=followup.fix_scope,
+                                    sub_items=followup.sub_items,
                                 )
                                 round_new_unresolved_items.append(tracked_item)
                                 reviewer_new_unresolved_items.append(tracked_item)
@@ -24234,12 +24382,17 @@ def run_pr_loop(
                 raise pr_fatal_errors[0][1]
 
             round_evidence_clearances: list[tuple[str, str]] = []
+            round_cleared_sub_items: list[ClearedItemProgress] = []
+            round_sub_item_notes: list[str] = []
             evidence_reconciliation_kwargs = {
                 "evidence_response_head": evidence_response_head,
                 "configured_reviewers": tuple(
                     agent_display_name(reviewer) for reviewer in configured_reviewers
                 ),
                 "evidence_clearances": round_evidence_clearances,
+                "round_number": round_number,
+                "cleared_items_progress": round_cleared_sub_items,
+                "sub_item_degradations": round_sub_item_notes,
             }
             if use_compact_pr_context:
                 unresolved_items, future_from_prior_items = _apply_unresolved_item_dispositions(
@@ -24279,6 +24432,18 @@ def run_pr_loop(
                 future_from_prior_items = []
             unresolved_items = list(
                 pr_ledger_view([*unresolved_items, *round_new_unresolved_items])
+            )
+            # Confirmed sub-item outcome of this round (#958): published after
+            # reconciliation and before any coder turn, approval, budget check
+            # or exit, so a terminal approval round is never silent.
+            _publish_sub_item_progress(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                round_number=round_number,
+                items=unresolved_items,
+                cleared=round_cleared_sub_items,
+                notes=round_sub_item_notes,
             )
             # Dispositions first, then newly emitted evidence requests, so a
             # same-response re-emission of a just-cleared request hits its
@@ -24600,6 +24765,7 @@ def run_pr_loop(
                                             source_round=round_number,
                                             text=item.text,
                                             status="blocking",
+                                            sub_items=item.sub_items,
                                         )
                                         round_new_unresolved_items.append(new_item)
                                         unresolved_items.append(new_item)
@@ -24611,6 +24777,7 @@ def run_pr_loop(
                                             source_round=round_number,
                                             text=item.text,
                                             status="same-pr",
+                                            sub_items=item.sub_items,
                                         )
                                         round_new_unresolved_items.append(new_item)
                                         unresolved_items.append(new_item)
@@ -25203,6 +25370,7 @@ def run_pr_loop(
                             round_number=round_number,
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
+                            sub_item_stall_rounds=config.sub_item_stall_rounds,
                         )
                         if config.auto_merge:
                             if not watch_outcome.head_sha:
@@ -25976,6 +26144,7 @@ def run_pr_loop(
                                     round_number=round_number,
                                     items=unresolved_items,
                                     current_head_sha=pr_metadata.head_sha,
+                                    sub_item_stall_rounds=config.sub_item_stall_rounds,
                                 )
                                 if config.auto_merge:
                                     managed_ci_qualified = True
@@ -26325,6 +26494,7 @@ def run_pr_loop(
                             round_number=round_number,
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
+                            sub_item_stall_rounds=config.sub_item_stall_rounds,
                         )
                         print(
                             f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}."
@@ -26339,6 +26509,7 @@ def run_pr_loop(
                         round_number=round_number,
                         items=unresolved_items,
                         current_head_sha=pr_metadata.head_sha,
+                        sub_item_stall_rounds=config.sub_item_stall_rounds,
                     )
                 )
 
@@ -27012,6 +27183,11 @@ def run_pr_loop(
 
         raise AgentLoopError(
             f"Reached max rounds ({config.max_rounds}) for PR #{pr_number}; human review required."
+            + _sub_item_progress_block(
+                unresolved_items,
+                round_number=config.max_rounds,
+                window=config.sub_item_stall_rounds,
+            )
         )
     finally:
         cleanup_failure: AgentLoopError | None = None

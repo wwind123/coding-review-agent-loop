@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import json
 import re
@@ -62,7 +64,13 @@ from .protocol import (
     parse_human_requirements_acknowledgement,
     review_freeform_summary_text,
 )
-from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID
+from .unresolved_items import (
+    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+    MERGE_CONFLICT_ITEM_ID,
+    ClearedItemProgress,
+    SubItemProgress,
+    render_sub_item_progress_summary,
+)
 from .protocol_markers import sanitize_historical_text
 from .round_transport import (
     MAX_GITHUB_BODY_CHARS,
@@ -380,7 +388,49 @@ def _render_prior_dispositions_section(
             f"- [{disposition.item_id}] {_render_disposition_status(disposition)}"
         )
         lines.append(f"  - Original finding: {_format_unresolved_item_label(item, config)}")
+        projection = _render_sub_item_projection(item, disposition)
+        if projection:
+            lines.append(projection)
     return "\n".join(lines)
+
+
+def _short_sub_item_id(sub_item_id: str) -> str:
+    return sub_item_id.rsplit(".", 1)[-1]
+
+
+def _render_sub_item_projection(
+    item: UnresolvedReviewItem, disposition: ReviewItemDisposition
+) -> str | None:
+    """Labelled per-review projection of one reviewer's sub-item dispositions (#958).
+
+    Rendered before reconciliation, so it applies only this review's own map to
+    the carried counts and says so; the confirmed round outcome is published
+    separately after reconciliation.
+    """
+    if not item.sub_items or not disposition.sub_item_dispositions:
+        return None
+    mapped = dict(disposition.sub_item_dispositions)
+    resolves = [_short_sub_item_id(sid) for sid, verdict in mapped.items() if verdict == "resolved"]
+    reopens = [_short_sub_item_id(sid) for sid, verdict in mapped.items() if verdict == "unresolved"]
+    known = {sub.sub_item_id for sub in item.sub_items}
+    resolved_after = sum(
+        1
+        for sub in item.sub_items
+        if mapped.get(sub.sub_item_id) == "resolved"
+        or (sub.status == "resolved" and mapped.get(sub.sub_item_id) != "unresolved")
+    )
+    actions = []
+    if resolves:
+        actions.append("resolves " + ", ".join(resolves))
+    if reopens:
+        actions.append("reopens " + ", ".join(reopens))
+    if not actions or not (set(mapped) & known):
+        return None
+    return (
+        f"  - Sub-items (per this review only, not the round outcome; the confirmed "
+        f"outcome is posted after reconciliation): {', '.join(actions)} → "
+        f"{resolved_after}/{len(item.sub_items)}"
+    )
 
 
 def _replace_structured_section(
@@ -1573,6 +1623,9 @@ def _render_public_coder_followup_comment(
         ]
     if disputed_items:
         sections.append("\n".join(["### Disputed items", *disputed_items]))
+    sub_item_section = _render_coder_sub_item_progress(parsed_followup, prior_items)
+    if sub_item_section:
+        sections.append(sub_item_section)
     if parsed_followup.tests_run:
         sections.append(
             "\n".join(
@@ -1622,6 +1675,133 @@ def _render_public_coder_followup_comment(
     sections.append(f"<!-- AGENT_STATE: {parsed_followup.state} -->")
     sections.append(f"-- {_comment_signature(agent, config, model_used)}")
     return "\n\n".join(section for section in sections if section)
+
+
+def _render_coder_sub_item_progress(
+    parsed_followup: StructuredCoderFollowup,
+    prior_items: Sequence[UnresolvedReviewItem],
+) -> str | None:
+    """Carried sub-item counts for the coder comment (#958).
+
+    Reviewer-confirmed counts and coder claims are labelled separately so a
+    claim is never presented as verified.  Items with no sub-items contribute
+    nothing, so the comment is unchanged when no carried item has any.
+    """
+    claimed = set(parsed_followup.addressed_sub_items)
+    lines: list[str] = []
+    for item in prior_items:
+        if not item.sub_items or item.item_id in parsed_followup.addressed_items:
+            continue
+        resolved = sum(1 for sub in item.sub_items if sub.status == "resolved")
+        item_claims = [
+            sub for sub in item.sub_items if sub.sub_item_id in claimed and sub.status == "open"
+        ]
+        headline = f"- {item.item_id}: {resolved}/{len(item.sub_items)} sub-items resolved (reviewer-confirmed)"
+        if item_claims:
+            headline += f"; coder claims {len(item_claims)} more addressed this round (unverified)"
+        lines.append(headline)
+        for sub in item.sub_items:
+            if sub.status == "resolved":
+                state = f"resolved (round {sub.resolved_round})" if sub.resolved_round is not None else "resolved"
+            elif sub.sub_item_id in claimed:
+                state = "open; coder claims addressed (unverified)"
+            else:
+                state = "open"
+            lines.append(f"  - {sub.sub_item_id}: {state}")
+    for record in parsed_followup.sub_item_claim_degradations:
+        lines.append(f"- Dropped sub-item claim ({record.rule}): {record.observed_preview}")
+    if not lines:
+        return None
+    return "\n".join(["### Sub-item progress", *lines])
+
+
+SUB_ITEM_PROGRESS_MARKER = "AGENT_SUB_ITEM_PROGRESS"
+SUB_ITEM_PROGRESS_RECORD_RE = re.compile(
+    r"<!--\s*AGENT_SUB_ITEM_PROGRESS:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->"
+)
+
+
+def sub_item_progress_digest(
+    cleared: Sequence[ClearedItemProgress], stalled: Sequence[SubItemProgress]
+) -> str:
+    """Stable digest of the cleared and newly-stalled records of one round."""
+    payload = [
+        ["cleared", c.item_id, c.resolved, c.total, c.cause, list(c.closed_sub_item_ids)]
+        for c in cleared
+    ] + [["stalled", e.item_id, e.resolved, e.total, e.window] for e in stalled]
+    return hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def render_sub_item_progress_record(*, pr_number: int, round_number: int, digest: str) -> str:
+    """Orchestrator-authored audit record keyed by PR, round and digest."""
+    raw = json.dumps(
+        {"digest": digest, "pr": pr_number, "round": round_number},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"<!-- {SUB_ITEM_PROGRESS_MARKER}: {base64.urlsafe_b64encode(raw).decode('ascii')} -->"
+
+
+def sub_item_progress_record_keys(body: str) -> tuple[tuple[int, int, str], ...]:
+    """Every well-formed ``(pr, round, digest)`` key a body claims."""
+    keys: list[tuple[int, int, str]] = []
+    for match in SUB_ITEM_PROGRESS_RECORD_RE.finditer(body):
+        try:
+            value = json.loads(base64.urlsafe_b64decode(match.group("payload").encode("ascii")))
+            keys.append((int(value["pr"]), int(value["round"]), str(value["digest"])))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return tuple(keys)
+
+
+def render_sub_item_progress_comment(
+    *,
+    pr_number: int,
+    round_number: int,
+    cleared: Sequence[ClearedItemProgress],
+    stalled: Sequence[SubItemProgress],
+) -> str:
+    """Post-reconciliation orchestrator comment for one round (#958)."""
+    sections = [f"### Sub-item progress — review round {round_number}"]
+    if cleared:
+        lines = []
+        for record in cleared:
+            if record.cause == "all-sub-items-resolved":
+                lines.append(
+                    f"- {record.item_id}: {record.resolved}/{record.total} — cleared "
+                    "(all sub-items resolved)"
+                )
+            else:
+                lines.append(
+                    f"- {record.item_id}: cleared by item-level resolution at "
+                    f"{record.resolved}/{record.total}"
+                )
+        sections.append("\n".join(lines))
+    if stalled:
+        sections.append(
+            "\n".join(
+                [
+                    "### Stalled findings",
+                    *[
+                        f"- {entry.item_id}: {entry.resolved}/{entry.total} sub-items resolved, "
+                        f"none closed in the last {entry.window} rounds"
+                        for entry in stalled
+                    ],
+                    "Advisory only: the round budget is unchanged.",
+                ]
+            )
+        )
+    sections.append(
+        render_sub_item_progress_record(
+            pr_number=pr_number,
+            round_number=round_number,
+            digest=sub_item_progress_digest(cleared, stalled),
+        )
+    )
+    sections.append("-- Orchestrator")
+    return "\n\n".join(sections)
 
 
 def _render_public_issue_implementation_comment(

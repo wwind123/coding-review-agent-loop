@@ -658,6 +658,56 @@ at H inside the same round, so it spends no round budget. Only the requester
 can clear its evidence there. New findings or a failing machine gate release
 the freeze with one release comment, and an external push breaks it.
 
+Conjunctive findings carry sub-items (#958). A PR-review blocking or same-PR
+finding may declare an ordered `sub_items` array of two to twelve distinct
+statements; a single-obligation finding is unchanged. The orchestrator mints
+the IDs `item-N.s1`..`item-N.sK` on every minting path, including the
+reviewer-repair path, and each carried item persists every sub-item's text,
+status and closing round in round metadata. The persisted fields are optional
+and emitted only when present, so legacy records, dispositions and the
+prior-item ledger signature are byte-identical. A malformed persisted payload
+decodes to no sub-items and never clears or weakens the item. Malformed
+sub-items in a reviewer response degrade to a plain finding with a recorded
+degradation (#924) instead of rejecting the envelope, and a plan-review
+finding's well-formed `sub_items` are flattened into its text with no ledger
+structure.
+
+Sub-item status is reviewer-authoritative. A reviewer disposition may carry
+`sub_item_dispositions`, mapping a sub-item ID to `resolved` or `unresolved`;
+only reviewers whose entries count toward the item under the current mode
+(every disposing reviewer in aggregate mode, owners plus reviewers added as
+owners this round in owner-scoped mode) can close or reopen a sub-item, and
+machine obligations never accept them. Coder `addressed_sub_items` are
+advisory claims that never change persisted status: they are validated against
+the open sub-items of `remaining_items` parents, persisted with the coder
+round, and shown to the next reviewer as unverified. An item is resolved when
+all of its sub-items are. The item-level outcome logic is unchanged and runs
+on effective dispositions: a `blocking`/`same-pr` entry that resolves every
+remaining sub-item (a completing entry) is exempt from the actionable-note rule
+and derives to `resolved`. A post-outcome invariant defers the completing
+closure whenever the item would otherwise stay open with every sub-item
+resolved, the outcome is recomputed from the literal dispositions so no owner
+is cleared on its strength, and a note-less completing entry that does not take
+effect always leaves a synthesized explanation naming the open sub-item and
+why. The literal item-level `resolved` shortcut changes sub-item status only
+when the item actually clears. Reconciliation is a deterministic function of
+the ledger and the persisted dispositions, so a resumed round applies each
+closure exactly once.
+
+Progress is published three ways: a labelled per-review projection on each
+reviewer comment, carried `k/K` counts (reviewer-confirmed and coder-claimed
+counts labelled separately) in the coder follow-up comment, and one
+orchestrator progress comment per round, posted right after reconciliation
+and before any coder turn, approval or budget exit. That comment lists cleared
+items and newly stalled findings and carries an `AGENT_SUB_ITEM_PROGRESS`
+audit record keyed by PR, round and digest; only records in comments written by
+the authenticated actor suppress a repost, which keeps it exactly-once across
+resume. A pure helper classifies each item as `new`, `converging`, `stalled`,
+`complete` or `cleared` from persisted rounds. `--sub-item-stall-rounds`
+(default 3, 0 disables) sets the stall window, and the max-rounds diagnostics
+add a per-item progress block. The signal is advisory: it never changes
+`--max-rounds`, `allowed_rounds` or a checkpoint bound.
+
 ### CI and Merge
 
 Ordinary CI observes the current-head check board. Known failures can join

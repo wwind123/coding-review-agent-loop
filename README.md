@@ -583,6 +583,18 @@ metadata, so a later run can reconstruct the active review state. When the PR
 number is known, resume with `agent-loop pr <number>` instead of starting issue
 implementation again.
 
+### Sub-items for conjunctive findings
+
+A reviewer can split a finding that bundles several separately checkable
+obligations into an ordered `sub_items` list, and the loop reports partial
+progress as counts (`item-1: 3/4 sub-items resolved`) instead of a bare
+addressed/remaining split. Single-obligation findings are unchanged. Reviewers
+disposition individual sub-items, coder claims are advisory, and an item is
+resolved when all of its sub-items are. `--sub-item-stall-rounds N` (default 3,
+`0` disables) warns when no sub-item of a finding closes for `N` rounds; it is
+advisory and never changes `--max-rounds`. See
+[docs/local_agent_loop.md](docs/local_agent_loop.md#sub-items-for-conjunctive-review-findings).
+
 ### Advisory architecture context
 
 By default, workflows read the conventional repository-local `ARCHITECTURE.md`
