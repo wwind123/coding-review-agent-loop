@@ -16015,7 +16015,10 @@ def _m1133_post_panel_latch_run(tmp_path, monkeypatch, *, configured):
         "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    merges = []
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: merges.append(kwargs)
+    )
     runner = FakeRunner(
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
         codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
@@ -16096,6 +16099,7 @@ def _m1133_post_panel_latch_run(tmp_path, monkeypatch, *, configured):
         for item in _posted_scheduler_metadata(runner)
         if item.reviewer_board_amendment_digest is not None
     ]
+    runner.merge_calls = merges
     return (
         runner,
         _agent_sequence(runner)[seeded_agents:],
@@ -16125,6 +16129,13 @@ def test_1133_post_panel_automatic_latch_uses_the_amended_board(
     assert all("Antigravity" not in selected for _b, _d, _p, selected, *_ in records)
     assert any(latched and source == "automatic" for *_, latched, source in records)
     assert not any("missing required input" in c for c in new_comments)
+    # Qualification: exactly one exact-head merge, after every latched review,
+    # followed by the durable reduced-board completion note.
+    assert runner.merge_calls == [{"expected_head_sha": "abc123-coder-1"}]
+    notes = [c for c in new_comments if c.startswith("Review completed on a reduced reviewer board.")]
+    assert len(notes) == 1 and "required board now Codex, Gemini" in notes[0]
+    last_review = max(i for i, c in enumerate(new_comments) if "Google Gemini review" in c)
+    assert new_comments.index(notes[0]) > last_review
     reviewer_prompts = [prompt for agent, prompt in prompts if agent in {"codex", "gemini"}]
     boards = [
         board
