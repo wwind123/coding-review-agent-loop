@@ -12664,3 +12664,95 @@ def test_draft_labeled_state_left_by_supersession_stop_is_accepted_by_real_resum
     )
     assert resume.lifecycle == "draft-labeled"
     assert _mutations(source_runner) == []
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+@pytest.mark.parametrize("auto_merge", [True, False], ids=["auto-merge", "manual"])
+def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligation(
+    tmp_path, monkeypatch, origin, auto_merge
+):
+    """#1117: stop a real draft-labeled managed PR carrying the persisted item, then resume it."""
+    import dataclasses
+    from test_orchestrator_pr import _carried_ci_obligations, _carried_ci_review_comment
+    from coding_review_agent_loop.github import PullRequestMergeability
+    from coding_review_agent_loop.managed_ci import ManagedCiOutcome
+
+    item = dataclasses.replace(
+        _carried_ci_obligations()[1], text="Failing checks: Python 3.12 full suite (failure)"
+    )
+    approval = structured_pr_review(
+        reviewer="OpenAI Codex", state="approved",
+        prior_item_dispositions=[{"item_id": item.item_id, "disposition": "resolved"}],
+    )
+    runner = _qualified_ready_labeled_runner(origin, codex_outputs=[approval, approval])
+    runner.rest_pr["draft"] = True
+    runner.pr_payload["comments"] = [
+        {"author": {"login": "coding-review-agent-loop"}, "body": _carried_ci_review_comment((item,))}
+    ]
+    kwargs = {"auto_merge": True} if auto_merge else {}
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", reviewer=("codex",),
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
+        ),
+        **kwargs,
+    )
+    monkeypatch.setattr(
+        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    )
+
+    def board(protection):
+        runs = [
+            PullRequestCheck(FINAL_CONTEXT, "check_run", "success"),
+            PullRequestCheck("Python 3.12 full suite", "check_run", "skipped"),
+        ]
+        return PullRequestChecks(
+            state="passing", required_checks=(), passing=tuple(runs), pending=(), failing=(),
+            missing_required=(), branch_protection_status=protection, listing_complete=True,
+        )
+
+    state = {"protection": "forbidden"}
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification",
+        lambda *a, **k: ManagedCiOutcome(
+            status="passed", checks=board(state["protection"]), head_sha="abc123"
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_mergeability_for_unreadable_protection",
+        lambda *a, **k: PullRequestMergeability(
+            state="mergeable", mergeable_raw="MERGEABLE", merge_state_raw="DRAFT",
+            head_sha="abc123", base_branch="main",
+        ),
+    )
+    finalized = []
+    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *a, **k: finalized.append("prepare"))
+    monkeypatch.setattr(orchestrator, "_merge_with_exact_head_proof", lambda *a, **k: finalized.append("merge"))
+    monkeypatch.setattr(
+        orchestrator, "publish_manual_v2_qualification",
+        lambda *a, **k: finalized.append("publish") or "abc123",
+    )
+    real_activate = orchestrator.activate_managed_ci
+    lifecycles = []
+
+    def activate(*args, **kwargs):
+        lifecycles.append(kwargs["managed_resume"].lifecycle)
+        return real_activate(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate)
+
+    with pytest.raises(AgentLoopError, match="administration: read"):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert lifecycles == ["draft-labeled"]
+    assert finalized == []
+    assert _lifecycle_writes(runner) == []  # no label, ready, or merge write
+    assert runner.rest_pr["draft"] is True
+    assert runner.rest_pr["labels"] == [{"name": MANAGED_LABEL}]
+
+    # Protection becomes readable: resume the SAME PR through the same real entry path.
+    state["protection"] = "configured"
+    assert orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True) == 0
+    assert lifecycles == ["draft-labeled", "draft-labeled"]
+    assert finalized == (["prepare", "merge"] if auto_merge else ["publish"])
