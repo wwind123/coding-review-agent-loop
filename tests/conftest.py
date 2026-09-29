@@ -69,3 +69,13 @@ def _isolate_worker_budget_environment(monkeypatch, tmp_path_factory):
         "AGENT_LOOP_WORKER_TELEMETRY_LOG",
         str(tmp_path_factory.mktemp("worker-telemetry") / "worker-reservations.jsonl"),
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_workdir_claims(tmp_path_factory):
+    """Keep checkout claims (#1127) off the real host lock root."""
+    from coding_review_agent_loop import workdir_claims
+
+    workdir_claims._set_claim_root_for_tests(tmp_path_factory.mktemp("workdir-claims"))
+    yield
+    workdir_claims._set_claim_root_for_tests(None)

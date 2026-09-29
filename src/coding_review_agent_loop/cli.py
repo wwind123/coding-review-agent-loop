@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ from .agents.registry import (
     agent_signature,
 )
 from .agent_permissions import establish_sandboxed_run
+from .workdir_claims import claim_agent_workdirs, workdir_claim_scope
 from .config import (
     DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS,
     DEFAULT_MAX_ROUNDS,
@@ -203,7 +205,11 @@ def build_parser() -> argparse.ArgumentParser:
                 "reviewers; all must approve (default: codex)."
             ),
         )
-        subparser.add_argument("--allow-shared-dir", action="store_true")
+        subparser.add_argument(
+            "--allow-shared-dir",
+            action="store_true",
+            help="Let agents within one run share a checkout. Never lets a second run use a claimed checkout.",
+        )
         subparser.add_argument(
             "--max-rounds",
             type=int,
@@ -1841,6 +1847,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"agent-loop: {exc}", file=sys.stderr)
             return PREFLIGHT_INDETERMINATE
     runner = Runner(dry_run=args.dry_run)
+    claim_stack = contextlib.ExitStack()
     try:
         # Preserve tokens (rather than a rendered command) so timeout guidance can
         # be safely shell-quoted locally. Programmatic callers have no sys.argv.
@@ -1852,6 +1859,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not (args.managed_ci_trusted_actor or "").strip():
                 raise AgentLoopError("--managed-ci requires --managed-ci-trusted-actor.")
         config = config_from_args(args, runner, invocation_argv=invocation)
+        # Claim every required checkout before base-branch resolution, sandbox
+        # setup or dispatch; released on every exit path below (#1127).
+        claim_stack.enter_context(
+            workdir_claim_scope(
+                command=args.command,
+                number=(
+                    getattr(args, "issue_number", None)
+                    if args.command in {"issue", "discuss"}
+                    else getattr(args, "pr_number", None) if args.command == "pr" else None
+                ),
+                head=getattr(args, "head", None) if args.command == "managed-pr" else None,
+            )
+        )
+        claim_agent_workdirs(config)
         runner.configure_from_config(config)
         if config.dry_run:
             print(
@@ -2046,6 +2067,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except AgentLoopError as exc:
         print(f"agent-loop: {exc}", file=sys.stderr)
         return 1
+    finally:
+        claim_stack.close()
     return 0
 
 
