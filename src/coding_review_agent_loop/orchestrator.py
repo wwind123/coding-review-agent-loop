@@ -133,6 +133,7 @@ from .expected_closure import (
 )
 from .github import (
     _REST_ISSUE_COMMENT_PAGE_SIZE,
+    _classify_check_status,
     CiWatchOutcome,
     strip_bot_login_suffix,
     IssueContext,
@@ -18085,6 +18086,72 @@ def _ordinary_checks_snapshot_is_authoritative(
     )
 
 
+def _managed_success_supersedes_ordinary_checks(
+    items: Sequence[UnresolvedReviewItem],
+    *,
+    outcome: ManagedCiOutcome,
+    current_head_sha: str | None,
+    mergeability: PullRequestMergeability | None,
+) -> tuple[str, str]:
+    """Decide whether a correlated managed success retires carried ordinary checks (#1117).
+
+    Returns ``(verdict, predicate)`` with verdict ``not_applicable``, ``cleared``
+    or ``unqualified``. Only a ``github-pr-checks`` revalidation candidate at the
+    qualified head is considered; the judgement is made from the full,
+    unfiltered exact-head board and never from obligation text.
+    """
+    candidates = [
+        item
+        for item in items
+        if item.obligation_kind == "github-pr-checks"
+        and _machine_obligation_is_revalidation_candidate(item, current_head_sha=current_head_sha)
+    ]
+    if not candidates:
+        return "not_applicable", ""
+    checks = outcome.checks
+    if checks is None or not current_head_sha or outcome.head_sha != current_head_sha:
+        return "unqualified", "the qualified exact-head check board is unavailable or not for the current head"
+    if checks.check_query_status != "ok" or checks.check_query_errors:
+        errors = "; ".join(checks.check_query_errors) or checks.check_query_status
+        return "unqualified", f"the exact-head check board had query errors ({errors})"
+    if not checks.listing_complete:
+        return "unqualified", "the exact-head check listing is incomplete (total_count mismatch or unparsed entries)"
+    final = [check for check in (*checks.passing, *checks.pending, *checks.failing) if check.name == FINAL_CONTEXT]
+    if not any(check.status.strip().lower() == "success" for check in final):
+        return "unqualified", f"`{FINAL_CONTEXT}` has no success observation"
+    if checks.failing or checks.pending or checks.missing_required:
+        names = [
+            check.name for check in (*checks.failing, *checks.pending)
+        ] + list(checks.missing_required)
+        return "unqualified", f"checks are failing, pending or missing at the qualified head: {', '.join(names)}"
+    required = set(checks.required_checks)
+    for check in checks.shadowed:
+        state = _classify_check_status(check.status)
+        if state in {"failing", "pending"}:
+            return "unqualified", f"a same-name observation of `{check.name}` is {check.status.lower()}"
+        if check.name in required and check.status.strip().lower() != "success":
+            return "unqualified", (
+                f"required check `{check.name}` has a same-name observation that is {check.status.lower()}"
+            )
+    if not _ordinary_checks_snapshot_is_authoritative(checks, mergeability, head_sha=current_head_sha):
+        if protection_awaits_readiness(checks, mergeability, head_sha=current_head_sha):
+            return "unqualified", (
+                f"branch protection is unreadable (HTTP 403) and GitHub reports DRAFT for draft PR at "
+                f"{current_head_sha}, so required contexts cannot be verified before readiness; grant the "
+                "token read access to branch protection (administration: read), then resume. Do not mark "
+                "the PR ready manually: a ready PR that still carries the managed label is a mixed "
+                "lifecycle that managed resume refuses"
+            )
+        if checks.branch_protection_status == "forbidden":
+            state = mergeability.merge_state_raw if mergeability is not None else None
+            return "unqualified", (
+                "branch protection is unreadable (HTTP 403) and GitHub's merge state is "
+                f"{state or 'unavailable'} rather than CLEAN for {current_head_sha}"
+            )
+        return "unqualified", "the exact-head board is not an authoritative success-only snapshot"
+    return "cleared", ""
+
+
 def _persist_qualification_checkpoint(
     runner: Runner,
     *,
@@ -25765,6 +25832,51 @@ def run_pr_loop(
                                 unresolved_items = _clear_machine_obligations(
                                     unresolved_items, kind="managed-exact-head-ci"
                                 )
+                                supersession_items = [
+                                    item for item in unresolved_items
+                                    if item.obligation_kind == "github-pr-checks"
+                                    and _machine_obligation_is_revalidation_candidate(
+                                        item, current_head_sha=pr_metadata.head_sha
+                                    )
+                                ]
+                                supersession_verdict, supersession_predicate = (
+                                    _managed_success_supersedes_ordinary_checks(
+                                        unresolved_items,
+                                        outcome=managed_outcome,
+                                        current_head_sha=pr_metadata.head_sha,
+                                        mergeability=(
+                                            managed_outcome.mergeability
+                                            or (
+                                                _mergeability_for_unreadable_protection(
+                                                    runner,
+                                                    config=config,
+                                                    pr_number=pr_number,
+                                                    checks=managed_outcome.checks,
+                                                )
+                                                if supersession_items
+                                                else None
+                                            )
+                                        ),
+                                    )
+                                )
+                                if supersession_verdict == "cleared":
+                                    unresolved_items = _clear_machine_obligations(
+                                        unresolved_items, kind="github-pr-checks"
+                                    )
+                                    log(
+                                        config,
+                                        f"PR #{pr_number}: exact-head qualification at "
+                                        f"{pr_metadata.head_sha} superseded carried github-pr-checks "
+                                        f"({', '.join(item.item_id for item in supersession_items)})",
+                                    )
+                                elif supersession_verdict == "unqualified":
+                                    raise AgentLoopError(
+                                        f"PR #{pr_number} cannot finalize: carried github-pr-checks "
+                                        f"({', '.join(item.item_id for item in supersession_items)}) "
+                                        "was not superseded by exact-head qualification at "
+                                        f"{pr_metadata.head_sha}: {supersession_predicate}. "
+                                        "No approval or merge was attempted."
+                                    )
                                 # A signed child-plan supersession stops the run before any freeze
                                 # can ask a human for evidence under a plan authorized for replacement.
                                 recheck_pending_child_plan_supersession()
@@ -25980,10 +26092,74 @@ def run_pr_loop(
                                     allowed_rounds += 1
                                     watch_failure_extension_used = True
                             else:
-                                raise AgentLoopError(
+                                legacy_timeout_message = (
                                     f"Managed exact-head CI for PR #{pr_number} did not pass within "
                                     f"{config.ci_timeout_seconds}s."
                                 )
+                                timeout_board = managed_outcome.checks
+                                if (
+                                    timeout_board is None
+                                    or not pr_metadata.head_sha
+                                    or managed_outcome.head_sha != pr_metadata.head_sha
+                                    or timeout_board.check_query_status != "ok"
+                                    or timeout_board.check_query_errors
+                                ):
+                                    raise AgentLoopError(legacy_timeout_message)
+                                stalled_names = {
+                                    stalled.name for stalled in timeout_board.infrastructure_stalls
+                                }
+                                repairable = tuple(
+                                    check for check in timeout_board.failing
+                                    if check.name != FINAL_CONTEXT and check.name not in stalled_names
+                                )
+                                if not repairable:
+                                    final_observed = [
+                                        check for check in (
+                                            *timeout_board.passing, *timeout_board.pending, *timeout_board.failing
+                                        )
+                                        if check.name == FINAL_CONTEXT
+                                    ]
+                                    pending_names = [
+                                        check.name for check in timeout_board.pending
+                                        if check.name != FINAL_CONTEXT
+                                    ]
+                                    if not pending_names and not timeout_board.missing_required:
+                                        raise AgentLoopError(legacy_timeout_message)
+                                    raise AgentLoopError(
+                                        f"{legacy_timeout_message} Exact-head board at "
+                                        f"{pr_metadata.head_sha}: final context "
+                                        f"{final_observed[0].status.lower() if final_observed else 'not reporting'}; "
+                                        f"pending: {', '.join(pending_names) or 'none'}; "
+                                        "required not reporting: "
+                                        f"{', '.join(timeout_board.missing_required) or 'none'}."
+                                    )
+                                details = _pr_check_details(
+                                    dataclasses_replace(timeout_board, failing=repairable)
+                                )
+                                post_pr_comment(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    body=_format_pr_checks_comment(pr_number, "failing", details),
+                                )
+                                had_checks_obligation = any(
+                                    _is_machine_obligation(item)
+                                    and item.obligation_kind == "github-pr-checks"
+                                    for item in unresolved_items
+                                )
+                                unresolved_items = _upsert_machine_obligation(
+                                    unresolved_items,
+                                    item_number=next_unresolved_item_number,
+                                    kind="github-pr-checks",
+                                    source_round=round_number,
+                                    text=_pr_check_blocking_review(pr_number, "failing", details),
+                                    failed_head_sha=pr_metadata.head_sha,
+                                )
+                                if not had_checks_obligation:
+                                    next_unresolved_item_number += 1
+                                if round_number == allowed_rounds and not watch_failure_extension_used:
+                                    allowed_rounds += 1
+                                    watch_failure_extension_used = True
                         elif ordinary_recovery_selected:
                             if ordinary_recovery is None:
                                 raise AgentLoopError(

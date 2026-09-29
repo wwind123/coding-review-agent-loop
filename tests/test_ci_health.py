@@ -442,3 +442,76 @@ def test_reexported_names_import_from_github_module():
 def test_full_board_types_remain_reexported_for_current_callers():
     assert github_module.PullRequestCheck.__name__ == "PullRequestCheck"
     assert github_module.PullRequestChecks.__name__ == "PullRequestChecks"
+
+
+# --- shadowed observations and listing completeness (#1117) -------------------
+
+
+def _run(name, conclusion="success", run_id=1):
+    return {"id": run_id, "name": name, "status": "completed", "conclusion": conclusion}
+
+
+def _board(tmp_path, check_runs, *, statuses=None, total=None, status_total=None, protection=None):
+    payload = {"check_runs": check_runs}
+    if total is not False:
+        payload["total_count"] = len(check_runs) if total is None else total
+    status_payload = {"state": "success", "statuses": statuses or []}
+    status_payload["total_count"] = len(statuses or []) if status_total is None else status_total
+    runner = _StubGhRunner(
+        check_runs_payload=payload,
+        status_payload=status_payload,
+        branch_protection_payload=protection or {"contexts": []},
+    )
+    return get_pr_checks(runner, config=make_config(tmp_path), metadata=_metadata(), now=NOW)
+
+
+@pytest.mark.parametrize("order", ["success-first", "failure-first"])
+def test_shadowed_keeps_dropped_same_name_observation_without_changing_board(tmp_path, order):
+    runs = [_run("X", "success", 1), _run("X", "failure", 2)]
+    if order == "failure-first":
+        runs.reverse()
+    board = _board(tmp_path, runs)
+
+    assert [c.name for c in board.passing + board.failing] == ["X"]
+    assert len(board.shadowed) == 1
+    assert board.shadowed[0].name == "X"
+    assert board.shadowed[0].status != (board.passing + board.failing)[0].status
+    assert board.listing_complete is True
+
+
+def test_no_duplicates_means_empty_shadowed(tmp_path):
+    board = _board(tmp_path, [_run("A"), _run("B")])
+    assert board.shadowed == ()
+    assert board.listing_complete is True
+
+
+def test_listing_incomplete_when_total_count_exceeds_entries(tmp_path):
+    assert _board(tmp_path, [_run("A")], total=2).listing_complete is False
+    assert _board(tmp_path, [_run("A")], status_total=3).listing_complete is False
+
+
+def test_listing_incomplete_when_total_count_missing(tmp_path):
+    assert _board(tmp_path, [_run("A")], total=False).listing_complete is False
+
+
+@pytest.mark.parametrize("bad", ["not-an-object", {"id": 9, "status": "completed", "conclusion": "failure"}])
+def test_listing_incomplete_when_counted_check_run_entry_is_skipped(tmp_path, bad):
+    board = _board(tmp_path, [_run("A"), bad])
+    assert board.listing_complete is False
+    assert board.check_query_errors == ()
+    assert [c.name for c in board.passing] == ["A"]
+
+
+def test_listing_incomplete_when_status_entry_lacks_context(tmp_path):
+    board = _board(tmp_path, [_run("A")], statuses=[{"state": "failure"}])
+    assert board.listing_complete is False
+    assert board.check_query_errors == ()
+
+
+def test_unset_listing_defaults_to_incomplete():
+    board = PullRequestChecks(
+        state="passing", required_checks=(), passing=(), pending=(), failing=(),
+        missing_required=(), branch_protection_status="not_found",
+    )
+    assert board.listing_complete is False
+    assert board.shadowed == ()

@@ -77,6 +77,11 @@ class PullRequestChecks:
     check_query_status: Literal["ok", "partial", "unavailable"] = "ok"
     check_query_errors: tuple[str, ...] = ()
     infrastructure_stalls: tuple[StalledCheck, ...] = field(default=())
+    # Same-name observations dropped by first-wins deduplication, in API order.
+    shadowed: tuple[PullRequestCheck, ...] = field(default=())
+    # True only when get_pr_checks saw every counted check-run and status entry
+    # and parsed each into a check. Fails closed for every other constructor.
+    listing_complete: bool = False
 
 
 @dataclass(frozen=True)

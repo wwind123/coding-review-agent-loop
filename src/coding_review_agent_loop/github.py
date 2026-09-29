@@ -1532,6 +1532,29 @@ def _dedupe_checks(checks: list[PullRequestCheck]) -> tuple[PullRequestCheck, ..
     return tuple(deduped.values())
 
 
+def _shadowed_checks(checks: list[PullRequestCheck]) -> tuple[PullRequestCheck, ...]:
+    seen: set[tuple[str, str]] = set()
+    shadowed: list[PullRequestCheck] = []
+    for check in checks:
+        key = (check.kind, check.name)
+        if key in seen:
+            shadowed.append(check)
+        else:
+            seen.add(key)
+    return tuple(shadowed)
+
+
+def _listing_is_complete(payload: object, list_key: str, parsed_count: int) -> bool:
+    """True when total_count == raw entries == parsed checks (no truncation, no skips)."""
+    if not isinstance(payload, dict):
+        return False
+    total = payload.get("total_count")
+    raw = payload.get(list_key)
+    if isinstance(total, bool) or not isinstance(total, int) or not isinstance(raw, list):
+        return False
+    return total == len(raw) == parsed_count
+
+
 def _parse_check_runs_payload(payload: object) -> tuple[list[PullRequestCheck], list[str]]:
     """Parse the `commits/{sha}/check-runs` response into `PullRequestCheck`s.
 
@@ -1722,6 +1745,8 @@ def get_pr_checks(
     checks: list[PullRequestCheck] = []
     check_runs_ok = False
     statuses_ok = False
+    check_runs_complete = False
+    statuses_complete = False
 
     if check_runs_result.returncode == 0:
         try:
@@ -1733,6 +1758,7 @@ def get_pr_checks(
             parsed_checks, parse_errors = _parse_check_runs_payload(payload)
             checks.extend(parsed_checks)
             check_errors.extend(parse_errors)
+            check_runs_complete = _listing_is_complete(payload, "check_runs", len(parsed_checks))
     else:
         check_errors.append("check-runs query failed")
 
@@ -1746,6 +1772,7 @@ def get_pr_checks(
             parsed_statuses, parse_errors = _parse_commit_statuses_payload(payload)
             checks.extend(parsed_statuses)
             check_errors.extend(parse_errors)
+            statuses_complete = _listing_is_complete(payload, "statuses", len(parsed_statuses))
     else:
         check_errors.append("commit-status query failed")
 
@@ -1799,6 +1826,8 @@ def get_pr_checks(
         check_query_status=check_query_status,
         check_query_errors=tuple(check_errors),
         infrastructure_stalls=infrastructure_stalls,
+        shadowed=_shadowed_checks(checks),
+        listing_complete=check_runs_complete and statuses_complete,
     )
 
 
