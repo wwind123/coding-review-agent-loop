@@ -768,3 +768,170 @@ def test_single_run_prepares_existing_checkout_without_clone_or_refusal(tmp_path
     assert not any(cmd[:3] == ["gh", "repo", "clone"] for cmd in commands)
     assert any(cmd[:2] == ["git", "fetch"] or cmd[:1] == ["git"] for cmd in commands)
     assert workdir_claims._registry == {}
+
+
+def test_incomplete_holder_metadata_is_reported_unidentified(tmp_path, monkeypatch):
+    monkeypatch.setattr(workdir_claims, "_METADATA_READ_DELAY_SECONDS", 0)
+    proc = start_holder([tmp_path], "issue", "1")
+    try:
+        meta_path = next(claim_root().glob("*.json"))
+        for record in ({"pid": proc.pid, "run_id": "abc"}, {"pid": "x", "run_id": "abc", "repo": "R",
+                       "command": "issue", "target": "issue #1", "started_at": "t"}, ["not", "a", "dict"]):
+            meta_path.write_text(json.dumps(record))
+            with pytest.raises(WorkdirClaimedError) as exc:
+                claim_once(tmp_path)
+            message = str(exc.value)
+            assert "unidentified holder" in message
+            assert str(next(claim_root().glob("*.lock"))) in message
+            assert "None" not in message and "run_id abc" not in message
+    finally:
+        stop(proc)
+
+
+CLI_HOLDER = r"""
+import json, sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[4])
+from agent_loop_helpers import make_config
+from coding_review_agent_loop import cli, workdir_claims as w
+w._set_claim_root_for_tests(Path(sys.argv[1]))
+config = make_config(Path(sys.argv[2]), **json.loads(sys.argv[5]))
+
+def loop(*a, **k):
+    print("held", flush=True)
+    sys.stdin.read()
+    return 0
+
+for name in ("run_issue_loop", "run_pr_loop", "run_task_loop", "run_discuss_loop"):
+    setattr(cli, name, loop)
+cli.config_from_args = lambda *a, **k: config
+cli.establish_sandboxed_run = lambda *a, **k: None
+cli.resolve_base_branch = lambda c, r: c
+cli.ensure_agent_workdirs = lambda c, r: None
+cli.create_managed_pr = lambda *a, **k: SimpleNamespace(pr_number=5, config=config, source_branch=None)
+raise SystemExit(cli.main(json.loads(sys.argv[3])))
+"""
+
+
+def start_cli_holder(tmp_path, argv, env=None, **config_overrides):
+    proc = subprocess.Popen(
+        [sys.executable, "-c", CLI_HOLDER, str(claim_root()), str(tmp_path), json.dumps(argv),
+         os.path.dirname(__file__), json.dumps(config_overrides)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env={**os.environ, **(env or {})},
+    )
+    assert proc.stdout.readline().strip() == "held"
+    return proc
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["issue", "41", "--repo", "OWNER/REPO"], ("issue", 41, "issue #41")),
+    (["pr", "42", "--repo", "OWNER/REPO"], ("pr", 42, "PR #42")),
+    (["discuss", "43", "--repo", "OWNER/REPO"], ("discuss", 43, "discuss #43")),
+    (["task", "do it", "--repo", "OWNER/REPO"], ("task", None, "task")),
+    (CLI_CASES[3][0], ("managed-pr", None, "managed-pr from feat-x")),
+])
+def test_live_cli_holder_metadata_and_contender_refusal(tmp_path, monkeypatch, capsys, argv, expected):
+    """A real cli.main run holds the claims; a second cli.main is refused by name, untouched checkout."""
+    other_tmp = tmp_path / "othertmp"
+    other_tmp.mkdir()
+    (tmp_path / "claude").mkdir()
+    (tmp_path / "claude" / "dirty.txt").write_text("wip")
+    holder = start_cli_holder(tmp_path, argv, env={"TMPDIR": str(other_tmp)})
+    try:
+        records = [json.loads(p.read_text()) for p in claim_root().glob("*.json")]
+        assert len(records) == 2
+        for record in records:
+            assert (record["command"], record["number"], record["target"]) == expected
+            assert record["pid"] == holder.pid
+        assert list(other_tmp.iterdir()) == []
+
+        seen = {}
+        cli = _stub_cli(monkeypatch, make_config(tmp_path), "run_issue_loop", seen)
+        runner = MagicMock()
+        monkeypatch.setattr(cli, "Runner", lambda **kw: runner)
+        assert cli.main(["issue", "7", "--repo", "OWNER/REPO"]) == 1
+        err = capsys.readouterr().err
+        assert f"target {expected[2]}" in err and f"pid {holder.pid}" in err
+        assert seen == {} and runner.method_calls == []
+        assert (tmp_path / "claude" / "dirty.txt").read_text() == "wip"
+        assert [json.loads(p.read_text()) for p in claim_root().glob("*.json")] == records
+    finally:
+        stop(holder)
+
+
+def test_cli_allow_shared_dir_claims_once_and_still_refuses_other_process(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    config = make_config(tmp_path, claude_dir=shared, codex_dir=shared, allow_shared_dir=True,
+                         create_dirs=False)
+    result = {}
+
+    def loop(runner, **kwargs):
+        result["claims"] = len(workdir_claims._registry)
+        code = (
+            "import sys;from pathlib import Path;"
+            "from coding_review_agent_loop import workdir_claims as w;"
+            "w._set_claim_root_for_tests(Path(sys.argv[1]));"
+            "s=w.workdir_claim_scope('task');s.__enter__()\n"
+            "try:\n w.acquire_workdir_claim(Path(sys.argv[2]),agent='codex',repo='R')\n"
+            "except w.WorkdirClaimedError: print('refused')"
+        )
+        result["out"] = subprocess.run(
+            [sys.executable, "-c", code, str(claim_root()), str(shared)],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        return 0
+
+    seen = {}
+    cli = _stub_cli(monkeypatch, config, "run_issue_loop", seen)
+    monkeypatch.setattr(cli, "run_issue_loop", loop)
+    assert cli.main(["issue", "7", "--repo", "OWNER/REPO", "--allow-shared-dir"]) == 0
+    assert result == {"claims": 1, "out": "refused"}
+    assert workdir_claims._registry == {}
+
+
+def test_nested_pr_loop_under_issue_and_task_keeps_outer_identity(tmp_path, monkeypatch):
+    from agent_loop_helpers import FakeRunner
+
+    real_pr_loop = orchestrator.run_pr_loop
+    nested = []
+
+    def spy(*args, **kwargs):
+        owner = workdir_claims.current_claim_owner()
+        nested.append((owner.command, owner.number, owner.target, len(workdir_claims._registry)))
+        return real_pr_loop(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "run_pr_loop", spy)
+    runner = FakeRunner(
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(tmp_path, test_command=("pytest", "x"), pre_review_tests=False)
+    assert orchestrator.run_issue_loop(runner, issue_number=56, config=config) == 0
+    assert nested and all(item == ("issue", 56, "issue #56", 2) for item in nested)
+    assert workdir_claims._registry == {}
+
+
+def test_managed_pr_handoff_reaches_real_pr_loop_with_outer_identity(tmp_path, monkeypatch):
+    from agent_loop_helpers import FakeRunner
+
+    seen = {}
+    identities = []
+
+    class Observing(FakeRunner):
+        def run(self, *args, **kwargs):
+            owner = workdir_claims.current_claim_owner()
+            identities.append((owner.command, owner.number, owner.target, len(workdir_claims._registry)))
+            return super().run(*args, **kwargs)
+
+    config = make_config(tmp_path, coder="claude", reviewer="codex", agent_memory=False)
+    cli = _stub_cli(monkeypatch, config, "run_task_loop", seen)
+    monkeypatch.setattr(
+        cli, "Runner", lambda **kw: Observing(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    )
+    assert cli.main(CLI_CASES[3][0]) == 0
+    assert identities and all(i == ("managed-pr", None, "managed-pr from feat-x", 2) for i in identities)
+    assert seen.get("prepared") is True  # managed-pr preparation ran under the claim
+    assert workdir_claims._registry == {}
