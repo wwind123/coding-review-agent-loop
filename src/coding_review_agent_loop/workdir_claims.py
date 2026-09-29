@@ -83,12 +83,32 @@ def _claim_key(path: Path) -> str:
     return hashlib.sha256(os.path.realpath(path).encode("utf-8")).hexdigest()
 
 
+_NUMBERED_LABELS = {"issue": "issue", "pr": "PR", "discuss": "discuss"}
+_UNNUMBERED_COMMANDS = {"task", "managed-pr", "library"}
+
+
 def _target_for(command: str, number: int | None, head: str | None) -> str:
-    if command in {"issue", "pr", "discuss"} and number is not None:
-        label = {"issue": "issue", "pr": "PR", "discuss": "discuss"}[command]
-        return f"{label} #{number}"
+    """Validate an owner identity and render its target.
+
+    Numbered modes require a positive number; task, managed-pr and library
+    require none; only managed-pr takes a head branch.
+    """
+    if command in _NUMBERED_LABELS:
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise AgentLoopError(f"workdir claim scope for {command!r} requires a positive number.")
+    elif command in _UNNUMBERED_COMMANDS:
+        if number is not None:
+            raise AgentLoopError(f"workdir claim scope for {command!r} must not carry a number.")
+    else:
+        raise AgentLoopError(f"workdir claim scope has unknown command {command!r}.")
     if command == "managed-pr":
-        return f"managed-pr from {head}" if head else "managed-pr"
+        if not isinstance(head, str) or not head.strip():
+            raise AgentLoopError("workdir claim scope for 'managed-pr' requires a head branch.")
+        return f"managed-pr from {head}"
+    if head is not None:
+        raise AgentLoopError(f"workdir claim scope for {command!r} must not carry a head branch.")
+    if command in _NUMBERED_LABELS:
+        return f"{_NUMBERED_LABELS[command]} #{number}"
     return command
 
 
