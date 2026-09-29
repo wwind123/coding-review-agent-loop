@@ -15077,6 +15077,36 @@ def test_issue_edit_retires_the_stalled_streak(tmp_path):
     assert not any(r.scheduler_stall_reset for r in _plan_round_records(rerun))
 
 
+def test_issue_edit_with_blocking_primary_opens_no_panel(tmp_path):
+    """`edit-retires-streak`: retirement itself never opens the panel."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    _fresh, base = _m1103_fresh_base()
+    _codex, _claude, base = _m1103_blocking_chain(1, 2, base=base)
+    codex, claude, _base = _m1103_blocking_chain(3, 4, base=base)
+
+    rerun = _FakeRunner(
+        issue_comments=list(history),
+        issue_payload={"body": "Narrowed issue body with explicit non-goals."},
+        codex_outputs=codex,
+        claude_outputs=claude,
+    )
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    # Two new blocking rounds ran under the new text, then the stop re-tripped.
+    assert _m1103_agent_calls(rerun) == ["codex", "claude", "codex", "claude"]
+    records = _plan_round_records(rerun)
+    assert not any(r.scheduler_force_full for r in records)
+    assert not any(r.scheduler_stall_reset for r in records)
+    assert not any(
+        r.scheduler_phase in {"secondary-audit", "remediation", "final-secondary-sweep", "full-board"}
+        for r in records
+    )
+    assert not any(
+        r.role == "reviewer" and r.agent != "Codex" for r in records
+    )
+
+
 def test_unchanged_issue_with_new_comment_still_stops(tmp_path):
     """`unchanged-rerun-stops`."""
     runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
@@ -15242,6 +15272,28 @@ def test_absent_digest_counts_and_is_flagged_legacy():
         records, primary="Codex", current_issue_digest="c" * 16
     )
     assert detail.count == 2 and detail.legacy_undigested
+
+
+def test_mixed_history_flags_legacy_only_when_the_newest_round_is_undigested():
+    """An edit ends the streak at a newer digested round; no reset is needed."""
+    detail = orchestrator_module.plan_primary_blocking_streak_detail
+    old = _m1103_rounds("blocking", "blocking")
+    records = list(old)
+    records.append(_m1112_digest_record(len(records), 3, "a" * 16))
+    records.append(_m1103_review(len(records), 3, "blocking"))
+    unchanged = detail(records, primary="Codex", current_issue_digest="a" * 16)
+    assert unchanged.count == 3 and not unchanged.legacy_undigested
+    edited = detail(records, primary="Codex", current_issue_digest="b" * 16)
+    assert edited.count == 0
+    # Newest counted round undigested: an edit cannot retire it.
+    newest_legacy = [
+        _m1112_digest_record(0, 1, "a" * 16),
+        _m1103_review(1, 1, "blocking"),
+        _m1103_checkpoint(2, 2),
+        _m1103_review(3, 2, "blocking"),
+    ]
+    flagged = detail(newest_legacy, primary="Codex", current_issue_digest="b" * 16)
+    assert flagged.count == 1 and flagged.legacy_undigested
 
 
 def test_reset_checkpoint_is_a_boundary_with_or_without_a_review():

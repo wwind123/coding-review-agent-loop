@@ -19049,7 +19049,10 @@ def plan_primary_blocking_streak_detail(
     (that review judged other issue text) ends the streak before it counts, and
     a checkpoint carrying the operator reset marker ends it after counting that
     round's own review, or immediately when its review never completed.
-    Rounds with no recorded digest count, and are reported as legacy.
+    Rounds with no recorded digest count.  ``legacy_undigested`` is set only
+    when the newest counted round has none, since an issue edit ends the
+    streak at the newest digested round and cannot reach undigested ones
+    behind it.
 
     Counts, newest round first, the rounds whose primary review ended
     ``blocking`` and follows a valid ``primary``-phase scheduler checkpoint of
@@ -19133,9 +19136,12 @@ def plan_primary_blocking_streak_detail(
             and recorded_digest != current_issue_digest
         ):
             break
-        streak += 1
-        if recorded_digest is None:
+        # An edit changes the current digest and ends the streak at the newest
+        # digested round, so only an undigested *newest* counted round is out
+        # of an edit's reach.
+        if streak == 0 and recorded_digest is None:
             legacy_undigested = True
+        streak += 1
         if has_reset(round_checkpoints):
             break
     return PlanPrimaryStreak(count=streak, legacy_undigested=legacy_undigested)
