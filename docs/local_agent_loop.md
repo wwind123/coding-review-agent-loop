@@ -2903,9 +2903,11 @@ unchanged. The panel is never convened automatically. To continue:
 Retiring the streak does not discard the stalled plan: the next round is the
 primary review of the current candidate, which the planner then revises against
 the narrowed issue. Rounds recorded before issue-text tracking carry no digest
-and keep counting, so an edit cannot retire them; the diagnostic says the
-counted rounds predate issue-text tracking and `--plan-reset-stall-streak` is
-required. Rounds under new issue text accumulate normally and re-trip the stop.
+and keep counting, so an edit cannot retire them; when the newest undigested
+rounds by themselves reach the threshold, the diagnostic says they
+predate issue-text tracking and `--plan-reset-stall-streak` is required. When older
+digested rounds supply the rest of the streak, an edit still clears the stop
+and the diagnostic does not claim otherwise. Rounds under new issue text accumulate normally and re-trip the stop.
 
 Because the count is recomputed from durable records, rerunning with unchanged
 flags and unchanged issue text stops again at the same point before any agent

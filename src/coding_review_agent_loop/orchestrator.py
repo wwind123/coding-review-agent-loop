@@ -13406,7 +13406,9 @@ def _run_plan_first_loop(
                                 streak=plan_primary_streak.count,
                                 threshold=config.plan_primary_stall_rounds,
                                 plan_chars=len(current_plan),
-                                legacy_undigested=plan_primary_streak.legacy_undigested,
+                                legacy_undigested=plan_primary_streak.edit_cannot_clear(
+                                    config.plan_primary_stall_rounds
+                                ),
                             ),
                             round_number=round_number,
                         )
@@ -18994,10 +18996,21 @@ def _classify_staged_plan_history(
 
 @dataclass(frozen=True)
 class PlanPrimaryStreak:
-    """Stall streak plus whether any counted round lacked an issue digest."""
+    """Stall streak plus the newest counted rounds that lack an issue digest."""
 
     count: int
-    legacy_undigested: bool = False
+    # Newest consecutive counted rounds with no recorded issue digest: an
+    # issue edit ends the streak at the first digested round, so this is the
+    # count an edit leaves behind.
+    undigested_prefix: int = 0
+
+    @property
+    def legacy_undigested(self) -> bool:
+        return self.undigested_prefix > 0
+
+    def edit_cannot_clear(self, threshold: int) -> bool:
+        """Whether the undigested rounds alone keep the stop tripped after an edit."""
+        return threshold > 0 and self.undigested_prefix >= threshold
 
 
 def plan_issue_text_digest(issue_context: IssueContext) -> str:
@@ -19049,10 +19062,10 @@ def plan_primary_blocking_streak_detail(
     (that review judged other issue text) ends the streak before it counts, and
     a checkpoint carrying the operator reset marker ends it after counting that
     round's own review, or immediately when its review never completed.
-    Rounds with no recorded digest count.  ``legacy_undigested`` is set only
-    when the newest counted round has none, since an issue edit ends the
-    streak at the newest digested round and cannot reach undigested ones
-    behind it.
+    Rounds with no recorded digest count.  ``undigested_prefix`` counts the
+    newest consecutive counted rounds with none: an issue edit ends the streak
+    at the newest digested round, so those rounds are exactly what an edit
+    leaves counting.
 
     Counts, newest round first, the rounds whose primary review ended
     ``blocking`` and follows a valid ``primary``-phase scheduler checkpoint of
@@ -19105,7 +19118,7 @@ def plan_primary_blocking_streak_detail(
         )
 
     streak = 0
-    legacy_undigested = False
+    undigested_prefix = 0
     for number in sorted(set(checkpoints) | set(reviews), reverse=True):
         review = reviews.get(number)
         round_checkpoints = checkpoints.get(number, [])
@@ -19137,14 +19150,14 @@ def plan_primary_blocking_streak_detail(
         ):
             break
         # An edit changes the current digest and ends the streak at the newest
-        # digested round, so only an undigested *newest* counted round is out
-        # of an edit's reach.
-        if streak == 0 and recorded_digest is None:
-            legacy_undigested = True
+        # digested round, so only the undigested *newest* counted rounds are
+        # out of an edit's reach.
+        if recorded_digest is None and undigested_prefix == streak:
+            undigested_prefix += 1
         streak += 1
         if has_reset(round_checkpoints):
             break
-    return PlanPrimaryStreak(count=streak, legacy_undigested=legacy_undigested)
+    return PlanPrimaryStreak(count=streak, undigested_prefix=undigested_prefix)
 
 
 def plan_primary_stall_message(
@@ -19156,8 +19169,9 @@ def plan_primary_stall_message(
 ) -> str:
     """Operator diagnostic for the primary-phase stall stop (#1103, #1112)."""
     legacy_note = (
-        " The counted rounds predate issue-text tracking, so editing the issue "
-        "cannot retire them and --plan-reset-stall-streak is required."
+        " The newest counted rounds predate issue-text tracking and by themselves "
+        "reach the threshold, so editing the issue cannot retire them or clear "
+        "this stop and --plan-reset-stall-streak is required."
         if legacy_undigested
         else ""
     )

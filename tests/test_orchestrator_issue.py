@@ -15294,6 +15294,61 @@ def test_mixed_history_flags_legacy_only_when_the_newest_round_is_undigested():
     ]
     flagged = detail(newest_legacy, primary="Codex", current_issue_digest="b" * 16)
     assert flagged.count == 1 and flagged.legacy_undigested
+    assert flagged.undigested_prefix == 1
+
+
+def test_mixed_history_warns_only_when_undigested_rounds_alone_reach_threshold():
+    """Older digested round then a newer undigested one: an edit still clears."""
+    detail = orchestrator_module.plan_primary_blocking_streak_detail
+    message = orchestrator_module.plan_primary_stall_message
+    threshold = 2
+    records = [
+        _m1112_digest_record(0, 1, "a" * 16),
+        _m1103_review(1, 1, "blocking"),
+        _m1103_checkpoint(2, 2),
+        _m1103_review(3, 2, "blocking"),
+    ]
+    tripped = detail(records, primary="Codex", current_issue_digest="a" * 16)
+    assert tripped.count == threshold
+    assert tripped.undigested_prefix == 1
+    assert not tripped.edit_cannot_clear(threshold)
+    text = message(
+        streak=tripped.count,
+        threshold=threshold,
+        plan_chars=1,
+        legacy_undigested=tripped.edit_cannot_clear(threshold),
+    )
+    assert "predate issue-text tracking" not in text
+    assert "edit the issue title or body" in text
+    # The advertised edit really clears the stop: only the undigested round
+    # is left counting, below the threshold.
+    edited = detail(records, primary="Codex", current_issue_digest="b" * 16)
+    assert edited.count == 1 < threshold
+
+    # Two undigested newest rounds alone reach the threshold: an edit leaves
+    # the stop tripped, so the diagnostic must require the reset flag.
+    legacy_heavy = [
+        _m1112_digest_record(0, 1, "a" * 16),
+        _m1103_review(1, 1, "blocking"),
+        _m1103_checkpoint(2, 2),
+        _m1103_review(3, 2, "blocking"),
+        _m1103_checkpoint(4, 3),
+        _m1103_review(5, 3, "blocking"),
+    ]
+    heavy = detail(legacy_heavy, primary="Codex", current_issue_digest="a" * 16)
+    assert heavy.count == 3 and heavy.undigested_prefix == 2
+    assert heavy.edit_cannot_clear(threshold)
+    assert not heavy.edit_cannot_clear(3)
+    edited_heavy = detail(legacy_heavy, primary="Codex", current_issue_digest="b" * 16)
+    assert edited_heavy.count == 2 >= threshold
+    heavy_text = message(
+        streak=heavy.count,
+        threshold=threshold,
+        plan_chars=1,
+        legacy_undigested=heavy.edit_cannot_clear(threshold),
+    )
+    assert "predate issue-text tracking" in heavy_text
+    assert "--plan-reset-stall-streak is required" in heavy_text
 
 
 def test_reset_checkpoint_is_a_boundary_with_or_without_a_review():
