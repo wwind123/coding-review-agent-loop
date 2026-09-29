@@ -187,6 +187,10 @@ class AgentLoopConfig:
     # primary-then-panel run stops instead of re-invoking the primary.  0
     # disables the stop.
     plan_primary_stall_rounds: int = DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
+    # One-shot operator retirement of the stall streak (#1112): the run's first
+    # primary-phase checkpoint is stamped as a durable streak boundary.  Never
+    # inherited by child planning, isolated providers, or recovery commands.
+    plan_reset_stall_streak: bool = False
     # Plan-growth gate (#886): structural thresholds above which a one-shot
     # plan needs a reviewed justification or a staged restructure.
     plan_growth_gate: str = "enforce"
@@ -581,6 +585,10 @@ class AgentLoopConfig:
         if self.plan_review_force_full and self.plan_review_policy != "primary-then-panel":
             raise AgentLoopError(
                 "--plan-review-force-full requires --plan-review-policy primary-then-panel."
+            )
+        if self.plan_reset_stall_streak and self.plan_review_policy != "primary-then-panel":
+            raise AgentLoopError(
+                "--plan-reset-stall-streak requires --plan-review-policy primary-then-panel."
             )
         stall_rounds = self.plan_primary_stall_rounds
         if (
@@ -1702,6 +1710,7 @@ def config_from_args(
         plan_primary_stall_rounds=_arg_or_default(
             args, "plan_primary_stall_rounds", DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
         ),
+        plan_reset_stall_streak=bool(getattr(args, "plan_reset_stall_streak", False)),
         plan_growth_gate=getattr(args, "plan_growth_gate", None) or "enforce",
         plan_growth_max_chars=_arg_or_default(args, "plan_growth_max_chars", 120_000),
         plan_growth_max_revisions=_arg_or_default(args, "plan_growth_max_revisions", 6),

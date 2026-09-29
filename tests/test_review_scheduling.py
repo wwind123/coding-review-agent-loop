@@ -1698,3 +1698,18 @@ def test_plan_review_policy_validates_independently_of_the_pr_policy(tmp_path):
     assert default.plan_review_policy == "all-reviewers"
     assert default.primary_plan_reviewer is None
     assert default.plan_review_force_full is False
+
+
+def test_plan_reset_stall_streak_requires_primary_then_panel(tmp_path):
+    """`config-and-inheritance` (#1112)."""
+    with pytest.raises(AgentLoopError, match="--plan-reset-stall-streak requires"):
+        make_config(tmp_path, reviewer=("codex", "gemini"), plan_reset_stall_streak=True)
+    assert make_config(tmp_path, reviewer=("codex", "gemini")).plan_reset_stall_streak is False
+    ok = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+        plan_reset_stall_streak=True,
+    )
+    assert ok.plan_reset_stall_streak is True

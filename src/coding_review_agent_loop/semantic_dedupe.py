@@ -219,6 +219,7 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
             "plan_review_policy": "all-reviewers",
             "primary_plan_reviewer": None,
             "plan_review_force_full": False,
+            "plan_reset_stall_streak": False,
             "plan_primary_stall_rounds": DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
         }
         if backend == "claude":

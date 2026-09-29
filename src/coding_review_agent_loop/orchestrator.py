@@ -7639,7 +7639,14 @@ def _run_child_planning_cycle(
         config,
         plan_execution_mode="auto",
         plan_review_force_full=False,
+        plan_reset_stall_streak=False,
     )
+    if config.plan_reset_stall_streak:
+        log(
+            config,
+            f"Issue #{parent_issue}: child #{child_issue_number} plan review does not "
+            "inherit --plan-reset-stall-streak",
+        )
     if config.plan_review_force_full:
         log(
             config,
@@ -12435,6 +12442,8 @@ def _run_plan_first_loop(
         plan_scheduler_contract.primary_reviewer if plan_scheduler_contract is not None else None
     )
     plan_operator_force_full = bool(config.plan_review_force_full)
+    plan_issue_digest = plan_issue_text_digest(issue_context)
+    plan_reset_checkpoint_written = False
     plan_automatic_force_full = False
     plan_scheduler_calls_avoided = 0
     plan_phase_advance_pending = False
@@ -13349,8 +13358,20 @@ def _run_plan_first_loop(
                 # A contradictory persisted key can supply neither an approval
                 # nor a panel opening.
                 plan_qualifying_approvals = ()
+            plan_reset_round = (
+                config.plan_reset_stall_streak
+                and not plan_reset_checkpoint_written
+                and plan_scheduler_contract is not None
+            )
+            if plan_reset_round and config.plan_primary_stall_rounds > 0:
+                log(
+                    config,
+                    f"Planning round {round_number}: stall streak reset by operator "
+                    "(--plan-reset-stall-streak)",
+                )
             if (
                 config.plan_primary_stall_rounds > 0
+                and not plan_reset_round
                 and plan_primary_name is not None
                 and not plan_panel_evidence.opened
                 and not plan_operator_force_full
@@ -13370,20 +13391,22 @@ def _run_plan_first_loop(
                         f"planning history ({plan_history_class})",
                     )
                 else:
-                    plan_primary_streak = plan_primary_blocking_streak(
+                    plan_primary_streak = plan_primary_blocking_streak_detail(
                         plan_records,
                         primary=plan_primary_name,
                         panel_opening_index=plan_panel_evidence.opening_index,
+                        current_issue_digest=plan_issue_digest,
                     )
-                    if plan_primary_streak >= config.plan_primary_stall_rounds:
+                    if plan_primary_streak.count >= config.plan_primary_stall_rounds:
                         # Before the prelaunch checkpoint and every agent turn,
                         # so the stop writes no record a resume could read as
                         # a checkpoint, an approval, or a panel opening.
                         stop_plan_pre_panel(
                             plan_primary_stall_message(
-                                streak=plan_primary_streak,
+                                streak=plan_primary_streak.count,
                                 threshold=config.plan_primary_stall_rounds,
                                 plan_chars=len(current_plan),
+                                legacy_undigested=plan_primary_streak.legacy_undigested,
                             ),
                             round_number=round_number,
                         )
@@ -13530,10 +13553,20 @@ def _run_plan_first_loop(
                         scheduler_plan_previous_key=(
                             plan_previous_key.as_dict() if plan_previous_key is not None else None
                         ),
+                        scheduler_issue_digest=(
+                            plan_issue_digest
+                            if plan_scheduler_decision.phase == "primary"
+                            else None
+                        ),
+                        scheduler_stall_reset=(
+                            plan_reset_round and plan_scheduler_decision.phase == "primary"
+                        ),
                         **_architecture_metadata_fields(config),
                     ),
                 ),
             )
+            if plan_reset_round and plan_scheduler_decision.phase == "primary":
+                plan_reset_checkpoint_written = True
         use_compact_context = (
             config.planning_context_mode == "compact"
             and round_number >= 2
@@ -18959,13 +18992,64 @@ def _classify_staged_plan_history(
     )
 
 
+@dataclass(frozen=True)
+class PlanPrimaryStreak:
+    """Stall streak plus whether any counted round lacked an issue digest."""
+
+    count: int
+    legacy_undigested: bool = False
+
+
+def plan_issue_text_digest(issue_context: IssueContext) -> str:
+    """16-hex digest of the normalized issue title and body (#1112).
+
+    Comments are deliberately excluded: loop-posted comments share the
+    operator's account, so a comment cannot be trusted as operator intent.
+    """
+
+    def normalize(text: str | None) -> str:
+        return "\n".join(
+            line.rstrip() for line in (text or "").replace("\r\n", "\n").split("\n")
+        )
+
+    payload = json.dumps(
+        [normalize(issue_context.title), normalize(issue_context.body)],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def plan_primary_blocking_streak(
     records: Sequence[PostedRoundRecord],
     *,
     primary: str,
     panel_opening_index: int | None = None,
+    current_issue_digest: str | None = None,
 ) -> int:
+    """Integer form of :func:`plan_primary_blocking_streak_detail`."""
+    return plan_primary_blocking_streak_detail(
+        records,
+        primary=primary,
+        panel_opening_index=panel_opening_index,
+        current_issue_digest=current_issue_digest,
+    ).count
+
+
+def plan_primary_blocking_streak_detail(
+    records: Sequence[PostedRoundRecord],
+    *,
+    primary: str,
+    panel_opening_index: int | None = None,
+    current_issue_digest: str | None = None,
+) -> PlanPrimaryStreak:
     """Consecutive completed blocking primary plan reviews (#1103).
+
+    Two further boundaries retire older rounds (#1112): a round whose
+    checkpoint recorded a different issue digest than ``current_issue_digest``
+    (that review judged other issue text) ends the streak before it counts, and
+    a checkpoint carrying the operator reset marker ends it after counting that
+    round's own review, or immediately when its review never completed.
+    Rounds with no recorded digest count, and are reported as legacy.
 
     Counts, newest round first, the rounds whose primary review ended
     ``blocking`` and follows a valid ``primary``-phase scheduler checkpoint of
@@ -19011,7 +19095,14 @@ def plan_primary_blocking_streak(
             and checkpoint.metadata.scheduler_phase == "primary"
         )
 
+    def has_reset(round_checkpoints: list[PostedRoundRecord]) -> bool:
+        return any(
+            usable_primary_checkpoint(record) and record.metadata.scheduler_stall_reset
+            for record in round_checkpoints
+        )
+
     streak = 0
+    legacy_undigested = False
     for number in sorted(set(checkpoints) | set(reviews), reverse=True):
         review = reviews.get(number)
         round_checkpoints = checkpoints.get(number, [])
@@ -19019,6 +19110,8 @@ def plan_primary_blocking_streak(
             if usable_primary_checkpoint(
                 round_checkpoints[-1] if round_checkpoints else None
             ):
+                if has_reset(round_checkpoints):
+                    break
                 continue
             break
         if panel_opening_index is not None and review.index >= panel_opening_index:
@@ -19033,24 +19126,50 @@ def plan_primary_blocking_streak(
         )
         if not usable_primary_checkpoint(checkpoint) or review.metadata.state != "blocking":
             break
+        recorded_digest = checkpoint.metadata.scheduler_issue_digest
+        if (
+            recorded_digest is not None
+            and current_issue_digest is not None
+            and recorded_digest != current_issue_digest
+        ):
+            break
         streak += 1
-    return streak
+        if recorded_digest is None:
+            legacy_undigested = True
+        if has_reset(round_checkpoints):
+            break
+    return PlanPrimaryStreak(count=streak, legacy_undigested=legacy_undigested)
 
 
 def plan_primary_stall_message(
-    *, streak: int, threshold: int, plan_chars: int
+    *,
+    streak: int,
+    threshold: int,
+    plan_chars: int,
+    legacy_undigested: bool = False,
 ) -> str:
-    """Operator diagnostic for the primary-phase stall stop (#1103)."""
+    """Operator diagnostic for the primary-phase stall stop (#1103, #1112)."""
+    legacy_note = (
+        " The counted rounds predate issue-text tracking, so editing the issue "
+        "cannot retire them and --plan-reset-stall-streak is required."
+        if legacy_undigested
+        else ""
+    )
     return (
         f"the primary plan reviewer has blocked {streak} consecutive primary-phase "
         f"planning round(s) with no exact-plan primary approval, reaching "
         f"--plan-primary-stall-rounds {threshold} (current canonical plan: "
         f"{plan_chars} characters). The secondary plan panel was not convened, "
         "because it opens only after an exact-plan primary approval; no reviewer and "
-        "no planner turn were invoked. To continue, rerun with "
-        "--plan-review-force-full to authorize the complete plan board, raise "
-        "--plan-primary-stall-rounds (or pass 0 to disable this stop), or narrow the "
-        "issue."
+        "no planner turn were invoked. To continue: edit the issue title or body "
+        "to narrow it (rounds reviewed against earlier issue text stop counting; a "
+        "comment alone does not change the issue text and does not clear this stop); "
+        "rerun with --plan-reset-stall-streak to retire the counted rounds, for "
+        "example after narrowing the issue by comment; rerun with "
+        "--plan-review-force-full to authorize the complete plan board; or raise "
+        "--plan-primary-stall-rounds (or pass 0 to disable this stop). Retiring the "
+        "streak resumes with the primary review of the current candidate plan, which "
+        "the planner then revises against the narrowed issue." + legacy_note
     )
 
 

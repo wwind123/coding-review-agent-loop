@@ -577,7 +577,12 @@ phase-advance record, or a panel opening ends the count, and a round with no
 completed primary review is skipped. At the threshold the run stops with a
 plain diagnostic before the prelaunch checkpoint. The stop is suppressed while
 planning history is degraded, writes no scheduler record, and never opens the
-panel. `--plan-review-force-full` stays the only way to convene the panel
+panel. Two optional planning-only checkpoint fields retire the streak (#1112):
+`scheduler_issue_digest` (issue title/body digest; a differing digest ends the
+count, an absent one counts as legacy) and `scheduler_stall_reset` (set by the
+one-shot `--plan-reset-stall-streak` on the invocation's first primary
+checkpoint; a durable boundary even without a completed review). Both are omitted
+when unset and invalid on PR-flow records. `--plan-review-force-full` stays the only way to convene the panel
 without an exact-plan primary approval.
 
 Planning scheduler metadata is a flow-discriminated branch of the same durable

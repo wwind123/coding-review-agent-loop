@@ -529,9 +529,14 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
         "--primary-plan-reviewer",
         "--plan-review-force-full",
         "--plan-primary-stall-rounds",
+        "--plan-reset-stall-streak",
     ):
         assert flag in text
         assert flag in readme
+    # #1112: edit-based retirement, the comment-only limit, legacy rounds.
+    assert "edit the issue title or body" in text
+    assert "comment alone does not" in text
+    assert "predate issue-text tracking" in text
     # #1103: the stall stop, its upgrade note, and the contract identity.
     assert "#### Primary-phase stall stop" in text
     assert "**Upgrade note:**" in text
@@ -539,6 +544,8 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     architecture = (root / "ARCHITECTURE.md").read_text()
     assert "primary-phase stall stop" in architecture
     assert "--plan-primary-stall-rounds" in architecture
+    assert "scheduler_issue_digest" in architecture
+    assert "scheduler_stall_reset" in architecture
     for phase in (
         "`primary`",
         "`secondary-audit`",
