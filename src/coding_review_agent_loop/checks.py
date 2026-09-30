@@ -8,7 +8,7 @@ from .github import PullRequestChecks
 from .logging import log
 from .errors import AgentLoopError
 from .runner import Runner
-from .test_runtime import launch_integrity_state, record_launcher_health, record_test_observation
+from .test_runtime import launch_integrity_state, launch_state_fields, record_launcher_health, record_test_observation
 from .workdirs import active_workdir
 
 
@@ -85,6 +85,7 @@ def _record_gate_observation(config: AgentLoopConfig, result) -> None:
         # A gate run whose suite start was not verified (e.g. a shell
         # wrapper) is recorded only as non-evidence (#989).
         launch_integrity=launch_integrity_state(result, wrapper_boundary=False),
+        launch_state=launch_state_fields(result),
     )
 
 

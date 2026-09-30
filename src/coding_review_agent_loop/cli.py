@@ -8,7 +8,7 @@ import contextlib
 import os
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "inspect":
     # The sandboxed inspect grant runs `python -I -m coding_review_agent_loop.cli
@@ -94,6 +94,7 @@ from .test_runtime import (
     TestRuntimeConfigurationError,
     inherited_timeout_ceiling,
     launch_integrity_state,
+    launch_state_fields,
     record_launcher_health,
     record_test_observation,
     resolve_timeout_seconds,
@@ -1574,6 +1575,7 @@ def _record_run_tests_result(
     worker_enforcement: str | None,
     caveats: Sequence[str],
     launch_integrity: str,
+    launch_state: Mapping[str, str],
 ) -> None:
     record_test_observation(
         args.memory_dir,
@@ -1591,6 +1593,7 @@ def _record_run_tests_result(
         worker_enforcement=worker_enforcement,
         caveats=caveats,
         launch_integrity=launch_integrity,
+        launch_state=launch_state,
     )
 
 
@@ -1705,6 +1708,7 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                         # A launch the evidence gate refuses stays non-evidence
                         # here too, so it is never recommended back (#989).
                         launch_integrity=launch_integrity_state(broker_result),
+                        launch_state=launch_state_fields(broker_result),
                     )
                 return int(broker_result.returncode if broker_result.returncode is not None else 1)
         else:
@@ -1789,6 +1793,7 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                 worker_enforcement=result.worker_enforcement,
                 caveats=result.worker_caveats,
                 launch_integrity=launch_integrity_state(result),
+                launch_state=launch_state_fields(result),
             )
         return int(result.returncode if result.returncode is not None else 1)
     except (AgentLoopError, OSError, ValueError) as exc:

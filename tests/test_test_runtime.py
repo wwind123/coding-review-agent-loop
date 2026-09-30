@@ -2368,3 +2368,132 @@ def test_cli_off_mode_labels_only_proven_serial(worker_cli, tmp_path):
     }
     assert labels == {"-n 2": "unknown", "-p no:xdist": "serial"}
     assert {row["worker_enforcement"] for row in runtime.load_runtime_memory(memory)} == {"off"}
+
+
+# --- #1110: persist the launch triple beside the derived verdict ---------------
+
+_TRIPLE_KEYS = ("wrapper_bootstrap", "inner_exec", "suite_start")
+
+
+def _triple_row(memory: Path, tmp_path: Path, **kwargs) -> dict:
+    assert runtime.record_test_observation(
+        memory, argv=[sys.executable, "-m", "pytest", "-q"], cwd=tmp_path, outcome="passed",
+        elapsed_seconds=1, attempted_timeout_seconds=1800, policy_ceiling_seconds=1800,
+        timestamp=_now(), **kwargs,
+    )
+    return runtime.load_runtime_memory(memory)[-1]
+
+
+def test_record_persists_launch_triple_verbatim(tmp_path):
+    row = _triple_row(
+        tmp_path / "memory", tmp_path, launch_integrity="unverified",
+        launch_state={"wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "unknown"},
+    )
+    assert (row["wrapper_bootstrap"], row["inner_exec"], row["suite_start"]) == ("verified", "started", "unknown")
+    assert row["launch_integrity"] == "unverified"
+
+
+def test_record_coerces_out_of_vocabulary_triple_to_fail_closed_defaults(tmp_path):
+    row = _triple_row(
+        tmp_path / "memory", tmp_path, launch_integrity="verified",
+        launch_state={"wrapper_bootstrap": "bogus", "inner_exec": 7, "suite_start": "verified"},
+    )
+    assert (row["wrapper_bootstrap"], row["inner_exec"], row["suite_start"]) == ("unknown", "not-attempted", "verified")
+
+
+def test_record_without_launch_state_still_writes_fail_closed_triple(tmp_path):
+    row = _triple_row(tmp_path / "memory", tmp_path, launch_integrity="verified")
+    assert (row["wrapper_bootstrap"], row["inner_exec"], row["suite_start"]) == ("unknown", "not-attempted", "not-started")
+    partial = _triple_row(tmp_path / "memory2", tmp_path, launch_state={"suite_start": "verified"})
+    assert (partial["wrapper_bootstrap"], partial["inner_exec"], partial["suite_start"]) == ("unknown", "not-attempted", "verified")
+
+
+def test_launch_state_fields_reads_result_and_fails_closed():
+    from types import SimpleNamespace
+
+    verified = SimpleNamespace(wrapper_bootstrap="verified", inner_exec="started", suite_start="verified")
+    assert runtime.launch_state_fields(verified) == {
+        "wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "verified",
+    }
+    degraded = SimpleNamespace(wrapper_bootstrap="failed", inner_exec="failed", suite_start="junk")
+    assert runtime.launch_state_fields(degraded) == {
+        "wrapper_bootstrap": "failed", "inner_exec": "failed", "suite_start": "not-started",
+    }
+    assert runtime.launch_state_fields(object()) == {
+        "wrapper_bootstrap": "unknown", "inner_exec": "not-attempted", "suite_start": "not-started",
+    }
+
+
+def test_verified_triple_without_launch_integrity_is_not_evidence(tmp_path):
+    row = {"wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "verified"}
+    assert not runtime.runtime_row_is_evidence(row)
+
+
+def test_existing_rows_are_not_rewritten_when_a_new_row_is_recorded(tmp_path):
+    memory = tmp_path / "memory"
+    legacy = [sys.executable, "-m", "pytest", "legacy", "-q"]
+    _record(memory, tmp_path, legacy, outcome="passed", elapsed=5)
+    before = runtime.load_runtime_memory(memory)[0]
+    _triple_row(memory, tmp_path, launch_integrity="verified")
+    rows = runtime.load_runtime_memory(memory)
+    old = next(r for r in rows if r["normalized_command"] == before["normalized_command"])
+    assert old == before
+
+
+def test_local_run_tests_path_persists_triple(tmp_path, monkeypatch):
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "AGENT_LOOP_TEST_BROKER_ENDPOINT", "AGENT_LOOP_TEST_BROKER_CAPABILITY", "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert main([
+        "run-tests", "--timeout-seconds", "5", "--memory-dir", str(memory), "--", sys.executable, "-c", "pass",
+    ]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert all(key in row for key in _TRIPLE_KEYS)
+    assert row["inner_exec"] == "started"
+
+
+def test_broker_run_tests_path_persists_triple(tmp_path, monkeypatch):
+    import coding_review_agent_loop.cli as cli_module
+    from coding_review_agent_loop.local_test_evidence import BrokerRunResult
+
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+
+    class FakeBroker:
+        def run(self, *args, **kwargs):
+            return BrokerRunResult(
+                receipt_id="r1", execution_ref=None, outcome="passed", returncode=0, elapsed_seconds=1.0,
+                wrapper_bootstrap="verified", inner_exec="started", suite_start="unknown",
+            )
+
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker())
+    assert main([
+        "run-tests", "--timeout-seconds", "5", "--memory-dir", str(memory), "--", sys.executable, "-c", "pass",
+    ]) == 0
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert (row["wrapper_bootstrap"], row["inner_exec"], row["suite_start"]) == ("verified", "started", "unknown")
+    assert row["launch_integrity"] == "unverified"
+
+
+def test_gate_path_persists_triple(tmp_path):
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop.checks import _record_gate_observation
+
+    memory = tmp_path / "memory"
+    config = SimpleNamespace(
+        dry_run=False, agent_memory=True, agent_memory_dir=memory, repo="owner/repo",
+        coder_test_command_timeout_seconds=1800,
+    )
+    result = SimpleNamespace(
+        cwd=tmp_path, args=[sys.executable, "-m", "pytest"], outcome="passed", inner_exec="started",
+        suite_start="verified", diagnostic="", output_tail="", elapsed_seconds=0.2, returncode=0,
+        containment=None, overlap_rejected=False,
+    )
+    _record_gate_observation(config, result)
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert (row["wrapper_bootstrap"], row["inner_exec"], row["suite_start"]) == ("unknown", "started", "verified")
+    assert row["launch_integrity"] == "verified"
