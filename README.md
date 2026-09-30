@@ -1435,7 +1435,12 @@ Recognized inner launchers receive the same bounded `--version` probe: direct
 every other option on a fixed allow-list so print-and-exit options such as
 `--version` or `--help` and startup-code options such as `--import`/`--require`
 stay unrecognized, as does a non-empty `NODE_OPTIONS`; probed as
-`node --version`); other
+`node --version`), and the Playwright CLI (`playwright test ...`, with `test`
+as the first argument and every other option on a fixed allow-list in
+`--name=value` form, so `--list`, `--help`, `--version`, zero-test-success
+flags, `--config`/`--tsconfig`/global-setup options, custom reporters, and a
+non-empty `NODE_OPTIONS` or `PW_TEST_REPORTER` stay unrecognized; probed as
+`playwright --version`); other
 commands remain
 unknown rather than being judged from text or exit codes. The runtime result
 keeps independent `wrapper_bootstrap`, `inner_exec`, and `suite_start` states,

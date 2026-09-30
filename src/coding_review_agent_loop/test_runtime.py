@@ -2514,6 +2514,71 @@ def _is_node_test_runner(arguments: Sequence[str]) -> bool:
     return selected
 
 
+# Playwright ``test`` options accepted by the recognizer.  Allow-list only:
+# enumerate-and-exit (``--list``) and print-and-exit (``--help``/``--version``)
+# forms and zero-test-success forms (``--pass-with-no-tests``,
+# ``--only-changed``, ``--last-failed``) exit 0 without running a test;
+# code-loading options (``--config``/``-c``, ``--tsconfig``, global-setup
+# options, custom reporter modules) load arbitrary modules into the runner;
+# interactive modes (``--ui``, ``--debug``) are not suite runs.  The
+# ``playwright --version`` probe cannot see any of that.  Value options are only
+# accepted in ``--name=value`` form so a detached value can never hide one.
+_PLAYWRIGHT_TEST_FLAGS = frozenset({
+    "--headed",
+    "--forbid-only",
+    "--fully-parallel",
+    "--fail-on-flaky-tests",
+    "--no-deps",
+    "--quiet",
+    "--ignore-snapshots",
+})
+_PLAYWRIGHT_TEST_VALUE_OPTIONS = frozenset({
+    "--project",
+    "--grep",
+    "--grep-invert",
+    "--workers",
+    "--retries",
+    "--repeat-each",
+    "--shard",
+    "--timeout",
+    "--max-failures",
+    "--global-timeout",
+    "--trace",
+    "--output",
+    "--reporter",
+})
+_PLAYWRIGHT_BUILTIN_REPORTERS = frozenset({
+    "list", "line", "dot", "json", "junit", "html", "github", "null", "blob",
+})
+
+
+def _is_playwright_test_runner(arguments: Sequence[str]) -> bool:
+    """Return whether ``playwright`` argv provably runs the test subcommand.
+
+    ``test`` must be the first argument and every other option must be on the
+    allow-list, so no enumerate/print-and-exit or code-loading option can turn
+    a zero exit into citable evidence.
+    """
+    if not arguments or arguments[0] != "test":
+        return False
+    for argument in arguments[1:]:
+        if argument == "--":
+            return False
+        if not argument.startswith("-"):
+            continue
+        name, has_value, value = argument.partition("=")
+        if has_value:
+            if name not in _PLAYWRIGHT_TEST_VALUE_OPTIONS or not value:
+                return False
+            if name == "--reporter" and not all(
+                entry in _PLAYWRIGHT_BUILTIN_REPORTERS for entry in value.split(",")
+            ):
+                return False
+        elif argument not in _PLAYWRIGHT_TEST_FLAGS:
+            return False
+    return True
+
+
 def _recognized_inner_probe_tokens(
     tokens: tuple[str, ...], *, cwd: Path, environment: Mapping[str, str]
 ) -> tuple[str, ...] | None:
@@ -2532,6 +2597,14 @@ def _recognized_inner_probe_tokens(
         # Node's built-in test runner has the same safe bootstrap shape as
         # pytest: ``node --version`` proves the runtime starts without running
         # any test file.
+        return (_direct_launcher_executable(tokens[0], cwd=cwd, environment=values), "--version")
+    if (
+        first == "playwright"
+        and _is_playwright_test_runner(tokens[1:])
+        # Both can load arbitrary modules into the runner process.
+        and not values.get("NODE_OPTIONS", "").strip()
+        and not values.get("PW_TEST_REPORTER", "").strip()
+    ):
         return (_direct_launcher_executable(tokens[0], cwd=cwd, environment=values), "--version")
     if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
         interpreter = _python_interpreter_path(tokens[0], cwd=cwd, environment=values)
