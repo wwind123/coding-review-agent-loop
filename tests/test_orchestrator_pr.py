@@ -4096,6 +4096,65 @@ def test_review_only_mode_clears_repaired_ordinary_ci_from_fresh_passing_snapsho
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
+def test_review_only_mode_reports_passing_but_uncleared_ci_at_the_gate(
+    tmp_path, monkeypatch
+):
+    failed = PullRequestCheck(
+        name="test", kind="check_run", status="failure", url="https://example.test/555"
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Initial review."),
+            structured_pr_review(
+                state="approved",
+                summary="Repaired head approved.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Repaired the failing check.", addressed_items=["item-1"]
+            )
+        ],
+    )
+
+    def checks(*args, **kwargs):
+        if kwargs["metadata"].head_sha == "abc123":
+            return _watch_check_board("failing", failing=(failed,))
+        return _watch_check_board(
+            "passing",
+            passing=(PullRequestCheck(name="docs", kind="check_run", status="skipped"),),
+        )
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: pytest.fail("review-only mode must not start the watcher"),
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(
+            runner,
+            pr_number=77,
+            config=make_config(
+                tmp_path, auto_merge=False, watch_pending_ci=False, max_rounds=2
+            ),
+        )
+
+    message = str(excinfo.value)
+    assert "cannot finalize" in message
+    assert "github-pr-checks (item-1)" in message
+    assert "Blocking obligations:" in message
+    assert "observed in this run: GitHub checks read passing at repaired-head" in message
+    assert "only skipped or neutral" in message
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+    assert not any("observed in this run" in comment for comment in runner.comments)
+
+
 @pytest.mark.parametrize("auto_merge", [False, True])
 def test_watch_mode_success_uses_full_board_without_second_wait(
     tmp_path, monkeypatch, auto_merge

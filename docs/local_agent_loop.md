@@ -4271,7 +4271,13 @@ unreadable (HTTP 403), the same-head `CLEAN` merge state is required; a draft
 reports `DRAFT`, so the run stops before any side effect. Grant the token read
 access to branch protection and resume; do not mark the PR ready by hand.
 Otherwise the run refuses with `cannot finalize`, naming the unsatisfied
-predicate. `repair_required` items at their own failed head, migration,
+predicate. The refusal appends a `Blocking obligations:` list with one line per
+machine obligation: kind, item id, lifecycle, candidate and failed heads, and
+either a predicate derived from the ledger or an observation made in this run.
+The same lines are logged to stderr, never posted. A `qualifying` predicate means
+no authoritative success was recorded, not that CI failed. Observations are
+in-memory only, so a resumed run falls back to the ledger predicate.
+`repair_required` items at their own failed head, migration,
 evidence, and unknown obligations are never cleared this way. A repository that
 disagrees should not enable managed CI for that check. When the managed wait
 times out with the final context successful and a non-final check failing at
