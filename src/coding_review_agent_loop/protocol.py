@@ -3015,9 +3015,22 @@ def _observation_projection_field(observation: object, name: str) -> object:
 
 def _observation_command_label(observation: object) -> str:
     """Redacted, bounded command text; never reads raw argv attributes."""
-    from .local_test_evidence import MAX_SAFE_COMMAND_BYTES, redact_test_command
+    from .local_test_evidence import _UNPARSABLE_PREFIX, MAX_SAFE_COMMAND_BYTES, redact_test_command
 
     command = _observation_projection_field(observation, "command")
+    caveats = _observation_projection_field(observation, "caveats")
+    unparsable = isinstance(caveats, (list, tuple)) and any(
+        isinstance(item, str) and item.startswith(_UNPARSABLE_PREFIX) for item in caveats
+    )
+    if unparsable:
+        return "command not recorded (unparsable)"
+    if isinstance(command, str):
+        # The redactor keeps an unparsable string as one opaque token, which
+        # can hide a secret assignment; fail closed rather than echo it.
+        try:
+            shlex.split(command)
+        except ValueError:
+            return "command not recorded (unparsable)"
     if isinstance(observation, Mapping) and command:
         try:
             if isinstance(command, (str, list, tuple)):

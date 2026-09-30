@@ -6511,3 +6511,31 @@ def test_rejection_redacts_secret_commands_for_mapping_and_projection_forms():
     message = str(excinfo.value)
     assert rendered in message and "s3cr3t-value" not in message
     assert "`2026-09-30T00:00:00+00:00`" in message
+
+
+def test_rejection_fails_closed_on_unparsable_secret_command():
+    from coding_review_agent_loop.local_test_evidence import observation_from_mapping
+
+    bad = 'env SECRET_KEY=s3cr3t-value "unterminated'
+    mapping = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "unknown", "command": bad})
+    outcome = _reject_message({"outcome": "failed", "provenance": "parent-observed", "command": bad})
+    obs = observation_from_mapping({"command": bad, "outcome": "passed", "provenance": "parent-observed"})
+    for message in (mapping, outcome):
+        assert "s3cr3t-value" not in message
+        assert "command not recorded (unparsable)" in message
+    for kwargs in ({"wrapper_bootstrap": "failed"}, {"outcome": "failed"}):
+        projected = type("P", (), {
+            "execution_ref": "turn:observation-1", "outcome": "passed", "provenance": "parent-observed",
+            "wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "unknown",
+            "public_projection": lambda self: obs.public_projection(),
+        })()
+        if "outcome" in kwargs:
+            projected.outcome = "failed"
+        with pytest.raises(NonRepairableEvidenceRejection) as excinfo:
+            _validate_claims_envelope(
+                "issue_implementation",
+                [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+                catalog=[projected],
+            )
+        assert "s3cr3t-value" not in str(excinfo.value)
+        assert "command not recorded (unparsable)" in str(excinfo.value)
