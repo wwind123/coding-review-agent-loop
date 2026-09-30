@@ -492,7 +492,10 @@ def _apply_command_parse_guard(observation: LocalTestObservation) -> LocalTestOb
 
 
 _SAFE_FLAG_RE = re.compile(r"-{1,2}[A-Za-z][A-Za-z0-9_-]*")
-_PLACEHOLDER_TOKEN_RE = re.compile(r"[^\s<>]*<[a-z-]+:[0-9a-f]{16}>[^\s<>]*")
+_PLACEHOLDER = r"<(?:redacted|sha256|arg-sha256|path-sha256|userinfo):[0-9a-f]{16}>"
+_PLACEHOLDER_TOKEN_RE = re.compile(
+    rf"(?:(?:-{{1,2}}[A-Za-z][A-Za-z0-9_-]*|[A-Za-z_][A-Za-z0-9_]*)=)?{_PLACEHOLDER}"
+)
 
 
 def _argv_tail_is_safe(tokens: Sequence[str]) -> bool:
@@ -500,7 +503,10 @@ def _argv_tail_is_safe(tokens: Sequence[str]) -> bool:
 
     The durable argv extends past the 512-byte display, and redaction leaves
     unrecognised ``-`` options and short positionals verbatim.  Only bare
-    flags, digest placeholders and repo-relative paths are trusted there.
+    flags, a whole-token digest placeholder (optionally behind a ``name=``
+    prefix) and repo-relative paths are trusted there; any other token,
+    including literal text mixed with a placeholder, makes the row fail closed
+    (argv withheld, row capture-limited).
     """
     shown = 0
     for index, token in enumerate(tokens):

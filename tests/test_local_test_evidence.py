@@ -1862,6 +1862,35 @@ def test_secret_after_display_cutoff_is_never_persisted_in_argv():
     assert "topsecret" not in bounded_evidence_for_round(decode_bounded_evidence(encoded))
 
 
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "--session-key=topsecret<sha256:0123456789abcdef>",
+        "<sha256:0123456789abcdef>topsecret",
+        "x=topsecret<redacted:0123456789abcdef>",
+    ],
+)
+def test_mixed_literal_and_placeholder_tail_is_not_trusted(secret):
+    argv = ("pytest", "--pad=" + "x" * 490, secret)
+    assert secret not in redact_test_command(argv)[0]
+    encoded = bounded_evidence_for_round(LocalTestEvidence(observations=(_obs(argv),)))
+    assert "topsecret" not in encoded
+    (row,) = _rows(encoded)
+    if secret.startswith("--"):
+        # Redaction leaves this option intact, so the tail is not trusted.
+        assert "argv" not in row
+        assert row["outcome"] == "incomplete"
+    assert "topsecret" not in bounded_evidence_for_round(decode_bounded_evidence(encoded))
+
+
+def test_whole_token_placeholder_tail_keeps_argv():
+    argv = ("pytest", "--pad=" + "x" * 490, "--token=<redacted:0123456789abcdef>", "--flag")
+    encoded = bounded_evidence_for_round(LocalTestEvidence(observations=(_obs(argv),)))
+    (row,) = _rows(encoded)
+    assert row["argv"][2] == "--token=<redacted:0123456789abcdef>"
+    assert row["outcome"] == "passed"
+
+
 @pytest.mark.parametrize("variant", ["parse-cut", "quote-cut"])
 def test_over_budget_argv_is_downgraded_on_every_path(variant, tmp_path):
     if variant == "parse-cut":
