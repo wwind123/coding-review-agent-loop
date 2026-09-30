@@ -3024,9 +3024,11 @@ def _observation_command_label(observation: object) -> str:
     )
     if unparsable:
         return "command not recorded (unparsable)"
-    if isinstance(command, str):
+    if isinstance(observation, Mapping) and isinstance(command, str):
         # The redactor keeps an unparsable string as one opaque token, which
         # can hide a secret assignment; fail closed rather than echo it.
+        # Only raw mapping strings are checked: a projection's display may be
+        # truncated inside a quote while its source parsed fine.
         try:
             shlex.split(command)
         except ValueError:

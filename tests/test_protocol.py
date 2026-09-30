@@ -6539,3 +6539,32 @@ def test_rejection_fails_closed_on_unparsable_secret_command():
             )
         assert "s3cr3t-value" not in str(excinfo.value)
         assert "command not recorded (unparsable)" in str(excinfo.value)
+
+
+def test_rejection_keeps_truncated_projection_command_label():
+    from coding_review_agent_loop.local_test_evidence import observation_from_mapping
+
+    argv = ["python", "-m", "pytest"] + [f"-{chr(97 + i % 26)}" for i in range(400)] + [
+        "SECRET_KEY=s3cr3t-value",
+    ]
+    obs = observation_from_mapping({"command": argv, "outcome": "passed", "provenance": "parent-observed"})
+    projected = type("P", (), {
+        "outcome": "passed", "provenance": "parent-observed", "wrapper_bootstrap": "verified",
+        "inner_exec": "started", "suite_start": "unknown",
+        "public_projection": lambda self: obs.public_projection(),
+    })()
+    with pytest.raises(NonRepairableEvidenceRejection) as excinfo:
+        _validate_claims_envelope(
+            "issue_implementation",
+            [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+            catalog=[_with_ref(projected)],
+        )
+    message = str(excinfo.value)
+    assert "unparsable" not in message
+    assert "command: `python -m pytest" in message
+    assert "s3cr3t-value" not in message
+
+
+def _with_ref(obj):
+    obj.execution_ref = "turn:observation-1"
+    return obj
