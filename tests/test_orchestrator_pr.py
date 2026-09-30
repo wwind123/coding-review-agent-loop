@@ -8564,7 +8564,29 @@ def test_pr_loop_quarantines_unavailable_reviewer_while_healthy_reviewer_finishe
     assert "--reviewer flags" in incomplete[0]
     assert "AGENT_" not in incomplete[0]
     assert "{" not in incomplete[0]
+    # The advertised route must not contradict the policy-specific remedy.
+    assert "replacement reviewer" not in incomplete[0]
+    reconciliations = [body for body in runner.comments if "reconciliation" in body]
+    assert reconciliations, "sequential stop must post a reconciliation record"
+    assert "Finalization stops" in reconciliations[0]
+    assert "Finalization continues" not in reconciliations[0]
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+
+def test_incomplete_review_comment_reports_zero_open_must_fix_count():
+    comment = orchestrator._format_incomplete_pr_review_comment(
+        pr_number=5,
+        unavailable_reviewers={
+            "codex": __import__("coding_review_agent_loop.errors", fromlist=["x"]).AgentInvocationError("down", failure_category="agent-unavailable")
+        },
+        approved_reviewer_names=["Claude"],
+        detection_round=2,
+        open_must_fix_count=0,
+        remedy_lines=["- Restore the reviewer backend and rerun unchanged."],
+    )
+    assert "### Open findings" in comment
+    assert "Open must-fix items (including carried): 0" in comment
+    assert "replacement reviewer" not in comment
 
 
 def test_pr_loop_retries_explicit_retryable_agent_unavailable_response(tmp_path):

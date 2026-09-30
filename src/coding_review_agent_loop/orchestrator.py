@@ -6772,7 +6772,7 @@ def _format_incomplete_pr_review_comment(
                 *[f"- {name}" for name in approved_reviewer_names],
             ]
         )
-    if blocking_reviewer_names or open_must_fix_count:
+    if blocking_reviewer_names or open_must_fix_count is not None:
         lines.extend(["", "### Open findings"])
         if blocking_reviewer_names:
             lines.append("- Blocking reviewers this round: " + ", ".join(blocking_reviewer_names))
@@ -6783,8 +6783,11 @@ def _format_incomplete_pr_review_comment(
     lines.extend(
         [
             "",
-            "Resolve the reviewer problem or rerun with a replacement reviewer/model "
-            f"before merging PR #{pr_number}.",
+            (
+                f"Resolve the reviewer problem as described above before merging PR #{pr_number}."
+                if remedy_lines
+                else f"Resolve the reviewer problem before merging PR #{pr_number}."
+            ),
         ]
     )
     return "\n".join(lines)
@@ -24577,7 +24580,7 @@ def run_pr_loop(
                 # resume that replayed withheld reviews no longer needs them.
                 pr_round_spool.discard()
             if (
-                (pr_round_parallel or selective_policy)
+                (pr_round_parallel or selective_policy or unavailable_reviewer_failures)
                 and not skip_reviewers_this_round
                 and not (current_resume is not None and current_resume.reconciled)
                 and evidence_pass is None
