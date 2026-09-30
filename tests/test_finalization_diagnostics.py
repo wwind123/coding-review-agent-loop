@@ -276,3 +276,95 @@ def test_nonauthority_reason_matches_authority_predicate():
         assert (reason == "") == authoritative
         if fragment:
             assert fragment in reason
+
+
+def _pred(item, current=HEAD):
+    return _finalization_obligation_predicate(item, current_head_sha=current)
+
+
+def test_kind_specific_predicates_are_exact_in_every_lifecycle():
+    ack = "signed human requirements have not been validly acknowledged; a response acknowledging them is required"
+    for lifecycle in ("repair_required", *CANDIDATE_LIFECYCLES):
+        cand = None if lifecycle == "repair_required" else HEAD
+        assert _pred(machine("human-requirements-acknowledgement", lifecycle, candidate=cand)) == ack
+        assert _pred(machine("merge-conflict", lifecycle, candidate=cand, failed="c1")) == (
+            "merge conflict with the base branch confirmed at c1; resolve the conflict on a new head"
+        )
+        assert _pred(machine("merge-conflict", lifecycle, candidate=cand)) == (
+            "merge conflict with the base branch reported; head not confirmed; "
+            "resolve the conflict on a new head"
+        )
+        assert _pred(machine("alembic-migration", lifecycle, candidate=cand, failed="m1")) == (
+            "migration validation failed at m1; it is re-probed each round and clears "
+            f"only when validation of the current head {HEAD} succeeds"
+        )
+        assert _pred(machine("alembic-migration", lifecycle, candidate=cand), None) == (
+            "migration validation has no recorded clearance; it is re-probed each round "
+            "and clears only when validation of the current head none succeeds"
+        )
+
+
+@pytest.mark.parametrize("kind", CI_KINDS)
+def test_ci_predicates_are_exact(kind):
+    def p(lifecycle, candidate=None, failed=None, current=HEAD):
+        return _pred(machine(kind, lifecycle, candidate=candidate, failed=failed), current)
+
+    assert p("repair_required", failed=HEAD) == (
+        f"authoritative source failed at {HEAD}, which is the current head; "
+        "a strictly different head is required"
+    )
+    assert p("repair_required", failed="old") == (
+        f"authoritative source failed at old; current head {HEAD} has not been bound "
+        "as a revalidation candidate"
+    )
+    assert p("awaiting_current_head_review", HEAD) == (
+        f"awaiting unanimous reviewer approval at candidate head {HEAD}"
+    )
+    assert p("qualification_ready", HEAD) == (
+        f"approved at {HEAD}; authoritative qualification not yet dispatched"
+    )
+    assert p("qualifying", HEAD) == (
+        f"qualification in progress at {HEAD}; no authoritative success recorded "
+        "for this source in this run"
+    )
+    for lifecycle in CANDIDATE_LIFECYCLES:
+        assert p(lifecycle) == f"lifecycle {lifecycle} has no recorded candidate head; failing closed"
+        assert p(lifecycle, "stale") == (
+            f"lifecycle {lifecycle} is bound to candidate head stale, not the current "
+            f"head {HEAD}; the current head must be reviewed before qualification"
+        )
+        assert p(lifecycle, HEAD, current=None) == (
+            f"lifecycle {lifecycle} is bound to candidate head {HEAD}, not the current "
+            "head none; the current head must be reviewed before qualification"
+        )
+        assert p(lifecycle, "other", failed=HEAD) == (
+            f"lifecycle {lifecycle}, but the current head {HEAD} is the recorded failed "
+            "head; a strictly different head is required"
+        )
+
+
+def test_mixed_repair_candidate_evidence_unknown_listing_in_partition_order():
+    repair = machine("github-pr-checks", "repair_required", item_id="item-1", failed="old")
+    unknown = machine("unknown", "repair_required", item_id="item-2")
+    candidate = machine("managed-exact-head-ci", "qualification_ready", item_id="item-3", candidate=HEAD)
+    evidence = UnresolvedReviewItem(
+        item_id="item-4", reviewer="r", source_round=1, text="x", status="blocking",
+        authority="machine", obligation_kind="human-exact-head-evidence",
+        lifecycle="evidence_frozen", candidate_head_sha="frozen1",
+        obligation_identity="ev:4",
+    )
+    items = [evidence, candidate, unknown, repair]
+    message = _raise(items)
+    legacy = _legacy(items)
+    assert message.startswith(legacy)
+    lines = message[len(legacy):].splitlines()
+    assert lines[:2] == ["", "Blocking obligations:"]
+    body = lines[2:]
+    order = [l.split(" (")[1].split(")")[0] for l in body]
+    assert order == ["item-2", "item-1", "item-3", "item-4"]
+    assert len(body) == 4
+    assert body[-1] == (
+        "- human-exact-head-evidence (item-4): lifecycle=evidence_frozen, "
+        "candidate_head=frozen1, failed_head=none; human-only exact-head evidence pending at frozen1"
+    )
+    assert any("unknown (item-2)" in l and "unknown or unreconstructible" in l for l in body)
