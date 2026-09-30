@@ -63,6 +63,7 @@ from .github import (
     validate_open_issue,
     validate_open_pr,
 )
+from . import tool_provenance
 from .logging import agent_log_path, log
 from .orchestrator import (
     run_discuss_loop,
@@ -1874,6 +1875,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not (args.managed_ci_trusted_actor or "").strip():
                 raise AgentLoopError("--managed-ci requires --managed-ci-trusted-actor.")
         config = config_from_args(args, runner, invocation_argv=invocation)
+        if args.command in {"issue", "task", "pr", "discuss", "managed-pr"}:
+            # Before claims, sandbox setup and base-branch resolution (#1111).
+            tool_provenance.capture_process_provenance(config)
         # Claim every required checkout before base-branch resolution, sandbox
         # setup or dispatch; released on every exit path below (#1127).
         claim_stack.enter_context(

@@ -5810,6 +5810,46 @@ data, the orchestrator records an `estimated` fallback based on prompt and
 public-response size, along with raw character and byte counts. `--dry-run`
 does not invent token usage records.
 
+### Tool provenance and startup timing
+
+`agent-loop` is usually installed editable from one shared checkout, so a run
+records which tool commit it started on. When a loop command (`issue`, `task`,
+`pr`, `discuss`, `managed-pr`) finishes config construction, the process captures
+the loaded package's checkout HEAD once, before workdir claims, sandbox setup or
+base-branch resolution, and logs one line (suppressed by `--quiet`):
+
+- `agent-loop tool commit <sha> (clean) from <root>`
+- `agent-loop tool commit <sha> (DIRTY: N changed paths) from <root>`
+- `agent-loop tool commit <sha> (cleanliness unknown: <error>) from <root>`
+- `agent-loop tool commit unknown (<error>)`
+
+`<run-id>-usage-summary.json` gains `tool_provenance` (`package_path`,
+`checkout_root`, `commit`, `dirty`, `dirty_paths_sample`, `error`, `captured_at`,
+`process_started_at`) and `timing` (`process_started_at`, `run_started_at`,
+`first_agent_dispatch_at`, `startup_gap_seconds`). The end-of-run
+`Usage summary written to ...` line ends with `tool_commit=<sha7> clean|dirty|dirty=unknown`
+or `tool_commit=unknown`. `dirty: null` beside a commit means the cleanliness
+was not read. Error labels: `git-unavailable`, `git-timeout`,
+`git-untrusted-location` (the Git executable lies inside an agent checkout or the
+response root), `config-gate-refused`, `not-a-git-checkout`,
+`package-not-in-repository` (the package is not tracked by the enclosing
+repository), and `git-status-failed`. A commit is recorded only after the
+package files are confirmed tracked in that repository.
+
+All Git reads go through the hardened inspect path and share one overall
+deadline (10 seconds), so capture adds at most about 10 seconds, and only when
+Git hangs. `first_agent_dispatch_at` is stamped before the first primary agent
+call, including under `--dry-run`. `process_started_at` is taken at package
+import; a launcher's sleep before the process spawns cannot be observed.
+
+Guarantee boundaries: the log line appears for every loop-command process that
+completes config construction, unless `--quiet` is set. The summary fields
+appear for every run that reaches its owning entry, including runs that fail
+inside it. A failure between capture and the owning entry (a claim conflict or
+sandbox setup error) leaves only the log line; an argument or config-construction
+failure leaves no record; under `--quiet` the summary is the only record.
+Movement of the checkout after capture is not detected.
+
 ## Runtime-aware local test timeouts
 
 The run-level command ceiling is configured with

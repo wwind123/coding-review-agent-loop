@@ -203,6 +203,9 @@ class RunUsageContext:
     summary_path: Path
     records: list[UsageCallRecord] = field(default_factory=list)
     _next_call_id: int = 1
+    tool_provenance: dict | None = None
+    run_started_at: str | None = None
+    first_agent_dispatch_at: str | None = None
     # Parallel discuss debaters add records from worker threads (#475).
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
@@ -273,8 +276,34 @@ class RunUsageContext:
             for agent, records in sorted(agent_records.items())
         }
 
+    def note_agent_dispatch(self) -> None:
+        with self._lock:
+            if self.first_agent_dispatch_at is None:
+                self.first_agent_dispatch_at = datetime.now(UTC).isoformat()
+
+    def _timing(self) -> dict[str, object]:
+        provenance = self.tool_provenance or {}
+        started = provenance.get("process_started_at")
+        gap: float | None = None
+        if started and self.first_agent_dispatch_at:
+            try:
+                gap = (
+                    datetime.fromisoformat(self.first_agent_dispatch_at)
+                    - datetime.fromisoformat(started)
+                ).total_seconds()
+            except ValueError:
+                gap = None
+        return {
+            "process_started_at": started,
+            "run_started_at": self.run_started_at,
+            "first_agent_dispatch_at": self.first_agent_dispatch_at,
+            "startup_gap_seconds": gap,
+        }
+
     def summary_payload(self) -> dict[str, object]:
         return {
+            "tool_provenance": self.tool_provenance,
+            "timing": self._timing(),
             "run_id": self.run_id,
             "generated_at": datetime.now(UTC).isoformat(),
             "summary_path": str(self.summary_path),
