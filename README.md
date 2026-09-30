@@ -1233,13 +1233,16 @@ cannot recover an unreadable planning history. `--plan-primary-stall-rounds N`
 (default 8, `0` disables) stops the run with a diagnostic once the primary has
 blocked N consecutive completed primary-phase rounds with no exact-plan
 approval, instead of spending the rest of `--max-rounds`; the panel is never
-convened automatically, so rerun with `--plan-review-force-full` or a higher
-threshold to continue. An in-flight run already past eight such rounds stops at
+convened automatically. Editing the issue title or body retires rounds reviewed
+against earlier text (a comment alone does not, and rounds recorded before
+issue-text tracking carry no digest, so an edit cannot retire them), and the one-shot
+`--plan-reset-stall-streak` durably retires the counted rounds; otherwise rerun
+with `--plan-review-force-full` or a higher threshold. An in-flight run already past eight such rounds stops at
 its next round after upgrading. Omitting the flags keeps today's
 full-board planning behavior unchanged, and discussion-mode cycles always stay
 full-board. A child-planning cycle inherits `--plan-review-policy`,
 `--primary-plan-reviewer`, and `--plan-primary-stall-rounds` but never the parent's `--plan-review-force-full`
-override or scheduler state. `review-evaluation` reports planning runs in
+override, `--plan-reset-stall-streak`, or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board
 planning can be compared on calls, tokens, latency, overlap, severity-weighted
 marginal findings, and escaped plan defects before any proposal to change the

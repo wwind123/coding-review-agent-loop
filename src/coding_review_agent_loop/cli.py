@@ -859,8 +859,23 @@ def build_parser() -> argparse.ArgumentParser:
                 "Under --plan-review-policy primary-then-panel, stop the run with a "
                 "diagnostic once N consecutive completed primary plan reviews have "
                 "blocked with no exact-plan primary approval (default: 8; 0 disables). "
-                "The secondary panel is never convened automatically; rerun with "
-                "--plan-review-force-full or a higher threshold to continue."
+                "The secondary panel is never convened automatically. Editing the issue "
+                "title or body retires rounds reviewed against earlier text (rounds "
+                "recorded before issue-text tracking cannot be retired this way); a "
+                "comment alone does not. Rerun with --plan-reset-stall-streak, "
+                "--plan-review-force-full, or a higher threshold to continue."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-reset-stall-streak",
+            dest="plan_reset_stall_streak",
+            action="store_true",
+            help=(
+                "One-shot: under --plan-review-policy primary-then-panel, skip the primary "
+                "stall stop for this invocation's first primary-phase round and stamp that "
+                "round's checkpoint as a durable streak boundary, retiring the earlier "
+                "blocking primary rounds. Not inherited by child planning or recovery "
+                "commands."
             ),
         )
         subparser.add_argument(

@@ -2944,14 +2944,39 @@ for any round whose planning history is degraded (`absent`, `invalid`, or
 `contradictory-key`), so the conservative primary-only fallback runs
 unchanged. The panel is never convened automatically. To continue:
 
+- edit the issue title or body to narrow it (#1112): each primary-phase
+  scheduler checkpoint records a digest of the issue title and body the run
+  loaded, and the count stops at the newest round whose digest differs from the
+  current issue text, so rounds reviewed against earlier text stop counting.
+  A comment alone does not change the issue text and does not clear this stop,
+  because loop-posted comments share the operator's account and cannot be
+  authenticated as operator intent;
+- rerun with `--plan-reset-stall-streak` (one-shot, requires
+  `primary-then-panel`) to skip the stop for that invocation's first primary
+  round and stamp its checkpoint as a durable streak boundary, so older
+  rounds stop counting as soon as that checkpoint posts, even if the primary
+  review is interrupted, and later flagless reruns do not stop until `N` new
+  blocking rounds accumulate. Use it after narrowing by comment. If the run is
+  interrupted before the checkpoint posts, nothing was written and the stop
+  fires again. Child planning, isolated providers, and rendered recovery
+  commands never carry the flag;
 - rerun with `--plan-review-force-full` to authorize the complete board (an
-  operator-sourced opening);
+  operator-sourced opening); or
 - rerun with a higher `--plan-primary-stall-rounds`, or `0`, to keep revising in
-  the primary phase; or
-- narrow the issue.
+  the primary phase.
+
+Retiring the streak does not discard the stalled plan: the next round is the
+primary review of the current candidate, which the planner then revises against
+the narrowed issue. Rounds recorded before issue-text tracking carry no digest
+and keep counting, so an edit cannot retire them; when the newest undigested
+rounds by themselves reach the threshold, the diagnostic says they
+predate issue-text tracking and `--plan-reset-stall-streak` is required. When older
+digested rounds supply the rest of the streak, an edit still clears the stop
+and the diagnostic does not claim otherwise. Rounds under new issue text accumulate normally and re-trip the stop.
 
 Because the count is recomputed from durable records, rerunning with unchanged
-flags stops again at the same point before any agent turn.
+flags and unchanged issue text stops again at the same point before any agent
+turn.
 
 **Upgrade note:** an in-flight `primary-then-panel` run that already has eight
 or more trailing blocking primary rounds stops at its next round after

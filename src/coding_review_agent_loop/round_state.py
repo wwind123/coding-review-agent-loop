@@ -208,6 +208,12 @@ class PostedRoundMetadata:
     # Planning-only scheduler auxiliary: the key the previous planning round
     # was scheduled against.  ``None`` on the first staged planning round.
     scheduler_plan_previous_key: dict | None = None
+    # Planning-only, primary-phase checkpoint fields (#1112).  The digest is
+    # the normalized issue title/body the run loaded; the reset marker is the
+    # operator's durable ``--plan-reset-stall-streak`` streak boundary.  Both
+    # are omitted from the serialized record when unset.
+    scheduler_issue_digest: str | None = None
+    scheduler_stall_reset: bool = False
     # This is an in-memory decode-quality signal, deliberately not serialized.
     # ``absent`` is the legacy-compatible state; ``invalid`` means scheduler
     # fields were present but could not be reconstructed safely.
@@ -1704,6 +1710,12 @@ _SCHEDULER_METADATA_KEYS = frozenset(
         "scheduler_calls_avoided",
     }
 )
+# Planning-only optional checkpoint keys (#1112).  Deliberately outside the
+# shared auxiliary set and the serializer's presence test.
+_PLAN_ONLY_SCHEDULER_KEYS = frozenset(
+    {"scheduler_issue_digest", "scheduler_stall_reset"}
+)
+
 _SCHEDULER_AUXILIARY_KEYS = frozenset(
     {
         "scheduler_phase",
@@ -1864,9 +1876,22 @@ def _decode_plan_scheduler_fields(payload: Mapping[str, object]) -> dict[str, ob
             not isinstance(primary, str) or primary != contract.primary_reviewer
         ):
             raise ValueError("contradictory planning scheduler primary reviewer")
+        issue_digest = payload.get("scheduler_issue_digest")
+        if "scheduler_issue_digest" in payload and (
+            not isinstance(issue_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{16}", issue_digest)
+        ):
+            raise ValueError("invalid scheduler issue digest")
+        stall_reset = False
+        if "scheduler_stall_reset" in payload:
+            if payload["scheduler_stall_reset"] is not True or phase != "primary":
+                raise ValueError("invalid scheduler stall reset marker")
+            stall_reset = True
     except (AgentLoopError, TypeError, ValueError, KeyError):
         return {"scheduler_metadata_status": "invalid"}
     return {
+        "scheduler_issue_digest": issue_digest,
+        "scheduler_stall_reset": stall_reset,
         "scheduler_contract": contract.as_dict(),
         "scheduler_obligation_digest": digest,
         "scheduler_phase": phase,
@@ -1884,11 +1909,16 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
     A malformed or partial record therefore becomes legacy metadata instead of
     being allowed to select a smaller reviewer set during resume.
     """
-    scheduler_keys = _SCHEDULER_METADATA_KEYS | _SCHEDULER_AUXILIARY_KEYS
+    scheduler_keys = (
+        _SCHEDULER_METADATA_KEYS | _SCHEDULER_AUXILIARY_KEYS | _PLAN_ONLY_SCHEDULER_KEYS
+    )
     if not (scheduler_keys & payload.keys()):
         return {"scheduler_metadata_status": "absent"}
     if payload.get("flow") == "plan":
         return _decode_plan_scheduler_fields(payload)
+    if _PLAN_ONLY_SCHEDULER_KEYS & payload.keys():
+        # Planning-only state on a PR-flow record is contradictory.
+        return {"scheduler_metadata_status": "invalid"}
     required = _SCHEDULER_METADATA_KEYS
     if not required.issubset(payload.keys()):
         return {"scheduler_metadata_status": "invalid"}
@@ -2285,6 +2315,10 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
                 if key not in _SCHEDULER_AUXILIARY_KEYS or value not in (None, [])
             }
         )
+    if metadata.scheduler_issue_digest is not None:
+        payload["scheduler_issue_digest"] = metadata.scheduler_issue_digest
+    if metadata.scheduler_stall_reset:
+        payload["scheduler_stall_reset"] = True
     if metadata.plan_supersession_digest is not None:
         payload["plan_supersession_digest"] = metadata.plan_supersession_digest
         payload["plan_supersession_superseded_hash"] = (

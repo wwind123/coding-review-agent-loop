@@ -12771,3 +12771,26 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
     assert orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True) == 0
     assert lifecycles == ["draft-labeled", "draft-labeled"]
     assert finalized == (["prepare", "merge"] if auto_merge else ["publish"])
+
+
+@pytest.mark.parametrize("target", ["issue", "pr"])
+@pytest.mark.parametrize("managed_ci", [True, False])
+def test_recovery_renderer_never_replays_plan_reset_stall_streak(tmp_path, target, managed_ci):
+    """`config-and-inheritance` (#1112)."""
+    config = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "issue", "643", "--plan-first",
+            "--plan-reset-stall-streak", "--plan-primary-stall-rounds", "3",
+            "--reviewer", "codex",
+        ),
+    )
+    rendered = _render_recovery_command(
+        config, target=target, identifier=7, managed_ci=managed_ci,
+        preserve_managed_options=True,
+    )
+    tokens = shlex.split(rendered)
+    assert "--plan-reset-stall-streak" not in tokens
+    assert "--reviewer" in tokens
+    if target == "issue":
+        assert tokens[tokens.index("--plan-primary-stall-rounds") + 1] == "3"

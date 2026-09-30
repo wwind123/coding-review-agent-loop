@@ -3552,6 +3552,8 @@ _ISSUE_ONLY_RECOVERY_OPTIONS = frozenset({
 })
 _PR_ONLY_RECOVERY_OPTIONS = frozenset({"--managed-ci-adopt-existing-pr"})
 _MANAGED_PR_ONLY_RECOVERY_OPTIONS = frozenset({"--head", "--title", "--body-file"})
+# One-shot operator flags a rendered recovery/rerun command must never replay.
+_ONE_SHOT_OPERATOR_RECOVERY_OPTIONS = frozenset({"--plan-reset-stall-streak"})
 _MANAGED_RECOVERY_OPTIONS = frozenset({
     "--managed-ci", "--managed-ci-trusted-actor", "--allow-unprotected-managed-ci",
     "--allow-unreadable-protection", "--managed-ci-adopt-existing-pr", "--managed-ci-fresh", "--managed-ci-fresh-authorization",
@@ -3704,7 +3706,7 @@ def _render_recovery_command(
         command.extend(_human_reviewer_trust_args(config))
     else:
         source = command[command_index]
-        remove = set()
+        remove = set(_ONE_SHOT_OPERATOR_RECOVERY_OPTIONS)
         if target == "pr":
             remove.update(_ISSUE_ONLY_RECOVERY_OPTIONS)
             remove.update(_MANAGED_PR_ONLY_RECOVERY_OPTIONS)

@@ -14990,3 +14990,472 @@ def test_pr_loop_writes_run_end_when_managed_label_cleanup_raises(tmp_path, monk
     assert calls
     assert [r["record"] for r in load_records(telemetry_log_path())] == ["run-start", "run-end"]
     assert runner.telemetry_attribution is None
+
+
+# --- Stall streak retirement: issue-text edit and reset flag (#1112) ---------
+
+
+def _m1112_primary_checkpoints(runner):
+    return [
+        record
+        for record in _plan_round_records(runner)
+        if record.phase == "scheduler-prelaunch" and record.scheduler_phase == "primary"
+    ]
+
+
+def _m1112_rerun(history, config, *, issue_payload=None, comments=(), **runner_kwargs):
+    runner = _FakeRunner(
+        issue_comments=[*history, *comments],
+        issue_payload=issue_payload,
+        **runner_kwargs,
+    )
+    error = None
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except AgentLoopError as exc:
+        error = exc
+    return runner, error
+
+
+def _m1112_approvals():
+    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
+    return {
+        "codex_outputs": [
+            structured_plan_review(state="approved", prior_plan_item_dispositions=resolved)
+        ],
+        "gemini_outputs": [
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=resolved,
+            )
+        ],
+    }
+
+
+def _m1112_digest_record(index, round_number, digest, *, reset=False):
+    record = _m1103_checkpoint(index, round_number)
+    return PostedRoundRecord(
+        index=index,
+        metadata=replace(
+            record.metadata,
+            scheduler_issue_digest=digest,
+            scheduler_stall_reset=reset,
+        ),
+        body="",
+    )
+
+
+def test_stalled_checkpoints_record_the_issue_digest(tmp_path):
+    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    digests = {record.scheduler_issue_digest for record in _m1112_primary_checkpoints(runner)}
+    assert len(digests) == 1 and re.fullmatch(r"[0-9a-f]{16}", digests.pop())
+    assert not any(r.scheduler_stall_reset for r in _plan_round_records(runner))
+
+
+def test_issue_edit_retires_the_stalled_streak(tmp_path):
+    """`edit-retires-streak`."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    old_digest = _m1112_primary_checkpoints(runner)[0].scheduler_issue_digest
+
+    rerun, _error = _m1112_rerun(
+        history,
+        config,
+        issue_payload={"body": "Narrowed issue body with explicit non-goals."},
+        **_m1112_approvals(),
+    )
+    assert "codex" in _m1103_agent_calls(rerun)
+    new_checkpoints = [
+        record
+        for record in _m1112_primary_checkpoints(rerun)
+        if record.round_number == 3
+    ]
+    assert new_checkpoints
+    assert new_checkpoints[0].scheduler_issue_digest not in (None, old_digest)
+    assert not any(r.scheduler_force_full for r in _plan_round_records(rerun))
+    assert not any(r.scheduler_stall_reset for r in _plan_round_records(rerun))
+
+
+def test_issue_edit_with_blocking_primary_opens_no_panel(tmp_path):
+    """`edit-retires-streak`: retirement itself never opens the panel."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    _fresh, base = _m1103_fresh_base()
+    _codex, _claude, base = _m1103_blocking_chain(1, 2, base=base)
+    codex, claude, _base = _m1103_blocking_chain(3, 4, base=base)
+
+    rerun = _FakeRunner(
+        issue_comments=list(history),
+        issue_payload={"body": "Narrowed issue body with explicit non-goals."},
+        codex_outputs=codex,
+        claude_outputs=claude,
+    )
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    # Two new blocking rounds ran under the new text, then the stop re-tripped.
+    assert _m1103_agent_calls(rerun) == ["codex", "claude", "codex", "claude"]
+    records = _plan_round_records(rerun)
+    assert not any(r.scheduler_force_full for r in records)
+    assert not any(r.scheduler_stall_reset for r in records)
+    assert not any(
+        r.scheduler_phase in {"secondary-audit", "remediation", "final-secondary-sweep", "full-board"}
+        for r in records
+    )
+    assert not any(
+        r.role == "reviewer" and r.agent != "Codex" for r in records
+    )
+
+
+def test_unchanged_issue_with_new_comment_still_stops(tmp_path):
+    """`unchanged-rerun-stops`."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    before = len(_plan_round_records(runner))
+
+    rerun, error = _m1112_rerun(
+        history,
+        config,
+        comments=[{"author": "operator", "body": "Please narrow the scope."}],
+    )
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert _m1103_agent_calls(rerun) == []
+    assert "a comment alone does not" in str(error)
+    assert len(_plan_round_records(rerun)) == before
+
+
+def test_legacy_undigested_rounds_keep_counting_and_name_the_reset_flag(tmp_path):
+    """`legacy-undigested`."""
+    with patch.object(orchestrator_module, "plan_issue_text_digest", lambda _ctx: None):
+        runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    assert all(
+        record.scheduler_issue_digest is None for record in _m1112_primary_checkpoints(runner)
+    )
+
+    rerun, error = _m1112_rerun(
+        history, config, issue_payload={"body": "Edited after the stall."}
+    )
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert _m1103_agent_calls(rerun) == []
+    assert "predate issue-text tracking" in str(error)
+    assert "--plan-reset-stall-streak" in str(error)
+
+
+def _m1112_crash_at_checkpoint(history, config, *, after_post):
+    """A flagged run killed at its first scheduler checkpoint post."""
+    runner = _FakeRunner(issue_comments=list(history), **_m1112_approvals())
+    real_post = orchestrator_module.post_issue_comment
+
+    def crashing_post(*args, **kwargs):
+        if "Plan review scheduling audit" in str(kwargs.get("body", "")):
+            if after_post:
+                real_post(*args, **kwargs)
+            raise KeyboardInterrupt("simulated crash at the prelaunch checkpoint")
+        return real_post(*args, **kwargs)
+
+    with patch.object(orchestrator_module, "post_issue_comment", crashing_post):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner
+
+
+def _m1112_no_panel_or_force_full(runner):
+    records = _plan_round_records(runner)
+    assert not any(r.scheduler_force_full for r in records)
+    assert not any(
+        r.scheduler_phase in {"secondary-audit", "full-board"} for r in records
+    )
+    assert "gemini" not in _m1103_agent_calls(runner)
+
+
+def test_reset_flag_durably_retires_the_streak(tmp_path):
+    """`reset-flag-durable`: the reset checkpoint bounds later flagless reruns."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    _fresh, base = _m1103_fresh_base()
+    _codex, _claude, base = _m1103_blocking_chain(1, 2, base=base)
+    codex, claude, _base = _m1103_blocking_chain(3, 4, base=base)
+
+    flagged = _FakeRunner(
+        issue_comments=list(history), codex_outputs=codex, claude_outputs=claude
+    )
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        run_issue_loop(
+            flagged,
+            issue_number=56,
+            config=replace(config, plan_reset_stall_streak=True),
+            plan_first=True,
+        )
+    # The flagged run gets rounds 3 and 4 (two new blocking rounds), and only
+    # the invocation's first primary checkpoint carries the marker.
+    assert _m1103_agent_calls(flagged) == ["codex", "claude", "codex", "claude"]
+    marked = [r for r in _plan_round_records(flagged) if r.scheduler_stall_reset]
+    assert [r.round_number for r in marked] == [3]
+    assert marked[0].scheduler_phase == "primary"
+    _m1112_no_panel_or_force_full(flagged)
+
+    # A flagless rerun of that history stops again only because N new blocking
+    # rounds followed the reset checkpoint, never the two older ones.
+    later = _FakeRunner(issue_comments=list(flagged.issue_comments))
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        run_issue_loop(later, issue_number=56, config=config, plan_first=True)
+    assert _m1103_agent_calls(later) == []
+
+
+def test_reset_interrupted_before_checkpoint_stops_again(tmp_path):
+    """`reset-interrupted-before-checkpoint`: nothing durable, still stops."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    crashed = _m1112_crash_at_checkpoint(
+        history, replace(config, plan_reset_stall_streak=True), after_post=False
+    )
+    assert crashed.issue_comments == history
+    assert not any(r.scheduler_stall_reset for r in _plan_round_records(crashed))
+
+    rerun, error = _m1112_rerun(crashed.issue_comments, config)
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert "blocked 2" in str(error)
+    assert _m1103_agent_calls(rerun) == []
+
+
+def test_reset_interrupted_after_checkpoint_resumes_the_primary_review(tmp_path):
+    """`reset-interrupted-after-checkpoint`: the posted marker is a boundary."""
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    crashed = _m1112_crash_at_checkpoint(
+        history, replace(config, plan_reset_stall_streak=True), after_post=True
+    )
+    marked = [r for r in _plan_round_records(crashed) if r.scheduler_stall_reset]
+    assert [r.round_number for r in marked] == [3]
+    assert _m1103_agent_calls(crashed) == []
+
+    rerun, error = _m1112_rerun(crashed.issue_comments, config, **_m1112_approvals())
+    assert not (
+        isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+        and "blocked" in str(error)
+    )
+    assert "codex" in _m1103_agent_calls(rerun)
+    # No second reset marker and no panel or force-full before primary approval.
+    assert [
+        r.round_number for r in _plan_round_records(rerun) if r.scheduler_stall_reset
+    ] == [3]
+    records = _plan_round_records(rerun)
+    assert not any(r.scheduler_force_full for r in records)
+    # The resumed round runs primary-only; the panel opens only after the
+    # primary's own approval, never on the reset.
+    round_three = [
+        r for r in records
+        if r.phase == "scheduler-prelaunch" and r.round_number == 3
+    ]
+    assert round_three
+    assert all(r.scheduler_phase == "primary" for r in round_three)
+
+
+def test_streak_ends_at_a_digest_mismatch_and_reaccumulates():
+    """`streak-reaccumulates`."""
+    records = []
+    for number, digest in ((1, "a" * 16), (2, "a" * 16), (3, "b" * 16), (4, "b" * 16)):
+        records.append(_m1112_digest_record(len(records), number, digest))
+        records.append(_m1103_review(len(records), number, "blocking"))
+    detail = orchestrator_module.plan_primary_blocking_streak_detail
+    assert detail(records, primary="Codex", current_issue_digest="b" * 16).count == 2
+    assert detail(records, primary="Codex", current_issue_digest="a" * 16).count == 0
+    # No current digest: nothing can mismatch.
+    assert detail(records, primary="Codex").count == 4
+    assert not detail(records, primary="Codex", current_issue_digest="b" * 16).legacy_undigested
+
+
+def test_absent_digest_counts_and_is_flagged_legacy():
+    records = _m1103_rounds("blocking", "blocking")
+    detail = orchestrator_module.plan_primary_blocking_streak_detail(
+        records, primary="Codex", current_issue_digest="c" * 16
+    )
+    assert detail.count == 2 and detail.legacy_undigested
+
+
+def test_mixed_history_flags_legacy_only_when_the_newest_round_is_undigested():
+    """An edit ends the streak at a newer digested round; no reset is needed."""
+    detail = orchestrator_module.plan_primary_blocking_streak_detail
+    old = _m1103_rounds("blocking", "blocking")
+    records = list(old)
+    records.append(_m1112_digest_record(len(records), 3, "a" * 16))
+    records.append(_m1103_review(len(records), 3, "blocking"))
+    unchanged = detail(records, primary="Codex", current_issue_digest="a" * 16)
+    assert unchanged.count == 3 and not unchanged.legacy_undigested
+    edited = detail(records, primary="Codex", current_issue_digest="b" * 16)
+    assert edited.count == 0
+    # Newest counted round undigested: an edit cannot retire it.
+    newest_legacy = [
+        _m1112_digest_record(0, 1, "a" * 16),
+        _m1103_review(1, 1, "blocking"),
+        _m1103_checkpoint(2, 2),
+        _m1103_review(3, 2, "blocking"),
+    ]
+    flagged = detail(newest_legacy, primary="Codex", current_issue_digest="b" * 16)
+    assert flagged.count == 1 and flagged.legacy_undigested
+    assert flagged.undigested_prefix == 1
+
+
+def test_mixed_history_warns_only_when_undigested_rounds_alone_reach_threshold():
+    """Older digested round then a newer undigested one: an edit still clears."""
+    detail = orchestrator_module.plan_primary_blocking_streak_detail
+    message = orchestrator_module.plan_primary_stall_message
+    threshold = 2
+    records = [
+        _m1112_digest_record(0, 1, "a" * 16),
+        _m1103_review(1, 1, "blocking"),
+        _m1103_checkpoint(2, 2),
+        _m1103_review(3, 2, "blocking"),
+    ]
+    tripped = detail(records, primary="Codex", current_issue_digest="a" * 16)
+    assert tripped.count == threshold
+    assert tripped.undigested_prefix == 1
+    assert not tripped.edit_cannot_clear(threshold)
+    text = message(
+        streak=tripped.count,
+        threshold=threshold,
+        plan_chars=1,
+        legacy_undigested=tripped.edit_cannot_clear(threshold),
+    )
+    assert "predate issue-text tracking" not in text
+    assert "edit the issue title or body" in text
+    # The advertised edit really clears the stop: only the undigested round
+    # is left counting, below the threshold.
+    edited = detail(records, primary="Codex", current_issue_digest="b" * 16)
+    assert edited.count == 1 < threshold
+
+    # Two undigested newest rounds alone reach the threshold: an edit leaves
+    # the stop tripped, so the diagnostic must require the reset flag.
+    legacy_heavy = [
+        _m1112_digest_record(0, 1, "a" * 16),
+        _m1103_review(1, 1, "blocking"),
+        _m1103_checkpoint(2, 2),
+        _m1103_review(3, 2, "blocking"),
+        _m1103_checkpoint(4, 3),
+        _m1103_review(5, 3, "blocking"),
+    ]
+    heavy = detail(legacy_heavy, primary="Codex", current_issue_digest="a" * 16)
+    assert heavy.count == 3 and heavy.undigested_prefix == 2
+    assert heavy.edit_cannot_clear(threshold)
+    assert not heavy.edit_cannot_clear(3)
+    edited_heavy = detail(legacy_heavy, primary="Codex", current_issue_digest="b" * 16)
+    assert edited_heavy.count == 2 >= threshold
+    heavy_text = message(
+        streak=heavy.count,
+        threshold=threshold,
+        plan_chars=1,
+        legacy_undigested=heavy.edit_cannot_clear(threshold),
+    )
+    assert "predate issue-text tracking" in heavy_text
+    assert "--plan-reset-stall-streak is required" in heavy_text
+
+
+def test_reset_checkpoint_is_a_boundary_with_or_without_a_review():
+    old = _m1103_rounds("blocking", "blocking")
+    reviewed = [*old, _m1112_digest_record(len(old), 3, None, reset=True)]
+    reviewed.append(_m1103_review(len(reviewed), 3, "blocking"))
+    assert _m1103_streak(reviewed) == 1
+    # Interrupted after the checkpoint: the reset still shields older rounds.
+    interrupted = [*old, _m1112_digest_record(len(old), 3, None, reset=True)]
+    assert _m1103_streak(interrupted) == 0
+    # A flagless restart re-posting an unmarked checkpoint keeps the boundary.
+    restarted = [*interrupted, _m1103_checkpoint(len(interrupted), 3)]
+    assert _m1103_streak(restarted) == 0
+    later = [*reviewed, *_m1103_rounds("blocking", "blocking", start=4)]
+    later = [
+        record if i < len(reviewed) else PostedRoundRecord(
+            index=i, metadata=record.metadata, body=""
+        )
+        for i, record in enumerate(later)
+    ]
+    assert _m1103_streak(later) == 3
+
+
+def test_stall_message_names_every_working_remedy():
+    message = orchestrator_module.plan_primary_stall_message(
+        streak=8, threshold=8, plan_chars=90212
+    )
+    for needle in (
+        "edit the issue title or body",
+        "a comment alone does not",
+        "--plan-reset-stall-streak",
+        "--plan-review-force-full",
+        "--plan-primary-stall-rounds",
+        "no reviewer and no planner turn were invoked",
+    ):
+        assert needle in message
+    assert "predate issue-text tracking" not in message
+    legacy = orchestrator_module.plan_primary_stall_message(
+        streak=8, threshold=8, plan_chars=1, legacy_undigested=True
+    )
+    assert "predate issue-text tracking" in legacy
+
+
+from coding_review_agent_loop.round_transport import decode_mapping  # noqa: E402
+
+
+def _m1112_first_primary_payload(runner):
+    for comment in runner.issue_comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is None:
+            continue
+        payload = decode_mapping(match.group("payload"))
+        if payload.get("phase") == "scheduler-prelaunch":
+            return payload
+    raise AssertionError("no scheduler checkpoint")
+
+
+def test_issue_digest_and_reset_fields_are_strictly_validated(tmp_path):
+    """`malformed-fields` and `all-reviewers-unaffected` at the codec."""
+    from coding_review_agent_loop.round_state import (
+        _decode_round_metadata_mapping,
+        _encode_round_metadata,
+    )
+
+    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    base = _m1112_first_primary_payload(runner)
+    assert _decode_round_metadata_mapping(base).scheduler_metadata_status == "valid"
+    good_digest = base["scheduler_issue_digest"]
+    assert re.fullmatch(r"[0-9a-f]{16}", good_digest)
+
+    def status(**changes):
+        payload = {**base, **changes}
+        return _decode_round_metadata_mapping(payload).scheduler_metadata_status
+
+    assert status(scheduler_stall_reset=True) == "valid"
+    assert status(scheduler_issue_digest="XYZ") == "invalid"
+    assert status(scheduler_issue_digest=None) == "invalid"
+    assert status(scheduler_stall_reset=False) == "invalid"
+    assert status(scheduler_stall_reset="yes") == "invalid"
+    assert status(scheduler_stall_reset=True, scheduler_phase="full-board") == "invalid"
+    assert status(flow="pr") == "invalid"
+
+    # Unset fields serialize with no new keys (byte-stable legacy shape).
+    decoded = _decode_round_metadata_mapping(base)
+    unset = replace(decoded, scheduler_issue_digest=None, scheduler_stall_reset=False)
+    legacy = decode_mapping(_encode_round_metadata(unset))
+    assert "scheduler_issue_digest" not in legacy
+    assert "scheduler_stall_reset" not in legacy
+    # A record carrying only the new keys is not classified absent.
+    only_new = {"flow": "plan", "role": "summary", "agent": "Orchestrator",
+                "round_number": 1, "subject": "s", "scheduler_stall_reset": True}
+    assert _decode_round_metadata_mapping(only_new).scheduler_metadata_status == "invalid"
+
+
+def test_all_reviewers_policy_writes_no_digest_or_reset_fields(tmp_path):
+    fresh = structured_v1_plan_state()
+    runner = _FakeRunner(
+        claude_outputs=[fresh],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except AgentLoopError:
+        pass
+    records = _plan_round_records(runner)
+    assert not any(
+        r.scheduler_issue_digest is not None or r.scheduler_stall_reset for r in records
+    )

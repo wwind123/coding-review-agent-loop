@@ -811,3 +811,21 @@ def test_approved_plan_step_summary_requires_one_exact_canonical_block():
     # A prefix match against a longer final step is not the canonical block.
     prefix = "### Plan steps\n1. Only step. And more."
     assert _summarize_approved_plan_steps(prefix, plan_steps=["Only step."], plan_comment_url=None) == prefix
+
+
+def test_isolated_config_does_not_inherit_plan_reset_stall_streak(tmp_path):
+    """`config-and-inheritance` (#1112)."""
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+        plan_reset_stall_streak=True,
+    )
+    isolated_config, isolated_dir = _isolated_provider_config(config, "claude", "")
+    try:
+        assert isolated_config.plan_reset_stall_streak is False
+    finally:
+        import shutil
+
+        shutil.rmtree(isolated_dir, ignore_errors=True)
