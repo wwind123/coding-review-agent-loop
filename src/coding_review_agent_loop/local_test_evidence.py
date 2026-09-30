@@ -380,7 +380,9 @@ class LocalTestObservation:
         if _TRUNCATED_CAVEAT in command_caveats:
             caveats.append(_TRUNCATED_CAVEAT)
             if _ARGV_OMITTED_CAVEAT not in caveats:
-                fits = sum(len(t.encode()) for t in tokens) <= MAX_SAFE_ARGV_BYTES
+                fits = sum(
+                    len(t.encode()) for t in tokens
+                ) <= MAX_SAFE_ARGV_BYTES and _argv_tail_is_safe(tokens)
                 if not fits:
                     caveats.extend((_CAPTURE_LIMITED_CAVEAT, _ARGV_OMITTED_CAVEAT))
                     if outcome == "passed":
@@ -487,6 +489,31 @@ def _apply_command_parse_guard(observation: LocalTestObservation) -> LocalTestOb
         outcome="incomplete",
         caveats=tuple(dict.fromkeys((*fallback, *observation.caveats))),
     )
+
+
+_SAFE_FLAG_RE = re.compile(r"-{1,2}[A-Za-z][A-Za-z0-9_-]*")
+_PLACEHOLDER_TOKEN_RE = re.compile(r"[^\s<>]*<[a-z-]+:[0-9a-f]{16}>[^\s<>]*")
+
+
+def _argv_tail_is_safe(tokens: Sequence[str]) -> bool:
+    """Whether every token the bounded display did not show is verifiably safe.
+
+    The durable argv extends past the 512-byte display, and redaction leaves
+    unrecognised ``-`` options and short positionals verbatim.  Only bare
+    flags, digest placeholders and repo-relative paths are trusted there.
+    """
+    shown = 0
+    for index, token in enumerate(tokens):
+        shown = len(shlex.join(tokens[: index + 1]).encode())
+        if shown <= MAX_SAFE_COMMAND_BYTES - 8:
+            continue
+        if not (
+            _SAFE_FLAG_RE.fullmatch(token)
+            or _PLACEHOLDER_TOKEN_RE.fullmatch(token)
+            or (_REPO_RELATIVE_RE.match(token) and "=" not in token)
+        ):
+            return False
+    return True
 
 
 def _is_downgraded(caveats: Iterable[str]) -> bool:
