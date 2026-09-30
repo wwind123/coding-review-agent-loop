@@ -6544,9 +6544,8 @@ def test_rejection_fails_closed_on_unparsable_secret_command():
 def test_rejection_keeps_truncated_projection_command_label():
     from coding_review_agent_loop.local_test_evidence import observation_from_mapping
 
-    argv = ["python", "-m", "pytest"] + [f"-{chr(97 + i % 26)}" for i in range(400)] + [
-        "SECRET_KEY=s3cr3t-value",
-    ]
+    # 152 short flags put the 512-byte display cut inside the quoted redacted token.
+    argv = ["python", "-m", "pytest"] + ["-q"] * 152 + ["SECRET_KEY=s3cr3t-value"]
     obs = observation_from_mapping({"command": argv, "outcome": "passed", "provenance": "parent-observed"})
     projected = type("P", (), {
         "outcome": "passed", "provenance": "parent-observed", "wrapper_bootstrap": "verified",
@@ -6561,6 +6560,7 @@ def test_rejection_keeps_truncated_projection_command_label():
         )
     message = str(excinfo.value)
     assert "unparsable" not in message
+    assert "<redacted:" in message
     assert "command: `python -m pytest" in message
     assert "s3cr3t-value" not in message
 
