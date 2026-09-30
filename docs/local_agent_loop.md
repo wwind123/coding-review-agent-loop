@@ -5908,7 +5908,7 @@ and the Playwright CLI (a direct `playwright` launcher such as
 `node_modules/.bin/playwright`, with the `test` subcommand as the first
 argument and every other option on a fixed allow-list with values only in
 `--name=value` form, so `--list`, `--help`, `--version`, zero-test-success
-flags such as `--pass-with-no-tests`, `--only-changed`, and `--last-failed`,
+flags such as `--pass-with-no-tests`, `--only-changed`, `--last-failed`, and `--shard`,
 interactive `--ui`/`--debug`, `--config`/`--tsconfig`/global-setup options,
 custom `--reporter` modules, and a non-empty `NODE_OPTIONS` or
 `PW_TEST_REPORTER` stay unrecognized; `npx`/`pnpm`/`yarn` launch forms are not

@@ -2517,7 +2517,8 @@ def _is_node_test_runner(arguments: Sequence[str]) -> bool:
 # Playwright ``test`` options accepted by the recognizer.  Allow-list only:
 # enumerate-and-exit (``--list``) and print-and-exit (``--help``/``--version``)
 # forms and zero-test-success forms (``--pass-with-no-tests``,
-# ``--only-changed``, ``--last-failed``) exit 0 without running a test;
+# ``--only-changed``, ``--last-failed``, ``--shard``, which disables the
+# "No tests found" failure) exit 0 without running a test;
 # code-loading options (``--config``/``-c``, ``--tsconfig``, global-setup
 # options, custom reporter modules) load arbitrary modules into the runner;
 # interactive modes (``--ui``, ``--debug``) are not suite runs.  The
@@ -2539,7 +2540,6 @@ _PLAYWRIGHT_TEST_VALUE_OPTIONS = frozenset({
     "--workers",
     "--retries",
     "--repeat-each",
-    "--shard",
     "--timeout",
     "--max-failures",
     "--global-timeout",

@@ -1063,6 +1063,8 @@ def test_playwright_test_is_a_recognized_inner_launcher(tmp_path, no_ambient_inv
         ["test", "--pass-with-no-tests"],
         ["test", "--only-changed"],
         ["test", "--last-failed"],
+        ["test", "--shard=1/1"],
+        ["test", "--shard=1/1", "--grep=nomatch"],
         ["test", "--ui"],
         ["test", "--debug"],
         ["test", "--", "x"],

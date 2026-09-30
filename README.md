@@ -1438,7 +1438,7 @@ stay unrecognized, as does a non-empty `NODE_OPTIONS`; probed as
 `node --version`), and the Playwright CLI (`playwright test ...`, with `test`
 as the first argument and every other option on a fixed allow-list in
 `--name=value` form, so `--list`, `--help`, `--version`, zero-test-success
-flags, `--config`/`--tsconfig`/global-setup options, custom reporters, and a
+flags (including `--shard`), `--config`/`--tsconfig`/global-setup options, custom reporters, and a
 non-empty `NODE_OPTIONS` or `PW_TEST_REPORTER` stay unrecognized; probed as
 `playwright --version`); other
 commands remain
