@@ -748,6 +748,9 @@ def no_ambient_invocation(monkeypatch):
     # design, which would fail positive node tests and let negative ones pass
     # for the wrong reason. Tests that exercise it set it explicitly.
     monkeypatch.delenv("NODE_OPTIONS", raising=False)
+    # Likewise a host-exported PW_TEST_REPORTER makes the probe refuse
+    # Playwright by design.
+    monkeypatch.delenv("PW_TEST_REPORTER", raising=False)
 
 
 @requires_system_env
@@ -1003,6 +1006,154 @@ def test_foreground_node_test_run_reports_verified_suite_start(tmp_path, monkeyp
 
     assert result.suite_start == "verified"
     assert result.passed
+
+
+def _fake_playwright(root):
+    launcher = root / "node_modules" / ".bin" / "playwright"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    return launcher
+
+
+_PW = "node_modules/.bin/playwright"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ["test"],
+        ["test", "--project=chromium"],
+        ["test", "tests/e2e/cost.spec.ts", "--reporter=line", "--workers=1"],
+        ["test", "--reporter=list,json", "--headed", "--grep=cost"],
+    ],
+)
+def test_playwright_test_is_a_recognized_inner_launcher(tmp_path, no_ambient_invocation, tail):
+    launcher = _fake_playwright(tmp_path)
+    environment = {"PATH": str(launcher.parent)}
+    expected = (str(launcher.resolve()), "--version")
+    assert runtime.recognized_inner_probe([_PW, *tail], cwd=tmp_path, environment=environment) == expected
+    assert runtime.recognized_inner_probe(["playwright", *tail], cwd=tmp_path, environment=environment) == (
+        str(launcher), "--version"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ["test", "--project=chromium", "--list"],
+        ["--list"],
+        ["--version"],
+        ["--help"],
+        ["test", "--help"],
+        ["test", "-h"],
+        ["test", "--version"],
+        [],
+        ["show-report"],
+        ["install"],
+        ["tests", "test"],
+        ["test", "--config=./evil.config.ts"],
+        ["test", "-c", "x"],
+        ["test", "--tsconfig=x"],
+        ["test", "--global-setup=./exit.js"],
+        ["test", "--reporter=./reporter.js"],
+        ["test", "--reporter=list,./r.js"],
+        ["test", "--reporter="],
+        ["test", "--project", "chromium"],
+        ["test", "--pass-with-no-tests"],
+        ["test", "--only-changed"],
+        ["test", "--last-failed"],
+        ["test", "--shard=1/1"],
+        ["test", "--shard=1/1", "--grep=nomatch"],
+        ["test", "--ui"],
+        ["test", "--debug"],
+        ["test", "--", "x"],
+        ["test", "-x"],
+    ],
+)
+def test_playwright_unsafe_forms_stay_unrecognized(tmp_path, monkeypatch, no_ambient_invocation, tail):
+    _fake_playwright(tmp_path)
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    argv = [_PW, *tail]
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path) is None
+    assert runtime.probe_inner_launcher(argv, cwd=tmp_path).state == "unknown"
+    assert calls == []
+
+
+def test_npx_playwright_stays_unrecognized(tmp_path, no_ambient_invocation):
+    assert runtime.recognized_inner_probe(["npx", "playwright", "test"], cwd=tmp_path) is None
+
+
+@pytest.mark.parametrize("name", ["NODE_OPTIONS", "PW_TEST_REPORTER"])
+def test_playwright_code_loading_environment_stays_unrecognized(tmp_path, monkeypatch, no_ambient_invocation, name):
+    _fake_playwright(tmp_path)
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
+    argv = [_PW, "test"]
+    environment = {**os.environ, name: "./evil.js"}
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path, environment=environment) is None
+    assert runtime.probe_inner_launcher(argv, cwd=tmp_path, environment=environment).state == "unknown"
+    assert runtime.recognized_inner_probe(
+        ["env", f"{name}=./evil.js", *argv], cwd=tmp_path, environment={**os.environ, name: ""}
+    ) is None
+    assert calls == []
+
+
+def test_playwright_probe_uses_only_version_argv(tmp_path, monkeypatch, no_ambient_invocation):
+    launcher = _fake_playwright(tmp_path)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "1.50.0", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    result = runtime.probe_inner_launcher([_PW, "test", "--project=chromium"], cwd=tmp_path)
+    assert result.state == "verified"
+    assert calls[0][0] == (str(launcher.resolve()), "--version")
+    assert calls[0][1]["timeout_seconds"] == 5.0
+
+
+def test_foreground_playwright_run_is_verified_and_list_is_not(tmp_path, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    _fake_playwright(tmp_path)
+    verified = runner_module.run_foreground_test(
+        [_PW, "test", "--project=chromium"], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert verified.suite_start == "verified"
+    assert runtime.launch_integrity_state(verified, wrapper_boundary=False) == "verified"
+    listed = runner_module.run_foreground_test(
+        [_PW, "test", "--project=chromium", "--list"], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert listed.suite_start != "verified"
+    assert runtime.launch_integrity_state(listed, wrapper_boundary=False) == "unverified"
+
+
+def test_cli_records_playwright_run_as_evidence_and_list_as_non_evidence(tmp_path, monkeypatch, no_ambient_invocation):
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "AGENT_LOOP_TEST_BROKER_ENDPOINT",
+        "AGENT_LOOP_TEST_BROKER_CAPABILITY",
+        "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    _fake_playwright(tmp_path)
+    base = ["run-tests", "--timeout-seconds", "30", "--memory-dir", str(memory), "--"]
+    assert main([*base, _PW, "test", "--project=chromium"]) == 0
+    first_rows = runtime.load_runtime_memory(memory)
+    assert len(first_rows) == 1
+    row = first_rows[0]
+    assert row["launch_integrity"] == "verified"
+    assert runtime.runtime_row_is_evidence(row)
+    assert main([*base, _PW, "test", "--project=chromium", "--list"]) == 0
+    new_rows = [item for item in runtime.load_runtime_memory(memory) if item not in first_rows]
+    assert len(new_rows) == 1
+    row = new_rows[0]
+    assert row["launch_integrity"] == "unverified"
+    assert not runtime.runtime_row_is_evidence(row)
 
 
 def test_lookalike_env_executable_is_not_stripped_from_probe(tmp_path, monkeypatch, no_ambient_invocation):

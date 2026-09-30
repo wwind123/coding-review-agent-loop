@@ -5903,7 +5903,16 @@ allow-list with values only in `--name=value` form, so print-and-exit options
 such as `--version`, `--help`, `--check`, or `--eval` stay unrecognized;
 startup-code options (`--import`, `--require`, loaders, `--test-global-setup`,
 `--env-file`, custom `--test-reporter` modules) and a non-empty `NODE_OPTIONS`
-also stay unrecognized because a preload can exit 0 before any test runs), agent-loop
+also stay unrecognized because a preload can exit 0 before any test runs),
+and the Playwright CLI (a direct `playwright` launcher such as
+`node_modules/.bin/playwright`, with the `test` subcommand as the first
+argument and every other option on a fixed allow-list with values only in
+`--name=value` form, so `--list`, `--help`, `--version`, zero-test-success
+flags such as `--pass-with-no-tests`, `--only-changed`, `--last-failed`, and `--shard`,
+interactive `--ui`/`--debug`, `--config`/`--tsconfig`/global-setup options,
+custom `--reporter` modules, and a non-empty `NODE_OPTIONS` or
+`PW_TEST_REPORTER` stay unrecognized; `npx`/`pnpm`/`yarn` launch forms are not
+recognized), agent-loop
 performs a fixed `--version` bootstrap probe
 under the same five-second bound. Other launchers are never classified from
 stderr or an exit code. Results carry independent `wrapper_bootstrap`,
