@@ -214,6 +214,9 @@ def _render_test_observation_citations(
         elif current_test_turn_id is None or observed.turn_id != current_test_turn_id:
             supported = False
             reason = "unverified: unknown or cross-turn receipt"
+        elif "capture-limited" in observed.caveats:
+            supported = False
+            reason = "unverified: receipt is capture-limited"
         elif redact_test_command(observed.command)[0] != safe_command:
             supported = False
             reason = "unverified: command disagrees with the parent journal"

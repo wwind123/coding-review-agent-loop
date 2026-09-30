@@ -1744,3 +1744,203 @@ def test_non_coder_launch_exports_attribution_for_standalone_run_tests(tmp_path,
     assert (row["run_id"], row["repo"], row["issue_number"]) == ("run-9", "o/r", 5)
     assert row["pr_number"] is None  # the stale inherited value was cleared
     assert row["lane"] == "standalone" and row["attribution_source"] == "environment"
+
+
+# --- #1139: truncated / malformed commands must not crash evidence handling ---
+
+import shlex as _shlex
+
+from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+from coding_review_agent_loop.local_test_evidence import (
+    MAX_SAFE_ARGV_BYTES,
+    LocalTestEvidence,
+    redact_observation,
+)
+
+
+def _long_argv(count: int = 40, width: int = 8) -> tuple[str, ...]:
+    return ("pytest", *(f"-k{i:02d} " + "x" * width for i in range(count)))
+
+
+def _obs(command, *, outcome="passed", caveats=(), receipt="r1", cwd="/checkout"):
+    return LocalTestObservation(
+        command=command,
+        outcome=outcome,
+        provenance="parent-observed",
+        receipt_id=receipt,
+        turn_id="t1",
+        cwd=cwd,
+        caveats=tuple(caveats),
+    )
+
+
+def _rows(encoded: str) -> list[dict]:
+    return json.loads(encoded)["observations"]
+
+
+def _cite(encoded: str, command: str, receipt="r1") -> str:
+    citation = SimpleNamespace(receipt_id=receipt, command=command, claim="passed")
+    return _render_test_observation_citations(
+        [citation], local_test_evidence=encoded, current_test_turn_id="t1"
+    )
+
+
+def test_redact_observation_does_not_reparse_truncated_display():
+    argv = _long_argv()
+    display = redact_test_command(argv)[0]
+    with pytest.raises(ValueError):
+        _shlex.split(display)  # precondition: the cut lands inside a quote
+    redacted = redact_observation(_obs(argv))
+    assert redacted.outcome == "passed"
+    assert redacted.command == tuple(argv)
+    assert redacted.normalized_command == display
+    assert "safe command truncated" in redacted.caveats
+
+
+def test_live_truncated_row_is_retained_with_argv():
+    encoded = bounded_evidence_for_round(LocalTestEvidence(observations=(_obs(_long_argv()),)))
+    (row,) = _rows(encoded)
+    assert row["argv"] == list(_long_argv())
+    assert row["outcome"] == "passed"
+    assert "safe command truncated" in row["caveats"]
+
+
+def test_restart_decode_roundtrip_is_stable():
+    first = bounded_evidence_for_round(LocalTestEvidence(observations=(_obs(_long_argv()),)))
+    decoded = decode_bounded_evidence(first)
+    assert decoded.observations[0].command == tuple(_long_argv())
+    assert decoded.observations[0].environment_state == environment_comparison_for_restart()
+    second = bounded_evidence_for_round(decoded)
+    a, b = _rows(first)[0], _rows(second)[0]
+    for key in ("command", "argv", "outcome", "caveats"):
+        assert a[key] == b[key]
+    third = bounded_evidence_for_round(decode_bounded_evidence(second))
+    assert second == third
+
+
+@pytest.mark.parametrize("width", [8, 300])
+def test_over_budget_argv_is_downgraded_on_every_path(width):
+    # width=300 keeps the cut inside a quote too; both variants exceed the budget
+    argv = _long_argv(count=20, width=width + 200)
+    assert sum(len(t.encode()) for t in argv) > MAX_SAFE_ARGV_BYTES
+    entries = [
+        LocalTestEvidence(observations=(_obs(argv),)),
+        {"observations": [_obs(argv).to_dict()]},
+    ]
+    for entry in entries:
+        encoded = bounded_evidence_for_round(entry)
+        for candidate in (encoded, bounded_evidence_for_round(decode_bounded_evidence(encoded))):
+            (row,) = _rows(candidate)
+            assert "argv" not in row
+            assert row["caveats"][0] == "capture-limited"
+            assert row["outcome"] == "incomplete"
+            assert json.loads(candidate)["capture_incomplete"] is True
+            assert "unverified: receipt is capture-limited" in _cite(
+                candidate, redact_test_command(argv)[0]
+            )
+
+
+def test_malformed_string_command_through_mapping():
+    row = _obs(("x",)).to_dict()
+    row["command"] = "pytest 'unterminated"
+    encoded = bounded_evidence_for_round({"observations": [row]})
+    (out,) = _rows(encoded)
+    assert out["outcome"] == "incomplete"
+    assert out["caveats"][0] == "capture-limited"
+    assert out["caveats"][1].startswith("unparsable command:")
+    assert json.loads(encoded)["capture_incomplete"] is True
+    decoded = decode_bounded_evidence(encoded)
+    assert decoded.capture_incomplete is True
+
+
+def test_malformed_string_command_in_evidence_object():
+    encoded = bounded_evidence_for_round(
+        LocalTestEvidence(observations=(_obs("pytest 'unterminated"),))
+    )
+    (row,) = _rows(encoded)
+    assert row["outcome"] == "incomplete"
+    assert "argv" not in row
+    assert row["caveats"][:2][0] == "capture-limited"
+    assert json.loads(encoded)["capture_incomplete"] is True
+    assert "unverified: receipt is capture-limited" in _cite(encoded, "pytest 'unterminated")
+
+
+def test_direct_redact_observation_guards_string_command():
+    redacted = redact_observation(
+        _obs("pytest 'oops", caveats=("a", "b", "c", "d"))
+    )
+    assert redacted.command == ("pytest 'oops",)
+    assert redacted.outcome == "incomplete"
+    assert redacted.caveats[0] == "capture-limited"
+    assert redacted.caveats[1].startswith("unparsable command:")
+    assert redacted.caveats[2:] == ("a", "b", "c", "d")
+    assert redacted.to_dict()["caveats"][0] == "capture-limited"
+
+
+def test_citation_rejects_capture_limited_row():
+    obs = _obs(("pytest", "tests/a.py"), caveats=("capture-limited",))
+    encoded = bounded_evidence_for_round(LocalTestEvidence(observations=(obs,)))
+    rendered = _cite(encoded, "pytest tests/a.py")
+    assert "unverified: receipt is capture-limited" in rendered
+    ok = bounded_evidence_for_round(
+        LocalTestEvidence(observations=(_obs(("pytest", "tests/a.py")),))
+    )
+    assert "verified against the parent journal" in _cite(ok, "pytest tests/a.py")
+
+
+def test_caveat_collision_keeps_all_four_signals():
+    argv = _long_argv(count=20, width=400)
+    obs = _obs(
+        "pytest 'x",
+        caveats=("out-of-checkout context", "e1", "e2", "e3"),
+    )
+    obs = LocalTestObservation(
+        **{**obs.__dict__, "command": argv, "caveats": (
+            evidence_module.OUT_OF_CHECKOUT_CONTEXT_CAVEAT,
+            "capture-limited",
+            "unparsable command: boom",
+            "e1", "e2",
+        )}
+    )
+    caveats = obs.to_dict()["caveats"]
+    assert caveats == [
+        evidence_module.OUT_OF_CHECKOUT_CONTEXT_CAVEAT,
+        "capture-limited",
+        "unparsable command: boom",
+        "safe command truncated; argv omitted",
+    ]
+    within = _obs(_long_argv(), caveats=(evidence_module.OUT_OF_CHECKOUT_CONTEXT_CAVEAT,))
+    assert "safe command truncated" in within.to_dict()["caveats"]
+
+
+def test_redaction_is_idempotent_for_placeholders():
+    argv = (
+        "pytest",
+        "https://user:pw@example.com/x",
+        "Authorization: Bearer abc",
+        "--token=s3cret",
+        "API_KEY=zzz",
+        "tests/test_a.py::test_x[some param]",
+        "HOME=/tmp/x",
+    )
+    once = redact_observation(_obs(argv))
+    twice = redact_observation(once)
+    assert twice.command == once.command
+    assert twice.normalized_command == once.normalized_command
+    assert "pw" not in " ".join(once.command)
+    encoded = bounded_evidence_for_round(LocalTestEvidence(observations=(_obs(argv),)))
+    again = bounded_evidence_for_round(decode_bounded_evidence(encoded))
+    assert _rows(encoded)[0]["command"] == _rows(again)[0]["command"]
+
+
+def test_public_contract_and_short_rows_unchanged():
+    command, ids, caveats = redact_test_command(("pytest", "tests/a.py"))
+    assert (command, ids, caveats) == ("pytest tests/a.py", (), ())
+    assert "argv" not in _obs(("pytest", "tests/a.py")).to_dict()
+
+
+def test_issue_reproduction_does_not_raise():
+    encoded = bounded_evidence_for_round(
+        LocalTestEvidence(observations=(_obs(_long_argv(count=60)),))
+    )
+    assert decode_bounded_evidence(encoded) is not None

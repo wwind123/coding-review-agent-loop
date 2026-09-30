@@ -62,6 +62,7 @@ ATTRIBUTIONS = frozenset(
 )
 
 MAX_SAFE_COMMAND_BYTES = 512
+MAX_SAFE_ARGV_BYTES = 4 * 1024
 MAX_SAFE_IDENTIFIER_BYTES = 256
 MAX_SAFE_IDENTIFIERS = 8
 MAX_SAFE_CAVEAT_BYTES = 256
@@ -93,6 +94,7 @@ _SECRET_KEY_RE = re.compile(
 _SHELL_OPERATOR_RE = re.compile(r"(?:^|\s)(?:&&|\|\||[|;<>]|\$\(|`)")
 _PARAMETER_RE = re.compile(r"\[(?:[^\]]{1,160})\]$")
 _REDACTED_VALUE_RE = re.compile(r"<(?:redacted|sha256):[0-9a-f]{16}>")
+_USERINFO_PLACEHOLDER_RE = re.compile(r"<userinfo:[0-9a-f]{16}>")
 _REPO_RELATIVE_RE = re.compile(
     r"^(?:\.?\.?/)?(?:src|tests?|docs|helpers|lib|app|packages?)/[^\s]+$"
 )
@@ -367,16 +369,30 @@ class LocalTestObservation:
         return OUT_OF_CHECKOUT_CONTEXT_CAVEAT in self.caveats
 
     def public_projection(self) -> dict[str, object]:
-        command, _, _ = redact_test_command(
-            self.command,
-            cwd=Path(self.cwd) if self.cwd else None,
+        source = _apply_command_parse_guard(self)
+        tokens, command, _, command_caveats = _redact_command_tokens(
+            source.command,
+            cwd=Path(source.cwd) if source.cwd else None,
         )
+        caveats = list(source.caveats)
+        outcome = source.outcome
+        argv: list[str] | None = None
+        if _TRUNCATED_CAVEAT in command_caveats:
+            caveats.append(_TRUNCATED_CAVEAT)
+            if _ARGV_OMITTED_CAVEAT not in caveats:
+                fits = sum(len(t.encode()) for t in tokens) <= MAX_SAFE_ARGV_BYTES
+                if not fits:
+                    caveats.extend((_CAPTURE_LIMITED_CAVEAT, _ARGV_OMITTED_CAVEAT))
+                    if outcome == "passed":
+                        outcome = "incomplete"
+                elif not _is_downgraded(caveats):
+                    argv = list(tokens)
         projection = {
             "command": _bounded(command, MAX_SAFE_COMMAND_BYTES),
             "receipt_id": _safe_text(self.receipt_id or "", MAX_SAFE_IDENTIFIER_BYTES),
             "turn_id": _safe_text(self.turn_id or "", MAX_SAFE_IDENTIFIER_BYTES),
             "timestamp": _bounded(_safe_text(self.timestamp, 64), 64),
-            "outcome": self.outcome,
+            "outcome": outcome,
             "provenance": self.provenance,
             "scope": self.scope.to_dict(),
             "attribution": self.attribution.to_dict(),
@@ -386,12 +402,17 @@ class LocalTestObservation:
             "superseded_by": _safe_text(self.superseded_by or "", MAX_SAFE_IDENTIFIER_BYTES)
             if self.superseded_by
             else None,
-            "caveats": [_safe_text(item, MAX_SAFE_CAVEAT_BYTES) for item in self.caveats[:4]],
+            "caveats": [
+                _safe_text(item, MAX_SAFE_CAVEAT_BYTES)
+                for item in _prioritized_caveats(caveats)[:4]
+            ],
             "identifiers": [
                 _safe_text(item, MAX_SAFE_IDENTIFIER_BYTES)
                 for item in self.identifiers[:MAX_SAFE_IDENTIFIERS]
             ],
         }
+        if argv is not None:
+            projection["argv"] = argv
         # Keep the legacy wire size stable for restored rows while carrying
         # explicit state whenever a live runner supplied it.
         if (self.wrapper_bootstrap, self.inner_exec, self.suite_start) != (
@@ -436,6 +457,65 @@ def mark_out_of_checkout_context(
     return tuple(marked)
 
 
+_TRUNCATED_CAVEAT = "safe command truncated"
+_ARGV_OMITTED_CAVEAT = "safe command truncated; argv omitted"
+_CAPTURE_LIMITED_CAVEAT = "capture-limited"
+_UNPARSABLE_PREFIX = "unparsable command:"
+
+
+def _split_command_text(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split a command string; on failure return a single token and caveats."""
+    try:
+        return tuple(shlex.split(text)), ()
+    except ValueError as exc:
+        return (text,), (
+            _CAPTURE_LIMITED_CAVEAT,
+            f"{_UNPARSABLE_PREFIX} {_safe_text(exc)}",
+        )
+
+
+def _apply_command_parse_guard(observation: LocalTestObservation) -> LocalTestObservation:
+    """Downgrade a string command that cannot be parsed instead of raising (#1139)."""
+    if not isinstance(observation.command, str):
+        return observation
+    argv, fallback = _split_command_text(observation.command)
+    if not fallback:
+        return replace(observation, command=argv)
+    return replace(
+        observation,
+        command=argv,
+        outcome="incomplete",
+        caveats=tuple(dict.fromkeys((*fallback, *observation.caveats))),
+    )
+
+
+def _is_downgraded(caveats: Iterable[str]) -> bool:
+    return any(
+        item == _CAPTURE_LIMITED_CAVEAT or item.startswith(_UNPARSABLE_PREFIX)
+        for item in caveats
+    )
+
+
+def _prioritized_caveats(caveats: Iterable[str]) -> list[str]:
+    unique = list(dict.fromkeys(caveats))
+    has_omitted = _ARGV_OMITTED_CAVEAT in unique
+    first_unparsable = next((c for c in unique if c.startswith(_UNPARSABLE_PREFIX)), None)
+
+    def rank(item: str) -> int:
+        if item == OUT_OF_CHECKOUT_CONTEXT_CAVEAT:
+            return 1
+        if item == _CAPTURE_LIMITED_CAVEAT:
+            return 2
+        if item == first_unparsable:
+            return 3
+        if item in {_TRUNCATED_CAVEAT, _ARGV_OMITTED_CAVEAT}:
+            return 4
+        return 5
+
+    kept = [c for c in unique if not (has_omitted and c == _TRUNCATED_CAVEAT)]
+    return sorted(kept, key=rank)
+
+
 def _coerce_command(value: object) -> tuple[str, ...]:
     if isinstance(value, str):
         try:
@@ -473,7 +553,12 @@ def observation_from_mapping(
     registry: EnvironmentIdentityRegistry | None = None,
     default_provenance: str = "telemetry-unverified",
 ) -> LocalTestObservation:
-    command = _coerce_command(value.get("argv", value.get("command", ())))
+    raw_command = value.get("argv", value.get("command", ()))
+    fallback_caveats: tuple[str, ...] = ()
+    if isinstance(raw_command, str):
+        command, fallback_caveats = _split_command_text(raw_command)
+    else:
+        command = _coerce_command(raw_command)
     from .test_runtime import normalize_test_command
 
     base = cwd or Path.cwd()
@@ -489,7 +574,7 @@ def observation_from_mapping(
         environment_state = "unknown"
     return LocalTestObservation(
         command=command,
-        outcome=str(value.get("outcome", "incomplete")),
+        outcome="incomplete" if fallback_caveats else str(value.get("outcome", "incomplete")),
         provenance=str(value.get("provenance", default_provenance)),
         scope=EvidenceScope.from_value(value.get("scope")),
         receipt_id=str(value["receipt_id"]) if value.get("receipt_id") is not None else None,
@@ -505,7 +590,14 @@ def observation_from_mapping(
         attribution=_coerce_attribution(value.get("attribution", value.get("tree"))),
         environment_state=environment_state,
         environment_identity=environment_identity,
-        caveats=tuple(_safe_text(item) for item in value.get("caveats", ()) if item is not None),
+        caveats=tuple(
+            dict.fromkeys(
+                (
+                    *fallback_caveats,
+                    *(_safe_text(item) for item in value.get("caveats", ()) if item is not None),
+                )
+            )
+        ),
         identifiers=tuple(_safe_text(item, MAX_SAFE_IDENTIFIER_BYTES) for item in value.get("identifiers", ()) if item is not None),
         diagnostic=str(value["diagnostic"]) if value.get("diagnostic") is not None else None,
         claim=str(value["claim"]) if value.get("claim") is not None else None,
@@ -806,11 +898,9 @@ def parse_legacy_tests_run(
     for index, declaration in enumerate(tests_run):
         command_text = str(declaration)
         caveats: list[str] = ["legacy tests_run declaration; no parent receipt"]
-        try:
-            argv = tuple(shlex.split(command_text))
-        except ValueError as exc:
-            argv = (command_text,)
-            caveats.extend(("capture-limited", f"unparsable command: {_safe_text(exc)}"))
+        argv, fallback_caveats = _split_command_text(command_text)
+        if fallback_caveats:
+            caveats.extend(fallback_caveats)
             outcome = "incomplete"
         else:
             if not argv or _SHELL_OPERATOR_RE.search(command_text):
@@ -855,10 +945,10 @@ def _relativize_token(token: str, cwd: Path) -> str:
     return token
 
 
-def redact_test_command(
+def _redact_command_tokens(
     argv: Sequence[str] | str, *, cwd: Path | None = None, identifiers: Sequence[str] = ()
-) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
-    """Return a bounded safe command, identifiers, and redaction caveats."""
+) -> tuple[tuple[str, ...], str, tuple[str, ...], tuple[str, ...]]:
+    """Return redacted tokens plus the bounded command, identifiers and caveats."""
     base = cwd or Path.cwd()
     tokens = _coerce_command(argv)
     result: list[str] = []
@@ -905,7 +995,13 @@ def redact_test_command(
             result.append(f"{name}={safe_value}")
             continue
         token = _URL_USERINFO_RE.sub(
-            lambda match: match.group(1) + f"<userinfo:{_digest(match.group(2))}>", token
+            lambda match: match.group(1)
+            + (
+                match.group(2)
+                if _USERINFO_PLACEHOLDER_RE.fullmatch(match.group(2))
+                else f"<userinfo:{_digest(match.group(2))}>"
+            ),
+            token,
         )
         # Fix the deliberately compact lambda output without ever retaining
         # userinfo in a public string.
@@ -918,7 +1014,11 @@ def redact_test_command(
         token = _POSIX_PATH_RE.sub(lambda match: _relativize_token(match.group(0), base), token)
         auth_header = _AUTH_HEADER_RE.match(token)
         if auth_header:
-            token = auth_header.group(1) + f"<redacted:{_digest(auth_header.group(2))}>"
+            token = auth_header.group(1) + (
+                auth_header.group(2)
+                if _REDACTED_VALUE_RE.fullmatch(auth_header.group(2))
+                else f"<redacted:{_digest(auth_header.group(2))}>"
+            )
             caveats.append("authorization header redacted")
         parameter = _PARAMETER_RE.search(token)
         if parameter:
@@ -943,26 +1043,46 @@ def redact_test_command(
     command = shlex.join(result)
     if len(command.encode()) > MAX_SAFE_COMMAND_BYTES:
         command = _bounded(command, MAX_SAFE_COMMAND_BYTES)
-        caveats.append("safe command truncated")
+        caveats.append(_TRUNCATED_CAVEAT)
     safe_ids = tuple(_bounded(item, MAX_SAFE_IDENTIFIER_BYTES) for item in found_identifiers[:MAX_SAFE_IDENTIFIERS])
-    return command, safe_ids, tuple(
+    return tuple(result), command, safe_ids, tuple(
         dict.fromkeys(_bounded(item, MAX_SAFE_CAVEAT_BYTES) for item in caveats)
     )
 
 
+def redact_test_command(
+    argv: Sequence[str] | str, *, cwd: Path | None = None, identifiers: Sequence[str] = ()
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Return a bounded safe command, identifiers, and redaction caveats."""
+    _, command, safe_ids, caveats = _redact_command_tokens(
+        argv, cwd=cwd, identifiers=identifiers
+    )
+    return command, safe_ids, caveats
+
+
 def redact_observation(observation: LocalTestObservation) -> LocalTestObservation:
-    command, identifiers, command_caveats = redact_test_command(
+    observation = _apply_command_parse_guard(observation)
+    tokens, command, identifiers, command_caveats = _redact_command_tokens(
         observation.command, cwd=Path(observation.cwd) if observation.cwd else None,
         identifiers=observation.identifiers,
     )
     return replace(
         observation,
         normalized_command=command,
-        # Preserve argv boundaries so repeated durable projections are stable.
-        command=tuple(shlex.split(command)),
+        # Take the redacted argv directly: the bounded display may end inside
+        # a quoted token and must never be re-parsed (#1139).
+        command=tokens,
         identifiers=identifiers,
         caveats=tuple(dict.fromkeys((*observation.caveats, *command_caveats))),
         diagnostic=None,
+    )
+
+
+def _row_has_evidence_downgrade(caveats: object) -> bool:
+    return isinstance(caveats, list) and any(
+        isinstance(item, str)
+        and (item.startswith(_UNPARSABLE_PREFIX) or item == _ARGV_OMITTED_CAVEAT)
+        for item in caveats
     )
 
 
@@ -1025,7 +1145,8 @@ def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object
             for item in source_caveats
             if item is not None
         ],
-        "capture_incomplete": bool(source.get("capture_incomplete", False)),
+        "capture_incomplete": bool(source.get("capture_incomplete", False))
+        or any(_row_has_evidence_downgrade(row.get("caveats")) for row in all_details),
         "authoritative_failures": [
             _safe_text(item, MAX_SAFE_IDENTIFIER_BYTES)
             for item in source_failures
@@ -1124,7 +1245,12 @@ def decode_bounded_evidence(value: object) -> LocalTestEvidence | None:
     return LocalTestEvidence(
         observations=observations,
         caveats=tuple(_safe_text(item) for item in payload.get("caveats", ()) if item is not None),
-        capture_incomplete=bool(payload.get("capture_incomplete", False)),
+        capture_incomplete=bool(payload.get("capture_incomplete", False))
+        or any(
+            item.startswith(_UNPARSABLE_PREFIX)
+            for observation in observations
+            for item in observation.caveats
+        ),
         authoritative_failures=tuple(str(item) for item in payload.get("authoritative_failures", ()) if item),
         legacy_capture_limited=bool(payload.get("legacy_capture_limited", False)),
     )
