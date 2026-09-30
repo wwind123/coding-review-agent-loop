@@ -511,3 +511,20 @@ def test_relative_path_git_inside_checkout_is_refused(repo, config, tmp_path, mo
     )
     assert result["error"] == "git-untrusted-location"
     assert calls == []
+
+
+def test_status_probe_config_gate_refusal_voids_the_commit(repo, config):
+    real = tp.inspect_tool._subprocess_executor
+    gate_calls = []
+
+    def executor(argv, env, cwd, capture):
+        if argv[1:] and "config" in argv and "--list" in " ".join(argv):
+            gate_calls.append(1)
+            if len(gate_calls) == 3:  # rev-parse and ls-files gates passed
+                return ExecResult(1, b"", b"config changed")
+        return real(argv, env, cwd, capture)
+
+    result = _capture(config, executor=executor)
+    assert len(gate_calls) == 3
+    assert result["error"] == "config-gate-refused"
+    assert result["commit"] is None and result["dirty"] is None

@@ -150,6 +150,10 @@ def _capture(config, result, executor, which, deadline_seconds) -> None:
     except (_Stop, subprocess.TimeoutExpired):
         result["error"] = "git-timeout"
         return
+    except inspect_tool.InspectRejected:
+        # A config-gate refusal at any probe voids the record (approved contract).
+        result["commit"] = None
+        raise
     except Exception:  # noqa: BLE001 - the commit is already verified; keep it
         result["error"] = "git-status-failed"
         return
