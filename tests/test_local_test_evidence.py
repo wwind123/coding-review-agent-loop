@@ -2054,3 +2054,33 @@ def test_public_contract_and_short_rows_unchanged():
 def test_issue_reproduction_does_not_raise(tmp_path):
     encoded = _runner_encode(_obs(_quote_cut_argv(count=60)), tmp_path)
     assert decode_bounded_evidence(encoded) is not None
+
+
+@pytest.mark.parametrize("pad", [490, 495, 496, 497, 498])
+def test_untruncated_command_at_the_512_byte_boundary_is_not_sealed(pad):
+    argv = ("pytest", "--filter=" + "x" * pad)
+    joined = _shlex.join(argv)
+    display, _ids, caveats = redact_test_command(argv)
+    if len(joined.encode()) <= 512:
+        assert display == joined
+        assert "safe command truncated" not in caveats
+        (row,) = _rows(
+            bounded_evidence_for_round(LocalTestEvidence(observations=(_obs(argv),)))
+        )
+        assert row["command"] == joined
+        assert "argv" not in row
+        assert redact_observation(_obs(argv)).command == argv
+    else:
+        # Over the limit: the unverified selector is digested, not truncated.
+        assert "x" * pad not in display
+        assert "<arg-sha256:" in display
+
+
+def test_sealing_that_shrinks_command_under_the_limit_is_stable():
+    # Digesting the unverified tail can bring the join under 512 bytes; the
+    # display then shows every (digested) token and re-redaction is a no-op.
+    argv = ("pytest", "--pad=" + "x" * 480, "--a=" + "y" * 40)
+    once = redact_observation(_obs(argv))
+    twice = redact_observation(once)
+    assert twice.command == once.command
+    assert twice.normalized_command == once.normalized_command

@@ -519,18 +519,23 @@ def _seal_unverified_tail(tokens: Sequence[str]) -> list[str]:
     which keeps re-redaction idempotent.
     """
     result = list(tokens)
-    limit = MAX_SAFE_COMMAND_BYTES - 8
+    # _bounded keeps limit - 3 bytes and appends "...", so a token is fully
+    # displayed only when it ends within that prefix.
+    limit = MAX_SAFE_COMMAND_BYTES - 3
     while True:
         offset = -1  # shlex.join separates tokens with one space
-        changed = False
-        for index, token in enumerate(result):
+        offsets = []
+        for token in result:
             offset += 1 + len(shlex.quote(token).encode())
-            if offset <= limit or _tail_token_is_safe(token):
+            offsets.append(offset)
+        if not offsets or offsets[-1] <= MAX_SAFE_COMMAND_BYTES:
+            return result  # no truncation: the display shows every token
+        for index, token in enumerate(result):
+            if offsets[index] <= limit or _tail_token_is_safe(token):
                 continue
             result[index] = f"<arg-sha256:{_digest(token)}>"
-            changed = True
             break
-        if not changed:
+        else:
             return result
 
 
