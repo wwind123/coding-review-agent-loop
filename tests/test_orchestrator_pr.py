@@ -1351,7 +1351,7 @@ def test_selective_final_sweep_blocker_dispatches_coder_remediation(tmp_path, mo
     assert "final-sweep regression" in coder_commands[1][-1]
 
 
-def test_selective_owner_unavailability_stops_without_coder_redispatch(tmp_path, monkeypatch):
+def _run_selective_owner_unavailable(tmp_path, monkeypatch):
     def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
         return (
             json.dumps(
@@ -1405,10 +1405,53 @@ def test_selective_owner_unavailability_stops_without_coder_redispatch(tmp_path,
         max_rounds=3,
     )
 
-    with pytest.raises(AgentLoopError, match="all remaining resolution owners for item-1 are unavailable"):
+    with pytest.raises(AgentLoopError, match="missing required input from Codex") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
+    return runner, str(excinfo.value)
 
+
+def test_selective_owner_unavailability_stops_without_coder_redispatch(tmp_path, monkeypatch):
+    runner, message = _run_selective_owner_unavailable(tmp_path, monkeypatch)
+
+    assert "Detected in round 2" in message
+    # Only the round-1 coder turn ran; the round-2 detection stops before a second.
     assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == 1
+    # A validated amendment template goes to the error only, never the PR comment.
+    assert "Signed amendment template" in message
+    assert '"kind": "reviewer-board-amendment"' in message
+    incomplete = [body for body in runner.comments if "**Review status: Incomplete**" in body]
+    assert len(incomplete) == 1
+    assert "effective from round 2" in incomplete[0]
+    assert "reviewer-board-amendment" not in incomplete[0]
+    assert "```" not in incomplete[0]
+
+
+def test_unavailable_reviewer_amendment_rejected_prints_prose_only(tmp_path, monkeypatch):
+    def reject(*args, **kwargs):
+        raise AgentLoopError("cannot reduce")
+
+    monkeypatch.setattr(orchestrator, "amend_contract", reject)
+    runner, message = _run_selective_owner_unavailable(tmp_path, monkeypatch)
+
+    assert "cannot be reduced for this run" in message
+    assert "Signed amendment template" not in message
+    incomplete = [body for body in runner.comments if "**Review status: Incomplete**" in body]
+    assert len(incomplete) == 1
+    assert "cannot be reduced for this run" in incomplete[0]
+
+
+def test_unavailable_reviewer_advisory_lookup_failure_keeps_the_stop(tmp_path, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("lookup exploded")
+
+    monkeypatch.setattr(orchestrator, "_pr_amendment_start_round", broken)
+    runner, message = _run_selective_owner_unavailable(tmp_path, monkeypatch)
+
+    assert "lookup exploded" not in message
+    assert "Signed amendment template" not in message
+    assert "the round the rerun resumes into" in message
+    incomplete = [body for body in runner.comments if "**Review status: Incomplete**" in body]
+    assert len(incomplete) == 1
 
 
 def test_selective_resume_uses_a_valid_persisted_scheduler_checkpoint(tmp_path):
@@ -8498,17 +8541,29 @@ def test_pr_loop_quarantines_unavailable_reviewer_while_healthy_reviewer_finishe
         max_rounds=3,
     )
 
-    with pytest.raises(AgentLoopError, match="missing required input from Codex"):
+    with pytest.raises(AgentLoopError, match="missing required input from Codex") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
 
     codex_reviews = [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
     claude_reviews = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     gemini_coder_turns = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"]]
+    # Decided at detection (#1129): no coder follow-up and no later round.
     assert len(codex_reviews) == 1
-    assert len(claude_reviews) == 2
-    assert len(gemini_coder_turns) == 1
-    assert "**Review status: Incomplete**" in runner.comments[-1]
-    assert "Claude" in runner.comments[-1]
+    assert len(claude_reviews) == 1
+    assert gemini_coder_turns == []
+    message = str(excinfo.value)
+    assert "Detected in round 1" in message
+    assert "Blocking reviewers this round: Claude" in message
+    assert "Open must-fix items (including carried): 1" in message
+    assert "--reviewer flags" in message
+    assert "Signed amendment template" not in message
+    incomplete = [body for body in runner.comments if "**Review status: Incomplete**" in body]
+    assert len(incomplete) == 1
+    assert "- Codex: agent-unavailable" in incomplete[0]
+    assert "Claude" in incomplete[0]
+    assert "--reviewer flags" in incomplete[0]
+    assert "AGENT_" not in incomplete[0]
+    assert "{" not in incomplete[0]
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
 
 

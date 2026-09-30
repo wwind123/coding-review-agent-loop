@@ -1694,6 +1694,43 @@ def test_pr_loop_parallel_unavailable_reviewer_alongside_healthy_reviewer(tmp_pa
     assert any("Gemini approves the PR." in comment for comment in runner.comments)
 
 
+def test_pr_loop_parallel_unavailable_reviewer_with_blocking_peer_stops_in_round(tmp_path):
+    unavailable = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "agent_unavailable",
+            "retryable": False,
+            "category": "environment",
+            "summary": "The review checkout cannot access the diff.",
+            "suggested_action": "Repair the reviewer sandbox before retrying it.",
+        }
+    ) + "\n<!-- AGENT_UNAVAILABLE -->\n-- OpenAI Codex"
+    runner = FakeRunner(
+        codex_outputs=[unavailable],
+        gemini_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Needs a test.",
+                blocking_items=["Add a regression test."],
+                reviewer="Google Gemini",
+            )
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, max_rounds=3)
+
+    with pytest.raises(AgentLoopError, match="missing required input from Codex") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert "Detected in round 1" in str(excinfo.value)
+    assert "--reviewer flags" in str(excinfo.value)
+    assert sum(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands) == 0
+    assert sum(cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands) == 1
+    assert any("Finalization stops after reconciliation" in c for c in runner.comments)
+    assert not any("Finalization continues" in c for c in runner.comments)
+    assert any("Needs a test." in c for c in runner.comments)
+    assert "**Review status: Incomplete**" in runner.comments[-1]
+
+
 # ---------------------------------------------------------------------------
 # Quota precedence
 # ---------------------------------------------------------------------------

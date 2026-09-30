@@ -383,6 +383,22 @@ them. Both routes above are the intended migration path.
 
 ### Removing an unavailable reviewer from an in-flight run
 
+When a required PR reviewer becomes unavailable and the board has more than one
+reviewer, the PR run stops in the round where it is detected (#1129), after the
+other reviewers finish that round and before any evidence terminal record,
+coder turn, CI wait, qualification, or merge, even when peers left must-fix
+items. The `AgentLoopError` and an incomplete-review PR comment name the
+reviewer, its failure category, the detection round, the healthy and blocking
+reviewers, and the open must-fix count. The remedy depends on the policy:
+restore the backend and rerun unchanged (every policy); for scheduler-contract
+policies, a signed amendment (printed only after a dry run accepts it) plus a
+rerun with the original board; for `all-reviewers`, a rerun with the reviewer
+dropped from the `--reviewer` flags, except on strict managed-CI issue-created
+PRs where only restoring the backend works. When the board cannot be reduced
+(the primary or last secondary), only prose guidance is given. A stopped
+evidence pass is repeated in full on rerun. The PR comment never contains the
+amendment JSON.
+
 A persisted scheduler contract (the required reviewer board, the policy, and
 the primary) is immutable for the run. If one reviewer's backend becomes
 unavailable, for example because its quota is exhausted, rerunning without that
@@ -2435,8 +2451,9 @@ blocking or Same-PR disposition adds that reviewer as a pending owner; a
 non-owner resolved disposition is evidence only. Every owner must provide its
 own valid clearing disposition. If all remaining owners are unavailable, the
 run records an incomplete review and stops without another coder turn, CI,
-qualification, or merge. Mixed-owner obligations continue only with available
-owners while the unavailable reviewer remains required.
+qualification, or merge. More generally, any unavailable required reviewer
+stops the run with an incomplete review in the round where it is detected,
+whatever the obligation ownership (#1129).
 
 Scheduler checkpoints are written before reviewer launch and after
 reconciliation. They persist the immutable reviewer/policy/rule contract,
