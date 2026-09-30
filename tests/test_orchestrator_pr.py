@@ -16445,18 +16445,22 @@ def test_scheduler_stop_comment_carries_prose_and_error_carries_validated_templa
 def test_scheduler_stop_template_is_accepted_on_rerun_with_the_original_board(
     tmp_path, monkeypatch
 ):
-    """Row printed-amendment-accepted-on-rerun: the printed template round-trips."""
+    """Row printed-amendment-accepted-on-rerun: the template printed by the stop itself."""
     runner = _scheduler_stop_runner()
-    with pytest.raises(AgentLoopError, match="missing required input"):
-        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
-    with pytest.raises(AgentLoopError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=reduced)
-    _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
+    original = _staged_config(tmp_path, auto_merge=True)
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=original)
+    printed_round = int(re.search(r"effective from round (\d+)", _incomplete_comments(runner)[0]).group(1))
+    template = _m943_amendment_from_error(str(excinfo.value))
+    assert f'"effective_from_round": {printed_round}' in template
+    # Post the first stop's template as-is and rerun with the ORIGINAL board.
+    _m943_append(runner, template)
     monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
     mark = len(runner.commands)
-    assert run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, auto_merge=True)) == 0
+    assert run_pr_loop(runner, pr_number=77, config=original) == 0
     assert "agy" not in [cmd[0] for cmd in _stop_commands_after(runner, mark)]
+    assert any("Reviewer board amendment applied." in comment for comment in runner.comments)
+    assert not any("scheduler contract changed" in comment for comment in runner.comments)
 
 
 def test_scheduler_stop_with_primary_unavailable_is_prose_only_without_patching(tmp_path):
@@ -16587,19 +16591,53 @@ def test_incomplete_non_actionable_review_beside_a_blocking_peer_stops_at_detect
 
 
 def test_strict_managed_all_reviewers_stop_suggests_restore_only(tmp_path, monkeypatch):
-    """Row strict-managed-all-reviewers-restore-only."""
-    monkeypatch.setattr(orchestrator, "_managed_binding_protection_mode", lambda handoff: "strict")
-    runner, message = _all_reviewers_stop(
-        tmp_path,
+    """Row strict-managed-all-reviewers-restore-only on a real strict issue-created handoff."""
+    plan_board = ("codex", "claude", "antigravity")
+    monkeypatch.setattr(
+        orchestrator, "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    )
+    monkeypatch.setattr(
+        orchestrator, "_require_complete_canonical_plan_approval", lambda *a, **k: None
+    )
+    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="strict", override_nonce=None,
+    )
+    assert orchestrator._managed_binding_protection_mode(handoff) == "strict"
+    monkeypatch.setattr(
+        orchestrator, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff
+    )
+    monkeypatch.setattr(
+        orchestrator, "revalidate_issue_created_handoff", lambda *a, **k: k["handoff"]
+    )
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *a, **k: ManagedCiContract(protocol_version=2, protection_mode="strict"),
+    )
+    runner = FakeRunner(
         codex_outputs=[structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")],
         claude_outputs=[structured_pr_review(state="approved", summary="ok", reviewer="Anthropic Claude")],
+        antigravity_outputs=[_unavail("Antigravity")],
+        issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        pr_payload={"body": "Fixes #56"},
     )
+    config = make_config(
+        tmp_path, reviewer=plan_board, max_rounds=3, managed_ci=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(excinfo.value)
     assert "--reviewer flags" not in message
     assert "Reviewer board amendment:" not in message
     assert "Restore the reviewer backend" in message
     incomplete = _incomplete_comments(runner)
     assert len(incomplete) == 1
     assert "--reviewer flags" not in incomplete[0]
+    assert "reviewer-board amendment" not in incomplete[0]
 
 
 def test_carried_migration_obligation_is_not_revalidated_when_a_reviewer_is_unavailable(
