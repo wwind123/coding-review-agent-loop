@@ -228,6 +228,7 @@ from .split_materialization import (
     split_stage_proposal_from_deferred_stage,
     split_stage_proposal_from_text,
 )
+from . import tool_provenance
 from .logging import log, new_run_id, run_usage_summary_path
 from .evidence_reconciliation import (
     bounded_reconciliation_candidates,
@@ -2612,7 +2613,12 @@ def _new_usage_context(config: AgentLoopConfig) -> RunUsageContext:
     # run that received a usage context shares the outer latch (#1043).
     reset_host_footer_log_latch()
     run_id = new_run_id()
-    return RunUsageContext(run_id=run_id, summary_path=run_usage_summary_path(config, run_id))
+    return RunUsageContext(
+        run_id=run_id,
+        summary_path=run_usage_summary_path(config, run_id),
+        tool_provenance=tool_provenance.process_provenance(config),
+        run_started_at=datetime.datetime.now(datetime.UTC).isoformat(),
+    )
 
 
 def _begin_run_telemetry(
@@ -2680,7 +2686,8 @@ def _persist_usage_summary(config: AgentLoopConfig, usage_context: RunUsageConte
         "Usage summary written to "
         f"{usage_context.summary_path} "
         f"(calls={totals.call_count}, exact={totals.exact_calls}, "
-        f"partial={totals.partial_calls}, estimated={totals.estimated_calls})",
+        f"partial={totals.partial_calls}, estimated={totals.estimated_calls}, "
+        f"{tool_provenance.format_tool_commit_suffix(usage_context.tool_provenance)})",
     )
 
 
@@ -3620,6 +3627,8 @@ def _run_validated_agent(
             else prompt
         )
         pending_contract_reprompt = None
+        if usage_context is not None:
+            usage_context.note_agent_dispatch()
         result = run_agent_result(
             runner,
             agent=agent,

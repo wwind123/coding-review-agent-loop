@@ -16,6 +16,26 @@ def _no_real_repair():
         yield
 
 
+STUB_TOOL_PROVENANCE = {
+    "package_path": "/stub/src/coding_review_agent_loop",
+    "checkout_root": "/stub",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "dirty": False,
+    "dirty_paths_sample": [],
+    "error": None,
+    "captured_at": "2026-01-01T00:00:00+00:00",
+    "process_started_at": "2026-01-01T00:00:00+00:00",
+}
+
+
+@pytest.fixture(autouse=True)
+def _stub_tool_provenance(monkeypatch):
+    """Keep tests deterministic: no real git probe of the tool checkout (#1111)."""
+    import coding_review_agent_loop.tool_provenance as tp
+
+    monkeypatch.setattr(tp, "_PROCESS_PROVENANCE", dict(STUB_TOOL_PROVENANCE))
+
+
 @pytest.fixture(autouse=True)
 def _agent_commands_available(monkeypatch):
     """Keep config tests independent of agent CLIs installed on the test host."""

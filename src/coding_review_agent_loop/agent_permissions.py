@@ -730,6 +730,28 @@ def _check_provenance_outside(
             )
 
 
+def executable_location_refusal(path: str, config: AgentLoopConfig) -> str | None:
+    """Return a reason when an executable lies inside an agent checkout or the response root.
+
+    Applies the sandboxed provenance rule to the executable, its realpath and
+    its directory in every permission mode; creates nothing on disk.
+    """
+    absolute = os.path.abspath(path)
+    resolved = os.path.realpath(path)
+    candidates = (absolute, resolved, os.path.dirname(absolute), os.path.dirname(resolved))
+    records = [_observe_checkout(checkout) for checkout in configured_checkouts(config)]
+    resolved_root = str(_response_component_paths(config)[0])
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        for record in records:
+            for form in (os.path.abspath(candidate), real):
+                if _is_within(form, record.resolved) or _is_within(form, record.stored):
+                    return f"{path} lies inside agent checkout {record.stored}"
+        if _is_within(real, resolved_root):
+            return f"{path} lies inside the response root"
+    return None
+
+
 def establish_inspect_provenance(
     config: AgentLoopConfig,
     *,
