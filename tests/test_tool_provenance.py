@@ -377,3 +377,109 @@ def test_process_capture_is_once_and_shared_by_nested_contexts(tmp_path, monkeyp
     assert first.tool_provenance is second.tool_provenance
     assert calls == [1]
     assert capsys.readouterr().err.count("agent-loop tool commit") == 1
+
+
+# ---- owning-run integration through the real finally path ----
+
+_TASK_OUTPUTS = dict(
+    claude_outputs=[
+        "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+    ],
+    codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    pr_payload={"baseRefName": "develop", "body": "Fixes #56"},
+    repo_default_branch="develop",
+)
+
+
+def _summaries(config):
+    return sorted(Path(config.log_dir).glob("*-usage-summary.json"))
+
+
+@pytest.mark.parametrize("quiet", [False, True])
+def test_owning_task_run_writes_summary_with_provenance(tmp_path, capsys, quiet):
+    from coding_review_agent_loop.orchestrator import run_task_loop
+
+    config = make_config(
+        tmp_path, base=None, reviewer="codex", auto_agent_dirs=("claude", "codex"), quiet=quiet,
+    )
+    assert run_task_loop(FakeRunner(**_TASK_OUTPUTS), task_text="Add /healthz.", config=config) == 0
+    (path,) = _summaries(config)
+    payload = json.loads(path.read_text())
+    assert payload["tool_provenance"]["commit"]
+    assert payload["tool_provenance"]["dirty"] is False
+    timing = payload["timing"]
+    assert timing["run_started_at"] and timing["first_agent_dispatch_at"]
+    assert timing["first_agent_dispatch_at"] >= timing["run_started_at"]
+    assert timing["startup_gap_seconds"] is not None
+    err = capsys.readouterr().err
+    assert ("tool_commit=" in err) is (not quiet)
+
+
+def test_failing_owning_run_still_writes_provenance_summary(tmp_path):
+    from coding_review_agent_loop.orchestrator import run_task_loop
+
+    config = make_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="Task text is empty"):
+        run_task_loop(FakeRunner(), task_text="  ", config=config)
+    (path,) = _summaries(config)
+    payload = json.loads(path.read_text())
+    assert payload["tool_provenance"]["commit"]
+    assert payload["timing"]["run_started_at"]
+    assert payload["timing"]["first_agent_dispatch_at"] is None
+    assert payload["timing"]["startup_gap_seconds"] is None
+
+
+def test_nested_run_shares_context_without_recapture(tmp_path, monkeypatch, capsys):
+    from coding_review_agent_loop.orchestrator import run_pr_loop
+
+    calls = []
+    _cli_setup(monkeypatch, tmp_path, calls)
+    config = make_config(tmp_path, quiet=False, reviewer="codex", auto_agent_dirs=("codex",),
+                         create_dirs=False)
+    Path(config.claude_dir).mkdir(parents=True)
+    Path(config.gemini_dir).mkdir(parents=True)
+    Path(config.codex_dir).mkdir(parents=True, exist_ok=True)
+    outer = _new_usage_context(config)
+    before = dict(outer.tool_provenance)
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"baseRefName": "main", "body": "Fixes #1"},
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config, usage_context=outer) == 0
+    assert calls == [1]
+    assert outer.tool_provenance == before
+    assert _summaries(config) == []  # the nested run does not persist the shared context
+    assert outer.first_agent_dispatch_at is not None
+    assert capsys.readouterr().err.count("agent-loop tool commit") == 1
+    _persist_usage_summary(config, outer)
+    (path,) = _summaries(config)
+    assert json.loads(path.read_text())["tool_provenance"]["commit"] == "c" * 40
+
+
+def test_relative_path_git_is_pinned_to_one_absolute_executable(repo, config, tmp_path, monkeypatch):
+    """A relative PATH hit is validated and executed as the same absolute path."""
+    seen = []
+
+    def recorder(argv, env, cwd, capture):
+        seen.append(argv[0])
+        return ExecResult(1, b"", b"")
+
+    monkeypatch.chdir(tmp_path)
+    result = tp.capture_tool_provenance(config, which=lambda _n: "bin/git", executor=recorder)
+    expected = os.path.abspath("bin/git")
+    assert seen and set(seen) == {expected}
+    assert result["error"] in {"not-a-git-checkout", "config-gate-refused"}
+
+
+def test_relative_path_git_inside_checkout_is_refused(repo, config, tmp_path, monkeypatch):
+    inside = Path(config.claude_dir)
+    (inside / "bin").mkdir(parents=True, exist_ok=True)
+    (inside / "bin" / "git").write_text("#!/bin/sh\n")
+    (inside / "bin" / "git").chmod(0o755)
+    monkeypatch.chdir(inside)
+    calls = []
+    result = tp.capture_tool_provenance(
+        config, which=lambda _n: "bin/git", executor=lambda *a: calls.append(a) or ExecResult(0)
+    )
+    assert result["error"] == "git-untrusted-location"
+    assert calls == []

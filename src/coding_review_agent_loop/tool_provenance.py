@@ -107,9 +107,12 @@ def capture_tool_provenance(
 
 
 def _capture(config, result, executor, which, deadline_seconds) -> None:
-    git = which("git")
-    if not git:
+    found = which("git")
+    if not found:
         raise _Stop("git-unavailable")
+    # Pin one absolute path: a relative PATH entry would otherwise be validated
+    # against this process's cwd but executed against the probe's cwd.
+    git = os.path.abspath(found)
     refusal = executable_location_refusal(git, config)
     if refusal:
         result["untrusted_git"] = git
