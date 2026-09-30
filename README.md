@@ -1397,7 +1397,12 @@ verified (for example an ad hoc shell script wrapping pytest, whose suite start
 is unknown) is the same run the evidence gate refuses, so it is stored as
 non-evidence. Only `verified` rows feed a timeout recommendation or are
 surfaced to coders as remembered commands; older rows without the field are
-treated as non-evidence too.
+treated as non-evidence too. New rows also carry `wrapper_bootstrap`,
+`inner_exec` and `suite_start` as diagnostics explaining that verdict; they are
+not evidence inputs, and older rows lack them. When an `execution_refs`
+selector is refused, the rejection names the failing launch condition(s) (or
+the failing outcome/provenance), the redacted command and the observation
+timestamp.
 
 `run-tests`, `containment-preflight` and the loop flows accept
 `--test-workers N`, `--test-worker-memory SIZE` and

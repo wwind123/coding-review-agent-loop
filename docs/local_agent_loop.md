@@ -6044,6 +6044,15 @@ as a remembered command. Legacy rows without the field fail closed the same
 way, because argv alone cannot prove the suite start was authenticated, so
 unauthenticated wrappers already in history stop being recommended.
 
+New rows also persist `wrapper_bootstrap`, `inner_exec` and `suite_start`
+(out-of-vocabulary values are stored as the fail-closed default) so the reason
+for an `unverified` verdict is recoverable. They are diagnostic only and never
+decide evidence; the gate's `wrapper_bootstrap` is recorded but is not one of
+its conditions, and legacy rows lack the fields and stay non-evidence. A
+refused `execution_refs` selector's rejection names each failing launch
+condition (or the failing outcome/provenance), the secret-redacted bounded
+command and the observation timestamp.
+
 ### Semantic revision assembly
 
 The phase-1 semantic planning foundation separates model decisions from wire

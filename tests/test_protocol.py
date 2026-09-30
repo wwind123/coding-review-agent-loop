@@ -6361,3 +6361,153 @@ def test_non_string_sub_item_disposition_values_degrade_instead_of_crashing(bad)
     )
     assert parsed.dispositions[0].sub_item_dispositions == (("item-1.s2", "resolved"),)
     assert len(parsed.sub_item_degradations) == 1
+
+
+# --- #1110: rejections name the failing condition, command and timestamp -------
+
+def _reject_message(observation, kind="issue_implementation"):
+    with pytest.raises(NonRepairableEvidenceRejection) as excinfo:
+        _validate_claims_envelope(
+            kind,
+            [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+            catalog=[{"execution_ref": "turn:observation-1", **observation}],
+        )
+    return str(excinfo.value)
+
+
+_PASSING = {"outcome": "passed", "provenance": "parent-observed"}
+_VERIFIED = {"wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "verified"}
+_CONDITION_PHRASES = {
+    ("wrapper_bootstrap", "failed"): "wrapper bootstrap failed (wrapper_bootstrap=failed)",
+    ("wrapper_bootstrap", "unknown"): "wrapper bootstrap was never verified",
+    ("inner_exec", "not-attempted"): "inner test command was never executed (inner_exec=not-attempted)",
+    ("inner_exec", "failed"): "inner test command failed to exec (inner_exec=failed)",
+    ("suite_start", "not-started"): "test suite never started (suite_start=not-started)",
+    ("suite_start", "unknown"): "suite start was never verified (suite_start=unknown)",
+}
+
+
+@pytest.mark.parametrize(("field", "value"), sorted(_CONDITION_PHRASES))
+def test_launch_rejection_names_only_the_failing_condition(field, value):
+    message = _reject_message({
+        **_PASSING, **_VERIFIED, field: value,
+        "command": "python -m pytest -q", "timestamp": "2026-09-30T00:00:00+00:00",
+    })
+    assert _CONDITION_PHRASES[(field, value)] in message
+    assert message.count("(") == 1  # only the one failing condition is named
+    assert "`python -m pytest -q`" in message
+    assert "`2026-09-30T00:00:00+00:00`" in message
+    assert "non-authoritative" in message and "launch-integrity" in message
+
+
+def test_launch_rejection_lists_multiple_failures_in_fixed_order():
+    message = _reject_message({
+        **_PASSING, "wrapper_bootstrap": "failed", "inner_exec": "not-attempted", "suite_start": "unknown",
+    })
+    assert (
+        message.index("wrapper_bootstrap=failed")
+        < message.index("inner_exec=not-attempted")
+        < message.index("suite_start=unknown")
+    )
+
+
+def test_launch_rejection_reports_partial_triple_as_not_recorded():
+    message = _reject_message({**_PASSING, "wrapper_bootstrap": "verified"})
+    assert "inner_exec was not recorded" in message
+    assert "suite_start was not recorded" in message
+    assert "wrapper_bootstrap" not in message.replace("wrapper_bootstrap=", "")
+
+
+def test_launch_rejection_does_not_echo_unrecognized_values():
+    message = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "evil-value"})
+    assert "suite_start has unrecognized state" in message
+    assert "evil-value" not in message
+
+
+def test_launch_rejection_renders_missing_command_and_timestamp():
+    message = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "unknown"})
+    assert "command not recorded" in message
+    assert "timestamp not recorded" in message
+
+
+def test_launch_rejection_distinguishes_same_command_by_timestamp():
+    messages = [
+        _reject_message({
+            **_PASSING, **_VERIFIED, "suite_start": "unknown",
+            "command": "pytest -q", "timestamp": stamp,
+        })
+        for stamp in ("2026-09-30T01:00:00+00:00", "2026-09-30T02:00:00+00:00")
+    ]
+    assert messages[0] != messages[1]
+    assert "01:00:00" in messages[0] and "02:00:00" in messages[1]
+
+
+def test_catalog_observation_without_launch_fields_is_still_accepted():
+    _validate_claims_envelope(
+        "issue_implementation",
+        [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+        catalog=[{"execution_ref": "turn:observation-1", **_PASSING}],
+    )
+
+
+@pytest.mark.parametrize(
+    ("observation", "expected", "absent"),
+    [
+        ({"outcome": "failed", "provenance": "parent-observed"}, ["outcome is failed, not passed"], ["provenance is"]),
+        (
+            {"outcome": "passed", "provenance": "self-reported"},
+            ["provenance is self-reported, not parent-observed"], ["outcome is"],
+        ),
+        (
+            {"outcome": "passed", "provenance": "telemetry-unverified"},
+            ["provenance is telemetry-unverified, not parent-observed"], ["outcome is"],
+        ),
+        (
+            {"outcome": "failed", "provenance": "self-reported"},
+            ["outcome is failed, not passed; provenance is self-reported"], [],
+        ),
+        (
+            {"outcome": "weird", "provenance": "weird"},
+            ["outcome is unrecognized", "provenance is unrecognized"], ["weird"],
+        ),
+    ],
+)
+def test_outcome_provenance_rejection_names_exact_reasons(observation, expected, absent):
+    message = _reject_message({**observation, "command": "pytest -q", "timestamp": "2026-09-30T00:00:00+00:00"})
+    assert "not an admissible passing observation" in message
+    for fragment in expected:
+        assert fragment in message
+    for fragment in absent:
+        assert fragment not in message
+    assert "`pytest -q`" in message and "`2026-09-30T00:00:00+00:00`" in message
+
+
+def test_rejection_redacts_secret_commands_for_mapping_and_projection_forms():
+    from coding_review_agent_loop.local_test_evidence import redact_test_command
+
+    argv = ["env", "SECRET_KEY=s3cr3t-value", "python", "-m", "pytest"]
+    rendered = redact_test_command(argv)[0]
+    assert "<redacted:" in rendered and "s3cr3t-value" not in rendered
+    mapping_message = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "unknown", "command": argv})
+    assert rendered in mapping_message and "s3cr3t-value" not in mapping_message
+
+    class Projected:
+        outcome = "passed"
+        provenance = "parent-observed"
+        wrapper_bootstrap = "verified"
+        inner_exec = "started"
+        suite_start = "unknown"
+        execution_ref = "turn:observation-1"
+
+        def public_projection(self):
+            return {"command": rendered, "timestamp": "2026-09-30T00:00:00+00:00"}
+
+    with pytest.raises(NonRepairableEvidenceRejection) as excinfo:
+        _validate_claims_envelope(
+            "issue_implementation",
+            [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+            catalog=[Projected()],
+        )
+    message = str(excinfo.value)
+    assert rendered in message and "s3cr3t-value" not in message
+    assert "`2026-09-30T00:00:00+00:00`" in message

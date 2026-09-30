@@ -2946,6 +2946,114 @@ def _authoritative_receipt_passes(
     )
 
 
+_LAUNCH_FAILURE_PHRASES: tuple[tuple[str, dict[str, str]], ...] = (
+    (
+        "wrapper_bootstrap",
+        {
+            "failed": "the run-tests wrapper bootstrap failed (wrapper_bootstrap=failed)",
+            "unknown": "the wrapper bootstrap was never verified, e.g. an unrecognized launcher (wrapper_bootstrap=unknown)",
+        },
+    ),
+    (
+        "inner_exec",
+        {
+            "not-attempted": "the inner test command was never executed (inner_exec=not-attempted)",
+            "failed": "the inner test command failed to exec (inner_exec=failed)",
+        },
+    ),
+    (
+        "suite_start",
+        {
+            "not-started": "the test suite never started (suite_start=not-started)",
+            "unknown": "suite start was never verified (suite_start=unknown)",
+        },
+    ),
+)
+_LAUNCH_PASSING_STATES = {
+    "wrapper_bootstrap": "verified",
+    "inner_exec": "started",
+    "suite_start": "verified",
+}
+
+
+def _launch_integrity_failure_reasons(observation: object) -> tuple[str, ...]:
+    """Plain-language phrases for each failing launch condition, in fixed order."""
+    semantics, _rich = _observation_semantics(observation)
+    reasons: list[str] = []
+    for name, phrases in _LAUNCH_FAILURE_PHRASES:
+        value = semantics[name]
+        if value == _LAUNCH_PASSING_STATES[name]:
+            continue
+        if value is None:
+            reasons.append(f"{name} was not recorded")
+        elif isinstance(value, str) and value in phrases:
+            reasons.append(phrases[value])
+        else:
+            reasons.append(f"{name} has unrecognized state")
+    return tuple(reasons)
+
+
+def _safe_label(text: str, limit: int) -> str:
+    cleaned = "".join(" " if ch.isspace() or ord(ch) < 32 or ch == "\x7f" else ch for ch in text)
+    cleaned = cleaned.replace("`", "'").strip()
+    return cleaned.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+
+
+def _observation_projection_field(observation: object, name: str) -> object:
+    if isinstance(observation, Mapping):
+        return observation.get(name)
+    projected = getattr(observation, "public_projection", None)
+    if callable(projected):
+        try:
+            value = projected()
+        except Exception:  # pragma: no cover - defensive provider boundary
+            return None
+        if isinstance(value, Mapping):
+            return value.get(name)
+    return None
+
+
+def _observation_command_label(observation: object) -> str:
+    """Redacted, bounded command text; never reads raw argv attributes."""
+    from .local_test_evidence import MAX_SAFE_COMMAND_BYTES, redact_test_command
+
+    command = _observation_projection_field(observation, "command")
+    if isinstance(observation, Mapping) and command:
+        try:
+            if isinstance(command, (str, list, tuple)):
+                command = redact_test_command(
+                    [str(item) for item in command] if not isinstance(command, str) else command
+                )[0]
+            else:
+                command = None
+        except Exception:  # pragma: no cover - defensive redactor boundary
+            command = None
+    label = _safe_label(command, MAX_SAFE_COMMAND_BYTES) if isinstance(command, str) else ""
+    return f"`{label}`" if label else "command not recorded"
+
+
+def _observation_timestamp_label(observation: object) -> str:
+    timestamp = _observation_projection_field(observation, "timestamp")
+    label = _safe_label(timestamp, 64) if isinstance(timestamp, str) else ""
+    return f"`{label}`" if label else "timestamp not recorded"
+
+
+def _observation_outcome_failure_reasons(observation: object) -> tuple[str, ...]:
+    from .local_test_evidence import OUTCOMES, PROVENANCES
+
+    semantics, _rich = _observation_semantics(observation)
+    reasons: list[str] = []
+    outcome = semantics["outcome"]
+    if outcome != "passed":
+        shown = outcome if isinstance(outcome, str) and outcome in OUTCOMES else "unrecognized"
+        reasons.append(f"outcome is {shown}, not passed")
+    provenance = semantics["provenance"]
+    if provenance != "parent-observed":
+        shown = provenance if isinstance(provenance, str) and provenance in PROVENANCES else "unrecognized"
+        reasons.append(f"provenance is {shown}, not parent-observed")
+    return tuple(reasons)
+
+
 def _known_launch_integrity_passes(observation: object) -> bool:
     """Reject explicit broker launch failures before PR/head authentication.
 
@@ -2973,11 +3081,7 @@ def _known_launch_integrity_passes(observation: object) -> bool:
     if not supplied:
         return True
     semantics, _rich = _observation_semantics(observation)
-    return (
-        semantics["wrapper_bootstrap"] == "verified"
-        and semantics["inner_exec"] == "started"
-        and semantics["suite_start"] == "verified"
-    )
+    return not _launch_integrity_failure_reasons(observation)
 
 
 def _receipt_expected_status(observation: object, *, claim: str) -> str | None:
@@ -4328,12 +4432,19 @@ def _parse_semantic_risk_coverage_claims(
                 # satisfy them, so they must not route to it (#990).
                 if semantics["outcome"] != "passed" or semantics["provenance"] != "parent-observed":
                     raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
-                        f"{refs_context} selector `{ref}` is not an admissible passing observation."
+                        f"{refs_context} selector `{ref}` is not an admissible passing observation: "
+                        f"{'; '.join(_observation_outcome_failure_reasons(observation))}; "
+                        f"command: {_observation_command_label(observation)}; "
+                        f"observed at {_observation_timestamp_label(observation)}."
                     )
                 if not _known_launch_integrity_passes(observation):
                     raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
                         f"{refs_context} selector `{ref}` has known non-authoritative "
-                        "launch-integrity state and cannot be selected before authentication."
+                        "launch-integrity state and cannot be selected before authentication: "
+                        f"{'; '.join(_launch_integrity_failure_reasons(observation))}; "
+                        f"command: {_observation_command_label(observation)}; "
+                        f"observed at {_observation_timestamp_label(observation)}. "
+                        "Cite a different observation whose launch was fully verified."
                     )
         # Then the first degradable defect wins, in a fixed order, so every
         # dropped claim yields exactly one record.  The #926 row-ID rules come

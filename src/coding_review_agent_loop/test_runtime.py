@@ -1410,6 +1410,32 @@ def launch_integrity_state(result: object, *, wrapper_boundary: bool = True) -> 
     return "verified" if authoritative else "unverified"
 
 
+_LAUNCH_STATE_FIELDS: tuple[tuple[str, frozenset[str], str], ...] = (
+    ("wrapper_bootstrap", WRAPPER_BOOTSTRAP_STATES, "unknown"),
+    ("inner_exec", INNER_EXEC_STATES, "not-attempted"),
+    ("suite_start", SUITE_START_STATES, "not-started"),
+)
+
+
+def _coerce_launch_state(values: Mapping[str, object]) -> dict[str, str]:
+    """Return the launch triple with out-of-vocabulary values fail-closed."""
+    fields: dict[str, str] = {}
+    for name, vocabulary, default in _LAUNCH_STATE_FIELDS:
+        value = values.get(name, default)
+        fields[name] = value if isinstance(value, str) and value in vocabulary else default
+    return fields
+
+
+def launch_state_fields(result: object) -> dict[str, str]:
+    """Read the diagnostic launch triple from a runner/broker result.
+
+    The triple is diagnostic only; ``launch_integrity`` stays the verdict.
+    """
+    return _coerce_launch_state(
+        {name: getattr(result, name, default) for name, _vocab, default in _LAUNCH_STATE_FIELDS}
+    )
+
+
 def runtime_row_is_evidence(row: Mapping[str, object]) -> bool:
     """Whether a remembered row carries an authenticated launch.
 
@@ -1440,6 +1466,7 @@ def record_test_observation(
     worker_enforcement: str | None = None,
     caveats: Sequence[str] = (),
     launch_integrity: str | None = None,
+    launch_state: Mapping[str, str] | None = None,
 ) -> bool:
     """Append a bounded observation; persistence failure never affects execution.
 
@@ -1451,6 +1478,11 @@ def record_test_observation(
     wrapper, inner exec and suite start were all authenticated.  An
     ``unverified`` row is kept only as non-evidence: it never feeds a timeout
     recommendation and is never surfaced to coders as a remembered command.
+
+    Every new row also carries ``wrapper_bootstrap``, ``inner_exec`` and
+    ``suite_start`` from ``launch_state`` as diagnostics explaining the
+    verdict.  Absent or out-of-vocabulary values are stored as the fail-closed
+    default; the triple never decides evidence.  Existing rows are not rewritten.
     """
     if memory_dir is None:
         return False
@@ -1493,6 +1525,7 @@ def record_test_observation(
                 observation["launch_integrity"] = (
                     launch_integrity if launch_integrity in LAUNCH_INTEGRITY_STATES else "unverified"
                 )
+            observation.update(_coerce_launch_state(launch_state or {}))
             if containment is not None:
                 # Evidence is already bounded by the runner.  Keep only JSON
                 # values and expose unsupported telemetry explicitly.

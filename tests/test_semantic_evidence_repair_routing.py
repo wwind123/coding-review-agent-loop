@@ -32,9 +32,15 @@ _CLAIM = {
 }
 
 
+_SECRET_COMMAND = "env SECRET_KEY=s3cr3t-value python -m pytest tests/"
+_TIMESTAMP = "2026-09-30T00:00:00+00:00"
+
+
 def _observation(**launch_state):
     return {
         "execution_ref": _SELECTOR,
+        "command": _SECRET_COMMAND,
+        "timestamp": _TIMESTAMP,
         "outcome": "passed",
         "provenance": "parent-observed",
         "wrapper_bootstrap": "verified",
@@ -95,6 +101,8 @@ def test_non_authoritative_selector_skips_repair_and_reports_the_rejection(
     catalog = [_observation(suite_start="unknown")]
     monkeypatch.setattr(orchestrator_module, "_run_structured_repair", _forbid_repair)
     result = AgentResult(text=response_text, returncode=0)
+    logged: list[str] = []
+    monkeypatch.setattr(orchestrator_module, "log", lambda config, text, *a, **k: logged.append(str(text)))
 
     with patch.object(orchestrator_module, "run_agent_result", return_value=result) as invoke:
         with pytest.raises(AgentInvocationError) as excinfo:
@@ -109,6 +117,19 @@ def test_non_authoritative_selector_skips_repair_and_reports_the_rejection(
     assert _SELECTOR in message
     assert "Failure category: semantic-evidence-rejection" in message
     assert "Failure category: timeout" not in message
+    # The richer diagnosis reaches last_error: condition, redacted command, time.
+    from coding_review_agent_loop.local_test_evidence import redact_test_command
+
+    rendered = redact_test_command(_SECRET_COMMAND)[0]
+    assert "suite_start=unknown" in message
+    assert rendered in message
+    assert _TIMESTAMP in message
+    assert "s3cr3t-value" not in message
+    rejected_line = next(line for line in logged if "semantic evidence rejected" in line)
+    assert "suite_start=unknown" in rejected_line
+    assert rendered in rejected_line
+    assert _TIMESTAMP in rejected_line
+    assert "s3cr3t-value" not in rejected_line
 
 
 def test_non_admissible_selector_also_skips_repair(tmp_path, monkeypatch):
