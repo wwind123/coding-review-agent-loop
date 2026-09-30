@@ -380,9 +380,7 @@ class LocalTestObservation:
         if _TRUNCATED_CAVEAT in command_caveats:
             caveats.append(_TRUNCATED_CAVEAT)
             if _ARGV_OMITTED_CAVEAT not in caveats:
-                fits = sum(
-                    len(t.encode()) for t in tokens
-                ) <= MAX_SAFE_ARGV_BYTES and _argv_tail_is_safe(tokens)
+                fits = sum(len(t.encode()) for t in tokens) <= MAX_SAFE_ARGV_BYTES
                 if not fits:
                     caveats.extend((_CAPTURE_LIMITED_CAVEAT, _ARGV_OMITTED_CAVEAT))
                     if outcome == "passed":
@@ -491,35 +489,49 @@ def _apply_command_parse_guard(observation: LocalTestObservation) -> LocalTestOb
     )
 
 
-_SAFE_FLAG_RE = re.compile(r"-{1,2}[A-Za-z][A-Za-z0-9_-]*")
+# A bare flag never carries an attached value: one letter after a single dash
+# (``-pS3CRET`` is a value) or a long ``--name``.
+_SAFE_FLAG_RE = re.compile(r"-[A-Za-z]|--[A-Za-z][A-Za-z0-9_-]*")
 _PLACEHOLDER = r"<(?:redacted|sha256|arg-sha256|path-sha256|userinfo):[0-9a-f]{16}>"
 _PLACEHOLDER_TOKEN_RE = re.compile(
-    rf"(?:(?:-{{1,2}}[A-Za-z][A-Za-z0-9_-]*|[A-Za-z_][A-Za-z0-9_]*)=)?{_PLACEHOLDER}"
+    rf"(?:(?:--[A-Za-z][A-Za-z0-9_-]*|[A-Za-z_][A-Za-z0-9_]*)=)?{_PLACEHOLDER}"
 )
 
 
-def _argv_tail_is_safe(tokens: Sequence[str]) -> bool:
-    """Whether every token the bounded display did not show is verifiably safe.
+def _tail_token_is_safe(token: str) -> bool:
+    return bool(
+        _SAFE_FLAG_RE.fullmatch(token)
+        or _PLACEHOLDER_TOKEN_RE.fullmatch(token)
+        or (_REPO_RELATIVE_RE.match(token) and "=" not in token)
+    )
+
+
+def _seal_unverified_tail(tokens: Sequence[str]) -> list[str]:
+    """Digest every token the bounded display does not fully show unless safe.
 
     The durable argv extends past the 512-byte display, and redaction leaves
-    unrecognised ``-`` options and short positionals verbatim.  Only bare
-    flags, a whole-token digest placeholder (optionally behind a ``name=``
-    prefix) and repo-relative paths are trusted there; any other token,
-    including literal text mixed with a placeholder, makes the row fail closed
-    (argv withheld, row capture-limited).
+    unrecognised ``-`` options and short positionals verbatim.  Tokens that
+    are not fully displayed are kept only when they are a bare flag, a
+    whole-token digest placeholder (optionally behind a ``name=`` prefix) or a
+    repo-relative path; anything else, including a token straddling the
+    cutoff, becomes an ``<arg-sha256:...>`` placeholder.  Replacements shorten
+    or lengthen tokens and so move the cutoff, so this runs to a fixed point,
+    which keeps re-redaction idempotent.
     """
-    shown = 0
-    for index, token in enumerate(tokens):
-        shown = len(shlex.join(tokens[: index + 1]).encode())
-        if shown <= MAX_SAFE_COMMAND_BYTES - 8:
-            continue
-        if not (
-            _SAFE_FLAG_RE.fullmatch(token)
-            or _PLACEHOLDER_TOKEN_RE.fullmatch(token)
-            or (_REPO_RELATIVE_RE.match(token) and "=" not in token)
-        ):
-            return False
-    return True
+    result = list(tokens)
+    limit = MAX_SAFE_COMMAND_BYTES - 8
+    while True:
+        offset = -1  # shlex.join separates tokens with one space
+        changed = False
+        for index, token in enumerate(result):
+            offset += 1 + len(shlex.quote(token).encode())
+            if offset <= limit or _tail_token_is_safe(token):
+                continue
+            result[index] = f"<arg-sha256:{_digest(token)}>"
+            changed = True
+            break
+        if not changed:
+            return result
 
 
 def _is_downgraded(caveats: Iterable[str]) -> bool:
@@ -1073,6 +1085,7 @@ def _redact_command_tokens(
             found_identifiers.append(_path_digest(token))
             token = f"<arg-sha256:{_digest(token)}>"
         result.append(token)
+    result = _seal_unverified_tail(result)
     command = shlex.join(result)
     if len(command.encode()) > MAX_SAFE_COMMAND_BYTES:
         command = _bounded(command, MAX_SAFE_COMMAND_BYTES)

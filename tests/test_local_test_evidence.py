@@ -1760,9 +1760,14 @@ from coding_review_agent_loop.local_test_evidence import (
 _HEAD = ("pytest", *(f"-k{i:02d} xxxxxxxx" for i in range(26)))
 
 
-def _quote_cut_argv(count: int = 40, width: int = 8) -> tuple[str, ...]:
-    """Quoted tokens; the 512-byte cut lands inside a quoted token."""
+def _unsafe_tail_argv(count: int = 40, width: int = 8) -> tuple[str, ...]:
+    """Quoted ``-k`` tokens; the tail past the display is not verifiably safe."""
     return ("pytest", *(f"-k{i:02d} " + "x" * width for i in range(count)))
+
+
+def _quote_cut_argv(count: int = 40) -> tuple[str, ...]:
+    """Safe-shaped paths needing quotes; the 512-byte cut lands inside a quote."""
+    return ("pytest", *(f"tests/it's_{i:02d}_xxxxxxxx.py" for i in range(count)))
 
 
 def _parse_cut_argv(paths: int = 20, width: int = 4) -> tuple[str, ...]:
@@ -1806,7 +1811,7 @@ def test_redact_observation_does_not_reparse_truncated_display():
         _shlex.split(display)  # precondition: the cut lands inside a quote
     redacted = redact_observation(_obs(argv))
     assert redacted.outcome == "passed"
-    assert redacted.command == tuple(argv)
+    assert redacted.command == tuple(argv)  # all tokens are safe-shaped
     assert redacted.normalized_command == display
     assert "safe command truncated" in redacted.caveats
 
@@ -1818,11 +1823,27 @@ def test_runner_handoff_retains_truncated_inside_quote_row(tmp_path):
     encoded = _runner_encode(_obs(argv), tmp_path)
     (row,) = _rows(encoded)
     assert row["receipt_id"] == "r1"
-    # The unshown tail is not verifiably safe, so argv is withheld fail-closed.
-    assert "argv" not in row
-    assert row["outcome"] == "incomplete"
-    assert row["caveats"][0] == "capture-limited"
-    assert decode_bounded_evidence(encoded) is not None
+    assert row["argv"] == list(argv)
+    assert row["outcome"] == "passed"
+    decoded = decode_bounded_evidence(encoded)
+    assert decoded.observations[0].command == tuple(argv)
+    assert _rows(bounded_evidence_for_round(decoded))[0]["argv"] == row["argv"]
+
+
+def test_unsafe_quoted_tail_is_digested_and_recovered_across_restart(tmp_path):
+    argv = _unsafe_tail_argv()  # quoted -k selectors straddle and follow the cutoff
+    encoded = _runner_encode(_obs(argv), tmp_path)
+    (row,) = _rows(encoded)
+    assert row["outcome"] == "passed"
+    assert len(row["argv"]) == len(argv)
+    assert any(t.startswith("<arg-sha256:") for t in row["argv"])
+    assert row["argv"][:5] == list(argv[:5])  # displayed prefix is verbatim
+    decoded = decode_bounded_evidence(encoded)
+    assert decoded.observations[0].command == tuple(row["argv"])
+    again = bounded_evidence_for_round(decoded)
+    assert _rows(again)[0]["argv"] == row["argv"]
+    assert _rows(again)[0]["command"] == row["command"]
+    assert again == bounded_evidence_for_round(decode_bounded_evidence(again))
 
 
 def test_live_parseable_cut_row_keeps_argv():
@@ -1849,38 +1870,31 @@ def test_restart_decode_roundtrip_is_stable():
     assert second == third
 
 
-def test_secret_after_display_cutoff_is_never_persisted_in_argv():
-    argv = ("pytest", "--pad=" + "x" * 490, "--session-key=topsecret", "--flag")
-    display = redact_test_command(argv)[0]
-    assert "topsecret" not in display  # the secret sits past the cutoff
-    encoded = bounded_evidence_for_round(LocalTestEvidence(observations=(_obs(argv),)))
-    assert "topsecret" not in encoded
-    (row,) = _rows(encoded)
-    assert "argv" not in row
-    assert row["outcome"] == "incomplete"
-    assert row["caveats"][0] == "capture-limited"
-    assert "topsecret" not in bounded_evidence_for_round(decode_bounded_evidence(encoded))
-
-
 @pytest.mark.parametrize(
     "secret",
     [
-        "--session-key=topsecret<sha256:0123456789abcdef>",
-        "<sha256:0123456789abcdef>topsecret",
-        "x=topsecret<redacted:0123456789abcdef>",
+        ["--session-key=topsecret"],
+        ["--session-key=topsecret<sha256:0123456789abcdef>"],
+        ["--innocuousflag", "-pS3CRET"],
+        ["--session-key", "topsecret"],
     ],
 )
-def test_mixed_literal_and_placeholder_tail_is_not_trusted(secret):
-    argv = ("pytest", "--pad=" + "x" * 490, secret)
-    assert secret not in redact_test_command(argv)[0]
+def test_secret_after_display_cutoff_is_never_persisted_in_argv(secret):
+    argv = ("pytest", "--pad=" + "x" * 485, *secret)
+    display = redact_test_command(argv)[0]
+    assert "topsecret" not in display and "S3CRET" not in display
     encoded = bounded_evidence_for_round(LocalTestEvidence(observations=(_obs(argv),)))
-    assert "topsecret" not in encoded
-    (row,) = _rows(encoded)
-    if secret.startswith("--"):
-        # Redaction leaves this option intact, so the tail is not trusted.
-        assert "argv" not in row
-        assert row["outcome"] == "incomplete"
-    assert "topsecret" not in bounded_evidence_for_round(decode_bounded_evidence(encoded))
+    for candidate in (
+        encoded,
+        bounded_evidence_for_round(decode_bounded_evidence(encoded)),
+    ):
+        assert "topsecret" not in candidate and "S3CRET" not in candidate
+        (row,) = _rows(candidate)
+        assert row["outcome"] == "passed"
+        assert len(row["argv"]) == len(argv)
+    assert _rows(encoded)[0]["argv"] == _rows(
+        bounded_evidence_for_round(decode_bounded_evidence(encoded))
+    )[0]["argv"]
 
 
 def test_whole_token_placeholder_tail_keeps_argv():
@@ -1897,10 +1911,11 @@ def test_over_budget_argv_is_downgraded_on_every_path(variant, tmp_path):
         argv = _parse_cut_argv(paths=60, width=70)
         _shlex.split(redact_test_command(argv)[0])
     else:
-        argv = _quote_cut_argv(count=20, width=200)
+        argv = _quote_cut_argv(count=200)
         with pytest.raises(ValueError):
             _shlex.split(redact_test_command(argv)[0])
-    assert sum(len(t.encode()) for t in argv) > MAX_SAFE_ARGV_BYTES
+    sealed = redact_observation(_obs(argv)).command
+    assert sum(len(t.encode()) for t in sealed) > MAX_SAFE_ARGV_BYTES
     display = redact_test_command(argv)[0]
     encodings = [
         bounded_evidence_for_round(LocalTestEvidence(observations=(_obs(argv),))),
@@ -1971,7 +1986,7 @@ def test_caveat_collision_keeps_all_four_signals():
     obs = LocalTestObservation(
         **{
             **_obs("x").__dict__,
-            "command": _quote_cut_argv(count=20, width=200),
+            "command": _unsafe_tail_argv(count=200),
             "caveats": (
                 evidence_module.OUT_OF_CHECKOUT_CONTEXT_CAVEAT,
                 "capture-limited",
