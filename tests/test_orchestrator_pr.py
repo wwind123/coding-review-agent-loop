@@ -4150,7 +4150,11 @@ def test_review_only_mode_reports_passing_but_uncleared_ci_at_the_gate(
     assert "awaiting authoritative qualification after round" in message
     assert "github-pr-checks (item-1)" in message
     legacy_prefix, _, _detail = message.partition("\nBlocking obligations:\n")
-    assert legacy_prefix.endswith(" No approval or merge was attempted.")
+    assert legacy_prefix == (
+        "PR #77 cannot finalize: PR #77 has a unanimously reviewed correction "
+        "awaiting authoritative qualification after round 2: github-pr-checks "
+        "(item-1). No approval or merge was attempted."
+    )
     assert "Blocking obligations:" in message
     assert "observed in this run: GitHub checks read passing at repaired-head" in message
     assert "only skipped or neutral" in message
