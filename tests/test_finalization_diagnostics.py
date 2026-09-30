@@ -368,3 +368,31 @@ def test_mixed_repair_candidate_evidence_unknown_listing_in_partition_order():
         "candidate_head=frozen1, failed_head=none; human-only exact-head evidence pending at frozen1"
     )
     assert any("unknown (item-2)" in l and "unknown or unreconstructible" in l for l in body)
+
+
+def _without_failed_head(item):
+    # The constructor rejects a CI repair_required item with no failed head;
+    # a resumed ledger can still carry one, so build it past validation.
+    object.__setattr__(item, "failed_head_sha", None)
+    return item
+
+
+@pytest.mark.parametrize("kind", CI_KINDS)
+def test_ci_repair_without_recorded_failed_head_is_exact(kind):
+    item = _without_failed_head(machine(kind, "repair_required", failed="tmp"))
+    expected = (
+        "authoritative source reported a failure at an unrecorded head; "
+        "a corrected head is required"
+    )
+    assert _pred(item) == expected
+    assert _pred(item, None) == expected
+    assert "failed at" not in expected
+
+
+def test_unfrozen_evidence_predicate_is_exact():
+    evidence = UnresolvedReviewItem(
+        item_id="e1", reviewer="r", source_round=1, text="x", status="blocking",
+        authority="machine", obligation_kind="human-exact-head-evidence",
+        lifecycle="evidence_deferred", obligation_identity="ev:1",
+    )
+    assert _pred(evidence) == "human-only exact-head evidence pending"

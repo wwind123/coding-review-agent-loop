@@ -4146,13 +4146,37 @@ def test_review_only_mode_reports_passing_but_uncleared_ci_at_the_gate(
         )
 
     message = str(excinfo.value)
-    assert "cannot finalize" in message
+    assert message.startswith("PR #77 cannot finalize: PR #77 ")
+    assert "awaiting authoritative qualification after round" in message
     assert "github-pr-checks (item-1)" in message
+    legacy_prefix, _, _detail = message.partition("\nBlocking obligations:\n")
+    assert legacy_prefix.endswith(" No approval or merge was attempted.")
     assert "Blocking obligations:" in message
     assert "observed in this run: GitHub checks read passing at repaired-head" in message
     assert "only skipped or neutral" in message
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
     assert not any("observed in this run" in comment for comment in runner.comments)
+    metadata_bodies = [
+        body
+        for body in [
+            *runner.comments,
+            *(
+                item["body"]
+                for item in runner.pr_payload.get("comments", [])
+                if isinstance(item, dict) and isinstance(item.get("body"), str)
+            ),
+        ]
+        if "AGENT_LOOP_META: " in body
+    ]
+    assert metadata_bodies
+    for body in metadata_bodies:
+        decoded = orchestrator._decode_round_metadata(
+            body.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+        )
+        rendered = repr(decoded)
+        assert "observed in this run" not in rendered
+        assert "read passing at" not in rendered
+        assert "not authoritative" not in rendered
 
 
 @pytest.mark.parametrize("auto_merge", [False, True])
