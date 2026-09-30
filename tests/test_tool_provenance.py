@@ -144,6 +144,21 @@ def test_untrusted_executable_in_checkout_is_never_run(repo, config, tmp_path):
     assert not marker.exists()
 
 
+def _agrees(monkeypatch, config, path, records, resolved_root, *, refused):
+    """The helper and the sandbox rule must give the same verdict for one path."""
+    monkeypatch.setattr(ap, "_provenance_paths", lambda p: [("git", p.git)])
+    helper = ap.executable_location_refusal(str(path), config)
+    try:
+        ap._check_provenance_outside(
+            _FakeProvenance(str(path)), records, response_root_path=str(resolved_root)
+        )
+        rule = None
+    except AgentLoopError as exc:
+        rule = str(exc)
+    assert (helper is not None) is refused
+    assert (rule is not None) is refused
+
+
 def test_executable_location_refusal_agrees_with_provenance_check(tmp_path, monkeypatch):
     real = tmp_path / "real"
     real.mkdir()
@@ -152,31 +167,42 @@ def test_executable_location_refusal_agrees_with_provenance_check(tmp_path, monk
     monkeypatch.setattr(tempfile, "tempdir", str(link))
     config = make_config(tmp_path)
     resolved_root = ap._response_component_paths(config)[0]
+    records = [ap._observe_checkout(c) for c in ap.configured_checkouts(config)]
+
+    # Executable inside a configured agent checkout.
+    checkout = Path(config.claude_dir)
+    checkout.mkdir(parents=True, exist_ok=True)
+    in_checkout = checkout / "git"
+    in_checkout.write_text("")
+    _agrees(monkeypatch, config, in_checkout, records, resolved_root, refused=True)
+
+    # Executable outside every checkout whose directory is inside one: a symlink
+    # whose own directory is a checkout subdirectory but whose target is outside.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "git").write_text("")
+    sub = checkout / "bin"
+    sub.mkdir()
+    (sub / "git").symlink_to(elsewhere / "git")
+    _agrees(monkeypatch, config, sub / "git", records, resolved_root, refused=True)
+
+    # Inside the response root reached through a symlinked temp directory.
     inside = resolved_root / "bin" / "git"
     inside.parent.mkdir(parents=True)
     inside.write_text("")
     assert not ap._is_within(str(inside), str(ap.response_root(config)))
-    assert ap.executable_location_refusal(str(inside), config)
-    with pytest.raises(AgentLoopError):
-        ap._check_provenance_outside(
-            _FakeProvenance(str(inside)), [], response_root_path=str(resolved_root)
-        )
+    _agrees(monkeypatch, config, inside, records, resolved_root, refused=True)
+
+    # Outside all of them.
     outside = tmp_path / "usr" / "git"
     outside.parent.mkdir()
     outside.write_text("")
-    assert ap.executable_location_refusal(str(outside), config) is None
+    _agrees(monkeypatch, config, outside, records, resolved_root, refused=False)
 
 
 class _FakeProvenance:
     def __init__(self, git):
         self.git = git
-
-
-@pytest.fixture(autouse=True)
-def _fake_provenance_paths(monkeypatch):
-    monkeypatch.setattr(
-        ap, "_provenance_paths", lambda p: [("git", p.git)] if hasattr(p, "git") else []
-    )
 
 
 def test_oserror_and_timeout_never_raise(repo, config):
@@ -351,6 +377,7 @@ def test_cli_logs_line_before_claim_conflict(tmp_path, monkeypatch, capsys):
     assert "agent-loop tool commit " + "c" * 40 + " (clean)" in err
     assert err.index("agent-loop tool commit") < err.index("claim conflict")
     assert calls == [1]
+    assert _summaries(config) == []
 
 
 def test_cli_quiet_suppresses_line(tmp_path, monkeypatch, capsys):
@@ -366,6 +393,7 @@ def test_cli_quiet_suppresses_line(tmp_path, monkeypatch, capsys):
     assert "agent-loop tool commit" not in capsys.readouterr().err
     assert calls == [1]
     assert tp._PROCESS_PROVENANCE["commit"] == "c" * 40
+    assert _summaries(config) == []
 
 
 def test_process_capture_is_once_and_shared_by_nested_contexts(tmp_path, monkeypatch, capsys):

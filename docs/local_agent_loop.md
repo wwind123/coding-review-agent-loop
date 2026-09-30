@@ -5825,7 +5825,9 @@ base-branch resolution, and logs one line (suppressed by `--quiet`):
 
 `<run-id>-usage-summary.json` gains `tool_provenance` (`package_path`,
 `checkout_root`, `commit`, `dirty`, `dirty_paths_sample`, `error`, `captured_at`,
-`process_started_at`) and `timing` (`process_started_at`, `run_started_at`,
+`process_started_at`; plus `dirty_count`, the total number of changed paths, when
+status was read, and `untrusted_git`, the refused Git path, when the Git location
+was refused) and `timing` (`process_started_at`, `run_started_at`,
 `first_agent_dispatch_at`, `startup_gap_seconds`). The end-of-run
 `Usage summary written to ...` line ends with `tool_commit=<sha7> clean|dirty|dirty=unknown`
 or `tool_commit=unknown`. `dirty: null` beside a commit means the cleanliness
@@ -5833,7 +5835,10 @@ was not read. Error labels: `git-unavailable`, `git-timeout`,
 `git-untrusted-location` (the Git executable lies inside an agent checkout or the
 response root), `config-gate-refused`, `not-a-git-checkout`,
 `package-not-in-repository` (the package is not tracked by the enclosing
-repository), and `git-status-failed`. A commit is recorded only after the
+repository), `git-status-failed`, and `capture-failed: <ExceptionType>` (an
+unexpected exception, caught so the run continues). The
+`commit unknown (git-untrusted-location)` log line ends with `: refused <path>`
+naming the refused Git executable. A commit is recorded only after the
 package files are confirmed tracked in that repository.
 
 All Git reads go through the hardened inspect path and share one overall
