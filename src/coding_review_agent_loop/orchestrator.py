@@ -39,6 +39,8 @@ from .config import (
     sync_reviewer_pr_before_review,
 )
 from .board_amendment import (
+    ReviewerBoardAmendment,
+    amend_contract,
     ContractLineage,
     added_in_config,
     amendment_audit_already_posted,
@@ -6744,11 +6746,17 @@ def _format_incomplete_pr_review_comment(
     pr_number: int,
     unavailable_reviewers: Mapping[AgentName, AgentInvocationError],
     approved_reviewer_names: Sequence[str],
+    detection_round: int | None = None,
+    blocking_reviewer_names: Sequence[str] = (),
+    open_must_fix_count: int | None = None,
+    remedy_lines: Sequence[str] = (),
 ) -> str:
     lines = [
         "**Review status: Incomplete**",
         "",
-        "No coder follow-up was started for the unavailable reviewer(s). "
+        "After the unavailable reviewer(s) were detected"
+        + (f" in round {detection_round}" if detection_round is not None else "")
+        + ", no coder follow-up, CI wait, qualification, or merge was started. "
         "Their failure is not a code finding and does not count as approval.",
         "",
         "### Missing required reviewer input",
@@ -6764,14 +6772,131 @@ def _format_incomplete_pr_review_comment(
                 *[f"- {name}" for name in approved_reviewer_names],
             ]
         )
+    if blocking_reviewer_names or open_must_fix_count is not None:
+        lines.extend(["", "### Open findings"])
+        if blocking_reviewer_names:
+            lines.append("- Blocking reviewers this round: " + ", ".join(blocking_reviewer_names))
+        if open_must_fix_count is not None:
+            lines.append(f"- Open must-fix items (including carried): {open_must_fix_count}")
+    if remedy_lines:
+        lines.extend(["", "### What to do", *remedy_lines])
     lines.extend(
         [
             "",
-            "Resolve the reviewer problem or rerun with a replacement reviewer/model "
-            f"before merging PR #{pr_number}.",
+            (
+                f"Resolve the reviewer problem as described above before merging PR #{pr_number}."
+                if remedy_lines
+                else f"Resolve the reviewer problem before merging PR #{pr_number}."
+            ),
         ]
     )
     return "\n".join(lines)
+
+
+def _unavailable_reviewer_remedy(
+    *,
+    route: str,
+    surface: str,
+    round_number: int | None = None,
+    in_evidence_pass: bool = False,
+) -> list[str]:
+    """Operator remedy prose for an unavailable-reviewer stop (#1129).
+
+    ``route`` is ``amendment`` (scheduler contract, amendment validated),
+    ``amendment-lookup-failed``, ``flags`` (all-reviewers), ``restore-only``
+    (strict managed-CI all-reviewers), or ``rejected`` (the amendment would be
+    refused).  The text carries no amendment JSON or record grammar.
+    """
+    lines = [
+        "- Restore the reviewer backend and rerun unchanged; nothing else needs to change.",
+    ]
+    degraded = " This is a degraded review mode, not a neutral substitution."
+    if route == "amendment":
+        lines.append(
+            "- Or, for this run only, a human operator may remove the reviewer with a signed "
+            f"reviewer-board amendment posted on {surface}, effective from round {round_number}."
+            + _PR_AMENDMENT_RERUN_CLAUSE + degraded
+        )
+    elif route == "amendment-lookup-failed":
+        lines.append(
+            "- Or, for this run only, a human operator may remove the reviewer with a signed "
+            f"reviewer-board amendment posted on {surface}, effective from the round the "
+            "rerun resumes into." + _PR_AMENDMENT_RERUN_CLAUSE + degraded
+        )
+    elif route == "flags":
+        lines.append(
+            "- Or rerun with the unavailable reviewer removed from the --reviewer flags."
+            + degraded
+        )
+    elif route == "restore-only":
+        lines.append(
+            "- Restoring the backend is the only in-run option: this is an issue-created strict "
+            "managed-CI PR whose approved plan re-verifies the configured reviewer board."
+        )
+    else:
+        lines.append(
+            "- The reviewer board cannot be reduced for this run (the unavailable reviewer is "
+            "the primary or the last secondary); restore the backend, or start a fresh run "
+            "with a different reviewer board."
+        )
+    if in_evidence_pass:
+        lines.append(
+            "- The stopped exact-head evidence pass is repeated in full with the remaining "
+            "board on rerun."
+        )
+    return lines
+
+
+def _unavailable_reviewer_amendment_advisory(
+    *,
+    pr_number: int,
+    contract: object,
+    lineage: object,
+    removed: Sequence[str],
+    fetch_start_round: Callable[[], int],
+) -> tuple[str, int | None, str | None]:
+    """Validate an amendment removing ``removed`` before it is advertised (#1129).
+
+    Returns ``(outcome, round, template)`` where outcome is ``validated``,
+    ``rejected`` or ``lookup-failed``.  Never raises.
+    """
+    try:
+        round_number = fetch_start_round()
+        amendment = ReviewerBoardAmendment(
+            flow="pr",
+            issue=None,
+            pr_number=pr_number,
+            original_required_reviewers=tuple(getattr(contract, "required_reviewers")),
+            policy=str(getattr(contract, "policy")),
+            primary_reviewer=getattr(contract, "primary_reviewer"),
+            removed_reviewers=tuple(removed),
+            effective_from_round=round_number,
+            reason="reviewer unavailable",
+            rationale="",
+            digest="",
+            comment_locator="(dry run)",
+            comment_index=0,
+        )
+        try:
+            amend_contract(
+                contract,
+                amendment,
+                base_board=tuple(getattr(getattr(lineage, "contracts")[0], "required_reviewers")),
+                previously_removed=tuple(getattr(lineage, "removed_reviewers", ())),
+            )
+        except AgentLoopError:
+            return "rejected", round_number, None
+        template = _board_amendment_template(
+            flow="pr",
+            issue_number=None,
+            pr_number=pr_number,
+            persisted=contract,
+            removed=removed,
+            start_round_number=round_number,
+        )
+        return "validated", round_number, template
+    except Exception:  # noqa: BLE001 - advisory text only; the stop stays authoritative
+        return "lookup-failed", None, None
 
 
 def _is_incomplete_plan_review(parsed_review: ParsedPlanReview) -> bool:
@@ -18753,6 +18878,16 @@ def _board_amendment_template(
     )
 
 
+_PR_AMENDMENT_RERUN_CLAUSE = (
+    " Posting the record is what removes the reviewer. Rerun with the original "
+    "reviewer board still configured (recommended); the reduced board is also "
+    "accepted, except on an issue-created strict managed-CI PR, where the approved "
+    "plan is re-verified against the supplied flags and the original board is "
+    "required. Do not drop the reviewer from the command line instead of posting "
+    "the record."
+)
+
+
 def _board_amendment_route_clause(
     *,
     flow: str,
@@ -18798,14 +18933,7 @@ def _board_amendment_route_clause(
             "the reduced reviewer board with the same policy and primary."
         )
     else:
-        rerun = (
-            " Posting the record is what removes the reviewer. Rerun with the original "
-            "reviewer board still configured (recommended); the reduced board is also "
-            "accepted, except on an issue-created strict managed-CI PR, where the approved "
-            "plan is re-verified against the supplied flags and the original board is "
-            "required. Do not drop the reviewer from the command line instead of posting "
-            "the record."
-        )
+        rerun = _PR_AMENDMENT_RERUN_CLAUSE
     not_recognized = (
         ""
         if amendments_recognized
@@ -22814,6 +22942,7 @@ def run_pr_loop(
             if not evidence_skip_reviewers:
                 evidence_surfaced_baseline = surfaced_reviewer_requirement_ids
             approved_review_outputs: list[tuple[str, str]] = []
+            round_blocking_reviewer_names: list[str] = []
             # The accepted carrier beside each approved text, keyed by reviewer, so
             # an acknowledgement repair can pin its assessment and records (#925).
             accepted_review_carriers: dict[str, ParsedPlanReview | ParsedReview] = {}
@@ -24067,7 +24196,7 @@ def run_pr_loop(
                         log(
                             config,
                             f"Round {round_number}: {reviewer_name} became unavailable "
-                            f"({category}); continuing with the remaining reviewers",
+                            f"({category}); finishing this round's remaining reviews, then stopping",
                         )
                         continue
                     assert turn is not None and turn.response is not None
@@ -24196,7 +24325,7 @@ def run_pr_loop(
                         log(
                             config,
                             f"Round {round_number}: {reviewer_name} became unavailable "
-                            f"({category}); continuing with the remaining reviewers",
+                            f"({category}); finishing this round's remaining reviews, then stopping",
                         )
                         continue
                     assert review_response is not None
@@ -24305,7 +24434,7 @@ def run_pr_loop(
                         config,
                         f"Round {round_number}: {reviewer_name} did not complete its PR review "
                         "and reported no actionable blocking items or Same-PR follow-ups; "
-                        "continuing with the remaining reviewers",
+                        "finishing this round's remaining reviews, then stopping",
                     )
                     continue
 
@@ -24352,6 +24481,7 @@ def run_pr_loop(
                     f"{_describe_pr_review_outcome(parsed_review, has_blocking_summary=has_blocking_summary)}",
                 )
                 if review_state == "blocking":
+                    round_blocking_reviewer_names.append(reviewer_name)
                     if (
                         (resumed_record is None or resumed_record.metadata.phase == "publication")
                         and carried_approval_record is None
@@ -24450,7 +24580,7 @@ def run_pr_loop(
                 # resume that replayed withheld reviews no longer needs them.
                 pr_round_spool.discard()
             if (
-                (pr_round_parallel or selective_policy)
+                (pr_round_parallel or selective_policy or unavailable_reviewer_failures)
                 and not skip_reviewers_this_round
                 and not (current_resume is not None and current_resume.reconciled)
                 and evidence_pass is None
@@ -24465,7 +24595,7 @@ def run_pr_loop(
                     runner, config=config, pr_number=pr_number,
                     body=_attach_round_metadata(
                         f"PR review round {round_number} reconciliation: settled reviewers: {settled or 'none'}. "
-                        f"Finalization {'stops' if pr_fatal_errors else 'continues'} after reconciliation. "
+                        f"Finalization {'stops' if pr_fatal_errors or unavailable_reviewer_failures else 'continues'} after reconciliation. "
                         f"Historical approvals remain exact-head-bound; scheduler-policy calls avoided "
                         f"cumulatively: {scheduler_calls_avoided}. Phase: "
                         f"{scheduler_decision.phase if scheduler_decision is not None else 'full-board'}; "
@@ -24645,7 +24775,7 @@ def run_pr_loop(
                 if item.status == "future"
             ]
             migration_validation = None
-            if any(
+            if not unavailable_reviewer_failures and any(
                 _is_machine_obligation(item)
                 and item.obligation_kind == "alembic-migration"
                 for item in unresolved_items
@@ -24680,6 +24810,81 @@ def run_pr_loop(
             # repair go to the coder.  A current, fully reviewed CI candidate
             # proceeds to source-authoritative qualification instead.
             must_fix_items = list(item_partitions["coder_blockers"])
+            if unavailable_reviewer_failures:
+                # Decide at the point of detection (#1129): a required reviewer
+                # that cannot be reached can never be satisfied by continuing.
+                approved_reviewer_names = [
+                    reviewer_name for reviewer_name, _review_output in approved_review_outputs
+                ]
+                unavailable_names = [
+                    agent_display_name(reviewer) for reviewer in unavailable_reviewer_failures
+                ]
+                pr_surface = f"PR #{pr_number}"
+                advisory_template: str | None = None
+                advisory_round: int | None = None
+                if selective_policy:
+                    advisory_outcome, advisory_round, advisory_template = (
+                        _unavailable_reviewer_amendment_advisory(
+                            pr_number=pr_number,
+                            contract=pr_effective_contract,
+                            lineage=pr_contract_lineage,
+                            removed=unavailable_names,
+                            fetch_start_round=lambda: _pr_amendment_start_round(
+                                get_pr_review_context(runner, config=config, pr_number=pr_number),
+                                configured_reviewers,
+                                scheduler_capabilities,
+                            ),
+                        )
+                    )
+                    remedy_route = {
+                        "validated": "amendment",
+                        "rejected": "rejected",
+                    }.get(advisory_outcome, "amendment-lookup-failed")
+                elif _managed_binding_protection_mode(managed_ci_handoff) == "strict":
+                    remedy_route = "restore-only"
+                else:
+                    remedy_route = "flags"
+                remedy_lines = _unavailable_reviewer_remedy(
+                    route=remedy_route,
+                    surface=pr_surface,
+                    round_number=advisory_round,
+                    in_evidence_pass=evidence_pass is not None,
+                )
+                post_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=_format_incomplete_pr_review_comment(
+                        pr_number=pr_number,
+                        unavailable_reviewers=unavailable_reviewer_failures,
+                        approved_reviewer_names=approved_reviewer_names,
+                        detection_round=round_number,
+                        blocking_reviewer_names=round_blocking_reviewer_names,
+                        open_must_fix_count=len(must_fix_items),
+                        remedy_lines=remedy_lines,
+                    ),
+                )
+                categories = "; ".join(
+                    f"{agent_display_name(reviewer)}: {failure.failure_category or 'unknown'}"
+                    for reviewer, failure in unavailable_reviewer_failures.items()
+                )
+                healthy = ", ".join(approved_reviewer_names) or "(none)"
+                blockers = ", ".join(round_blocking_reviewer_names) or "(none)"
+                raise AgentLoopError(
+                    f"PR #{pr_number} review incomplete: missing required input from "
+                    f"{', '.join(unavailable_names)} ({categories}). Detected in round "
+                    f"{round_number}. Healthy reviewers approved: {healthy}. Blocking reviewers "
+                    f"this round: {blockers}. Open must-fix items (including carried): "
+                    f"{len(must_fix_items)}. After detection in round {round_number}, no coder "
+                    "follow-up, CI wait, qualification, or merge was started.\n"
+                    + "\n".join(remedy_lines)
+                    + (
+                        "\n\nSigned amendment template (replace the rationale placeholder):\n\n"
+                        + advisory_template
+                        if advisory_template
+                        else ""
+                    )
+                )
             if evidence_pass is not None:
                 # Every evidence-response or refresh pass ends with exactly one
                 # terminal record at this round and head (#1068).
@@ -24795,36 +25000,6 @@ def run_pr_loop(
                         ),
                     )
                     raise
-                if selective_policy:
-                    unavailable_names = {
-                        agent_display_name(reviewer)
-                        for reviewer in unavailable_reviewer_failures
-                    }
-                    owner_unavailable = [
-                        item
-                        for item in must_fix_items
-                        if _all_pending_resolution_owners_unavailable(item, unavailable_names)
-                    ]
-                    if owner_unavailable:
-                        approved_names = [
-                            reviewer_name for reviewer_name, _output in approved_review_outputs
-                        ]
-                        post_pr_comment(
-                            runner,
-                            config=config,
-                            pr_number=pr_number,
-                            body=_format_incomplete_pr_review_comment(
-                                pr_number=pr_number,
-                                unavailable_reviewers=unavailable_reviewer_failures,
-                                approved_reviewer_names=approved_names,
-                            ),
-                        )
-                        item_ids = ", ".join(item.item_id for item in owner_unavailable)
-                        raise AgentLoopError(
-                            f"PR #{pr_number} review incomplete: all remaining resolution owners "
-                            f"for {item_ids} are unavailable. No coder follow-up, CI, qualification, "
-                            "or merge was attempted."
-                        )
 
             pr_checks: PullRequestChecks | None = None
             if not must_fix_items:
@@ -24960,30 +25135,6 @@ def run_pr_loop(
                             must_fix_items = [
                                 item for item in unresolved_items if item.status in {"blocking", "same-pr"}
                             ]
-                if not must_fix_items and unavailable_reviewer_failures:
-                    approved_reviewer_names = [
-                        reviewer_name for reviewer_name, _review_output in approved_review_outputs
-                    ]
-                    post_pr_comment(
-                        runner,
-                        config=config,
-                        pr_number=pr_number,
-                        body=_format_incomplete_pr_review_comment(
-                            pr_number=pr_number,
-                            unavailable_reviewers=unavailable_reviewer_failures,
-                            approved_reviewer_names=approved_reviewer_names,
-                        ),
-                    )
-                    missing = ", ".join(
-                        agent_display_name(reviewer)
-                        for reviewer in unavailable_reviewer_failures
-                    )
-                    healthy = ", ".join(approved_reviewer_names) or "(none)"
-                    raise AgentLoopError(
-                        f"PR #{pr_number} review incomplete: missing required input from {missing}. "
-                        f"Healthy reviewers approved: {healthy}. No coder follow-up or merge was attempted."
-                    )
-
                 if not must_fix_items and selective_policy:
                     fresh_context, fresh_requirement_ids, fresh_plan_context, config = _fresh_pr_qualification_snapshot(
                         runner,

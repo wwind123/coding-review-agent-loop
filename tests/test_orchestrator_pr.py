@@ -1351,7 +1351,7 @@ def test_selective_final_sweep_blocker_dispatches_coder_remediation(tmp_path, mo
     assert "final-sweep regression" in coder_commands[1][-1]
 
 
-def test_selective_owner_unavailability_stops_without_coder_redispatch(tmp_path, monkeypatch):
+def _run_selective_owner_unavailable(tmp_path, monkeypatch):
     def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
         return (
             json.dumps(
@@ -1405,10 +1405,53 @@ def test_selective_owner_unavailability_stops_without_coder_redispatch(tmp_path,
         max_rounds=3,
     )
 
-    with pytest.raises(AgentLoopError, match="all remaining resolution owners for item-1 are unavailable"):
+    with pytest.raises(AgentLoopError, match="missing required input from Codex") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
+    return runner, str(excinfo.value)
 
+
+def test_selective_owner_unavailability_stops_without_coder_redispatch(tmp_path, monkeypatch):
+    runner, message = _run_selective_owner_unavailable(tmp_path, monkeypatch)
+
+    assert "Detected in round 2" in message
+    # Only the round-1 coder turn ran; the round-2 detection stops before a second.
     assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == 1
+    # A validated amendment template goes to the error only, never the PR comment.
+    assert "Signed amendment template" in message
+    assert '"kind": "reviewer-board-amendment"' in message
+    incomplete = [body for body in runner.comments if "**Review status: Incomplete**" in body]
+    assert len(incomplete) == 1
+    assert "effective from round 2" in incomplete[0]
+    assert "reviewer-board-amendment" not in incomplete[0]
+    assert "```" not in incomplete[0]
+
+
+def test_unavailable_reviewer_amendment_rejected_prints_prose_only(tmp_path, monkeypatch):
+    def reject(*args, **kwargs):
+        raise AgentLoopError("cannot reduce")
+
+    monkeypatch.setattr(orchestrator, "amend_contract", reject)
+    runner, message = _run_selective_owner_unavailable(tmp_path, monkeypatch)
+
+    assert "cannot be reduced for this run" in message
+    assert "Signed amendment template" not in message
+    incomplete = [body for body in runner.comments if "**Review status: Incomplete**" in body]
+    assert len(incomplete) == 1
+    assert "cannot be reduced for this run" in incomplete[0]
+
+
+def test_unavailable_reviewer_advisory_lookup_failure_keeps_the_stop(tmp_path, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("lookup exploded")
+
+    monkeypatch.setattr(orchestrator, "_pr_amendment_start_round", broken)
+    runner, message = _run_selective_owner_unavailable(tmp_path, monkeypatch)
+
+    assert "lookup exploded" not in message
+    assert "Signed amendment template" not in message
+    assert "the round the rerun resumes into" in message
+    incomplete = [body for body in runner.comments if "**Review status: Incomplete**" in body]
+    assert len(incomplete) == 1
 
 
 def test_selective_resume_uses_a_valid_persisted_scheduler_checkpoint(tmp_path):
@@ -8498,18 +8541,52 @@ def test_pr_loop_quarantines_unavailable_reviewer_while_healthy_reviewer_finishe
         max_rounds=3,
     )
 
-    with pytest.raises(AgentLoopError, match="missing required input from Codex"):
+    with pytest.raises(AgentLoopError, match="missing required input from Codex") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
 
     codex_reviews = [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
     claude_reviews = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     gemini_coder_turns = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"]]
+    # Decided at detection (#1129): no coder follow-up and no later round.
     assert len(codex_reviews) == 1
-    assert len(claude_reviews) == 2
-    assert len(gemini_coder_turns) == 1
-    assert "**Review status: Incomplete**" in runner.comments[-1]
-    assert "Claude" in runner.comments[-1]
+    assert len(claude_reviews) == 1
+    assert gemini_coder_turns == []
+    message = str(excinfo.value)
+    assert "Detected in round 1" in message
+    assert "Blocking reviewers this round: Claude" in message
+    assert "Open must-fix items (including carried): 1" in message
+    assert "--reviewer flags" in message
+    assert "Signed amendment template" not in message
+    incomplete = [body for body in runner.comments if "**Review status: Incomplete**" in body]
+    assert len(incomplete) == 1
+    assert "- Codex: agent-unavailable" in incomplete[0]
+    assert "Claude" in incomplete[0]
+    assert "--reviewer flags" in incomplete[0]
+    assert "AGENT_" not in incomplete[0]
+    assert "{" not in incomplete[0]
+    # The advertised route must not contradict the policy-specific remedy.
+    assert "replacement reviewer" not in incomplete[0]
+    reconciliations = [body for body in runner.comments if "reconciliation" in body]
+    assert reconciliations, "sequential stop must post a reconciliation record"
+    assert "Finalization stops" in reconciliations[0]
+    assert "Finalization continues" not in reconciliations[0]
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+
+def test_incomplete_review_comment_reports_zero_open_must_fix_count():
+    comment = orchestrator._format_incomplete_pr_review_comment(
+        pr_number=5,
+        unavailable_reviewers={
+            "codex": __import__("coding_review_agent_loop.errors", fromlist=["x"]).AgentInvocationError("down", failure_category="agent-unavailable")
+        },
+        approved_reviewer_names=["Claude"],
+        detection_round=2,
+        open_must_fix_count=0,
+        remedy_lines=["- Restore the reviewer backend and rerun unchanged."],
+    )
+    assert "### Open findings" in comment
+    assert "Open must-fix items (including carried): 0" in comment
+    assert "replacement reviewer" not in comment
 
 
 def test_pr_loop_retries_explicit_retryable_agent_unavailable_response(tmp_path):
@@ -16263,3 +16340,408 @@ def test_1133_managed_entry_refuses_the_reduced_board_with_the_rerun_hint(
     with pytest.raises(AgentLoopError, match="Rerun with the original reviewer board"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert plan_checks == [("codex", "gemini")] and not merges
+
+
+_AGENT_UNAVAILABLE_ENV = (
+    json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "agent_unavailable",
+            "retryable": False,
+            "category": "environment",
+            "summary": "The reviewer sandbox is down.",
+            "suggested_action": "Repair the reviewer sandbox.",
+        }
+    )
+    + "\n<!-- AGENT_UNAVAILABLE -->\n-- Google Gemini"
+)
+
+
+def _incomplete_comments(runner):
+    return [body for body in runner.comments if "**Review status: Incomplete**" in body]
+
+
+def test_evidence_response_pass_with_unavailable_reviewer_stops_before_the_gate_and_reruns_in_full(
+    tmp_path, monkeypatch
+):
+    """Rows evidence-response-pass-unavailable and evidence-pass-stop-then-restore-rerun."""
+    runner = FakeRunner(
+        codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    gate_calls = []
+    real_gate = orchestrator._evidence_freeze_gate
+    monkeypatch.setattr(
+        orchestrator,
+        "_evidence_freeze_gate",
+        lambda *a, **k: gate_calls.append(1) or real_gate(*a, **k),
+    )
+    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
+    runner.gemini_outputs.append(_AGENT_UNAVAILABLE_ENV)
+    with pytest.raises(AgentLoopError, match="missing required input from Gemini") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "evidence gate proceeded" not in str(excinfo.value)
+    assert gate_calls == []
+    assert _release_records(runner) == []
+    assert len(_freeze_records(runner)) == 1
+    assert len(_incomplete_comments(runner)) == 1
+    assert "in full with the remaining board on rerun" in _incomplete_comments(runner)[0]
+
+    # Backend restored: the unterminated pass is discarded and the FULL board reruns.
+    runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
+    runner.gemini_outputs.append(
+        _evidence_review(
+            reviewer="Google Gemini", hr=True,
+            dispositions=[_resolve("item-1", "Codex owns this request.")],
+        )
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert runner.codex_outputs == [] and runner.gemini_outputs == []
+    releases = _release_records(runner)
+    assert len(releases) == 1 and releases[0].metadata.evidence_release.reason == "evidence-cleared"
+
+
+def _unavail(label):
+    return _AGENT_UNAVAILABLE_ENV.replace("Google Gemini", label)
+
+
+def _scheduler_stop_runner(**overrides):
+    values = dict(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_unavail("Antigravity")],
+    )
+    values.update(overrides)
+    return FakeRunner(**values)
+
+
+def _stop_commands_after(runner, mark):
+    return [cmd for cmd, _cwd in runner.commands[mark:] if cmd]
+
+
+def test_scheduler_stop_comment_carries_prose_and_error_carries_validated_template(tmp_path):
+    """Rows selective-panel-unavailable-remediation and printed-amendment-accepted-on-rerun."""
+    runner = _scheduler_stop_runner()
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
+    message = str(excinfo.value)
+    assert "Reviewer board amendment:" in message
+    incomplete = _incomplete_comments(runner)
+    assert len(incomplete) == 1
+    assert "effective from round" in incomplete[0]
+    assert "original board" in incomplete[0]
+    assert "reviewer-board-amendment" not in incomplete[0]
+    assert "~~~" not in incomplete[0] and "```" not in incomplete[0] and "{" not in incomplete[0]
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    assert not any("pausing" in comment for comment in runner.comments)
+    assert "Finalization stops" in " ".join(runner.comments)
+
+
+def test_scheduler_stop_template_is_accepted_on_rerun_with_the_original_board(
+    tmp_path, monkeypatch
+):
+    """Row printed-amendment-accepted-on-rerun: the template printed by the stop itself."""
+    runner = _scheduler_stop_runner()
+    original = _staged_config(tmp_path, auto_merge=True)
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=original)
+    printed_round = int(re.search(r"effective from round (\d+)", _incomplete_comments(runner)[0]).group(1))
+    template = _m943_amendment_from_error(str(excinfo.value))
+    assert f'"effective_from_round": {printed_round}' in template
+    # Post the first stop's template as-is and rerun with the ORIGINAL board.
+    _m943_append(runner, template)
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    mark = len(runner.commands)
+    assert run_pr_loop(runner, pr_number=77, config=original) == 0
+    assert "agy" not in [cmd[0] for cmd in _stop_commands_after(runner, mark)]
+    assert any("Reviewer board amendment applied." in comment for comment in runner.comments)
+    assert not any("scheduler contract changed" in comment for comment in runner.comments)
+
+
+def test_scheduler_stop_with_primary_unavailable_is_prose_only_without_patching(tmp_path):
+    """Row primary-unavailable-no-template with the real amend_contract dry-run."""
+    runner = FakeRunner(
+        codex_outputs=[_unavail("OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    with pytest.raises(AgentLoopError, match="missing required input from Codex") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
+    message = str(excinfo.value)
+    assert "cannot be reduced for this run" in message
+    assert "Reviewer board amendment:" not in message
+    incomplete = _incomplete_comments(runner)
+    assert len(incomplete) == 1 and "cannot be reduced for this run" in incomplete[0]
+    assert "signed reviewer-board amendment" not in incomplete[0]
+
+
+def test_scheduler_stop_with_last_secondary_unavailable_is_prose_only(tmp_path):
+    """Row primary-unavailable-no-template: 2-member board, only secondary unavailable."""
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_unavail("Google Gemini")],
+    )
+    config = _staged_config(tmp_path, reviewer=("codex", "gemini"))
+    with pytest.raises(AgentLoopError, match="missing required input from Gemini") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(excinfo.value)
+    assert "cannot be reduced for this run" in message
+    assert "Reviewer board amendment:" not in message
+    incomplete = _incomplete_comments(runner)
+    assert len(incomplete) == 1 and "cannot be reduced for this run" in incomplete[0]
+
+
+def test_scheduler_stop_survives_a_failing_fresh_context_fetch(tmp_path, monkeypatch):
+    """Row advisory-lookup-failure-fallback: the fresh PR-context fetch raises."""
+    stopping = []
+    real_advisory = orchestrator._unavailable_reviewer_amendment_advisory
+    real_fetch = orchestrator.get_pr_review_context
+
+    def mark_advisory(**kwargs):
+        stopping.append(True)
+        return real_advisory(**kwargs)
+
+    def fetch(*args, **kwargs):
+        if stopping:
+            raise RuntimeError("context fetch exploded")
+        return real_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_unavailable_reviewer_amendment_advisory", mark_advisory)
+    monkeypatch.setattr(orchestrator, "get_pr_review_context", fetch)
+    runner = _scheduler_stop_runner()
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
+    assert stopping
+    message = str(excinfo.value)
+    assert "context fetch exploded" not in message
+    assert "Reviewer board amendment:" not in message
+    assert "the round the rerun resumes into" in message
+    assert len(_incomplete_comments(runner)) == 1
+
+
+def _all_reviewers_stop(tmp_path, *, codex_outputs, claude_outputs):
+    runner = FakeRunner(
+        codex_outputs=list(codex_outputs),
+        claude_outputs=list(claude_outputs),
+        antigravity_outputs=[_unavail("Antigravity")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "claude", "antigravity"), max_rounds=3)
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    return runner, str(excinfo.value)
+
+
+def test_all_reviewers_flag_removal_rerun_proceeds_without_the_removed_reviewer(tmp_path):
+    """Row all-reviewers-flag-removal-rerun."""
+    runner, message = _all_reviewers_stop(
+        tmp_path,
+        codex_outputs=[structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")],
+        claude_outputs=[structured_pr_review(state="approved", summary="ok", reviewer="Anthropic Claude")],
+    )
+    assert "--reviewer flags" in message
+    assert "Reviewer board amendment:" not in message
+    incomplete = _incomplete_comments(runner)
+    assert len(incomplete) == 1
+    assert "Open must-fix items (including carried): 0" in incomplete[0]
+    mark = len(runner.commands)
+    runner.codex_outputs.append(
+        structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")
+    )
+    runner.claude_outputs.append(
+        structured_pr_review(state="approved", summary="ok", reviewer="Anthropic Claude")
+    )
+    reduced = make_config(tmp_path, reviewer=("codex", "claude"), max_rounds=3)
+    assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+    assert "agy" not in [cmd[0] for cmd in _stop_commands_after(runner, mark)]
+
+
+def test_incomplete_non_actionable_review_beside_a_blocking_peer_stops_at_detection(tmp_path):
+    """Row incomplete-review-with-peer-blocking (markerless prose = incomplete review)."""
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Needs work.",
+                blocking_items=["Add the missing test."], reviewer="OpenAI Codex",
+            )
+        ],
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"]),
+        ],
+        gemini_outputs=[
+            structured_pr_review(
+                state="blocking", summary="The review is incomplete; I could not verify the diff.",
+                reviewer="Google Gemini",
+            )
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=3)
+    runner.antigravity_outputs = [
+        structured_pr_review(state="approved", summary="ok", reviewer="Antigravity")
+    ]
+    with pytest.raises(AgentLoopError, match="missing required input from Gemini") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "Blocking reviewers this round: Codex" in str(excinfo.value)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    assert len(_incomplete_comments(runner)) == 1
+
+
+def test_strict_managed_all_reviewers_stop_suggests_restore_only(tmp_path, monkeypatch):
+    """Row strict-managed-all-reviewers-restore-only on a real strict issue-created handoff."""
+    plan_board = ("codex", "claude", "antigravity")
+    monkeypatch.setattr(
+        orchestrator, "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    )
+    monkeypatch.setattr(
+        orchestrator, "_require_complete_canonical_plan_approval", lambda *a, **k: None
+    )
+    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="strict", override_nonce=None,
+    )
+    assert orchestrator._managed_binding_protection_mode(handoff) == "strict"
+    monkeypatch.setattr(
+        orchestrator, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff
+    )
+    monkeypatch.setattr(
+        orchestrator, "revalidate_issue_created_handoff", lambda *a, **k: k["handoff"]
+    )
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *a, **k: ManagedCiContract(protocol_version=2, protection_mode="strict"),
+    )
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="ok", reviewer="OpenAI Codex")],
+        claude_outputs=[structured_pr_review(state="approved", summary="ok", reviewer="Anthropic Claude")],
+        antigravity_outputs=[_unavail("Antigravity")],
+        issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(
+        tmp_path, reviewer=plan_board, max_rounds=3, managed_ci=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(excinfo.value)
+    assert "--reviewer flags" not in message
+    assert "Reviewer board amendment:" not in message
+    assert "Restore the reviewer backend" in message
+    incomplete = _incomplete_comments(runner)
+    assert len(incomplete) == 1
+    assert "--reviewer flags" not in incomplete[0]
+    assert "reviewer-board amendment" not in incomplete[0]
+
+
+def test_carried_migration_obligation_is_not_revalidated_when_a_reviewer_is_unavailable(
+    tmp_path, monkeypatch
+):
+    """Row carried-migration-obligation-unavailable."""
+    def approve(name):
+        return structured_pr_review(state="approved", summary="ok", reviewer=name)
+
+    def approve_again(name):
+        return structured_pr_review(
+            state="approved", summary="ok", reviewer=name,
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        )
+
+    runner = FakeRunner(
+        codex_outputs=[approve("OpenAI Codex"), approve_again("OpenAI Codex")],
+        claude_outputs=[approve("Anthropic Claude"), approve_again("Anthropic Claude")],
+        antigravity_outputs=[approve("Antigravity"), _unavail("Antigravity")],
+        gemini_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Fixed the migration.", addressed_items=["item-1"],
+                reviewer="Google Gemini",
+            )
+        ],
+    )
+    config = make_config(
+        tmp_path, coder="gemini", reviewer=("codex", "claude", "antigravity"), max_rounds=3
+    )
+    calls = []
+    validations = iter(
+        [
+            MigrationValidationResult(ok=False, message="down_revision does not match head."),
+            MigrationValidationResult(ok=True),
+        ]
+    )
+
+    def validate(*args, **kwargs):
+        calls.append("validate")
+        return next(validations)
+
+    monkeypatch.setattr(orchestrator, "validate_pr_migration_topology", validate)
+    real_sync = orchestrator.sync_coder_pr_before_validation
+    monkeypatch.setattr(
+        orchestrator, "sync_coder_pr_before_validation",
+        lambda *a, **k: calls.append("sync") or real_sync(*a, **k),
+    )
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    # Round 1 validated once; the round-2 stop must not sync or validate again.
+    assert calls.count("validate") == 1
+    assert calls.count("sync") == 1
+    message = str(excinfo.value)
+    assert "Detected in round 2" in message
+    assert "Open must-fix items (including carried): 1" in message
+    assert sum(cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands) == 1
+
+
+def test_refresh_pass_with_unavailable_reviewer_publishes_no_release_and_reruns_in_full(
+    tmp_path, monkeypatch
+):
+    """Rows evidence-response-pass-unavailable and evidence-pass-stop-then-restore-rerun (refresh)."""
+    runner = FakeRunner(
+        codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    with pytest.raises(HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
+    runner.gemini_outputs.append(
+        _evidence_review(
+            reviewer="Google Gemini", hr=True,
+            dispositions=[_resolve("item-1", "Codex owns this request.")],
+        )
+    )
+    real_checks = orchestrator.get_pr_checks
+    stops = []
+
+    def stop_after_release(*args, **kwargs):
+        if _release_records(runner) and not stops:
+            stops.append(True)
+            raise AgentLoopError("simulated process stop before finalization")
+        return real_checks(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", stop_after_release)
+    with pytest.raises(AgentLoopError, match="simulated process stop"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_release_records(runner)) == 1
+
+    # New signed input forces a refresh pass; Gemini is unavailable in it.
+    runner.pr_payload["comments"].append(_signed("One more requirement: keep the flag.", 2))
+    runner.codex_outputs.append(_evidence_review(hr=True, summary="Checked the new requirement."))
+    runner.gemini_outputs.append(_AGENT_UNAVAILABLE_ENV)
+    with pytest.raises(AgentLoopError, match="missing required input from Gemini"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_release_records(runner)) == 1
+    assert len(_incomplete_comments(runner)) == 1
+
+    # Backend restored: the whole refresh pass repeats with both reviewers.
+    runner.codex_outputs.append(_evidence_review(hr=True, summary="Checked the new requirement."))
+    runner.gemini_outputs.append(_evidence_review(reviewer="Google Gemini", hr=True))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert runner.codex_outputs == [] and runner.gemini_outputs == []
+    reasons = [record.metadata.evidence_release.reason for record in _release_records(runner)]
+    assert reasons == ["evidence-cleared", "refresh-clean"]

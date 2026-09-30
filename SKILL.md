@@ -268,6 +268,11 @@ and then inspects phase 1:
   such a record is pending.
   Never edit handoff records by hand. See "Re-planning an approved child plan"
   in `docs/local_agent_loop.md`.
+- A PR-review reviewer that becomes unavailable stops the run in that round
+  with an incomplete-review error naming the remedy for the run's policy
+  (restore the backend; a signed amendment for scheduler policies; dropping it
+  from the reviewer flags for `all-reviewers`, except on strict managed-CI PRs).
+  Report it to the human; do not drop the reviewer silently.
 - If a reviewer backend is unavailable (for example, an exhausted quota) and a
   rerun without it stops with the scheduler contract-drift error, do not drop
   the reviewer silently or refile the issue. Report the error to the human; the
