@@ -2334,14 +2334,19 @@ def _listed_comment_ids(message):
     return [int(value) for value in re.findall(r"comment (\d+) https://", message)]
 
 
-def _delete_rest_comments(runner, ids, markers):
+def _delete_listed_comments(runner, ids, *, surface):
+    """Delete exactly the advertised ids from every fake comment projection."""
+    from agent_loop_helpers import _strip_round_metadata
+
+    store = runner.pr_payload["comments"] if surface == "pr" else runner.issue_comments
     doomed = {comment_id - 10_000 - 1 for comment_id in ids}
-    runner.pr_payload["comments"] = [
-        comment for index, comment in enumerate(runner.pr_payload["comments"]) if index not in doomed
-    ]
-    runner.comments = [
-        body for body in runner.comments if not any(marker in body for marker in markers)
-    ]
+    deleted = [comment["body"] for index, comment in enumerate(store) if index in doomed]
+    kept = [comment for index, comment in enumerate(store) if index not in doomed]
+    store[:] = kept
+    for body in deleted:
+        stripped = _strip_round_metadata(body)
+        if stripped in runner.comments:
+            runner.comments.remove(stripped)
 
 
 @pytest.mark.parametrize("review_parallel", [True, False])
@@ -2363,7 +2368,9 @@ def test_pr_partial_round_refusal_lists_comments_and_recovers(tmp_path, review_p
     ids = _listed_comment_ids(message)
     assert len(ids) == 1
 
-    _delete_rest_comments(runner, ids, markers)
+    _delete_listed_comments(runner, ids, surface="pr")
+    # Deleting only the advertised ids must have removed every peer body.
+    assert not any(m in body for m in markers for body in runner.comments)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert not runner.peer_body_visible_at_launch
     assert len(runner.reviewer_launches) - launches_before == 2
@@ -2723,11 +2730,9 @@ def test_plan_partial_round_recovers_from_the_message_alone(tmp_path):
     ids = _listed_comment_ids(message)
     assert ids
 
-    doomed = {comment_id - 10_000 - 1 for comment_id in ids}
-    runner.issue_comments = [
-        comment for index, comment in enumerate(runner.issue_comments) if index not in doomed
-    ]
-    runner.comments = [body for body in runner.comments if not any(m in body for m in markers)]
+    _delete_listed_comments(runner, ids, surface="issue")
+    # Deleting only the advertised ids must have removed every peer body.
+    assert not any(m in body for m in markers for body in runner.comments)
     runner.peer_body_visible_at_launch = False
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
