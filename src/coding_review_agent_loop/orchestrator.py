@@ -14066,6 +14066,10 @@ def _run_plan_first_loop(
                 resume=lambda remaining: _resume_plan_round(
                     remaining, configured_reviewers=configured_reviewers
                 ),
+                # The resumed plan subject must not shift after deletion.
+                fingerprint=lambda remaining: (
+                    lambda resumed: resumed[0] if resumed is not None else None
+                )(_resume_plan_round(remaining, configured_reviewers=configured_reviewers)),
             )
 
         if not plan_round_parallel:
@@ -24311,6 +24315,26 @@ def run_pr_loop(
             pr_round_parallel = (
                 config.review_parallel or pr_round_spool.has_records()
             ) and evidence_pass is None
+            def _pr_recovery_fingerprint(remaining: Sequence[object]) -> object:
+                """The qualified panel opening, identified by its comment, not its index."""
+                if not scheduler_capabilities.requires_primary:
+                    return None
+                evidence = _derive_pr_panel_evidence(
+                    _extract_round_metadata_records(remaining, flow="pr"),
+                    primary_reviewer=scheduler_contract.primary_reviewer,
+                    required_reviewers=scheduler_contract.required_reviewers,
+                )
+                opening = (
+                    remaining[evidence.opening_index]
+                    if evidence.opening_index is not None
+                    else None
+                )
+                return (
+                    evidence.opening_source,
+                    getattr(opening, "created_at", None),
+                    getattr(opening, "body", None),
+                )
+
             def _pr_round_recovery() -> PartialRoundRecovery:
                 return compute_partial_round_recovery(
                     snapshot=pr_comments,
@@ -24332,6 +24356,7 @@ def run_pr_loop(
                             else "aggregate"
                         ),
                     ),
+                    fingerprint=_pr_recovery_fingerprint,
                 )
 
             if not pr_round_parallel and not skip_reviewers_this_round and evidence_pass is None:

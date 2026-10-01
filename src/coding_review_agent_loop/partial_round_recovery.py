@@ -246,8 +246,13 @@ def compute_partial_round_recovery(
     scheduler_phase: str | None,
     reviewer_names: Sequence[str],
     resume: Callable[[Sequence[IssueComment]], object],
+    fingerprint: Callable[[Sequence[IssueComment]], object] | None = None,
 ) -> PartialRoundRecovery:
-    """The comments whose deletion lets the round run again, verified or provisional."""
+    """The comments whose deletion lets the round run again, verified or provisional.
+
+    ``fingerprint`` summarizes state the retained records must keep (for
+    example the qualified panel opening); it must be equal before and after.
+    """
     complete = True
     try:
         comments: Sequence[IssueComment] = tuple(read_rest())
@@ -260,7 +265,7 @@ def compute_partial_round_recovery(
         return _compute(
             comments, complete=complete, flow=flow, round_number=round_number,
             subject=subject, scheduler_phase=scheduler_phase,
-            reviewer_names=reviewer_names, resume=resume,
+            reviewer_names=reviewer_names, resume=resume, fingerprint=fingerprint,
         )
     except AgentLoopError:
         return PartialRoundRecovery(
@@ -279,7 +284,18 @@ def _compute(
     scheduler_phase: str | None,
     reviewer_names: Sequence[str],
     resume: Callable[[Sequence[IssueComment]], object],
+    fingerprint: Callable[[Sequence[IssueComment]], object] | None = None,
 ) -> PartialRoundRecovery:
+    def state_of(result: object) -> object:
+        return result[1] if isinstance(result, tuple) and len(result) == 2 else result
+
+    try:
+        before = state_of(resume(comments))
+        before_print = fingerprint(comments) if fingerprint is not None else None
+    except AgentLoopError:
+        before = None
+        before_print = None
+
     def check(targets: dict[int, str], lower_bound: int | None) -> bool:
         if not targets:
             return False
@@ -326,16 +342,38 @@ def _compute(
                 key in refs or (key[0], "*") in refs for key in keys
             ):
                 return False
-        # The resumed round, when it is this one, must be unreconciled and hold
-        # no same-batch reviewer record.
-        state = resumed[1] if isinstance(resumed, tuple) and len(resumed) == 2 else resumed
+        state = state_of(resumed)
+        anchored = any(
+            record.metadata.flow == flow
+            and record.metadata.role == "coder"
+            and record.metadata.round_number == round_number
+            and record.metadata.subject == subject
+            for record in records
+        )
         if getattr(state, "round_number", None) == round_number:
             if getattr(state, "reconciled", False):
                 return False
-            if scheduler_phase is None and any(
+            if any(
                 record.metadata.agent in reviewer_names
+                and (scheduler_phase is None or record.metadata.scheduler_phase == scheduler_phase)
                 for record in getattr(state, "completed_reviews", ())
             ):
+                return False
+        elif anchored:
+            # A round anchored by a retained coder record must still resume as
+            # this round; only an unanchored round may fall back legitimately.
+            return False
+        if before is not None and getattr(before, "round_number", None) == round_number:
+            if state is not None and getattr(state, "round_number", None) == round_number:
+                # Retained artifacts must hydrate exactly as before deletion.
+                for name in ("coder_output", "coder_metadata", "compact_prior_summaries"):
+                    if getattr(state, name, None) != getattr(before, name, None):
+                        return False
+        if fingerprint is not None:
+            try:
+                if fingerprint(remaining) != before_print:
+                    return False
+            except AgentLoopError:
                 return False
         return True
 

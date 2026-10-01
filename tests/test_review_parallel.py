@@ -2541,9 +2541,10 @@ class _History:
         parts = _prepare(_attach_round_metadata("orphan", metadata))
         return [self.add(part, **kwargs) for part in parts[:-1]]
 
-    def recover(self, *, scheduler_phase=None):
+    def recover(self, *, scheduler_phase=None, fingerprint=None):
         rest = tuple(self.comments)
         return compute_partial_round_recovery(
+            fingerprint=fingerprint,
             snapshot=rest, read_rest=lambda: rest, flow="pr", round_number=1, subject="h",
             scheduler_phase=scheduler_phase, reviewer_names=("Codex", "Gemini"),
             resume=lambda remaining: _resume_pr(
@@ -2651,3 +2652,47 @@ def test_recovery_reconciliation_summary_is_listed_and_prelaunch_retained():
     recovery = history.recover()
     assert recovery.verified, recovery.reason
     assert _listed(recovery) == history.ids([verdict, reconciliation])
+
+
+def test_recovery_is_provisional_when_retained_state_would_shift():
+    """A fingerprint of retained state (e.g. the panel opening) must survive deletion."""
+    history = _History()
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
+    history.add_record(_meta())
+    stable = history.recover(fingerprint=lambda comments: sum(
+        "scheduler-prelaunch" in str(c.body) or "AGENT_LOOP_META" in str(c.body) and False
+        for c in comments
+    ))
+    assert stable.verified, stable.reason
+    shifting = history.recover(fingerprint=lambda comments: len(comments))
+    assert not shifting.verified
+    assert "could not be confirmed" in shifting.reason
+
+
+def test_recovery_requires_anchored_round_to_resume_as_the_same_round():
+    history = _History()
+    history.add_record(_meta(role="coder", agent="Claude", phase="authoritative"))
+    history.add_record(_meta())
+    # The resume stub reports a different round once the verdict is gone.
+    rest = tuple(history.comments)
+
+    class _State:
+        def __init__(self, round_number):
+            self.round_number = round_number
+            self.reconciled = False
+            self.completed_reviews = ()
+            self.coder_output = "x"
+            self.coder_metadata = None
+            self.compact_prior_summaries = ()
+
+    calls = []
+
+    def resume(comments):
+        calls.append(len(comments))
+        return _State(1 if len(comments) == len(rest) else 0)
+
+    recovery = compute_partial_round_recovery(
+        snapshot=rest, read_rest=lambda: rest, flow="pr", round_number=1, subject="h",
+        scheduler_phase=None, reviewer_names=("Codex", "Gemini"), resume=resume,
+    )
+    assert not recovery.verified
