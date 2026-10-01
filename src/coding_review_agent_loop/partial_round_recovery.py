@@ -191,12 +191,18 @@ def _plan(
         if isinstance(comment.body, str) and is_round_transport_sidecar(comment.body)
     ]
     attachment_set = set(attachments)
+    undecodable = False
     retained_refs: set[tuple[str, str]] = set()
     targeted_refs: set[tuple[str, str]] = set()
     for index, comment in enumerate(comments):
         if index in attachment_set or not isinstance(comment.body, str):
             continue
-        refs = referenced_attachment_keys(comment.body)
+        try:
+            refs = referenced_attachment_keys(comment.body)
+        except AgentLoopError:
+            # Keep the known targets; no attachment may be called unreferenced.
+            undecodable = True
+            continue
         (targeted_refs if index in targets else retained_refs).update(refs)
 
     def referenced(keys: set[tuple[str, str]], item: tuple[str, str]) -> bool:
@@ -220,6 +226,9 @@ def _plan(
         if any(referenced(targeted_refs, key) for key in keys):
             targets[index] = "attachment of a listed comment"
             continue
+        if undecodable:
+            uncertain[index] = "attachment (references could not be decoded)"
+            continue
         # Unreferenced: attribute by the round interval and author.
         if lower_bound is not None:
             if index > lower_bound and same_author(index):
@@ -233,6 +242,8 @@ def _plan(
         else:
             uncertain[index] = "unreferenced attachment (author unknown or differs)"
     reason = "unreferenced attachments could not be attributed to this round" if uncertain else None
+    if undecodable:
+        reason = "attachment references could not be fully decoded"
     return targets, uncertain, reason, lower_bound
 
 
@@ -391,7 +402,7 @@ def _compute(
             break
     if not verified:
         reason = reason or "resume could not be confirmed on the history that would remain"
-    if uncertain:
+    if uncertain or reason == "attachment references could not be fully decoded":
         verified = False
     if not complete:
         verified = False

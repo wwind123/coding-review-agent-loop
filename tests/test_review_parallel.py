@@ -2779,3 +2779,27 @@ def test_provisional_target_without_id_but_with_url_never_prints_none():
         RecoveryTarget(label="x", comment_id=7, url="https://example.test/c/7", author=None, created_at=None)
     )
     assert with_id == "- x: comment 7 https://example.test/c/7"
+
+
+def test_recovery_keeps_known_targets_when_a_retained_reference_marker_is_undecodable():
+    history = _History()
+    history.add_record(_Metadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=0, subject="old",
+        state="approved", phase="publication",
+    ))
+    # A retained comment carries a reference-bearing marker that cannot be decoded.
+    history.add("Plan\n<!-- AGENT_EXECUTION_RECOMMENDATION: AAAA -->")
+    _a, verdict = history.add_record(_meta())
+
+    recovery = history.recover()
+
+    assert not recovery.verified
+    assert recovery.reason == "attachment references could not be fully decoded"
+    assert 1000 + verdict + 1 in {t.comment_id for t in recovery.targets}
+    message = str(orchestrator._partial_round_refusal(
+        surface="pr", number=77, round_number=1, reviewer_name="Gemini",
+        public_peers=["Codex"], recovery=lambda: recovery,
+    ))
+    assert "provisional list" in message
+    assert "attachment references could not be fully decoded" in message
+    assert "Delete these" not in message
