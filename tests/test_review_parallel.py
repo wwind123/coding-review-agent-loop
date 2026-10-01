@@ -2761,3 +2761,21 @@ def test_plan_partial_round_recovers_from_the_message_alone(tmp_path):
     assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
     # The retained plan record plus the fresh records equal the baseline's.
     assert len(runner.comments) == len(baseline.comments)
+
+
+def test_provisional_target_without_id_but_with_url_never_prints_none():
+    from coding_review_agent_loop.partial_round_recovery import RecoveryTarget
+
+    line = orchestrator._format_recovery_target(
+        RecoveryTarget(
+            label="Codex review (round 1)", comment_id=None,
+            url="https://example.test/c/1", author="bot", created_at="2026-01-01T00:00:01Z",
+        )
+    )
+    assert "comment None" not in line
+    assert "id could not be determined" in line
+    assert "https://example.test/c/1" in line
+    with_id = orchestrator._format_recovery_target(
+        RecoveryTarget(label="x", comment_id=7, url="https://example.test/c/7", author=None, created_at=None)
+    )
+    assert with_id == "- x: comment 7 https://example.test/c/7"

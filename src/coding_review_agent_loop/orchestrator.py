@@ -12327,10 +12327,13 @@ def _replay_unavailable_cause(
 
 
 def _format_recovery_target(target: RecoveryTarget) -> str:
-    if target.comment_id is None and not target.url:
+    if target.comment_id is None:
+        # A projection can carry a permalink without a numeric id; never print
+        # "comment None".
+        url = f" {target.url}" if target.url else ""
         return (
             f"- {target.label}: by {target.author or 'unknown author'}, created "
-            f"{target.created_at or 'unknown time'} (id could not be determined)"
+            f"{target.created_at or 'unknown time'} (id could not be determined){url}"
         )
     return f"- {target.label}: comment {target.comment_id} {target.url or ''}".rstrip()
 
