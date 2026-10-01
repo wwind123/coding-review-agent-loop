@@ -2851,7 +2851,7 @@ def test_reconciled_round_with_unavailable_reviewer_recovers_from_the_message(tm
     assert any("reconciliation" in body for body in runner.comments)
 
 
-def _overflow_pr_runner(seeds):
+def _overflow_pr_runner(seeds, slow_reviewer=None):
     """A PR runner whose Codex reviews overflow into attachment comments."""
     from coding_review_agent_loop.round_transport import attachment_keys  # noqa: F401
 
@@ -2862,6 +2862,7 @@ def _overflow_pr_runner(seeds):
     markers = ("Codex approves independently.", "Gemini approves independently.")
     runner = _PartialPublicationProbeRunner(
         round_markers=markers,
+        slow_reviewer=slow_reviewer,
         codex_outputs=[
             structured_pr_review(summary=f"Codex approves independently. {text}") for text in rnd_text
         ],
@@ -2902,6 +2903,56 @@ def test_overflow_peer_verdict_attachments_are_listed_and_recovered(tmp_path):
     _delete_listed_comments(runner, ids, surface="pr")
     # No comment carrying the peer's response (anchor or attachment) remains.
     assert runner.pr_payload["comments"] == []
+    runner.peer_body_visible_at_launch = False
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not runner.peer_body_visible_at_launch
+    baseline, _ = _overflow_pr_runner((12,))
+    baseline_config = make_config(
+        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
+    )
+    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
+    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
+    assert len(runner.pr_payload["comments"]) == len(baseline.pr_payload["comments"])
+
+
+def test_orphan_attachments_before_a_lost_anchor_are_listed_and_recovered(tmp_path):
+    """Interruption between a peer's attachments and its anchor leaves orphans."""
+    import coding_review_agent_loop.github as github_module
+    from coding_review_agent_loop.round_transport import attachment_keys
+
+    runner, markers = _overflow_pr_runner((11, 12), slow_reviewer="codex")
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    real_post = github_module._post_comment_body
+    state = {"marked": 0}
+
+    def interrupting_post(*args, **kwargs):
+        body = str(kwargs["body"])
+        if any(marker in body for marker in markers):
+            state["marked"] += 1
+            if state["marked"] == 2:  # Codex's anchor, after its attachments landed
+                raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    with patch.object(github_module, "_post_comment_body", side_effect=interrupting_post):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    posted = runner.pr_payload["comments"]
+    orphans = [10_000 + i for i, c in enumerate(posted, start=1) if attachment_keys(c["body"])]
+    assert len(orphans) == 2 and len(posted) == 3  # Gemini's verdict plus two orphans
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = len(runner.reviewer_launches)
+
+    message = _refusal_message(runner, config)
+
+    assert len(runner.reviewer_launches) == launches_before
+    ids = _listed_comment_ids(message)
+    assert set(orphans) <= set(ids) and len(ids) == 3, message
+    assert "Delete these 3 comments" in message
+    _delete_listed_comments(runner, ids, surface="pr")
+    assert runner.pr_payload["comments"] == []  # no comment carries any peer response
     runner.peer_body_visible_at_launch = False
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
