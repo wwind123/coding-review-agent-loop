@@ -3288,6 +3288,20 @@ def _plan_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
     )
 
 
+def _pr_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
+    """True when the PR round holds an actual reconciliation summary.
+
+    The scheduler-prelaunch summary the PR loop posts before review (also the
+    secondary-audit panel opening) is a pre-reviewer checkpoint, exactly as it
+    is for plans (#905); legacy unlabeled summaries still count.
+    """
+    return any(
+        record.metadata.role == "summary"
+        and record.metadata.phase != "scheduler-prelaunch"
+        for record in records
+    )
+
+
 def _max_unresolved_item_number_from_records(records: Sequence[PostedRoundRecord]) -> int:
     max_number = 0
     for record in records:
@@ -4360,7 +4374,7 @@ def _resume_pr_round(
             if latest_coder_record is not None
             else ()
         ),
-        reconciled=any(record.metadata.role == "summary" for record in current_round_records),
+        reconciled=_pr_round_is_reconciled(current_round_records),
         local_test_evidence=(
             latest_coder_record.metadata.local_test_evidence
             if latest_coder_record is not None

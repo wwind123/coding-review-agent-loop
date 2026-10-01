@@ -2380,9 +2380,26 @@ Execution model:
   - If a same-round peer is already public -- including a posted review that
     resume rejected, for example after the requirements changed -- and a
     reviewer's spooled outcome is missing or no longer validates (for example,
-    a rerun on another host), the run stops before invoking it. Rerun from the host that holds the spool, or
-    delete the round's already-posted reviewer comments so the whole round runs
-    again.
+    a rerun on another host), the run stops before invoking it. The refusal
+    states why replay is unavailable: no spool exists on this host (naming the
+    directory looked under), the spool holds no outcome for that reviewer, the
+    reviewer's spool file exists but is unreadable or foreign, the spooled
+    outcome no longer validates, or the reviewer's own posted review was
+    rejected and needs a fresh turn. It never offers a rerun from another host.
+    It then lists, by comment id and URL, the comments to delete so the whole
+    round runs again independently: the same-batch reviewer verdicts (including
+    a rejected own record), the round's reconciling summaries, attachments only
+    those comments reference, and unreferenced attachments left inside this
+    round's interval. Scheduler-prelaunch summaries and plan phase checkpoints,
+    the coder record, incomplete-status notices, attachments a retained comment
+    still references, and older attachments are not listed and need not be
+    deleted. The list is checked by simulating resume on the history that would
+    remain; when it cannot be checked (the comment history could not be read
+    completely, an attachment cannot be attributed, or the simulation fails) it
+    is labelled a provisional list and is not a sufficiency claim. Resuming a PR
+    round now treats a scheduler-prelaunch summary as a pre-reconciliation
+    checkpoint, as planning rounds already do. A reset operation that deletes
+    the comments for you is out of scope.
 - The orchestrator still waits for every reviewer to settle before shared state
   changes: it aggregates outcomes, numbers unresolved items, and may begin
   coder work only in configured `--reviewer` order. It then posts a neutral

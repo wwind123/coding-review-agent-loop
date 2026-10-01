@@ -1,6 +1,7 @@
 """Tests for opt-in parallel plan/PR reviewer execution (#594)."""
 import dataclasses
 import json
+import re
 import threading
 import time
 from unittest.mock import patch
@@ -2298,3 +2299,175 @@ def test_staged_planning_resume_does_not_re_invoke_a_settled_reviewer(tmp_path):
     assert not any(cmd[:1] == ["codex"] for cmd, _cwd in resumed_commands)
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in resumed_commands)
     assert len([cmd for cmd, _cwd in resumed_commands if cmd[:1] == ["gemini"]]) == 1
+
+
+# --- #1142: the refusal names the comments to delete and why replay is unavailable ---
+
+
+def _approving_pr_runner():
+    markers = ("Codex approves independently.", "Gemini approves independently.")
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        codex_outputs=[
+            structured_pr_review(summary=markers[0]),
+            structured_pr_review(summary="Codex approves on the rerun."),
+        ],
+        gemini_outputs=[
+            structured_pr_review(summary=markers[1], reviewer="Google Gemini"),
+            structured_pr_review(summary="Gemini approves on the rerun.", reviewer="Google Gemini"),
+        ],
+    )
+    runner.serve_rest_issue_comments = True
+    return runner, markers
+
+
+def _refusal_message(runner, config, *, review_parallel=True):
+    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+        run_pr_loop(
+            runner, pr_number=77,
+            config=dataclasses.replace(config, review_parallel=review_parallel),
+        )
+    return str(excinfo.value)
+
+
+def _listed_comment_ids(message):
+    return [int(value) for value in re.findall(r"comment (\d+) https://", message)]
+
+
+def _delete_rest_comments(runner, ids, markers):
+    doomed = {comment_id - 10_000 - 1 for comment_id in ids}
+    runner.pr_payload["comments"] = [
+        comment for index, comment in enumerate(runner.pr_payload["comments"]) if index not in doomed
+    ]
+    runner.comments = [
+        body for body in runner.comments if not any(marker in body for marker in markers)
+    ]
+
+
+@pytest.mark.parametrize("review_parallel", [True, False])
+def test_pr_partial_round_refusal_lists_comments_and_recovers(tmp_path, review_parallel):
+    runner, markers = _approving_pr_runner()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = len(runner.reviewer_launches)
+
+    message = _refusal_message(runner, config, review_parallel=review_parallel)
+
+    assert len(runner.reviewer_launches) == launches_before
+    assert "No review spool for this round exists on this host" in message
+    assert "Rerun from the host" not in message
+    assert "Delete these 1 comments so the whole round runs again independently" in message
+    assert "need not be deleted" in message
+    ids = _listed_comment_ids(message)
+    assert len(ids) == 1
+
+    _delete_rest_comments(runner, ids, markers)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not runner.peer_body_visible_at_launch
+    assert len(runner.reviewer_launches) - launches_before == 2
+
+
+def test_pr_partial_round_refusal_without_rest_ids_is_provisional(tmp_path):
+    runner, markers = _approving_pr_runner()
+    runner.serve_rest_issue_comments = False
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    for path in _spool_files(config):
+        path.unlink()
+
+    message = _refusal_message(runner, config)
+
+    assert "provisional list" in message
+    assert "comment ids could not be read completely" in message
+    assert "Delete these" not in message
+    assert "need not be deleted" not in message
+    assert "id could not be determined" in message
+
+
+def _unpublished_reviewer_spool_file(config, markers, runner):
+    published = {marker for marker in markers if _published_count(runner, marker)}
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not any(marker in payload["response"]["text"] for marker in published):
+            return path
+    raise AssertionError("no unpublished reviewer spool file")
+
+
+def test_pr_partial_round_spool_missing_record_cause(tmp_path):
+    runner, markers = _approving_pr_runner()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    path = _unpublished_reviewer_spool_file(config, markers, runner)
+    path.unlink()
+    (path.parent / "another-reviewer.json").write_text("{}", encoding="utf-8")
+
+    message = _refusal_message(runner, config)
+
+    assert "holds no outcome for" in message
+    assert "No review spool for this round exists" not in message
+    assert "Rerun from the host" not in message
+
+
+def test_pr_partial_round_spool_unusable_file_cause(tmp_path):
+    runner, markers = _approving_pr_runner()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    path = _unpublished_reviewer_spool_file(config, markers, runner)
+    path.write_text("{not json", encoding="utf-8")
+
+    message = _refusal_message(runner, config)
+
+    assert f"spool file {path} exists but is unreadable or does not belong to this round" in message
+    assert "holds no outcome" not in message
+
+
+def test_pr_partial_round_invalid_spool_record_cause(tmp_path):
+    runner, markers = _approving_pr_runner()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    path = _unpublished_reviewer_spool_file(config, markers, runner)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["response"]["text"] = "not a structured PR review"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    message = _refusal_message(runner, config)
+
+    assert "spooled outcome no longer validates against this run" in message
+
+
+def test_replay_unavailable_cause_for_rejected_own_record_ignores_spool(tmp_path):
+    spool = orchestrator.ReviewRoundSpool(
+        root=tmp_path, repo="OWNER/REPO", surface="pr", number=77, round_number=1, subject="abc"
+    )
+    spool.store("Codex", {"text": "valid"})
+
+    cause = orchestrator._replay_unavailable_cause(spool, "Codex", own_posted=True)
+
+    assert "already posted but no longer accepted" in cause
+    assert "fresh turn" in cause
+    assert "spool" not in cause
+    # Without the own-record fact the same intact file is a validation failure.
+    assert "no longer validates" in orchestrator._replay_unavailable_cause(
+        spool, "Codex", loaded_unreplayable=True
+    )
+
+
+def test_plan_partial_round_refusal_lists_posted_review(tmp_path):
+    runner, markers = _plan_partial_round_runner()
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_plan_round_between_publications(runner, config, markers)
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["response"]["text"] = "not a structured plan review"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    message = str(excinfo.value)
+    assert "no longer validates against this run" in message
+    assert "Rerun from the host" not in message
+    assert re.search(r"comment \d+ https://", message)

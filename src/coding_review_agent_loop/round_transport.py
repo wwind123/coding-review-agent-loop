@@ -1002,3 +1002,62 @@ def hydrate_mapping(
             missing.add(field)
             result[field] = None
     return result, missing
+
+
+def attachment_keys(body: str) -> tuple[tuple[str, str], ...]:
+    """The (anchor, field) keys the transport attachments in ``body`` carry."""
+    keys: list[tuple[str, str]] = []
+    for match in ROUND_TRANSPORT_SIDECAR_RE.finditer(body):
+        try:
+            item = json.loads(_unb64(match.group("payload")).decode())
+            if isinstance(item, dict):
+                keys.append((str(item["anchor"]), str(item["field"])))
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+    return tuple(keys)
+
+
+_REFERENCE_KEYS = (
+    "$round_transport_spill",
+    "$round_transport_execution_recommendation",
+    "$round_transport_risk_test_matrix",
+)
+
+
+def _reference_keys_of(field: str, value: object) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, Mapping):
+        return ()
+    return tuple((str(value[key]), field) for key in _REFERENCE_KEYS if key in value)
+
+
+def referenced_attachment_keys(body: str) -> tuple[tuple[str, str], ...]:
+    """Every attachment key ``body`` references, in any form.
+
+    Covers round-metadata spill references and the visible execution
+    recommendation and risk-matrix markers.  Raises ``AgentLoopError`` when a
+    reference-bearing marker cannot be decoded, so callers never call an
+    attachment unreferenced on incomplete evidence.
+    """
+    keys: list[tuple[str, str]] = []
+    for match in ROUND_RESUME_MARKER_RE.finditer(body):
+        payload = decode_mapping(match.group("payload"))
+        for field in _SPILL_FIELDS:
+            keys.extend(_reference_keys_of(field, payload.get(field)))
+    for regex, field in (
+        (_EXECUTION_RECOMMENDATION_RE, "execution_recommendation"),
+        (_RISK_TEST_MATRIX_RE, "risk_test_matrix_marker"),
+    ):
+        for match in regex.finditer(body):
+            try:
+                parsed = json.loads(
+                    base64.urlsafe_b64decode(match.group("payload").encode("ascii")).decode("utf-8")
+                )
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise AgentLoopError("Undecodable attachment-reference marker.") from exc
+            keys.extend(_reference_keys_of(field, parsed))
+            if isinstance(parsed, Mapping):
+                # The marker reference names its own field; match any field of its anchor.
+                for key in _REFERENCE_KEYS:
+                    if key in parsed:
+                        keys.append((str(parsed[key]), "*"))
+    return tuple(keys)

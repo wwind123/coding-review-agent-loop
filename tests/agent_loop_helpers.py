@@ -1186,9 +1186,16 @@ class FakeRunner(Runner):
         )
         if rest_comments is not None:
             number, per_page, page = (int(value) for value in rest_comments.groups())
+            # A PR's conversation comments are issue comments on GitHub.
+            rest_source = (
+                self.pr_payload.get("comments", [])
+                if number == self.pr_payload.get("number") and not self._issue_comments_for(number)
+                else self._issue_comments_for(number)
+            )
             rest_page = [
                 {
                     "id": 10_000 + index,
+                    "html_url": f"https://github.com/OWNER/REPO/issues/{number}#issuecomment-{10_000 + index}",
                     "user": (
                         {**(comment.get("author") or {}), "id": comment["_rest_author_id"]}
                         if "_rest_author_id" in comment
@@ -1197,7 +1204,7 @@ class FakeRunner(Runner):
                     "created_at": comment.get("createdAt"),
                     "body": comment.get("body"),
                 }
-                for index, comment in enumerate(self._issue_comments_for(number), start=1)
+                for index, comment in enumerate(rest_source, start=1)
             ][(page - 1) * per_page:page * per_page]
             return CommandResult(cmd, cwd_path, json_dumps(rest_page), "", 0)
 
