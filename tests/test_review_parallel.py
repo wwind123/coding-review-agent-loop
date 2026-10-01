@@ -2696,3 +2696,40 @@ def test_recovery_requires_anchored_round_to_resume_as_the_same_round():
         scheduler_phase=None, reviewer_names=("Codex", "Gemini"), resume=resume,
     )
     assert not recovery.verified
+
+
+def test_plan_partial_round_recovers_from_the_message_alone(tmp_path):
+    """Delete exactly the advertised ids, rerun: no refusal, no peer body visible."""
+    runner, markers = _plan_partial_round_runner()
+    runner.serve_rest_issue_comments = True
+    # The rerun needs a fresh plan and fresh reviews for the deleted round.
+    runner.claude_outputs.append(_initial_plan())
+    runner.codex_outputs.append(structured_plan_review(summary="Codex plan approval rerun note."))
+    runner.gemini_outputs.append(structured_plan_review(
+        summary="Gemini independent plan approval rerun.", reviewer="Google Gemini"
+    ))
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_plan_round_between_publications(runner, config, markers)
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = len(runner.reviewer_launches)
+
+    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    message = str(excinfo.value)
+    assert len(runner.reviewer_launches) == launches_before
+    assert "No review spool for this round exists on this host" in message
+    assert "Delete these" in message, message
+    ids = _listed_comment_ids(message)
+    assert ids
+
+    doomed = {comment_id - 10_000 - 1 for comment_id in ids}
+    runner.issue_comments = [
+        comment for index, comment in enumerate(runner.issue_comments) if index not in doomed
+    ]
+    runner.comments = [body for body in runner.comments if not any(m in body for m in markers)]
+    runner.peer_body_visible_at_launch = False
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert not runner.peer_body_visible_at_launch
+    assert len(runner.reviewer_launches) - launches_before == 2
