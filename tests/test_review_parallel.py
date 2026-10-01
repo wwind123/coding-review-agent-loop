@@ -2803,3 +2803,49 @@ def test_recovery_keeps_known_targets_when_a_retained_reference_marker_is_undeco
     assert "provisional list" in message
     assert "attachment references could not be fully decoded" in message
     assert "Delete these" not in message
+
+
+def test_reconciled_round_with_unavailable_reviewer_recovers_from_the_message(tmp_path):
+    """#1124 shape: peer verdict and reconciliation public, one reviewer's verdict gone."""
+    runner, markers = _approving_pr_runner()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    posted = runner.pr_payload["comments"]
+    assert len(posted) == 3  # two verdicts and a reconciliation
+    # The unavailable reviewer's verdict is lost (second comment, REST id 10002).
+    gemini_id = next(
+        10_000 + index for index, comment in enumerate(posted, start=1)
+        if markers[1] in comment["body"]
+    )
+    _delete_listed_comments(runner, [gemini_id], surface="pr")
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = len(runner.reviewer_launches)
+
+    message = _refusal_message(runner, config)
+
+    assert len(runner.reviewer_launches) == launches_before
+    assert "Rerun from the host" not in message
+    assert "No review spool for this round exists on this host" in message
+    assert "Delete these 2 comments" in message
+    assert "reconciliation" in message
+    ids = _listed_comment_ids(message)
+    assert len(ids) == 2
+    _delete_listed_comments(runner, ids, surface="pr")
+    assert runner.pr_payload["comments"] == []
+    assert not any(m in body for m in markers for body in runner.comments)
+    runner.peer_body_visible_at_launch = False
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not runner.peer_body_visible_at_launch
+    baseline, _ = _approving_pr_runner()
+    baseline_config = make_config(
+        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
+    )
+    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
+    # Same reviewers launched and the same records (verdicts plus a fresh
+    # reconciliation) posted as a never-started round.
+    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
+    assert len(runner.comments) == len(baseline.comments)
+    assert any("reconciliation" in body for body in runner.comments)
