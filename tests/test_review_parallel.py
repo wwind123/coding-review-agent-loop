@@ -2849,3 +2849,68 @@ def test_reconciled_round_with_unavailable_reviewer_recovers_from_the_message(tm
     assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
     assert len(runner.comments) == len(baseline.comments)
     assert any("reconciliation" in body for body in runner.comments)
+
+
+def _overflow_pr_runner(seeds):
+    """A PR runner whose Codex reviews overflow into attachment comments."""
+    from coding_review_agent_loop.round_transport import attachment_keys  # noqa: F401
+
+    rnd_text = []
+    for seed in seeds:
+        rnd = _random.Random(seed)
+        rnd_text.append("".join(rnd.choice(_string.ascii_letters + " ") for _ in range(45_000)))
+    markers = ("Codex approves independently.", "Gemini approves independently.")
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        codex_outputs=[
+            structured_pr_review(summary=f"Codex approves independently. {text}") for text in rnd_text
+        ],
+        gemini_outputs=[
+            structured_pr_review(summary=markers[1], reviewer="Google Gemini"),
+            structured_pr_review(summary="Gemini approves on the rerun.", reviewer="Google Gemini"),
+        ],
+    )
+    runner.serve_rest_issue_comments = True
+    return runner, markers
+
+
+def test_overflow_peer_verdict_attachments_are_listed_and_recovered(tmp_path):
+    """A peer verdict published as an anchor plus attachments is listed whole."""
+    from coding_review_agent_loop.round_transport import attachment_keys
+
+    runner, markers = _overflow_pr_runner((11, 12))
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    posted = runner.pr_payload["comments"]
+    attachment_ids = [
+        10_000 + i for i, c in enumerate(posted, start=1) if attachment_keys(c["body"])
+    ]
+    assert len(attachment_ids) == 2
+    gemini_id = next(10_000 + i for i, c in enumerate(posted, start=1) if markers[1] in c["body"])
+    _delete_listed_comments(runner, [gemini_id], surface="pr")
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = len(runner.reviewer_launches)
+
+    message = _refusal_message(runner, config)
+
+    assert len(runner.reviewer_launches) == launches_before
+    ids = _listed_comment_ids(message)
+    # Anchor, both attachments and the reconciliation are all advertised.
+    assert len(ids) == 4, message
+    assert "Delete these 4 comments" in message
+    _delete_listed_comments(runner, ids, surface="pr")
+    # No comment carrying the peer's response (anchor or attachment) remains.
+    assert runner.pr_payload["comments"] == []
+    runner.peer_body_visible_at_launch = False
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not runner.peer_body_visible_at_launch
+    baseline, _ = _overflow_pr_runner((12,))
+    baseline_config = make_config(
+        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
+    )
+    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
+    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
+    assert len(runner.pr_payload["comments"]) == len(baseline.pr_payload["comments"])
