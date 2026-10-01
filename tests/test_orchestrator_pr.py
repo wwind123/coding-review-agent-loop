@@ -4096,6 +4096,93 @@ def test_review_only_mode_clears_repaired_ordinary_ci_from_fresh_passing_snapsho
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
+def test_review_only_mode_reports_passing_but_uncleared_ci_at_the_gate(
+    tmp_path, monkeypatch
+):
+    failed = PullRequestCheck(
+        name="test", kind="check_run", status="failure", url="https://example.test/555"
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Initial review."),
+            structured_pr_review(
+                state="approved",
+                summary="Repaired head approved.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Repaired the failing check.", addressed_items=["item-1"]
+            )
+        ],
+    )
+
+    def checks(*args, **kwargs):
+        if kwargs["metadata"].head_sha == "abc123":
+            return _watch_check_board("failing", failing=(failed,))
+        return _watch_check_board(
+            "passing",
+            passing=(PullRequestCheck(name="docs", kind="check_run", status="skipped"),),
+        )
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: pytest.fail("review-only mode must not start the watcher"),
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(
+            runner,
+            pr_number=77,
+            config=make_config(
+                tmp_path, auto_merge=False, watch_pending_ci=False, max_rounds=2
+            ),
+        )
+
+    message = str(excinfo.value)
+    assert message.startswith("PR #77 cannot finalize: PR #77 ")
+    assert "awaiting authoritative qualification after round" in message
+    assert "github-pr-checks (item-1)" in message
+    legacy_prefix, _, _detail = message.partition("\nBlocking obligations:\n")
+    assert legacy_prefix == (
+        "PR #77 cannot finalize: PR #77 has a unanimously reviewed correction "
+        "awaiting authoritative qualification after round 2: github-pr-checks "
+        "(item-1). No approval or merge was attempted."
+    )
+    assert "Blocking obligations:" in message
+    assert "observed in this run: GitHub checks read passing at repaired-head" in message
+    assert "only skipped or neutral" in message
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+    assert not any("observed in this run" in comment for comment in runner.comments)
+    metadata_bodies = [
+        body
+        for body in [
+            *runner.comments,
+            *(
+                item["body"]
+                for item in runner.pr_payload.get("comments", [])
+                if isinstance(item, dict) and isinstance(item.get("body"), str)
+            ),
+        ]
+        if "AGENT_LOOP_META: " in body
+    ]
+    assert metadata_bodies
+    for body in metadata_bodies:
+        decoded = orchestrator._decode_round_metadata(
+            body.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+        )
+        rendered = repr(decoded)
+        assert "observed in this run" not in rendered
+        assert "read passing at" not in rendered
+        assert "not authoritative" not in rendered
+
+
 @pytest.mark.parametrize("auto_merge", [False, True])
 def test_watch_mode_success_uses_full_board_without_second_wait(
     tmp_path, monkeypatch, auto_merge

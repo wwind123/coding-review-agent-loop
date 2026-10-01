@@ -12,6 +12,7 @@ import re
 import shlex
 import sys
 import time
+import unicodedata
 import urllib.parse
 import zoneinfo
 from collections.abc import Callable, Mapping, Sequence
@@ -355,6 +356,7 @@ from .protocol import (
     StructuredTaskResult,
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
+    MACHINE_OBLIGATION_KINDS,
     human_requirements_resolved,
     is_clarification_request,
     parse_human_requirements_acknowledgement,
@@ -17913,6 +17915,145 @@ def _round_limit_blocker_message(
     return f"Reached the review budget after round {round_number} for PR #{pr_number}; human review required."
 
 
+def _single_line_diagnostic(value: object) -> str:
+    """Escape every control character so a value renders on exactly one line."""
+    out: list[str] = []
+    for ch in str(value):
+        if unicodedata.category(ch)[0] == "C" or unicodedata.category(ch) in {"Zl", "Zp"}:
+            code = ord(ch)
+            out.append(f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _finalization_obligation_predicate(
+    item: UnresolvedReviewItem, *, current_head_sha: str | None
+) -> str:
+    """Describe, from ledger fields only, what keeps one obligation unsatisfied.
+
+    Never claims success that was not observed: no wording here says a source
+    passed or succeeded, and ``failed at`` appears only where a failed head is
+    recorded.
+    """
+    kind = item.obligation_kind
+    lifecycle = item.lifecycle
+    cur = current_head_sha or "none"
+    candidate = item.candidate_head_sha
+    failed = item.failed_head_sha
+    if kind not in MACHINE_OBLIGATION_KINDS or kind == "unknown":
+        return "unknown or unreconstructible obligation; no qualification or merge is permitted"
+    if _is_evidence_obligation(item):
+        frozen = f" at {candidate}" if candidate else ""
+        return f"human-only exact-head evidence pending{frozen}"
+    if kind == "human-requirements-acknowledgement":
+        return (
+            "signed human requirements have not been validly acknowledged; "
+            "a response acknowledging them is required"
+        )
+    if kind == "merge-conflict":
+        head = (
+            f"merge conflict with the base branch confirmed at {failed}"
+            if failed
+            else "merge conflict with the base branch reported; head not confirmed"
+        )
+        return f"{head}; resolve the conflict on a new head"
+    if kind == "alembic-migration":
+        head = (
+            f"migration validation failed at {failed}"
+            if failed
+            else "migration validation has no recorded clearance"
+        )
+        return (
+            f"{head}; it is re-probed each round and clears only when "
+            f"validation of the current head {cur} succeeds"
+        )
+    if kind in CI_MACHINE_OBLIGATION_KINDS:
+        if lifecycle == "repair_required":
+            if failed and failed == current_head_sha:
+                return (
+                    f"authoritative source failed at {failed}, which is the current head; "
+                    "a strictly different head is required"
+                )
+            if failed:
+                return (
+                    f"authoritative source failed at {failed}; current head {cur} "
+                    "has not been bound as a revalidation candidate"
+                )
+            return (
+                "authoritative source reported a failure at an unrecorded head; "
+                "a corrected head is required"
+            )
+        if lifecycle in {"awaiting_current_head_review", "qualification_ready", "qualifying"}:
+            if not candidate:
+                return f"lifecycle {lifecycle} has no recorded candidate head; failing closed"
+            if failed and failed == current_head_sha:
+                return (
+                    f"lifecycle {lifecycle}, but the current head {cur} is the recorded "
+                    "failed head; a strictly different head is required"
+                )
+            if candidate != current_head_sha:
+                return (
+                    f"lifecycle {lifecycle} is bound to candidate head {candidate}, "
+                    f"not the current head {cur}; the current head must be reviewed "
+                    "before qualification"
+                )
+            if lifecycle == "awaiting_current_head_review":
+                return f"awaiting unanimous reviewer approval at candidate head {candidate}"
+            if lifecycle == "qualification_ready":
+                return f"approved at {candidate}; authoritative qualification not yet dispatched"
+            return (
+                f"qualification in progress at {candidate}; "
+                "no authoritative success recorded for this source in this run"
+            )
+    return f"{kind} in lifecycle {lifecycle or 'none'}; no clearance recorded; failing closed"
+
+
+def _finalization_obligation_detail(
+    items: Sequence[UnresolvedReviewItem],
+    *,
+    current_head_sha: str | None,
+    observations: Mapping[str, str] | None,
+) -> str:
+    """Render one escaped line per machine-obligation blocker (#1119)."""
+    lines = _finalization_obligation_lines(
+        items, current_head_sha=current_head_sha, observations=observations
+    )
+    if not lines:
+        return ""
+    return "\nBlocking obligations:\n" + "\n".join(f"- {line}" for line in lines)
+
+
+def _finalization_obligation_lines(
+    items: Sequence[UnresolvedReviewItem],
+    *,
+    current_head_sha: str | None,
+    observations: Mapping[str, str] | None,
+) -> list[str]:
+    partitions = _partition_unresolved_items(items, current_head_sha=current_head_sha)
+    ordered = (
+        *partitions["repair_required_machine_obligations"],
+        *partitions["revalidation_candidates"],
+        *partitions["evidence_obligations"],
+    )
+    esc = _single_line_diagnostic
+    lines: list[str] = []
+    for item in ordered:
+        if item.item_id in (observations or {}):
+            predicate = f"observed in this run: {esc(observations[item.item_id])}"
+        else:
+            predicate = esc(
+                _finalization_obligation_predicate(item, current_head_sha=current_head_sha)
+            )
+        lines.append(
+            f"{esc(item.obligation_kind or 'unknown')} ({esc(item.item_id)}): "
+            f"lifecycle={esc(item.lifecycle or 'none')}, "
+            f"candidate_head={esc(item.candidate_head_sha or 'none')}, "
+            f"failed_head={esc(item.failed_head_sha or 'none')}; {predicate}"
+        )
+    return lines
+
+
 def _ensure_finalization_ready(
     *,
     pr_number: int,
@@ -17921,6 +18062,8 @@ def _ensure_finalization_ready(
     current_head_sha: str | None,
     ignored_machine_kinds: frozenset[str] = frozenset(),
     sub_item_stall_rounds: int | None = None,
+    observations: Mapping[str, str] | None = None,
+    config: AgentLoopConfig | None = None,
 ) -> None:
     """Fail closed unless every non-ignored obligation is actually cleared.
 
@@ -17948,8 +18091,26 @@ def _ensure_finalization_ready(
             current_head_sha=current_head_sha,
             sub_item_stall_rounds=sub_item_stall_rounds,
         )
+        detail = _finalization_obligation_detail(
+            blockers, current_head_sha=current_head_sha, observations=observations
+        )
+        if config is not None:
+            # Operator diagnostics only: logged, never posted (#1119).
+            for item in blockers:
+                if _is_machine_obligation(item):
+                    continue
+                log(
+                    config,
+                    f"{_single_line_diagnostic(item.reviewer)} "
+                    f"({_single_line_diagnostic(item.item_id)}): reviewer-owned finding",
+                )
+            for line in _finalization_obligation_lines(
+                blockers, current_head_sha=current_head_sha, observations=observations
+            ):
+                log(config, f"PR #{pr_number} blocking obligation {line}")
         raise AgentLoopError(
             f"PR #{pr_number} cannot finalize: {diagnostic} No approval or merge was attempted."
+            + detail
         )
 
 
@@ -18377,6 +18538,7 @@ def _finalize_ordinary_recovery_checked(
         items=items,
         current_head_sha=current_head_sha,
         ignored_machine_kinds=frozenset({"github-pr-checks"}),
+        config=config,
     )
     return _finalize_ordinary_recovery_merge(
         runner,
@@ -18399,6 +18561,54 @@ def _mergeability_for_unreadable_protection(
     return get_pr_mergeability(runner, config=config, pr_number=pr_number)
 
 
+def _ordinary_snapshot_nonauthority_reason(
+    checks: PullRequestChecks | None,
+    mergeability: PullRequestMergeability | None = None,
+    *,
+    head_sha: str | None = None,
+    defer_unreadable_protection: bool = False,
+) -> str:
+    """Name the first unmet conjunct of ``_ordinary_checks_snapshot_is_authoritative``.
+
+    Empty exactly when that predicate is True. Edit both functions together.
+    """
+    if checks is None:
+        return "the check board is unavailable"
+    if checks.state != "passing":
+        return f"the aggregate state is {checks.state}"
+    if checks.check_query_status != "ok":
+        return f"the check query status is {checks.check_query_status}"
+    if not (
+        board_protection_is_reliable(checks, mergeability, head_sha=head_sha)
+        or (defer_unreadable_protection and checks.branch_protection_status == "forbidden")
+    ):
+        merge_state = mergeability.merge_state_raw if mergeability is not None else None
+        return (
+            f"branch protection is not reliable for the head (protection status "
+            f"{checks.branch_protection_status}, merge state {merge_state or 'unknown'})"
+        )
+    if checks.pending:
+        return "checks are still pending: " + ", ".join(c.name for c in checks.pending)
+    if checks.missing_required:
+        return "required checks are missing: " + ", ".join(checks.missing_required)
+    successful = [c for c in checks.passing if c.status.strip().lower() == "success"]
+    if not successful:
+        return "no check has a real success conclusion (only skipped or neutral)"
+    required = set(checks.required_checks)
+    success_names = {c.name for c in successful if c.name in required}
+    if success_names != required:
+        return "required checks without a success conclusion: " + ", ".join(
+            sorted(required - success_names)
+        )
+    for check in checks.passing:
+        if check.name in required and check.status.strip().lower() != "success":
+            return (
+                f"required check {check.name} has a non-success {check.kind} "
+                f"observation ({check.status})"
+            )
+    return ""
+
+
 def _ordinary_checks_snapshot_is_authoritative(
     checks: PullRequestChecks | None,
     mergeability: PullRequestMergeability | None = None,
@@ -18415,6 +18625,8 @@ def _ordinary_checks_snapshot_is_authoritative(
     accepted only with GitHub's ``CLEAN`` merge state for ``head_sha``, unless
     ``defer_unreadable_protection`` says the caller checks ``CLEAN`` itself
     after readiness and before merging (a draft reports ``DRAFT``).
+
+    Keep ``_ordinary_snapshot_nonauthority_reason`` in step with this predicate.
     """
     # ``PullRequestChecks.state`` deliberately treats neutral and skipped
     # conclusions as passing for ordinary status reporting.  That aggregate is
@@ -25450,6 +25662,7 @@ def run_pr_loop(
                         current_head_sha=pr_metadata.head_sha,
                     )["coder_blockers"]
                 )
+                finalization_observations: dict[str, str] = {}
                 merge_gate_conflict_pending = any(
                     item.item_id == MERGE_CONFLICT_ITEM_ID for item in unresolved_items
                 )
@@ -25818,6 +26031,7 @@ def run_pr_loop(
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
                             sub_item_stall_rounds=config.sub_item_stall_rounds,
+                            config=config,
                         )
                         if config.auto_merge:
                             if not watch_outcome.head_sha:
@@ -26123,22 +26337,41 @@ def run_pr_loop(
                             and item.obligation_kind == "github-pr-checks"
                             for item in unresolved_items
                         )
-                        and _ordinary_checks_snapshot_is_authoritative(
-                            pr_checks,
-                            _mergeability_for_unreadable_protection(
-                                runner, config=config, pr_number=pr_number, checks=pr_checks,
-                            ),
-                            head_sha=pr_metadata.head_sha,
-                        )
                     ):
-                        # In review-only mode the foreground watcher is
-                        # intentionally disabled. A fresh, correlated,
-                        # full-board passing snapshot is still the ordinary CI
-                        # authority named by the lifecycle contract and must
-                        # clear the carried obligation here.
-                        unresolved_items = _clear_machine_obligations(
-                            unresolved_items, kind="github-pr-checks"
+                        snapshot_mergeability = _mergeability_for_unreadable_protection(
+                            runner, config=config, pr_number=pr_number, checks=pr_checks,
                         )
+                        if _ordinary_checks_snapshot_is_authoritative(
+                            pr_checks,
+                            snapshot_mergeability,
+                            head_sha=pr_metadata.head_sha,
+                        ):
+                            # In review-only mode the foreground watcher is
+                            # intentionally disabled. A fresh, correlated,
+                            # full-board passing snapshot is still the ordinary CI
+                            # authority named by the lifecycle contract and must
+                            # clear the carried obligation here.
+                            unresolved_items = _clear_machine_obligations(
+                                unresolved_items, kind="github-pr-checks"
+                            )
+                        elif pr_checks.state == "passing":
+                            reason = _single_line_diagnostic(
+                                _ordinary_snapshot_nonauthority_reason(
+                                    pr_checks,
+                                    snapshot_mergeability,
+                                    head_sha=pr_metadata.head_sha,
+                                )
+                            )
+                            for item in unresolved_items:
+                                if (
+                                    _is_machine_obligation(item)
+                                    and item.obligation_kind == "github-pr-checks"
+                                ):
+                                    finalization_observations[item.item_id] = (
+                                        f"GitHub checks read passing at {pr_metadata.head_sha} "
+                                        f"in this run, but the snapshot was not authoritative "
+                                        f"({reason}), so this obligation was not cleared"
+                                    )
                     must_fix_items = list(
                         _partition_unresolved_items(
                             unresolved_items,
@@ -26595,6 +26828,7 @@ def run_pr_loop(
                                     items=unresolved_items,
                                     current_head_sha=pr_metadata.head_sha,
                                     sub_item_stall_rounds=config.sub_item_stall_rounds,
+                                    config=config,
                                 )
                                 if config.auto_merge:
                                     managed_ci_qualified = True
@@ -26945,6 +27179,8 @@ def run_pr_loop(
                             items=unresolved_items,
                             current_head_sha=pr_metadata.head_sha,
                             sub_item_stall_rounds=config.sub_item_stall_rounds,
+                            observations=finalization_observations,
+                            config=config,
                         )
                         print(
                             f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}."
