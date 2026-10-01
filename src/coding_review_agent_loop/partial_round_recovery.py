@@ -114,7 +114,7 @@ def _plan(
     scheduler_phase: str | None,
     reviewer_names: Sequence[str],
     widen: bool,
-) -> tuple[dict[int, str], dict[int, str], str | None]:
+) -> tuple[dict[int, str], dict[int, str], str | None, int | None]:
     """Return (targets, uncertain attachments, uncertainty reason) by comment index."""
     records = _extract_round_metadata_records(comments, flow=flow)
     publications = _publication_records(
@@ -144,7 +144,7 @@ def _plan(
             ):
                 targets.setdefault(record.index, f"round {round_number} record")
     if not targets:
-        return {}, {}, None
+        return {}, {}, None, None
 
     # The last durable record before the round began bounds orphan attribution.
     round_indexes = {
@@ -160,16 +160,31 @@ def _plan(
     ]
     lower_bound = max(earlier) if earlier else None
     if scheduler_phase is not None:
-        openings = [
+        # A later scheduler phase starts at its qualified opening: the first
+        # checkpoint after the last earlier-phase record of this round.  A
+        # later checkpoint (posted by a rerun) must not move the bound up and
+        # hide an orphan from the first attempt.
+        earlier_phase = [
             record.index for record in records
-            if record.metadata.role == "summary"
-            and record.metadata.phase == "scheduler-prelaunch"
+            if record.metadata.flow == flow
             and record.metadata.round_number == round_number
             and record.metadata.subject == subject
+            and record.metadata.role == "reviewer"
+            and record.metadata.phase == "publication"
+            and record.metadata.scheduler_phase != scheduler_phase
             and record.index < min(targets)
         ]
-        if openings:
-            lower_bound = max(openings)
+        if earlier_phase:
+            last_earlier = max(earlier_phase)
+            openings = [
+                record.index for record in records
+                if record.metadata.role == "summary"
+                and record.metadata.phase == "scheduler-prelaunch"
+                and record.metadata.round_number == round_number
+                and record.metadata.subject == subject
+                and last_earlier < record.index < min(targets)
+            ]
+            lower_bound = min(openings) if openings else last_earlier
 
     attachments = [
         index for index, comment in enumerate(comments)
@@ -188,8 +203,15 @@ def _plan(
         return item in keys or (item[0], "*") in keys
 
     round_authors = {
-        strip_bot_login_suffix(comments[i].author) for i in targets
+        strip_bot_login_suffix(comments[i].author)
+        for i in targets
+        if comments[i].author is not None
     }
+
+    def same_author(index: int) -> bool:
+        author = comments[index].author
+        return author is not None and strip_bot_login_suffix(author) in round_authors
+
     uncertain: dict[int, str] = {}
     for index in attachments:
         keys = attachment_keys(comments[index].body or "")
@@ -200,16 +222,18 @@ def _plan(
             continue
         # Unreferenced: attribute by the round interval and author.
         if lower_bound is not None:
-            if index > lower_bound and strip_bot_login_suffix(comments[index].author) in round_authors:
+            if index > lower_bound and same_author(index):
                 targets[index] = "unreferenced attachment"
             elif index > lower_bound:
                 uncertain[index] = "unreferenced attachment (author differs)"
         elif index < first_in_round:
             uncertain[index] = "unreferenced attachment (possibly from this round, not verified)"
-        elif strip_bot_login_suffix(comments[index].author) in round_authors:
+        elif same_author(index):
             targets[index] = "unreferenced attachment"
+        else:
+            uncertain[index] = "unreferenced attachment (author unknown or differs)"
     reason = "unreferenced attachments could not be attributed to this round" if uncertain else None
-    return targets, uncertain, reason
+    return targets, uncertain, reason, lower_bound
 
 
 def compute_partial_round_recovery(
@@ -256,13 +280,24 @@ def _compute(
     reviewer_names: Sequence[str],
     resume: Callable[[Sequence[IssueComment]], object],
 ) -> PartialRoundRecovery:
-    def check(targets: dict[int, str]) -> bool:
+    def check(targets: dict[int, str], lower_bound: int | None) -> bool:
         if not targets:
             return False
         remaining = [c for i, c in enumerate(comments) if i not in targets]
         try:
-            resume(remaining)
+            resumed = resume(remaining)
             records = _extract_round_metadata_records(remaining, flow=flow)
+            refs: set[tuple[str, str]] = set()
+            held: set[tuple[str, str]] = set()
+            attachment_positions: list[tuple[int, tuple[tuple[str, str], ...]]] = []
+            for position, comment in enumerate(remaining):
+                body = comment.body if isinstance(comment.body, str) else ""
+                if is_round_transport_sidecar(body):
+                    keys = attachment_keys(body)
+                    held.update(keys)
+                    attachment_positions.append((position, keys))
+                else:
+                    refs.update(referenced_attachment_keys(body))
         except AgentLoopError:
             return False
         if _publication_records(
@@ -270,20 +305,50 @@ def _compute(
             scheduler_phase=scheduler_phase, reviewer_names=reviewer_names,
         ):
             return False
-        return not _reconciling_summaries(
+        if _reconciling_summaries(
             records, flow=flow, round_number=round_number, subject=subject
-        )
+        ):
+            return False
+        # Every attachment a retained comment references must still exist.
+        def present(key: tuple[str, str]) -> bool:
+            if key[1] == "*":
+                return any(held_key[0] == key[0] for held_key in held)
+            return key in held
+
+        if not all(present(key) for key in refs):
+            return False
+        # No unreferenced attachment may remain inside the round's interval.
+        original_index = [i for i in range(len(comments)) if i not in targets]
+        for position, keys in attachment_positions:
+            if lower_bound is None or original_index[position] <= lower_bound:
+                continue
+            if not any(
+                key in refs or (key[0], "*") in refs for key in keys
+            ):
+                return False
+        # The resumed round, when it is this one, must be unreconciled and hold
+        # no same-batch reviewer record.
+        state = resumed[1] if isinstance(resumed, tuple) and len(resumed) == 2 else resumed
+        if getattr(state, "round_number", None) == round_number:
+            if getattr(state, "reconciled", False):
+                return False
+            if scheduler_phase is None and any(
+                record.metadata.agent in reviewer_names
+                for record in getattr(state, "completed_reviews", ())
+            ):
+                return False
+        return True
 
     verified = False
     targets: dict[int, str] = {}
     uncertain: dict[int, str] = {}
     reason: str | None = None
     for widen in (False, True):
-        targets, uncertain, reason = _plan(
+        targets, uncertain, reason, bound = _plan(
             comments, flow=flow, round_number=round_number, subject=subject,
             scheduler_phase=scheduler_phase, reviewer_names=reviewer_names, widen=widen,
         )
-        if check(targets):
+        if check(targets, bound):
             verified = True
             break
     if not verified:

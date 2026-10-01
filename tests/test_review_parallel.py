@@ -2471,3 +2471,183 @@ def test_plan_partial_round_refusal_lists_posted_review(tmp_path):
     assert "no longer validates against this run" in message
     assert "Rerun from the host" not in message
     assert re.search(r"comment \d+ https://", message)
+
+
+# --- #1142 review: recovery-list unit coverage (boundaries, authors, attachments) ---
+
+import random as _random
+import string as _string
+
+from coding_review_agent_loop.github import IssueComment as _IssueComment
+from coding_review_agent_loop.partial_round_recovery import compute_partial_round_recovery
+from coding_review_agent_loop.protocol_markers import TrustedBody as _TrustedBody
+from coding_review_agent_loop.round_state import (
+    PostedRoundMetadata as _Metadata,
+    _attach_round_metadata,
+    _resume_pr_round as _resume_pr,
+)
+from coding_review_agent_loop.round_transport import prepare_round_comment as _prepare
+
+
+def _big_text(seed=1):
+    rnd = _random.Random(seed)
+    return "".join(rnd.choice(_string.ascii_letters + " ") for _ in range(300_000))
+
+
+def _meta(role="reviewer", agent="Codex", phase="publication", scheduler_phase=None, **extra):
+    scheduler = {}
+    if scheduler_phase is not None or phase == "scheduler-prelaunch":
+        # Scheduler fields decode only as a complete, valid set.
+        from coding_review_agent_loop.review_scheduling import make_contract
+
+        scheduler = dict(
+            scheduler_contract=make_contract(
+                ("Codex", "Gemini"), "selective-intermediate", None
+            ).as_dict(),
+            scheduler_previous_sha=None, scheduler_current_sha="h",
+            scheduler_obligation_digest="0" * 16,
+            scheduler_selected_reviewers=("Codex", "Gemini"), scheduler_paused_reviewers=(),
+            scheduler_reasons=("full board",), scheduler_final_sweep=False,
+            scheduler_force_full=False, scheduler_calls_avoided=0,
+            scheduler_phase=scheduler_phase,
+        )
+    return _Metadata(
+        flow="pr", role=role, agent=agent, round_number=1, subject="h",
+        state="approved" if role == "reviewer" else None, phase=phase,
+        **scheduler, **extra,
+    )
+
+
+class _History:
+    def __init__(self, author="bot"):
+        self.comments: list[_IssueComment] = []
+        self.author = author
+
+    def add(self, body, *, author="__default__"):
+        number = len(self.comments) + 1
+        self.comments.append(_IssueComment(
+            author=self.author if author == "__default__" else author,
+            created_at=f"2026-01-01T00:00:{number:02d}Z", body=str(body),
+            comment_id=1000 + number, url=f"https://example.test/c/{1000 + number}",
+        ))
+        return number - 1
+
+    def add_record(self, metadata, text="body", **kwargs):
+        parts = _prepare(_attach_round_metadata(text, metadata))
+        indexes = [self.add(part, **kwargs) for part in parts]
+        return indexes[:-1], indexes[-1]  # attachments, anchor
+
+    def orphan(self, metadata, **kwargs):
+        parts = _prepare(_attach_round_metadata("orphan", metadata))
+        return [self.add(part, **kwargs) for part in parts[:-1]]
+
+    def recover(self, *, scheduler_phase=None):
+        rest = tuple(self.comments)
+        return compute_partial_round_recovery(
+            snapshot=rest, read_rest=lambda: rest, flow="pr", round_number=1, subject="h",
+            scheduler_phase=scheduler_phase, reviewer_names=("Codex", "Gemini"),
+            resume=lambda remaining: _resume_pr(
+                remaining, head_sha="h", configured_reviewers=("codex", "gemini")
+            ),
+        )
+
+    def ids(self, indexes):
+        return {1000 + i + 1 for i in indexes}
+
+
+def _listed(recovery):
+    return {target.comment_id for target in recovery.targets}
+
+
+def test_recovery_lists_overflow_anchor_with_all_attachments_and_orphans():
+    history = _History()
+    history.add_record(_Metadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=0, subject="old",
+        state="approved", phase="publication",
+    ))
+    orphans = history.orphan(_meta(agent="Gemini", canonical_reviewer_response=_big_text(2)))
+    attachments, anchor = history.add_record(_meta(canonical_reviewer_response=_big_text(1)))
+    recovery = history.recover()
+    assert recovery.verified, recovery.reason
+    assert _listed(recovery) == history.ids([*orphans, *attachments, anchor])
+
+
+def test_recovery_does_not_list_older_orphan_below_the_round_boundary():
+    history = _History()
+    older = history.orphan(_meta(agent="Gemini", canonical_reviewer_response=_big_text(3)))
+    # A durable record from an earlier round bounds the interval.
+    history.add_record(_Metadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=0, subject="old",
+        state="approved", phase="publication",
+    ))
+    _attachments, anchor = history.add_record(_meta())
+    recovery = history.recover()
+    assert recovery.verified, recovery.reason
+    assert _listed(recovery) == history.ids([anchor])
+    assert not history.ids(older) & _listed(recovery)
+
+
+def test_recovery_with_unknown_attachment_author_is_provisional():
+    history = _History()
+    history.add_record(_Metadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=0, subject="old",
+        state="approved", phase="publication",
+    ))
+    orphans = history.orphan(_meta(agent="Gemini", canonical_reviewer_response=_big_text(4)), author=None)
+    _attachments, anchor = history.add_record(_meta(), author=None)
+    recovery = history.recover()
+    assert not recovery.verified
+    assert history.ids(orphans) <= {t.comment_id for t in recovery.uncertain}
+    assert history.ids(orphans).isdisjoint(_listed(recovery))
+
+
+def test_recovery_keeps_retained_artifact_attachments():
+    history = _History()
+    coder_parts, coder = history.add_record(
+        _meta(role="coder", agent="Claude", phase="authoritative",
+              raw_structured_coder_response=_big_text(5))
+    )
+    _a, anchor = history.add_record(_meta())
+    recovery = history.recover()
+    assert recovery.verified, recovery.reason
+    assert _listed(recovery) == history.ids([anchor])
+    assert not history.ids([*coder_parts, coder]) & _listed(recovery)
+
+
+def test_recovery_lists_orphan_of_first_attempt_despite_later_prelaunch_checkpoint():
+    """A rerun's later checkpoint must not hide the first attempt's orphan."""
+    history = _History()
+    history.add_record(_meta(agent="Codex", scheduler_phase="primary"))
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
+    orphans = history.orphan(
+        _meta(agent="Gemini", scheduler_phase="secondary-audit", canonical_reviewer_response=_big_text(6))
+    )
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
+    _a, verdict = history.add_record(_meta(agent="Codex", scheduler_phase="secondary-audit"))
+    recovery = history.recover(scheduler_phase="secondary-audit")
+    assert recovery.verified, recovery.reason
+    assert history.ids(orphans) <= _listed(recovery)
+    assert 1000 + verdict + 1 in _listed(recovery)
+    # The primary review and both checkpoints are retained.
+    assert len(recovery.targets) == len(orphans) + 1
+
+
+def test_recovery_without_a_prior_boundary_is_provisional_for_gap_attachments():
+    history = _History()
+    orphans = history.orphan(_meta(agent="Gemini", canonical_reviewer_response=_big_text(7)))
+    history.add_record(_meta())
+    recovery = history.recover()
+    assert not recovery.verified
+    assert history.ids(orphans) <= {t.comment_id for t in recovery.uncertain}
+
+
+def test_recovery_reconciliation_summary_is_listed_and_prelaunch_retained():
+    history = _History()
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
+    _a, verdict = history.add_record(_meta())
+    _b, reconciliation = history.add_record(
+        _meta(role="summary", agent="Orchestrator", phase="reconciliation")
+    )
+    recovery = history.recover()
+    assert recovery.verified, recovery.reason
+    assert _listed(recovery) == history.ids([verdict, reconciliation])
