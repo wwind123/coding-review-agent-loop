@@ -2371,9 +2371,21 @@ def test_pr_partial_round_refusal_lists_comments_and_recovers(tmp_path, review_p
     _delete_listed_comments(runner, ids, surface="pr")
     # Deleting only the advertised ids must have removed every peer body.
     assert not any(m in body for m in markers for body in runner.comments)
+    comments_before = len(runner.comments)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert not runner.peer_body_visible_at_launch
     assert len(runner.reviewer_launches) - launches_before == 2
+
+    # Effective transition equals a never-started fixture: same reviewers
+    # launched and the same number of records published (verdicts plus a
+    # fresh reconciliation).  The raw resume result is not compared.
+    baseline, _markers = _approving_pr_runner()
+    baseline_config = make_config(
+        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
+    )
+    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
+    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
+    assert len(runner.comments) - comments_before == len(baseline.comments)
 
 
 def test_pr_partial_round_refusal_without_rest_ids_is_provisional(tmp_path):
@@ -2735,6 +2747,17 @@ def test_plan_partial_round_recovers_from_the_message_alone(tmp_path):
     assert not any(m in body for m in markers for body in runner.comments)
     runner.peer_body_visible_at_launch = False
 
+    comments_before = len(runner.comments)
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     assert not runner.peer_body_visible_at_launch
     assert len(runner.reviewer_launches) - launches_before == 2
+
+    # Same effective transition as a never-started plan round.
+    baseline, _markers = _plan_partial_round_runner()
+    baseline_config = make_config(
+        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
+    )
+    assert run_issue_loop(baseline, issue_number=56, config=baseline_config, plan_first=True) == 0
+    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
+    # The retained plan record plus the fresh records equal the baseline's.
+    assert len(runner.comments) == len(baseline.comments)
