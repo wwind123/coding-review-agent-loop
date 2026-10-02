@@ -3222,8 +3222,11 @@ _PANEL_MARKERS = ("Gemini panel review.", "Antigravity panel review.")
 
 
 def _panel_pr_runner():
+    # Antigravity's first turn is delayed so Gemini deterministically publishes
+    # first (publication follows completion order under parallel execution).
     runner = _PartialPublicationProbeRunner(
         round_markers=_PANEL_MARKERS,
+        slow_reviewer="agy",
         codex_outputs=[_staged_review(reviewer="OpenAI Codex")] * 3,
         gemini_outputs=[
             _staged_review(reviewer="Google Gemini").replace("Google Gemini review", _PANEL_MARKERS[0])
@@ -3282,6 +3285,7 @@ def _panel_plan_runner():
 
     runner = _PartialPublicationProbeRunner(
         round_markers=_PLAN_PANEL_MARKERS,
+        slow_reviewer="agy",
         claude_outputs=[structured_v1_plan_state()],
         codex_outputs=[structured_plan_review(state="approved")] * 3,
         gemini_outputs=[structured_plan_review(
