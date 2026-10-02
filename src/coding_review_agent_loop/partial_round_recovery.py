@@ -164,9 +164,14 @@ def _plan(
         and record.metadata.subject == subject
     }
     first_in_round = min(round_indexes | set(targets))
+    # Durable records of any flow (plan, pr, discuss) on the surface count.
     earlier = [
-        record.index for record in records
-        if record.index < first_in_round and record.index not in round_indexes
+        index for index, comment in enumerate(comments)
+        if index < first_in_round
+        and index not in round_indexes
+        and isinstance(comment.body, str)
+        and ROUND_RESUME_MARKER_RE.search(comment.body)
+        and not is_round_transport_sidecar(comment.body)
     ]
     lower_bound = max(earlier) if earlier else None
     if scheduler_phase is not None:

@@ -2652,6 +2652,24 @@ def test_recovery_lists_orphan_of_first_attempt_despite_later_prelaunch_checkpoi
     assert len(recovery.targets) == len(orphans) + 1
 
 
+def test_recovery_boundary_counts_durable_records_of_other_flows():
+    """An other-flow durable record between an old record and the round bounds it."""
+    history = _History()
+    history.add_record(_Metadata(
+        flow="pr", role="reviewer", agent="Codex", round_number=0, subject="old",
+        state="approved", phase="publication",
+    ))
+    older = history.orphan(_meta(agent="Gemini", canonical_reviewer_response=_big_text(8)))
+    history.add_record(_Metadata(
+        flow="plan", role="reviewer", agent="Codex", round_number=3, subject="other",
+        state="approved", phase="publication",
+    ))
+    _a, anchor = history.add_record(_meta())
+    recovery = history.recover()
+    assert history.ids(older).isdisjoint(_listed(recovery))
+    assert _listed(recovery) == history.ids([anchor])
+
+
 def test_recovery_without_a_prior_boundary_is_provisional_for_gap_attachments():
     history = _History()
     orphans = history.orphan(_meta(agent="Gemini", canonical_reviewer_response=_big_text(7)))
