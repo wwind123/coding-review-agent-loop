@@ -4078,7 +4078,14 @@ def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, m
                 orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
             )
             listed.append((metadata.role, metadata.agent, metadata.scheduler_phase))
-    assert ("reviewer", "Gemini", "final-secondary-sweep") in listed
+    # Publication follows completion order, so assert whichever panel reviewer
+    # actually published for the new head rather than assuming one.
+    published = {
+        r.agent for r in _records(runner, flow="pr", surface="pr")
+        if r.subject == "def456" and r.role == "reviewer" and r.scheduler_phase == "final-secondary-sweep"
+    }
+    assert len(published) == 1 and published <= {"Gemini", "Antigravity"}
+    assert ("reviewer", next(iter(published)), "final-secondary-sweep") in listed
     # The primary's remediation approval gates the sweep and is retained.
     assert not any(agent == "Codex" for _role, agent, _phase in listed)
 
