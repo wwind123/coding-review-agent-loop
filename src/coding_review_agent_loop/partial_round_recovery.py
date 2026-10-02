@@ -10,6 +10,7 @@ decision and never deletes anything.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -59,15 +60,24 @@ def _comment_key(comment: IssueComment) -> tuple[str | None, str | None, str | N
 def _snapshot_covered(
     snapshot: Sequence[IssueComment], rest: Sequence[IssueComment]
 ) -> bool:
-    """The REST history is non-empty and holds every snapshot round record."""
+    """The REST history is non-empty and holds every relevant snapshot comment.
+
+    Relevant comments are round-metadata records and transport attachments;
+    they are compared with multiplicity so duplicates cannot collapse.
+    """
     if not rest:
         return False
-    keys = {_comment_key(comment) for comment in rest}
-    return all(
-        _comment_key(comment) in keys
+    available = Counter(_comment_key(comment) for comment in rest)
+    needed = Counter(
+        _comment_key(comment)
         for comment in snapshot
-        if isinstance(comment.body, str) and ROUND_RESUME_MARKER_RE.search(comment.body)
+        if isinstance(comment.body, str)
+        and (
+            ROUND_RESUME_MARKER_RE.search(comment.body)
+            or is_round_transport_sidecar(comment.body)
+        )
     )
+    return all(available[key] >= count for key, count in needed.items())
 
 
 def _publication_records(

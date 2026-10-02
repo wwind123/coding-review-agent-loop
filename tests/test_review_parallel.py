@@ -3150,3 +3150,27 @@ def test_plan_round_with_spilled_coder_artifact_recovers_and_keeps_its_attachmen
     assert _transition(after, round_number=1) == _transition(
         _comment_records(baseline, surface="issue", flow="plan"), round_number=1
     )
+
+
+def test_snapshot_cover_requires_sidecars_and_multiplicity():
+    from coding_review_agent_loop import partial_round_recovery as prr
+
+    def comment(body, n):
+        return _IssueComment(
+            author="bot", body=body, created_at="2026-01-01T00:00:00Z",
+            url=f"https://x/{n}", comment_id=n,
+        )
+
+    plain = comment("no marker", 1)
+    sidecar_body = "<!-- agent-loop round transport attachment -->"
+    with patch.object(
+        prr, "is_round_transport_sidecar", lambda body: body == sidecar_body
+    ):
+        side = comment(sidecar_body, 2)
+        assert prr._snapshot_covered([plain, side], [plain, side])
+        # A sidecar missing from REST must not pass.
+        assert not prr._snapshot_covered([plain, side], [plain])
+        # Duplicates in the snapshot need duplicates in REST.
+        dup = comment(sidecar_body, 3)
+        assert not prr._snapshot_covered([side, dup], [side])
+        assert prr._snapshot_covered([side, dup], [side, dup])
