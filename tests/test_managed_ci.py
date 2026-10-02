@@ -15,6 +15,7 @@ import pytest
 
 import coding_review_agent_loop.managed_ci as managed_ci
 import coding_review_agent_loop.orchestrator as orchestrator
+from coding_review_agent_loop.workdirs import github_api_cwd
 
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import (
@@ -12794,3 +12795,123 @@ def test_recovery_renderer_never_replays_plan_reset_stall_streak(tmp_path, targe
     assert "--reviewer" in tokens
     if target == "issue":
         assert tokens[tokens.index("--plan-primary-stall-rounds") + 1] == "3"
+
+
+class _CheckoutSetupReached(Exception):
+    """Stop the resume right after the default checkout has been cloned."""
+
+
+def test_run_pr_loop_resume_with_missing_default_checkout_clones_it(tmp_path, monkeypatch):
+    record = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        nonce="opening-nonce", label_event_id=101,
+    )
+    # FakeRunner raises FileNotFoundError for a missing cwd, like subprocess.run,
+    # and creates the target directory for `gh repo clone`.
+    runner = _workflow_runner_for_issue_authorization(record, labeled=True)
+    default_checkout = tmp_path / "claude" / "repo"
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path, create_dirs=False, managed_ci=True, managed_ci_pr_mode=True,
+        claude_dir=default_checkout, codex_dir=codex_dir,
+        auto_agent_dirs=("claude",), agent_memory=False,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    assert not default_checkout.exists()
+
+    def stop_after_clone(*_args, **_kwargs):
+        raise _CheckoutSetupReached
+
+    monkeypatch.setattr("coding_review_agent_loop.config._sync_base_branch", stop_after_clone)
+
+    with pytest.raises(_CheckoutSetupReached):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config)
+
+    pull_reads = [
+        cwd for command, cwd in runner.commands
+        if command[:3] == ["gh", "api", "repos/OWNER/REPO/pulls/7"]
+    ]
+    assert pull_reads
+    # The opening read uses the bootstrap directory (an existing agent dir);
+    # the recovery reads use the neutral directory.  None may name the
+    # missing default checkout.
+    assert all(cwd.is_dir() and cwd != default_checkout for cwd in pull_reads)
+    assert any(cwd == github_api_cwd() for cwd in pull_reads)
+    assert any(
+        command[:4] == ["gh", "repo", "clone", "OWNER/REPO"]
+        and command[4] == str(default_checkout)
+        for command, _cwd in runner.commands
+    )
+    assert default_checkout.is_dir()
+    # No GitHub write may precede checkout setup on an ordinary resume.
+    assert not [
+        command for command, _cwd in runner.commands
+        if command[:2] == ["gh", "api"]
+        and any(part in command for part in ("POST", "PATCH", "PUT", "DELETE"))
+    ]
+    assert runner.comments == []
+
+
+def test_run_pr_loop_fresh_resume_with_missing_default_checkout_publishes_and_clones(
+    tmp_path, monkeypatch,
+):
+    runner = _workflow_runner_for_issue_authorization(None, labeled=False)
+    default_checkout = tmp_path / "claude" / "repo"
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path, create_dirs=False, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=643,
+        claude_dir=default_checkout, codex_dir=codex_dir,
+        auto_agent_dirs=("claude",), agent_memory=False,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-fresh",
+            "--managed-ci-issue", "643", "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+
+    def stop_after_clone(*_args, **_kwargs):
+        raise _CheckoutSetupReached
+
+    monkeypatch.setattr("coding_review_agent_loop.config._sync_base_branch", stop_after_clone)
+
+    with pytest.raises(_CheckoutSetupReached):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config)
+
+    # A new grant was actually published (a write) before checkout setup,
+    # from a directory that is not the missing checkout.
+    writes = [
+        cwd for command, cwd in runner.commands
+        if command[:2] == ["gh", "api"] and "POST" in command
+        and any("issues/7/comments" in part for part in command)
+    ]
+    assert writes
+    assert all(cwd.is_dir() and cwd != default_checkout for cwd in writes)
+    assert default_checkout.is_dir()
+
+
+def test_api_json_runs_from_a_directory_that_is_not_an_agent_checkout(tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path)
+    config.antigravity_dir.mkdir(parents=True, exist_ok=True)
+
+    managed_ci._api_json(runner, config, "repos/OWNER/REPO/pulls/7", quiet=True)
+
+    (command, cwd), = [
+        item for item in runner.commands if item[0][:2] == ["gh", "api"]
+    ]
+    assert command[2] == "repos/OWNER/REPO/pulls/7"
+    assert cwd.is_dir()
+    assert cwd not in (
+        config.claude_dir, config.codex_dir, config.gemini_dir, config.antigravity_dir
+    )
