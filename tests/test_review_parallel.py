@@ -3174,3 +3174,22 @@ def test_snapshot_cover_requires_sidecars_and_multiplicity():
         dup = comment(sidecar_body, 3)
         assert not prr._snapshot_covered([side, dup], [side])
         assert prr._snapshot_covered([side, dup], [side, dup])
+
+
+def test_recovery_is_provisional_when_rest_history_drops_a_sidecar():
+    history = _History()
+    attachments, anchor = history.add_record(_meta(canonical_reviewer_response=_big_text(7)))
+    assert attachments
+    snapshot = tuple(history.comments)
+    rest = tuple(c for i, c in enumerate(snapshot) if i not in attachments)
+    recovery = compute_partial_round_recovery(
+        snapshot=snapshot, read_rest=lambda: rest, flow="pr", round_number=1, subject="h",
+        scheduler_phase=None, reviewer_names=("Codex", "Gemini"),
+        resume=lambda remaining: _resume_pr(
+            remaining, head_sha="h", configured_reviewers=("codex", "gemini")
+        ),
+    )
+    assert not recovery.verified
+    assert recovery.reason == "comment ids could not be read completely"
+    # Control: the complete REST history verifies and lists the sidecars.
+    assert history.recover().verified
