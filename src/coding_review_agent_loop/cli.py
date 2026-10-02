@@ -315,7 +315,12 @@ def build_parser() -> argparse.ArgumentParser:
             "--repair-backend",
             choices=("antigravity", "gemini", "codex", "claude"),
             default="antigravity",
-            help="Malformed-response repair backend (default: antigravity).",
+            help=(
+                "Malformed-response repair backend (default: antigravity, which requires "
+                "the agy CLI even when no role uses Antigravity). Use "
+                "--repair-backend codex|claude --repair-model MODEL to repair with a "
+                "configured agent instead."
+            ),
         )
         subparser.add_argument(
             "--repair-model",
