@@ -981,14 +981,35 @@ class FakeRunner(Runner):
             moved = {self._last_agent_cwd}
         else:
             moved = {key for key, (head, _status) in snapshots.items() if head == previous}
+        # The snapshot is retaken, but the production baseline is KEPT: an
+        # external head move between turns is exactly what the gate must refuse.
+        # A test modelling a fresh process calls ``simulate_new_process``.
         self._checkout_refresh_pending.update(moved)
-        # A scripted head move is the test changing the simulated world (e.g.
-        # a rerun starting from a fresh clone), not a foreign write: drop the
-        # recorded baseline so the next preparation/turn records a new one.
-        from coding_review_agent_loop.checkout_verification import forget_checkout
 
-        for key in moved:
-            forget_checkout(key)
+    def simulate_agent_turn(self, config, cwd, *, head=None) -> None:
+        """Stand in for a turn that bypassed run_agent_result.
+
+        Tests that fake the orchestrator's agent callable move the scripted head
+        themselves; the real boundary would have recorded the checkout's new
+        state afterwards, so do exactly that for ``cwd``.
+        """
+        from coding_review_agent_loop.checkout_verification import record_checkout_baseline
+
+        cwd = Path(cwd)
+        self._last_agent_cwd = cwd
+        if head is not None:
+            self._move_head(head, cwd=cwd)
+        else:
+            self._note_checkout_event(cwd)
+        record_checkout_baseline(config, self, cwd, source="simulated agent turn")
+
+    def simulate_new_process(self) -> None:
+        """Model a fresh agent-loop process: no baselines, snapshots retaken."""
+        from coding_review_agent_loop.checkout_verification import reset_checkout_baselines
+
+        reset_checkout_baselines()
+        self._checkout_state_by_cwd.clear()
+        self._checkout_refresh_pending.clear()
 
     def _move_head(self, value: str, *, cwd) -> None:
         """The fake's own head move, attributed to exactly one checkout."""
@@ -1017,7 +1038,40 @@ class FakeRunner(Runner):
             self._checkout_state_by_cwd[key] = (self.git_head, status_text)
         return self._checkout_state_by_cwd[key]
 
+    @staticmethod
+    def _scripted_text_result(cmd, cwd_path, scripted):
+        if isinstance(scripted, CommandResult):
+            return CommandResult(cmd, cwd_path, scripted.stdout, scripted.stderr, scripted.returncode)
+        if isinstance(scripted, dict):
+            return CommandResult(
+                cmd, cwd_path, scripted.get("stdout", ""), scripted.get("stderr", ""),
+                scripted.get("returncode", 0),
+            )
+        return None
+
+    def _adopt_scripted_text(self, cwd_path, *, head=None, status=None) -> None:
+        """A successful scripted text probe defines that checkout's state for the
+        binary probes too, so both forms agree."""
+        current_head, current_status = self._checkout_state(cwd_path)
+        if status is not None:
+            self._materialize_status(Path(cwd_path), status)
+        self._checkout_state_by_cwd[Path(cwd_path)] = (
+            head if head is not None else current_head,
+            status if status is not None else current_status,
+        )
+
     def _materialize_status(self, cwd: Path, status_text: str) -> None:
+        # Only ever write under the system temp dir: some suites hand the fake a
+        # relative or real working directory, and a fake must not litter it.
+        import tempfile
+
+        resolved = cwd.resolve()
+        if resolved == Path.cwd().resolve() or Path.cwd().resolve() in resolved.parents:
+            return  # never write into the working tree the tests run from
+        try:
+            resolved.relative_to(Path(tempfile.gettempdir()).resolve())
+        except ValueError:
+            return
         for line in status_text.splitlines():
             if len(line) < 4 or line[2] != " ":
                 continue
@@ -1500,22 +1554,28 @@ class FakeRunner(Runner):
                 raise self.git_probe_exceptions.pop(0)
             if self.git_probe_results:
                 scripted = self.git_probe_results.pop(0)
-                if isinstance(scripted, CommandResult):
-                    return CommandResult(
-                        cmd, cwd_path, scripted.stdout, scripted.stderr, scripted.returncode
-                    )
-                if isinstance(scripted, dict):
-                    return CommandResult(
-                        cmd,
-                        cwd_path,
-                        scripted.get("stdout", ""),
-                        scripted.get("stderr", ""),
-                        scripted.get("returncode", 0),
-                    )
+                result = self._scripted_text_result(cmd, cwd_path, scripted)
+                if result is not None:
+                    if result.returncode == 0:
+                        self._adopt_scripted_text(cwd_path, head=result.stdout.strip())
+                    return result
             return CommandResult(cmd, cwd_path, f"{self._checkout_state(cwd_path)[0]}\n", "", 0)
 
+        if cmd[:4] == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return CommandResult(
+                cmd, cwd_path, f"{self._checkout_branch.get(cwd_path, 'main')}\n", "", 0
+            )
         if cmd[:2] == ["git", "switch"] and len(cmd) > 2:
-            self._checkout_branch[cwd_path] = cmd[-1]
+            # `switch X`, `switch -c X [start]`, `switch -C X [start]`: the branch
+            # is X, never the start point.
+            flags = {"-c", "-C", "--create", "--force-create"}
+            targets = [
+                cmd[index + 1] for index, token in enumerate(cmd) if token in flags and index + 1 < len(cmd)
+            ]
+            positional = [token for token in cmd[2:] if not token.startswith("-")]
+            branch = targets[0] if targets else (positional[0] if positional else None)
+            if branch:
+                self._checkout_branch[cwd_path] = branch
         if cmd[:3] == ["git", "checkout", "--detach"]:
             self._checkout_branch[cwd_path] = "HEAD"
             if len(cmd) > 3 and cmd[3].startswith("refs/remotes/origin/pr/"):
@@ -1555,18 +1615,11 @@ class FakeRunner(Runner):
                 raise self.git_probe_exceptions.pop(0)
             if self.git_probe_results:
                 scripted = self.git_probe_results.pop(0)
-                if isinstance(scripted, CommandResult):
-                    return CommandResult(
-                        cmd, cwd_path, scripted.stdout, scripted.stderr, scripted.returncode
-                    )
-                if isinstance(scripted, dict):
-                    return CommandResult(
-                        cmd,
-                        cwd_path,
-                        scripted.get("stdout", ""),
-                        scripted.get("stderr", ""),
-                        scripted.get("returncode", 0),
-                    )
+                result = self._scripted_text_result(cmd, cwd_path, scripted)
+                if result is not None:
+                    if result.returncode == 0:
+                        self._adopt_scripted_text(cwd_path, status=result.stdout)
+                    return result
             return CommandResult(cmd, cwd_path, self._checkout_state(cwd_path)[1], "", 0)
 
         if cmd[:3] == ["git", "status", "--short"]:

@@ -396,6 +396,11 @@ def record_checkout_baseline(config, runner, path: Path, *, source: str) -> None
     """Refresh the baseline from the live checkout; poison it if that cannot be captured."""
     if getattr(runner, "dry_run", False):
         return
+    with _LEDGER_LOCK:
+        # Poison is sticky: a refresh never turns an untrusted checkout back
+        # into a trusted one (only a fresh startup establishment may).
+        if isinstance(_LEDGER.get(_key(path)), _Poisoned):
+            return
     try:
         fingerprint = capture_fingerprint(config, runner, path)
     except _Incomplete as exc:
@@ -403,6 +408,8 @@ def record_checkout_baseline(config, runner, path: Path, *, source: str) -> None
         poison_checkout(path, f"baseline capture after {source} failed: {exc}")
         return
     with _LEDGER_LOCK:
+        if isinstance(_LEDGER.get(_key(path)), _Poisoned):
+            return
         _LEDGER[_key(path)] = _Expected(fingerprint)
 
 

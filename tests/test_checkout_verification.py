@@ -1158,3 +1158,151 @@ def test_cleanup_io_failure_does_not_mask_the_result_and_stays_fail_closed(tmp_p
     monkeypatch.undo()
     with pytest.raises(CheckoutVerificationError):  # and the next turn refuses, fail-closed
         registry.run_agent_result(runner, agent="antigravity", config=config, prompt="p", role="reviewer")
+
+
+# ----- round 3: lock I/O, absurd header lengths, harness agreement -------------
+
+
+def _antigravity_setup(tmp_path, repo, outputs=(("done", 0),)):
+    runner = GitRunner(antigravity_outputs=list(outputs))
+    config = make_config(tmp_path, antigravity_dir=repo, antigravity_cmd="agy")
+    cv.establish_initial_baseline(config, runner, repo)
+    return runner, config
+
+
+def _run_antigravity(runner, config):
+    return registry.run_agent_result(
+        runner, agent="antigravity", config=config, prompt="p", role="reviewer"
+    )
+
+
+def _agy_spawned(runner):
+    return any(cmd and cmd[0] == "agy" for cmd, _cwd in runner.commands)
+
+
+def test_backend_lock_open_failure_is_a_refusal_before_spawn(tmp_path, repo, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity
+
+    runner, config = _antigravity_setup(tmp_path, repo)
+    monkeypatch.setattr(antigravity, "_git_lock_path", lambda workdir: tmp_path / "no-such-dir" / "x.lock")
+    with pytest.raises(CheckoutVerificationError, match="cannot open the GEMINI lock"):
+        _run_antigravity(runner, config)
+    assert not _agy_spawned(runner)
+    assert not (repo / GEMINI_MD_NAME).exists()
+
+
+def test_backend_lock_acquisition_failure_is_a_refusal_before_spawn(tmp_path, repo, monkeypatch):
+    runner, config = _antigravity_setup(tmp_path, repo)
+    real_flock = fcntl.flock
+
+    def flock(handle, operation):
+        if operation == fcntl.LOCK_EX and str(getattr(handle, "name", "")).endswith("GEMINI.md.lock"):
+            raise OSError(5, "input/output error")
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+    with pytest.raises(CheckoutVerificationError, match="cannot take the GEMINI lock"):
+        _run_antigravity(runner, config)
+    assert not _agy_spawned(runner)
+
+
+def test_backend_lock_release_failure_keeps_the_result_and_poisons_stickily(tmp_path, repo, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity
+
+    runner, config = _antigravity_setup(tmp_path, repo, outputs=[("done", 0), ("done", 0)])
+    monkeypatch.setattr(antigravity, "_release_gemini_lock", lambda handle: "unlock failed: boom")
+    result = _run_antigravity(runner, config)
+    assert result.text  # the completed backend result is not masked
+    monkeypatch.undo()
+    # the post-turn baseline refresh did not turn the poisoned entry trusted again
+    with pytest.raises(CheckoutVerificationError, match="GEMINI lock release failed"):
+        _run_antigravity(runner, config)
+
+
+def test_recovery_lock_acquisition_and_release_failures_are_refusals(harness, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity
+
+    (harness.repo / GEMINI_MD_NAME).write_bytes(build_gemini_injection("# i\n", orig="absent"))
+    real_flock = fcntl.flock
+
+    def flock(handle, operation):
+        if operation & fcntl.LOCK_NB:
+            raise OSError(5, "input/output error")
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+    refused(harness, "cannot take the GEMINI lock", "input/output error")
+    monkeypatch.undo()
+    assert (harness.repo / GEMINI_MD_NAME).exists()
+    # a release failure after a successful recovery is also terminal and poisons
+    monkeypatch.setattr(antigravity, "_release_gemini_lock", lambda handle: "close failed: boom")
+    refused(harness, "could not be released")
+    monkeypatch.undo()
+    refused(harness, "can no longer be trusted", "close failed: boom")
+
+
+@pytest.mark.parametrize("digits", [13, 4301, 20000])
+def test_absurd_injection_length_is_ordinary_content_not_an_exception(harness, digits):
+    from coding_review_agent_loop.agents.antigravity import parse_gemini_injection, strip_gemini_injection
+
+    header = (
+        f"<!-- agent-loop gemini injection v1 orig=absent bytes={'9' * digits} "
+        f"sha256={'a' * 64} -->\n"
+    ).encode()
+    assert parse_gemini_injection(header + b"body") is None
+    (harness.repo / GEMINI_MD_NAME).write_bytes(header + b"operator text\n")
+    refused(harness, "GEMINI.md (added)")  # reported like any other path, never a ValueError
+    assert strip_gemini_injection(harness.repo) is False  # normal cleanup leaves it alone
+    assert (harness.repo / GEMINI_MD_NAME).read_bytes() == header + b"operator text\n"
+
+
+def test_normal_cleanup_with_an_absurd_header_does_not_mask_the_result(tmp_path, repo):
+    runner, config = _antigravity_setup(tmp_path, repo)
+    huge = (
+        f"<!-- agent-loop gemini injection v1 orig=absent bytes={'9' * 5000} sha256={'b' * 64} -->\n"
+    ).encode()
+    original = runner.run_with_log
+
+    def coder_rewrites_gemini_md(*args, **kwargs):
+        (repo / GEMINI_MD_NAME).write_bytes(huge)
+        return original(*args, **kwargs)
+
+    runner.run_with_log = coder_rewrites_gemini_md
+    assert _run_antigravity(runner, config).text
+    assert (repo / GEMINI_MD_NAME).read_bytes() == huge
+
+
+def test_external_head_assignment_on_a_prepared_baseline_is_refused(tmp_path):
+    runner = FakeRunner(git_head="h-1")
+    config = make_config(tmp_path)
+    cv.establish_initial_baseline(config, runner, config.codex_dir)
+    runner.git_head = "h-2"  # a clean between-turn head move, not made by any turn
+    with pytest.raises(CheckoutVerificationError, match="observed main at h-2"):
+        cv.verify_checkout(config, runner, path=config.codex_dir, agent="codex", purpose="coder turn")
+    runner.simulate_new_process()  # only a fresh process re-establishes
+    cv.verify_checkout(config, runner, path=config.codex_dir, agent="codex", purpose="coder turn")
+
+
+def test_fake_runner_text_and_binary_share_scripted_state(tmp_path):
+    runner = FakeRunner(git_head="h-1")
+    head = ["git", "rev-parse", "HEAD"]
+    runner.git_probe_results.append({"stdout": "h-scripted\n"})
+    assert runner.run(head, cwd=tmp_path).stdout == "h-scripted\n"
+    assert runner.run_binary(head, cwd=tmp_path).stdout == b"h-scripted\n"  # shared success
+    runner.git_probe_results.append({"stdout": " M a.py\n"})
+    assert runner.run(["git", "status", "--porcelain"], cwd=tmp_path).stdout == " M a.py\n"
+    assert runner.run_binary(["git", "status", "--porcelain", "-z"], cwd=tmp_path).stdout == b" M a.py\0"
+    runner.git_probe_results.append({"stdout": "", "returncode": 128})  # failures are not adopted
+    assert runner.run(head, cwd=tmp_path).returncode == 128
+    assert runner.run_binary(head, cwd=tmp_path).stdout == b"h-scripted\n"
+
+
+def test_fake_runner_branch_follows_the_switch_target_in_both_forms(tmp_path):
+    runner = FakeRunner()
+    abbrev = ["git", "rev-parse", "--abbrev-ref", "HEAD"]
+    assert runner.run(abbrev, cwd=tmp_path).stdout == "main\n"
+    runner.run(["git", "switch", "-C", "release", "origin/release"], cwd=tmp_path)
+    assert runner.run(abbrev, cwd=tmp_path).stdout == "release\n"
+    assert runner.run_binary(abbrev, cwd=tmp_path).stdout == b"release\n"
+    runner.run(["git", "switch", "main"], cwd=tmp_path)
+    assert runner.run_binary(abbrev, cwd=tmp_path).stdout == b"main\n"

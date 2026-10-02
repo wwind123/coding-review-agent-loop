@@ -117,7 +117,7 @@ def _git_lock_path(workdir: Path) -> Path:
 
 GEMINI_MD_NAME = "GEMINI.md"
 _GEMINI_HEADER_RE = re.compile(
-    rb"<!-- agent-loop gemini injection v1 orig=(absent|present) bytes=(\d+) sha256=([0-9a-f]{64}) -->\n"
+    rb"<!-- agent-loop gemini injection v1 orig=(absent|present) bytes=(\d{1,12}) sha256=([0-9a-f]{64}) -->\n"
 )
 _LEGACY_BASE_RE = re.compile(r"`git diff ([^`<>\s]+)\.\.\.HEAD`")
 
@@ -150,6 +150,9 @@ def parse_gemini_injection(data: bytes) -> ParsedGeminiInjection | None:
     match = _GEMINI_HEADER_RE.match(data)
     if match is None:
         return None
+    # The length field is bounded by the regex (at most 12 digits), so int()
+    # cannot hit the interpreter's digit limit; an absurd value just fails the
+    # length/hash check below and the file stays ordinary checkout content.
     length = int(match.group(2))
     body = data[match.end() : match.end() + length]
     if len(body) != length or hashlib.sha256(body).hexdigest() != match.group(3).decode("ascii"):
@@ -380,6 +383,22 @@ def _legacy_injection_length(data: bytes) -> int | None:
     return None
 
 
+def _release_gemini_lock(lock_file) -> str | None:
+    """Unlock and close; return a diagnostic instead of raising."""
+    import fcntl
+
+    problems = []
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+    except OSError as exc:
+        problems.append(f"unlock failed: {exc}")
+    try:
+        lock_file.close()
+    except OSError as exc:
+        problems.append(f"close failed: {exc}")
+    return "; ".join(problems) or None
+
+
 def recover_stale_gemini_injection(checkout: Path, *, is_tracked: "Callable[[], bool]") -> bool:
     """Remove a killed run's leftover injection under the backend's GEMINI lock.
 
@@ -409,6 +428,10 @@ def recover_stale_gemini_injection(checkout: Path, *, is_tracked: "Callable[[], 
                 f"{checkout / GEMINI_MD_NAME} may hold an agent-loop injection, but another "
                 "process currently holds the GEMINI lock (a concurrent holder is writing in "
                 "this checkout); refusing to touch it."
+            ) from exc
+        except OSError as exc:
+            raise CheckoutVerificationError(
+                f"cannot take the GEMINI lock for {checkout / GEMINI_MD_NAME}: {exc}"
             ) from exc
         try:
             found = safe_read_gemini_md(checkout)
@@ -443,8 +466,15 @@ def recover_stale_gemini_injection(checkout: Path, *, is_tracked: "Callable[[], 
         except (SafeGeminiAccessError, OSError) as exc:
             raise CheckoutVerificationError(str(exc)) from exc
     finally:
-        fcntl.flock(lock_file, fcntl.LOCK_UN)
-        lock_file.close()
+        release_problem = _release_gemini_lock(lock_file)
+        if release_problem is not None:
+            from ..checkout_verification import poison_checkout
+
+            poison_checkout(checkout, f"GEMINI lock release failed ({release_problem})")
+            raise CheckoutVerificationError(
+                f"GEMINI lock for {checkout / GEMINI_MD_NAME} could not be released "
+                f"({release_problem}); the checkout is no longer trusted."
+            )
 
 
 _REVIEWER_QUOTED_COMMAND_RULE = (
@@ -758,11 +788,16 @@ class AntigravityBackend:
         # _git_lock_path into git metadata, not the worktree) serializes the entire
         # inject→run→strip sequence across concurrent processes sharing the same
         # default per-repo workdir.
-        gemini_lock_path = (
-            config.antigravity_dir.parent / f".{config.antigravity_dir.name}.GEMINI.md.lock"
-            if role == "repair"
-            else _git_lock_path(config.antigravity_dir)
-        )
+        try:
+            gemini_lock_path = (
+                config.antigravity_dir.parent / f".{config.antigravity_dir.name}.GEMINI.md.lock"
+                if role == "repair"
+                else _git_lock_path(config.antigravity_dir)
+            )
+        except OSError as exc:
+            raise CheckoutVerificationError(
+                f"cannot resolve the GEMINI lock for {config.antigravity_dir}: {exc}"
+            ) from exc
         if role == "repair":
             single_shot_instruction = _REPAIR_GEMINI_MD
         else:
@@ -824,9 +859,19 @@ class AntigravityBackend:
             # Hold both locks across the complete normal-run lifecycle. Repair
             # uses an isolated temporary directory and intentionally performs no
             # checkout probes or replacement classification.
-            gemini_lock_file = gemini_lock_path.open("a+")
             try:
-                fcntl.flock(gemini_lock_file, fcntl.LOCK_EX)
+                gemini_lock_file = gemini_lock_path.open("a+")
+            except OSError as exc:
+                raise CheckoutVerificationError(
+                    f"cannot open the GEMINI lock {gemini_lock_path}: {exc}"
+                ) from exc
+            try:
+                try:
+                    fcntl.flock(gemini_lock_file, fcntl.LOCK_EX)
+                except OSError as exc:
+                    raise CheckoutVerificationError(
+                        f"cannot take the GEMINI lock {gemini_lock_path}: {exc}"
+                    ) from exc
                 if role != "repair":
                     before_snapshot = capture_workdir_snapshot(
                         runner,
@@ -900,8 +945,18 @@ class AntigravityBackend:
                             after_snapshot=after_snapshot,
                         )
             finally:
-                fcntl.flock(gemini_lock_file, fcntl.LOCK_UN)
-                gemini_lock_file.close()
+                # A release failure must neither mask a completed result nor
+                # leave the checkout trusted: poison it (sticky) and carry on.
+                release_problem = _release_gemini_lock(gemini_lock_file)
+                if release_problem is not None:
+                    log(config, f"GEMINI lock release problem: {release_problem}")
+                    if role != "repair":
+                        from ..checkout_verification import poison_checkout
+
+                        poison_checkout(
+                            config.antigravity_dir,
+                            f"GEMINI lock release failed ({release_problem})",
+                        )
                 if role == "repair":
                     gemini_lock_path.unlink(missing_ok=True)
         finally:
