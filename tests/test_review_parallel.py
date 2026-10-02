@@ -3867,3 +3867,206 @@ def test_plan_operator_opening_keeps_the_primary_publication_a_peer(tmp_path):
     assert not runner.peer_body_visible_at_launch
     assert "Codex already posted" in str(excinfo.value)
     assert "Codex review (round 1)" in str(excinfo.value)
+
+
+def test_pr_undecodable_refreshed_history_stops_before_any_launch(tmp_path):
+    """History read after the checkpoint but not decodable must not fall back to the stale peer set."""
+    runner = _panel_pr_runner()
+    config = _panel_pr_config(tmp_path)
+    _interrupt_panel_pr_round(runner, config)
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = list(runner.reviewer_launches)
+    real_extract = orchestrator._extract_round_metadata_records
+    seen = []
+
+    def extract(comments, *, flow):
+        if any("final-secondary-sweep" in str(getattr(c, "body", "")) for c in comments):
+            seen.append(flow)
+            raise AgentLoopError("Incomplete round metadata: sidecars are unavailable")
+        return real_extract(comments, flow=flow)
+
+    with patch.object(orchestrator, "_extract_round_metadata_records", side_effect=extract):
+        with pytest.raises(AgentLoopError) as excinfo:
+            run_pr_loop(runner, pr_number=77, config=config, **{})
+
+    assert seen, "the refreshed history was never decoded"
+    assert not isinstance(excinfo.value, orchestrator.PartialReviewRoundError)
+    assert runner.reviewer_launches == launches_before
+    assert not runner.peer_body_visible_at_launch
+
+
+def _rewrite_payloads(runner, transform):
+    from coding_review_agent_loop.round_transport import (
+        ROUND_RESUME_MARKER_RE,
+        decode_mapping,
+        encode_mapping,
+    )
+
+    for comment in runner.pr_payload["comments"]:
+        matches = list(ROUND_RESUME_MARKER_RE.finditer(comment["body"]))
+        if not matches:
+            continue
+        match = matches[-1]
+        payload = transform(dict(decode_mapping(match.group("payload"))))
+        if payload is not None:
+            comment["body"] = (
+                comment["body"][: match.start("payload")] + encode_mapping(payload)
+                + comment["body"][match.end("payload"):]
+            )
+
+
+def test_pr_publication_hidden_by_a_ledger_mismatch_still_counts_as_a_peer(tmp_path):
+    """Resume drops a same-round review whose prior-item ledger differs; it is still public."""
+    runner, config = _same_round_panel_state(tmp_path)
+    _refusal_message(runner, config)  # the rerun's later checkpoint becomes the round's anchor
+
+    def mismatch(payload):
+        if payload.get("agent") != "Gemini" or payload.get("phase") != "publication":
+            return None
+        payload["prior_items"] = [{
+            "item_id": "item-9", "reviewer": "Gemini", "source_round": 1,
+            "text": "Unrelated ledger entry.", "status": "blocking",
+            "source_status": "blocking", "notes": [],
+        }]
+        return payload
+
+    _rewrite_payloads(runner, mismatch)
+    launches_before = list(runner.reviewer_launches)
+    comments_before = len(runner.pr_payload["comments"])
+
+    message = _refusal_message(runner, config)
+
+    assert runner.reviewer_launches == launches_before
+    assert not runner.peer_body_visible_at_launch
+    assert "Gemini already posted" in message
+    assert "Gemini review (round 1)" in message
+    # No reviewer comment was posted by the refused run.
+    new = runner.pr_payload["comments"][comments_before:]
+    assert not any("Antigravity" in c["body"] and "panel review" in c["body"] for c in new)
+
+
+def _same_round_plan_panel_state(tmp_path):
+    runner = _panel_plan_runner()
+    config = _panel_plan_config(tmp_path)
+    with patch.object(
+        orchestrator, "post_issue_comment",
+        side_effect=_interrupt_on_phase(
+            orchestrator.post_issue_comment, "reconciliation", flow="plan", round_number=1
+        ),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _interrupt_panel_plan_round(runner, config)
+    for path in _spool_files(config):
+        path.unlink()
+    return runner, config
+
+
+def test_plan_publication_stripped_as_pre_opening_still_counts_as_a_peer(tmp_path):
+    """Resume strips a secondary review recorded before the qualified opening; it is still public."""
+    runner, config = _same_round_plan_panel_state(tmp_path)
+    comments = runner.issue_comments
+
+    def role_of(comment):
+        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        if match is None:
+            return None
+        metadata = orchestrator._decode_round_metadata(match["payload"])
+        return (metadata.role, metadata.agent, metadata.phase, metadata.scheduler_phase)
+
+    gemini = next(i for i, c in enumerate(comments) if role_of(c) == ("reviewer", "Gemini", "publication", None))
+    opening = next(i for i, c in enumerate(comments) if (role_of(c) or ("",) * 4)[3] == "secondary-audit")
+    assert opening < gemini
+    comments.insert(opening, comments.pop(gemini))  # Gemini's review now precedes the opening
+    launches_before = list(runner.reviewer_launches)
+
+    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert runner.reviewer_launches == launches_before
+    assert not runner.peer_body_visible_at_launch
+    assert "Gemini already posted" in str(excinfo.value)
+    assert "Gemini review (round 1)" in str(excinfo.value)
+
+
+def _remediation_gate_state(tmp_path, monkeypatch):
+    """Panel opened on an earlier head; on a new head the primary alone re-approved, unreconciled."""
+    from coding_review_agent_loop.migrations import MigrationValidationResult
+    from coding_review_agent_loop.review_scheduling import TransitionClassification
+
+    monkeypatch.setattr(
+        orchestrator, "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    monkeypatch.setattr(
+        orchestrator, "validate_pr_migration_topology",
+        lambda *args, **kwargs: MigrationValidationResult(ok=True),
+    )
+    runner = _panel_pr_runner()
+    config = _panel_pr_config(tmp_path, max_rounds=8)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    runner.pr_payload["headRefOid"] = "def456"
+    with patch.object(
+        orchestrator, "post_pr_comment",
+        side_effect=_interrupt_on_phase(orchestrator.post_pr_comment, "reconciliation"),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    return runner, config
+
+
+def _remediation_phases(runner):
+    return [
+        r.scheduler_phase for r in _records(runner, flow="pr", surface="pr")
+        if r.subject == "def456" and r.phase == "scheduler-prelaunch"
+    ]
+
+
+def test_pr_remediation_gate_resumed_into_a_same_round_final_sweep_launches_the_sweep(
+    tmp_path, monkeypatch
+):
+    runner, config = _remediation_gate_state(tmp_path, monkeypatch)
+    assert _remediation_phases(runner) == ["remediation"]
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # The resuming invocation posted its checkpoint in the same round and the
+    # panel launched beside the primary's retained remediation approval.
+    assert _remediation_phases(runner) == ["remediation", "final-secondary-sweep"]
+    assert sorted(runner.reviewer_launches[launches_before:]) == ["agy", "gemini"]
+    primary = [
+        r for r in _records(runner, flow="pr", surface="pr")
+        if r.subject == "def456" and r.role == "reviewer" and r.agent == "Codex"
+    ]
+    assert len(primary) == 1
+
+
+def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, monkeypatch):
+    runner, config = _remediation_gate_state(tmp_path, monkeypatch)
+    with patch.object(
+        orchestrator, "post_pr_comment",
+        side_effect=_interrupt_on_second_review_post(orchestrator.post_pr_comment, _PANEL_MARKERS),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert _remediation_phases(runner) == ["remediation", "final-secondary-sweep"]
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = list(runner.reviewer_launches)
+
+    message = _refusal_message(runner, config)
+
+    assert runner.reviewer_launches == launches_before
+    assert "provisional" not in message, message
+    listed = []
+    for index, comment in enumerate(runner.pr_payload["comments"]):
+        if index + 10_001 in _listed_comment_ids(message):
+            metadata = orchestrator._decode_round_metadata(
+                orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
+            )
+            listed.append((metadata.role, metadata.agent, metadata.scheduler_phase))
+    assert ("reviewer", "Gemini", "final-secondary-sweep") in listed
+    # The primary's remediation approval gates the sweep and is retained.
+    assert not any(agent == "Codex" for _role, agent, _phase in listed)

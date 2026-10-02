@@ -24455,45 +24455,55 @@ def run_pr_loop(
                 # (#1156).  Visibility is read from the complete history with
                 # this invocation's own checkpoint included, so opening
                 # evidence is never stale.
+                # A failed transport read falls back to the pre-post history plus
+                # the posted checkpoint; history that was read but cannot be
+                # decoded makes visibility unknowable, so stop before any
+                # reviewer launches (as the round-start decode failure does).
+                pr_fresh_records: tuple[PostedRoundRecord, ...] | None = None
                 try:
-                    pr_fresh_records: tuple[PostedRoundRecord, ...] | None
-                    try:
-                        pr_fresh_records = _extract_round_metadata_records(
-                            get_pr_review_context(
-                                runner, config=config, pr_number=pr_number
-                            ).comments,
-                            flow="pr",
-                        )
-                    except AgentLoopError:
-                        pr_fresh_records = None
-                    pr_visibility_records, _pr_checkpoint_present = _visibility_snapshot(
-                        fresh_records=pr_fresh_records,
-                        base_records=_extract_round_metadata_records(pr_comments, flow="pr"),
-                        base_length=len(pr_comments),
-                        checkpoint=pr_posted_checkpoint,
-                    )
-                    pr_visibility_evidence = (
-                        _derive_pr_visibility_evidence(pr_visibility_records)
-                        if scheduler_capabilities.requires_primary else None
-                    )
-                    pr_visible_names = visible_peer_names(
-                        pr_visibility_records,
-                        opening_source=(
-                            pr_visibility_evidence.opening_source
-                            if pr_visibility_evidence is not None else None
-                        ),
-                        flow="pr", round_number=round_number, subject=current_pr_subject,
-                        reviewer_names=[agent_display_name(r) for r in configured_reviewers],
-                        primary_reviewer=pr_recovery_context.primary_reviewer,
-                        launch_phase=pr_launch_phase,
-                        launching=pr_recovery_context.launching,
-                        checkpoint_index=latest_round_checkpoint_index(
-                            pr_visibility_records, flow="pr",
-                            round_number=round_number, subject=current_pr_subject,
-                        ),
-                    )
+                    pr_fresh_comments = get_pr_review_context(
+                        runner, config=config, pr_number=pr_number
+                    ).comments
                 except AgentLoopError:
-                    pr_visible_names = set()
+                    pr_fresh_comments = None
+                try:
+                    if pr_fresh_comments is not None:
+                        pr_fresh_records = _extract_round_metadata_records(
+                            pr_fresh_comments, flow="pr"
+                        )
+                    pr_base_records = _extract_round_metadata_records(pr_comments, flow="pr")
+                except AgentLoopError as exc:
+                    if scheduler_capabilities.requires_primary:
+                        stop_pre_panel(
+                            undecodable_history_message(exc), round_number=round_number
+                        )
+                    raise
+                pr_visibility_records, _pr_checkpoint_present = _visibility_snapshot(
+                    fresh_records=pr_fresh_records,
+                    base_records=pr_base_records,
+                    base_length=len(pr_comments),
+                    checkpoint=pr_posted_checkpoint,
+                )
+                pr_visibility_evidence = (
+                    _derive_pr_visibility_evidence(pr_visibility_records)
+                    if scheduler_capabilities.requires_primary else None
+                )
+                pr_visible_names = visible_peer_names(
+                    pr_visibility_records,
+                    opening_source=(
+                        pr_visibility_evidence.opening_source
+                        if pr_visibility_evidence is not None else None
+                    ),
+                    flow="pr", round_number=round_number, subject=current_pr_subject,
+                    reviewer_names=[agent_display_name(r) for r in configured_reviewers],
+                    primary_reviewer=pr_recovery_context.primary_reviewer,
+                    launch_phase=pr_launch_phase,
+                    launching=pr_recovery_context.launching,
+                    checkpoint_index=latest_round_checkpoint_index(
+                        pr_visibility_records, flow="pr",
+                        round_number=round_number, subject=current_pr_subject,
+                    ),
+                )
                 pr_round_public_peers = tuple(
                     reviewer for reviewer in configured_reviewers
                     if reviewer in pr_today_peers
