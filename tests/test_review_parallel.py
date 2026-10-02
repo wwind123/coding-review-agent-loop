@@ -2965,3 +2965,188 @@ def test_orphan_attachments_before_a_lost_anchor_are_listed_and_recovered(tmp_pa
     assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
     assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
     assert len(runner.pr_payload["comments"]) == len(baseline.pr_payload["comments"])
+
+
+# --- #1142 review: real-loop deletion-and-rerun for the scheduler, plan and panel paths ---
+
+
+def _comment_records(runner, *, surface, flow):
+    """Round metadata of ``flow``, decoded the way resume does (spills assembled)."""
+    from coding_review_agent_loop.github import IssueComment
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    store = runner.pr_payload["comments"] if surface == "pr" else runner.issue_comments
+    comments = [
+        IssueComment(author="bot", created_at=f"2026-01-01T00:00:{i:02d}Z", body=c["body"])
+        for i, c in enumerate(store)
+    ]
+    return [record.metadata for record in _extract_round_metadata_records(comments, flow=flow)]
+
+
+def _transition(records, *, round_number):
+    """Round, phase and record kinds a rerun published (the effective transition)."""
+    return sorted(
+        (r.role, r.agent, r.phase, r.scheduler_phase)
+        for r in records
+        if r.round_number == round_number
+    )
+
+
+def _selective_followup_runner():
+    markers = ("Codex approves after the fix.", "Gemini approves after the fix.")
+    runner = _PartialPublicationProbeRunner(
+        round_markers=markers,
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Codex found a blocker.", blocking_items=["Persist this item."]
+            ),
+            structured_pr_review(
+                summary=markers[0],
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+            structured_pr_review(
+                summary="Codex rerun approval.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[
+            structured_pr_review(summary="Gemini approves round one.", reviewer="Google Gemini"),
+            structured_pr_review(
+                summary=markers[1], reviewer="Google Gemini",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+            structured_pr_review(
+                summary="Gemini rerun approval.", reviewer="Google Gemini",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(
+            summary="Fixed the persisted item.", addressed_items=["item-1"]
+        )],
+    )
+    runner.serve_rest_issue_comments = True
+    return runner, markers
+
+
+def test_scheduler_enabled_round_recovers_with_retained_prelaunch_and_coder(tmp_path):
+    """A coder-anchored scheduler round: prelaunch and coder retained, rerun reconciles."""
+    runner, markers = _selective_followup_runner()
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
+        pr_review_policy="selective-intermediate", max_rounds=4,
+    )
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    for path in _spool_files(config):
+        path.unlink()
+    retained = list(runner.pr_payload["comments"])
+    launches_before = len(runner.reviewer_launches)
+
+    message = _refusal_message(runner, config)
+
+    assert len(runner.reviewer_launches) == launches_before
+    assert "Rerun from the host" not in message
+    ids = _listed_comment_ids(message)
+    assert ids and "Delete these" in message, message
+    # The prelaunch summaries and the coder record are never advertised.
+    doomed = {i - 10_001 for i in ids}
+    for index, comment in enumerate(retained):
+        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        if match is None:
+            continue
+        metadata = orchestrator._decode_round_metadata(match["payload"])
+        if index in doomed:
+            assert metadata.role != "coder" and metadata.phase != "scheduler-prelaunch"
+    _delete_listed_comments(runner, ids, surface="pr")
+    assert not any(m in body for m in markers for body in runner.comments)
+    assert any(
+        r.phase == "scheduler-prelaunch" and r.round_number == 2
+        for r in _comment_records(runner, surface="pr", flow="pr")
+    )
+    assert any(
+        r.role == "coder" for r in _comment_records(runner, surface="pr", flow="pr")
+    )
+    runner.peer_body_visible_at_launch = False
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not runner.peer_body_visible_at_launch
+    after = _comment_records(runner, surface="pr", flow="pr")
+    # The rerun stayed in round 2 and posted a fresh reconciliation.
+    assert any(r.role == "summary" and r.phase == "reconciliation" and r.round_number == 2 for r in after)
+    assert launches_before + 2 <= len(runner.reviewer_launches)
+    assert not any(m in body for m in markers for body in runner.comments)
+
+    baseline, _ = _selective_followup_runner()
+    baseline_config = make_config(
+        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True,
+        pr_review_policy="selective-intermediate", max_rounds=4,
+    )
+    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
+    def effective(records):
+        # Checkpoints are retained history (a rerun may add one); compare the
+        # records the round itself publishes: coder, verdicts, reconciliation.
+        return [
+            entry for entry in _transition(records, round_number=2)
+            if entry[2] != "scheduler-prelaunch"
+        ]
+
+    assert effective(after) == effective(_comment_records(baseline, surface="pr", flow="pr"))
+    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(
+        baseline.reviewer_launches[2:]
+    )
+
+
+def test_plan_round_with_spilled_coder_artifact_recovers_and_keeps_its_attachments(tmp_path):
+    """The coder record's attachments are referenced by a retained comment: never listed."""
+    from coding_review_agent_loop.round_transport import attachment_keys
+
+    def build():
+        runner, markers = _plan_partial_round_runner()
+        runner.serve_rest_issue_comments = True
+        runner.claude_outputs[:] = [structured_plan_state(
+            state="blocking", summary="Initial plan.", plan_steps=["Make the change.", _big_text(21)],
+        )]
+        runner.codex_outputs.append(structured_plan_review(summary="Codex rerun note."))
+        runner.gemini_outputs.append(structured_plan_review(
+            summary="Gemini rerun note.", reviewer="Google Gemini"
+        ))
+        return runner, markers
+
+    runner, markers = build()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_plan_round_between_publications(runner, config, markers)
+    for path in _spool_files(config):
+        path.unlink()
+    spilled = [c["body"] for c in runner.issue_comments if attachment_keys(c["body"])]
+    assert spilled, "the coder artifact did not spill into attachments"
+    launches_before = len(runner.reviewer_launches)
+
+    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    message = str(excinfo.value)
+
+    assert len(runner.reviewer_launches) == launches_before
+    ids = _listed_comment_ids(message)
+    assert ids and "Delete these" in message, message
+    _delete_listed_comments(runner, ids, surface="issue")
+    # Every attachment of the retained coder artifact survives.
+    assert [c["body"] for c in runner.issue_comments if attachment_keys(c["body"])] == spilled
+    assert not any(m in body for m in markers for body in runner.comments)
+    runner.peer_body_visible_at_launch = False
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert not runner.peer_body_visible_at_launch
+    assert sorted(runner.reviewer_launches[launches_before:]) == ["codex", "gemini"]
+    after = _comment_records(runner, surface="issue", flow="plan")
+    assert {r.round_number for r in after} == {1}
+    assert any(r.role == "summary" and r.phase == "reconciliation" for r in after)
+    baseline, _ = build()
+    assert run_issue_loop(
+        baseline, issue_number=56,
+        config=make_config(tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True),
+        plan_first=True,
+    ) == 0
+    assert _transition(after, round_number=1) == _transition(
+        _comment_records(baseline, surface="issue", flow="plan"), round_number=1
+    )
