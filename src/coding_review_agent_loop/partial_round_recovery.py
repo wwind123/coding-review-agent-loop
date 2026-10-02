@@ -21,6 +21,12 @@ from .round_state import (
     PostedRoundRecord,
     _extract_round_metadata_records,
 )
+from .round_visibility import (
+    PRIMARY_APPROVAL_OPENING,
+    latest_round_checkpoint_index,
+    primary_gate_records,
+    same_round_public_publications,
+)
 from .round_transport import (
     ROUND_RESUME_MARKER_RE,
     attachment_keys,
@@ -44,6 +50,26 @@ class PartialRoundRecovery:
     targets: tuple[RecoveryTarget, ...] = ()
     uncertain: tuple[RecoveryTarget, ...] = ()
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryVisibilityContext:
+    """What the launch guard knew, so the listing applies the same peer predicate (#1156).
+
+    ``derive_evidence`` maps extracted round records to a panel-evidence object
+    (``opening_index`` / ``opening_source``).  ``target_opening`` additionally
+    lists an in-round primary-approval opening and the round's later scheduler
+    checkpoints, so the post-deletion rerun reopens the panel from scratch;
+    ``removed_opening_fingerprint`` is then the fingerprint of a history with
+    no opening.
+    """
+
+    primary_reviewer: str | None
+    launch_phase: str | None
+    launching: tuple[str, ...]
+    derive_evidence: Callable[[Sequence[PostedRoundRecord]], object]
+    target_opening: bool = False
+    removed_opening_fingerprint: object = None
 
 
 def _target(label: str, comment: IssueComment) -> RecoveryTarget:
@@ -80,28 +106,6 @@ def _snapshot_covered(
     return all(available[key] >= count for key, count in needed.items())
 
 
-def _publication_records(
-    records: Sequence[PostedRoundRecord],
-    *,
-    flow: str,
-    round_number: int,
-    subject: str,
-    scheduler_phase: str | None,
-    reviewer_names: Sequence[str],
-) -> list[PostedRoundRecord]:
-    return [
-        record for record in records
-        if record.metadata.flow == flow
-        and record.metadata.round_number == round_number
-        and record.metadata.subject == subject
-        and record.metadata.agent in reviewer_names
-        and record.metadata.role != "summary"
-        and record.metadata.role != "coder"
-        and record.metadata.phase == "publication"
-        and (flow != "pr" or record.metadata.scheduler_phase == scheduler_phase)
-    ]
-
-
 def _reconciling_summaries(
     records: Sequence[PostedRoundRecord], *, flow: str, round_number: int, subject: str
 ) -> list[PostedRoundRecord]:
@@ -115,26 +119,72 @@ def _reconciling_summaries(
     ]
 
 
+def _frame(
+    comments: Sequence[IssueComment],
+    *,
+    flow: str,
+    round_number: int,
+    subject: str,
+    context: RecoveryVisibilityContext | None,
+) -> tuple[frozenset[int], dict[int, str]]:
+    """Freeze the gate records and opening checkpoints from the original history."""
+    if context is None:
+        return frozenset(), {}
+    records = _extract_round_metadata_records(comments, flow=flow)
+    evidence = context.derive_evidence(records)
+    source = getattr(evidence, "opening_source", None)
+    gates = primary_gate_records(
+        records, opening_source=source, flow=flow, round_number=round_number,
+        subject=subject, primary_reviewer=context.primary_reviewer,
+        launch_phase=context.launch_phase, launching=context.launching,
+        checkpoint_index=latest_round_checkpoint_index(
+            records, flow=flow, round_number=round_number, subject=subject
+        ),
+    )
+    opening_targets: dict[int, str] = {}
+    opening_index = getattr(evidence, "opening_index", None)
+    if context.target_opening and source == PRIMARY_APPROVAL_OPENING and opening_index is not None:
+        opening = next((r for r in records if r.index == opening_index), None)
+        if (
+            opening is not None
+            and opening.metadata.round_number == round_number
+            and opening.metadata.subject == subject
+        ):
+            for record in records:
+                if (
+                    record.metadata.role == "summary"
+                    and record.metadata.phase == "scheduler-prelaunch"
+                    and record.metadata.round_number == round_number
+                    and record.metadata.subject == subject
+                    and record.index >= opening_index
+                ):
+                    opening_targets[record.index] = f"round {round_number} scheduler checkpoint"
+    return frozenset(gate.index for gate in gates), opening_targets
+
+
 def _plan(
     comments: Sequence[IssueComment],
     *,
     flow: str,
     round_number: int,
     subject: str,
-    scheduler_phase: str | None,
+    gate_indices: frozenset[int],
+    opening_targets: dict[int, str],
     reviewer_names: Sequence[str],
     widen: bool,
 ) -> tuple[dict[int, str], dict[int, str], str | None, int | None]:
     """Return (targets, uncertain attachments, uncertainty reason) by comment index."""
     records = _extract_round_metadata_records(comments, flow=flow)
-    publications = _publication_records(
+    publications = same_round_public_publications(
         records, flow=flow, round_number=round_number, subject=subject,
-        scheduler_phase=scheduler_phase, reviewer_names=reviewer_names,
+        reviewer_names=reviewer_names,
     )
     targets: dict[int, str] = {
         record.index: f"{record.metadata.agent} review (round {round_number})"
         for record in publications
+        if record.index not in gate_indices
     }
+    targets.update(opening_targets)
     for record in _reconciling_summaries(
         records, flow=flow, round_number=round_number, subject=subject
     ):
@@ -147,10 +197,7 @@ def _plan(
                 and record.metadata.role != "coder"
                 and record.metadata.phase not in PRE_RECONCILIATION_PLAN_SUMMARY_PHASES
                 and (record.metadata.phase == "publication" or record.metadata.role == "summary")
-                and (
-                    record.metadata.scheduler_phase == scheduler_phase
-                    or record.metadata.role == "summary"
-                )
+                and record.index not in gate_indices
             ):
                 targets.setdefault(record.index, f"round {round_number} record")
     if not targets:
@@ -174,32 +221,22 @@ def _plan(
         and not is_round_transport_sidecar(comment.body)
     ]
     lower_bound = max(earlier) if earlier else None
-    if scheduler_phase is not None:
-        # A later scheduler phase starts at its qualified opening: the first
-        # checkpoint after the last earlier-phase record of this round.  A
-        # later checkpoint (posted by a rerun) must not move the bound up and
-        # hide an orphan from the first attempt.
-        earlier_phase = [
+    retained_gates = [index for index in gate_indices if index < min(targets)]
+    if retained_gates:
+        # A retained gating review starts the panel's window at its qualified
+        # opening: the first checkpoint after it.  A later checkpoint (posted by
+        # a rerun) must not move the bound up and hide an orphan from the first
+        # attempt.
+        last_earlier = max(retained_gates)
+        openings = [
             record.index for record in records
-            if record.metadata.flow == flow
+            if record.metadata.role == "summary"
+            and record.metadata.phase == "scheduler-prelaunch"
             and record.metadata.round_number == round_number
             and record.metadata.subject == subject
-            and record.metadata.role == "reviewer"
-            and record.metadata.phase == "publication"
-            and record.metadata.scheduler_phase != scheduler_phase
-            and record.index < min(targets)
+            and last_earlier < record.index < min(targets)
         ]
-        if earlier_phase:
-            last_earlier = max(earlier_phase)
-            openings = [
-                record.index for record in records
-                if record.metadata.role == "summary"
-                and record.metadata.phase == "scheduler-prelaunch"
-                and record.metadata.round_number == round_number
-                and record.metadata.subject == subject
-                and last_earlier < record.index < min(targets)
-            ]
-            lower_bound = min(openings) if openings else last_earlier
+        lower_bound = min(openings) if openings else last_earlier
 
     attachments = [
         index for index, comment in enumerate(comments)
@@ -269,15 +306,18 @@ def compute_partial_round_recovery(
     flow: str,
     round_number: int,
     subject: str,
-    scheduler_phase: str | None,
     reviewer_names: Sequence[str],
     resume: Callable[[Sequence[IssueComment]], object],
+    scheduler_phase: str | None = None,
     fingerprint: Callable[[Sequence[IssueComment]], object] | None = None,
+    context: RecoveryVisibilityContext | None = None,
 ) -> PartialRoundRecovery:
     """The comments whose deletion lets the round run again, verified or provisional.
 
     ``fingerprint`` summarizes state the retained records must keep (for
     example the qualified panel opening); it must be equal before and after.
+    ``scheduler_phase`` is accepted for compatibility and no longer selects
+    peers: visibility, not phase, decides (#1156).
     """
     complete = True
     try:
@@ -290,8 +330,8 @@ def compute_partial_round_recovery(
     try:
         return _compute(
             comments, complete=complete, flow=flow, round_number=round_number,
-            subject=subject, scheduler_phase=scheduler_phase,
-            reviewer_names=reviewer_names, resume=resume, fingerprint=fingerprint,
+            subject=subject, reviewer_names=reviewer_names, resume=resume,
+            fingerprint=fingerprint, context=context,
         )
     except AgentLoopError:
         return PartialRoundRecovery(
@@ -307,11 +347,15 @@ def _compute(
     flow: str,
     round_number: int,
     subject: str,
-    scheduler_phase: str | None,
     reviewer_names: Sequence[str],
     resume: Callable[[Sequence[IssueComment]], object],
     fingerprint: Callable[[Sequence[IssueComment]], object] | None = None,
+    context: RecoveryVisibilityContext | None = None,
 ) -> PartialRoundRecovery:
+    gate_indices, opening_targets = _frame(
+        comments, flow=flow, round_number=round_number, subject=subject, context=context,
+    )
+
     def state_of(result: object) -> object:
         return result[1] if isinstance(result, tuple) and len(result) == 2 else result
 
@@ -342,9 +386,21 @@ def _compute(
                     refs.update(referenced_attachment_keys(body))
         except AgentLoopError:
             return False
-        if _publication_records(
-            records, flow=flow, round_number=round_number, subject=subject,
-            scheduler_phase=scheduler_phase, reviewer_names=reviewer_names,
+        original_index = [i for i in range(len(comments)) if i not in targets]
+
+        def retained_gate(record_index: int) -> bool:
+            return 0 <= record_index < len(original_index) and (
+                original_index[record_index] in gate_indices
+            )
+
+        # Peers of any scheduler phase must be gone; only the frozen gate
+        # records (never re-derived from the remaining history) may survive.
+        if any(
+            not retained_gate(record.index)
+            for record in same_round_public_publications(
+                records, flow=flow, round_number=round_number, subject=subject,
+                reviewer_names=reviewer_names,
+            )
         ):
             return False
         if _reconciling_summaries(
@@ -360,7 +416,6 @@ def _compute(
         if not all(present(key) for key in refs):
             return False
         # No unreferenced attachment may remain inside the round's interval.
-        original_index = [i for i in range(len(comments)) if i not in targets]
         for position, keys in attachment_positions:
             if lower_bound is None or original_index[position] <= lower_bound:
                 continue
@@ -381,7 +436,7 @@ def _compute(
                 return False
             if any(
                 record.metadata.agent in reviewer_names
-                and (scheduler_phase is None or record.metadata.scheduler_phase == scheduler_phase)
+                and not retained_gate(getattr(record, "index", -1))
                 for record in getattr(state, "completed_reviews", ())
             ):
                 return False
@@ -395,9 +450,25 @@ def _compute(
                 for name in ("coder_output", "coder_metadata", "compact_prior_summaries"):
                     if getattr(state, name, None) != getattr(before, name, None):
                         return False
+        if opening_targets and context is not None:
+            # The restored transition: the opening is gone, every frozen gate
+            # record survives, and the panel reopens from the same history a
+            # never-started round would have.
+            try:
+                if getattr(context.derive_evidence(records), "opening_index", None) is not None:
+                    return False
+            except AgentLoopError:
+                return False
+            if not all(index in original_index for index in gate_indices):
+                return False
         if fingerprint is not None:
             try:
-                if fingerprint(remaining) != before_print:
+                expected = (
+                    context.removed_opening_fingerprint
+                    if opening_targets and context is not None
+                    else before_print
+                )
+                if fingerprint(remaining) != expected:
                     return False
             except AgentLoopError:
                 return False
@@ -410,7 +481,8 @@ def _compute(
     for widen in (False, True):
         targets, uncertain, reason, bound = _plan(
             comments, flow=flow, round_number=round_number, subject=subject,
-            scheduler_phase=scheduler_phase, reviewer_names=reviewer_names, widen=widen,
+            gate_indices=gate_indices, opening_targets=opening_targets,
+            reviewer_names=reviewer_names, widen=widen,
         )
         if check(targets, bound):
             verified = True
@@ -434,5 +506,6 @@ def _compute(
 
 
 __all__ = [
-    "PartialRoundRecovery", "RecoveryTarget", "compute_partial_round_recovery",
+    "PartialRoundRecovery", "RecoveryTarget", "RecoveryVisibilityContext",
+    "compute_partial_round_recovery",
 ]

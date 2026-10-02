@@ -2380,17 +2380,33 @@ Execution model:
   - If a same-round peer is already public -- including a posted review that
     resume rejected, for example after the requirements changed -- and a
     reviewer's spooled outcome is missing or no longer validates (for example,
-    a rerun on another host), the run stops before invoking it. The refusal
+    a rerun on another host), the run stops before invoking it. A peer is every
+    reviewer verdict of the same round and subject posted after the round's
+    latest coder record, whatever scheduler phase it was published under
+    (#1156): a panel review published under `secondary-audit` is still a peer
+    when the rerun lands in `final-secondary-sweep`. One record is not a peer:
+    the primary's approved review that gates the current `secondary-audit` or
+    `final-secondary-sweep` launch under a primary-approval panel opening, which
+    the panel is designed to read. It is judged against this invocation's own
+    scheduler checkpoint, so a primary interrupted before reconciliation and
+    resumed into a same-round panel opening still launches the panel. The
+    refusal
     states why replay is unavailable: no spool exists on this host (naming the
     directory looked under), the spool holds no outcome for that reviewer, the
     reviewer's spool file exists but is unreadable or foreign, the spooled
     outcome no longer validates, or the reviewer's own posted review was
     rejected and needs a fresh turn. It never offers a rerun from another host.
     It then lists, by comment id and URL, the comments to delete so the whole
-    round runs again independently: the same-batch reviewer verdicts (including
-    a rejected own record), the round's reconciling summaries, attachments only
+    round runs again independently: the round's peer reviewer verdicts of any
+    scheduler phase (including a rejected own record), the round's reconciling
+    summaries, attachments only
     those comments reference, and unreferenced attachments left inside this
-    round's interval. Scheduler-prelaunch summaries and plan phase checkpoints,
+    round's interval. Under `primary-then-panel`, when the panel opening was
+    posted in this same round, the opening checkpoint and every later
+    scheduler checkpoint of the round are listed as well, while the primary's
+    gating approval is kept, so the rerun reopens `secondary-audit` exactly as
+    a round that never started would. Other scheduler-prelaunch summaries and
+    plan phase checkpoints,
     the coder record, incomplete-status notices, attachments a retained comment
     still references, and older attachments are not listed and need not be
     deleted. The list is checked by simulating resume on the history that would

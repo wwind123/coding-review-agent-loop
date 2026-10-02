@@ -671,7 +671,13 @@ from .review_scheduling import (
     select_reviewers,
     undecodable_history_message,
 )
-from .partial_round_recovery import PartialRoundRecovery, RecoveryTarget, compute_partial_round_recovery
+from .partial_round_recovery import (
+    PartialRoundRecovery,
+    RecoveryTarget,
+    RecoveryVisibilityContext,
+    compute_partial_round_recovery,
+)
+from .round_visibility import latest_round_checkpoint_index, visible_peer_names
 from .review_spool import ReviewRoundSpool, review_spool_root
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
@@ -13550,6 +13556,7 @@ def _run_plan_first_loop(
             else None
         )
         plan_scheduler_decision = None
+        plan_posted_checkpoint: PostedRoundMetadata | None = None
         plan_panel_evidence = PlanPanelEvidence()
         plan_qualifying_approvals: tuple[str, ...] = ()
         plan_previous_key: PlanCandidateKey | None = None
@@ -13757,6 +13764,47 @@ def _run_plan_first_loop(
                 f"calls_avoided_cumulative={plan_scheduler_calls_avoided}"
                 + (f"; {plan_amendment_note}" if plan_amendment_note else ""),
             )
+            plan_posted_checkpoint = PostedRoundMetadata(
+                flow="plan",
+                role="summary",
+                agent="Orchestrator",
+                round_number=round_number,
+                subject=current_plan_subject,
+                prior_items=prior_unresolved_items,
+                phase="scheduler-prelaunch",
+                scheduler_contract=plan_scheduler_contract.as_dict(),
+                reviewer_board_amendment_digest=plan_amendment_digest,
+                scheduler_obligation_digest=hashlib.sha256(
+                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                ).hexdigest()[:16],
+                scheduler_selected_reviewers=plan_scheduler_decision.selected_reviewers,
+                scheduler_paused_reviewers=plan_scheduler_decision.paused_reviewers,
+                scheduler_reasons=(
+                    plan_scheduler_decision.reason,
+                    plan_classification.reason,
+                ),
+                scheduler_final_sweep=plan_scheduler_decision.final_sweep,
+                scheduler_force_full=plan_recorded_force_full,
+                scheduler_force_full_source=plan_recorded_force_full_source,
+                scheduler_calls_avoided=plan_scheduler_calls_avoided,
+                scheduler_phase=plan_scheduler_decision.phase,
+                scheduler_primary_reviewer=plan_primary_name,
+                scheduler_approved_reviewers=tuple(plan_qualifying_approvals),
+                scheduler_active_owners=plan_scheduler_decision.active_owners,
+                plan_candidate_key=current_plan_key.as_dict(),
+                scheduler_plan_previous_key=(
+                    plan_previous_key.as_dict() if plan_previous_key is not None else None
+                ),
+                scheduler_issue_digest=(
+                    plan_issue_digest
+                    if plan_scheduler_decision.phase == "primary"
+                    else None
+                ),
+                scheduler_stall_reset=(
+                    plan_reset_round and plan_scheduler_decision.phase == "primary"
+                ),
+                **_architecture_metadata_fields(config),
+            )
             post_issue_comment(
                 runner,
                 config=config,
@@ -13781,47 +13829,7 @@ def _run_plan_first_loop(
                             else plan_panel_evidence.unqualified_artifacts
                         ),
                     ), plan_amendment_note),
-                    PostedRoundMetadata(
-                        flow="plan",
-                        role="summary",
-                        agent="Orchestrator",
-                        round_number=round_number,
-                        subject=current_plan_subject,
-                        prior_items=prior_unresolved_items,
-                        phase="scheduler-prelaunch",
-                        scheduler_contract=plan_scheduler_contract.as_dict(),
-                        reviewer_board_amendment_digest=plan_amendment_digest,
-                        scheduler_obligation_digest=hashlib.sha256(
-                            repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
-                        ).hexdigest()[:16],
-                        scheduler_selected_reviewers=plan_scheduler_decision.selected_reviewers,
-                        scheduler_paused_reviewers=plan_scheduler_decision.paused_reviewers,
-                        scheduler_reasons=(
-                            plan_scheduler_decision.reason,
-                            plan_classification.reason,
-                        ),
-                        scheduler_final_sweep=plan_scheduler_decision.final_sweep,
-                        scheduler_force_full=plan_recorded_force_full,
-                        scheduler_force_full_source=plan_recorded_force_full_source,
-                        scheduler_calls_avoided=plan_scheduler_calls_avoided,
-                        scheduler_phase=plan_scheduler_decision.phase,
-                        scheduler_primary_reviewer=plan_primary_name,
-                        scheduler_approved_reviewers=tuple(plan_qualifying_approvals),
-                        scheduler_active_owners=plan_scheduler_decision.active_owners,
-                        plan_candidate_key=current_plan_key.as_dict(),
-                        scheduler_plan_previous_key=(
-                            plan_previous_key.as_dict() if plan_previous_key is not None else None
-                        ),
-                        scheduler_issue_digest=(
-                            plan_issue_digest
-                            if plan_scheduler_decision.phase == "primary"
-                            else None
-                        ),
-                        scheduler_stall_reset=(
-                            plan_reset_round and plan_scheduler_decision.phase == "primary"
-                        ),
-                        **_architecture_metadata_fields(config),
-                    ),
+                    plan_posted_checkpoint,
                 ),
             )
             if plan_reset_round and plan_scheduler_decision.phase == "primary":
@@ -14050,11 +14058,76 @@ def _run_plan_first_loop(
         # it through the same withhold-then-publish launcher even when this run
         # is sequential, so no retried reviewer sees a same-round peer's body.
         plan_round_parallel = config.review_parallel or plan_round_spool.has_records()
-        plan_round_public_peers = tuple(
+        plan_today_peers = tuple(
             reviewer for reviewer in round_reviewers
             if (record := resumed_by_name.get(agent_display_name(reviewer))) is not None
             and record.metadata.phase == "publication"
         )
+        plan_round_public_peers = plan_today_peers
+        plan_recovery_context: RecoveryVisibilityContext | None = None
+        if staged_planning and plan_scheduler_decision is not None:
+            def _derive_plan_visibility_evidence(
+                records: Sequence[PostedRoundRecord],
+            ) -> PlanPanelEvidence:
+                return _derive_plan_panel_evidence(
+                    records,
+                    primary_reviewer=plan_primary_name,
+                    required_reviewers=plan_reviewer_names,
+                )
+
+            plan_recovery_context = RecoveryVisibilityContext(
+                primary_reviewer=plan_primary_name,
+                launch_phase=plan_scheduler_decision.phase,
+                launching=tuple(sorted(plan_selected_names)),
+                derive_evidence=_derive_plan_visibility_evidence,
+            )
+            if plan_posted_checkpoint is not None:
+                # Same visibility rule as the PR guard (#1156): every same-round
+                # review already public counts, whatever its scheduler phase and
+                # whether or not its author was selected again, including
+                # records resume stripped as unqualified pre-opening.
+                try:
+                    plan_fresh_comments = get_issue_context(
+                        runner, config=config, issue_number=issue_number
+                    ).comments
+                except AgentLoopError:
+                    plan_fresh_records = None
+                else:
+                    try:
+                        plan_fresh_records = _extract_round_metadata_records(
+                            plan_fresh_comments, flow="plan"
+                        )
+                    except AgentLoopError as exc:
+                        stop_plan_pre_panel(
+                            plan_undecodable_history_message(exc), round_number=round_number
+                        )
+                        raise
+                plan_visibility_records, _plan_checkpoint_present = _visibility_snapshot(
+                    fresh_records=plan_fresh_records,
+                    base_records=plan_records,
+                    base_length=len(issue_context.comments),
+                    checkpoint=plan_posted_checkpoint,
+                )
+                plan_visible_names = visible_peer_names(
+                    plan_visibility_records,
+                    opening_source=_derive_plan_visibility_evidence(
+                        plan_visibility_records
+                    ).opening_source,
+                    flow="plan", round_number=round_number, subject=current_plan_subject,
+                    reviewer_names=[agent_display_name(r) for r in configured_reviewers],
+                    primary_reviewer=plan_primary_name,
+                    launch_phase=plan_scheduler_decision.phase,
+                    launching=plan_recovery_context.launching,
+                    checkpoint_index=latest_round_checkpoint_index(
+                        plan_visibility_records, flow="plan",
+                        round_number=round_number, subject=current_plan_subject,
+                    ),
+                )
+                plan_round_public_peers = tuple(
+                    reviewer for reviewer in configured_reviewers
+                    if reviewer in plan_today_peers
+                    or agent_display_name(reviewer) in plan_visible_names
+                )
         def _plan_round_recovery() -> PartialRoundRecovery:
             return compute_partial_round_recovery(
                 snapshot=issue_context.comments,
@@ -14064,8 +14137,8 @@ def _run_plan_first_loop(
                     reject_empty_output=True,
                 ),
                 flow="plan", round_number=round_number, subject=current_plan_subject,
-                scheduler_phase=None,
-                reviewer_names=[agent_display_name(r) for r in round_reviewers],
+                context=plan_recovery_context,
+                reviewer_names=[agent_display_name(r) for r in configured_reviewers],
                 resume=lambda remaining: _resume_plan_round(
                     remaining, configured_reviewers=configured_reviewers
                 ),
@@ -18906,6 +18979,45 @@ def _persist_qualification_checkpoint(
     )
 
 
+def _visibility_snapshot(
+    *,
+    fresh_records: Sequence[PostedRoundRecord] | None,
+    base_records: Sequence[PostedRoundRecord],
+    base_length: int,
+    checkpoint: PostedRoundMetadata | None,
+) -> tuple[tuple[PostedRoundRecord, ...], bool]:
+    """History as visible once this invocation's own scheduler checkpoint is posted (#1156).
+
+    Prefers the refreshed history when it holds the checkpoint; otherwise the
+    pre-post history plus a synthetic record for it, never the stale evidence
+    alone.  Returns the records and whether the checkpoint is present.
+    """
+    if checkpoint is None:
+        return tuple(base_records), False
+    base_top = max((record.index for record in base_records), default=-1)
+    if fresh_records is None:
+        history: tuple[PostedRoundRecord, ...] = tuple(base_records)
+    else:
+        history = tuple(fresh_records)
+        if any(
+            record.index > base_top
+            and record.metadata.flow == checkpoint.flow
+            and record.metadata.role == "summary"
+            and record.metadata.phase == "scheduler-prelaunch"
+            and record.metadata.round_number == checkpoint.round_number
+            and record.metadata.subject == checkpoint.subject
+            for record in history
+        ):
+            return history, True
+    # The refreshed history (when readable) keeps every publication it
+    # exposed; only the checkpoint this invocation just posted is added.
+    top = max((record.index for record in history), default=-1)
+    synthetic = PostedRoundRecord(
+        index=max(base_length, base_top + 1, top + 1), metadata=checkpoint, body=""
+    )
+    return (*history, synthetic), True
+
+
 @dataclass(frozen=True)
 class PrPanelEvidence:
     """Qualified panel-opening evidence for ``primary-then-panel`` (#840).
@@ -23061,6 +23173,7 @@ def run_pr_loop(
             if parent_issue_context is not None:
                 parent_issue_context_refreshed = True
             pr_comments = pr_context.comments
+            pr_posted_checkpoint: PostedRoundMetadata | None = None
             # A review round is a fresh acquisition boundary. Rebind the
             # candidate/base pair before constructing any reviewer prompt so
             # a coder push or retarget cannot be reviewed with stale
@@ -24088,6 +24201,33 @@ def run_pr_loop(
                     and evidence_pass is None
                 ):
                     pr_amendment_checkpoint_pending = False
+                    pr_posted_checkpoint = PostedRoundMetadata(
+                        flow="pr", role="summary", agent="Orchestrator",
+                        round_number=round_number, subject=current_pr_subject,
+                        prior_items=prior_unresolved_items, phase="scheduler-prelaunch",
+                        scheduler_contract=scheduler_contract.as_dict(),
+                        reviewer_board_amendment_digest=pr_amendment_digest,
+                        scheduler_previous_sha=scheduler_previous_sha,
+                        scheduler_current_sha=current_pr_subject,
+                        scheduler_obligation_digest=hashlib.sha256(
+                            repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                        ).hexdigest()[:16],
+                        scheduler_selected_reviewers=scheduler_decision.selected_reviewers,
+                        scheduler_paused_reviewers=scheduler_decision.paused_reviewers,
+                        scheduler_reasons=(scheduler_decision.reason, classification.reason),
+                        scheduler_final_sweep=final_sweep,
+                        scheduler_force_full=scheduler_recorded_force_full,
+                        scheduler_force_full_source=scheduler_recorded_force_full_source,
+                        scheduler_calls_avoided=scheduler_calls_avoided,
+                        scheduler_phase=scheduler_decision.phase,
+                        scheduler_primary_reviewer=scheduler_contract.primary_reviewer,
+                        scheduler_approved_reviewers=tuple(sorted(unchanged_head_approvals)),
+                        scheduler_active_owners=scheduler_decision.active_owners,
+                        scheduler_scope_digest=hashlib.sha256(
+                            repr(classification.changed_paths).encode("utf-8")
+                        ).hexdigest()[:16],
+                        **_architecture_metadata_fields(config),
+                    )
                     post_pr_comment(
                         runner,
                         config=config,
@@ -24104,33 +24244,7 @@ def run_pr_loop(
                             "scheduler-policy calls avoided cumulatively: "
                             f"{scheduler_calls_avoided}.{superseded_audit_text}"
                             + (f" {pr_amendment_note}" if pr_amendment_note else ""),
-                            PostedRoundMetadata(
-                                flow="pr", role="summary", agent="Orchestrator",
-                                round_number=round_number, subject=current_pr_subject,
-                                prior_items=prior_unresolved_items, phase="scheduler-prelaunch",
-                                scheduler_contract=scheduler_contract.as_dict(),
-                                reviewer_board_amendment_digest=pr_amendment_digest,
-                                scheduler_previous_sha=scheduler_previous_sha,
-                                scheduler_current_sha=current_pr_subject,
-                                scheduler_obligation_digest=hashlib.sha256(
-                                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
-                                ).hexdigest()[:16],
-                                scheduler_selected_reviewers=scheduler_decision.selected_reviewers,
-                                scheduler_paused_reviewers=scheduler_decision.paused_reviewers,
-                                scheduler_reasons=(scheduler_decision.reason, classification.reason),
-                                scheduler_final_sweep=final_sweep,
-                                scheduler_force_full=scheduler_recorded_force_full,
-                                scheduler_force_full_source=scheduler_recorded_force_full_source,
-                                scheduler_calls_avoided=scheduler_calls_avoided,
-                                scheduler_phase=scheduler_decision.phase,
-                                scheduler_primary_reviewer=scheduler_contract.primary_reviewer,
-                                scheduler_approved_reviewers=tuple(sorted(unchanged_head_approvals)),
-                                scheduler_active_owners=scheduler_decision.active_owners,
-                                scheduler_scope_digest=hashlib.sha256(
-                                    repr(classification.changed_paths).encode("utf-8")
-                                ).hexdigest()[:16],
-                                **_architecture_metadata_fields(config),
-                            ),
+                            pr_posted_checkpoint,
                         ),
                     )
             else:
@@ -24298,20 +24412,103 @@ def run_pr_loop(
                 config, surface="pr", number=pr_number,
                 round_number=round_number, subject=current_pr_subject,
             )
-            # Only peers published by the same launch batch count: under
-            # primary-then-panel the panel is meant to see the primary's
-            # earlier review, which carries a different scheduler phase.
             pr_launch_phase = (
                 scheduler_decision.phase if selective_policy and scheduler_decision is not None else None
             )
-            # Built from every posted same-round record, including records
-            # resume rejected: their bodies are just as public.
-            pr_same_batch_public_peers = tuple(
+            # Today's peer set, built from every posted same-round record
+            # including records resume rejected: their bodies are just as
+            # public.  It is only ever widened below, never narrowed.
+            pr_today_peers = tuple(
                 reviewer for reviewer in configured_reviewers
                 if (record := completed_by_name.get(agent_display_name(reviewer))) is not None
                 and record.metadata.phase == "publication"
                 and record.metadata.scheduler_phase == pr_launch_phase
             )
+            pr_round_public_peers = pr_today_peers
+            pr_recovery_context: RecoveryVisibilityContext | None = None
+            if selective_policy and scheduler_decision is not None:
+                def _derive_pr_visibility_evidence(records: Sequence[PostedRoundRecord]) -> PrPanelEvidence:
+                    return _derive_pr_panel_evidence(
+                        records,
+                        primary_reviewer=scheduler_contract.primary_reviewer,
+                        required_reviewers=scheduler_contract.required_reviewers,
+                    )
+
+                pr_recovery_context = RecoveryVisibilityContext(
+                    primary_reviewer=(
+                        scheduler_contract.primary_reviewer
+                        if scheduler_capabilities.requires_primary else None
+                    ),
+                    launch_phase=pr_launch_phase,
+                    launching=tuple(sorted(selected_reviewer_names)),
+                    derive_evidence=_derive_pr_visibility_evidence,
+                    target_opening=scheduler_capabilities.requires_primary,
+                    removed_opening_fingerprint=(None, None, None),
+                )
+            if (
+                pr_recovery_context is not None
+                and evidence_pass is None
+                and pr_posted_checkpoint is not None
+            ):
+                # Panel independence is about what a launching reviewer can
+                # read, not the scheduler phase a record was published under
+                # (#1156).  Visibility is read from the complete history with
+                # this invocation's own checkpoint included, so opening
+                # evidence is never stale.
+                # A failed transport read falls back to the pre-post history plus
+                # the posted checkpoint; history that was read but cannot be
+                # decoded makes visibility unknowable, so stop before any
+                # reviewer launches (as the round-start decode failure does).
+                pr_fresh_records: tuple[PostedRoundRecord, ...] | None = None
+                try:
+                    pr_fresh_comments = get_pr_review_context(
+                        runner, config=config, pr_number=pr_number
+                    ).comments
+                except AgentLoopError:
+                    pr_fresh_comments = None
+                try:
+                    if pr_fresh_comments is not None:
+                        pr_fresh_records = _extract_round_metadata_records(
+                            pr_fresh_comments, flow="pr"
+                        )
+                    pr_base_records = _extract_round_metadata_records(pr_comments, flow="pr")
+                except AgentLoopError as exc:
+                    if scheduler_capabilities.requires_primary:
+                        stop_pre_panel(
+                            undecodable_history_message(exc), round_number=round_number
+                        )
+                    raise
+                pr_visibility_records, _pr_checkpoint_present = _visibility_snapshot(
+                    fresh_records=pr_fresh_records,
+                    base_records=pr_base_records,
+                    base_length=len(pr_comments),
+                    checkpoint=pr_posted_checkpoint,
+                )
+                pr_visibility_evidence = (
+                    _derive_pr_visibility_evidence(pr_visibility_records)
+                    if scheduler_capabilities.requires_primary else None
+                )
+                pr_visible_names = visible_peer_names(
+                    pr_visibility_records,
+                    opening_source=(
+                        pr_visibility_evidence.opening_source
+                        if pr_visibility_evidence is not None else None
+                    ),
+                    flow="pr", round_number=round_number, subject=current_pr_subject,
+                    reviewer_names=[agent_display_name(r) for r in configured_reviewers],
+                    primary_reviewer=pr_recovery_context.primary_reviewer,
+                    launch_phase=pr_launch_phase,
+                    launching=pr_recovery_context.launching,
+                    checkpoint_index=latest_round_checkpoint_index(
+                        pr_visibility_records, flow="pr",
+                        round_number=round_number, subject=current_pr_subject,
+                    ),
+                )
+                pr_round_public_peers = tuple(
+                    reviewer for reviewer in configured_reviewers
+                    if reviewer in pr_today_peers
+                    or agent_display_name(reviewer) in pr_visible_names
+                )
             # A round that holds withheld outcomes began as a parallel round;
             # finish it through the same withhold-then-publish launcher even
             # when this run is sequential (#1025).
@@ -24347,7 +24544,7 @@ def run_pr_loop(
                         reject_empty_output=True,
                     ),
                     flow="pr", round_number=round_number, subject=current_pr_subject,
-                    scheduler_phase=pr_launch_phase,
+                    context=pr_recovery_context,
                     reviewer_names=[agent_display_name(r) for r in configured_reviewers],
                     resume=lambda remaining: _resume_pr_round(
                         remaining,
@@ -24369,7 +24566,7 @@ def run_pr_loop(
                         reviewer for reviewer in configured_reviewers
                         if _pr_reviewer_prelaunch_kind(reviewer) == "turn"
                     ],
-                    public_peers=pr_same_batch_public_peers,
+                    public_peers=pr_round_public_peers,
                     already_posted=tuple(
                         reviewer for reviewer in configured_reviewers
                         if agent_display_name(reviewer) in completed_by_name
@@ -24592,7 +24789,7 @@ def run_pr_loop(
                                 runner, config=config, reviewer=reviewer, fields=fields,
                                 validators=_pr_review_validators(agent_display_name(reviewer)),
                             ),
-                            public_peers=pr_same_batch_public_peers,
+                            public_peers=pr_round_public_peers,
                             recovery=_pr_round_recovery,
                             retry_bound=_pr_retry_bound,
                             max_workers=None if config.review_parallel else 1,
@@ -24788,7 +24985,7 @@ def run_pr_loop(
                             config=config,
                             reviewer=reviewer,
                             spool=pr_round_spool,
-                            public_peers=pr_same_batch_public_peers,
+                            public_peers=pr_round_public_peers,
                             recovery=_pr_round_recovery,
                             validators=sequential_pr_validators,
                             already_posted=reviewer_name in completed_by_name,
