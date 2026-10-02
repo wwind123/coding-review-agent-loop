@@ -337,6 +337,10 @@ def _legacy_injection_length(data: bytes) -> int | None:
     candidates.append(single_shot_session_instruction(None))
     for candidate in candidates:
         if text.startswith(candidate):
+            # A legacy oversized prompt carried its whole task section; that
+            # format is reported, never stripped (the operator removes it once).
+            if text[len(candidate):].startswith("# Agent Loop Task"):
+                return None
             return len(candidate.encode("utf-8"))
     return None
 

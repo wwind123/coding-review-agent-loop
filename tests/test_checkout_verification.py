@@ -616,3 +616,243 @@ def test_missing_explicit_dir_is_refused_not_silently_accepted(tmp_path):
     config_module.ensure_workdir(missing, "--codex-dir")
     with pytest.raises(AgentLoopError, match="is not a git checkout"):
         config_module.validate_explicit_workdir(missing, "--codex-dir", cfg, Runner())
+
+
+# ----- review round 1 regressions ------------------------------------------
+
+
+def test_stale_recreation_never_launders_a_prepared_checkout(synced):
+    config_module, cfg, runner, checkout = synced
+    config_module.ensure_temp_checkout(checkout, agent="codex", config=cfg, runner=runner)
+    for tracked in list(checkout.iterdir()):
+        if tracked.name != ".git":
+            tracked.unlink()  # a foreign writer emptied the tree: now "stale"
+    with pytest.raises(CheckoutVerificationError):
+        config_module.ensure_temp_checkout(checkout, agent="codex", config=cfg, runner=runner)
+    assert (checkout / ".git").is_dir() and not (checkout / "a.py").exists()
+    cv.poison_checkout(checkout, "capture after the turn failed: boom")
+    with pytest.raises(CheckoutVerificationError, match="boom"):
+        config_module.ensure_temp_checkout(checkout, agent="codex", config=cfg, runner=runner)
+    assert (checkout / ".git").is_dir()
+
+
+def test_legacy_oversized_injection_is_reported_not_stripped(harness):
+    legacy = single_shot_session_instruction("main") + "# Agent Loop Task\n\nbig prompt\n\n---\n\n"
+    target = harness.repo / GEMINI_MD_NAME
+    target.write_text(legacy)
+    refused(harness, "GEMINI.md (added)")
+    assert target.read_text() == legacy
+    git(harness.repo, "add", GEMINI_MD_NAME)
+    git(harness.repo, "commit", "-q", "-m", "gemini")
+    cv.record_checkout_baseline(harness.config, harness.runner, harness.repo, source="test")
+    target.write_text(legacy + "committed rules\n")
+    refused(harness, "GEMINI.md (added)")
+    assert target.read_text() == legacy + "committed rules\n"
+
+
+def test_filesystem_errors_during_capture_fail_closed_and_poison(harness, monkeypatch):
+    (harness.repo / "link").symlink_to("a.py")
+    cv.record_checkout_baseline(harness.config, harness.runner, harness.repo, source="test")
+
+    def vanished(*args, **kwargs):
+        raise FileNotFoundError("link vanished between lstat and readlink")
+
+    monkeypatch.setattr(cv.os, "readlink", vanished)
+    refused(harness, "could not be read while fingerprinting")
+    # post-turn: the error must poison, not leak or leave the stale baseline
+    harness.backend.on_run = None
+    cv.record_checkout_baseline(harness.config, harness.runner, harness.repo, source="test")
+    monkeypatch.undo()
+    refused(harness, "can no longer be trusted", "link vanished")
+
+
+def test_hashing_io_error_is_a_verification_error(harness, monkeypatch):
+    (harness.repo / "a.py").write_text("a = 2\n")
+    real_fdopen = cv.os.fdopen
+
+    def failing(*args, **kwargs):
+        raise OSError(5, "input/output error")
+
+    monkeypatch.setattr(cv.os, "fdopen", failing)
+    refused(harness, "could not be read while fingerprinting")
+    monkeypatch.setattr(cv.os, "fdopen", real_fdopen)
+
+
+def test_fake_runner_binary_and_text_probes_agree(tmp_path):
+    runner = FakeRunner(git_status=" M src/a.py\n?? new.txt\n", git_head="h-1")
+    text = runner.run(["git", "status", "--porcelain"], cwd=tmp_path).stdout
+    binary = runner.run_binary(
+        ["git", "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames"], cwd=tmp_path
+    ).stdout
+    assert binary.split(b"\0")[:-1] == [line.encode() for line in text.splitlines()]
+    assert (tmp_path / "src" / "a.py").is_file() and (tmp_path / "new.txt").is_file()
+    head = runner.run(["git", "rev-parse", "HEAD"], cwd=tmp_path).stdout.strip()
+    assert runner.run_binary(["git", "rev-parse", "HEAD"], cwd=tmp_path).stdout.strip() == head.encode()
+
+
+def test_fake_runner_keeps_per_checkout_state(tmp_path):
+    runner = FakeRunner(git_head="h-1")
+    one, two = tmp_path / "one", tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+    assert runner.run_binary(["git", "rev-parse", "HEAD"], cwd=two).stdout == b"h-1\n"
+    runner.git_head = "h-2"  # a coder commit in ONE must not move TWO
+    (one / "x").write_text("")
+    runner.run(["git", "checkout", "--detach", "refs/heads/x"], cwd=one)
+    assert runner.run_binary(["git", "rev-parse", "HEAD"], cwd=one).stdout == b"h-2\n"
+    assert runner.run_binary(["git", "rev-parse", "HEAD"], cwd=two).stdout == b"h-1\n"
+
+
+@pytest.fixture
+def pr_synced(synced):
+    config_module, cfg, runner, checkout = synced
+    origin = checkout.parent / "OWNER" / "REPO"
+    git(origin, "switch", "-q", "-c", "feature")
+    (origin / "feature.txt").write_text("f\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-q", "-m", "feature")
+    sha = git(origin, "rev-parse", "HEAD").stdout.decode().strip()
+    git(origin, "update-ref", "refs/pull/7/head", sha)
+    git(origin, "switch", "-q", "main")
+    from coding_review_agent_loop.github import PullRequestMetadata
+
+    meta = PullRequestMetadata(7, "OWNER/REPO", "t", "feature", "main", sha, None)
+    return config_module, cfg, runner, checkout, meta
+
+
+def sync_pr(pr_synced):
+    config_module, cfg, runner, checkout, meta = pr_synced
+    config_module.sync_checkout_to_pr(
+        cfg, runner, path=checkout, label="Default codex workdir", default_owned=True,
+        pr_number=7, pr_metadata=meta,
+    )
+
+
+def test_pr_sync_verifies_first_then_refreshes_the_baseline(pr_synced):
+    config_module, cfg, runner, checkout, meta = pr_synced
+    config_module._sync_base_branch(
+        checkout, label="Default codex workdir", default_owned=True, config=cfg, runner=runner
+    )
+    (checkout / "foreign.txt").write_text("keep me")
+    with pytest.raises(CheckoutVerificationError, match="foreign.txt"):
+        sync_pr(pr_synced)
+    assert (checkout / "foreign.txt").exists()
+    assert git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == b"main"
+    (checkout / "foreign.txt").unlink()
+    sync_pr(pr_synced)
+    assert (checkout / "feature.txt").exists()
+    # the refreshed baseline matches the detached PR head: verification passes
+    cv.verify_checkout(cfg, runner, path=checkout, agent="codex", purpose="reviewer turn")
+
+
+def test_poisoned_checkout_refuses_clean_wrong_branch_and_syncs(pr_synced, monkeypatch):
+    config_module, cfg, runner, checkout, meta = pr_synced
+    config_module._sync_base_branch(
+        checkout, label="Default codex workdir", default_owned=True, config=cfg, runner=runner
+    )
+    real = cv.capture_fingerprint
+    state = {"fail": False}
+
+    def flaky(config, run, path):
+        if state["fail"]:
+            raise cv._Incomplete("capture failed after the turn")
+        return real(config, run, path)
+
+    monkeypatch.setattr(cv, "capture_fingerprint", flaky)
+    state["fail"] = True
+    cv.record_checkout_baseline(cfg, runner, checkout, source="codex reviewer turn")
+    state["fail"] = False
+    git(checkout, "switch", "-q", "-c", "clean-wrong")  # clean, but the wrong branch
+    with pytest.raises(CheckoutVerificationError, match="capture failed after the turn"):
+        cv.verify_checkout(cfg, runner, path=checkout, agent="codex", purpose="reviewer turn")
+    with pytest.raises(CheckoutVerificationError, match="capture failed after the turn"):
+        sync_pr(pr_synced)
+    with pytest.raises(CheckoutVerificationError, match="capture failed after the turn"):
+        config_module._sync_base_branch(
+            checkout, label="Default codex workdir", default_owned=True, config=cfg, runner=runner
+        )
+    assert git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == b"clean-wrong"
+
+
+def test_path_cap_exceeded_after_a_turn_poisons_with_the_cap_message(harness, monkeypatch):
+    monkeypatch.setattr(cv, "MAX_DIRTY_PATHS", 3)
+
+    def flood():
+        for index in range(5):
+            (harness.repo / f"gen{index}.txt").write_text("x")
+
+    harness.backend.on_run = flood
+    harness.turn()
+    harness.backend.on_run = None
+    monkeypatch.setattr(cv, "MAX_DIRTY_PATHS", 100_000)
+    for index in range(5):
+        (harness.repo / f"gen{index}.txt").unlink()
+    refused(harness, "can no longer be trusted", "3-path limit", "5 dirty paths")
+
+
+def test_symlinked_ancestor_target_is_never_opened(harness, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.txt").write_text("secret")
+    (harness.repo / "dir" / "x.txt").write_text("edited")
+    cv.record_checkout_baseline(harness.config, harness.runner, harness.repo, source="test")
+    (harness.repo / "dir" / "x.txt").unlink()
+    (harness.repo / "dir").rmdir()
+    (harness.repo / "dir").symlink_to(outside)
+    opened = []
+    real_open = os.open
+
+    def spy(path, flags, *args, **kwargs):
+        opened.append((path, kwargs.get("dir_fd")))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(cv.os, "open", spy)
+    refused(harness, "ancestor-not-directory")
+    assert all(os.fsdecode(path) != "x.txt" for path, _ in opened)
+    assert all(not str(path).startswith(str(outside)) for path, _ in opened)
+
+
+def test_every_attempt_is_verified_including_after_a_failed_attempt(harness):
+    def nonzero():
+        (harness.repo / "partial.txt").write_text("own edit")
+        raise AgentLoopError("agent exited nonzero")
+
+    harness.backend.on_run = nonzero
+    with pytest.raises(AgentLoopError):
+        harness.turn()
+    harness.backend.on_run = None
+    harness.turn()  # retry: the failed attempt's own edit is the baseline
+    (harness.repo / "foreign.txt").write_text("x")
+    refused(harness, "foreign.txt (added)")
+
+
+def test_pre_review_test_gate_verifies_and_adopts(harness, monkeypatch):
+    from coding_review_agent_loop import checks
+
+    config = gate_config(harness)
+    monkeypatch.setattr(checks, "active_workdir", lambda cfg: harness.repo)
+    monkeypatch.setattr(checks, "_record_gate_observation", lambda *a: None)
+    monkeypatch.setattr(checks, "_raise_for_gate_result", lambda *a: None)
+    harness.runner.run_test_command = lambda args, **kw: (harness.repo / "report.xml").write_text("r")
+    checks.run_pre_review_tests(harness.runner, config)
+    harness.turn()
+    (harness.repo / "foreign.txt").write_text("x")
+    ran = []
+    harness.runner.run_test_command = lambda args, **kw: ran.append(1)
+    with pytest.raises(CheckoutVerificationError):
+        checks.run_pre_review_tests(harness.runner, config)
+    assert ran == []
+
+
+def test_antigravity_normal_cleanup_keeps_an_originally_empty_tracked_file(tmp_path, repo):
+    (repo / GEMINI_MD_NAME).write_bytes(b"")
+    os.chmod(repo / GEMINI_MD_NAME, 0o600)
+    git(repo, "add", GEMINI_MD_NAME)
+    git(repo, "commit", "-q", "-m", "empty gemini")
+    runner = GitRunner(antigravity_outputs=[("done", 0)])
+    config = make_config(tmp_path, antigravity_dir=repo, antigravity_cmd="agy")
+    cv.establish_initial_baseline(config, runner, repo)
+    registry.run_agent_result(runner, agent="antigravity", config=config, prompt="p", role="reviewer")
+    assert (repo / GEMINI_MD_NAME).exists() and (repo / GEMINI_MD_NAME).read_bytes() == b""
+    assert ((repo / GEMINI_MD_NAME).stat().st_mode & 0o777) == 0o600
+    assert git(repo, "status", "--porcelain").stdout == b""

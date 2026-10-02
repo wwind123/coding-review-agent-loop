@@ -365,6 +365,13 @@ class FakeRunner(Runner):
         self.git_remote = git_remote
         self.git_inside = git_inside
         self.git_head = git_head
+        self._checkout_state_by_cwd = {}
+        # A new fake world is a new process: its checkouts have no recorded
+        # baseline yet (the ledger is process-global and keyed by real path).
+        from coding_review_agent_loop.checkout_verification import reset_checkout_baselines
+
+        reset_checkout_baselines()
+        self._checkout_refresh_pending = set()
         self.tracked_files = tracked_files or [
             "pyproject.toml",
             "README.md",
@@ -666,6 +673,10 @@ class FakeRunner(Runner):
         # prompt as a trailing element: tests can keep reading ``cmd[-1]`` as
         # the delivered prompt while argv-leak checks use ``argv_commands``.
         self.argv_commands.append((argv, cwd_path))
+        if argv[:1] in (["claude"], ["codex"], ["gemini"], ["agy"]) or argv[:2] in (
+            ["git", "checkout"], ["git", "switch"], ["git", "pull"], ["git", "reset"], ["git", "clean"],
+        ):
+            self._note_checkout_event(cwd_path)
         cmd = list(argv)
         if input_text is not None and (argv[:1] == ["claude"] or argv[:2] == ["codex", "exec"]):
             cmd.append(input_text)
@@ -924,18 +935,58 @@ class FakeRunner(Runner):
             return payload
         return self.pr_payload
 
+    # ---- checkout-verification probes (#1130) ---------------------------
+    # The fake keeps ONE scripted head/status for the whole run, but real
+    # checkouts are separate directories.  Each checkout therefore keeps its own
+    # (head, status) snapshot, refreshed lazily at the next binary probe after
+    # an event that really changes that checkout: an agent command run in it or
+    # a mutating git command (checkout/switch/pull/reset/clean) run in it.  The
+    # binary probes read the same scripted state as the text probes, and
+    # materialize scripted dirty paths on disk so the production
+    # "present but missing fails closed" rule is exercised unchanged.
+
+    def _note_checkout_event(self, cwd) -> None:
+        self._checkout_refresh_pending.add(Path(cwd))
+
+    def _checkout_state(self, cwd) -> tuple[str, str]:
+        key = Path(cwd)
+        if key not in self._checkout_state_by_cwd or key in self._checkout_refresh_pending:
+            self._checkout_refresh_pending.discard(key)
+            self._checkout_state_by_cwd[key] = (self.git_head, self._current_git_status())
+        return self._checkout_state_by_cwd[key]
+
+    def _scripted_status_records(self, cwd, status_text: str) -> bytes:
+        records = []
+        for line in status_text.splitlines():
+            if len(line) < 4 or line[2] != " ":
+                continue
+            xy, name = line[:2], line[3:]
+            target = Path(cwd) / name
+            if "D" in xy:
+                if target.is_file():
+                    target.unlink()
+            elif not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(f"fake content for {name}\n", encoding="utf-8")
+            records.append(f"{xy} {name}".encode())
+        return b"\0".join(records) + (b"\0" if records else b"")
+
     def run_binary(self, args, *, cwd, max_bytes=None, check=True, env=None):
-        """Answer checkout-verification probes as a clean checkout; defer the rest."""
+        """Answer checkout-verification probes from per-checkout scripted state."""
         cmd = [str(arg) for arg in args]
-        if cmd[:1] == ["git"] and cmd[1:3] in (["rev-parse", "--abbrev-ref"], ["rev-parse", "HEAD"], ["status", "--porcelain"], ["diff", "--cached"], ["ls-files", "-z"]):
+        if cmd[:1] == ["git"] and cmd[1:3] in (
+            ["rev-parse", "--abbrev-ref"], ["rev-parse", "HEAD"], ["status", "--porcelain"],
+            ["diff", "--cached"], ["ls-files", "-z"],
+        ):
             from coding_review_agent_loop.runner import BinaryCommandResult
 
+            head, status_text = self._checkout_state(cwd)
             if cmd[1:3] == ["rev-parse", "--abbrev-ref"]:
                 stdout = b"main\n"
             elif cmd[1:3] == ["rev-parse", "HEAD"]:
-                # One scripted head is shared by every fake checkout, so a coder
-                # commit would look like foreign movement in a reviewer checkout.
-                stdout = b"fake-checkout-head\n"
+                stdout = f"{head}\n".encode()
+            elif cmd[1:3] == ["status", "--porcelain"]:
+                stdout = self._scripted_status_records(cwd, status_text)
             else:
                 stdout = b""
             return BinaryCommandResult(cmd, Path(cwd), stdout, b"", 0)

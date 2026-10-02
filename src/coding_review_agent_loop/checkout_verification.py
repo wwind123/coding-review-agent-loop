@@ -276,7 +276,12 @@ def capture_fingerprint(config, runner, path: Path) -> CheckoutFingerprint:
             raise _Incomplete(f"checkout directory is not readable: {exc}") from exc
         try:
             for xy, name in records:
-                descriptor = _classify(root_fd, name, budget)
+                try:
+                    descriptor = _classify(root_fd, name, budget)
+                except OSError as exc:
+                    raise _Incomplete(
+                        f"{_disp(name)} could not be read while fingerprinting: {exc}"
+                    ) from exc
                 kind = descriptor[0]
                 if kind == "unsupported":
                     raise _Incomplete(

@@ -738,6 +738,10 @@ def test_codex_chatgpt_unsupported_model_public_response_skips_retry_repair_and_
         codex_model="gpt-5.5-pro",
         agent_max_retries=2,
     )
+    from coding_review_agent_loop.checkout_verification import establish_initial_baseline
+
+    # The scripted dirty tree is this checkout's prepared state.
+    establish_initial_baseline(config, runner, config.codex_dir)
 
     with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
         with pytest.raises(AgentInvocationError) as exc_info:

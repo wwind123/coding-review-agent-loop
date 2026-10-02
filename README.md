@@ -1606,3 +1606,12 @@ the agent hosts and can reverse coder/reviewer roles.
 ## License
 
 [MIT](LICENSE)
+
+## Explicit agent directories
+
+`--claude-dir`, `--codex-dir`, `--gemini-dir` and `--antigravity-dir` must point
+at existing, clean git checkouts of the target repository; an empty or non-git
+directory is refused at startup with `<option> is not a git checkout`. Before
+every agent turn agent-loop verifies the checkout still matches what it last
+left there and fails closed, naming the observed branch and unexpected paths,
+if something else modified it.

@@ -4079,3 +4079,42 @@ def test_discuss_loop_writes_run_window_on_normal_exit(tmp_path, monkeypatch):
     records = list(load_records(telemetry_log_path()))
     assert [r["record"] for r in records] == ["run-start", "run-end"]
     assert records[0]["issue_number"] == 56 and runner.telemetry_attribution is None
+
+
+# ----- checkout-verification refusals are never advisory (#1130) -----------
+
+
+def _refusal(*args, **kwargs):
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+
+    raise CheckoutVerificationError("assigned checkout changed outside agent-loop")
+
+
+def test_discuss_analyzer_helpers_propagate_checkout_refusals(monkeypatch, tmp_path):
+    from coding_review_agent_loop import orchestrator
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+
+    config = make_config(tmp_path)
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", _refusal)
+    monkeypatch.setattr(orchestrator, "build_discuss_agenda_prompt", lambda *a, **k: "p")
+    with pytest.raises(CheckoutVerificationError):
+        orchestrator._run_discuss_analyzer(
+            FakeRunner(), issue_number=1, config=config, analyzer="codex", memory=None,
+            issue_context=None, round_number=1, round_history=(), prior_agenda=None,
+            prior_round_synthesis=None, configured_reviewers=("codex",), usage_context=None,
+        )
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_discuss_debater_refusal_is_terminal_even_in_partial_mode(monkeypatch, tmp_path, parallel):
+    from coding_review_agent_loop import orchestrator
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+
+    monkeypatch.setattr(orchestrator, "_run_discuss_debater_turn", _refusal)
+    runner = FakeRunner(codex_outputs=["x"], gemini_outputs=["x"])
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), discuss_parallel=parallel,
+        discuss_on_debater_failure="partial",
+    )
+    with pytest.raises(CheckoutVerificationError):
+        run_discuss_loop(runner, issue_number=56, config=config)

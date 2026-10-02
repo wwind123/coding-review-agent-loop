@@ -1167,9 +1167,13 @@ def _sync_base_branch(
 
 def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfig, runner: Runner) -> None:
     if _is_stale_default_workdir(path):
+        # A path agent-loop already prepared in this process must never be
+        # deleted and re-cloned over its recorded baseline: that would launder
+        # a corrupted (or poisoned) checkout.  Verification raises first.
+        verify_before_sync(config, runner, path=path, label=f"Default {agent} workdir")
         log(config, f"Stale default {agent} workdir detected (no checkout, only logs remain); recreating: {path}")
         shutil.rmtree(path)
-        forget_checkout(path)
+        forget_checkout(path)  # verified above; the tool itself removed it
 
     if not path.exists():
         try:
