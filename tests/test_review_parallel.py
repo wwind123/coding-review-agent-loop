@@ -4091,3 +4091,118 @@ def test_recovery_lists_a_secondary_remediation_verdict_beside_the_retained_gate
     assert recovery.verified, recovery.reason
     assert _listed(recovery) == history.ids([owner])
     assert history.ids([gate]).isdisjoint(_listed(recovery))
+
+
+def _plan_meta(comment):
+    match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+    if match is None:
+        return None
+    metadata = orchestrator._decode_round_metadata(match["payload"])
+    return metadata if metadata.flow == "plan" else None
+
+
+def _clone_plan_comment(comment, serial, **changes):
+    """Copy a durable plan record into a later round, ordered after every existing comment."""
+    from coding_review_agent_loop.round_transport import (
+        ROUND_RESUME_MARKER_RE,
+        decode_mapping,
+        encode_mapping,
+    )
+
+    match = list(ROUND_RESUME_MARKER_RE.finditer(comment["body"]))[-1]
+    payload = dict(decode_mapping(match.group("payload")))
+    payload.update(changes)
+    clone = dict(comment)
+    # The fake issue view orders comments by creation time.
+    clone["createdAt"] = f"2026-05-23T01:00:{serial:02d}Z"
+    clone["body"] = (
+        comment["body"][: match.start("payload")] + encode_mapping(payload)
+        + comment["body"][match.end("payload"):]
+    )
+    return clone
+
+
+def _seeded_plan_remediation_state(tmp_path, *, secondary_published=False):
+    """Seeded history: the panel opened in round 2 (Antigravity's review is missing);
+    round 3 holds the primary's unreconciled remediation approval of the same plan key."""
+    runner = _panel_plan_runner()
+    config = _panel_plan_config(tmp_path, max_rounds=8)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    comments = runner.issue_comments
+    gemini = next(
+        c for c in comments
+        if (m := _plan_meta(c)) is not None and m.agent == "Gemini" and m.phase == "publication"
+    )
+    comments[:] = [
+        c for c in comments
+        if not ((m := _plan_meta(c)) is not None and m.agent == "Antigravity" and m.phase == "publication")
+    ]
+    opening = next(
+        c for c in comments
+        if (m := _plan_meta(c)) is not None and m.scheduler_phase == "secondary-audit"
+    )
+    primary = next(
+        c for c in comments
+        if (m := _plan_meta(c)) is not None and m.role == "reviewer" and m.agent == "Codex"
+    )
+    advance = next(
+        c for c in comments
+        if (m := _plan_meta(c)) is not None and m.phase == "plan-phase-advance"
+    )
+    comments.append(_clone_plan_comment(advance, 1, round_number=3))
+    comments.append(_clone_plan_comment(
+        opening, 2, round_number=3, scheduler_phase="remediation",
+        scheduler_selected_reviewers=["Codex"],
+        scheduler_paused_reviewers=[
+            ["Gemini", "remediation did not select this reviewer"],
+            ["Antigravity", "remediation did not select this reviewer"],
+        ],
+        scheduler_approved_reviewers=["Gemini"],
+    ))
+    comments.append(_clone_plan_comment(primary, 3, round_number=3))
+    if secondary_published:
+        comments.append(_clone_plan_comment(gemini, 4, round_number=3))
+    # The fake issue view orders by creation time: keep the seeded history in
+    # store order and strictly before anything a later invocation posts.
+    for index, comment in enumerate(comments):
+        comment["createdAt"] = f"2026-05-22T00:00:{index:02d}Z"
+    return runner, config
+
+
+def _plan_round_three_phases(runner):
+    records = [
+        r for r in _records(runner, flow="plan", surface="issue")
+        if r.round_number == 3 and r.phase == "scheduler-prelaunch"
+    ]
+    return [r.scheduler_phase for r in records]
+
+
+def test_plan_remediation_gate_resumed_into_a_same_round_final_sweep_launches_the_sweep(tmp_path):
+    runner, config = _seeded_plan_remediation_state(tmp_path)
+    launches_before = len(runner.reviewer_launches)
+    assert _plan_round_three_phases(runner) == ["remediation"]
+
+    run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    # The resuming invocation stayed in round 3 and posted the sweep there.
+    assert _plan_round_three_phases(runner) == ["remediation", "final-secondary-sweep"]
+    assert runner.reviewer_launches[launches_before:] == ["agy"]
+    records = _records(runner, flow="plan", surface="issue")
+    assert [r.round_number for r in records if r.role == "reviewer" and r.agent == "Codex"] == [1, 3]
+    assert [r.round_number for r in records if r.role == "reviewer" and r.agent == "Antigravity"] == [3]
+
+
+def test_plan_secondary_remediation_verdict_is_a_peer_beside_the_retained_gate(tmp_path):
+    runner, config = _seeded_plan_remediation_state(tmp_path, secondary_published=True)
+    launches_before = list(runner.reviewer_launches)
+
+    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    message = str(excinfo.value)
+    # The sweep would read Gemini's round-3 verdict; the primary's approval is the gate.
+    assert runner.reviewer_launches == launches_before
+    assert _plan_round_three_phases(runner) == ["remediation", "final-secondary-sweep"]
+    assert "Gemini already posted" in message and "provisional" not in message, message
+    assert "Gemini review (round 3)" in message
+    assert "Codex review" not in message
