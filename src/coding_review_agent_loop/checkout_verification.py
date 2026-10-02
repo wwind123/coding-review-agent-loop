@@ -414,7 +414,7 @@ def verify_checkout(
         recover_gemini_injection(config, runner, path)
     except CheckoutVerificationError:
         raise
-    except AgentLoopError as exc:
+    except (AgentLoopError, OSError) as exc:
         raise CheckoutVerificationError(str(exc)) from exc
     observed = _capture_or_raise(config, runner, path, agent=agent, purpose=purpose)
     with _LEDGER_LOCK:

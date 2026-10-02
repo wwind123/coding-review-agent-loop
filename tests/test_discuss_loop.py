@@ -4118,3 +4118,23 @@ def test_discuss_debater_refusal_is_terminal_even_in_partial_mode(monkeypatch, t
     )
     with pytest.raises(CheckoutVerificationError):
         run_discuss_loop(runner, issue_number=56, config=config)
+
+
+def test_evidence_reconciler_propagates_checkout_refusals(monkeypatch, tmp_path):
+    from coding_review_agent_loop import orchestrator
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+
+    candidates = [{"id": "o1"}, {"id": "o2"}]
+    items = [
+        type("Observation", (), {"observation_id": "o1", "status": "open"})(),
+        type("Observation", (), {"observation_id": "o2", "status": "open"})(),
+    ]
+    monkeypatch.setattr(orchestrator, "collect_evidence_observations", lambda *a, **k: (items, ()))
+    monkeypatch.setattr(orchestrator, "bounded_reconciliation_candidates", lambda *a, **k: candidates)
+    monkeypatch.setattr(orchestrator, "build_discuss_evidence_reconciliation_prompt", lambda *a, **k: "p")
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", _refusal)
+    with pytest.raises(CheckoutVerificationError):
+        orchestrator._run_discuss_evidence_reconciler(
+            FakeRunner(), issue_number=1, config=make_config(tmp_path), analyzer="codex",
+            subject="issue-1", round_history=(), usage_context=None,
+        )

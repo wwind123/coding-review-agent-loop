@@ -691,16 +691,76 @@ def test_fake_runner_binary_and_text_probes_agree(tmp_path):
 
 
 def test_fake_runner_keeps_per_checkout_state(tmp_path):
-    runner = FakeRunner(git_head="h-1")
+    runner = FakeRunner(git_head="h-1", codex_outputs=["ok"])
     one, two = tmp_path / "one", tmp_path / "two"
     one.mkdir()
     two.mkdir()
     assert runner.run_binary(["git", "rev-parse", "HEAD"], cwd=two).stdout == b"h-1\n"
+    runner.run_with_log(
+        ["codex", "exec", "-"], cwd=one, log_path=tmp_path / "log", label="x",
+        progress_interval_seconds=30, check=False,
+    )
     runner.git_head = "h-2"  # a coder commit in ONE must not move TWO
-    (one / "x").write_text("")
-    runner.run(["git", "checkout", "--detach", "refs/heads/x"], cwd=one)
-    assert runner.run_binary(["git", "rev-parse", "HEAD"], cwd=one).stdout == b"h-2\n"
-    assert runner.run_binary(["git", "rev-parse", "HEAD"], cwd=two).stdout == b"h-1\n"
+    for form in ("binary", "text"):
+        probe = (
+            (lambda cwd: runner.run_binary(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.decode())
+            if form == "binary"
+            else (lambda cwd: runner.run(["git", "rev-parse", "HEAD"], cwd=cwd).stdout)
+        )
+        assert probe(one) == "h-2\n", form
+        assert probe(two) == "h-1\n", form
+
+
+def test_fake_runner_probes_agree_after_agent_turn_and_detached_checkout(tmp_path):
+    runner = FakeRunner(
+        git_head="h-1", git_status="", post_agent_git_status=" M src/a.py\n",
+        codex_outputs=["ok"],
+    )
+    one, two = tmp_path / "one", tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+
+    def both(cwd):
+        text = runner.run(["git", "status", "--porcelain"], cwd=cwd).stdout
+        binary = runner.run_binary(["git", "status", "--porcelain", "-z"], cwd=cwd).stdout
+        return text, binary
+
+    assert both(one) == ("", b"") and both(two) == ("", b"")
+    runner.run_with_log(
+        ["codex", "exec", "-"], cwd=one, log_path=tmp_path / "log", label="x",
+        progress_interval_seconds=30, check=False,
+    )
+    text, binary = both(one)
+    assert text == " M src/a.py\n" and binary == b" M src/a.py\0"
+    assert both(two) == ("", b"")  # the turn happened in ONE only
+    assert runner.run_binary(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=one).stdout == b"main\n"
+    runner.run(["git", "checkout", "--detach", "refs/remotes/origin/pr/7"], cwd=one)
+    assert runner.run_binary(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=one).stdout == b"HEAD\n"
+    assert runner.run_binary(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=two).stdout == b"main\n"
+
+
+def test_fake_runner_scripted_binary_probe_failures_and_staged_state(tmp_path):
+    runner = FakeRunner()
+    runner.binary_probe_exceptions.append(AgentLoopError("scripted probe failure"))
+    with pytest.raises(AgentLoopError, match="scripted probe failure"):
+        runner.run_binary(["git", "rev-parse", "HEAD"], cwd=tmp_path)
+    runner.binary_probe_results.append({"stdout": b"", "returncode": 128})
+    assert runner.run_binary(["git", "rev-parse", "HEAD"], cwd=tmp_path).returncode == 128
+    runner.checkout_staged[tmp_path] = b":100644 100644 a b M\0a.py\0"
+    assert runner.run_binary(["git", "diff", "--cached", "--raw", "-z"], cwd=tmp_path).stdout.startswith(b":100644")
+
+
+def test_fake_runner_foreign_deletion_is_exposed_not_recreated(tmp_path):
+    runner = FakeRunner(git_status=" M src/a.py\n")
+    probe = ["git", "status", "--porcelain", "-z"]
+    runner.run_binary(probe, cwd=tmp_path)
+    assert (tmp_path / "src" / "a.py").is_file()
+    (tmp_path / "src" / "a.py").unlink()  # a foreign writer deletes it
+    runner.run_binary(probe, cwd=tmp_path)
+    assert not (tmp_path / "src" / "a.py").exists()
+    config = make_config(tmp_path)
+    with pytest.raises(cv._Incomplete, match="missing from the worktree"):
+        cv.capture_fingerprint(config, runner, tmp_path)
 
 
 @pytest.fixture
@@ -856,3 +916,245 @@ def test_antigravity_normal_cleanup_keeps_an_originally_empty_tracked_file(tmp_p
     assert (repo / GEMINI_MD_NAME).exists() and (repo / GEMINI_MD_NAME).read_bytes() == b""
     assert ((repo / GEMINI_MD_NAME).stat().st_mode & 0o777) == 0o600
     assert git(repo, "status", "--porcelain").stdout == b""
+
+
+# ----- round 2: real attempt loop, missing-directory recreation, GEMINI.md I/O --
+
+
+import shutil  # noqa: E402
+
+from coding_review_agent_loop import orchestrator  # noqa: E402
+from coding_review_agent_loop.runner import CommandResult  # noqa: E402
+
+
+class _LoopStub(StubBackend):
+    """Backend whose scripted results drive the orchestrator attempt loop."""
+
+    def __init__(self, workdir, script, name):
+        super().__init__(workdir)
+        self.name = name
+        self.script = list(script)
+
+    def run(self, runner, config, prompt, **kwargs):
+        self.calls += 1
+        step = self.script.pop(0)
+        if step.get("edit"):
+            step["edit"]()
+        return AgentResult(
+            text=step.get("text", ""),
+            returncode=step.get("returncode", 0),
+            self_update_reason=step.get("self_update_reason"),
+            command_result=(
+                CommandResult([self.name], self._workdir, "", "", step.get("returncode", 0))
+                if step.get("self_update_reason") else None
+            ),
+        )
+
+
+def _loop(tmp_path, repo, monkeypatch, *, agent, script, **config_kwargs):
+    runner = GitRunner()
+    runner.wait_for_executable_stability = lambda *a, **k: True
+    config_kwargs.setdefault("agent_max_retries", 2)
+    config = make_config(
+        tmp_path, codex_dir=repo, antigravity_dir=repo, coder=agent, **config_kwargs,
+    )
+    backend = _LoopStub(repo, script, agent)
+    monkeypatch.setitem(registry.BACKENDS, agent, backend)
+    cv.establish_initial_baseline(config, runner, repo)
+
+    def run_it():
+        return orchestrator._run_validated_agent(
+            runner, agent=agent, config=config, prompt="p",
+            marker_description="VALID",
+            validate=lambda text: text if text == "VALID" else (_ for _ in ()).throw(AgentLoopError("invalid")),
+            role="coder",
+        )
+
+    return runner, config, backend, run_it
+
+
+TRANSIENT = "Error: 503 Service Unavailable, please try again later"
+
+
+def _own_edit(repo):
+    def edit():
+        git(repo, "mv", "b.py", "c.py")
+        (repo / "c.py").write_text("c = 1\n")
+        (repo / "new.txt").write_text("own")
+
+    return edit
+
+
+def _foreign_between_attempts(runner, repo, monkeypatch, hook_owner, hook_name):
+    original = getattr(hook_owner, hook_name)
+    state = {"done": False}
+
+    def hooked(*args, **kwargs):
+        if not state["done"]:
+            state["done"] = True
+            (repo / "foreign.txt").write_text("another writer")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hook_owner, hook_name, hooked)
+
+
+def test_orchestrator_retry_keeps_own_staged_rename_edits(tmp_path, repo, monkeypatch):
+    runner, config, backend, run_it = _loop(
+        tmp_path, repo, monkeypatch, agent="codex",
+        script=[{"edit": _own_edit(repo), "text": TRANSIENT, "returncode": 1}, {"text": "VALID"}],
+    )
+    assert run_it().text == "VALID"
+    assert backend.calls == 2  # the retry proceeded over its own staged rename
+
+
+def test_orchestrator_retry_refuses_foreign_change_before_the_next_spawn(tmp_path, repo, monkeypatch):
+    runner, config, backend, run_it = _loop(
+        tmp_path, repo, monkeypatch, agent="codex",
+        script=[{"edit": _own_edit(repo), "text": TRANSIENT, "returncode": 1}, {"text": "VALID"}],
+    )
+    _foreign_between_attempts(runner, repo, monkeypatch, runner, "run")
+    with pytest.raises(CheckoutVerificationError, match="foreign.txt"):
+        run_it()
+    assert backend.calls == 1 and runner.comments == []
+    assert (repo / "foreign.txt").exists() and (repo / "c.py").exists()
+
+
+def test_orchestrator_replacement_replay_refuses_foreign_change(tmp_path, repo, monkeypatch):
+    runner, config, backend, run_it = _loop(
+        tmp_path, repo, monkeypatch, agent="codex",
+        script=[
+            {"edit": _own_edit(repo), "text": "", "returncode": 1, "self_update_reason": "exe replaced"},
+            {"text": "VALID"},
+        ],
+    )
+    original = runner.wait_for_executable_stability
+
+    def foreign_then_stable(*args, **kwargs):
+        (repo / "foreign.txt").write_text("another writer")
+        return original(*args, **kwargs)
+
+    runner.wait_for_executable_stability = foreign_then_stable
+    with pytest.raises(CheckoutVerificationError, match="foreign.txt"):
+        run_it()
+    assert backend.calls == 1  # the replay never spawned
+
+
+def test_orchestrator_replacement_replay_proceeds_over_own_edits(tmp_path, repo, monkeypatch):
+    runner, config, backend, run_it = _loop(
+        tmp_path, repo, monkeypatch, agent="codex",
+        script=[
+            {"edit": _own_edit(repo), "text": "", "returncode": 1, "self_update_reason": "exe replaced"},
+            {"text": "VALID"},
+        ],
+    )
+    assert run_it().text == "VALID" and backend.calls == 2
+
+
+def test_orchestrator_antigravity_fallback_refuses_foreign_change(tmp_path, repo, monkeypatch):
+    capacity = {"text": "quota exceeded please try again", "returncode": 1}
+    runner, config, backend, run_it = _loop(
+        tmp_path, repo, monkeypatch, agent="antigravity",
+        script=[dict(capacity, edit=_own_edit(repo)), {"text": "VALID"}],
+        antigravity_models=("model-one", "model-two"), agent_max_retries=0,
+    )
+    _foreign_between_attempts(
+        runner, repo, monkeypatch, orchestrator, "classify_antigravity_capacity"
+    )
+    with pytest.raises(CheckoutVerificationError, match="foreign.txt"):
+        run_it()
+    assert backend.calls == 1
+
+
+def test_orchestrator_antigravity_fallback_proceeds_over_own_edits(tmp_path, repo, monkeypatch):
+    capacity = {"text": "quota exceeded please try again", "returncode": 1}
+    runner, config, backend, run_it = _loop(
+        tmp_path, repo, monkeypatch, agent="antigravity",
+        script=[dict(capacity, edit=_own_edit(repo)), {"text": "VALID"}],
+        antigravity_models=("model-one", "model-two"), agent_max_retries=0,
+    )
+    assert run_it().text == "VALID" and backend.calls == 2
+
+
+@pytest.fixture
+def prepared_default(synced):
+    config_module, cfg, runner, checkout = synced
+    config_module.ensure_temp_checkout(checkout, agent="codex", config=cfg, runner=runner)
+    return config_module, cfg, checkout
+
+
+class _CloneSpy(Runner):
+    def __init__(self):
+        super().__init__()
+        self.clones = []
+
+    def run(self, args, **kwargs):
+        if tuple(args[:3]) == ("gh", "repo", "clone"):
+            self.clones.append(tuple(args))
+            raise AssertionError("must not clone over a prepared checkout")
+        return super().run(args, **kwargs)
+
+
+@pytest.mark.parametrize("poisoned", [False, True])
+def test_vanished_prepared_checkout_is_never_recreated(prepared_default, monkeypatch, poisoned):
+    from coding_review_agent_loop import agent_permissions
+
+    config_module, cfg, checkout = prepared_default
+    if poisoned:
+        cv.poison_checkout(checkout, "capture after the turn failed: boom")
+    entry_before = cv._LEDGER[checkout.resolve()]
+    shutil.rmtree(checkout)
+    registered = []
+    monkeypatch.setattr(agent_permissions, "register_checkout", lambda *a, **k: registered.append(a))
+    spy = _CloneSpy()
+    with pytest.raises(CheckoutVerificationError):
+        config_module.ensure_temp_checkout(checkout, agent="codex", config=cfg, runner=spy)
+    assert spy.clones == [] and registered == [] and not checkout.exists()
+    assert cv._LEDGER[checkout.resolve()] is entry_before
+
+
+def test_recovery_read_io_error_is_a_terminal_refusal(harness, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity
+
+    (harness.repo / GEMINI_MD_NAME).write_bytes(build_gemini_injection("# i\n", orig="absent"))
+    before = (harness.repo / GEMINI_MD_NAME).read_bytes()
+
+    def eio(*args, **kwargs):
+        raise OSError(5, "input/output error")
+
+    monkeypatch.setattr(antigravity.os, "fdopen", eio)
+    refused(harness, "cannot read", "input/output error")
+    monkeypatch.undo()
+    assert (harness.repo / GEMINI_MD_NAME).read_bytes() == before
+
+
+def test_recovery_lock_or_root_io_errors_are_terminal_refusals(harness, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity
+
+    (harness.repo / GEMINI_MD_NAME).write_bytes(build_gemini_injection("# i\n", orig="absent"))
+
+    def broken_lock(path):
+        raise OSError(13, "permission denied")
+
+    monkeypatch.setattr(antigravity, "_git_lock_path", broken_lock)
+    refused(harness, "cannot inspect", "permission denied")
+
+
+def test_cleanup_io_failure_does_not_mask_the_result_and_stays_fail_closed(tmp_path, repo, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity
+
+    runner = GitRunner(antigravity_outputs=[("done", 0), ("done", 0)])
+    config = make_config(tmp_path, antigravity_dir=repo, antigravity_cmd="agy")
+    cv.establish_initial_baseline(config, runner, repo)
+
+    def failing_strip(root):
+        raise OSError(5, "input/output error")
+
+    monkeypatch.setattr(antigravity, "strip_gemini_injection", failing_strip)
+    result = registry.run_agent_result(
+        runner, agent="antigravity", config=config, prompt="p", role="reviewer"
+    )
+    assert result.text  # the completed backend result survives the cleanup failure
+    assert (repo / GEMINI_MD_NAME).exists()  # the leftover injection is still there
+    monkeypatch.undo()
+    with pytest.raises(CheckoutVerificationError):  # and the next turn refuses, fail-closed
+        registry.run_agent_result(runner, agent="antigravity", config=config, prompt="p", role="reviewer")

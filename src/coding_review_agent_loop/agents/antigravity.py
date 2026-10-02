@@ -158,8 +158,31 @@ def parse_gemini_injection(data: bytes) -> ParsedGeminiInjection | None:
     return ParsedGeminiInjection(match.group(1).decode("ascii"), prefix_len, data[prefix_len:])
 
 
+def _io_normalized(function):
+    """Turn raw filesystem errors from the GEMINI.md accessor into SafeGeminiAccessError."""
+    import functools
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except SafeGeminiAccessError:
+            raise
+        except OSError as exc:
+            raise SafeGeminiAccessError(
+                f"{GEMINI_MD_NAME} access failed in {function.__name__}: {exc}", kind="io"
+            ) from exc
+
+    return wrapper
+
+
 def _open_root(root: Path) -> int:
-    return os.open(os.fspath(root), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return os.open(os.fspath(root), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise SafeGeminiAccessError(
+            f"cannot open checkout {root} to access {GEMINI_MD_NAME}: {exc}", kind="io"
+        ) from exc
 
 
 def _lstat_gemini(root_fd: int) -> os.stat_result | None:
@@ -167,6 +190,10 @@ def _lstat_gemini(root_fd: int) -> os.stat_result | None:
         return os.lstat(GEMINI_MD_NAME, dir_fd=root_fd)
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise SafeGeminiAccessError(
+            f"cannot stat {GEMINI_MD_NAME}: {exc}", kind="io"
+        ) from exc
 
 
 def _describe_type(mode: int) -> str:
@@ -214,12 +241,18 @@ def _safe_read_fd(root_fd: int, root: Path) -> tuple[bytes, os.stat_result] | No
                 "while it was being opened.",
                 kind="swapped",
             )
-        with os.fdopen(os.dup(fd), "rb") as handle:
-            return handle.read(), opened
+        try:
+            with os.fdopen(os.dup(fd), "rb") as handle:
+                return handle.read(), opened
+        except OSError as exc:
+            raise SafeGeminiAccessError(
+                f"cannot read {root / GEMINI_MD_NAME}: {exc}", kind="io"
+            ) from exc
     finally:
         os.close(fd)
 
 
+@_io_normalized
 def safe_read_gemini_md(root: Path) -> tuple[bytes, os.stat_result] | None:
     """Return (bytes, stat) of a regular GEMINI.md, None when absent."""
     root_fd = _open_root(root)
@@ -229,6 +262,7 @@ def safe_read_gemini_md(root: Path) -> tuple[bytes, os.stat_result] | None:
         os.close(root_fd)
 
 
+@_io_normalized
 def safe_write_gemini_md(root: Path, data: bytes, *, expect: os.stat_result | None) -> None:
     """Create (``expect is None``) or atomically replace the regular GEMINI.md."""
     root_fd = _open_root(root)
@@ -281,6 +315,7 @@ def safe_write_gemini_md(root: Path, data: bytes, *, expect: os.stat_result | No
         os.close(root_fd)
 
 
+@_io_normalized
 def safe_unlink_gemini_md(root: Path, *, expect: os.stat_result) -> None:
     root_fd = _open_root(root)
     try:
@@ -354,13 +389,18 @@ def recover_stale_gemini_injection(checkout: Path, *, is_tracked: "Callable[[], 
     """
     import fcntl
 
-    root_fd = _open_root(checkout)
     try:
-        if _lstat_gemini(root_fd) is None:
-            return False
-    finally:
-        os.close(root_fd)
-    lock_file = _git_lock_path(checkout).open("a+")
+        root_fd = _open_root(checkout)
+        try:
+            if _lstat_gemini(root_fd) is None:
+                return False
+        finally:
+            os.close(root_fd)
+        lock_file = _git_lock_path(checkout).open("a+")
+    except (SafeGeminiAccessError, OSError) as exc:
+        raise CheckoutVerificationError(
+            f"cannot inspect {checkout / GEMINI_MD_NAME} for a leftover injection: {exc}"
+        ) from exc
     try:
         try:
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -400,7 +440,7 @@ def recover_stale_gemini_injection(checkout: Path, *, is_tracked: "Callable[[], 
                 stat_result=st,
             )
             return True
-        except SafeGeminiAccessError as exc:
+        except (SafeGeminiAccessError, OSError) as exc:
             raise CheckoutVerificationError(str(exc)) from exc
     finally:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
@@ -749,7 +789,7 @@ class AntigravityBackend:
             # non-regular during the turn is left for the post-turn probe.
             try:
                 strip_gemini_injection(config.antigravity_dir)
-            except SafeGeminiAccessError as exc:
+            except (SafeGeminiAccessError, OSError) as exc:
                 log(config, f"Not touching GEMINI.md after the turn: {exc}")
 
         settings_was_injected = role in {"reviewer", "repair"}
