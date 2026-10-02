@@ -70,19 +70,69 @@ _LEDGER_LOCK = threading.Lock()
 
 
 def _key(path: Path) -> Path:
-    return Path(path).resolve()
+    # Lexical, NOT symlink-resolved: the ledger follows the path agent-loop was
+    # assigned, so replacing that path with a symlink cannot redirect lookups to
+    # a different checkout's (absent) entry.
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+# The directory identity (st_dev, st_ino) each assigned path had when its entry
+# was created.  A renamed root, a symlinked root or a redirected ancestor all
+# change it, and verification refuses before anything touches the replacement.
+_ROOT_IDENTITY: dict[Path, tuple[int, int]] = {}
+
+
+def _root_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.stat(os.fspath(path))
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _remember_root(path: Path, *, overwrite: bool = False) -> None:
+    identity = _root_identity(path)
+    if identity is None:
+        return
+    with _LEDGER_LOCK:
+        if overwrite:
+            _ROOT_IDENTITY[_key(path)] = identity
+        else:
+            _ROOT_IDENTITY.setdefault(_key(path), identity)
+
+
+def _refuse_untrusted_root(path: Path, *, agent: str, purpose: str) -> None:
+    """Refuse a poisoned entry or a redirected/replaced root BEFORE any recovery or sync."""
+    with _LEDGER_LOCK:
+        entry = _LEDGER.get(_key(path))
+        recorded = _ROOT_IDENTITY.get(_key(path))
+    if entry is None:
+        return
+    if isinstance(entry, _Poisoned):
+        raise CheckoutVerificationError(
+            f"Assigned {agent} checkout {path} can no longer be trusted: {entry.reason}. "
+            f"Refusing to start the {purpose}."
+        )
+    if recorded is not None and _root_identity(path) != recorded:
+        raise CheckoutVerificationError(
+            f"Assigned {agent} checkout {path} is no longer the directory agent-loop prepared: "
+            "it was renamed, removed, or replaced (for example by a symlink to another "
+            f"checkout). Refusing to start the {purpose}; nothing in the replacement was touched."
+        )
 
 
 def reset_checkout_baselines() -> None:
     """Forget every baseline (tests only)."""
     with _LEDGER_LOCK:
         _LEDGER.clear()
+        _ROOT_IDENTITY.clear()
 
 
 def forget_checkout(path: Path) -> None:
     """Drop a path whose checkout agent-loop itself deleted and is re-cloning."""
     with _LEDGER_LOCK:
         _LEDGER.pop(_key(path), None)
+        _ROOT_IDENTITY.pop(_key(path), None)
 
 
 def has_entry(path: Path) -> bool:
@@ -93,6 +143,7 @@ def has_entry(path: Path) -> bool:
 def poison_checkout(path: Path, reason: str) -> None:
     with _LEDGER_LOCK:
         _LEDGER[_key(path)] = _Poisoned(reason)
+    _remember_root(path)
 
 
 def _disp(raw: bytes) -> str:
@@ -390,6 +441,7 @@ def establish_initial_baseline(config, runner, path: Path) -> None:
     fingerprint = _capture_or_raise(config, runner, path, agent="agent", purpose="startup baseline")
     with _LEDGER_LOCK:
         _LEDGER[_key(path)] = _Expected(fingerprint)
+    _remember_root(path, overwrite=True)
 
 
 def record_checkout_baseline(config, runner, path: Path, *, source: str) -> None:
@@ -411,12 +463,14 @@ def record_checkout_baseline(config, runner, path: Path, *, source: str) -> None
         if isinstance(_LEDGER.get(_key(path)), _Poisoned):
             return
         _LEDGER[_key(path)] = _Expected(fingerprint)
+    _remember_root(path)  # never rewritten once recorded: a redirect stays visible
 
 
 def verify_checkout(
     config, runner, *, path: Path, agent: str, purpose: str
 ) -> CheckoutFingerprint:
     """Refuse (CheckoutVerificationError) unless the checkout matches its baseline."""
+    _refuse_untrusted_root(path, agent=agent, purpose=purpose)
     try:
         recover_gemini_injection(config, runner, path)
     except CheckoutVerificationError:
@@ -432,6 +486,7 @@ def verify_checkout(
         else:
             self_established = False
     if self_established:
+        _remember_root(path)
         log(config, f"Recorded a first baseline for {agent} checkout {path} (self-established).")
         return observed
     if entry is None:

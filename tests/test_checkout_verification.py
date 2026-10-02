@@ -1306,3 +1306,85 @@ def test_fake_runner_branch_follows_the_switch_target_in_both_forms(tmp_path):
     assert runner.run_binary(abbrev, cwd=tmp_path).stdout == b"release\n"
     runner.run(["git", "switch", "main"], cwd=tmp_path)
     assert runner.run_binary(abbrev, cwd=tmp_path).stdout == b"main\n"
+
+
+# ----- round 4: a redirected assigned root never inherits another checkout's trust --
+
+
+@pytest.fixture
+def redirected(tmp_path, harness):
+    """Checkout A is prepared; then A is renamed away and its path becomes a symlink to B."""
+    repo = harness.repo
+    other = tmp_path / "other-checkout"
+    shutil.copytree(repo, other, symlinks=True)
+    git(other, "switch", "-q", "-c", "elsewhere")  # clean, but a different branch
+    (other / "untouched.txt").write_text("foreign dirt that reset/clean would destroy")
+    (other / GEMINI_MD_NAME).write_bytes(build_gemini_injection("# not ours\n", orig="absent"))
+    snapshot = sorted(p.name for p in other.iterdir())
+    before = (
+        (other / "untouched.txt").read_text(),
+        (other / GEMINI_MD_NAME).read_bytes(),
+        git(other, "rev-parse", "--abbrev-ref", "HEAD").stdout,
+    )
+    entry = cv._LEDGER[cv._key(repo)]
+
+    def redirect():
+        repo.rename(tmp_path / "checkout.moved")
+        repo.symlink_to(other)
+
+    def assert_replacement_untouched():
+        assert sorted(p.name for p in other.iterdir()) == snapshot
+        assert (other / "untouched.txt").read_text() == before[0]
+        assert (other / GEMINI_MD_NAME).read_bytes() == before[1]  # no GEMINI.md recovery
+        assert git(other, "rev-parse", "--abbrev-ref", "HEAD").stdout == before[2]
+        assert cv._LEDGER[cv._key(repo)] is entry  # no baseline adopted
+
+    class R:
+        pass
+
+    r = R()
+    r.redirect, r.assert_untouched, r.other, r.harness = redirect, assert_replacement_untouched, other, harness
+    return r
+
+
+@pytest.mark.parametrize("poisoned", [False, True])
+def test_root_symlink_replacement_is_refused_without_touching_the_replacement(
+    redirected, poisoned, tmp_path
+):
+    harness = redirected.harness
+    if poisoned:
+        cv.poison_checkout(harness.repo, "capture after the turn failed: boom")
+        # re-read: poisoning replaced the entry object
+        redirected_entry = cv._LEDGER[cv._key(harness.repo)]
+    redirected.redirect()
+    if poisoned:
+        assert cv._LEDGER[cv._key(harness.repo)] is redirected_entry
+    with pytest.raises(CheckoutVerificationError) as info:
+        harness.turn()
+    assert harness.backend.calls == 0  # no backend spawn
+    if poisoned:
+        assert "can no longer be trusted" in str(info.value)
+    else:
+        assert "no longer the directory agent-loop prepared" in str(info.value)
+    if not poisoned:
+        redirected.assert_untouched()
+    else:
+        assert (redirected.other / "untouched.txt").exists()
+        assert (redirected.other / GEMINI_MD_NAME).read_bytes().startswith(b"<!-- agent-loop gemini")
+
+
+def test_root_symlink_replacement_blocks_syncs_before_reset_or_clean(redirected, tmp_path, harness):
+    from coding_review_agent_loop import config as config_module
+
+    cfg = make_config(tmp_path, codex_dir=harness.repo, create_dirs=False)
+    git(redirected.other, "remote", "add", "origin", "https://github.com/OWNER/REPO.git")
+    redirected.redirect()
+    with pytest.raises(CheckoutVerificationError):
+        config_module._sync_base_branch(
+            harness.repo, label="Default codex workdir", default_owned=True,
+            config=cfg, runner=Runner(),
+        )
+    redirected.assert_untouched()  # no reset --hard / clean -fd / switch ran in the replacement
+    with pytest.raises(CheckoutVerificationError):
+        config_module.ensure_temp_checkout(harness.repo, agent="codex", config=cfg, runner=Runner())
+    redirected.assert_untouched()
