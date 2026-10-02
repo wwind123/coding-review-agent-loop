@@ -41,7 +41,7 @@ from .github import (
 )
 from .logging import log
 from .runner import Runner
-from .workdirs import active_workdir
+from .workdirs import active_workdir, github_api_cwd
 from .protocol_markers import (
     MARKER_BY_TOKEN,
     PR_BODY_SURFACE,
@@ -1063,7 +1063,7 @@ def _log_asserted_actor(config: AgentLoopConfig, actor: str) -> None:
 def _advertised_managed_actor(runner: Runner, config: AgentLoopConfig) -> str | None:
     """Resolve the advertised actor for a config-bearing identity check."""
     variable = _read_managed_actor_variable(
-        runner, config.gh_cmd, config.repo, active_workdir(config)
+        runner, config.gh_cmd, config.repo, github_api_cwd()
     )
     advertised, source = _resolve_advertised_actor(variable, config.managed_ci_trusted_actor)
     if source == "asserted" and advertised is not None:
@@ -2695,7 +2695,7 @@ def authorize_fresh_issue_created_resume(
     protection = assess_exact_head_protection(
         runner,
         context=ManagedCiProbeContext(
-            config.repo, config.gh_cmd, active_workdir(config)
+            config.repo, config.gh_cmd, github_api_cwd()
         ),
         base=config.base,
     )
@@ -3405,7 +3405,7 @@ def _recover_issue_created_protection(
             for _comment, authorization in records
             if authorization.kind == "fresh"
         }
-    context = ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config))
+    context = ManagedCiProbeContext(config.repo, config.gh_cmd, github_api_cwd())
     live = assess_exact_head_protection(runner, context=context, base=handoff.base_ref)
     if len(creation_states) > 1:
         raise refuse(
@@ -6017,7 +6017,7 @@ def _activate_v2_managed_ci(
 def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[dict[str, object]] | None:
     """Fetch a paginated GitHub list, returning None for an uninspectable response."""
     result = runner.run(
-        [config.gh_cmd, "api", "--paginate", endpoint], cwd=active_workdir(config), check=False
+        [config.gh_cmd, "api", "--paginate", endpoint], cwd=github_api_cwd(), check=False
     )
     if result.returncode != 0:
         return None
@@ -6660,7 +6660,7 @@ def release_retained_managed_label(
 
 def _api_json(runner: Runner, config: AgentLoopConfig, endpoint: str, *, quiet: bool = False) -> dict[str, object]:
     result = runner.run(
-        [config.gh_cmd, "api", endpoint], cwd=active_workdir(config), check=False
+        [config.gh_cmd, "api", endpoint], cwd=github_api_cwd(), check=False
     )
     if result.returncode != 0:
         if quiet:

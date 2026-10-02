@@ -55,7 +55,7 @@ from .protocol_markers import (
     strip_known_host_footer,
 )
 from .runner import Runner
-from .workdirs import active_workdir
+from .workdirs import active_workdir, github_api_cwd
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
@@ -1918,7 +1918,7 @@ def _read_issue_state_projection(
             "--jq",
             "{number:.number,state:.state,is_pr:has(\"pull_request\"),url:.html_url}",
         ],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         # `check=False` so a nonzero `gh` exit reaches the contextual
         # diagnostic below instead of the Runner's generic command failure.
         check=False,
@@ -2049,7 +2049,7 @@ def read_rest_issue_comments(
                 "api",
                 f"repos/{config.repo}/issues/{issue_number}/comments?per_page={page_size}&page={page}",
             ],
-            cwd=active_workdir(config),
+            cwd=github_api_cwd(),
             check=False,
         )
         if result.returncode != 0:
@@ -2203,7 +2203,7 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
             "--json",
             "number,title,body,url,author,createdAt,comments",
         ],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
     )
     data = _load_json_object(result, description=f"issue #{issue_number}")
     comments = _merge_issue_comment_transport_identity(
@@ -2326,7 +2326,7 @@ def _gh_api_json(
 ) -> object:
     result = runner.run(
         [config.gh_cmd, "api", path],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0 or not (result.stdout or "").strip():
