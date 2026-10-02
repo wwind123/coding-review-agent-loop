@@ -2084,3 +2084,306 @@ def test_sealing_that_shrinks_command_under_the_limit_is_stable():
     twice = redact_observation(once)
     assert twice.command == once.command
     assert twice.normalized_command == once.normalized_command
+
+
+# --- bounded host-capacity wait through the broker (#1108) -------------------------
+
+import time  # noqa: E402
+
+from coding_review_agent_loop.test_workers import (  # noqa: E402
+    ENV_HOST_WAIT,
+    HostCapacity,
+    WorkerBudget,
+    WorkerBudgetLock,
+)
+
+_GIB = 1024 ** 3
+_PRINTER_ARGV = (sys.executable, "-c", "import os; print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS'])")
+
+
+def _wait_budget(workers=4):
+    return WorkerBudget(
+        workers, "inherited", "clamp", "cpu",
+        {"cpu_available": 4, "host_usable_bytes": 64 * _GIB, "per_worker_bytes": _GIB, "reserve_bytes": _GIB},
+        False,
+    )
+
+
+def _wait_server(tmp_path, turn_id):
+    server = BrokerServer(root=tmp_path, turn_id=turn_id).start()
+    locks = tmp_path.parent / f"{tmp_path.name}-locks"
+    server._worker_lock_root = locks
+    server.set_execution_context(
+        containment_handle=None, process_started=None, process_finished=None,
+        worker_budget=_wait_budget(),
+    )
+    return server, locks
+
+
+def _foreign_holder(locks, workers=4):
+    lock, problem = WorkerBudgetLock.acquire(invocation_id="foreign", cwd=locks, root=locks)
+    assert lock is not None, problem
+    assert lock.reserve_host_workers(workers, HostCapacity(4, 1024 * _GIB, _GIB)) == workers
+    return lock
+
+
+def _wait_request(server, tmp_path, nonce, wait_seconds, argv=_PRINTER_ARGV):
+    request = _signed_broker_request(server, tmp_path, nonce, argv)
+    request["timeout_seconds"] = 1
+    request["environment"] = {**request["environment"], ENV_HOST_WAIT: str(wait_seconds)}
+    return request
+
+
+class _FrameReader:
+    """Reads broker frames on a thread, recording heartbeat timing."""
+
+    def __init__(self, server, request):
+        self.beats = []
+        self.final = None
+        self.error = None
+        self._connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._connection.settimeout(11)  # the minimum client receive timeout
+        self._connection.connect(server.endpoint)
+        evidence_module._send_frame(self._connection, request)
+        self.thread = threading.Thread(target=self._run)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            while True:
+                frame = evidence_module._recv_frame(self._connection)
+                if frame.get("type") == "output":
+                    if frame.get("data") == "":
+                        self.beats.append(time.monotonic())
+                    continue
+                self.final = frame
+                return
+        except Exception as exc:  # noqa: BLE001
+            self.error = exc
+        finally:
+            self._connection.close()
+
+    def join(self, timeout):
+        self.thread.join(timeout)
+        assert not self.thread.is_alive()
+
+
+def test_broker_clients_and_replay_followers_survive_a_long_wait(tmp_path):
+    server, locks = _wait_server(tmp_path, "turn-wait-keepalive")
+    holder = _foreign_holder(locks)
+    try:
+        request = _wait_request(server, tmp_path, "c" * 32, 60)
+        owner = _FrameReader(server, request)
+        time.sleep(1.0)
+        follower = _FrameReader(server, request)
+        time.sleep(12.5)  # longer than either client's ~11 s receive timeout
+        assert owner.final is None and follower.final is None
+        holder.close()
+        owner.join(15)
+        follower.join(15)
+        assert owner.error is None and follower.error is None
+        assert owner.final["outcome"] == "passed" and "workers=4" in owner.final["output_tail"]
+        assert follower.final == owner.final  # one execution, one receipt
+        assert len(owner.beats) >= 4 and len(follower.beats) >= 4
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_broker_stop_cancels_a_pending_admission_and_launches_nothing(tmp_path):
+    marker = tmp_path / "spawned"
+    server, locks = _wait_server(tmp_path, "turn-wait-stop")
+    holder = _foreign_holder(locks)
+    try:
+        request = _wait_request(
+            server, tmp_path, "d" * 32, 60,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        reader = _FrameReader(server, request)
+        time.sleep(0.8)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 5
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled" and reader.final["returncode"] is None
+        holder.close()
+        time.sleep(0.5)
+        assert not marker.exists()
+        assert server.journal == ()
+        again, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert again is not None, problem  # the per-invocation flock was released
+        again.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_broker_stop_during_accounting_mutex_contention(tmp_path):
+    server, locks = _wait_server(tmp_path, "turn-wait-mutex")
+    code = (
+        "import sys, time, fcntl, pathlib; "
+        "h = open(pathlib.Path(sys.argv[1]) / 'host-capacity.mutex', 'a+'); "
+        "fcntl.flock(h.fileno(), fcntl.LOCK_EX); print('held', flush=True); time.sleep(60)"
+    )
+    locks.mkdir(mode=0o700, parents=True, exist_ok=True)
+    holder = subprocess.Popen([sys.executable, "-c", code, str(locks)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        request = _wait_request(server, tmp_path, "e" * 32, 60)
+        reader = _FrameReader(server, request)
+        time.sleep(0.8)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 5
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled"
+    finally:
+        holder.kill()
+        holder.wait()
+        server.stop()
+
+
+def test_launch_guard_race_runner_sees_cancellation_and_never_launches(tmp_path):
+    marker = tmp_path / "spawned"
+    server, locks = _wait_server(tmp_path, "turn-launch-race")
+    try:
+        request = _wait_request(
+            server, tmp_path, "f" * 32, 5,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        server._launch_lock.acquire()  # a stop() that is already past its snapshot
+        reader = _FrameReader(server, request)
+        time.sleep(1.0)  # the handler is now waiting at the launch guard
+        server._stop_event.set()
+        server._launch_lock.release()
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled" and not marker.exists()
+    finally:
+        server.stop()
+
+
+def test_stopped_running_target_is_recorded_unattributed(tmp_path):
+    server, locks = _wait_server(tmp_path, "turn-running-stop")
+    try:
+        request = _wait_request(
+            server, tmp_path, "9" * 32, 5, argv=(sys.executable, "-c", "import time; time.sleep(60)"),
+        )
+        request["timeout_seconds"] = 120
+        reader = _FrameReader(server, request)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not server._active_processes:
+            time.sleep(0.05)
+        assert server._active_processes
+        server.stop()
+        reader.join(15)
+        assert reader.final["outcome"] != "passed"
+        (observation,) = server.journal
+        assert observation.attribution.state == "unknown"
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+        assert observation.returncode == reader.final["returncode"]
+    finally:
+        server.stop()
+
+
+def test_stalled_handler_defers_resource_closure_to_the_last_handler(tmp_path, monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+    real = evidence_module.stable_tracked_tree_snapshot
+
+    def stalled(*args, **kwargs):
+        entered.set()
+        assert release.wait(30)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stalled)
+
+    def execute(argv, cwd, timeout, environment, stream):
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-deferred", execute=execute).start()
+    reader = _FrameReader(server, _signed_broker_request(server, tmp_path, "8" * 32))
+    try:
+        assert entered.wait(5)
+        server.stop()  # joins its 5 s bound, then must not close under the handler
+        assert server._deferred_close and server._pinned_root is not None
+        assert server._runtime_dir is not None
+        release.set()
+        reader.join(15)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and server._runtime_dir is not None:
+            time.sleep(0.05)
+        assert server._runtime_dir is None and server._pinned_root is None
+        (observation,) = server.journal
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+    finally:
+        release.set()
+
+
+def test_connection_sender_bounds_every_send_and_never_writes_after_a_truncated_frame():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    cancel = threading.Event()
+    sender = evidence_module._ConnectionSender(left, cancel)
+    try:
+        # Fill the send buffer: the peer never reads.
+        left.setblocking(False)
+        try:
+            while True:
+                left.send(b"x" * 1024)
+        except BlockingIOError:
+            pass
+        left.setblocking(True)
+        started = time.monotonic()
+        assert sender.send({"type": "output", "data": ""}, grace=0.5, skip_if_busy=True) is False
+        assert time.monotonic() - started < 0.3 and not sender.wedged  # skipped, not wedged
+        started = time.monotonic()
+        assert sender.send({"type": "output", "data": "notice"}, grace=0.3) is False
+        assert 0.25 <= time.monotonic() - started < 1.5
+        assert sender.wedged
+        started = time.monotonic()
+        assert sender.send({"type": "result"}, grace=5) is False  # later sends return at once
+        assert time.monotonic() - started < 0.2
+    finally:
+        left.close()
+        right.close()
+
+
+def test_connection_sender_cancel_wakes_a_blocked_send():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    cancel = threading.Event()
+    sender = evidence_module._ConnectionSender(left, cancel)
+    try:
+        left.setblocking(False)
+        try:
+            while True:
+                left.send(b"x" * 1024)
+        except BlockingIOError:
+            pass
+        left.setblocking(True)
+        threading.Timer(0.2, cancel.set).start()
+        started = time.monotonic()
+        assert sender.send({"type": "output", "data": "y"}, grace=30) is False
+        assert time.monotonic() - started < 3 and sender.wedged
+    finally:
+        left.close()
+        right.close()
+
+
+def test_connection_sender_delivers_complete_frames_to_a_slow_reader():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    sender = evidence_module._ConnectionSender(left, threading.Event())
+    payload = {"type": "output", "data": "z" * 60000}
+    received = []
+    reader = threading.Thread(
+        target=lambda: (time.sleep(0.3), received.append(evidence_module._recv_frame(right)))
+    )
+    reader.start()
+    try:
+        assert sender.send(payload, grace=10) is True
+        reader.join(10)
+        assert received == [payload]
+    finally:
+        left.close()
+        right.close()

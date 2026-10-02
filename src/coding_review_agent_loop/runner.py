@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import re
@@ -47,8 +48,9 @@ from .test_workers import (
     WorkerDecision,
     analyze_worker_report,
     apply_worker_budget,
-    host_capacity_busy_message,
+    HostWaitCancelled,
     host_sharing_enabled,
+    host_wait_seconds,
     ENV_WORKER_RESERVATION,
     host_capacity,
     terminate_process_group_descendants,
@@ -327,6 +329,15 @@ class _HeldTestLocks:
                     self._decision.cleanup()
 
 
+def _cancelled_result(cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance):
+    return ForegroundTestResult(
+        cmd, cwd, "cancelled", None, 0.0, timeout_seconds,
+        "test command cancelled before launch (the owning turn ended)", None, False,
+        wrapper_bootstrap, "not-attempted", "not-started",
+        "test command cancelled before launch (the owning turn ended)", health_provenance,
+    )
+
+
 def run_foreground_test(
     args: Sequence[str],
     *,
@@ -373,6 +384,10 @@ def _run_foreground_test_body(
     worker_budget: WorkerBudget | None = None,
     worker_budget_resizer: Callable[[InvocationHandle], WorkerBudget] | None = None,
     worker_lock_root: Path | None = None,
+    host_wait_cancel: Any = None,
+    host_wait_heartbeat: Callable[[], None] | None = None,
+    host_wait_notify: Callable[[str], None] | None = None,
+    host_launch_guard: Callable[[], Any] | None = None,
 ) -> ForegroundTestResult:
     """Run a command in the foreground, teeing output and bounding its process group.
 
@@ -499,10 +514,36 @@ def _run_foreground_test_body(
                 health_provenance,
             )
         if host_sharing_enabled(invocation_values):
-            # Issue #987: other loops on this host share one worker pool.
+            # Issue #987/#1108: other loops on this host share one worker pool.
+            # The run asks for its full budget and waits (bounded) for it; on
+            # timeout it degrades to the free workers.  Host capacity never
+            # reaches the coder as a refusal.
             capacity = host_capacity(worker_budget)
+            bound, bound_notice = host_wait_seconds(invocation_values)
+            if bound_notice:
+                notify(bound_notice)
             try:
-                granted = worker_lock.reserve_host_workers(worker_budget.workers, capacity)
+                wait = worker_lock.wait_for_host_workers(
+                    worker_budget.workers,
+                    capacity,
+                    wait_seconds=bound,
+                    notify=notify,
+                    wait_notify=host_wait_notify or notify,
+                    heartbeat=host_wait_heartbeat,
+                    cancel=host_wait_cancel,
+                    on_wait_start=tel.wait_started,
+                )
+            except HostWaitCancelled:
+                tel.set_outcome("cancelled")
+                worker_lock.close()
+                lane_lock.close()
+                if handle is not None:
+                    handle.close()
+                if decision is not None:
+                    decision.cleanup()
+                return _cancelled_result(
+                    cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance,
+                )
             except BaseException:
                 worker_lock.close()
                 lane_lock.close()
@@ -511,33 +552,27 @@ def _run_foreground_test_body(
                 if decision is not None:
                     decision.cleanup()
                 raise
+            granted = wait.granted
+            tel.waited(
+                wait.waited_seconds, bound, wait.timed_out, wait.oversubscribed,
+                wait.accounting_unavailable,
+            )
             tel.decision(capacity=capacity.describe(), others=worker_lock.last_others)
             tel.reserved(granted, worker_lock.reservation)
-            tel.set_outcome("refused" if granted == 0 else "granted")
-            if granted == 0:
-                worker_lock.close()
-                lane_lock.close()
-                if handle is not None:
-                    handle.close()
-                if decision is not None:
-                    decision.cleanup()
-                message = host_capacity_busy_message(worker_budget, capacity)
-                notify(message)
-                return ForegroundTestResult(
-                    cmd, cwd, "worker-budget-busy", WORKER_BUDGET_BUSY_EXIT_CODE,
-                    0.0, timeout_seconds, message, None, True,
-                    wrapper_bootstrap, "not-attempted", "not-started", message,
-                    health_provenance,
+            if wait.oversubscribed:
+                tel.set_outcome("oversubscribed")
+            elif granted < worker_budget.workers:
+                tel.set_outcome("degraded")
+            else:
+                tel.set_outcome("granted")
+            if wait.timed_out or granted < worker_budget.workers:
+                notify(
+                    f"agent-loop worker budget: waited {wait.waited_seconds:.0f} s (limit {bound:g} s) "
+                    f"for the shared test-worker pool ({capacity.describe()}); this command runs "
+                    f"with {granted} worker(s) instead of {worker_budget.workers}"
+                    + (" (oversubscribed)" if wait.oversubscribed else "")
                 )
             if granted < worker_budget.workers:
-                tel.set_outcome("degraded")
-                notify(
-                    f"agent-loop worker budget: other agent-loop runs on this host hold part of "
-                    f"the shared test-worker capacity ({capacity.describe()}); this command is "
-                    f"limited to {granted} "
-                    f"worker(s) instead of {worker_budget.workers}"
-                )
-                shared_budget = replace(worker_budget, workers=granted, limiting_factor="host-shared")
                 assert decision is not None
                 decision.cleanup()
                 try:
@@ -545,7 +580,8 @@ def _run_foreground_test_body(
                         requested_cmd,
                         base_environment,
                         cwd,
-                        shared_budget,
+                        worker_budget,
+                        host_cap=granted,
                     )
                 except BaseException:
                     worker_lock.close()
@@ -553,12 +589,28 @@ def _run_foreground_test_body(
                     if handle is not None:
                         handle.close()
                     raise
+                if decision.refused:
+                    # Only a configured-budget refusal (e.g. -n above the budget).
+                    worker_lock.close()
+                    lane_lock.close()
+                    if handle is not None:
+                        handle.close()
+                    decision.cleanup()
+                    notify(decision.refused)
+                    return ForegroundTestResult(
+                        cmd, cwd, "worker-budget-refused", WORKER_BUDGET_REFUSED_EXIT_CODE,
+                        0.0, timeout_seconds, decision.refused, None, False,
+                        wrapper_bootstrap, "not-attempted", "not-started", decision.refused,
+                        health_provenance, worker_enforcement="refused",
+                    )
                 cmd = list(decision.argv)
                 spawn_environment = decision.env
             if worker_lock.reservation_token is not None and spawn_environment is not None:
                 spawn_environment = {
                     **spawn_environment, ENV_WORKER_RESERVATION: worker_lock.reservation_token,
                 }
+            # The command's own timeout bounds only the target, not the wait.
+            started = time.monotonic()
     # Command lane first, worker-budget lock second; every later release
     # path closes both in reverse order.
     lane_lock = _HeldTestLocks(lane_lock, worker_lock, decision)
@@ -580,7 +632,16 @@ def _run_foreground_test_body(
             cwd=cwd,
             environment=spawn_environment,
             environment_is_complete=spawn_environment is not None,
+            cancel=host_wait_cancel,
         )
+        if host_wait_cancel is not None and host_wait_cancel.is_set():
+            if handle is not None:
+                handle.close()
+            lane_lock.close()
+            tel.set_outcome("cancelled")
+            return _cancelled_result(
+                cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance,
+            )
         inner_probe_state = inner_probe.state
         if inner_probe.state == "failed":
             if handle is not None:
@@ -670,19 +731,39 @@ def _run_foreground_test_body(
                     chdir()
                 anchor()
         try:
-            proc = subprocess.Popen(
-                spawn_cmd,
-                cwd=spawn_cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=False,
-                bufsize=0,
-                start_new_session=True,
-                env=spawn_environment,
-                preexec_fn=spawn_preexec,
-                pass_fds=pass_fds,
-            )
+            # Issue #1108: a broker stop must either see the registered
+            # process or stop this launch; the guard covers exactly the final
+            # cancel check, Popen and process registration (nothing blocking).
+            with (host_launch_guard() if host_launch_guard is not None else contextlib.nullcontext()):
+                if host_wait_cancel is not None and host_wait_cancel.is_set():
+                    cancelled_before_launch = True
+                    proc = None
+                else:
+                    cancelled_before_launch = False
+                    proc = subprocess.Popen(
+                        spawn_cmd,
+                        cwd=spawn_cwd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=False,
+                        bufsize=0,
+                        start_new_session=True,
+                        env=spawn_environment,
+                        preexec_fn=spawn_preexec,
+                        pass_fds=pass_fds,
+                    )
+                    if process_started is not None:
+                        process_started(proc)
+            if cancelled_before_launch:
+                if handle is not None:
+                    handle.close()
+                _close_held_fds(held_fds)
+                lane_lock.close()
+                tel.set_outcome("cancelled")
+                return _cancelled_result(
+                    cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance,
+                )
         except OSError as exc:
             if handle is not None:
                 handle.close()
@@ -695,8 +776,6 @@ def _run_foreground_test_body(
             )
         tel.target_started()
         lane_lock.record_process_group(proc.pid)
-        if process_started is not None:
-            process_started(proc)
         if held_fds is not None:
             ready_read, ready_write, release_read, release_write = held_fds
             os.close(ready_write)

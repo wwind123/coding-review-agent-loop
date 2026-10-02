@@ -61,7 +61,13 @@ def _load_spec():
     default = value.get("default_workers")
     if isinstance(default, bool) or not isinstance(default, int) or not 1 < default <= budget:
         default = None
-    return {"budget": budget, "mode": mode, "report": report, "default_workers": default}
+    host_cap = value.get("host_cap")
+    if isinstance(host_cap, bool) or not isinstance(host_cap, int) or not 1 <= host_cap < budget:
+        host_cap = None
+    return {
+        "budget": budget, "mode": mode, "report": report,
+        "default_workers": default, "host_cap": host_cap,
+    }
 
 
 def _plugin_entries(raw):
@@ -156,6 +162,9 @@ class _Session:
         self.mode = spec["mode"]
         self.report = spec["report"]
         self.default_workers = spec.get("default_workers")
+        # Host-capacity fallback grant (issue #1108): lowers launched workers
+        # strictly after the configured-budget judgement; never refuses.
+        self.host_cap = spec.get("host_cap")
         self.defaulted = False
         self.config = config
         self.session = f"{os.getpid()}-{time.monotonic_ns()}"
@@ -346,6 +355,19 @@ if _pluggy_supports_wrappers():
             "pytest; pass -n 0 or -p no:xdist to run serially)"
         )
 
+    def _apply_host_cap_to_count(state, option):
+        cap = state.host_cap
+        current = getattr(option, "numprocesses", None)
+        if not cap or isinstance(current, bool) or not isinstance(current, int) or current <= cap:
+            return
+        lowered = cap if cap > 1 else 0
+        option.numprocesses = lowered
+        state.lowered = True
+        state.notices.append(
+            f"agent-loop worker budget: lowered -n {current} to {lowered} "
+            f"(host capacity fallback; configured budget {state.budget})"
+        )
+
     def _option_gate(state, config):
         option = config.option
         _apply_default_workers(state, config)
@@ -366,6 +388,7 @@ if _pluggy_supports_wrappers():
                 effective = min(numprocesses, maxprocesses) if maxprocesses else numprocesses
                 if effective > state.budget:
                     state.refuse("cmdline", effective)
+            _apply_host_cap_to_count(state, option)
         elif numprocesses in ("auto", "logical"):
             if state.mode == "clamp":
                 if state.budget == 1:
@@ -395,12 +418,20 @@ if _pluggy_supports_wrappers():
                 state.notices.append(
                     f"agent-loop worker budget: lowered auto-resolved {result} worker(s) to {state.budget}"
                 )
-                return state.budget
-            return result
-        maxprocesses = getattr(config.option, "maxprocesses", None)
-        effective = min(result, maxprocesses) if maxprocesses else result
-        if effective > state.budget:
-            state.refuse("auto", effective)
+                result = state.budget
+        else:
+            maxprocesses = getattr(config.option, "maxprocesses", None)
+            effective = min(result, maxprocesses) if maxprocesses else result
+            if effective > state.budget:
+                state.refuse("auto", effective)
+        cap = state.host_cap
+        if cap and result > cap:
+            state.lowered = True
+            state.notices.append(
+                f"agent-loop worker budget: lowered auto-resolved {result} worker(s) to {cap} "
+                f"(host capacity fallback; configured budget {state.budget})"
+            )
+            return cap
         return result
 
     @pytest.hookimpl(wrapper=True, tryfirst=True, optionalhook=True)
@@ -425,6 +456,19 @@ if _pluggy_supports_wrappers():
                 )
             else:
                 state.refuse("setupnodes", total, total=total, remote=remote)
+        cap = state.host_cap
+        if cap and len(specs) > cap:
+            before = len(specs)
+            del specs[cap:]
+            try:
+                config.option.tx = [str(getattr(spec, "_spec", spec)) for spec in specs]
+            except Exception:
+                pass
+            state.lowered = True
+            state.notices.append(
+                f"agent-loop worker budget: trimmed {before} gateway spec(s) to {cap} "
+                f"(host capacity fallback; configured budget {state.budget})"
+            )
         planned, planned_remote = count_specs(specs)
         state.planned = planned
         state.planned_remote = planned_remote

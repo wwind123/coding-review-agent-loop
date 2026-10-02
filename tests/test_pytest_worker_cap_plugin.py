@@ -81,6 +81,7 @@ def _run(
     command: list[str] | None = None,
     timeout: float = 120,
     default_workers: int | None = None,
+    host_cap: int | None = None,
 ):
     report = report or (project.parent / "report.jsonl")
     marker = project.parent / "ran.txt"
@@ -97,6 +98,8 @@ def _run(
     spec = {"version": 1, "budget": budget, "mode": mode, "report": str(report)}
     if default_workers is not None:
         spec["default_workers"] = default_workers
+    if host_cap is not None:
+        spec["host_cap"] = host_cap
     child_env[ENV_WORKER_CAP_SPEC] = json.dumps(spec)
     child_env.update(env or {})
     for key, value in list(child_env.items()):
@@ -817,3 +820,87 @@ def test_socket_gateways_refused_before_any_gateway(tmp_path, socket_servers):
     assert _gateway_log(project) == [] and ran == []
     analysis = analyze_worker_report(project.parent / "report.jsonl", command_class="direct-pytest", mode="refuse")
     assert analysis.direct_refusal
+
+
+# ---------------------------------------------------------------------------
+# Host-capacity fallback cap (#1108): applied after the configured judgement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+@pytest.mark.parametrize("args, cap, expected", [
+    (["-n", "4"], 1, 0),
+    (["-n", "4"], 2, 2),
+    (["-n", "2"], 3, 2),
+    (["--dist=load", "--tx", "4*popen"], 2, 2),
+])
+def test_host_cap_lowers_requests_within_the_configured_budget(tmp_path, mode, args, cap, expected):
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    proc, rows, ran = _run(
+        project, args, budget=4, mode=mode, host_cap=cap, env=_probe_env(project),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "refused" not in proc.stdout + proc.stderr
+    assert len(_gateway_log(project)) == expected
+    assert _confirmed(rows)["effective"] == expected
+    assert rows[0]["budget"] == 4  # the report keeps the configured budget
+    assert len(ran) == 4
+
+
+def test_host_cap_does_not_weaken_refuse_mode_judgement(tmp_path):
+    project = _project(tmp_path)
+    proc, rows, ran = _run(project, ["-n", "8"], budget=4, mode="refuse", host_cap=2)
+    assert proc.returncode != 0 and ran == []
+    assert _only(rows, "refused")
+    project2 = tmp_path / "second"
+    project2.mkdir()
+    project2 = _project(project2)
+    proc, rows, ran = _run(
+        project2, ["--dist=load", "--tx", "8*popen"], budget=4, mode="refuse", host_cap=2,
+    )
+    assert proc.returncode != 0 and ran == []
+
+
+def test_host_cap_lowers_over_budget_requests_in_clamp_mode(tmp_path):
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    proc, rows, ran = _run(
+        project, ["-n", "8"], budget=4, mode="clamp", host_cap=2, env=_probe_env(project),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(_gateway_log(project)) == 2 and len(ran) == 4
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+def test_host_cap_caps_auto_resolution_within_budget(tmp_path, mode):
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    env = {**_probe_env(project), "PYTEST_XDIST_AUTO_NUM_WORKERS": "3"}
+    proc, rows, ran = _run(project, ["-n", "auto"], budget=4, mode=mode, host_cap=1, env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(_gateway_log(project)) == 1
+
+
+def test_host_cap_in_refuse_mode_still_refuses_auto_above_budget(tmp_path):
+    project = _project(tmp_path)
+    proc, rows, ran = _run(
+        project, ["-n", "auto"], budget=4, mode="refuse", host_cap=2,
+        env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "8"},
+    )
+    assert proc.returncode != 0 and ran == []
+
+
+def test_apply_worker_budget_exports_the_host_cap_but_keeps_the_configured_budget(tmp_path):
+    budget = WorkerBudget(4, "operator", "refuse", "cpu", {}, False)
+    decision = apply_worker_budget(
+        [sys.executable, "-c", "pass"], {}, tmp_path, budget, host_cap=2,
+    )
+    assert decision.env["AGENT_LOOP_TEST_WORKERS"] == "2"
+    spec = json.loads(decision.env[ENV_WORKER_CAP_SPEC])
+    assert spec["budget"] == 4 and spec["mode"] == "refuse" and spec["host_cap"] == 2
+    plain = apply_worker_budget([sys.executable, "-c", "pass"], {}, tmp_path, budget)
+    assert plain.env["AGENT_LOOP_TEST_WORKERS"] == "4"
+    assert "host_cap" not in json.loads(plain.env[ENV_WORKER_CAP_SPEC])
+    clamp = apply_worker_budget(
+        [sys.executable, "-c", "pass"], {"PYTEST_XDIST_AUTO_NUM_WORKERS": "3"}, tmp_path,
+        WorkerBudget(4, "operator", "clamp", "cpu", {}, False), host_cap=1,
+    )
+    assert clamp.env["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "1"

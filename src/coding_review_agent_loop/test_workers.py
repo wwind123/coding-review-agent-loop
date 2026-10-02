@@ -22,6 +22,7 @@ import shutil
 import signal
 import stat
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -65,6 +66,19 @@ HOST_CAPACITY_MUTEX = "host-capacity.mutex"
 HOST_RESERVATION_SUFFIX = ".reservation"
 HOST_ANCHOR_SUFFIX = ".pgid"
 ENV_HOST_SHARING = "AGENT_LOOP_TEST_WORKER_HOST_SHARING"
+# Issue #1108: a run waits (bounded) for the shared pool instead of dividing
+# it; on timeout it degrades to the free workers and never fails on capacity.
+ENV_HOST_WAIT = "AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS"
+DEFAULT_HOST_WAIT_SECONDS = 1200.0
+MAX_HOST_WAIT_SECONDS = 7200.0
+HOST_WAIT_POLL_INITIAL_SECONDS = 0.5
+HOST_WAIT_POLL_MAX_SECONDS = 2.0
+HOST_WAIT_HEARTBEAT_SECONDS = 2.0
+HOST_WAIT_NOTICE_INTERVAL_SECONDS = 60.0
+HOST_MUTEX_POLL_SECONDS = 0.05
+HOST_MUTEX_FINAL_GRACE_SECONDS = 5.0
+HOST_MUTEX_BOOKKEEPING_GRACE_SECONDS = 1.0
+HOST_WAIT_HEARTBEAT_SEND_GRACE_SECONDS = 0.5
 # Carried by every test command holding a host reservation, so the
 # reservation stays live while any process launched with it survives.
 ENV_WORKER_RESERVATION = "AGENT_LOOP_WORKER_RESERVATION"
@@ -715,8 +729,14 @@ def apply_worker_budget(
     mode: str | None = None,
     report_location: tuple[Path, Path] | None = None,
     parallel_supported: bool | None = None,
+    host_cap: int | None = None,
 ) -> WorkerDecision:
     """Compute the effective argv/env for one command under ``budget``.
+
+    ``host_cap`` (issue #1108) is the worker count granted by a host-capacity
+    fallback.  The refusal judgement and reports keep the configured
+    ``budget``; the cap only lowers launched workers after that judgement and
+    is what the target observes in ``AGENT_LOOP_TEST_WORKERS``.
 
     Only direct pytest receives argv changes (the plugin token, and removal
     of a plugin-disabling ``-p no:`` in clamp mode).  Every other command
@@ -736,7 +756,10 @@ def apply_worker_budget(
     child_env = {str(key): str(value) for key, value in env.items()}
     child_env.pop(ENV_WORKER_CAP_NESTED, None)
     child_env.pop(ENV_WORKER_CAP_SPEC, None)
-    child_env[ENV_TEST_WORKERS] = str(budget.workers)
+    if host_cap is not None and (isinstance(host_cap, bool) or host_cap < 1 or host_cap >= budget.workers):
+        host_cap = None
+    exported_workers = host_cap if host_cap is not None else budget.workers
+    child_env[ENV_TEST_WORKERS] = str(exported_workers)
     child_env[ENV_TEST_WORKER_ENFORCEMENT] = effective_mode
     if effective_mode == "off":
         return WorkerDecision(tuple(tokens), child_env, shape.command_class, effective_mode, budget.workers)
@@ -773,20 +796,22 @@ def apply_worker_budget(
     spec_values: dict[str, object] = {
         "version": 1, "budget": budget.workers, "mode": effective_mode, "report": str(report_path),
     }
+    if host_cap is not None:
+        spec_values["host_cap"] = host_cap
     if parallel_default:
-        spec_values["default_workers"] = budget.workers
+        spec_values["default_workers"] = exported_workers
     spec = json.dumps(spec_values, sort_keys=True)
     plugin_dir = str(plugin_directory())
     auto_cap: str | None = None
     if effective_mode == "clamp":
         caller_auto = child_env.get(ENV_XDIST_AUTO)
-        cap = budget.workers
+        cap = exported_workers
         if caller_auto is not None and caller_auto.strip().isdigit() and int(caller_auto) > 0:
             cap = min(cap, int(caller_auto))
         auto_cap = str(cap)
     controlled: dict[str, str] = {
         ENV_WORKER_CAP_SPEC: spec,
-        ENV_TEST_WORKERS: str(budget.workers),
+        ENV_TEST_WORKERS: str(exported_workers),
         ENV_TEST_WORKER_ENFORCEMENT: effective_mode,
     }
     if auto_cap is not None:
@@ -1037,6 +1062,8 @@ class WorkerBudgetLock:
         self._reservation_data: dict | None = None
         # Read-only observation for reservation telemetry (#1107).
         self.last_others: tuple[int, int] | None = None
+        # Free workers the divide rule would have granted at the last attempt.
+        self.last_free: int | None = None
 
     @classmethod
     def acquire(
@@ -1078,7 +1105,16 @@ class WorkerBudgetLock:
         os.set_inheritable(handle.fileno(), False)
         return cls(handle, path, key), None
 
-    def reserve_host_workers(self, requested: int, capacity: "HostCapacity") -> int:
+    def reserve_host_workers(
+        self,
+        requested: int,
+        capacity: "HostCapacity",
+        *,
+        exclusive: bool = False,
+        floor: int = 0,
+        mutex_deadline: float | None = None,
+        mutex_tick: Callable[[], None] | None = None,
+    ) -> int:
         """Reserve workers against the host-wide capacity record.
 
         Returns the number of workers granted, 0 when no capacity is left.
@@ -1093,10 +1129,18 @@ class WorkerBudgetLock:
         so one left behind by an earlier command of this invocation (for a
         survivor) keeps counting.  See ``_live_reservation`` for when a
         reservation stops counting.
+
+        ``exclusive`` (issue #1108) serialises runs: while any other live
+        reservation exists nothing is written and 0 is returned, even when the
+        request would have fitted beside it; ``last_free`` then holds what the
+        divide rule would have granted.  ``floor`` guarantees at least that
+        many workers (deliberate oversubscription, recorded as such).
+        ``mutex_deadline``/``mutex_tick`` bound and service the accounting
+        mutex; ``HostCapacityMutexTimeout`` propagates.
         """
         requested = max(1, int(requested))
         directory = self.path.parent
-        with _host_capacity_mutex(directory):
+        with _host_capacity_mutex(directory, deadline=mutex_deadline, tick=mutex_tick):
             previous, self.reservation = self.reservation, None
             if previous is not None:
                 _unlink_reservation(previous)
@@ -1122,6 +1166,13 @@ class WorkerBudgetLock:
                     used = sum(data["workers"] * data["per_worker_bytes"] for data in others)
                     granted = min(granted, (min(memory_caps) - used) // capacity.per_worker_bytes)
                 granted = max(0, granted)
+            self.last_free = granted
+            if others and exclusive:
+                self.reservation_token = None
+                self._reservation_data = None
+                return 0
+            if floor > 0:
+                granted = max(granted, floor)
             if granted == 0:
                 self.reservation_token = None
                 self._reservation_data = None
@@ -1142,6 +1193,113 @@ class WorkerBudgetLock:
             _write_reservation(own, self._reservation_data)
             self.reservation = own
         return granted
+
+    def wait_for_host_workers(
+        self,
+        requested: int,
+        capacity: "HostCapacity",
+        *,
+        wait_seconds: float,
+        notify: Callable[[str], None],
+        wait_notify: Callable[[str], None] | None = None,
+        heartbeat: Callable[[], None] | None = None,
+        cancel: "threading.Event | None" = None,
+        on_wait_start: Callable[[float, float], None] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> "HostWaitResult":
+        """Take the full budget exclusively, waiting up to ``wait_seconds``.
+
+        Polls the capacity record without ever holding the accounting mutex
+        across a sleep, so a waiter never blocks a holder's release.  When the
+        bound expires the run degrades to the free workers (or one
+        oversubscribed worker when none are free); capacity never refuses a
+        command.  ``cancel`` wakes the wait at once and raises
+        ``HostWaitCancelled``; ``heartbeat`` is called at least every
+        ``HOST_WAIT_HEARTBEAT_SECONDS`` in every phase, mutex contention
+        included, so a broker client stays connected.
+        """
+        cancel = cancel if cancel is not None else threading.Event()
+        say = wait_notify or notify
+        wait_seconds = max(0.0, float(wait_seconds))
+        start = monotonic()
+        if on_wait_start is not None:
+            on_wait_start(start, wait_seconds)
+        last_beat = start
+
+        def tick() -> None:
+            nonlocal last_beat
+            if cancel.is_set():
+                raise HostWaitCancelled()
+            if heartbeat is not None:
+                now = monotonic()
+                if now - last_beat >= HOST_WAIT_HEARTBEAT_SECONDS:
+                    last_beat = now
+                    heartbeat()
+
+        deadline = start + wait_seconds
+        refused = False
+        try:
+            if wait_seconds > 0:
+                interval = HOST_WAIT_POLL_INITIAL_SECONDS
+                last_notice = start
+                while True:
+                    granted = self.reserve_host_workers(
+                        requested, capacity, exclusive=True,
+                        mutex_deadline=deadline, mutex_tick=tick,
+                    )
+                    if granted:
+                        return HostWaitResult(
+                            granted, (monotonic() - start) if refused else 0.0, False, False, False,
+                        )
+                    others = self.last_others or (0, 0)
+                    now = monotonic()
+                    if not refused:
+                        refused = True
+                        say(
+                            "agent-loop worker budget: another agent-loop run on this host is using "
+                            f"the shared test-worker pool ({others[0]} reservation(s), {others[1]} "
+                            f"worker(s)); this command will start when it finishes, waiting at most "
+                            f"{wait_seconds:g} s"
+                        )
+                        last_notice = now
+                    elif now - last_notice >= HOST_WAIT_NOTICE_INTERVAL_SECONDS:
+                        last_notice = now
+                        say(
+                            "agent-loop worker budget: still waiting for the shared test-worker pool "
+                            f"({others[0]} reservation(s), {others[1]} worker(s)); waited "
+                            f"{now - start:.0f} s of at most {wait_seconds:g} s"
+                        )
+                    if now >= deadline:
+                        break
+                    next_poll = min(deadline, now + interval)
+                    interval = min(interval * 2, HOST_WAIT_POLL_MAX_SECONDS)
+                    while True:
+                        now = monotonic()
+                        if now >= next_poll:
+                            break
+                        tick()
+                        cancel.wait(min(next_poll - now, max(0.01, HOST_WAIT_HEARTBEAT_SECONDS / 2)))
+                    tick()
+                    if monotonic() >= deadline:
+                        break
+            tick()
+            granted = self.reserve_host_workers(
+                requested, capacity, floor=1,
+                mutex_deadline=monotonic() + HOST_MUTEX_FINAL_GRACE_SECONDS, mutex_tick=tick,
+            )
+            return HostWaitResult(
+                granted,
+                (monotonic() - start) if (refused or wait_seconds > 0) else 0.0,
+                wait_seconds > 0 and granted < requested,
+                self.last_free == 0,
+                False,
+            )
+        except HostCapacityMutexTimeout:
+            tick()
+            self.reservation = None
+            self.reservation_token = None
+            self._reservation_data = None
+            return HostWaitResult(1, monotonic() - start, True, True, True)
 
     def launch_anchor(self) -> tuple[int, Callable[[], None]] | None:
         """Anchor the reservation to the target atomically at launch.
@@ -1176,7 +1334,10 @@ class WorkerBudgetLock:
             return
         self._reservation_data = {**self._reservation_data, "pgid": int(pgid)}
         try:
-            with _host_capacity_mutex(self.reservation.parent):
+            with _host_capacity_mutex(
+                self.reservation.parent,
+                deadline=time.monotonic() + HOST_MUTEX_BOOKKEEPING_GRACE_SECONDS,
+            ):
                 if self.reservation is not None and self.reservation.exists():
                     _write_reservation(self.reservation, self._reservation_data)
         except OSError:
@@ -1194,7 +1355,10 @@ class WorkerBudgetLock:
         if record is None:
             return
         try:
-            with _host_capacity_mutex(record.parent):
+            with _host_capacity_mutex(
+                record.parent,
+                deadline=time.monotonic() + HOST_MUTEX_BOOKKEEPING_GRACE_SECONDS,
+            ):
                 data = _parse_reservation(record)
                 if data is None or not _target_alive(record, data):
                     _unlink_reservation(record)
@@ -1256,19 +1420,69 @@ class WorkerBudgetLock:
         self.close()
 
 
-class _host_capacity_mutex:
-    """Blocking exclusive flock held only for the capacity accounting."""
+class HostCapacityMutexTimeout(OSError):
+    """The host-capacity accounting mutex was not obtained before its deadline."""
 
-    def __init__(self, directory: Path):
+
+class HostWaitCancelled(Exception):
+    """A pending host-capacity wait was cancelled (the owning broker is stopping)."""
+
+
+@dataclass(frozen=True)
+class HostWaitResult:
+    granted: int
+    waited_seconds: float
+    timed_out: bool
+    oversubscribed: bool
+    accounting_unavailable: bool
+
+
+class _host_capacity_mutex:
+    """Exclusive flock held only for the capacity accounting.
+
+    Without ``deadline``/``tick`` it blocks (the historical behaviour).  With
+    either, it polls ``LOCK_NB`` outside any lock, calling ``tick`` each
+    iteration, and raises ``HostCapacityMutexTimeout`` once the deadline passes.
+    """
+
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        deadline: float | None = None,
+        tick: Callable[[], None] | None = None,
+    ):
         self._path = directory / HOST_CAPACITY_MUTEX
         self._handle = None
+        self._deadline = deadline
+        self._tick = tick
 
     def __enter__(self) -> "_host_capacity_mutex":
-        self._handle = self._path.open("a+")
-        if os.name != "nt":
-            import fcntl
+        handle = self._path.open("a+")
+        try:
+            if os.name != "nt":
+                import fcntl
 
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+                if self._deadline is None and self._tick is None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                else:
+                    while True:
+                        if self._tick is not None:
+                            self._tick()
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            pass
+                        if self._deadline is not None and time.monotonic() >= self._deadline:
+                            raise HostCapacityMutexTimeout(
+                                f"host capacity mutex {self._path} is held elsewhere"
+                            )
+                        time.sleep(HOST_MUTEX_POLL_SECONDS)
+        except BaseException:
+            handle.close()
+            raise
+        self._handle = handle
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -1485,12 +1699,25 @@ def host_sharing_enabled(env: Mapping[str, str]) -> bool:
     return str(env.get(ENV_HOST_SHARING, "")).strip().lower() not in {"off", "0", "false", "no"}
 
 
-def host_capacity_busy_message(budget: WorkerBudget, capacity: HostCapacity) -> str:
-    return (
-        f"agent-loop: worker budget ({budget.workers} worker(s), {budget.enforcement}) is busy: "
-        f"other agent-loop runs on this host hold all of the shared test-worker capacity "
-        f"({capacity.describe()}); wait for them to finish before starting another."
-    )
+def host_wait_seconds(env: Mapping[str, str]) -> tuple[float, str | None]:
+    """The host-capacity wait bound in seconds, plus a notice for an invalid value.
+
+    Unset -> the default; a finite number is clamped to ``[0, MAX]`` (0 means
+    degrade immediately); anything else falls back to the default.
+    """
+    raw = env.get(ENV_HOST_WAIT)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_HOST_WAIT_SECONDS, None
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
+        return DEFAULT_HOST_WAIT_SECONDS, (
+            f"agent-loop worker budget: ignoring invalid {ENV_HOST_WAIT}={str(raw).strip()!r}; "
+            f"using the default of {DEFAULT_HOST_WAIT_SECONDS:g} s"
+        )
+    return min(max(value, 0.0), MAX_HOST_WAIT_SECONDS), None
 
 
 def worker_budget_busy_message(budget: WorkerBudget, reason: str | None = None) -> str:
@@ -2071,7 +2298,10 @@ def render_worker_guidance(budget: WorkerBudget, *, parallel_supported: bool, pr
         )
     lines.append(
         "In clamp and refuse mode only one test command per invocation holds the worker budget "
-        "at a time; a concurrent second command gets a worker-budget-busy result."
+        "at a time; a concurrent second command gets a worker-budget-busy result. Contention "
+        "with other runs on this host is handled by the runner: a test command may wait before "
+        "it starts and, after a bounded wait, may run with fewer workers; neither is a failure "
+        "to fix."
     )
     return " ".join(lines) + "\n"
 
