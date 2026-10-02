@@ -1084,7 +1084,7 @@ class _PartialPublicationProbeRunner(FakeRunner):
 
     def run_with_log(self, args, *, cwd, **kwargs):
         cmd = [str(arg) for arg in args]
-        if cmd[:1] in (["codex"], ["gemini"]):
+        if cmd[:1] in (["codex"], ["gemini"]) or (cmd[:1] == ["agy"] and "catalog" not in cmd):
             self.reviewer_launches.append(cmd[0])
             if any(marker in body for marker in self.round_markers for body in self.comments):
                 self.peer_body_visible_at_launch = True
@@ -2637,7 +2637,7 @@ def test_recovery_keeps_retained_artifact_attachments():
 def test_recovery_lists_orphan_of_first_attempt_despite_later_prelaunch_checkpoint():
     """A rerun's later checkpoint must not hide the first attempt's orphan."""
     history = _History()
-    history.add_record(_meta(agent="Codex", scheduler_phase="primary"))
+    primary_attachments, primary = history.add_record(_meta(agent="Codex", scheduler_phase="primary"))
     history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
     orphans = history.orphan(
         _meta(agent="Gemini", scheduler_phase="secondary-audit", canonical_reviewer_response=_big_text(6))
@@ -2648,8 +2648,10 @@ def test_recovery_lists_orphan_of_first_attempt_despite_later_prelaunch_checkpoi
     assert recovery.verified, recovery.reason
     assert history.ids(orphans) <= _listed(recovery)
     assert 1000 + verdict + 1 in _listed(recovery)
-    # The primary review and both checkpoints are retained.
-    assert len(recovery.targets) == len(orphans) + 1
+    # Both checkpoints are retained.  The same-round primary-phase review is a
+    # public peer too (#1156): visibility, not scheduler phase, decides.
+    assert 1000 + primary + 1 in _listed(recovery)
+    assert len(recovery.targets) == len(orphans) + 2
 
 
 def test_recovery_boundary_counts_durable_records_of_other_flows():
@@ -3211,3 +3213,402 @@ def test_recovery_is_provisional_when_rest_history_drops_a_sidecar():
     assert recovery.reason == "comment ids could not be read completely"
     # Control: the complete REST history verifies and lists the sidecars.
     assert history.recover().verified
+
+
+# --- #1156: panel independence is keyed on visibility, not scheduler phase ---
+
+_PANEL_MARKERS = ("Gemini panel review.", "Antigravity panel review.")
+
+
+def _panel_pr_runner():
+    runner = _PartialPublicationProbeRunner(
+        round_markers=_PANEL_MARKERS,
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")] * 3,
+        gemini_outputs=[
+            _staged_review(reviewer="Google Gemini").replace("Google Gemini review", _PANEL_MARKERS[0])
+        ] * 3,
+        antigravity_outputs=[
+            _staged_review(reviewer="Antigravity").replace("Antigravity review", _PANEL_MARKERS[1])
+        ] * 3,
+    )
+    runner.serve_rest_issue_comments = True
+    return runner
+
+
+def _panel_pr_config(tmp_path, **overrides):
+    values = dict(
+        reviewer=("codex", "gemini", "antigravity"), review_parallel=True,
+        pr_review_policy="primary-then-panel", primary_reviewer="codex", max_rounds=4,
+    )
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+def _interrupt_panel_pr_round(runner, config):
+    with patch.object(
+        orchestrator, "post_pr_comment",
+        side_effect=_interrupt_on_second_review_post(orchestrator.post_pr_comment, _PANEL_MARKERS),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert sorted(_published_count(runner, marker) for marker in _PANEL_MARKERS) == [0, 1]
+
+
+def _interrupt_on_phase(real_post, phase, *, flow="pr", round_number=None):
+    """Interrupt the first post of a summary record with this durable phase."""
+    state = {"fired": False}
+
+    def post(*args, **kwargs):
+        match = orchestrator.ROUND_RESUME_MARKER_RE.search(str(kwargs["body"]))
+        if match is not None and not state["fired"]:
+            metadata = orchestrator._decode_round_metadata(match["payload"])
+            if (
+                metadata.flow == flow and metadata.role == "summary" and metadata.phase == phase
+                and (round_number is None or metadata.round_number == round_number)
+            ):
+                state["fired"] = True
+                raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    return post
+
+
+_PLAN_PANEL_MARKERS = ("Gemini panel plan review.", "Antigravity panel plan review.")
+
+
+def _panel_plan_runner():
+    from agent_loop_helpers import structured_v1_plan_state
+
+    runner = _PartialPublicationProbeRunner(
+        round_markers=_PLAN_PANEL_MARKERS,
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")] * 3,
+        gemini_outputs=[structured_plan_review(
+            state="approved", reviewer="Google Gemini", summary=_PLAN_PANEL_MARKERS[0]
+        )] * 3,
+        antigravity_outputs=[structured_plan_review(
+            state="approved", reviewer="Antigravity", summary=_PLAN_PANEL_MARKERS[1]
+        )] * 3,
+    )
+    runner.serve_rest_issue_comments = True
+    return runner
+
+
+def _panel_plan_config(tmp_path, **overrides):
+    return _staged_parallel_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), **overrides
+    )
+
+
+def _records(runner, *, flow, surface):
+    return _comment_records(runner, surface=surface, flow=flow)
+
+
+def _prelaunch_phases(runner, *, round_number):
+    return [
+        r.scheduler_phase for r in _records(runner, flow="pr", surface="pr")
+        if r.round_number == round_number and r.phase == "scheduler-prelaunch"
+    ]
+
+
+@pytest.mark.parametrize("review_parallel", [True, False])
+def test_pr_final_sweep_refuses_beside_a_public_panel_peer(tmp_path, review_parallel):
+    """#1156: a rerun that crosses into final-secondary-sweep never reads a published panel review."""
+    runner = _panel_pr_runner()
+    config = _panel_pr_config(tmp_path)
+    _interrupt_panel_pr_round(runner, config)
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = list(runner.reviewer_launches)
+    comments_before = len(runner.comments)
+
+    message = _refusal_message(runner, config, review_parallel=review_parallel)
+
+    assert _prelaunch_phases(runner, round_number=2) == ["secondary-audit", "final-secondary-sweep"]
+    assert runner.reviewer_launches == launches_before
+    assert not runner.peer_body_visible_at_launch
+    assert "Gemini already posted" in message
+    assert "Delete these" in message
+    # The refused run posted only its own scheduler checkpoint.
+    assert len(runner.comments) - comments_before == 1
+    assert not any(
+        r.role == "reviewer" and r.round_number == 2 and r.agent == "Antigravity"
+        for r in _records(runner, flow="pr", surface="pr")
+    )
+
+
+def test_pr_final_sweep_refusal_deletion_and_rerun_matches_a_never_started_round(tmp_path):
+    runner = _panel_pr_runner()
+    config = _panel_pr_config(tmp_path)
+    _interrupt_panel_pr_round(runner, config)
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = len(runner.reviewer_launches)
+    message = _refusal_message(runner, config)
+
+    assert "Delete these 3 comments" in message, message
+    assert "provisional" not in message
+    ids = _listed_comment_ids(message)
+    assert len(ids) == 3
+    listed = {
+        index: comment for index, comment in enumerate(runner.pr_payload["comments"])
+        if index + 10_001 in ids
+    }
+    phases = []
+    for comment in listed.values():
+        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        metadata = orchestrator._decode_round_metadata(match["payload"])
+        phases.append((metadata.round_number, metadata.role, metadata.agent, metadata.scheduler_phase))
+        # Never the primary's gating review, never a round-1 record.
+        assert metadata.round_number == 2 and metadata.agent != "Codex"
+    assert sorted(phases) == sorted([
+        (2, "summary", "Orchestrator", "secondary-audit"),
+        (2, "reviewer", "Gemini", "secondary-audit"),
+        (2, "summary", "Orchestrator", "final-secondary-sweep"),
+    ])
+
+    _delete_listed_comments(runner, ids, surface="pr")
+    assert not any(marker in body for marker in _PANEL_MARKERS for body in runner.comments)
+    runner.peer_body_visible_at_launch = False
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not runner.peer_body_visible_at_launch
+    # The never-started baseline: a run stopped just before the panel opens,
+    # then rerun.  Deleting the listed records must restore exactly that history.
+    baseline = _panel_pr_runner()
+    baseline_config = _panel_pr_config(tmp_path / "baseline")
+    with patch.object(
+        orchestrator, "post_pr_comment",
+        side_effect=_interrupt_on_phase(
+            orchestrator.post_pr_comment, "scheduler-prelaunch", round_number=2
+        ),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(baseline, pr_number=77, config=baseline_config)
+    baseline_launches_before = len(baseline.reviewer_launches)
+    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
+
+    assert _prelaunch_phases(runner, round_number=1) == _prelaunch_phases(baseline, round_number=1)
+    assert _prelaunch_phases(runner, round_number=1)[-1] == "secondary-audit"
+    assert "final-secondary-sweep" not in {
+        r.scheduler_phase for r in _records(runner, flow="pr", surface="pr")
+    }
+    assert _transition(_records(runner, flow="pr", surface="pr"), round_number=1) == _transition(
+        _records(baseline, flow="pr", surface="pr"), round_number=1
+    )
+    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(
+        baseline.reviewer_launches[baseline_launches_before:]
+    )
+    assert sorted(runner.reviewer_launches[launches_before:]) == ["agy", "gemini"]
+
+
+def test_pr_final_sweep_with_an_intact_spool_replays_the_withheld_review(tmp_path):
+    runner = _panel_pr_runner()
+    config = _panel_pr_config(tmp_path)
+    _interrupt_panel_pr_round(runner, config)
+    assert _spool_files(config)
+    launches_before = list(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert runner.reviewer_launches == launches_before
+    assert not runner.peer_body_visible_at_launch
+    assert [_published_count(runner, marker) for marker in _PANEL_MARKERS] == [1, 1]
+    assert _spool_files(config) == []
+
+
+def test_pr_interrupted_primary_resumed_into_a_same_round_panel_still_launches_the_panel(tmp_path):
+    """The primary's same-round approval gates the panel; it is not a peer."""
+    runner = _panel_pr_runner()
+    config = _panel_pr_config(tmp_path)
+    with patch.object(
+        orchestrator, "post_pr_comment",
+        side_effect=_interrupt_on_phase(orchestrator.post_pr_comment, "reconciliation", round_number=1),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert _prelaunch_phases(runner, round_number=1) == ["primary"]
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # The resuming invocation opened the panel in the same round and ran it.
+    assert _prelaunch_phases(runner, round_number=1) == ["primary", "secondary-audit"]
+    assert not runner.peer_body_visible_at_launch
+    assert sorted(runner.reviewer_launches) == ["agy", "codex", "gemini"]
+    assert [_published_count(runner, marker) for marker in _PANEL_MARKERS] == [1, 1]
+
+
+def test_plan_final_sweep_refuses_beside_a_public_panel_peer(tmp_path):
+    """#1156: staged planning, primary plus two panel reviewers."""
+    runner = _panel_plan_runner()
+    config = _panel_plan_config(tmp_path)
+    _interrupt_panel_plan_round(runner, config)
+    for path in _spool_files(config):
+        path.unlink()
+    launches_before = list(runner.reviewer_launches)
+
+    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    phases = [
+        r.scheduler_phase for r in _records(runner, flow="plan", surface="issue")
+        if r.round_number == 2 and r.phase == "scheduler-prelaunch"
+    ]
+    assert phases == ["secondary-audit", "final-secondary-sweep"]
+    assert runner.reviewer_launches == launches_before
+    assert not runner.peer_body_visible_at_launch
+    message = str(excinfo.value)
+    assert "Gemini already posted" in message
+    assert "Gemini review (round 2)" in message
+
+
+def test_plan_final_sweep_with_an_intact_spool_replays_the_withheld_review(tmp_path):
+    runner = _panel_plan_runner()
+    config = _panel_plan_config(tmp_path)
+    _interrupt_panel_plan_round(runner, config)
+    assert _spool_files(config)
+    launches_before = list(runner.reviewer_launches)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert runner.reviewer_launches == launches_before
+    assert not runner.peer_body_visible_at_launch
+    assert [_published_count(runner, marker) for marker in _PLAN_PANEL_MARKERS] == [1, 1]
+
+
+def test_plan_interrupted_primary_resumed_into_a_same_round_panel_still_launches_the_panel(tmp_path):
+    runner = _panel_plan_runner()
+    config = _panel_plan_config(tmp_path)
+    with patch.object(
+        orchestrator, "post_issue_comment",
+        side_effect=_interrupt_on_phase(
+            orchestrator.post_issue_comment, "reconciliation", flow="plan", round_number=1
+        ),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert not runner.peer_body_visible_at_launch
+    assert sorted(runner.reviewer_launches) == ["agy", "codex", "gemini"]
+    assert [_published_count(runner, marker) for marker in _PLAN_PANEL_MARKERS] == [1, 1]
+
+
+def _interrupt_panel_plan_round(runner, config):
+    with patch.object(
+        orchestrator, "post_issue_comment",
+        side_effect=_interrupt_on_second_review_post(orchestrator.post_issue_comment, _PLAN_PANEL_MARKERS),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert sorted(_published_count(runner, marker) for marker in _PLAN_PANEL_MARKERS) == [0, 1]
+
+
+# --- #1156: shared visibility selector and recovery gate set -----------------
+
+
+def _gate_context(*, launch_phase="final-secondary-sweep", launching=("Gemini",), source="primary-approval"):
+    import types
+
+    from coding_review_agent_loop.partial_round_recovery import RecoveryVisibilityContext
+
+    return RecoveryVisibilityContext(
+        primary_reviewer="Codex", launch_phase=launch_phase, launching=tuple(launching),
+        derive_evidence=lambda records: types.SimpleNamespace(opening_source=source, opening_index=None),
+    )
+
+
+def _recover_with(history, context):
+    rest = tuple(history.comments)
+    return compute_partial_round_recovery(
+        snapshot=rest, read_rest=lambda: rest, flow="pr", round_number=1, subject="h",
+        reviewer_names=("Codex", "Gemini"), context=context,
+        resume=lambda remaining: _resume_pr(
+            remaining, head_sha="h", configured_reviewers=("codex", "gemini")
+        ),
+    )
+
+
+def test_recovery_keeps_a_remediation_approval_that_gates_the_final_sweep():
+    """The frozen gate set covers the primary's remediation-phase approval (#1156)."""
+    history = _History()
+    _a, gate = history.add_record(_meta(agent="Codex", scheduler_phase="remediation"))
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
+    _b, sweep = history.add_record(_meta(agent="Gemini", scheduler_phase="final-secondary-sweep"))
+
+    recovery = _recover_with(history, _gate_context())
+
+    assert recovery.verified, recovery.reason
+    assert _listed(recovery) == history.ids([sweep])
+    assert history.ids([gate]).isdisjoint(_listed(recovery))
+
+
+def test_recovery_lists_the_primary_when_the_opening_is_operator_sourced():
+    history = _History()
+    _a, primary = history.add_record(_meta(agent="Codex", scheduler_phase="primary"))
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
+    _b, sweep = history.add_record(_meta(agent="Gemini", scheduler_phase="final-secondary-sweep"))
+
+    recovery = _recover_with(history, _gate_context(source="operator"))
+
+    assert recovery.verified, recovery.reason
+    assert _listed(recovery) == history.ids([primary, sweep])
+
+
+def test_recovery_lists_the_primary_when_it_is_part_of_the_launching_batch():
+    history = _History()
+    _a, primary = history.add_record(_meta(agent="Codex", scheduler_phase="full-board"))
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
+
+    recovery = _recover_with(
+        history, _gate_context(launch_phase="full-board", launching=("Codex", "Gemini"))
+    )
+
+    assert history.ids([primary]) <= _listed(recovery)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, {"Gemini"}),
+        # Primary-approval opening, panel launch without the primary: the gate is not a peer.
+        ({"extra": ("Codex", "approved", 0)}, {"Gemini"}),
+        # Operator opening: the primary's body is a peer.
+        ({"extra": ("Codex", "approved", 0), "opening": "operator"}, {"Gemini", "Codex"}),
+        # The primary is relaunched: nothing is excluded.
+        ({"extra": ("Codex", "approved", 0), "launching": ("Codex", "Gemini")}, {"Gemini", "Codex"}),
+        # A remediation (non-gating) launch never excludes.
+        ({"extra": ("Codex", "approved", 0), "phase": "remediation"}, {"Gemini", "Codex"}),
+        # A blocking primary review is not a gating approval.
+        ({"extra": ("Codex", "blocking", 0)}, {"Gemini", "Codex"}),
+        # Posted after this invocation's checkpoint: not the gate.
+        ({"extra": ("Codex", "approved", 7)}, {"Gemini", "Codex"}),
+    ],
+)
+def test_visible_peer_names_excludes_only_the_gating_primary_review(kwargs, expected):
+    from coding_review_agent_loop.round_visibility import visible_peer_names
+    from coding_review_agent_loop.round_state import PostedRoundRecord
+
+    def record(index, agent, state="approved"):
+        return PostedRoundRecord(
+            index=index,
+            metadata=_Metadata(
+                flow="pr", role="reviewer", agent=agent, round_number=1, subject="h",
+                state=state, phase="publication",
+            ),
+            body="",
+        )
+
+    records = [record(2, "Gemini")]
+    if "extra" in kwargs:
+        agent, state, index = kwargs["extra"]
+        records.append(record(index, agent, state))
+    names = visible_peer_names(
+        records,
+        opening_source=kwargs.get("opening", "primary-approval"),
+        flow="pr", round_number=1, subject="h", reviewer_names=("Codex", "Gemini"),
+        primary_reviewer="Codex", launch_phase=kwargs.get("phase", "final-secondary-sweep"),
+        launching=kwargs.get("launching", ("Gemini",)), checkpoint_index=3,
+    )
+    assert names == expected
