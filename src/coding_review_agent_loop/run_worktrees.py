@@ -300,10 +300,12 @@ def _linked_worktrees(store: Path, runner: Any) -> list[dict[str, str]]:
 def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) -> None:
     from .config import _is_stale_default_workdir, _validate_repo_remote
 
-    if store.is_dir() and (store / ".git").exists():
+    has_git = store.is_dir() and (store / ".git").exists()
+    if has_git:
         _git(runner, store, "worktree", "prune", check=False)
     if store.is_dir() and _is_stale_default_workdir(store):
-        if len(_linked_worktrees(store, runner)) > 1:
+        # Without a .git there can be no linked worktrees, so skip the enumeration.
+        if has_git and len(_linked_worktrees(store, runner)) > 1:
             pass  # live linked worktrees: never delete the store under them
         elif not free:
             raise AgentLoopError(_held_store_message(store, "is stale and cannot be recreated"))

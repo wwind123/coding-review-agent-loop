@@ -312,6 +312,12 @@ def test_run_end_removes_worktree(tmp_path, monkeypatch):
     prepare(after, Runner())  # startup prune completes the cleanup and drops the record
     assert not stuck_record.exists()
 
+    # A stale store with no .git (only tool artifacts) is re-cloned, not aborted.
+    shutil.rmtree(store)
+    (store / ".agent-loop-logs").mkdir(parents=True)
+    prepare(env.config(), Runner())
+    assert (store / ".git").is_dir()
+
     # A failing run removes its worktree too and its own exception propagates.
     failing = env.config()
     with pytest.raises(RuntimeError, match="boom"):
