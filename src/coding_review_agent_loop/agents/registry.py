@@ -155,12 +155,31 @@ def run_agent_result(
     )
     if attempt_suffix is not None:
         kwargs["attempt_suffix"] = attempt_suffix
-    result = get_backend(agent).run(
-        runner,
-        config,
-        prompt,
-        **kwargs,
+    from .. import checkout_verification
+
+    # Verify the assigned checkout before the backend can spawn, on every
+    # attempt (retries, replays and fallbacks all re-enter here).  Tool-isolated
+    # roles run in a temporary non-checkout directory; dry-run touches nothing.
+    checked = not getattr(runner, "dry_run", False) and role not in (
+        checkout_verification.TOOL_ISOLATED_ROLES
     )
+    checkout = get_backend(agent).workdir(config)
+    if checked:
+        checkout_verification.verify_checkout(
+            config, runner, path=checkout, agent=agent, purpose=f"{role or 'agent'} turn"
+        )
+    try:
+        result = get_backend(agent).run(
+            runner,
+            config,
+            prompt,
+            **kwargs,
+        )
+    finally:
+        if checked:
+            checkout_verification.record_checkout_baseline(
+                config, runner, checkout, source=f"{agent} {role or 'agent'} turn"
+            )
     # Capture the coder's broker turn immediately. A later semantic repair
     # runs with containment role ``repair`` and creates a fresh broker turn;
     # that repair turn must not replace the handles issued by this response.

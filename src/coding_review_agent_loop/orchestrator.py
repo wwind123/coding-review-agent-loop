@@ -117,6 +117,7 @@ from .protocol import EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNI
 from .child_topology import NeedsHumanDecision, NestedTopologyDecision, parent_child_search_queries
 from .errors import (
     AgentInvocationError,
+    CheckoutVerificationError,
     AgentLoopError,
     DeterministicPlanValidationExhaustion,
     FreshContractIntegrityError,
@@ -5879,6 +5880,10 @@ def _derive_authenticated_risk_evidence_for_coder(
                 row_ids=approved_plan_context.risk_test_matrix_expected_row_ids,
                 execution_catalog=catalog,
             )
+        except CheckoutVerificationError:
+            # A corrupted assigned checkout is a fail-closed run failure, never
+            # a recoverable "correction unavailable" (#1130).
+            raise
         except Exception as exc:
             corrected = None
             correction_error = f"semantic correction unavailable: {type(exc).__name__}"

@@ -24,10 +24,14 @@ emits no token usage (usage falls back to the estimated path).
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import errno
+import hashlib
+import os
 from pathlib import Path
 import re
+import stat as stat_module
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from .base import (
     AgentName,
@@ -39,7 +43,7 @@ from .base import (
     with_public_response_file_instruction,
 )
 from .replacement import classify_provider_executable_replacement_interruption
-from ..errors import AgentLoopError
+from ..errors import AgentLoopError, CheckoutVerificationError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
 from ..runner import CommandResult, Runner, strip_ansi
@@ -98,6 +102,305 @@ def _git_lock_path(workdir: Path) -> Path:
     # No .git directory yet (e.g. test tmp dirs) — create it.
     git_path.mkdir(parents=True, exist_ok=True)
     return git_path / "GEMINI.md.lock"
+
+
+# ---------------------------------------------------------------------------
+# GEMINI.md ownership header and the one safe accessor (#1130).
+#
+# agent-loop prepends an injection to <checkout>/GEMINI.md for the duration of a
+# turn.  A killed run leaves it behind, so the injection is self-describing:
+# a header line records whether the file pre-existed and the exact byte length
+# and sha256 of the injected body.  Only header+body bytes are ever removed.
+# Every agent-loop access to the file goes through the fd-relative accessor
+# below, which touches only a regular, non-symlink file.
+# ---------------------------------------------------------------------------
+
+GEMINI_MD_NAME = "GEMINI.md"
+_GEMINI_HEADER_RE = re.compile(
+    rb"<!-- agent-loop gemini injection v1 orig=(absent|present) bytes=(\d+) sha256=([0-9a-f]{64}) -->\n"
+)
+_LEGACY_BASE_RE = re.compile(r"`git diff ([^`<>\s]+)\.\.\.HEAD`")
+
+
+class SafeGeminiAccessError(AgentLoopError):
+    """GEMINI.md is not a plain regular file (or was swapped during access)."""
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind  # "type" (symlink/dir/fifo/...) or "swapped"
+
+
+@dataclass(frozen=True)
+class ParsedGeminiInjection:
+    orig: str  # "absent" | "present"
+    prefix_len: int  # header + body bytes
+    remainder: bytes
+
+
+def build_gemini_injection(body: str, *, orig: str) -> bytes:
+    body_bytes = body.encode("utf-8")
+    header = (
+        f"<!-- agent-loop gemini injection v1 orig={orig} bytes={len(body_bytes)} "
+        f"sha256={hashlib.sha256(body_bytes).hexdigest()} -->\n"
+    )
+    return header.encode("ascii") + body_bytes
+
+
+def parse_gemini_injection(data: bytes) -> ParsedGeminiInjection | None:
+    match = _GEMINI_HEADER_RE.match(data)
+    if match is None:
+        return None
+    length = int(match.group(2))
+    body = data[match.end() : match.end() + length]
+    if len(body) != length or hashlib.sha256(body).hexdigest() != match.group(3).decode("ascii"):
+        return None
+    prefix_len = match.end() + length
+    return ParsedGeminiInjection(match.group(1).decode("ascii"), prefix_len, data[prefix_len:])
+
+
+def _open_root(root: Path) -> int:
+    return os.open(os.fspath(root), os.O_RDONLY | os.O_DIRECTORY)
+
+
+def _lstat_gemini(root_fd: int) -> os.stat_result | None:
+    try:
+        return os.lstat(GEMINI_MD_NAME, dir_fd=root_fd)
+    except FileNotFoundError:
+        return None
+
+
+def _describe_type(mode: int) -> str:
+    for check, name in (
+        (stat_module.S_ISLNK, "symlink"),
+        (stat_module.S_ISDIR, "directory"),
+        (stat_module.S_ISFIFO, "fifo"),
+        (stat_module.S_ISSOCK, "socket"),
+        (stat_module.S_ISCHR, "character device"),
+        (stat_module.S_ISBLK, "block device"),
+    ):
+        if check(mode):
+            return name
+    return "non-regular file"
+
+
+def _safe_read_fd(root_fd: int, root: Path) -> tuple[bytes, os.stat_result] | None:
+    before = _lstat_gemini(root_fd)
+    if before is None:
+        return None
+    if not stat_module.S_ISREG(before.st_mode):
+        raise SafeGeminiAccessError(
+            f"{root / GEMINI_MD_NAME} is a {_describe_type(before.st_mode)}, not a regular file; "
+            "refusing to read, write or remove it.",
+            kind="type",
+        )
+    try:
+        fd = os.open(
+            GEMINI_MD_NAME,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY,
+            dir_fd=root_fd,
+        )
+    except OSError as exc:
+        raise SafeGeminiAccessError(
+            f"{root / GEMINI_MD_NAME} changed while it was being opened ({exc}).", kind="swapped"
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat_module.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise SafeGeminiAccessError(
+                f"{root / GEMINI_MD_NAME} was swapped for a {_describe_type(opened.st_mode)} "
+                "while it was being opened.",
+                kind="swapped",
+            )
+        with os.fdopen(os.dup(fd), "rb") as handle:
+            return handle.read(), opened
+    finally:
+        os.close(fd)
+
+
+def safe_read_gemini_md(root: Path) -> tuple[bytes, os.stat_result] | None:
+    """Return (bytes, stat) of a regular GEMINI.md, None when absent."""
+    root_fd = _open_root(root)
+    try:
+        return _safe_read_fd(root_fd, root)
+    finally:
+        os.close(root_fd)
+
+
+def safe_write_gemini_md(root: Path, data: bytes, *, expect: os.stat_result | None) -> None:
+    """Create (``expect is None``) or atomically replace the regular GEMINI.md."""
+    root_fd = _open_root(root)
+    try:
+        if expect is None:
+            try:
+                fd = os.open(
+                    GEMINI_MD_NAME,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o644,
+                    dir_fd=root_fd,
+                )
+            except OSError as exc:
+                raise SafeGeminiAccessError(
+                    f"{root / GEMINI_MD_NAME} appeared while it was being created ({exc}).",
+                    kind="swapped",
+                ) from exc
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            return
+        tmp_name = f".GEMINI.md.agent-loop.{os.getpid()}.tmp"
+        tmp_fd = os.open(
+            tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=root_fd
+        )
+        try:
+            with os.fdopen(tmp_fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fchmod(handle.fileno(), stat_module.S_IMODE(expect.st_mode))
+                os.fsync(handle.fileno())
+            current = _lstat_gemini(root_fd)
+            if (
+                current is None
+                or not stat_module.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != (expect.st_dev, expect.st_ino)
+            ):
+                raise SafeGeminiAccessError(
+                    f"{root / GEMINI_MD_NAME} was swapped before it could be rewritten; "
+                    "leaving the replacement untouched.",
+                    kind="swapped",
+                )
+            os.replace(tmp_name, GEMINI_MD_NAME, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp_name, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        os.close(root_fd)
+
+
+def safe_unlink_gemini_md(root: Path, *, expect: os.stat_result) -> None:
+    root_fd = _open_root(root)
+    try:
+        current = _lstat_gemini(root_fd)
+        if (
+            current is None
+            or not stat_module.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (expect.st_dev, expect.st_ino)
+        ):
+            raise SafeGeminiAccessError(
+                f"{root / GEMINI_MD_NAME} was swapped before it could be removed; "
+                "leaving the replacement untouched.",
+                kind="swapped",
+            )
+        os.unlink(GEMINI_MD_NAME, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _restore_without_prefix(
+    root: Path, *, remainder: bytes, keep_empty: bool, stat_result: os.stat_result
+) -> None:
+    if remainder or keep_empty:
+        safe_write_gemini_md(root, remainder, expect=stat_result)
+    else:
+        safe_unlink_gemini_md(root, expect=stat_result)
+
+
+def strip_gemini_injection(root: Path) -> bool:
+    """Remove a verified injection header+body; keep every other byte."""
+    found = safe_read_gemini_md(root)
+    if found is None:
+        return False
+    data, st = found
+    parsed = parse_gemini_injection(data)
+    if parsed is None:
+        return False
+    _restore_without_prefix(
+        root, remainder=parsed.remainder, keep_empty=parsed.orig == "present", stat_result=st
+    )
+    return True
+
+
+def _legacy_injection_length(data: bytes) -> int | None:
+    """Length of an exact pre-header single-shot prefix, else None."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not text.startswith("# Agent Loop Single-Shot Session"):
+        return None
+    match = _LEGACY_BASE_RE.search(text)
+    candidates = [single_shot_session_instruction(match.group(1) if match else None)]
+    candidates.append(single_shot_session_instruction(None))
+    for candidate in candidates:
+        if text.startswith(candidate):
+            return len(candidate.encode("utf-8"))
+    return None
+
+
+def recover_stale_gemini_injection(checkout: Path, *, is_tracked: "Callable[[], bool]") -> bool:
+    """Remove a killed run's leftover injection under the backend's GEMINI lock.
+
+    Returns True when GEMINI.md was changed.  A non-regular GEMINI.md is left
+    alone (ordinary verification reports it); a swap during access, or a
+    concurrent holder of the GEMINI lock, refuses with CheckoutVerificationError.
+    """
+    import fcntl
+
+    root_fd = _open_root(checkout)
+    try:
+        if _lstat_gemini(root_fd) is None:
+            return False
+    finally:
+        os.close(root_fd)
+    lock_file = _git_lock_path(checkout).open("a+")
+    try:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CheckoutVerificationError(
+                f"{checkout / GEMINI_MD_NAME} may hold an agent-loop injection, but another "
+                "process currently holds the GEMINI lock (a concurrent holder is writing in "
+                "this checkout); refusing to touch it."
+            ) from exc
+        try:
+            found = safe_read_gemini_md(checkout)
+        except SafeGeminiAccessError as exc:
+            if exc.kind == "type":
+                return False
+            raise CheckoutVerificationError(str(exc)) from exc
+        if found is None:
+            return False
+        data, st = found
+        try:
+            parsed = parse_gemini_injection(data)
+            if parsed is not None:
+                _restore_without_prefix(
+                    checkout,
+                    remainder=parsed.remainder,
+                    keep_empty=parsed.orig == "present",
+                    stat_result=st,
+                )
+                return True
+            legacy_len = _legacy_injection_length(data)
+            if legacy_len is None:
+                return False
+            remainder = data[legacy_len:]
+            _restore_without_prefix(
+                checkout,
+                remainder=remainder,
+                keep_empty=not remainder and is_tracked(),
+                stat_result=st,
+            )
+            return True
+        except SafeGeminiAccessError as exc:
+            raise CheckoutVerificationError(str(exc)) from exc
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
 
 _REVIEWER_QUOTED_COMMAND_RULE = (
@@ -411,7 +714,6 @@ class AntigravityBackend:
         # _git_lock_path into git metadata, not the worktree) serializes the entire
         # inject→run→strip sequence across concurrent processes sharing the same
         # default per-repo workdir.
-        gemini_md_path = config.antigravity_dir / "GEMINI.md"
         gemini_lock_path = (
             config.antigravity_dir.parent / f".{config.antigravity_dir.name}.GEMINI.md.lock"
             if role == "repair"
@@ -439,15 +741,12 @@ class AntigravityBackend:
         result: CommandResult | None = None
 
         def strip_injected_prefix() -> None:
-            if not gemini_md_path.exists():
-                return
-            current = gemini_md_path.read_text(encoding="utf-8")
-            if current.startswith(injected_gemini_prefix):
-                remainder = current[len(injected_gemini_prefix):]
-                if remainder:
-                    gemini_md_path.write_text(remainder, encoding="utf-8")
-                else:
-                    gemini_md_path.unlink()
+            # Only a verified header+body is removed; anything swapped or
+            # non-regular during the turn is left for the post-turn probe.
+            try:
+                strip_gemini_injection(config.antigravity_dir)
+            except SafeGeminiAccessError as exc:
+                log(config, f"Not touching GEMINI.md after the turn: {exc}")
 
         settings_was_injected = role in {"reviewer", "repair"}
         original_settings_text: str | None = None
@@ -492,13 +791,25 @@ class AntigravityBackend:
                     )
                 try:
                     try:
-                        existing_gemini = gemini_md_path.read_text(encoding="utf-8")
-                    except FileNotFoundError:
-                        existing_gemini = None
-                    gemini_md_path.write_text(
-                        injected_gemini_prefix + (existing_gemini or ""),
-                        encoding="utf-8",
+                        existing_gemini = safe_read_gemini_md(config.antigravity_dir)
+                    except SafeGeminiAccessError as exc:
+                        raise CheckoutVerificationError(
+                            f"Refusing to start the Antigravity turn: {exc}"
+                        ) from exc
+                    injection = build_gemini_injection(
+                        injected_gemini_prefix,
+                        orig="absent" if existing_gemini is None else "present",
                     )
+                    try:
+                        safe_write_gemini_md(
+                            config.antigravity_dir,
+                            injection + (existing_gemini[0] if existing_gemini else b""),
+                            expect=existing_gemini[1] if existing_gemini else None,
+                        )
+                    except SafeGeminiAccessError as exc:
+                        raise CheckoutVerificationError(
+                            f"Refusing to start the Antigravity turn: {exc}"
+                        ) from exc
                     result = runner.run_with_log(
                         args,
                         cwd=config.antigravity_dir,

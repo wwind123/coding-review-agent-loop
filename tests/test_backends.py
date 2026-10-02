@@ -1394,8 +1394,19 @@ def test_default_and_dangerous_backend_argv_unchanged(tmp_path, mode, role):
     assert not Path(last_message).exists()
 
 
+@pytest.fixture
+def stub_checkout_fingerprint(monkeypatch):
+    """Sandboxed turns probe through the hardened git runner, which needs a real checkout."""
+    from coding_review_agent_loop import checkout_verification as cv
+
+    fingerprint = cv.CheckoutFingerprint("main", "0" * 40, (), ())
+    monkeypatch.setattr(cv, "capture_fingerprint", lambda config, runner, path: fingerprint)
+
+
 @pytest.mark.parametrize("returncode", [1, 2])
-def test_sandboxed_codex_nonzero_exit_artifact_is_salvaged(tmp_path, monkeypatch, returncode):
+def test_sandboxed_codex_nonzero_exit_artifact_is_salvaged(
+    tmp_path, monkeypatch, returncode, stub_checkout_fingerprint
+):
     from coding_review_agent_loop import agent_permissions
     from coding_review_agent_loop.orchestrator import _run_validated_agent
     import tempfile as tempfile_module
@@ -1426,7 +1437,9 @@ def test_sandboxed_codex_nonzero_exit_artifact_is_salvaged(tmp_path, monkeypatch
     assert response.text == "VALID artifact"
 
 
-def test_sandboxed_codex_timeout_without_artifact_is_not_salvaged(tmp_path, monkeypatch):
+def test_sandboxed_codex_timeout_without_artifact_is_not_salvaged(
+    tmp_path, monkeypatch, stub_checkout_fingerprint
+):
     from coding_review_agent_loop import agent_permissions
     from coding_review_agent_loop.errors import AgentInvocationError
     from coding_review_agent_loop.orchestrator import _run_validated_agent

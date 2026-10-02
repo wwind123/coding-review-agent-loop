@@ -96,7 +96,7 @@ Source paths below are relative to
 | --- | --- | --- |
 | Entry points and effective configuration | `cli.py`, `config.py` | Parse modes; resolve role-specific models, effort, base, and policy before invocation. |
 | Lifecycle coordination | `orchestrator.py` | Compose planning, implementation, review, recovery, and finalization; do not delegate control decisions to free-form agent prose. |
-| Checkout identity | `workdirs.py`, `workdir_guard.py`, `workdir_claims.py` | Prepare assigned checkouts and validate repository/head and reported test locations. `workdir_claims.py` holds a run-scoped cross-process claim on each required checkout; cleanup and reset happen only under this run's claim. |
+| Checkout identity | `workdirs.py`, `workdir_guard.py`, `workdir_claims.py`, `checkout_verification.py` | Prepare assigned checkouts and validate repository/head and reported test locations. `workdir_claims.py` holds a run-scoped cross-process claim on each required checkout; cleanup and reset happen only under this run's claim. `checkout_verification.py` is the in-process pre-turn gate: it verifies that an assigned checkout still matches what agent-loop last left in it. |
 | Agent-facing context | `prompts.py`, `memory.py` | Render issue/plan/human/feedback context and advisory repository orientation. |
 | Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
@@ -1096,6 +1096,38 @@ workdirs are shared by repo/backend, and there is no repository-wide process
 lock enforcing this convention. Parallel reviewers within one invocation are
 supported; the orchestrator verifies distinct reviewer workdirs. Coder and
 reviewer turns are separate lifecycle stages even when they use the same CLI.
+
+**Pre-turn checkout verification.** A claim protects against another
+agent-loop run, not against an operator, editor or stray script writing to the
+same directory. `run_agent_result` therefore verifies the assigned checkout
+before every checked agent turn (every attempt, including retries,
+executable-replacement replays and Antigravity fallbacks) and fails closed with
+`CheckoutVerificationError`, naming the expected and observed branch/HEAD and
+each unexpected path. The in-process ledger in `checkout_verification.py` keeps
+one fingerprint per checkout: branch, HEAD, staged blob identity and a content
+identity (sha256, or stat identity beyond the 16 MiB per-file / 512 MiB total
+hash budget) for every dirty path, with each untracked file listed
+individually and paths handled as raw bytes. Probes use `--no-renames`, go
+through the hardened git runner in sandboxed mode, and never open a symlinked
+ancestor, FIFO, socket or device. Verification never resets, cleans, stashes
+or deletes foreign changes. The baseline is established by startup preparation,
+verified before every between-turn sync (before any reset or clean) and every
+real test gate, and refreshed only afterwards; a gate adopts only new
+artifacts. Each completed turn refreshes it, and a post-turn capture that
+fails, or exceeds the 100,000-path cap, poisons the entry so a later
+clean-but-wrong checkout is refused rather than adopted. `semantic-dedupe` and
+`repair` (tool-owned temporary directories) and dry-run are exempt. Explicit
+agent directories must be existing git checkouts. Foreign writes *during* a
+turn are absorbed into the refreshed baseline; excluding them is the claim's
+responsibility. Session-scoped default paths remain a separate decision (#1162).
+
+The Antigravity `GEMINI.md` injection carries a self-describing header
+(`orig`, body byte length and sha256) so a leftover from a killed run is
+recognised as tool-owned in both the per-turn check and the startup dirty
+check, and only the verified header and body are removed. Every agent-loop
+access to `GEMINI.md` goes through one fd-relative accessor that touches only a
+regular, non-symlink file, and stale recovery takes the backend's non-blocking
+`GEMINI.md` lock first.
 
 On supported Linux/systemd/cgroup-v2 hosts, containment bounds aggregate and
 role-specific process trees. The portable process-group fallback can terminate

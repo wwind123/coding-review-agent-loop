@@ -169,25 +169,25 @@ def build_parser() -> argparse.ArgumentParser:
             "--claude-dir",
             type=Path,
             default=None,
-            help="Claude checkout. Defaults to a repo-scoped temporary checkout when Claude is active.",
+            help="Claude checkout. Defaults to a repo-scoped temporary checkout when Claude is active. An explicit directory must be an existing, clean git checkout.",
         )
         subparser.add_argument(
             "--codex-dir",
             type=Path,
             default=None,
-            help="Codex checkout. Defaults to a repo-scoped temporary checkout when Codex is active.",
+            help="Codex checkout. Defaults to a repo-scoped temporary checkout when Codex is active. An explicit directory must be an existing, clean git checkout.",
         )
         subparser.add_argument(
             "--gemini-dir",
             type=Path,
             default=None,
-            help="Gemini checkout. Defaults to a repo-scoped temporary checkout when Gemini is active.",
+            help="Gemini checkout. Defaults to a repo-scoped temporary checkout when Gemini is active. An explicit directory must be an existing, clean git checkout.",
         )
         subparser.add_argument(
             "--antigravity-dir",
             type=Path,
             default=None,
-            help="Antigravity (agy) checkout. Defaults to a repo-scoped temporary checkout when Antigravity is active.",
+            help="Antigravity (agy) checkout. Defaults to a repo-scoped temporary checkout when Antigravity is active. An explicit directory must be an existing, clean git checkout.",
         )
         subparser.add_argument(
             "--coder",

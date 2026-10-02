@@ -13,6 +13,14 @@ class AgentLoopError(RuntimeError):
     """Raised for expected orchestration failures."""
 
 
+class CheckoutVerificationError(AgentLoopError):
+    """An assigned checkout no longer matches what agent-loop last left in it.
+
+    Fail-closed and non-retryable: the checkout was changed outside agent-loop
+    (or could not be inspected), so no agent turn may start in it.
+    """
+
+
 class HumanDecisionRequiredError(AgentLoopError):
     """The run reached a deliberate operator decision boundary."""
 

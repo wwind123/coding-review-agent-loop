@@ -924,6 +924,23 @@ class FakeRunner(Runner):
             return payload
         return self.pr_payload
 
+    def run_binary(self, args, *, cwd, max_bytes=None, check=True, env=None):
+        """Answer checkout-verification probes as a clean checkout; defer the rest."""
+        cmd = [str(arg) for arg in args]
+        if cmd[:1] == ["git"] and cmd[1:3] in (["rev-parse", "--abbrev-ref"], ["rev-parse", "HEAD"], ["status", "--porcelain"], ["diff", "--cached"], ["ls-files", "-z"]):
+            from coding_review_agent_loop.runner import BinaryCommandResult
+
+            if cmd[1:3] == ["rev-parse", "--abbrev-ref"]:
+                stdout = b"main\n"
+            elif cmd[1:3] == ["rev-parse", "HEAD"]:
+                # One scripted head is shared by every fake checkout, so a coder
+                # commit would look like foreign movement in a reviewer checkout.
+                stdout = b"fake-checkout-head\n"
+            else:
+                stdout = b""
+            return BinaryCommandResult(cmd, Path(cwd), stdout, b"", 0)
+        return super().run_binary(args, cwd=cwd, max_bytes=max_bytes, check=check, env=env)
+
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         with self._scripted_lock:
             cmd = [str(arg) for arg in args]

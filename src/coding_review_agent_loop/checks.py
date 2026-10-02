@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .checkout_verification import gate_window
 from .ci_health import CiInfrastructureStall
 from .config import AgentLoopConfig
 from .github import PullRequestChecks
@@ -18,11 +19,13 @@ def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
     runner.configure_from_config(config)
     runner.set_containment_role("test-gate")
     log(config, f"Running local test command: {' '.join(config.test_command)}")
-    result = runner.run_test_command(
-        config.test_command,
-        cwd=active_workdir(config),
-        timeout_seconds=config.coder_test_command_timeout_seconds,
-    )
+    workdir = active_workdir(config)
+    with gate_window(config, runner, path=workdir):
+        result = runner.run_test_command(
+            config.test_command,
+            cwd=workdir,
+            timeout_seconds=config.coder_test_command_timeout_seconds,
+        )
     _record_gate_observation(config, result)
     _raise_for_gate_result(result, config)
     log(config, "Local test command passed")
@@ -34,11 +37,13 @@ def run_pre_review_tests(runner: Runner, config: AgentLoopConfig) -> None:
     runner.configure_from_config(config)
     runner.set_containment_role("test-gate")
     log(config, f"Running pre-review test command: {' '.join(config.test_command)}")
-    result = runner.run_test_command(
-        config.test_command,
-        cwd=active_workdir(config),
-        timeout_seconds=config.coder_test_command_timeout_seconds,
-    )
+    workdir = active_workdir(config)
+    with gate_window(config, runner, path=workdir):
+        result = runner.run_test_command(
+            config.test_command,
+            cwd=workdir,
+            timeout_seconds=config.coder_test_command_timeout_seconds,
+        )
     _record_gate_observation(config, result)
     _raise_for_gate_result(result, config)
     log(config, "Pre-review test command passed")
