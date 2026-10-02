@@ -3057,7 +3057,7 @@ def _fetch_protocol_comment_envelope(
     """Re-read one stored comment when a write response omits its envelope."""
     result = runner.run(
         [config.gh_cmd, "api", f"repos/{config.repo}/issues/comments/{comment_id}"],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0:
@@ -3218,7 +3218,7 @@ def post_verified_trusted_pr_protocol_comment_observed(
             "-f",
             f"body={body}",
         ],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0:

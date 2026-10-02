@@ -12851,6 +12851,53 @@ def test_run_pr_loop_resume_with_missing_default_checkout_clones_it(tmp_path, mo
         for command, _cwd in runner.commands
     )
     assert default_checkout.is_dir()
+    # No GitHub write may precede checkout setup on an ordinary resume.
+    assert not [
+        command for command, _cwd in runner.commands
+        if command[:2] == ["gh", "api"]
+        and any(part in command for part in ("POST", "PATCH", "PUT", "DELETE"))
+    ]
+    assert runner.comments == []
+
+
+def test_run_pr_loop_fresh_resume_with_missing_default_checkout_publishes_and_clones(
+    tmp_path, monkeypatch,
+):
+    runner = _workflow_runner_for_issue_authorization(None, labeled=False)
+    default_checkout = tmp_path / "claude" / "repo"
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path, create_dirs=False, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=643,
+        claude_dir=default_checkout, codex_dir=codex_dir,
+        auto_agent_dirs=("claude",), agent_memory=False,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-fresh",
+            "--managed-ci-issue", "643", "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+
+    def stop_after_clone(*_args, **_kwargs):
+        raise _CheckoutSetupReached
+
+    monkeypatch.setattr("coding_review_agent_loop.config._sync_base_branch", stop_after_clone)
+
+    with pytest.raises(_CheckoutSetupReached):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config)
+
+    # A new grant was actually published (a write) before checkout setup,
+    # from a directory that is not the missing checkout.
+    writes = [
+        cwd for command, cwd in runner.commands
+        if command[:2] == ["gh", "api"] and "POST" in command
+        and any("issues/7/comments" in part for part in command)
+    ]
+    assert writes
+    assert all(cwd.is_dir() and cwd != default_checkout for cwd in writes)
+    assert default_checkout.is_dir()
 
 
 def test_api_json_runs_from_a_directory_that_is_not_an_agent_checkout(tmp_path):
