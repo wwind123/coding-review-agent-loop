@@ -4017,10 +4017,13 @@ def _remediation_gate_state(tmp_path, monkeypatch):
 
 
 def _remediation_phases(runner):
-    return [
-        r.scheduler_phase for r in _records(runner, flow="pr", surface="pr")
+    """Scheduler phases posted for the new head, asserting they all sit in one round."""
+    records = [
+        r for r in _records(runner, flow="pr", surface="pr")
         if r.subject == "def456" and r.phase == "scheduler-prelaunch"
     ]
+    assert len({r.round_number for r in records}) <= 1, "the run advanced to another round"
+    return [r.scheduler_phase for r in records]
 
 
 def test_pr_remediation_gate_resumed_into_a_same_round_final_sweep_launches_the_sweep(
@@ -4041,6 +4044,10 @@ def test_pr_remediation_gate_resumed_into_a_same_round_final_sweep_launches_the_
         if r.subject == "def456" and r.role == "reviewer" and r.agent == "Codex"
     ]
     assert len(primary) == 1
+    assert {r.round_number for r in primary} == {
+        r.round_number for r in _records(runner, flow="pr", surface="pr")
+        if r.subject == "def456" and r.scheduler_phase == "final-secondary-sweep"
+    }
 
 
 def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, monkeypatch):
@@ -4070,3 +4077,17 @@ def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, m
     assert ("reviewer", "Gemini", "final-secondary-sweep") in listed
     # The primary's remediation approval gates the sweep and is retained.
     assert not any(agent == "Codex" for _role, agent, _phase in listed)
+
+
+def test_recovery_lists_a_secondary_remediation_verdict_beside_the_retained_gate():
+    """A secondary's remediation-phase verdict is a peer for a same-round sweep; the primary's is the gate."""
+    history = _History()
+    _a, gate = history.add_record(_meta(agent="Codex", scheduler_phase="remediation"))
+    _b, owner = history.add_record(_meta(agent="Gemini", scheduler_phase="remediation"))
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch"))
+
+    recovery = _recover_with(history, _gate_context(launching=("Antigravity",)))
+
+    assert recovery.verified, recovery.reason
+    assert _listed(recovery) == history.ids([owner])
+    assert history.ids([gate]).isdisjoint(_listed(recovery))
