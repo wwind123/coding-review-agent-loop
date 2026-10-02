@@ -385,3 +385,30 @@ def test_external_push_after_freeze_releases_evidence_and_marks_broken_head():
     assert resumed.broken_evidence_freeze_head == _FROZEN_HEAD
     assert [item.lifecycle for item in resumed.prior_items] == ["evidence_deferred"]
     assert resumed.evidence_boundary.evidence_freeze.allowed_rounds == 5
+
+
+@pytest.mark.parametrize(
+    "phases, expected",
+    [
+        (("scheduler-prelaunch",), False),
+        (("scheduler-prelaunch", "reconciliation"), True),
+        (("authoritative",), True),  # legacy summary without a phase label
+    ],
+)
+def test_pr_round_reconciled_only_by_a_reconciliation_summary(phases, expected):
+    """Row leftover-reconciliation (#1142): prelaunch is a pre-reviewer checkpoint."""
+    records = [
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=1,
+            subject="head", state="approved", phase="publication",
+        ),
+        *(
+            PostedRoundMetadata(
+                flow="pr", role="summary", agent="Orchestrator", round_number=1,
+                subject="head", phase=phase,
+            )
+            for phase in phases
+        ),
+    ]
+    resumed = _resume_pr_round(_comments(*records), head_sha="head", configured_reviewers=("codex",))
+    assert resumed is not None and resumed.reconciled is expected

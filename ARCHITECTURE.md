@@ -536,7 +536,11 @@ and never synthesizes a planner turn. A planning round counts as reconciled only
 when it holds an actual reconciliation record: the `scheduler-prelaunch` and
 `plan-phase-advance` summaries are pre-reviewer checkpoints, so an interruption
 at either one resumes as an unsettled round that still reconstructs each
-published reviewer's numbered items, owners, and obligations. Resume also
+published reviewer's numbered items, owners, and obligations. A PR round follows
+the same rule: only an actual reconciliation summary marks it reconciled, and its
+`scheduler-prelaunch` summary (also the secondary-audit panel opening) is a
+pre-reviewer checkpoint. The partial-round refusal relies on this to list the
+comments whose deletion lets a half-published round rerun (#1142). Resume also
 rebuilds the transition classifier's authenticated inputs — the durable
 `semantic-patch-v1` payload and the cross-cutting contracts of the state that
 patch was bound to — from the coder records themselves, so an interruption

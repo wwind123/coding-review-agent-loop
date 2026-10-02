@@ -149,6 +149,9 @@ class ReviewRoundSpool:
             return None
         return {name: response.get(name) for name in SPOOLED_RESPONSE_FIELDS}
 
+    def record_exists(self, reviewer_name: str) -> bool:
+        return self._path(reviewer_name).exists()
+
     def has_records(self) -> bool:
         try:
             return any(self.directory.glob("*.json"))

@@ -671,6 +671,7 @@ from .review_scheduling import (
     select_reviewers,
     undecodable_history_message,
 )
+from .partial_round_recovery import PartialRoundRecovery, RecoveryTarget, compute_partial_round_recovery
 from .review_spool import ReviewRoundSpool, review_spool_root
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
@@ -12298,18 +12299,99 @@ class PartialReviewRoundError(AgentLoopError):
     """A reviewer would have to run while a same-round peer's body is public (#1025)."""
 
 
+def _replay_unavailable_cause(
+    spool: ReviewRoundSpool,
+    reviewer_name: str,
+    *,
+    own_posted: bool = False,
+    loaded_unreplayable: bool = False,
+) -> str:
+    """Why this reviewer's withheld outcome cannot be replayed (#1142)."""
+    if own_posted:
+        return (
+            f"{reviewer_name}'s own review for this round is already posted but no longer "
+            "accepted, so it needs a fresh turn and its withheld outcome cannot be replayed."
+        )
+    if loaded_unreplayable:
+        return f"{reviewer_name}'s spooled outcome no longer validates against this run."
+    if not spool.has_records():
+        return f"No review spool for this round exists on this host (looked under {spool.directory})."
+    if not spool.record_exists(reviewer_name):
+        return f"The round's review spool at {spool.directory} holds no outcome for {reviewer_name}."
+    if spool.load(reviewer_name) is None:
+        return (
+            f"{reviewer_name}'s spool file {spool._path(reviewer_name)} exists but is unreadable "
+            "or does not belong to this round."
+        )
+    return f"{reviewer_name}'s spooled outcome no longer validates against this run."
+
+
+def _format_recovery_target(target: RecoveryTarget) -> str:
+    if target.comment_id is None:
+        # A projection can carry a permalink without a numeric id; never print
+        # "comment None".
+        url = f" {target.url}" if target.url else ""
+        return (
+            f"- {target.label}: by {target.author or 'unknown author'}, created "
+            f"{target.created_at or 'unknown time'} (id could not be determined){url}"
+        )
+    return f"- {target.label}: comment {target.comment_id} {target.url or ''}".rstrip()
+
+
+def _render_recovery(recovery: PartialRoundRecovery) -> str:
+    lines: list[str] = []
+    if recovery.verified:
+        lines.append(
+            f"Delete these {len(recovery.targets)} comments so the whole round runs again "
+            "independently, then rerun:"
+        )
+        lines.extend(_format_recovery_target(t) for t in recovery.targets)
+        lines.append(
+            "Other comments (such as the incomplete-status notice) carry no round state for "
+            "this round and need not be deleted."
+        )
+    else:
+        lines.append(
+            "The comments below are a provisional list that could not be verified as a "
+            f"sufficient deletion set ({recovery.reason or 'unverified'}); inspect the "
+            "round's records before deleting."
+        )
+        lines.extend(_format_recovery_target(t) for t in recovery.targets)
+        if recovery.uncertain:
+            lines.append("Unreferenced attachments possibly from this round, not verified:")
+            lines.extend(_format_recovery_target(t) for t in recovery.uncertain)
+    return "\n".join(lines)
+
+
 def _partial_round_refusal(
-    *, surface: str, number: int, round_number: int, reviewer_name: str, public_peers: Sequence[str]
+    *,
+    surface: str,
+    number: int,
+    round_number: int,
+    reviewer_name: str,
+    public_peers: Sequence[str],
+    cause: str = "",
+    recovery: Callable[[], PartialRoundRecovery] | None = None,
 ) -> PartialReviewRoundError:
     target = f"PR #{number}" if surface == "pr" else f"issue #{number}"
-    return PartialReviewRoundError(
+    message = (
         f"Review round {round_number} on {target} is partially published "
         f"({', '.join(public_peers)} already posted) but {reviewer_name}'s withheld "
         "same-round outcome is missing or no longer validates, so invoking it now would "
-        "let it read its peers' findings. Rerun from the host whose agent-loop cache "
-        "holds the round's review spool, or delete the round's already-posted reviewer "
-        "comments so the whole round runs again independently."
+        "let it read its peers' findings."
     )
+    if cause:
+        message += f" {cause}"
+    if recovery is not None:
+        try:
+            listing = _render_recovery(recovery())
+        except Exception:  # the refusal type must never change
+            listing = (
+                "The round's comment list is unavailable; inspect the round's reviewer "
+                "verdicts, reconciliation records and attachments before deleting them."
+            )
+        message += "\n" + listing
+    return PartialReviewRoundError(message)
 
 
 def _replay_spooled_failure(fields: dict[str, object], reviewer_name: str) -> AgentInvocationError | None:
@@ -12327,6 +12409,8 @@ def _refuse_partial_round_before_sequential_turns(
     spool: ReviewRoundSpool,
     fresh_turn_reviewers: Sequence[AgentName],
     public_peers: Sequence[AgentName],
+    already_posted: Sequence[AgentName] = (),
+    recovery: Callable[[], PartialRoundRecovery] | None = None,
 ) -> None:
     """Stop before any sequential turn when one of them would face a public peer.
 
@@ -12342,6 +12426,10 @@ def _refuse_partial_round_before_sequential_turns(
             raise _partial_round_refusal(
                 surface=spool.surface, number=spool.number, round_number=spool.round_number,
                 reviewer_name=agent_display_name(reviewer), public_peers=peers,
+                cause=_replay_unavailable_cause(
+                    spool, agent_display_name(reviewer), own_posted=reviewer in already_posted
+                ),
+                recovery=recovery,
             )
 
 
@@ -12355,6 +12443,7 @@ def _same_round_replay_or_invoke(
     validators: dict[str, object],
     invoke: Callable[[], ValidatedAgentResponse],
     already_posted: bool = False,
+    recovery: Callable[[], PartialRoundRecovery] | None = None,
 ) -> ValidatedAgentResponse:
     """Sequential-mode seam: never invoke a reviewer against public same-round peers.
 
@@ -12380,6 +12469,11 @@ def _same_round_replay_or_invoke(
     raise _partial_round_refusal(
         surface=spool.surface, number=spool.number, round_number=spool.round_number,
         reviewer_name=reviewer_name, public_peers=sorted(peers),
+        cause=_replay_unavailable_cause(
+            spool, reviewer_name, own_posted=already_posted,
+            loaded_unreplayable=fields is not None,
+        ),
+        recovery=recovery,
     )
 
 
@@ -12400,6 +12494,7 @@ def _launch_reviewer_turns(
     already_posted: Sequence[AgentName] = (),
     max_workers: int | None = None,
     prepare_fallback: Callable[[AgentName], None] | None = None,
+    recovery: Callable[[], PartialRoundRecovery] | None = None,
 ) -> dict[AgentName, _ReviewerTurnResult]:
     """Run workers concurrently, then deliver results in completion order.
 
@@ -12470,6 +12565,12 @@ def _launch_reviewer_turns(
                 raise _partial_round_refusal(
                     surface=spool.surface, number=spool.number, round_number=spool.round_number,
                     reviewer_name=agent_display_name(reviewer), public_peers=peers,
+                    cause=_replay_unavailable_cause(
+                        spool, agent_display_name(reviewer),
+                        own_posted=reviewer in already_posted,
+                        loaded_unreplayable=reviewer in replay_fallbacks,
+                    ),
+                    recovery=recovery,
                 )
     if prepare_fallback is not None:
         for reviewer in [r for r in replay_fallbacks if r in to_launch]:
@@ -13954,6 +14055,26 @@ def _run_plan_first_loop(
             if (record := resumed_by_name.get(agent_display_name(reviewer))) is not None
             and record.metadata.phase == "publication"
         )
+        def _plan_round_recovery() -> PartialRoundRecovery:
+            return compute_partial_round_recovery(
+                snapshot=issue_context.comments,
+                read_rest=lambda: read_rest_issue_comments(
+                    runner, config=config, issue_number=issue_number,
+                    purpose="the partial review round's comment ids cannot be listed",
+                    reject_empty_output=True,
+                ),
+                flow="plan", round_number=round_number, subject=current_plan_subject,
+                scheduler_phase=None,
+                reviewer_names=[agent_display_name(r) for r in round_reviewers],
+                resume=lambda remaining: _resume_plan_round(
+                    remaining, configured_reviewers=configured_reviewers
+                ),
+                # The resumed plan subject must not shift after deletion.
+                fingerprint=lambda remaining: (
+                    lambda resumed: resumed[0] if resumed is not None else None
+                )(_resume_plan_round(remaining, configured_reviewers=configured_reviewers)),
+            )
+
         if not plan_round_parallel:
             _refuse_partial_round_before_sequential_turns(
                 spool=plan_round_spool,
@@ -13962,6 +14083,7 @@ def _run_plan_first_loop(
                     if resumed_by_name.get(agent_display_name(reviewer)) is None
                 ],
                 public_peers=plan_round_public_peers,
+                recovery=_plan_round_recovery,
             )
         if plan_round_parallel:
             pending_plan_reviewers = [
@@ -14084,6 +14206,7 @@ def _run_plan_first_loop(
                         validators=_plan_review_validators(agent_display_name(reviewer)),
                     ),
                     public_peers=plan_round_public_peers,
+                    recovery=_plan_round_recovery,
                     retry_bound=_plan_retry_bound,
                     max_workers=None if config.review_parallel else 1,
                     configured_order=round_reviewers,
@@ -14178,6 +14301,7 @@ def _run_plan_first_loop(
                     reviewer=reviewer,
                     spool=plan_round_spool,
                     public_peers=plan_round_public_peers,
+                    recovery=_plan_round_recovery,
                     validators=sequential_plan_validators,
                     invoke=lambda reviewer=reviewer, validators=sequential_plan_validators: _run_validated_agent(
                         runner,
@@ -24194,6 +24318,50 @@ def run_pr_loop(
             pr_round_parallel = (
                 config.review_parallel or pr_round_spool.has_records()
             ) and evidence_pass is None
+            def _pr_recovery_fingerprint(remaining: Sequence[object]) -> object:
+                """The qualified panel opening, identified by its comment, not its index."""
+                if not scheduler_capabilities.requires_primary:
+                    return None
+                evidence = _derive_pr_panel_evidence(
+                    _extract_round_metadata_records(remaining, flow="pr"),
+                    primary_reviewer=scheduler_contract.primary_reviewer,
+                    required_reviewers=scheduler_contract.required_reviewers,
+                )
+                opening = (
+                    remaining[evidence.opening_index]
+                    if evidence.opening_index is not None
+                    else None
+                )
+                return (
+                    evidence.opening_source,
+                    getattr(opening, "created_at", None),
+                    getattr(opening, "body", None),
+                )
+
+            def _pr_round_recovery() -> PartialRoundRecovery:
+                return compute_partial_round_recovery(
+                    snapshot=pr_comments,
+                    read_rest=lambda: read_rest_issue_comments(
+                        runner, config=config, issue_number=pr_number,
+                        purpose="the partial review round's comment ids cannot be listed",
+                        reject_empty_output=True,
+                    ),
+                    flow="pr", round_number=round_number, subject=current_pr_subject,
+                    scheduler_phase=pr_launch_phase,
+                    reviewer_names=[agent_display_name(r) for r in configured_reviewers],
+                    resume=lambda remaining: _resume_pr_round(
+                        remaining,
+                        head_sha=pr_metadata.head_sha,
+                        configured_reviewers=configured_reviewers,
+                        reconciliation_mode=(
+                            "owner-scoped"
+                            if scheduler_capabilities.owner_scoped_reconciliation
+                            else "aggregate"
+                        ),
+                    ),
+                    fingerprint=_pr_recovery_fingerprint,
+                )
+
             if not pr_round_parallel and not skip_reviewers_this_round and evidence_pass is None:
                 _refuse_partial_round_before_sequential_turns(
                     spool=pr_round_spool,
@@ -24202,6 +24370,11 @@ def run_pr_loop(
                         if _pr_reviewer_prelaunch_kind(reviewer) == "turn"
                     ],
                     public_peers=pr_same_batch_public_peers,
+                    already_posted=tuple(
+                        reviewer for reviewer in configured_reviewers
+                        if agent_display_name(reviewer) in completed_by_name
+                    ),
+                    recovery=_pr_round_recovery,
                 )
             if pr_round_parallel and not skip_reviewers_this_round:
                 pending_pr_reviewers = [
@@ -24420,6 +24593,7 @@ def run_pr_loop(
                                 validators=_pr_review_validators(agent_display_name(reviewer)),
                             ),
                             public_peers=pr_same_batch_public_peers,
+                            recovery=_pr_round_recovery,
                             retry_bound=_pr_retry_bound,
                             max_workers=None if config.review_parallel else 1,
                             # A spooled reviewer skipped the pre-review sync
@@ -24615,6 +24789,7 @@ def run_pr_loop(
                             reviewer=reviewer,
                             spool=pr_round_spool,
                             public_peers=pr_same_batch_public_peers,
+                            recovery=_pr_round_recovery,
                             validators=sequential_pr_validators,
                             already_posted=reviewer_name in completed_by_name,
                             invoke=lambda: _run_validated_agent(
