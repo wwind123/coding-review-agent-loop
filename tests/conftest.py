@@ -109,3 +109,13 @@ def _isolate_workdir_claims(tmp_path_factory):
     workdir_claims._set_claim_root_for_tests(tmp_path_factory.mktemp("workdir-claims"))
     yield
     workdir_claims._set_claim_root_for_tests(None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_store_locks(tmp_path_factory):
+    """Keep shared-store locks and owner records (#1162) off the real host lock root."""
+    from coding_review_agent_loop import run_worktrees
+
+    run_worktrees._set_store_lock_root_for_tests(tmp_path_factory.mktemp("workdir-stores"))
+    yield
+    run_worktrees._set_store_lock_root_for_tests(None)

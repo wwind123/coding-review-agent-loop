@@ -1,4 +1,5 @@
 from agent_loop_helpers import *  # noqa: F403
+from coding_review_agent_loop.config import default_run_worktree_root
 
 
 def test_antigravity_backend_command_and_prefers_response_file(tmp_path):
@@ -441,9 +442,11 @@ def test_config_from_args_antigravity_defaults(tmp_path):
         "overload", "no capacity", "temporarily at capacity",
     )
     assert config.antigravity_args == ("--dangerously-skip-permissions",)
-    assert config.antigravity_dir == default_agent_workdir("OWNER/REPO", "antigravity").resolve()
-    # antigravity is the coder -> primary/log dir lives under its checkout.
-    assert str(config.log_dir).startswith(str(config.antigravity_dir))
+    assert config.antigravity_dir.parent == default_run_worktree_root("OWNER/REPO", "antigravity").resolve()
+    assert dict(config.default_checkout_stores)["antigravity"] == default_agent_workdir("OWNER/REPO", "antigravity").resolve()
+    # The per-run worktree is removed at run end, so the log dir is durable and outside it.
+    assert config.antigravity_dir not in config.log_dir.parents
+    assert config.run_token in config.log_dir.parts
 
 def test_antigravity_quota_signatures_default_single_source(tmp_path):
     """The quota-signatures default comes from one constant — no drift across the

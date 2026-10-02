@@ -37,6 +37,7 @@ from coding_review_agent_loop.errors import HumanDecisionRequiredError
 from coding_review_agent_loop.config import (
     default_agent_memory_dir,
     default_agent_workdir,
+    default_run_worktree_root,
     default_cache_root,
     resolve_base_branch,
 )
@@ -1512,13 +1513,40 @@ def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts(monkeypatch, t
 
     config = config_from_args(args, FakeRunner())
 
-    assert config.codex_dir == default_agent_workdir("OWNER/REPO", "codex").resolve()
-    assert config.claude_dir == default_agent_workdir("OWNER/REPO", "claude").resolve()
-    assert config.gemini_dir == default_agent_workdir("OWNER/REPO", "gemini").resolve()
-    assert config.antigravity_dir == default_agent_workdir("OWNER/REPO", "antigravity").resolve()
+    token = config.run_token
+    assert token
+    for agent, path in (
+        ("codex", config.codex_dir),
+        ("claude", config.claude_dir),
+        ("gemini", config.gemini_dir),
+        ("antigravity", config.antigravity_dir),
+    ):
+        assert path.parent == default_run_worktree_root("OWNER/REPO", agent).resolve()
+        assert path.name == token
+    assert dict(config.default_checkout_stores) == {
+        agent: default_agent_workdir("OWNER/REPO", agent).resolve()
+        for agent in ("claude", "codex", "gemini", "antigravity")
+    }
     assert set(config.auto_agent_dirs) == {"claude", "codex", "gemini", "antigravity"}
     assert config.agent_memory_dir == (
         cache_home / "coding-review-agent-loop" / "repos" / "OWNER-REPO" / "memory"
+    ).resolve()
+    # The default log dir is durable and outside the removable worktree.
+    artifacts = (cache_home / "coding-review-agent-loop" / "run-artifacts" / "OWNER-REPO" / token)
+    assert config.log_dir == artifacts / ".agent-loop-logs"
+    assert config.codex_dir not in config.log_dir.parents
+    # A second invocation gets its own token and worktrees.
+    other = config_from_args(args, FakeRunner())
+    assert other.run_token != token
+    assert other.codex_dir != config.codex_dir
+    # A relative --agent-memory-dir stays repo-keyed, not under the worktree.
+    memory_args = parser.parse_args([
+        "task", "Fix the bug", "--repo", "OWNER/REPO", "--coder", "codex",
+        "--reviewer", "claude", "--agent-memory-dir", "my-memory",
+    ])
+    memory_config = config_from_args(memory_args, FakeRunner())
+    assert memory_config.agent_memory_dir == (
+        cache_home / "coding-review-agent-loop" / "repos" / "OWNER-REPO" / "my-memory"
     ).resolve()
 
 
@@ -2687,7 +2715,9 @@ def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):
     config = config_from_args(args, FakeRunner())
 
     assert config.codex_dir == codex_dir
-    assert config.claude_dir == default_agent_workdir("OWNER/REPO", "claude").resolve()
+    assert config.claude_dir.parent == default_run_worktree_root("OWNER/REPO", "claude").resolve()
+    assert dict(config.default_checkout_stores)["claude"] == default_agent_workdir("OWNER/REPO", "claude").resolve()
+    assert "codex" not in dict(config.default_checkout_stores)
     assert set(config.auto_agent_dirs) == {"claude", "gemini", "antigravity"}
 
 

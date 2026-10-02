@@ -208,6 +208,11 @@ class AgentLoopConfig:
     # Advisory stall window for conjunctive findings' sub-items (#958); 0 disables.
     sub_item_stall_rounds: int = DEFAULT_SUB_ITEM_STALL_ROUNDS
     auto_agent_dirs: tuple[AgentName, ...] = ()
+    # Per-run worktrees (#1162): the shared store behind each auto agent's
+    # per-run worktree, and the token naming this run's worktrees.  Empty for
+    # directly constructed configs, which keep the standalone-clone behaviour.
+    default_checkout_stores: tuple[tuple[AgentName, Path], ...] = ()
+    run_token: str | None = None
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
     implementation_coder: AgentName | None = None
@@ -976,6 +981,22 @@ def default_agent_workdir(repo: str, agent: AgentName) -> Path:
     return scratch_root() / repo_slug / agent / "repo"
 
 
+def default_run_worktree_root(repo: str, agent: AgentName) -> Path:
+    return scratch_root() / repo_cache_slug(repo) / agent / "runs"
+
+
+def default_run_worktree(repo: str, agent: AgentName, run_token: str) -> Path:
+    return default_run_worktree_root(repo, agent) / run_token
+
+
+def new_run_token() -> str:
+    return f"{datetime_stamp()}-{uuid.uuid4().hex[:12]}"
+
+
+def default_run_artifacts_dir(repo: str, run_token: str) -> Path:
+    return default_cache_root() / "run-artifacts" / repo_cache_slug(repo) / run_token
+
+
 def repo_cache_slug(repo: str) -> str:
     parts = repo.split("/")
     if len(parts) != 2 or not all(parts):
@@ -1019,6 +1040,29 @@ def ensure_workdir(path: Path, option_name: str) -> None:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise AgentLoopError(f"Could not create {option_name} at {path}: {exc}") from exc
+
+
+def _reject_inside_roots(path: Path, roots: tuple[Path, ...], option: str) -> None:
+    if any(path == root or root in path.parents for root in roots):
+        raise AgentLoopError(
+            f"{option} must not be equal to or nested beneath a managed checkout store or "
+            f"per-run worktree root: {path}"
+        )
+
+
+def _resolve_log_dir(
+    value: Path, *, repo: str, primary_dir: Path, run_token: str | None, store_roots: tuple[Path, ...]
+) -> Path:
+    """Relative log dirs of a per-run worktree primary live in a durable artifact root."""
+    if value.is_absolute():
+        path = value
+    elif run_token is not None:
+        path = default_run_artifacts_dir(repo, run_token) / value
+    else:
+        return primary_dir / value
+    if store_roots:
+        _reject_inside_roots(Path(os.path.abspath(path)), store_roots, "--log-dir")
+    return path
 
 
 def _resolve_subprocess_log_dir(
@@ -1126,6 +1170,7 @@ def _sync_base_branch(
         raise AgentLoopError(
             f"Base branch for {config.repo} was not resolved. Pass --base <branch> explicitly."
         )
+    store = run_worktree_store(config, path)
     if not path.is_dir():
         raise AgentLoopError(f"{label} does not exist or is not a directory: {path}")
 
@@ -1152,6 +1197,14 @@ def _sync_base_branch(
         runner=runner,
     )
 
+    if store is not None:
+        # Per-run worktree (#1162): stay detached at a SHA pinned under the store lock.
+        from . import run_worktrees
+
+        sha = run_worktrees.prepare_store(store, config=config, runner=runner)
+        _run_git(runner, path, ("checkout", "--detach", sha))
+        refresh_after_sync(config, runner, path)
+        return
     _run_git(runner, path, ("fetch", "origin"))
     switch = _run_git(runner, path, ("switch", config.base), check=False)
     if switch.returncode != 0:
@@ -1165,7 +1218,57 @@ def _sync_base_branch(
     refresh_after_sync(config, runner, path)
 
 
+def run_worktree_store(config: AgentLoopConfig, path: Path) -> Path | None:
+    """Return the shared store when ``path`` is one of this run's per-run worktrees."""
+    if not config.run_token:
+        return None
+    for agent, store in config.default_checkout_stores:
+        expected = default_run_worktree(config.repo, agent, config.run_token)
+        if os.path.abspath(expected) == os.path.abspath(path) or expected.resolve() == Path(path).resolve():
+            return store
+    return None
+
+
+def _ensure_run_worktree(
+    path: Path, *, agent: AgentName, store: Path, config: AgentLoopConfig, runner: Runner
+) -> None:
+    from . import run_worktrees
+    from .workdir_claims import register_run_finalizer
+
+    label = f"Default {agent} workdir"
+    runs_root = path.parent
+    if runner.dry_run:
+        if not store.exists():
+            runner.run((config.gh_cmd, "repo", "clone", config.repo, str(store)), cwd=store.parent)
+        runner.run(("git", "fetch", "origin"), cwd=store)
+        runner.run(
+            ("git", "worktree", "add", "--detach", str(path), f"origin/{config.base or 'HEAD'}"),
+            cwd=store,
+        )
+        return
+    verify_before_sync(config, runner, path=path, label=label)
+    sha = run_worktrees.prepare_store(store, config=config, runner=runner)
+    run_worktrees.prune_dead_worktrees(store, runs_root, path, config=config, runner=runner)
+    with run_worktrees.store_lock(store):
+        if not os.path.lexists(path):
+            run_worktrees.add_run_worktree(store, path, sha, config=config, runner=runner)
+        elif run_worktrees.identify_owned_worktree(store, runs_root, path) is None:
+            raise AgentLoopError(
+                f"{label} at {path} exists but is not a worktree this run created; refusing to use it."
+            )
+
+    def finalize(store=store, path=path) -> None:
+        run_worktrees.remove_run_worktree(store, path, config=config, runner=runner)
+
+    register_run_finalizer(os.path.abspath(path), finalize)
+    _sync_base_branch(path, label=label, default_owned=True, config=config, runner=runner)
+
+
 def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfig, runner: Runner) -> None:
+    store = run_worktree_store(config, path)
+    if store is not None:
+        _ensure_run_worktree(path, agent=agent, store=store, config=config, runner=runner)
+        return
     # A path agent-loop already prepared in this process is verified BEFORE any
     # recreation branch (missing or stale), so a vanished, emptied or poisoned
     # checkout is refused instead of being re-cloned over its baseline.
@@ -1330,9 +1433,17 @@ def sync_checkout_to_pr(
         runner=runner,
     )
 
-    _run_git(runner, path, ("fetch", "origin"))
-    _run_git(runner, path, ("fetch", "origin", pr_fetch_refspec))
-    _run_git(runner, path, ("checkout", "--detach", pr_ref))
+    store = run_worktree_store(config, path)
+    if store is not None:
+        from . import run_worktrees
+
+        # Check out the SHA pinned under the store lock, never the shared mutable ref.
+        pinned = run_worktrees.pin_pr_head(store, pr_number, config=config, runner=runner)
+        _run_git(runner, path, ("checkout", "--detach", pinned))
+    else:
+        _run_git(runner, path, ("fetch", "origin"))
+        _run_git(runner, path, ("fetch", "origin", pr_fetch_refspec))
+        _run_git(runner, path, ("checkout", "--detach", pr_ref))
     local_head = _run_git(runner, path, ("rev-parse", "HEAD")).stdout.strip()
     branch_state = _run_git(runner, path, ("status", "--short", "--branch")).stdout.strip()
     advertised_head = (pr_metadata.head_sha or "").strip()
@@ -1386,12 +1497,26 @@ def _split_command(value: str | None) -> tuple[str, ...] | None:
     return tuple(shlex.split(value))
 
 
-def _resolve_agent_memory_dir(value: Path | None, *, repo: str, primary_dir: Path) -> Path:
+def _resolve_agent_memory_dir(
+    value: Path | None,
+    *,
+    repo: str,
+    primary_dir: Path,
+    per_run_primary: bool = False,
+    store_roots: tuple[Path, ...] = (),
+) -> Path:
     if value is None:
         return default_agent_memory_dir(repo).resolve()
     if value.is_absolute():
-        return value.resolve()
-    return (primary_dir / value).resolve()
+        resolved = value.resolve()
+    elif per_run_primary:
+        # Repo-keyed, never beneath the removable per-run worktree.
+        resolved = (default_cache_root() / "repos" / repo_cache_slug(repo) / value).resolve()
+    else:
+        return (primary_dir / value).resolve()
+    if store_roots:
+        _reject_inside_roots(resolved, store_roots, "--agent-memory-dir")
+    return resolved
 
 
 def _repair_backend_only_hint(backend: str, override_flag: str) -> str:
@@ -1570,25 +1695,24 @@ def config_from_args(
         )
         if value is None
     )
-    claude_dir = (
-        args.claude_dir.resolve()
-        if args.claude_dir is not None
-        else default_agent_workdir(repo, "claude").resolve()
-    )
-    codex_dir = (
-        args.codex_dir.resolve()
-        if args.codex_dir is not None
-        else default_agent_workdir(repo, "codex").resolve()
-    )
-    gemini_dir = (
-        args.gemini_dir.resolve()
-        if args.gemini_dir is not None
-        else default_agent_workdir(repo, "gemini").resolve()
-    )
-    antigravity_dir = (
-        args.antigravity_dir.resolve()
-        if args.antigravity_dir is not None
-        else default_agent_workdir(repo, "antigravity").resolve()
+    run_token = new_run_token()
+    store_by_agent: dict[AgentName, Path] = {}
+
+    def resolve_agent_dir(agent: AgentName, value: Path | None) -> Path:
+        if value is not None:
+            return value.resolve()
+        store_by_agent[agent] = default_agent_workdir(repo, agent).resolve()
+        return default_run_worktree(repo, agent, run_token).resolve()
+
+    claude_dir = resolve_agent_dir("claude", args.claude_dir)
+    codex_dir = resolve_agent_dir("codex", args.codex_dir)
+    gemini_dir = resolve_agent_dir("gemini", args.gemini_dir)
+    antigravity_dir = resolve_agent_dir("antigravity", args.antigravity_dir)
+    default_checkout_stores = tuple(store_by_agent.items())
+    store_roots = tuple(
+        root
+        for agent, store in default_checkout_stores
+        for root in (store, default_run_worktree_root(repo, agent).resolve())
     )
     primary_dir = {
         "claude": claude_dir,
@@ -1596,6 +1720,7 @@ def config_from_args(
         "gemini": gemini_dir,
         "antigravity": antigravity_dir,
     }[args.coder]
+    per_run_primary = args.coder in store_by_agent
     test_command = _split_command(args.test_command)
     if args.max_rounds <= 0:
         raise AgentLoopError("--max-rounds must be greater than zero.")
@@ -1730,8 +1855,19 @@ def config_from_args(
         mergeability_poll_attempts=getattr(args, "mergeability_poll_attempts", 3),
         mergeability_poll_interval_seconds=getattr(args, "mergeability_poll_interval_seconds", 5),
         quiet=args.quiet,
-        log_dir=(primary_dir / args.log_dir if not args.log_dir.is_absolute() else args.log_dir),
-        subprocess_log_dir=_resolve_subprocess_log_dir(args, repo=repo, primary_dir=primary_dir, managed_roots=(claude_dir, codex_dir, gemini_dir, antigravity_dir)),
+        log_dir=_resolve_log_dir(
+            args.log_dir,
+            repo=repo,
+            primary_dir=primary_dir,
+            run_token=run_token if per_run_primary else None,
+            store_roots=store_roots,
+        ),
+        subprocess_log_dir=_resolve_subprocess_log_dir(
+            args,
+            repo=repo,
+            primary_dir=primary_dir,
+            managed_roots=(claude_dir, codex_dir, gemini_dir, antigravity_dir, *store_roots),
+        ),
         progress_interval_seconds=args.progress_interval_seconds,
         agent_max_retries=args.agent_max_retries,
         agent_retry_backoff_seconds=tuple(args.agent_retry_backoff_seconds),
@@ -1741,6 +1877,8 @@ def config_from_args(
             args.agent_memory_dir,
             repo=repo,
             primary_dir=primary_dir,
+            per_run_primary=per_run_primary,
+            store_roots=store_roots,
         ),
         refresh_test_profile=args.refresh_test_profile,
         approved_followups=args.approved_followups,
@@ -1795,6 +1933,8 @@ def config_from_args(
             args, "sub_item_stall_rounds", DEFAULT_SUB_ITEM_STALL_ROUNDS
         ),
         auto_agent_dirs=auto_agent_dirs,
+        default_checkout_stores=default_checkout_stores,
+        run_token=run_token if default_checkout_stores else None,
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),
         containment_memory_max=getattr(args, "containment_memory_max", None),

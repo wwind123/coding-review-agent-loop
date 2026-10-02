@@ -169,25 +169,25 @@ def build_parser() -> argparse.ArgumentParser:
             "--claude-dir",
             type=Path,
             default=None,
-            help="Claude checkout. Defaults to a repo-scoped temporary checkout when Claude is active. An explicit directory must be an existing, clean git checkout.",
+            help="Claude checkout. Defaults to a per-run detached git worktree off a shared repo-scoped clone (removed when the run ends; concurrent default runs proceed) when Claude is active. An explicit directory must be an existing, clean git checkout.",
         )
         subparser.add_argument(
             "--codex-dir",
             type=Path,
             default=None,
-            help="Codex checkout. Defaults to a repo-scoped temporary checkout when Codex is active. An explicit directory must be an existing, clean git checkout.",
+            help="Codex checkout. Defaults to a per-run detached git worktree off a shared repo-scoped clone (removed when the run ends; concurrent default runs proceed) when Codex is active. An explicit directory must be an existing, clean git checkout.",
         )
         subparser.add_argument(
             "--gemini-dir",
             type=Path,
             default=None,
-            help="Gemini checkout. Defaults to a repo-scoped temporary checkout when Gemini is active. An explicit directory must be an existing, clean git checkout.",
+            help="Gemini checkout. Defaults to a per-run detached git worktree off a shared repo-scoped clone (removed when the run ends; concurrent default runs proceed) when Gemini is active. An explicit directory must be an existing, clean git checkout.",
         )
         subparser.add_argument(
             "--antigravity-dir",
             type=Path,
             default=None,
-            help="Antigravity (agy) checkout. Defaults to a repo-scoped temporary checkout when Antigravity is active. An explicit directory must be an existing, clean git checkout.",
+            help="Antigravity (agy) checkout. Defaults to a per-run detached git worktree off a shared repo-scoped clone (removed when the run ends; concurrent default runs proceed) when Antigravity is active. An explicit directory must be an existing, clean git checkout.",
         )
         subparser.add_argument(
             "--coder",
@@ -581,7 +581,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--log-dir",
             type=Path,
             default=Path(".agent-loop-logs"),
-            help="Directory for salvage and usage artifacts (default: .agent-loop-logs).",
+            help="Directory for salvage and usage artifacts (default: .agent-loop-logs). Relative paths resolve inside an explicit coder checkout, or under a durable per-run artifact root in the user cache when the coder uses a default per-run worktree.",
         )
         subparser.add_argument(
             "--subprocess-log-dir",
@@ -642,7 +642,7 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help=(
                 "Directory for repo memory. Defaults to a repo-scoped user cache; "
-                "relative explicit paths are resolved inside the coder checkout."
+                "relative explicit paths are resolved inside an explicit coder checkout, or under the repo-keyed user cache when the coder uses a default per-run worktree."
             ),
         )
         subparser.add_argument(
