@@ -334,6 +334,7 @@ defaults to isolated Antigravity with `Gemini 3.8 Flash (Medium)` → `Gemini 3.
 repair models are tried first, followed by the configured Antigravity chain. Legacy
 Gemini CLI repair requires
 `--repair-backend gemini` and suitable non-interactive authentication.
+The Antigravity default requires `agy` even when no role uses Antigravity.
 Alternatively, select `--repair-backend codex` or `--repair-backend claude` with
 an explicit `--repair-model`; see [repair configuration](local_agent_loop.md#logs)
 for their isolated execution and independent effort settings. The

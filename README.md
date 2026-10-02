@@ -1040,7 +1040,9 @@ are estimated because `agy` does not expose token counts.
 Malformed structured responses get a format-repair pass. By default it uses
 Antigravity with the repair chain `Gemini 3.8 Flash (Medium)`, then
 `Gemini 3.7 Flash (Medium)`, followed by the Antigravity chain above. Use
-`--repair-backend` and repeatable `--repair-model` to change it. Models that
+`--repair-backend` and repeatable `--repair-model` to change it. The default
+requires the `agy` CLI even when no role uses Antigravity; on a host without it,
+pass `--repair-backend codex --repair-model MODEL` (or `claude`). Models that
 `agy models` does not list are skipped. When `agy` reports a transient
 `model-access validation errors` failure on its own output (stdout with no
 response artifact and no structured JSON response), that repair model is

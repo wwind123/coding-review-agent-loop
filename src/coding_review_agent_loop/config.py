@@ -468,7 +468,12 @@ class AgentLoopConfig:
             raise AgentLoopError("--repair-backend must be antigravity, gemini, codex, or claude.")
         if self.repair_backend in {"codex", "claude"}:
             if self.repair_models == DEFAULT_REPAIR_MODELS:
-                raise AgentLoopError("Codex/Claude repair requires an explicit --repair-model.")
+                raise AgentLoopError(
+                    "Codex/Claude repair requires an explicit --repair-model. "
+                    "Pass --repair-model MODEL (for example "
+                    "--repair-backend codex --repair-model MODEL); "
+                    "repeat it for a fallback chain."
+                )
             _validate_effort_value(
                 self.repair_backend, self.repair_reasoning_effort, "--repair-reasoning-effort"
             )
@@ -1364,6 +1369,17 @@ def _resolve_agent_memory_dir(value: Path | None, *, repo: str, primary_dir: Pat
     return (primary_dir / value).resolve()
 
 
+def _repair_backend_only_hint(backend: str, override_flag: str) -> str:
+    return (
+        f" It is needed only because the malformed-response repair backend is {backend} "
+        "(--repair-backend; the default is antigravity, which requires the agy CLI even "
+        "when no role uses Antigravity). Alternatively, pass "
+        "--repair-backend codex --repair-model MODEL or "
+        "--repair-backend claude --repair-model MODEL "
+        f"to repair with a configured agent, or install the CLI / pass {override_flag} <path>."
+    )
+
+
 def preflight_agent_commands(
     args: argparse.Namespace,
     runner: Runner,
@@ -1381,28 +1397,34 @@ def preflight_agent_commands(
     }
     discuss_analyzer = getattr(args, "discuss_analyzer", None)
     implementation_coder = getattr(args, "implementation_coder", None)
-    configured_agents = dict.fromkeys(
+    role_agents = dict.fromkeys(
         (
             args.coder,
             *((implementation_coder,) if implementation_coder is not None else ()),
             *configured_reviewers,
             *((discuss_analyzer,) if discuss_analyzer is not None else ()),
-            getattr(args, "repair_backend", "antigravity"),
         )
     )
+    repair_backend = getattr(args, "repair_backend", "antigravity")
+    configured_agents = dict.fromkeys((*role_agents, repair_backend))
     for agent in configured_agents:
         command, override_flag = command_options[agent]
         resolved = shutil.which(command)
         if resolved is None:
+            repair_only = agent == repair_backend and agent not in role_agents
             if os.path.isabs(command):
-                raise AgentLoopError(
+                message = (
                     f"{command} not found or not executable; "
                     f"pass a valid executable path to {override_flag}."
                 )
-            raise AgentLoopError(
-                f"{command} CLI not found on PATH; install it or pass "
-                f"{override_flag} <path>."
-            )
+            else:
+                message = (
+                    f"{command} CLI not found on PATH; install it or pass "
+                    f"{override_flag} <path>."
+                )
+            if repair_only:
+                message += _repair_backend_only_hint(agent, override_flag)
+            raise AgentLoopError(message)
         runner.remember_agent_command(command, resolved, override_flag)
 
 

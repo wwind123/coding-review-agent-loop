@@ -5794,7 +5794,9 @@ output`. A recovered response is still revalidated before posting; a failed
 repair leaves the run in local failure just like any other protocol error.
 
 Use `--repair-backend`, repeatable `--repair-model`, and
-`--repair-timeout-seconds` to configure this path. For Antigravity, the repair chain is the explicit
+`--repair-timeout-seconds` to configure this path. The Antigravity default
+requires `agy` even when no role uses Antigravity; a host without it should pass
+`--repair-backend codex --repair-model MODEL` (or `claude`). For Antigravity, the repair chain is the explicit
 prefix followed by `antigravity_models`, with duplicates removed. It queries `agy
 models` once through the same PTY-safe runner as `agy --print`, rejects stale names
 with available-choice guidance, and attempts candidates directly when discovery is

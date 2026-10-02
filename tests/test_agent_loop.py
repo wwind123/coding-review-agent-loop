@@ -6917,3 +6917,111 @@ def test_sub_item_stall_rounds_rejects_negative_values(tmp_path):
     args = _sub_item_stall_args(tmp_path, "--sub-item-stall-rounds", "-1")
     with pytest.raises(AgentLoopError, match="--sub-item-stall-rounds must be zero or greater"):
         config_from_args(args, FakeRunner())
+
+
+def _preflight_args(monkeypatch, extra, missing=("agy",)):
+    args = build_parser().parse_args(
+        ["task", "Fix the bug", "--coder", "codex", "--reviewer", "claude", *extra]
+    )
+    detection_calls = []
+    which_calls = []
+    monkeypatch.setattr(
+        "coding_review_agent_loop.config.detect_repo",
+        lambda *call_args: detection_calls.append(call_args),
+    )
+
+    def fake_which(command):
+        which_calls.append(command)
+        return None if command in missing else f"/bin/{command}"
+
+    monkeypatch.setattr("coding_review_agent_loop.config.shutil.which", fake_which)
+    return args, detection_calls, which_calls
+
+
+def _assert_repair_hint(message):
+    assert "--repair-backend" in message
+    assert "default is antigravity" in message
+    assert "--repair-backend codex --repair-model MODEL" in message
+    assert "--repair-backend claude --repair-model MODEL" in message
+    assert "--antigravity-cmd" in message
+
+
+@pytest.mark.parametrize("extra", [[], ["--repair-backend", "antigravity"]])
+def test_config_preflight_names_repair_backend_when_agy_missing(monkeypatch, extra):
+    args, detection_calls, _ = _preflight_args(monkeypatch, extra)
+
+    with pytest.raises(AgentLoopError, match="agy CLI not found on PATH") as exc:
+        config_from_args(args, Runner())
+
+    _assert_repair_hint(str(exc.value))
+    assert detection_calls == []
+
+
+def test_config_preflight_repair_hint_for_absolute_antigravity_cmd(monkeypatch):
+    args, _, _ = _preflight_args(
+        monkeypatch, ["--antigravity-cmd", "/missing/agy"], missing=("/missing/agy",)
+    )
+
+    with pytest.raises(AgentLoopError, match="not found or not executable") as exc:
+        config_from_args(args, Runner())
+
+    _assert_repair_hint(str(exc.value))
+
+
+def test_config_preflight_antigravity_role_keeps_generic_message(monkeypatch):
+    args = build_parser().parse_args(
+        ["task", "Fix the bug", "--coder", "codex", "--reviewer", "antigravity"]
+    )
+    monkeypatch.setattr(
+        "coding_review_agent_loop.config.shutil.which",
+        lambda command: None if command == "agy" else f"/bin/{command}",
+    )
+
+    with pytest.raises(AgentLoopError) as exc:
+        config_from_args(args, Runner())
+
+    assert str(exc.value) == "agy CLI not found on PATH; install it or pass --antigravity-cmd <path>."
+
+
+def test_config_preflight_default_repair_backend_is_antigravity(monkeypatch):
+    args, _, _ = _preflight_args(monkeypatch, [], missing=())
+    assert args.repair_backend == "antigravity"
+    monkeypatch.setattr(
+        "coding_review_agent_loop.config.detect_repo",
+        lambda *a: (_ for _ in ()).throw(RuntimeError("past preflight")),
+    )
+    with pytest.raises(RuntimeError, match="past preflight"):
+        config_from_args(args, Runner())
+
+
+def test_config_preflight_explicit_codex_repair_does_not_look_up_agy(monkeypatch):
+    args, _, which_calls = _preflight_args(
+        monkeypatch, ["--repair-backend", "codex", "--repair-model", "X"]
+    )
+    monkeypatch.setattr(
+        "coding_review_agent_loop.config.detect_repo",
+        lambda *a: (_ for _ in ()).throw(RuntimeError("past preflight")),
+    )
+    with pytest.raises(RuntimeError, match="past preflight"):
+        config_from_args(args, Runner())
+    assert "agy" not in which_calls
+    assert args.repair_backend == "codex"
+    assert args.repair_model == ["X"]
+
+
+def test_config_preflight_codex_repair_without_model_example(monkeypatch):
+    args, _, _ = _preflight_args(
+        monkeypatch, ["--repair-backend", "codex", "--repo", "owner/repo"]
+    )
+    with pytest.raises(AgentLoopError, match="requires an explicit --repair-model") as exc:
+        config_from_args(args, Runner())
+    assert "--repair-model MODEL" in str(exc.value)
+
+
+def test_repair_backend_help_names_default_and_alternative(capsys):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["task", "x", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "default: antigravity" in help_text
+    assert "agy CLI even when no role uses Antigravity" in help_text
+    assert "--repair-backend codex|claude --repair-model MODEL" in help_text
