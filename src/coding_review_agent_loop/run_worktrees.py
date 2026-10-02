@@ -227,7 +227,9 @@ def _remove_owned_locked(store: Path, path: Path, *, config: Any, runner: Any) -
     except CheckoutVerificationError as exc:
         log(config, f"Leaving run worktree untouched: {exc}")
         return False
-    _git(runner, store, "worktree", "remove", "--force", str(path), check=False)
+    admin_name = str(record_admin_name(store, path))
+    # A doubled --force also removes a worktree locked through git.
+    _git(runner, store, "worktree", "remove", "--force", "--force", str(path), check=False)
     if os.path.lexists(path):
         # Re-verify: git may have failed halfway, so never delete what is no longer ours.
         if identify_owned_worktree(store, runs_root, path) is None:
@@ -235,10 +237,30 @@ def _remove_owned_locked(store: Path, path: Path, *, config: Any, runner: Any) -
             return False
         shutil.rmtree(path)
     _git(runner, store, "worktree", "prune", check=False)
+    if _admin_registered(store, admin_name):
+        # Keep the owner record: it is the evidence a later startup needs to finish cleanup.
+        log(
+            config,
+            f"Run worktree {path} was removed but git still registers it ({admin_name}); "
+            "keeping its owner record for a later prune. Run `git worktree unlock` if it is locked.",
+        )
+        return False
     with contextlib.suppress(OSError):
         _record_path(store, path.name).unlink()
     forget_checkout(path)
     return True
+
+
+def record_admin_name(store: Path, path: Path) -> str:
+    record = _read_record(store, Path(path).name) or {}
+    return str(record.get("admin_name") or "")
+
+
+def _admin_registered(store: Path, admin_name: str) -> bool:
+    """True while git still holds the worktree's admin dir (fail closed on an unknown name)."""
+    if not admin_name:
+        return True
+    return os.path.lexists(store / ".git" / "worktrees" / admin_name)
 
 
 def remove_run_worktree(store: Path, path: Path, *, config: Any, runner: Any) -> bool:
@@ -251,6 +273,11 @@ def remove_run_worktree(store: Path, path: Path, *, config: Any, runner: Any) ->
 
 def _linked_worktrees(store: Path, runner: Any) -> list[dict[str, str]]:
     out = _git(runner, store, "worktree", "list", "--porcelain", check=False)
+    if out.returncode != 0:
+        raise AgentLoopError(
+            f"Could not list the worktrees of store {store} (git exited {out.returncode}); "
+            "leaving the store untouched."
+        )
     entries: list[dict[str, str]] = []
     current: dict[str, str] = {}
     for line in (out.stdout or "").splitlines():
@@ -263,6 +290,10 @@ def _linked_worktrees(store: Path, runner: Any) -> list[dict[str, str]]:
         current[key] = value
     if current:
         entries.append(current)
+    if not entries or "worktree" not in entries[0]:
+        raise AgentLoopError(
+            f"Unrecognized git worktree list output for store {store}; leaving the store untouched."
+        )
     return entries
 
 
@@ -383,6 +414,9 @@ def prune_dead_worktrees(store: Path, runs_root: Path, own_path: Path, *, config
             if os.path.lexists(raw["path"]):
                 if raw.get("state") != "ready":
                     log(config, f"Run worktree {raw['path']} has a pending owner record; remove it manually.")
+                continue
+            if _admin_registered(store, str(raw.get("admin_name") or "")) and raw.get("state") == "ready":
+                log(config, f"Run worktree {raw['path']} is gone but still registered by git; keeping its record.")
                 continue
             with contextlib.suppress(OSError):
                 record_file.unlink()

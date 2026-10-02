@@ -1061,7 +1061,8 @@ def _resolve_log_dir(
     else:
         return primary_dir / value
     if store_roots:
-        _reject_inside_roots(Path(os.path.abspath(path)), store_roots, "--log-dir")
+        # Resolve aliases first: a symlink into a runs/ root must not slip through.
+        _reject_inside_roots(Path(path).expanduser().resolve(), store_roots, "--log-dir")
     return path
 
 

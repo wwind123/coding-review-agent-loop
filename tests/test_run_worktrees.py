@@ -25,7 +25,7 @@ from coding_review_agent_loop.config import (
     sync_coder_base_before_implementation,
 )
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.runner import Runner
+from coding_review_agent_loop.runner import CommandResult, Runner
 from coding_review_agent_loop.workdir_claims import (
     claim_agent_workdirs,
     probe_free_claim,
@@ -168,6 +168,20 @@ class RecordingRunner(Runner):
         return super().run(args, cwd=cwd, **kwargs)
 
 
+class FailingGitRunner(Runner):
+    """Fails the named git subcommands (e.g. ``worktree remove``) with exit 1."""
+
+    def __init__(self, *failing: tuple[str, str]):
+        super().__init__()
+        self.failing = failing
+
+    def run(self, args, *, cwd, **kwargs):
+        args = tuple(str(a) for a in args)
+        if args[:1] == ("git",) and args[1:3] in self.failing:
+            return CommandResult(list(args), cwd, "", "forced failure", 1)
+        return super().run(args, cwd=cwd, **kwargs)
+
+
 def prepare(config, runner):
     with workdir_claim_scope(command="task"):
         claim_agent_workdirs(config)
@@ -265,6 +279,38 @@ def test_run_end_removes_worktree(tmp_path, monkeypatch):
     assert claim_held_during_removal and all(claim_held_during_removal)
     with probe_free_claim(path) as free:
         assert free
+
+    # A store whose worktree list cannot be read is never recreated under live worktrees.
+    live = env.config()
+    with workdir_claim_scope(command="task"):
+        claim_agent_workdirs(live)
+        ensure_agent_workdirs(live, Runner())
+        for entry in store.iterdir():
+            if entry.name != ".git":
+                shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+        with pytest.raises(AgentLoopError, match="leaving the store untouched"):
+            run_worktrees.prepare_store(
+                store, config=live, runner=FailingGitRunner(("worktree", "list"))
+            )
+        assert (store / ".git").is_dir() and live.claude_dir.is_dir()
+        # With a readable list, the live worktree also protects the store from recreation.
+        run_worktrees.prepare_store(store, config=live, runner=Runner())
+        assert (store / ".git").is_dir() and live.claude_dir.is_dir()
+
+    # Failed unregistration keeps the owner record until git really forgets the worktree.
+    stuck = env.config()
+    with workdir_claim_scope(command="task"):
+        claim_agent_workdirs(stuck)
+        ensure_agent_workdirs(stuck, FailingGitRunner(("worktree", "remove")))
+        stuck_path = stuck.claude_dir
+        git(store, "worktree", "lock", str(stuck_path))
+    assert not stuck_path.exists()
+    stuck_record = run_worktrees._record_path(store, stuck_path.name)
+    assert stuck_record.exists()  # registration survived, so the evidence is retained
+    git(store, "worktree", "unlock", str(stuck_path), check=False)
+    after = env.config()
+    prepare(after, Runner())  # startup prune completes the cleanup and drops the record
+    assert not stuck_record.exists()
 
     # A failing run removes its worktree too and its own exception propagates.
     failing = env.config()

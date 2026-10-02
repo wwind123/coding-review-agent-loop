@@ -1539,6 +1539,20 @@ def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts(monkeypatch, t
     other = config_from_args(args, FakeRunner())
     assert other.run_token != token
     assert other.codex_dir != config.codex_dir
+    # A log dir that aliases a runs/ root through a symlink is rejected.
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "scratch"))
+    runs_root = default_run_worktree_root("OWNER/REPO", "codex").resolve()
+    runs_root.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(runs_root, target_is_directory=True)
+    alias_args = parser.parse_args([
+        "task", "Fix the bug", "--repo", "OWNER/REPO", "--coder", "codex",
+        "--reviewer", "claude", "--log-dir", str(alias / "logs"),
+    ])
+    with pytest.raises(AgentLoopError, match="--log-dir"):
+        config_from_args(alias_args, FakeRunner())
     # A relative --agent-memory-dir stays repo-keyed, not under the worktree.
     memory_args = parser.parse_args([
         "task", "Fix the bug", "--repo", "OWNER/REPO", "--coder", "codex",
