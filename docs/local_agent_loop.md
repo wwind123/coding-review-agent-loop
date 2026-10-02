@@ -2266,11 +2266,13 @@ if the checkout's contents have since changed. A default (tool-managed)
 reviewer checkout is kept at the current base-branch tip by the same
 `ensure_agent_workdirs` sync used everywhere else, so it can drift past a
 debater's persisted claim as the base branch advances. An explicit reviewer
-checkout (e.g. `--codex-dir`) is only checked for cleanliness and remote by
-`validate_explicit_workdir` when it happens to already be a Git work tree —
-a non-Git explicit directory receives no such check and is used exactly as
-the user left it — but its contents are still validated live against the
-persisted claim like any other checkout.
+checkout (e.g. `--codex-dir`) must be an existing Git checkout of the
+repository: `validate_explicit_workdir` refuses a non-Git or empty directory
+at startup with `<option> is not a git checkout`, and checks cleanliness and
+remote for a real checkout. Its contents are then validated live against the
+persisted claim like any other checkout. Between turns agent-loop also
+verifies that the checkout still matches what it last left there (see
+[Pre-turn checkout verification](#pre-turn-checkout-verification)).
 
 ### Parallel debater execution
 
@@ -6132,3 +6134,16 @@ or identity-mismatched hydration fails closed before prompting, assembly, or
 publication. Repair is limited to envelope presentation before assembly and
 must preserve the semantic patch, rationale, operation ordering, and base
 binding exactly.
+
+
+## Pre-turn checkout verification
+
+Before every agent turn, between-turn sync and real test gate, agent-loop
+verifies that the assigned checkout still has the branch, HEAD, staged content
+and dirty-path contents it last recorded, and refuses (naming the observed
+branch/HEAD and each unexpected path) instead of starting the turn. It never
+resets, cleans or deletes foreign changes. Explicit `--*-dir` values must be
+existing git checkouts of the repository; a leftover agent-loop `GEMINI.md`
+injection from a killed run is recognised by its ownership header and removed
+automatically, while operator-authored `GEMINI.md` content is reported as an
+unexpected change. See `ARCHITECTURE.md` for the full contract.

@@ -884,6 +884,35 @@ def hardened_git_probe_runner(config: AgentLoopConfig) -> Callable[[tuple[str, .
     return run
 
 
+@dataclass(frozen=True)
+class _BinaryProbeResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+def hardened_git_probe_runner_bytes(
+    config: AgentLoopConfig,
+) -> Callable[[tuple[str, ...], Path], _BinaryProbeResult]:
+    """Like :func:`hardened_git_probe_runner`, but returns undecoded bytes.
+
+    Checkout verification must keep non-UTF-8 path names exact, so it cannot
+    use the lossy text variant.  The gate, closed environment and forced
+    configuration are identical.
+    """
+    from . import inspect_tool
+
+    def run(args: tuple[str, ...], workdir: Path) -> _BinaryProbeResult:
+        try:
+            git = require_inspect_provenance(config).git.path
+            result = inspect_tool.run_hardened_git(git, args[0], args[1:], cwd=str(workdir))
+        except inspect_tool.InspectRejected as exc:
+            raise AgentLoopError(f"sandboxed workdir probe refused: {exc}") from exc
+        return _BinaryProbeResult(result.returncode, result.stdout, result.stderr)
+
+    return run
+
+
 def inspect_prefix(config: AgentLoopConfig) -> str:
     return require_inspect_provenance(config).prefix_text
 

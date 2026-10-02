@@ -738,6 +738,10 @@ def test_codex_chatgpt_unsupported_model_public_response_skips_retry_repair_and_
         codex_model="gpt-5.5-pro",
         agent_max_retries=2,
     )
+    from coding_review_agent_loop.checkout_verification import establish_initial_baseline
+
+    # The scripted dirty tree is this checkout's prepared state.
+    establish_initial_baseline(config, runner, config.codex_dir)
 
     with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
         with pytest.raises(AgentInvocationError) as exc_info:
@@ -2612,7 +2616,16 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
                 marker_value=plan_review_marker,
             )
         if operation == "approved-plan implementation":
+            # This fake stands in for run_agent_result: the coder commits in its own
+            # checkout, and the real boundary then records that as the new baseline.
+            from coding_review_agent_loop.checkout_verification import record_checkout_baseline
+            from coding_review_agent_loop.workdirs import agent_workdir
+
+            runner_arg._last_agent_cwd = agent_workdir(config, agent)
             runner_arg.git_head = "def456"
+            record_checkout_baseline(
+                config, runner_arg, agent_workdir(config, agent), source="coder turn"
+            )
             return ValidatedAgentResponse(
                 text=implementation_text,
                 model_used="gpt-5.5 (high)",

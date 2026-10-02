@@ -2363,7 +2363,7 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") == "coder":
             runner.pr_payload["headRefOid"] = "repaired-head"
-            runner.git_head = "repaired-head"
+            runner.simulate_agent_turn(config, config.claude_dir, head="repaired-head")
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
@@ -2514,7 +2514,7 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") == "coder":
             runner.pr_payload["headRefOid"] = "repaired-head"
-            runner.git_head = "repaired-head"
+            runner.simulate_agent_turn(config, config.claude_dir, head="repaired-head")
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
@@ -10639,7 +10639,7 @@ def test_pr_initial_coder_post_includes_model(tmp_path):
                 )
             # PR host-coder call: advance git head so validate_assigned_head_advanced passes
             before_head = runner.git_head
-            runner.git_head = before_head + "-coder"
+            runner.simulate_agent_turn(config, config.claude_dir, head=before_head + "-coder")
             return ValidatedAgentResponse(
                 text=pr_coder_text,
                 model_used="gpt-5.5 (medium)",
@@ -15037,6 +15037,7 @@ def test_external_push_breaks_the_freeze_and_the_new_head_is_reviewed_in_full(tm
 
     runner.pr_payload["headRefOid"] = "def456"
     runner.git_head = "def456"
+    runner.simulate_new_process()  # the rerun is a fresh agent-loop process
     runner.codex_outputs.append(
         _evidence_review(
             evidence=[_EVIDENCE_TEXT],

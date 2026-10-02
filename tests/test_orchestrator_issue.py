@@ -2669,6 +2669,61 @@ def test_issue_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):
     assert list((tmp_path / "logs").glob("*-codex.log"))
     assert (tmp_path / "logs" / ".gitignore").read_text(encoding="utf-8") == "*\n!.gitignore\n"
 
+def test_issue_loop_refuses_a_corrupted_checkout_at_the_next_turn_1127(tmp_path, monkeypatch):
+    """The #1127 incident: another writer left the coder checkout on main with edited files."""
+    from coding_review_agent_loop import checkout_verification as cv
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+    from coding_review_agent_loop.runner import BinaryCommandResult
+
+    class CorruptibleRunner(FakeRunner):
+        corrupted = False
+        coder_dir = None
+
+        def run_binary(self, args, *, cwd, **kwargs):
+            cmd = [str(arg) for arg in args]
+            hit = self.corrupted and cwd == self.coder_dir
+            if hit and cmd[1:3] == ["rev-parse", "--abbrev-ref"]:
+                return BinaryCommandResult(cmd, cwd, b"main\n", b"", 0)
+            if hit and cmd[1:2] == ["status"]:
+                return BinaryCommandResult(
+                    cmd, cwd, b" M orchestrator.py\0 M protocol.py\0", b"", 0
+                )
+            if cmd[1:3] == ["rev-parse", "--abbrev-ref"]:
+                return BinaryCommandResult(cmd, cwd, b"agent-loop/managed-1112\n", b"", 0)
+            return super().run_binary(args, cwd=cwd, **kwargs)
+
+    runner = CorruptibleRunner(
+        claude_outputs=[
+            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
+            "Fixed review.\n<!-- AGENT_STATE: blocking -->",
+        ],
+        codex_outputs=[
+            "Finding: bug remains.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+        ],
+    )
+    config = make_config(tmp_path)
+    runner.coder_dir = config.claude_dir
+    (config.claude_dir / "orchestrator.py").write_text("edited by someone else\n")
+    (config.claude_dir / "protocol.py").write_text("edited by someone else\n")
+    real_record = cv.record_checkout_baseline
+
+    def record(cfg, run, path, *, source):
+        real_record(cfg, run, path, source=source)
+        if "coder turn" in source and path == run.coder_dir:
+            run.corrupted = True
+
+    monkeypatch.setattr(cv, "record_checkout_baseline", record)
+
+    with pytest.raises(CheckoutVerificationError) as info:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert "observed main" in str(info.value)
+    assert "orchestrator.py" in str(info.value) and "protocol.py" in str(info.value)
+    claude_turns = [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["claude", "--print"]]
+    assert len(claude_turns) == 1  # the corrupted checkout was never given a second turn
+    assert not runner.comments or "Fixed review" not in runner.comments[-1]
+
+
 def test_issue_loop_syncs_coder_base_after_memory_before_coder(tmp_path):
     runner = FakeRunner(
         claude_outputs=[

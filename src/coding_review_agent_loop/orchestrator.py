@@ -117,6 +117,7 @@ from .protocol import EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNI
 from .child_topology import NeedsHumanDecision, NestedTopologyDecision, parent_child_search_queries
 from .errors import (
     AgentInvocationError,
+    CheckoutVerificationError,
     AgentLoopError,
     DeterministicPlanValidationExhaustion,
     FreshContractIntegrityError,
@@ -5879,6 +5880,10 @@ def _derive_authenticated_risk_evidence_for_coder(
                 row_ids=approved_plan_context.risk_test_matrix_expected_row_ids,
                 execution_catalog=catalog,
             )
+        except CheckoutVerificationError:
+            # A corrupted assigned checkout is a fail-closed run failure, never
+            # a recoverable "correction unavailable" (#1130).
+            raise
         except Exception as exc:
             corrected = None
             correction_error = f"semantic correction unavailable: {type(exc).__name__}"
@@ -29091,7 +29096,7 @@ def _run_discuss_analyzer(
     Returns (parsed_agenda, raw_response, synthesis, raw_synthesis_response).
     Analyzer/agenda failures fall back to the mechanical agenda; a nested
     synthesis fidelity failure drops only that advisory extension and keeps
-    the validated agenda. Only a quota-reset stop propagates because the
+    the validated agenda. Only a quota-reset stop or a checkout-verification refusal propagates because the
     whole run must pause.
     """
     analyzer_name = agent_display_name(analyzer)
@@ -29126,7 +29131,7 @@ def _run_discuss_analyzer(
             label=f"discuss-analyzer-r{round_number}",
             operation_description="discuss analyzer",
         )
-    except QuotaResetExceededError:
+    except (QuotaResetExceededError, CheckoutVerificationError):
         raise
     except AgentLoopError as exc:
         log(
@@ -29216,7 +29221,7 @@ def _run_discuss_analyzer(
             configured_reviewers=configured_reviewers,
         )
         return parsed, response.text, fallback_synthesis, fallback.text
-    except QuotaResetExceededError:
+    except (QuotaResetExceededError, CheckoutVerificationError):
         raise
     except (AgentLoopError, AgentInvocationError) as exc:
         log(
@@ -29344,7 +29349,7 @@ def _run_discuss_final_analyzer(
             parsed, final_votes=final_votes, configured_reviewers=configured_reviewers, analyzer=analyzer,
         )
         return parsed, response.text, None
-    except QuotaResetExceededError:
+    except (QuotaResetExceededError, CheckoutVerificationError):
         raise
     except (AgentLoopError, AgentInvocationError) as exc:
         log(config, f"discuss: final analyzer {analyzer_name} unavailable ({exc}); omitting advisory observations")
@@ -29377,7 +29382,7 @@ def _run_discuss_evidence_reconciler(
         parsed = response.marker_value
         assert isinstance(parsed, ParsedDiscussEvidenceReconciliation)
         return parsed.groups, response.text
-    except QuotaResetExceededError:
+    except (QuotaResetExceededError, CheckoutVerificationError):
         raise
     except Exception as exc:
         log(config, f"discuss: evidence reconciler unavailable ({exc}); using exact-match ledger")
@@ -29517,6 +29522,8 @@ def _run_discuss_semantic_finalization(
         )
         comparison = response.marker_value
         assert isinstance(comparison, ParsedDiscussSemanticComparison)
+    except CheckoutVerificationError:
+        raise
     except (AgentLoopError, AgentInvocationError):
         # Preserve an explicit audit record even when the comparator itself
         # fails. This distinguishes its fail-closed deadlock from a purely
@@ -29554,6 +29561,8 @@ def _run_discuss_semantic_finalization(
                 operation_description="semantic answer confirmation",
             )
             confirmations.append(response.marker_value)
+    except CheckoutVerificationError:
+        raise
     except (AgentLoopError, AgentInvocationError):
         return "deadlock", "confirmation-failed", audit
     effective = [comparison.shared_recommendation if item.decision == "confirm" else item.answer for item in confirmations]
@@ -30134,7 +30143,9 @@ def _run_discuss_loop(
             # to abort, so a rerun resumes them instead of re-invoking.
             for name in pending_names:
                 turn = failures_by_name.get(name)
-                if turn is not None and isinstance(turn.error, QuotaResetExceededError):
+                if turn is not None and isinstance(
+                    turn.error, (QuotaResetExceededError, CheckoutVerificationError)
+                ):
                     raise turn.error
             if failures_by_name and config.discuss_on_debater_failure == "fail":
                 raise next(iter(failures_by_name.values())).error
@@ -30156,7 +30167,7 @@ def _run_discuss_loop(
                         round_number=round_number,
                         usage_context=usage_context,
                     )
-                except QuotaResetExceededError:
+                except (QuotaResetExceededError, CheckoutVerificationError):
                     raise
                 except AgentLoopError as exc:
                     if config.discuss_on_debater_failure == "fail":

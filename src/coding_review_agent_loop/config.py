@@ -14,6 +14,12 @@ from pathlib import Path
 
 from .agents.base import AgentName
 from .agents.registry import default_agent_args
+from .checkout_verification import (
+    forget_checkout,
+    recover_gemini_injection,
+    refresh_after_sync,
+    verify_before_sync,
+)
 from .errors import AgentLoopError
 from .expected_closure import normalize_issue_ids
 from .github import (
@@ -1096,6 +1102,8 @@ def _clean_or_reject_checkout(
     config: AgentLoopConfig,
     runner: Runner,
 ) -> None:
+    # A killed run's verifiable GEMINI.md injection is tool-owned, not dirt.
+    recover_gemini_injection(config, runner, path)
     status = _run_git(runner, path, ("status", "--porcelain")).stdout.strip()
     if not status:
         return
@@ -1133,6 +1141,8 @@ def _sync_base_branch(
             "Remove it or pass an explicit agent directory."
         )
 
+    # Verify an existing baseline BEFORE anything can reset or clean (#1130).
+    verify_before_sync(config, runner, path=path, label=label)
     _validate_repo_remote(path, label=label, config=config, runner=runner)
     _clean_or_reject_checkout(
         path,
@@ -1152,12 +1162,18 @@ def _sync_base_branch(
             )
         _run_git(runner, path, ("switch", "-C", config.base, f"origin/{config.base}"))
     _run_git(runner, path, ("pull", "--ff-only", "origin", config.base))
+    refresh_after_sync(config, runner, path)
 
 
 def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfig, runner: Runner) -> None:
+    # A path agent-loop already prepared in this process is verified BEFORE any
+    # recreation branch (missing or stale), so a vanished, emptied or poisoned
+    # checkout is refused instead of being re-cloned over its baseline.
+    verify_before_sync(config, runner, path=path, label=f"Default {agent} workdir")
     if _is_stale_default_workdir(path):
         log(config, f"Stale default {agent} workdir detected (no checkout, only logs remain); recreating: {path}")
         shutil.rmtree(path)
+        forget_checkout(path)  # verified above; the tool itself removed it
 
     if not path.exists():
         try:
@@ -1185,10 +1201,16 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
 
 
 def validate_explicit_workdir(path: Path, option_name: str, config: AgentLoopConfig, runner: Runner) -> None:
+    if runner.dry_run:
+        return
     git_check = _run_git(runner, path, ("rev-parse", "--is-inside-work-tree"), check=False)
     if git_check.returncode != 0 or git_check.stdout.strip() != "true":
-        return
+        raise AgentLoopError(
+            f"{option_name} is not a git checkout: {path}. "
+            f"Explicit agent directories must be existing git checkouts of {config.repo}."
+        )
 
+    verify_before_sync(config, runner, path=path, label=option_name)
     _clean_or_reject_checkout(
         path,
         label=option_name,
@@ -1197,6 +1219,7 @@ def validate_explicit_workdir(path: Path, option_name: str, config: AgentLoopCon
         runner=runner,
     )
     _validate_repo_remote(path, label=option_name, config=config, runner=runner)
+    refresh_after_sync(config, runner, path)
 
 
 def sync_coder_base_before_implementation(config: AgentLoopConfig, runner: Runner) -> None:
@@ -1297,6 +1320,7 @@ def sync_checkout_to_pr(
             "Remove it or pass an explicit agent directory."
         )
 
+    verify_before_sync(config, runner, path=path, label=label)
     _validate_repo_remote(path, label=label, config=config, runner=runner)
     _clean_or_reject_checkout(
         path,
@@ -1323,6 +1347,7 @@ def sync_checkout_to_pr(
         log(config, f"{label} refreshed for PR #{pr_number}: HEAD {local_head}; no PR head SHA available")
     if branch_state:
         log(config, f"{label} branch state before review: {branch_state}")
+    refresh_after_sync(config, runner, path)
 
 
 def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner) -> None:
