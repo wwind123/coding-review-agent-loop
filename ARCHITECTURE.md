@@ -96,7 +96,7 @@ Source paths below are relative to
 | --- | --- | --- |
 | Entry points and effective configuration | `cli.py`, `config.py` | Parse modes; resolve role-specific models, effort, base, and policy before invocation. |
 | Lifecycle coordination | `orchestrator.py` | Compose planning, implementation, review, recovery, and finalization; do not delegate control decisions to free-form agent prose. |
-| Checkout identity | `workdirs.py`, `workdir_guard.py`, `workdir_claims.py`, `checkout_verification.py` | Prepare assigned checkouts and validate repository/head and reported test locations. `workdir_claims.py` holds a run-scoped cross-process claim on each required checkout; cleanup and reset happen only under this run's claim. `checkout_verification.py` is the in-process pre-turn gate: it verifies that an assigned checkout still matches what agent-loop last left in it. |
+| Checkout identity | `workdirs.py`, `workdir_guard.py`, `workdir_claims.py`, `checkout_verification.py` | Prepare assigned checkouts and validate repository/head and reported test locations. `workdir_claims.py` holds a run-scoped cross-process claim on each required checkout (plus a claim probe and run-end finalizers); cleanup and reset happen only under this run's claim. `run_worktrees.py` creates, prunes and removes the per-run worktrees over the shared store. `checkout_verification.py` is the in-process pre-turn gate: it verifies that an assigned checkout still matches what agent-loop last left in it. |
 | Agent-facing context | `prompts.py`, `memory.py` | Render issue/plan/human/feedback context and advisory repository orientation. |
 | Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
@@ -967,7 +967,7 @@ between GitHub and local artifacts:
 | Source and candidate identity | Git commits/branches and live GitHub PR metadata. |
 | Cross-invocation workflow history | GitHub comments with round metadata, canonical issue/PR handoffs, plan identities, and managed-CI intents; oversized payloads use sidecar comments. |
 | Invocation results | Unique response files and external subprocess logs; validate the current attempt before accepting an artifact. |
-| Work in progress | Tool-owned or explicitly supplied checkouts; tracked diffs can be preserved as salvage on supported failure paths. |
+| Work in progress | Tool-owned per-run worktrees (removed at run end) or explicitly supplied checkouts; run artifacts (a relative `--log-dir`) live under `<cache>/run-artifacts/OWNER-REPO/<run-token>/`, a relative `--agent-memory-dir` under `<cache>/repos/OWNER-REPO/`, and worktree owner records under the host lock root; tracked diffs can be preserved as salvage on supported failure paths. |
 | Local evidence | Test observations/receipts, runtime recommendations, usage summaries, and containment evidence. |
 | Orientation only | Repo-scoped memory, file inventories, and cached execution profiles; these may be stale. |
 
@@ -1091,11 +1091,32 @@ to check them when a change crosses module boundaries.
 
 ## Execution and Concurrency
 
-Use one active `agent-loop` invocation per repository per machine. Default
-workdirs are shared by repo/backend, and there is no repository-wide process
-lock enforcing this convention. Parallel reviewers within one invocation are
-supported; the orchestrator verifies distinct reviewer workdirs. Coder and
-reviewer turns are separate lifecycle stages even when they use the same CLI.
+Concurrent default-dir invocations on one repository are supported (#1162).
+Each run with an omitted `--<agent>-dir` gets its own detached `git worktree`
+under `<scratch>/OWNER-REPO/<agent>/runs/<run-token>`, backed by one shared
+clone per repo/agent (the *store*, `<scratch>/OWNER-REPO/<agent>/repo`) that
+owns the object store. Explicit `--<agent>-dir` paths are untouched. Parallel
+reviewers within one invocation are supported; the orchestrator verifies
+distinct reviewer workdirs. Coder and reviewer turns are separate lifecycle
+stages even when they use the same CLI.
+
+**Per-run worktrees (`run_worktrees.py`).** Store mutations (clone, fetch+pin,
+local-base fast-forward, worktree add, prune, remove) run under a short,
+non-reentrant host `flock` (`<lock root>/workdir-stores/`) that is never held
+across an agent turn; a nested acquisition fails fast. A probe of the store
+path's own run claim (`workdir_claims.probe_free_claim`) interlocks with an
+explicit-dir or older-version run that checked out a branch in the store: while
+it is held the store's HEAD, branch, index and tree are untouched and the run
+only fetches. Every worktree has a durable owner record (`<store-key>/<token>.json`,
+pending then ready, with the root and admin-dir identities) under the lock
+root. Base and PR syncs check out an immutable SHA pinned under the store lock,
+so a concurrent fetch cannot move another run's checkout; the PR path still
+compares the pin with the advertised head. The local `<base>` ref moves only by
+a guarded `git branch -f` fast-forward, skipped when `<base>` is checked out in
+any worktree. The outermost `workdir_claim_scope` runs registered finalizers
+(identity-verified worktree removal) before releasing claims, on success and
+failure. At startup a run prunes worktrees whose owner record matches and whose
+claim lock is free; unrecognized entries are logged and left untouched.
 
 **Pre-turn checkout verification.** A claim protects against another
 agent-loop run, not against an operator, editor or stray script writing to the
@@ -1119,7 +1140,7 @@ clean-but-wrong checkout is refused rather than adopted. `semantic-dedupe` and
 `repair` (tool-owned temporary directories) and dry-run are exempt. Explicit
 agent directories must be existing git checkouts. Foreign writes *during* a
 turn are absorbed into the refreshed baseline; excluding them is the claim's
-responsibility. Session-scoped default paths remain a separate decision (#1162).
+responsibility.
 
 The Antigravity `GEMINI.md` injection carries a self-describing header
 (`orig`, body byte length and sha256) so a leftover from a killed run is

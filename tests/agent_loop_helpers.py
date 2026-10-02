@@ -2012,6 +2012,9 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         "claude_dir": tmp_path / "claude",
         "codex_dir": tmp_path / "codex",
         "gemini_dir": tmp_path / "gemini",
+        # Never the cwd-relative default: parallel workers would share one
+        # ./antigravity checkout and its GEMINI lock.
+        "antigravity_dir": tmp_path / "antigravity",
         "coder": "claude",
         "reviewer": "codex",
         "base": "main",
@@ -2048,6 +2051,7 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         config["claude_dir"].mkdir(parents=True, exist_ok=True)
         config["codex_dir"].mkdir(parents=True, exist_ok=True)
         config["gemini_dir"].mkdir(parents=True, exist_ok=True)
+        config["antigravity_dir"].mkdir(parents=True, exist_ok=True)
     return AgentLoopConfig(**config)
 
 

@@ -918,8 +918,8 @@ def test_configured_agent_selections_covers_every_agent_typed_field():
         for field in dataclasses.fields(AgentLoopConfig)
         if "AgentName" in repr(hints[field.name]) or "Literal['claude'" in repr(hints[field.name])
     }
-    # auto_agent_dirs records which directories were defaulted; it selects no agent.
-    agent_fields -= {"auto_agent_dirs"}
+    # auto_agent_dirs and default_checkout_stores record defaulted directories; they select no agent.
+    agent_fields -= {"auto_agent_dirs", "default_checkout_stores"}
     agent_fields |= {"repair_backend"}  # a str-typed agent selection
     covered = {
         "coder", "implementation_coder", "reviewer", "primary_reviewer",

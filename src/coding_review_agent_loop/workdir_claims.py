@@ -20,6 +20,7 @@ import hashlib
 import inspect
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -60,6 +61,8 @@ class _Claim:
 
 _claim_root_override: Path | None = None
 _registry: dict[str, _Claim] = {}
+# Run-end finalizers per logical run, keyed by a caller-chosen dedupe key (#1162).
+_finalizers: dict[ClaimOwner, dict[str, Callable[[], None]]] = {}
 _registry_lock = threading.Lock()
 _active_owner: ContextVar[ClaimOwner | None] = ContextVar("workdir_claim_owner", default=None)
 
@@ -250,6 +253,67 @@ def _release_claim(key: str) -> None:
         claim.handle.close()
 
 
+@contextlib.contextmanager
+def probe_free_claim(path: Path) -> Iterator[bool]:
+    """Yield True while no run claims ``path``; the probe lock is held for the block.
+
+    Uses the same lock file as :func:`acquire_workdir_claim` but writes no
+    metadata.  A claim held by another process, or by this process, yields
+    False.
+    """
+    key = _claim_key(path)
+    lock_path = claim_root() / f"{key}.lock"
+    with _registry_lock:
+        held_here = key in _registry
+    if held_here:
+        yield False
+        return
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    handle = os.fdopen(descriptor, "r+")
+    try:
+        try:
+            os.set_inheritable(descriptor, False)
+        except OSError:  # pragma: no cover
+            pass
+        free = _flock_nonblocking(handle)
+        try:
+            yield free
+        finally:
+            if free and os.name != "nt":
+                import fcntl
+
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def register_run_finalizer(key: str, callback: Callable[[], None]) -> bool:
+    """Attach a run-end callback to the active owner; True when newly registered.
+
+    Callbacks run LIFO in the outermost scope before claims are released.
+    """
+    owner = _active_owner.get()
+    if owner is None:
+        raise AgentLoopError("register_run_finalizer requires an active workdir_claim_scope().")
+    with _registry_lock:
+        bucket = _finalizers.setdefault(owner, {})
+        if key in bucket:
+            return False
+        bucket[key] = callback
+        return True
+
+
+def _run_finalizers(owner: ClaimOwner) -> None:
+    with _registry_lock:
+        bucket = _finalizers.pop(owner, {})
+    for key, callback in reversed(list(bucket.items())):
+        try:
+            callback()
+        except Exception as exc:  # noqa: BLE001 - never mask the run's own result
+            print(f"[agent-loop] run finalizer {key} failed: {exc}", file=sys.stderr)
+
+
 def release_workdir_claims(owner: ClaimOwner) -> None:
     with _registry_lock:
         for key in [k for k, c in _registry.items() if c.owner == owner]:
@@ -317,7 +381,10 @@ def workdir_claim_scope(
         yield owner
     finally:
         try:
-            release_workdir_claims(owner)
+            try:
+                _run_finalizers(owner)
+            finally:
+                release_workdir_claims(owner)
         finally:
             _active_owner.reset(token)
 

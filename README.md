@@ -577,8 +577,8 @@ agent-loop pr 456 \
   --review-parallel
 ```
 
-Agent-loop creates separate repo-scoped temporary checkouts for active agents
-unless you provide workdirs. GitHub comments carry durable round and handoff
+Agent-loop creates a separate per-run git worktree for each active agent unless
+you provide workdirs (see "Default checkouts" in `docs/local_agent_loop.md`). GitHub comments carry durable round and handoff
 metadata, so a later run can reconstruct the active review state. When the PR
 number is known, resume with `agent-loop pr <number>` instead of starting issue
 implementation again.
@@ -709,8 +709,10 @@ tells an agent to relay a decision, the relay must be disclosed in the comment.
   file under a private per-user lock root, outside the checkout). A second run
   that resolves to a claimed checkout is refused by name (pid, run id, repo,
   command and target) before any reset or clean; a claim left by a crashed run
-  is taken over. To run several `agent-loop` invocations concurrently against
-  one repository, give each explicit `--{agent}-dir` checkouts. Other
+  is taken over. Concurrent default-dir invocations on one repository now
+  proceed: each gets its own detached worktree off a shared per-repo store,
+  removed when the run ends, and stale worktrees of killed runs are pruned at
+  the next startup. Runs with explicit `--{agent}-dir` checkouts behave as before. Other
   repo-scoped local state (the memory cache, subprocess-log root) is still
   shared. `--allow-shared-dir` only lets agents within one run share a
   checkout; it never lets a second run use a claimed one. `--review-parallel`

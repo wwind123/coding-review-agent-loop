@@ -824,7 +824,9 @@ refusal metadata without triggering stability waiting.
 - `claude` is installed and authenticated if either side uses Claude.
 - `codex` is installed and authenticated if either side uses Codex.
 - `gemini` is installed and authenticated if either side uses Gemini. For individual Google accounts after the consumer cutoff, prefer `agy`; direct Gemini CLI support is best-effort for enterprise/API-key users who can provide logs when issues are not locally reproducible.
-- Use separate clones or worktrees for each active agent to avoid local file conflicts. If you omit `--claude-dir`, `--codex-dir`, or `--gemini-dir` for an active agent, the tool uses a repo-scoped temporary checkout under `/tmp/coding-review-agent-loop/OWNER-REPO/{agent}/repo`.
+- Use separate clones or worktrees for each active agent to avoid local file conflicts. If you omit `--claude-dir`, `--codex-dir`, or `--gemini-dir` for an active agent, the tool keeps one shared clone (the *store*) under `/tmp/coding-review-agent-loop/OWNER-REPO/{agent}/repo` and gives each run its own detached `git worktree` under `/tmp/coding-review-agent-loop/OWNER-REPO/{agent}/runs/<run-token>`.
+
+  **Default checkouts (#1162).** Store operations (clone, fetch, fast-forwarding the local base branch, adding, pruning and removing worktrees) are serialized by a short host lock that is never held across an agent turn. A run's worktree is created at the base SHA pinned under that lock, and every later base or PR sync checks out a pinned SHA, so concurrent runs never move each other's checkouts. The worktree is removed when the run ends, on success or failure, before its claim is released. At startup a run prunes worktrees of runs that are gone (owner record matches and the claim lock is free), including dirty ones left by a killed run; anything it cannot positively identify under `runs/` is logged and left untouched. Concurrent default-dir runs on one repository therefore both proceed. Run artifacts (the default `.agent-loop-logs`, salvage patches, usage summaries) are written under `<user cache>/coding-review-agent-loop/run-artifacts/OWNER-REPO/<run-token>/` so they survive worktree removal and are not deleted with it.
 
 ## Usage
 
@@ -3532,7 +3534,9 @@ Targets are `issue #N`, `PR #N`, `discuss #N`, `task`, `managed-pr from <head>`
 or `library`. Unreadable holder metadata is reported as an unidentified holder.
 A holder that crashed leaves a free lock, so the next run takes it over. Pass an
 explicit `--{agent}-dir` per run to work concurrently. `--allow-shared-dir` is
-intra-run only.
+intra-run only. Default-dir runs claim their own per-run worktree rather than
+the shared store, so they no longer refuse each other; only explicit-dir
+runs (or an older agent-loop) that claim a path still do.
 
 Explicit `--claude-dir`, `--codex-dir`, and `--gemini-dir` values are used
 exactly as provided. Missing explicit directories are still created for
@@ -3729,7 +3733,10 @@ agent-loop pr 123 --repo OWNER/REPO --agent-memory-dir .cache/agent-loop-memory
 ```
 
 Relative `--agent-memory-dir` values are resolved inside the active coder
-checkout. Use `--no-agent-memory` or a custom short-lived
+checkout when that checkout is an explicit directory; for a default per-run
+worktree they resolve under the repo-keyed user cache
+(`<user cache>/coding-review-agent-loop/repos/OWNER-REPO/<value>`) so memory
+survives worktree removal. Use `--no-agent-memory` or a custom short-lived
 `--agent-memory-dir` for sensitive repositories where local cache retention is
 undesirable. If a custom memory directory uses the repo-local `.agent-loop`
 parent, that parent is ignored automatically so generated memory files are not
@@ -5718,8 +5725,9 @@ before the existing continued-blocking escalation applies.
 
 Agent stdout/stderr is written to `.agent-loop-logs/` under the active coder
 checkout by default. If that coder directory was omitted, the relative default
-log path is also under the repo-scoped temporary checkout and may disappear
-with `/tmp` cleanup. The CLI prints heartbeat messages with the log path while
+log path instead resolves under the durable per-run artifact root
+`<user cache>/coding-review-agent-loop/run-artifacts/OWNER-REPO/<run-token>/`,
+outside the per-run worktree that is removed at run end. The CLI prints heartbeat messages with the log path while
 agents run:
 
 ```text
