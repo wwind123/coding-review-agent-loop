@@ -14086,9 +14086,22 @@ def _run_plan_first_loop(
                 # review already public counts, whatever its scheduler phase and
                 # whether or not its author was selected again, including
                 # records resume stripped as unqualified pre-opening.
-                plan_fresh_records = plan_history_records(
-                    refresh=True, round_number=round_number
-                )
+                try:
+                    plan_fresh_comments = get_issue_context(
+                        runner, config=config, issue_number=issue_number
+                    ).comments
+                except AgentLoopError:
+                    plan_fresh_records = None
+                else:
+                    try:
+                        plan_fresh_records = _extract_round_metadata_records(
+                            plan_fresh_comments, flow="plan"
+                        )
+                    except AgentLoopError as exc:
+                        stop_plan_pre_panel(
+                            plan_undecodable_history_message(exc), round_number=round_number
+                        )
+                        raise
                 plan_visibility_records, _plan_checkpoint_present = _visibility_snapshot(
                     fresh_records=plan_fresh_records,
                     base_records=plan_records,
@@ -18982,20 +18995,27 @@ def _visibility_snapshot(
     if checkpoint is None:
         return tuple(base_records), False
     base_top = max((record.index for record in base_records), default=-1)
-    if fresh_records is not None and any(
-        record.index > base_top
-        and record.metadata.flow == checkpoint.flow
-        and record.metadata.role == "summary"
-        and record.metadata.phase == "scheduler-prelaunch"
-        and record.metadata.round_number == checkpoint.round_number
-        and record.metadata.subject == checkpoint.subject
-        for record in fresh_records
-    ):
-        return tuple(fresh_records), True
+    if fresh_records is None:
+        history: tuple[PostedRoundRecord, ...] = tuple(base_records)
+    else:
+        history = tuple(fresh_records)
+        if any(
+            record.index > base_top
+            and record.metadata.flow == checkpoint.flow
+            and record.metadata.role == "summary"
+            and record.metadata.phase == "scheduler-prelaunch"
+            and record.metadata.round_number == checkpoint.round_number
+            and record.metadata.subject == checkpoint.subject
+            for record in history
+        ):
+            return history, True
+    # The refreshed history (when readable) keeps every publication it
+    # exposed; only the checkpoint this invocation just posted is added.
+    top = max((record.index for record in history), default=-1)
     synthetic = PostedRoundRecord(
-        index=max(base_length, base_top + 1), metadata=checkpoint, body=""
+        index=max(base_length, base_top + 1, top + 1), metadata=checkpoint, body=""
     )
-    return (*base_records, synthetic), True
+    return (*history, synthetic), True
 
 
 @dataclass(frozen=True)
@@ -24456,24 +24476,8 @@ def run_pr_loop(
                         _derive_pr_visibility_evidence(pr_visibility_records)
                         if scheduler_capabilities.requires_primary else None
                     )
-                    pr_peer_records = pr_visibility_records
-                    if (
-                        pr_visibility_evidence is not None
-                        and pr_visibility_evidence.opening_source == "primary-approval"
-                    ):
-                        # Secondary reviews recorded before the qualified panel
-                        # opening are superseded premature artifacts that
-                        # resume never counts (#840); they keep today's
-                        # treatment and are not peers.
-                        pr_peer_records = tuple(
-                            record for record in pr_visibility_records
-                            if record.metadata.agent == scheduler_contract.primary_reviewer
-                            or record.metadata.role != "reviewer"
-                            or pr_visibility_evidence.opening_index is None
-                            or record.index > pr_visibility_evidence.opening_index
-                        )
                     pr_visible_names = visible_peer_names(
-                        pr_peer_records,
+                        pr_visibility_records,
                         opening_source=(
                             pr_visibility_evidence.opening_source
                             if pr_visibility_evidence is not None else None

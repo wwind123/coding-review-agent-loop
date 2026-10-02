@@ -12044,6 +12044,19 @@ def test_840_premature_secondary_approvals_are_not_resumed_carried_or_counted(tm
         )
     runner.gemini_outputs.append(_staged_review(reviewer="Google Gemini"))
     runner.antigravity_outputs.append(_staged_review(reviewer="Antigravity"))
+    if parallel:
+        # #1156: the premature Gemini review is public, so Antigravity's fresh
+        # post-opening turn would read it.  Visibility, not resume
+        # qualification, decides: the round is refused before any launch.
+        launches_before = len(_agent_sequence(runner))
+        with pytest.raises(AgentLoopError, match="partially published") as excinfo:
+            run_pr_loop(
+                runner, pr_number=77,
+                config=_staged_config(tmp_path, auto_merge=True, review_parallel=parallel),
+            )
+        assert "Gemini review" in str(excinfo.value)
+        assert len(_agent_sequence(runner)) == launches_before
+        return
     merges = []
     import coding_review_agent_loop.orchestrator as module
 
