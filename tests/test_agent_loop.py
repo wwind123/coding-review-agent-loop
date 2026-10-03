@@ -1,6 +1,7 @@
 import ast
 import base64
 import datetime
+import errno
 import inspect
 import json
 import os
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
+import orchestrator_split_guard
 import coding_review_agent_loop.cli as cli_module
 import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.prompts as prompts_module
@@ -5411,10 +5413,226 @@ def test_orchestrator_target_exec_error_without_command_result_is_retryable(tmp_
                 validate=lambda value: value,
             )
 
-    assert exc_info.value.failure_category == "deterministic"
+    # The typed runner decision outranks textual classification (#1226).
+    assert exc_info.value.failure_category == "transient"
     assert runner.decisions
     assert all(command == "" and errno_value == 2 for command, errno_value in runner.decisions)
     assert "target executable retryable" in str(exc_info.value)
+
+
+def _contained_target_exec_result(tmp_path, command, errno_value=errno.ENOENT):
+    return AgentResult(
+        text="",
+        raw_output="",
+        returncode=127,
+        command_result=CommandResult([command, "exec"], tmp_path, "", "", 127),
+        containment=ContainmentEvidence(
+            backend="systemd-cgroup-v2",
+            termination_cause="target-exec-error",
+            target_exec_errno=errno_value,
+            cleanup_confirmed=True,
+            diagnostics=(f"target exec failed ({errno_value}): [Errno {errno_value}] missing",),
+        ),
+    )
+
+
+def _preflighted_target_exec_runner(monkeypatch, command, stable=True):
+    import coding_review_agent_loop.runner as runner_module
+
+    runner = FakeRunner()
+    runner.remember_agent_command(command, command, "--claude-cmd")
+    # The updater has already re-created the binary when the decision runs.
+    monkeypatch.setattr(runner_module.shutil, "which", lambda _name: "/opt/bin/claude")
+    monkeypatch.setattr(runner_module.os.path, "exists", lambda _path: True)
+    stability_calls = []
+    runner.wait_for_executable_stability = lambda cmd, *, deadline=None: (
+        stability_calls.append(cmd) or stable
+    )
+    return runner, stability_calls
+
+
+def _codex_review_validator(text):
+    return _validate_review_response(
+        text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy"
+    )
+
+
+@pytest.mark.parametrize("command", ["claude", "/home/user/.npm-global/bin/claude"])
+def test_validated_agent_recovers_after_contained_enoent_during_self_update(
+    monkeypatch, tmp_path, capsys, command
+):
+    """#1225/#1226: a mid-run self-update ENOENT is transient and relaunched once."""
+    runner, stability_calls = _preflighted_target_exec_runner(monkeypatch, command)
+    valid = structured_pr_review(state="approved", summary="Recovered.", reviewer="OpenAI Codex")
+    results = iter(
+        [
+            _contained_target_exec_result(tmp_path, command),
+            AgentResult(text=valid, raw_output=valid, returncode=0),
+        ]
+    )
+    config = make_config(
+        tmp_path, reviewer="codex", agent_max_retries=2, quiet=False
+    )
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="codex",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_codex_review_validator,
+        )
+
+    assert response.marker_value.state == "approved"
+    assert run_mock.call_count == 2
+    assert stability_calls == [command]
+    stderr = capsys.readouterr().err
+    assert "transient failure" in stderr
+    assert "deterministic failure" not in stderr
+    assert "temporarily unavailable/being replaced after successful preflight" in stderr
+
+
+def test_validated_agent_exhausted_contained_enoent_stays_transient(
+    monkeypatch, tmp_path, capsys
+):
+    command = "/home/user/.npm-global/bin/claude"
+    runner, stability_calls = _preflighted_target_exec_runner(monkeypatch, command)
+    config = make_config(
+        tmp_path, reviewer="codex", agent_max_retries=2, quiet=False
+    )
+
+    with patch.object(
+        orchestrator_module,
+        "run_agent_result",
+        side_effect=lambda *a, **k: _contained_target_exec_result(tmp_path, command),
+    ) as run_mock:
+        with pytest.raises(AgentInvocationError) as exc_info:
+            _run_validated_agent(
+                runner,
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=_codex_review_validator,
+            )
+
+    assert exc_info.value.failure_category == "transient"
+    assert "temporarily unavailable/being replaced after successful preflight" in str(
+        exc_info.value
+    )
+    assert run_mock.call_count == config.agent_max_retries + 1
+    # One bounded stability wait per actual relaunch, none after exhaustion.
+    assert stability_calls == [command] * config.agent_max_retries
+    stderr = capsys.readouterr().err
+    assert "deterministic failure" not in stderr
+
+
+@pytest.mark.parametrize("stable", [True, False])
+def test_validated_agent_target_exec_relaunch_ignores_stability_result(
+    monkeypatch, tmp_path, stable
+):
+    command = "claude"
+    runner, stability_calls = _preflighted_target_exec_runner(
+        monkeypatch, command, stable=stable
+    )
+    valid = structured_pr_review(state="approved", summary="Recovered.", reviewer="OpenAI Codex")
+    results = iter(
+        [
+            _contained_target_exec_result(tmp_path, command, errno.ETXTBSY),
+            AgentResult(text=valid, raw_output=valid, returncode=0),
+        ]
+    )
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="codex",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=_codex_review_validator,
+        )
+
+    assert response.marker_value.state == "approved"
+    assert run_mock.call_count == 2
+    assert stability_calls == [command]
+
+
+def test_validated_agent_target_exec_without_retry_budget_skips_stability_wait(
+    monkeypatch, tmp_path
+):
+    command = "claude"
+    runner, stability_calls = _preflighted_target_exec_runner(monkeypatch, command)
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=0)
+
+    with patch.object(
+        orchestrator_module,
+        "run_agent_result",
+        side_effect=lambda *a, **k: _contained_target_exec_result(tmp_path, command),
+    ) as run_mock:
+        with pytest.raises(AgentInvocationError) as exc_info:
+            _run_validated_agent(
+                runner,
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=_codex_review_validator,
+            )
+
+    assert exc_info.value.failure_category == "transient"
+    assert run_mock.call_count == 1
+    assert stability_calls == []
+
+
+@pytest.mark.parametrize(
+    ("containment_kwargs", "expected_category"),
+    [
+        (
+            {"termination_cause": "oom", "applicable_limit": "MemoryMax", "cleanup_confirmed": True},
+            "resource-exhausted",
+        ),
+        (
+            {"termination_cause": "target-exec-error", "cleanup_confirmed": False},
+            "containment-indeterminate",
+        ),
+    ],
+)
+def test_validated_agent_target_exec_retry_keeps_safety_precedence(
+    monkeypatch, tmp_path, containment_kwargs, expected_category
+):
+    command = "claude"
+    runner, stability_calls = _preflighted_target_exec_runner(monkeypatch, command)
+    result = AgentResult(
+        text="",
+        raw_output="",
+        returncode=127,
+        command_result=CommandResult([command], tmp_path, "", "", 127),
+        containment=ContainmentEvidence(
+            backend="systemd-cgroup-v2",
+            target_exec_errno=errno.ENOENT,
+            diagnostics=("target exec failed (2): missing",),
+            **containment_kwargs,
+        ),
+    )
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=2)
+
+    with patch.object(orchestrator_module, "run_agent_result", return_value=result) as run_mock:
+        with pytest.raises(AgentInvocationError) as exc_info:
+            _run_validated_agent(
+                runner,
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=_codex_review_validator,
+            )
+
+    assert exc_info.value.failure_category == expected_category
+    assert run_mock.call_count == 1
+    assert stability_calls == []
 
 
 @pytest.mark.parametrize("use_pty", [False, True])
@@ -5683,7 +5901,7 @@ def test_runner_preflighted_command_permission_error_does_not_retry(
     tmp_path,
     use_pty,
 ):
-    """Only FileNotFoundError and preflighted bare-command ENOEXEC can retry."""
+    """Only FileNotFoundError and preflighted ENOEXEC/ETXTBSY can retry."""
     import coding_review_agent_loop.runner as runner_module
 
     command_name = "bare-agent"
@@ -5760,7 +5978,7 @@ def test_runner_unpreflighted_or_absolute_exec_format_error_does_not_retry(
     tmp_path,
     command,
 ):
-    """ENOEXEC is fail-closed for unpreflighted and absolute commands."""
+    """ENOEXEC is fail-closed for unpreflighted bare and absolute commands."""
     import errno
     import coding_review_agent_loop.runner as runner_module
 
@@ -5861,6 +6079,229 @@ def test_runner_absolute_path_spawn_does_not_retry(monkeypatch, tmp_path, use_pt
             use_pty=use_pty,
         )
 
+    assert len(popen_calls) == 1
+    assert sleep_calls == []
+
+
+def _self_update_command(tmp_path, monkeypatch, absolute):
+    command = tmp_path / "bare-agent"
+    command.symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+    return str(command) if absolute else "bare-agent"
+
+
+@pytest.mark.parametrize("use_pty", [False, True])
+@pytest.mark.parametrize("absolute", [False, True])
+@pytest.mark.parametrize("errno_value", [errno.ETXTBSY, errno.ENOEXEC])
+def test_runner_preflighted_self_update_exec_error_recovers(
+    monkeypatch, tmp_path, use_pty, absolute, errno_value
+):
+    """#1226: a preflighted CLI busy/non-executable mid-update recovers after one backoff."""
+    import coding_review_agent_loop.runner as runner_module
+
+    command = _self_update_command(tmp_path, monkeypatch, absolute)
+    runner = Runner()
+    runner.remember_agent_command(command, str(tmp_path / "bare-agent"), "--claude-cmd")
+    original_popen = runner_module.subprocess.Popen
+    popen_calls = []
+    sleep_calls = []
+
+    def flaky_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        if len(popen_calls) == 1:
+            raise OSError(errno_value, os.strerror(errno_value))
+        return original_popen(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", flaky_popen)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda delay: sleep_calls.append(delay))
+
+    result = runner.run_with_log(
+        [command, "-c", "print('recovered')"],
+        cwd=tmp_path,
+        log_path=tmp_path / "logs" / f"self-update-{use_pty}.log",
+        label="Self-update probe",
+        progress_interval_seconds=999,
+        use_pty=use_pty,
+    )
+
+    assert result.returncode == 0
+    assert "recovered" in result.stdout
+    assert len(popen_calls) == 2
+    assert sleep_calls[0] == 2
+
+
+@pytest.mark.parametrize("use_pty", [False, True])
+@pytest.mark.parametrize("command", ["bare-agent", "/opt/bin/bare-agent"])
+@pytest.mark.parametrize(
+    ("errno_value", "expected"),
+    [
+        (errno.ETXTBSY, "remained temporarily busy"),
+        (errno.ENOEXEC, "remained temporarily non-executable"),
+    ],
+)
+def test_runner_preflighted_self_update_exec_error_is_bounded(
+    monkeypatch, tmp_path, use_pty, command, errno_value, expected
+):
+    import coding_review_agent_loop.runner as runner_module
+
+    runner = Runner()
+    runner.remember_agent_command(command, "/opt/bin/bare-agent", "--claude-cmd")
+    popen_calls = []
+    sleep_calls = []
+
+    def busy_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        raise OSError(errno_value, os.strerror(errno_value))
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", busy_popen)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda delay: sleep_calls.append(delay))
+
+    with pytest.raises(AgentLoopError, match=rf"{expected}.*--claude-cmd"):
+        runner.run_with_log(
+            [command, "--version"],
+            cwd=tmp_path,
+            log_path=tmp_path / "logs" / f"busy-{use_pty}.log",
+            label="Busy probe",
+            progress_interval_seconds=999,
+            use_pty=use_pty,
+        )
+
+    assert len(popen_calls) == runner_module._SPAWN_ATTEMPTS
+    assert sleep_calls == [2] * (runner_module._SPAWN_ATTEMPTS - 1)
+
+
+@pytest.mark.parametrize("command", ["bare-agent", "/opt/bin/bare-agent"])
+def test_runner_unpreflighted_text_busy_does_not_retry(monkeypatch, tmp_path, command):
+    import coding_review_agent_loop.runner as runner_module
+
+    popen_calls = []
+    sleep_calls = []
+
+    def busy_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        raise OSError(errno.ETXTBSY, "Text file busy")
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", busy_popen)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda delay: sleep_calls.append(delay))
+
+    with pytest.raises(OSError) as exc_info:
+        Runner().run_with_log(
+            [command, "--version"],
+            cwd=tmp_path,
+            log_path=tmp_path / "logs" / "busy-no-retry.log",
+            label="Busy no-retry probe",
+            progress_interval_seconds=999,
+        )
+
+    assert exc_info.value.errno == errno.ETXTBSY
+    assert len(popen_calls) == 1
+    assert sleep_calls == []
+
+
+@pytest.mark.parametrize("use_pty", [False, True])
+def test_runner_preflighted_absolute_command_disappearance_recovers(
+    monkeypatch, tmp_path, use_pty
+):
+    """#1226: a preflighted absolute --<agent>-cmd briefly missing is retried, bounded."""
+    import coding_review_agent_loop.runner as runner_module
+
+    command = str(tmp_path / "abs-agent")
+    runner = Runner()
+    runner.remember_agent_command(command, command, "--claude-cmd")
+    original_popen = runner_module.subprocess.Popen
+    popen_calls = []
+    sleep_calls = []
+
+    def flaky_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        if len(popen_calls) == 1:
+            raise FileNotFoundError(command)
+        return original_popen(*args, **kwargs)
+
+    def restore_command(delay):
+        sleep_calls.append(delay)
+        if not os.path.lexists(command):
+            os.symlink(sys.executable, command)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", flaky_popen)
+    monkeypatch.setattr(runner_module.time, "sleep", restore_command)
+
+    result = runner.run_with_log(
+        [command, "-c", "print('absolute recovered')"],
+        cwd=tmp_path,
+        log_path=tmp_path / "logs" / f"abs-retry-{use_pty}.log",
+        label="Absolute retry probe",
+        progress_interval_seconds=999,
+        use_pty=use_pty,
+    )
+
+    assert result.returncode == 0
+    assert "absolute recovered" in result.stdout
+    assert len(popen_calls) == 2
+    assert sleep_calls[0] == 2
+
+
+def test_runner_preflighted_absolute_command_disappearance_is_bounded(monkeypatch, tmp_path):
+    import coding_review_agent_loop.runner as runner_module
+
+    command = str(tmp_path / "abs-agent")
+    runner = Runner()
+    runner.remember_agent_command(command, command, "--claude-cmd")
+    popen_calls = []
+    sleep_calls = []
+
+    def missing_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        raise FileNotFoundError(command)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", missing_popen)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda delay: sleep_calls.append(delay))
+
+    with pytest.raises(AgentLoopError, match="disappeared after successful preflight"):
+        runner.run_with_log(
+            [command, "--version"],
+            cwd=tmp_path,
+            log_path=tmp_path / "logs" / "abs-bounded.log",
+            label="Absolute bounded probe",
+            progress_interval_seconds=999,
+        )
+
+    assert len(popen_calls) == runner_module._SPAWN_ATTEMPTS
+    assert sleep_calls == [2] * (runner_module._SPAWN_ATTEMPTS - 1)
+
+
+def test_runner_unpreflighted_dangling_symlink_fails_fast(monkeypatch, tmp_path):
+    """A cached dangling candidate is not retry evidence without preflight (#1226)."""
+    import coding_review_agent_loop.runner as runner_module
+
+    command_name = "bare-agent"
+    command = tmp_path / command_name
+    command.symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+    runner = Runner()
+    popen_calls = []
+    sleep_calls = []
+
+    def dangling_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        # The runtime resolution was cached; the target now disappears.
+        command.unlink()
+        command.symlink_to(tmp_path / "missing-target")
+        raise FileNotFoundError(command_name)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", dangling_popen)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda delay: sleep_calls.append(delay))
+
+    with pytest.raises(AgentLoopError, match="bare-agent CLI not found on PATH"):
+        runner.run_with_log(
+            [command_name, "--version"],
+            cwd=tmp_path,
+            log_path=tmp_path / "logs" / "dangling-fast.log",
+            label="Dangling fail-fast probe",
+            progress_interval_seconds=999,
+        )
+
+    assert runner._resolved_commands[command_name] == str(command)
     assert len(popen_calls) == 1
     assert sleep_calls == []
 
@@ -6884,7 +7325,20 @@ _OWNING_RUN_ENTRIES = {"run_issue_loop", "run_task_loop", "run_pr_loop", "run_di
 
 
 def _orchestrator_tree():
-    return ast.parse(Path(orchestrator_module.__file__).read_text(encoding="utf-8"))
+    # Spans orchestrator.py and every module extracted from it (#1181), so
+    # moved run entries and nested run_pr_loop calls stay in scope.
+    return orchestrator_split_guard.combined_split_tree()
+
+
+def test_orchestrator_tree_includes_registered_extracted_modules(monkeypatch):
+    monkeypatch.setattr(orchestrator_split_guard, "EXTRACTED_MODULES", ("usage",))
+    functions = {node.name for node in _orchestrator_tree().body if isinstance(node, ast.FunctionDef)}
+    facade_source = orchestrator_split_guard.module_path("orchestrator").read_text(encoding="utf-8")
+    facade_functions = {node.name for node in ast.parse(facade_source).body if isinstance(node, ast.FunctionDef)}
+    assert facade_functions <= functions
+    usage_source = orchestrator_split_guard.module_path("usage").read_text(encoding="utf-8")
+    usage_functions = {node.name for node in ast.parse(usage_source).body if isinstance(node, ast.FunctionDef)}
+    assert usage_functions and usage_functions <= functions
 
 
 def test_only_owning_run_entries_create_a_usage_context():

@@ -95,7 +95,21 @@ Source paths below are relative to
 | Responsibility | Main source files | Boundary |
 | --- | --- | --- |
 | Entry points and effective configuration | `cli.py`, `config.py` | Parse modes; resolve role-specific models, effort, base, and policy before invocation. |
-| Lifecycle coordination | `orchestrator.py` | Compose planning, implementation, review, recovery, and finalization; do not delegate control decisions to free-form agent prose. |
+| Lifecycle facade | `orchestrator.py` | Import/re-export facade only: a docstring plus import statements that keep the historical `coding_review_agent_loop.orchestrator` surface (used by `cli.py` and tests) bound to the owning modules below; it defines nothing itself. Together with the rows below it composes planning, implementation, review, recovery, and finalization; control decisions are never delegated to free-form agent prose. |
+| Agent failure classification | `agent_failure.py` | Validated agent response types, rate-limit reset parsing, transient/unsupported-model classification, structured-candidate recovery, and failed-run diagnostics. |
+| Architecture-impact contract | `architecture_contract.py` | Prompt-architecture freezing, PR architecture identity revalidation, and accepted-candidate carriers for the architecture-impact contract. |
+| Validated agent turn | `validated_agent.py` | Run telemetry and usage contexts, structured repair, completion recovery, and the validated agent turn shared by every role. |
+| Response validation | `response_validation.py` | Coder and plan response validators, human-requirement checks, and post-PR test/observation validation. |
+| Panel evidence | `panel_evidence.py` | PR/plan panel evidence, board-amendment notes, plan primary streak, and plan-growth gates. |
+| Review rounds | `review_rounds.py` | Review outcome classification, round-ledger helpers, parallel reviewer-turn launch, spool replay, and partial-round refusal. |
+| Discuss loop | `discuss_loop.py` | The discuss mode entry point and its consensus and split-proposal analyzers. |
+| Execution policy | `execution_policy.py` | Execution-policy resolution, child routing and provenance, staged reporting, typed plan-stage extraction, and fresh-topology preflights. |
+| Child plan binding | `child_plan_binding.py` | Inherited-matrix replan state, child-plan rebind and supersession, and structured plan-round assembly. |
+| PR loop support | `pr_loop_support.py` | Exact-head merge proof, finalization, evidence freeze, qualification snapshot, and PR transition observation. |
+| PR review loop | `pr_loop.py` | The PR review loop entry point (`run_pr_loop`). |
+| Approved-plan implementation | `issue_implementation.py` | Approved-plan implementation handoff and plan decomposition. |
+| Plan-first loop | `plan_first_loop.py` | The plan-first loop together with staged child dispatch and child planning cycles (one mutually recursive group, kept in one module). |
+| Issue and task loops | `issue_loop.py` | The issue and task loop entry points. |
 | Checkout identity | `workdirs.py`, `workdir_guard.py`, `workdir_claims.py`, `checkout_verification.py` | Prepare assigned checkouts and validate repository/head and reported test locations. `workdir_claims.py` holds a run-scoped cross-process claim on each required checkout (plus a claim probe and run-end finalizers); cleanup and reset happen only under this run's claim. `run_worktrees.py` creates, prunes and removes the per-run worktrees over the shared store. `checkout_verification.py` is the in-process pre-turn gate: it verifies that an assigned checkout still matches what agent-loop last left in it. |
 | Agent-facing context | `prompts.py`, `memory.py` | Render issue/plan/human/feedback context and advisory repository orientation. |
 | Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
@@ -110,10 +124,16 @@ Source paths below are relative to
 | Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. |
 | Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `tool_provenance.py`, `logging.py`, `worker_telemetry.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success; `tool_provenance.py` validates the Git executable's location and reads the tool checkout only through `run_hardened_git` to record the running commit; runtime rows persist the launch triple (`wrapper_bootstrap`, `inner_exec`, `suite_start`) as diagnostics beside `launch_integrity`; `worker_telemetry.py` appends a disposable host-scoped worker-reservation log whose broker-lane attribution comes from the runner while standalone `run-tests` attribution is self-reported. |
 
-`orchestrator.py` is still a large integration module. The table describes
-existing ownership, not a completed decomposition into independently deployed
-services. Shared data types live alongside their owning modules rather than in
-one central model package.
+`orchestrator.py` is a thin re-export facade over the lifecycle modules listed
+above, which were extracted from it by pure moves (#1181). Each extracted module
+imports alone, never imports the facade, and imports only modules extracted
+before it, so the lifecycle layers form an acyclic chain ending at
+`issue_loop.py`; [tests/test_orchestrator_split.py](tests/test_orchestrator_split.py) enforces those rules and
+that the facade stays docstring-and-imports only. Tests still patch names on
+the facade; a test-only shim installed from [tests/conftest.py](tests/conftest.py) propagates those
+patches to the owning modules. The table describes code ownership, not a
+decomposition into independently deployed services. Shared data types live
+alongside their owning modules rather than in one central model package.
 
 ## Main Lifecycle
 
@@ -1361,7 +1381,7 @@ Record contract of the digest:
   plan sidecar carries the same collections as structured state. Every reader of
   these records (`_extract_current_deferred_stages`,
   `_extract_current_expected_closing_issue_ids` and the typed-stage extractors
-  in `orchestrator.py`) takes the canonical plan text, never the visible body of
+  in `execution_policy.py`) takes the canonical plan text, never the visible body of
   a plan coder round comment.
 - *Signed requirement IDs are never omitted.* The acknowledgement block keeps
   its record, heading, every requirement ID line and the direct-discussion

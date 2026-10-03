@@ -518,7 +518,11 @@ def test_timeout_resolution_uses_observation_order_not_duration_comparisons(tmp_
     )
     assert timed_out.unresolved_timeout_seconds == 300
     assert "Last 300s attempt timed out" in runtime.render_runtime_context(
-        memory, commands=(command,), cwd=tmp_path, policy_ceiling_seconds=1800
+        memory,
+        commands=(command,),
+        cwd=tmp_path,
+        policy_ceiling_seconds=1800,
+        recommendations={tuple(command): timed_out},
     )
 
     _record(

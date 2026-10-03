@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import orchestrator_split_guard
 import coding_review_agent_loop.managed_ci as managed_ci
 import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.workdirs import github_api_cwd
@@ -7637,8 +7638,9 @@ def test_managed_ci_gh_invocations_obey_the_245_floor():
         "--paginate", "--method", "-H", "-f", "-F", "--input", "--hostname", "--jq",
         "--silent", "--verbose",
     }
-    for filename in ("managed_ci.py", "orchestrator.py"):
-        path = Path(__file__).parents[1] / "src" / "coding_review_agent_loop" / filename
+    # Follow orchestrator code into the modules extracted from it (#1181).
+    paths = [orchestrator_split_guard.module_path("managed_ci"), *orchestrator_split_guard.split_source_paths()]
+    for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
