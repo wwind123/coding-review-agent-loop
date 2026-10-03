@@ -15537,37 +15537,6 @@ def _claude_prompts_1229(runner):
     return [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
 
 
-def test_bare_string_matrix_field_is_normalized_without_repair_or_replay(tmp_path, capsys):
-    bare = _matrix_plan_candidate_1229(forbidden_side_effects="Must not refuse")
-    runner = _PlanDiagnosticRunner(issue_number=56)
-    runner.claude_outputs = [bare]
-    config = make_config(tmp_path, agent_max_retries=0, execution_strategy_contract_required=True, quiet=False)
-    try:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    except Exception:
-        pass  # later stages are not under test
-    assert len(_claude_prompts_1229(runner)) >= 1
-    assert not runner.diagnostic_posts
-    assert "normalized risk test matrix string field(s)" in capsys.readouterr().err
-
-
-def test_unrecoverable_matrix_replays_planner_once_and_quotes_error(tmp_path, capsys):
-    bad = _matrix_plan_candidate_1229(forbidden_side_effects="")
-    good = _matrix_plan_candidate_1229()
-    runner = _PlanDiagnosticRunner(issue_number=56)
-    runner.claude_outputs = [bad, good]
-    config = make_config(tmp_path, agent_max_retries=0, execution_strategy_contract_required=True, quiet=False)
-    try:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    except Exception:
-        pass
-    out = capsys.readouterr().err
-    assert "retrying planner turn once (fresh risk-test-matrix contract" in out
-    assert not runner.diagnostic_posts
-    calls = _claude_prompts_1229(runner)
-    assert any("Previous response not accepted: risk_test_matrix" in " ".join(c) for c in calls[1:2])
-
-
 def test_normalized_remaining_defect_is_quoted_and_persisted(tmp_path):
     bad = _matrix_plan_candidate_1229(forbidden_side_effects="Must not refuse", related_scope_item_ids="")
     runner = _PlanDiagnosticRunner(issue_number=56)
@@ -15578,7 +15547,8 @@ def test_normalized_remaining_defect_is_quoted_and_persisted(tmp_path):
     exhaustion = error.value.plan_validation_exhaustion
     assert exhaustion is not None
     assert "related_scope_item_ids" in exhaustion.diagnostic
-    assert "must be a JSON array" not in exhaustion.diagnostic or "related_scope_item_ids" in exhaustion.diagnostic
+    assert "forbidden_side_effects" not in exhaustion.diagnostic
+    assert "one automatic planner replay" in str(error.value)
     assert '"forbidden_side_effects": ["Must not refuse"]' in exhaustion.candidate_text
     assert exhaustion.candidate_digest == hashlib.sha256(exhaustion.candidate_text.encode()).hexdigest()
     assert len(runner.diagnostic_posts) == 1

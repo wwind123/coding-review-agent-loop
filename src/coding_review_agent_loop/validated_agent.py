@@ -295,6 +295,11 @@ def _run_structured_repair(
             )
             if matrix_normalized is not None:
                 raw = matrix_normalized[0]
+                log(
+                    config,
+                    "repair guard: normalized risk test matrix string field(s) "
+                    f"to one-element list(s): {', '.join(matrix_normalized[1])}",
+                )
             try:
                 require_recoverable_fresh_risk_test_matrix_contract(
                     raw, expected_kind=expected_kind
@@ -2584,6 +2589,11 @@ def _run_validated_agent(
         last_classification_text = "\n".join(
             part for part in (last_classification_text, latest_replay_refusal_detail) if part
         ).strip()
+    if matrix_integrity_replay_used and last_failure_category == "fresh-contract-integrity":
+        last_error = (
+            f"{last_error}; one automatic planner replay was already attempted "
+            "and also failed the fresh risk-test-matrix contract"
+        )
     diagnostics = _failed_run_diagnostics(
         runner=runner,
         config=config,
