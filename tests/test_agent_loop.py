@@ -6893,7 +6893,9 @@ def _orchestrator_tree():
 def test_orchestrator_tree_includes_registered_extracted_modules(monkeypatch):
     monkeypatch.setattr(orchestrator_split_guard, "EXTRACTED_MODULES", ("usage",))
     functions = {node.name for node in _orchestrator_tree().body if isinstance(node, ast.FunctionDef)}
-    assert "run_pr_loop" in functions
+    facade_source = orchestrator_split_guard.module_path("orchestrator").read_text(encoding="utf-8")
+    facade_functions = {node.name for node in ast.parse(facade_source).body if isinstance(node, ast.FunctionDef)}
+    assert facade_functions <= functions
     usage_source = orchestrator_split_guard.module_path("usage").read_text(encoding="utf-8")
     usage_functions = {node.name for node in ast.parse(usage_source).body if isinstance(node, ast.FunctionDef)}
     assert usage_functions and usage_functions <= functions
