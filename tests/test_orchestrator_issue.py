@@ -2299,11 +2299,11 @@ def test_exhausted_plan_validation_persists_from_the_planning_orchestration_path
     ("missing_contract", "agent_max_retries", "expected_planner_calls"),
     [
         ("execution", 0, 1),
-        ("matrix", 0, 1),
+        ("matrix", 0, 2),
         ("execution", 1, 2),
-        ("matrix", 1, 1),
-        ("matrix-malformed", 0, 1),
-        ("matrix-malformed", 1, 1),
+        ("matrix", 1, 2),
+        ("matrix-malformed", 0, 2),
+        ("matrix-malformed", 1, 2),
     ],
 )
 def test_exhausted_fresh_contract_integrity_persists_validation_diagnostic(
@@ -15514,3 +15514,73 @@ def test_all_reviewers_policy_writes_no_digest_or_reset_fields(tmp_path):
     assert not any(
         r.scheduler_issue_digest is not None or r.scheduler_stall_reset for r in records
     )
+
+
+def _matrix_plan_candidate_1229(**row_overrides):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    row = {
+        "row_id": "row-a", "label": "L", "entry_path_or_mode": "m", "initial_state": "i",
+        "event": "e", "expected_outcome": "o",
+        "forbidden_side_effects": ["Must not refuse"],
+        "proposed_test_level": "unit", "proposed_test_location": "tests/x.py",
+        "applicability": "required", "related_scope_item_ids": ["scope-1"],
+        "execution_owner": "one-shot",
+    }
+    row.update(row_overrides)
+    payload["risk_test_matrix"] = {
+        "applicability": "applicable", "rows": [row], "important_exclusions": [],
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _claude_prompts_1229(runner):
+    return [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+
+
+def test_bare_string_matrix_field_is_normalized_without_repair_or_replay(tmp_path, capsys):
+    bare = _matrix_plan_candidate_1229(forbidden_side_effects="Must not refuse")
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [bare]
+    config = make_config(tmp_path, agent_max_retries=0, execution_strategy_contract_required=True, quiet=False)
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except Exception:
+        pass  # later stages are not under test
+    assert len(_claude_prompts_1229(runner)) >= 1
+    assert not runner.diagnostic_posts
+    assert "normalized risk test matrix string field(s)" in capsys.readouterr().err
+
+
+def test_unrecoverable_matrix_replays_planner_once_and_quotes_error(tmp_path, capsys):
+    bad = _matrix_plan_candidate_1229(forbidden_side_effects="")
+    good = _matrix_plan_candidate_1229()
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [bad, good]
+    config = make_config(tmp_path, agent_max_retries=0, execution_strategy_contract_required=True, quiet=False)
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except Exception:
+        pass
+    out = capsys.readouterr().err
+    assert "retrying planner turn once (fresh risk-test-matrix contract" in out
+    assert not runner.diagnostic_posts
+    calls = _claude_prompts_1229(runner)
+    assert any("Previous response not accepted: risk_test_matrix" in " ".join(c) for c in calls[1:2])
+
+
+def test_normalized_remaining_defect_is_quoted_and_persisted(tmp_path):
+    bad = _matrix_plan_candidate_1229(forbidden_side_effects="Must not refuse", related_scope_item_ids="")
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [bad, bad]
+    config = make_config(tmp_path, agent_max_retries=1, execution_strategy_contract_required=True)
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None
+    assert "related_scope_item_ids" in exhaustion.diagnostic
+    assert "must be a JSON array" not in exhaustion.diagnostic or "related_scope_item_ids" in exhaustion.diagnostic
+    assert '"forbidden_side_effects": ["Must not refuse"]' in exhaustion.candidate_text
+    assert exhaustion.candidate_digest == hashlib.sha256(exhaustion.candidate_text.encode()).hexdigest()
+    assert len(runner.diagnostic_posts) == 1
+    assert len(_claude_prompts_1229(runner)) == 2
+    assert error.value.failure_category == "fresh-contract-integrity"

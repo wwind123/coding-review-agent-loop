@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import logging
@@ -1801,6 +1802,47 @@ def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_
 
 def parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_matrix_changes") -> tuple[RiskTestMatrixChange, ...]:
     return _parse_risk_test_matrix_changes(value, context=context)  # shape-check: fatal:no-conservative-reading
+
+
+# Explicit, lossless table of risk-test-matrix list-of-strings fields (same
+# spirit as PLAN_REVIEW_FINDING_KEY_ALIASES, #1169). A lone non-empty string
+# has exactly one correct reading: a one-element list. Strict parsers stay
+# strict because they also validate stored and authenticated matrices.
+RISK_TEST_MATRIX_ROW_STRING_LIST_KEYS = ("forbidden_side_effects", "related_scope_item_ids")
+RISK_TEST_MATRIX_STRING_LIST_KEYS = ("important_exclusions",)
+RISK_TEST_MATRIX_CHANGE_STRING_LIST_KEYS = ("row_ids",)
+
+
+def _wrap_lone_string(container: dict, key: str, path: str, changed: list[str]) -> None:
+    value = container.get(key)
+    if isinstance(value, str) and value.strip():
+        container[key] = [value]
+        changed.append(path)
+
+
+def normalize_risk_test_matrix_string_lists(payload: dict) -> tuple[dict, tuple[str, ...]]:
+    """Return a copy of a plan payload with lone matrix strings wrapped in lists."""
+    result = copy.deepcopy(payload)
+    changed: list[str] = []
+    matrix = result.get("risk_test_matrix")
+    if isinstance(matrix, dict):
+        rows = matrix.get("rows")
+        if isinstance(rows, list):
+            for index, row in enumerate(rows):
+                if isinstance(row, dict):
+                    for key in RISK_TEST_MATRIX_ROW_STRING_LIST_KEYS:
+                        _wrap_lone_string(row, key, f"risk_test_matrix.rows[{index}].{key}", changed)
+        for key in RISK_TEST_MATRIX_STRING_LIST_KEYS:
+            _wrap_lone_string(matrix, key, f"risk_test_matrix.{key}", changed)
+    changes = result.get("risk_test_matrix_changes")
+    if isinstance(changes, dict):
+        changes = changes.get("changes")
+    if isinstance(changes, list):
+        for index, change in enumerate(changes):
+            if isinstance(change, dict):
+                for key in RISK_TEST_MATRIX_CHANGE_STRING_LIST_KEYS:
+                    _wrap_lone_string(change, key, f"risk_test_matrix_changes[{index}].{key}", changed)
+    return result, tuple(changed)
 
 
 def risk_test_matrix_prompt_examples() -> dict[str, object]:

@@ -4969,3 +4969,54 @@ def test_run_validated_agent_salvages_artifact_whose_prose_names_markers(
     assert response.acquisition_outcome == (
         "accepted_timeout" if returncode is None else "accepted_nonzero_exit"
     )
+
+
+# --- #1229: raw-text wrapper for lone-string matrix list fields -------------
+
+from coding_review_agent_loop.repair import attempt_risk_test_matrix_string_list_normalization  # noqa: E402
+
+
+def _bare_string_plan_1229():
+    raw = structured_v1_plan_state()
+    payload, end = json.JSONDecoder().raw_decode(raw.lstrip())
+    payload["risk_test_matrix"] = {
+        "applicability": "applicable",
+        "rows": [{
+            "row_id": "row-a", "label": "L", "entry_path_or_mode": "m", "initial_state": "i",
+            "event": "e", "expected_outcome": "o",
+            "forbidden_side_effects": "Must not refuse",
+            "proposed_test_level": "unit", "proposed_test_location": "tests/x.py",
+            "applicability": "required", "related_scope_item_ids": ["scope-1"],
+            "execution_owner": "one-shot",
+        }],
+        "important_exclusions": [],
+    }
+    return payload, raw.lstrip()[end:]
+
+
+def test_matrix_string_list_wrapper_preserves_envelope_bytes():
+    payload, tail = _bare_string_plan_1229()
+    raw = "lead\n" + json.dumps(payload) + tail
+    result = attempt_risk_test_matrix_string_list_normalization(raw, expected_kind="plan_state")
+    assert result is not None
+    text, paths = result
+    assert paths == ("risk_test_matrix.rows[0].forbidden_side_effects",)
+    assert text.startswith("lead\n") and text.endswith(tail)
+    assert json.loads(text[len("lead\n"):-len(tail)])["risk_test_matrix"]["rows"][0]["forbidden_side_effects"] == ["Must not refuse"]
+
+
+def test_matrix_string_list_wrapper_skips_patch_other_kinds_and_clean_payloads():
+    payload, tail = _bare_string_plan_1229()
+    raw = json.dumps(payload) + tail
+    assert attempt_risk_test_matrix_string_list_normalization(raw, expected_kind="plan_revision_patch") is None
+    assert attempt_risk_test_matrix_string_list_normalization(raw, expected_kind="pr_review") is None
+    clean = structured_v1_plan_state()
+    assert attempt_risk_test_matrix_string_list_normalization(clean, expected_kind="plan_state") is None
+
+
+def test_fresh_matrix_guard_stays_strict_for_unnormalized_bare_string():
+    payload, tail = _bare_string_plan_1229()
+    with pytest.raises(FreshContractIntegrityError):
+        require_recoverable_fresh_risk_test_matrix_contract(
+            json.dumps(payload) + tail, expected_kind="plan_state"
+        )

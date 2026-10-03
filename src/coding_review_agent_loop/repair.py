@@ -36,6 +36,7 @@ from .repair_preservation import (
 from .protocol_markers import scan_reserved_markers
 from .usage import RunUsageContext, estimate_usage
 from .protocol import (
+    normalize_risk_test_matrix_string_lists,
     HUMAN_REQUIREMENTS_RESOLVED_RE,
     PLAN_STATE_RE,
     STATE_RE,
@@ -162,6 +163,32 @@ def unknown_dispositions_are_resolved_history(
             return False
         seen.add(item_id)
     return seen == unknown
+
+
+def attempt_risk_test_matrix_string_list_normalization(
+    raw: str, *, expected_kind: str | None
+) -> tuple[str, tuple[str, ...]] | None:
+    """Wrap lone-string risk matrix list fields, preserving all other bytes.
+
+    Semantic patches are excluded: they must be preserved byte-for-byte.
+    """
+    if expected_kind not in {"plan_state", "plan_revision"}:
+        return None
+    start = len(raw) - len(raw.lstrip())
+    brace = raw.find("{", start)
+    if brace < 0:
+        return None
+    try:
+        payload, json_end = json.JSONDecoder().raw_decode(raw[brace:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    normalized, paths = normalize_risk_test_matrix_string_lists(payload)
+    if not paths:
+        return None
+    new_json = json.dumps(normalized, ensure_ascii=False)
+    return raw[:brace] + new_json + raw[brace + json_end :], paths
 
 
 def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> str | None:
