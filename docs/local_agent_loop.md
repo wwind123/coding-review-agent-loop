@@ -1400,6 +1400,14 @@ and its model fallback chain entirely. The run reports `Failure category:
 semantic-evidence-rejection` with the selector named, rather than a repair
 timeout (#990).
 
+A PR review that leaves a carried prior item without a disposition is missing a
+judgement, not a format, so repair cannot supply it. The same reviewer is
+re-asked once within the same worker, with the same frozen prompt and session
+plus a short note naming the omitted item IDs, under the existing round
+publication barrier. The re-ask uses neither the retry budget nor the Antigravity
+model fallback, and never goes to repair. A second omission stops as before
+(#1167).
+
 Broader handoff atomicity for other envelope failures after a PR is pushed is
 owned by #827 and #828.
 

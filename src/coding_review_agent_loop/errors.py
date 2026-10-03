@@ -105,6 +105,20 @@ class UnknownPriorItemDispositionError(AgentLoopError):
         super().__init__(message)
 
 
+class MissingPriorItemDispositionError(AgentLoopError):
+    """A review left one or more carried prior items without a disposition.
+
+    This is a missing judgement, not a formatting defect: only the reviewer
+    can supply it, so it is re-asked of the reviewer rather than repaired.
+    """
+
+    def __init__(self, missing_ids: tuple[str, ...]) -> None:
+        self.missing_ids = tuple(missing_ids)
+        super().__init__(
+            "Review did not evaluate all prior unresolved items: " + ", ".join(self.missing_ids)
+        )
+
+
 class SemanticPatchPayloadRejection(AgentLoopError):
     """A semantic-patch rejection that names content inside the patch payload.
 
