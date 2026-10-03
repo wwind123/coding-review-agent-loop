@@ -3935,6 +3935,31 @@ def test_build_issue_prompt_carries_explicit_managed_creation_contract(tmp_path)
     assert "agent-loop will dispatch exact-head qualification after review." in plan_prompt
 
 
+def test_managed_creation_command_names_the_configured_base(tmp_path):
+    # A non-default --base must reach the literal `gh pr create` command;
+    # without it gh targets the repository default branch (#1183).
+    from dataclasses import replace
+
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="agent-loop",
+        protection_mode="strict",
+    )
+    config = replace(make_config(tmp_path, managed_ci=True), base="refactor/1181")
+    prompt = build_issue_prompt(56, config, managed_ci_creation_intent=intent)
+    plan_prompt = build_issue_implementation_prompt(
+        56, "1. Implement it.", config, managed_ci_creation_intent=intent,
+    )
+
+    command = (
+        "gh pr create --draft --label agent-loop-managed --body-file <path> "
+        "--base refactor/1181"
+    )
+    assert command in prompt
+    assert command in plan_prompt
+    assert "open a pull request against refactor/1181" in prompt
+
+
 def test_review_prompts_forbid_dispositioning_previously_resolved_items(tmp_path):
     # #862: a secondary audit must not disposition a primary finding that an
     # earlier round already cleared.

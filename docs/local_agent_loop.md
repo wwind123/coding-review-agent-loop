@@ -4284,7 +4284,8 @@ through that account).
 For auto-merge issue work, a v2 preflight gives the coder an atomic creation
 intent: create or verify `agent-loop-managed`, use the reserved
 `agent-loop/managed-<issue>` branch, then run `gh pr create --draft --label
-agent-loop-managed --body-file <path>`. The workflow can suppress later
+agent-loop-managed --body-file <path> --base <base>`, naming the configured base
+explicitly so a non-default `--base` is honoured. The workflow can suppress later
 reopened/synchronize matrices only for the complete tuple: same-repository
 head, trusted REST author, reserved branch, draft, and label. The opening event
 is necessarily evaluated before GitHub's separate label write and therefore

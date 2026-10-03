@@ -310,7 +310,7 @@ def test_coder_docs_require_github_body_files():
     )
     assert "passed with `--body-file`" in text
     assert (
-        "`gh pr create --draft --label agent-loop-managed --body-file <path>`"
+        "`gh pr create --draft --label agent-loop-managed --body-file <path> --base <base>`"
         in normalized_text
     )
 
