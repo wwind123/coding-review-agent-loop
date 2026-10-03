@@ -2562,6 +2562,8 @@ selectively, and validate any reused changes yourself.
 
 def _managed_ci_creation_guidance(
     intent: ManagedCiCreationIntent | None,
+    *,
+    base: str | None,
 ) -> str:
     if intent is None:
         return ""
@@ -2574,10 +2576,13 @@ def _managed_ci_creation_guidance(
             "This is a voluntary gate: GitHub cannot force a later human merge, other automation, "
             "a compromised credential, or an agent-loop defect to use the qualified SHA."
         )
+    # Name the base explicitly: `gh pr create` otherwise targets the repository
+    # default branch, which contradicts a non-default `--base` (#1183).
+    base_flag = f" --base {shlex.quote(base)}" if base else ""
     return (
         "\nThis invocation has authenticated managed-CI v2 enabled. Create the PR atomically: "
         f"use exactly the reserved branch `{intent.branch}`, create or verify the `agent-loop-managed` "
-        "label, then run `gh pr create --draft --label agent-loop-managed --body-file <path>` so it "
+        f"label, then run `gh pr create --draft --label agent-loop-managed --body-file <path>{base_flag}` so it "
         "is born open, draft, "
         "and labeled. Do not create a second PR or apply a readiness transition. Do not mark it ready; "
         f"agent-loop will dispatch exact-head qualification after review.{override}\n"
@@ -2619,7 +2624,9 @@ def build_issue_prompt(
     provenance_guidance = _issue_pr_provenance_guidance(
         IssuePrProvenanceScope(repository=config.repo, issue_number=issue_number, flow="direct")
     )
-    managed_creation_guidance = _managed_ci_creation_guidance(managed_ci_creation_intent)
+    managed_creation_guidance = _managed_ci_creation_guidance(
+        managed_ci_creation_intent, base=config.base
+    )
     return f"""Fix GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout as your workspace. Create a branch, implement the fix,
@@ -3729,7 +3736,9 @@ def build_issue_implementation_prompt(
             approved_plan_hash=plan_context.plan_hash or approved_plan_hash(approved_plan),
         )
     )
-    managed_creation_guidance = _managed_ci_creation_guidance(managed_ci_creation_intent)
+    managed_creation_guidance = _managed_ci_creation_guidance(
+        managed_ci_creation_intent, base=config.base
+    )
     phase_slice = ""
     if plan_context.canonical_text and plan_context.canonical_text.strip() != approved_plan.strip():
         phase_slice = (
