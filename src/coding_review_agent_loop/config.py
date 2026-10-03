@@ -1770,8 +1770,8 @@ def config_from_args(
     gemini_dir = resolve_agent_dir("gemini", args.gemini_dir)
     antigravity_dir = resolve_agent_dir("antigravity", args.antigravity_dir)
     default_checkout_stores = tuple(store_by_agent.items())
-    if worktree_links and not default_checkout_stores:
-        log_message = "--worktree-link is ignored: every agent uses an explicit --<agent>-dir checkout."
+    if worktree_links and not ({args.coder, *configured_reviewers} & set(store_by_agent)):
+        log_message = "--worktree-link is ignored: no active agent uses a default per-run worktree."
         print(log_message, file=sys.stderr)
         worktree_links = ()
     store_roots = tuple(

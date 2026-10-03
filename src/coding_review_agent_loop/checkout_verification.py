@@ -177,7 +177,7 @@ def link_intact(root: Path, link: bytes | str, target: bytes | str) -> bool:
         return False
     try:
         descriptor = _classify(root_fd, os.fsencode(link), _Budget())
-    except OSError:
+    except (OSError, _Incomplete):
         return False
     finally:
         os.close(root_fd)
