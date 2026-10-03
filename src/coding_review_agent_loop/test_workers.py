@@ -1175,10 +1175,16 @@ class WorkerBudgetLock:
                     granted = min(granted, (min(memory_caps) - used) // capacity.per_worker_bytes)
                 granted = max(0, granted)
             self.last_free = granted
-            if others and exclusive:
+            # Exclusive admission waits only on other invocations; a survivor
+            # left by this invocation's own earlier command still reduces the
+            # grant (divide rule) but must never make the run wait on itself.
+            foreign = [data for data in others if data.get("lock") != self.path.name]
+            if foreign and exclusive:
                 self.reservation_token = None
                 self._reservation_data = None
                 return 0
+            if exclusive and others:
+                granted = max(granted, 1)
             if floor > 0:
                 granted = max(granted, floor)
             if granted == 0:

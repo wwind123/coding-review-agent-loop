@@ -568,12 +568,18 @@ def _run_foreground_test_body(
                 tel.set_outcome("degraded")
             else:
                 tel.set_outcome("granted")
-            if wait.timed_out or granted < worker_budget.workers:
+            if granted < worker_budget.workers:
                 admission_notify(
                     f"agent-loop worker budget: waited {wait.waited_seconds:.0f} s (limit {bound:g} s) "
                     f"for the shared test-worker pool ({capacity.describe()}); this command runs "
                     f"with {granted} worker(s) instead of {worker_budget.workers}"
                     + (" (oversubscribed)" if wait.oversubscribed else "")
+                )
+            elif wait.timed_out:
+                admission_notify(
+                    f"agent-loop worker budget: waited {wait.waited_seconds:.0f} s (limit {bound:g} s) "
+                    f"for the shared test-worker pool ({capacity.describe()}); proceeding alongside "
+                    f"the other run with the full {granted} worker(s)"
                 )
             if granted < worker_budget.workers:
                 assert decision is not None

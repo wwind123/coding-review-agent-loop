@@ -1234,3 +1234,68 @@ def test_exclusive_wait_expiry_is_a_timeout_even_when_the_fallback_fits(tmp_path
     finally:
         a.close()
         b.close()
+
+
+# --- review round 6 (#1108) --------------------------------------------------------
+
+
+def test_same_invocation_survivor_never_makes_the_next_command_wait(tmp_path):
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    root = tmp_path / "locks"
+    pid_file = tmp_path / "escaped.pid"
+    script = (
+        "import subprocess, sys; "
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True); "
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))"
+    )
+    first = run_foreground_test(
+        [sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=30, env=_env("same-inv"),
+        environment_is_complete=True, echo_output=False, worker_budget=_budget(4), worker_lock_root=root,
+    )
+    escaped = int(pid_file.read_text())
+    try:
+        assert first.returncode == 0 and _pid_alive(escaped) and len(_records(root)) == 1
+        log, tel = _telemetry(tmp_path)
+        started = time.monotonic()
+        # A long bound: the old exclusive rule would wait ~for it on its own survivor.
+        second = _run(tmp_path, root, tel, env=_env("same-inv", wait=60), cmd=_PRINTER)
+        assert time.monotonic() - started < 15
+        assert second.returncode == 0 and "is busy" not in second.output_tail
+        (row,) = _attempts(log)
+        assert row["reservation_wait_seconds"] == 0.0 and row["wait_timed_out"] is False
+        assert row["workers_granted"] <= 1  # the survivor still reduces the grant
+        # A different invocation still waits (exclusive) for that same survivor.
+        other = _lock(root, "other-inv")
+        try:
+            assert other.reserve_host_workers(4, _cpus(4), exclusive=True) == 0
+        finally:
+            other.close()
+    finally:
+        try:
+            os.kill(escaped, 9)
+        except ProcessLookupError:
+            pass
+
+
+def test_timed_out_full_grant_notice_does_not_say_instead_of(tmp_path, monkeypatch):
+    _fast(monkeypatch)
+    root = tmp_path / "locks"
+    other = _lock(root, "other-loop")
+    big = HostCapacity(8, 1024 * GIB, GIB)
+    import coding_review_agent_loop.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "host_capacity", lambda _b: big)
+    assert other.reserve_host_workers(4, big) == 4
+    notices = []
+    try:
+        _, tel = _telemetry(tmp_path)
+        result = _run(
+            tmp_path, root, tel, env=_env("mine", wait=0.3), cmd=_PRINTER,
+            output_callback=notices.append,
+        )
+    finally:
+        other.close()
+    assert "workers=4" in result.output_tail
+    assert any("proceeding alongside the other run with the full 4 worker(s)" in text for text in notices)
+    assert not any("instead of" in text for text in notices)
