@@ -249,8 +249,11 @@ def _order(runner, binary):
 
 
 def _spy_transitions():
-    from coding_review_agent_loop.agents.antigravity import AntigravityAttemptState
+    # Patch the class object validated_agent actually uses: other tests may reload
+    # the antigravity module, leaving a differently-identified class behind.
+    from coding_review_agent_loop import validated_agent
 
+    AntigravityAttemptState = validated_agent.AntigravityAttemptState
     transitions: list[int] = []
     real = AntigravityAttemptState.next_after_failure
 
