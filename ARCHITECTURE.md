@@ -95,7 +95,7 @@ Source paths below are relative to
 | Responsibility | Main source files | Boundary |
 | --- | --- | --- |
 | Entry points and effective configuration | `cli.py`, `config.py` | Parse modes; resolve role-specific models, effort, base, and policy before invocation. |
-| Lifecycle coordination | `orchestrator.py`, `agent_failure.py` | Compose planning, implementation, review, recovery, and finalization; do not delegate control decisions to free-form agent prose. |
+| Lifecycle coordination | `orchestrator.py`, `agent_failure.py`, `architecture_contract.py` | Compose planning, implementation, review, recovery, and finalization; do not delegate control decisions to free-form agent prose. |
 | Checkout identity | `workdirs.py`, `workdir_guard.py`, `workdir_claims.py`, `checkout_verification.py` | Prepare assigned checkouts and validate repository/head and reported test locations. `workdir_claims.py` holds a run-scoped cross-process claim on each required checkout (plus a claim probe and run-end finalizers); cleanup and reset happen only under this run's claim. `run_worktrees.py` creates, prunes and removes the per-run worktrees over the shared store. `checkout_verification.py` is the in-process pre-turn gate: it verifies that an assigned checkout still matches what agent-loop last left in it. |
 | Agent-facing context | `prompts.py`, `memory.py` | Render issue/plan/human/feedback context and advisory repository orientation. |
 | Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
