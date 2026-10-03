@@ -4653,8 +4653,11 @@ def _expect_optional_string_list(
 # flattened mechanically, in this fixed order, into one finding string that
 # keeps every supplied prose value verbatim, so no model repair is needed and
 # no qualifier can be lost.  Identifier keys are dropped: they are the
-# reviewer's local labels, not orchestrator item IDs.  Unknown keys and
-# non-string values are still rejected.
+# reviewer's local labels, not orchestrator item IDs.  Reference keys (#1230)
+# are the exception: the plan renderer shows scope/stage/constraint/row IDs to
+# reviewers, and they name which plan requirement a finding concerns, so they
+# are folded into the text as labelled lines instead of dropped.  Unknown keys
+# and non-string values are still rejected.
 PLAN_REVIEW_FINDING_TEXT_FIELDS: tuple[tuple[str, str], ...] = (
     ("title", ""),
     ("text", ""),
@@ -4671,6 +4674,24 @@ PLAN_REVIEW_FINDING_TEXT_FIELDS: tuple[tuple[str, str], ...] = (
     ("suggested_fix", "Suggested fix"),
 )
 PLAN_REVIEW_FINDING_ID_FIELDS = frozenset({"item_id", "id"})
+PLAN_REVIEW_FINDING_REFERENCE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("scope_item_ids", "Scope items"),
+    ("scope_item_id", "Scope items"),
+    ("covered_scope_item_ids", "Covered scope items"),
+    ("stage_ids", "Stages"),
+    ("stage_id", "Stages"),
+    ("constraint_ids", "Coupling constraints"),
+    ("constraint_id", "Coupling constraints"),
+    ("row_ids", "Matrix rows"),
+    ("row_id", "Matrix rows"),
+)
+# Rendered plan identifier keys deliberately not accepted on findings.
+PLAN_REVIEW_FINDING_EXCLUDED_RENDERED_KEYS = frozenset(
+    {
+        # A stage-to-stage plan relation, not a finding reference; use stage_ids.
+        "depends_on_stage_ids",
+    }
+)
 # Explicit, unambiguous key aliases (#1169): each alias is renamed to its one
 # canonical key before validation, so a synonym spelling needs no model repair.
 # Extend this table when a new model adopts a new spelling; there is no fuzzy
@@ -4703,9 +4724,11 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
         raise AgentLoopError(f"{item_context} must be a string or a finding object.")  # shape-check: fatal:no-conservative-reading
     raw = _normalize_plan_review_finding_key_aliases(raw, item_context=item_context)
     text_fields = {name for name, _label in PLAN_REVIEW_FINDING_TEXT_FIELDS}
-    unknown = sorted(set(raw) - text_fields - PLAN_REVIEW_FINDING_ID_FIELDS - {"sub_items"})
+    reference_fields = {name for name, _label in PLAN_REVIEW_FINDING_REFERENCE_FIELDS}
+    accepted = text_fields | reference_fields | PLAN_REVIEW_FINDING_ID_FIELDS | {"sub_items"}
+    unknown = sorted(set(raw) - accepted)
     if unknown:
-        allowed = ", ".join(sorted(text_fields | PLAN_REVIEW_FINDING_ID_FIELDS | {"sub_items"}))
+        allowed = ", ".join(sorted(accepted))
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             f"{item_context} has unsupported finding key(s) {', '.join(unknown)}; "
             f"use a string or an object with only: {allowed}."
@@ -4721,6 +4744,20 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
         parts.append(f"{label}: {value}" if label else value)
     if not parts:
         raise AgentLoopError(f"{item_context} finding object has no text field.")  # shape-check: fatal:no-conservative-reading
+    for name, label in PLAN_REVIEW_FINDING_REFERENCE_FIELDS:
+        if name not in raw:
+            continue
+        reference = raw[name]
+        if isinstance(reference, str):
+            references = [_expect_non_empty_string(reference, context=f"{item_context}.{name}").strip()]  # shape-check: fatal:no-conservative-reading
+        elif isinstance(reference, list) and reference:
+            references = [
+                _expect_non_empty_string(entry, context=f"{item_context}.{name}[{position}]").strip()  # shape-check: fatal:no-conservative-reading
+                for position, entry in enumerate(reference)
+            ]
+        else:
+            raise AgentLoopError(f"{item_context}.{name} must be a non-empty string or a non-empty JSON array of strings.")  # shape-check: fatal:no-conservative-reading
+        parts.append(f"{label}: {', '.join(references)}")
     if "sub_items" in raw:
         # Plan reviews get no ledger structure (#958): well-formed statements
         # are flattened into the finding text with nothing lost.

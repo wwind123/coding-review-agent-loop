@@ -5107,6 +5107,18 @@ label); the local labels are dropped. No repair model runs for this shape, so a
 container-type mismatch can no longer discard a well-grounded review. Unknown
 keys and non-string values are still rejected.
 
+A finding object may also cite the plan IDs the plan renderer shows reviewers
+(#1230): `scope_item_ids`/`scope_item_id` (label `Scope items`),
+`covered_scope_item_ids` (`Covered scope items`), `stage_ids`/`stage_id`
+(`Stages`), `constraint_ids`/`constraint_id` (`Coupling constraints`) and
+`row_ids`/`row_id` (`Matrix rows`). Each value is one non-empty string or a
+non-empty array of non-empty strings. They are folded losslessly, in that order
+after the text fields and before `Sub-items:`, as lines such as
+`Scope items: scope-1, scope-3`. IDs are not checked against the scope ledger,
+so unknown IDs never fail. A finding with only reference keys still has no text
+field and is rejected. `depends_on_stage_ids` is deliberately not accepted
+(it is a stage-to-stage relation; use `stage_ids`).
+
 When a structured response is recognized but fails schema validation, the
 terminal error leads with the validation reason and reports `Failure category:
 schema-validation`: the rejection is deterministic for that output, but model
