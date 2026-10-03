@@ -9070,10 +9070,7 @@ def _preflight_fresh_split_topology(
                     )
                 comment_keys.add(key)
 
-    searches = (
-        f'"(from #{issue_number})" in:title',
-        f'"[#{issue_number} stage]" in:title',
-    )
+    searches = parent_child_search_queries(issue_number)
     found_keys: dict[str, tuple[int | None, str | None]] = {}
     for search in searches:
         for candidate in search_issues(
