@@ -4255,3 +4255,95 @@ def test_m1068_supersession_posted_during_review_stops_before_an_evidence_freeze
     assert not any(
         "Attach the authenticated live-CLI run" in body for body in world.runner.comments
     )
+
+
+# --- #1207: staged rerun finds children whose titles were truncated ---------
+
+def _long_title_rerun_1207(tmp_path, *, bodyless_search):
+    from coding_review_agent_loop.decomposition import (
+        EXECUTION_TOPOLOGY_SOURCE, _legacy_phase_issue_title,
+    )
+    from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
+
+    plan = fresh_staged_plan()
+    plan = plan.replace('"title": "First contract"', '"title": "First contract ' + "a" * 130 + '"')
+    plan = plan.replace('"title": "Second contract"', '"title": "Second contract ' + "b" * 130 + '"')
+    plan_hash = approved_plan_hash(plan)
+    payload, _end = json.JSONDecoder().raw_decode(plan)
+    recommendation = parse_execution_recommendation_payload(
+        payload["execution_recommendation"], context="test recommendation"
+    )
+    normalized, retained = normalize_execution_recommendation(
+        recommendation, approved_plan=plan, plan_subject=_plan_subject(plan)
+    )
+    children = {}
+    for index, phase in enumerate(normalized.phases, start=1):
+        number = 70 + index
+        identity = phase_identity(
+            parent_issue=55, plan_hash=plan_hash, topology_source=EXECUTION_TOPOLOGY_SOURCE,
+            phase_index=index, phase=phase, stage_id=phase.stage_id,
+            execution_strategy_contract_version=normalized.execution_strategy_contract_version,
+        )
+        body = format_phase_issue_body(
+            repo="OWNER/REPO", parent_issue=55, approved_plan=plan, phase=phase,
+            created_so_far=(), phase_identity_value=identity,
+            topology_source=EXECUTION_TOPOLOGY_SOURCE, phase_index=index,
+            phase_plan_hash=plan_hash, strategy=normalized.strategy,
+            recommendation_digest=normalized.recommendation_digest,
+            execution_strategy_contract_version=normalized.execution_strategy_contract_version,
+        )
+        children[number] = {
+            "number": number,
+            "title": _legacy_phase_issue_title(55, index, phase),
+            "url": f"https://github.com/OWNER/REPO/issues/{number}",
+            "body": body,
+        }
+        assert "(from #55)" not in children[number]["title"]
+    created = tuple(
+        CreatedPhaseIssue(phase, children[70 + i]["url"], 70 + i)
+        for i, phase in enumerate(normalized.phases, start=1)
+    )
+    summary = format_decomposition_parent_summary(
+        parent_issue=55, mode="implement-by-phase", plan_hash=plan_hash, created=created,
+        topology_source=EXECUTION_TOPOLOGY_SOURCE, retained_parent_scope=retained,
+        final_integration_work=normalized.final_integration_work,
+        strategy=normalized.strategy,
+        execution_strategy_contract_version=normalized.execution_strategy_contract_version,
+        recommendation_digest=normalized.recommendation_digest,
+        plan_subject=_plan_subject(plan),
+    )
+    parent = IssueContext(
+        number=55, repo="OWNER/REPO", title="Issue", body="Body",
+        url="https://github.com/OWNER/REPO/issues/55",
+        comments=(comment(plan_record(plan)), comment(summary)),
+    )
+    search = (
+        [{**child, "body": None} for child in children.values()] if bodyless_search else []
+    )
+    runner = FakeRunner(search_issues_payload=search, issue_payloads_by_number=children)
+    return runner, plan, parent, normalized, retained, created
+
+
+@pytest.mark.parametrize("bodyless_search", [False, True])
+def test_rerun_preflight_finds_children_with_truncated_titles(
+    tmp_path, monkeypatch, bodyless_search
+):
+    """#1207: legacy 120-char titles missing from search do not wedge the rerun."""
+    runner, plan, parent, normalized, retained, created = _long_title_rerun_1207(
+        tmp_path, bodyless_search=bodyless_search
+    )
+    monkeypatch.setattr(
+        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    )
+
+    result = orchestrator._preflight_fresh_staged_topology(
+        runner, issue_number=55, approved_plan=plan,
+        config=make_config(tmp_path), issue_context=parent,
+        mode="implement-by-phase", normalized_topology=(normalized, retained),
+    )
+
+    assert [(c.issue_url, c.issue_number) for c in result] == [
+        (c.issue_url, c.issue_number) for c in created
+    ]
+    assert [c.origin for c in result] == ["adopted", "adopted"]
+    assert not runner.issues

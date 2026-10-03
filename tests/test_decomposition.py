@@ -4067,7 +4067,11 @@ _LONG_TITLE_1207 = "Extract architecture_contract.py " + "architecture-impact he
 def _long_topology_1207(plan: str):
     topology = _fresh_recovery_topology(plan)
     phases = tuple(
-        dataclasses.replace(phase, title=f"{_LONG_TITLE_1207}{index}")
+        dataclasses.replace(
+            phase,
+            title=f"{_LONG_TITLE_1207}{index}",
+            depends_on=tuple(f"{_LONG_TITLE_1207}1" for _ in phase.depends_on),
+        )
         for index, phase in enumerate(topology.phases, start=1)
     )
     return dataclasses.replace(topology, phases=phases)
@@ -4304,3 +4308,245 @@ def test_get_issue_found_dry_run_returns_none(tmp_path):
     assert get_issue_found(runner, config=make_config(tmp_path, dry_run=True), issue_number=800) is None
     live = get_issue_found(runner, config=make_config(tmp_path), issue_number=800)
     assert live is not None and live.number == 800 and live.body == "b"
+
+
+def _call_1207(runner, tmp_path, topology, plan, *, comments=(), source="approved-plan-v1",
+               preflight_only=False, dry_run=False, **config_overrides):
+    config = make_config(tmp_path, dry_run=dry_run, **config_overrides) if (
+        dry_run or config_overrides
+    ) else make_config(tmp_path)
+    kwargs = {}
+    if source == "approved-plan-v1":
+        kwargs = dict(
+            strategy="staged",
+            execution_strategy_contract_version=1,
+            recommendation_digest="recommendation-digest",
+        )
+    return create_decomposition_child_issues(
+        runner,
+        config=config,
+        parent_issue=56,
+        approved_plan=plan,
+        decomposition=topology,
+        topology_source=source,
+        issue_comments=comments,
+        mode="implement-by-phase",
+        preflight_only=preflight_only,
+        **kwargs,
+    )
+
+
+def test_crash_recovery_adopts_body_search_child_and_creates_only_missing_phase(tmp_path):
+    plan = "Approved fresh staged plan"
+    topology = _long_topology_1207(plan)
+    existing = _legacy_child_1207(topology.phases[0], plan, 901)
+    runner = FakeRunner(
+        search_issues_payload=[[], [], [existing]],
+        issue_urls=["https://github.com/OWNER/REPO/issues/902"],
+    )
+
+    recovered = _call_1207(runner, tmp_path, topology, plan)
+
+    assert [item.origin for item in recovered] == ["adopted", "created"]
+    assert [item.issue_number for item in recovered] == [901, 902]
+    assert len(runner.issues) == 1
+    assert runner.issues[0]["title"] == _phase_issue_title(56, 2, topology.phases[1])
+    # The adopted child keeps its legacy title: nothing edits or renames it.
+    assert not any(cmd[:3] == ["gh", "issue", "edit"] for cmd, _cwd in runner.commands)
+
+
+def test_new_long_title_child_is_created_bounded_and_rediscovered_by_title_search(tmp_path):
+    plan = "Approved fresh staged plan"
+    topology = _long_topology_1207(plan)
+    runner = FakeRunner(
+        search_issues_payload=[],
+        issue_urls=[
+            "https://github.com/OWNER/REPO/issues/910",
+            "https://github.com/OWNER/REPO/issues/911",
+        ],
+    )
+
+    created = _call_1207(runner, tmp_path, topology, plan)
+
+    assert [item.origin for item in created] == ["created", "created"]
+    submitted = [issue["title"] for issue in runner.issues]
+    assert len(submitted) == 2
+    for title in submitted:
+        assert len(title) <= PHASE_ISSUE_TITLE_LIMIT
+        assert title.endswith(" (from #56)")
+
+    # A rerun whose title search returns the created issues adopts them.
+    rerun_children = [
+        {
+            "number": 910 + index,
+            "title": issue["title"],
+            "url": f"https://github.com/OWNER/REPO/issues/{910 + index}",
+            "body": issue["body"],
+        }
+        for index, issue in enumerate(runner.issues)
+    ]
+    rerun = FakeRunner(search_issues_payload=rerun_children)
+    recovered = _call_1207(rerun, tmp_path, topology, plan, preflight_only=True)
+    assert [item.origin for item in recovered] == ["adopted", "adopted"]
+    assert [item.issue_number for item in recovered] == [910, 911]
+    assert not rerun.issues
+
+
+def _foreign_child_1207(phase, plan, number):
+    other = 99
+    identity = phase_identity(
+        parent_issue=other,
+        plan_hash=approved_plan_hash(plan),
+        topology_source="approved-plan-v1",
+        phase_index=phase.position,
+        phase=phase,
+        stage_id=phase.stage_id,
+        execution_strategy_contract_version=1,
+    )
+    body = format_phase_issue_body(
+        repo="OWNER/REPO",
+        parent_issue=other,
+        approved_plan=plan,
+        phase=phase,
+        created_so_far=(),
+        phase_identity_value=identity,
+        topology_source="approved-plan-v1",
+        phase_index=phase.position,
+        phase_plan_hash=approved_plan_hash(plan),
+        strategy="staged",
+        recommendation_digest="recommendation-digest",
+        execution_strategy_contract_version=1,
+    )
+    return {
+        "number": number,
+        "title": _legacy_phase_issue_title(56, phase.position, phase),
+        "url": f"https://github.com/OWNER/REPO/issues/{number}",
+        "body": body,
+    }
+
+
+@pytest.mark.parametrize("through", ["search", "recorded"])
+def test_foreign_parent_child_with_identical_legacy_title_is_not_adopted(tmp_path, through):
+    plan = "Approved fresh staged plan"
+    topology = _long_topology_1207(plan)
+    foreign = _foreign_child_1207(topology.phases[0], plan, 950)
+    comments = ()
+    search = []
+    by_number = {}
+    if through == "search":
+        search = [foreign]
+    else:
+        by_number = {950: foreign}
+        comments = (
+            _summary_comment_1207(
+                topology, plan, [foreign, _legacy_child_1207(topology.phases[1], plan, 951)]
+            ),
+        )
+    runner = FakeRunner(search_issues_payload=search, issue_payloads_by_number=by_number)
+
+    recovered = _call_1207(
+        runner, tmp_path, topology, plan, comments=comments, preflight_only=True,
+        flat_child_limit=2,
+    )
+
+    assert all(item.issue_number != 950 for item in recovered)
+    assert not runner.issues
+
+
+def test_foreign_parent_child_with_identical_legacy_title_is_not_adopted_non_fresh(tmp_path):
+    plan = "Approved plan"
+    topology = _long_topology_1207(plan)
+    foreign = _foreign_child_1207(topology.phases[0], plan, 960)
+    runner = FakeRunner(search_issues_payload=[foreign])
+
+    recovered = _call_1207(
+        runner, tmp_path, topology, plan, source="model", preflight_only=True,
+        flat_child_limit=2,
+    )
+
+    assert all(item.issue_number != 960 for item in recovered)
+    assert not runner.issues
+
+
+def _model_summary_1207(topology, plan, number_by_index):
+    created = [
+        CreatedPhaseIssue(
+            phase=phase,
+            issue_url=f"https://github.com/OWNER/REPO/issues/{number_by_index[i]}",
+            issue_number=number_by_index[i],
+        )
+        for i, phase in enumerate(topology.phases, start=1)
+    ]
+    return _NS1207(
+        body=format_decomposition_parent_summary(
+            parent_issue=56,
+            mode="implement-by-phase",
+            plan_hash=approved_plan_hash(plan),
+            created=created,
+        )
+    )
+
+
+@pytest.mark.parametrize("variant", ["no-identity", "foreign-parent", "unreadable"])
+def test_non_fresh_recorded_references_without_valid_identity_are_not_adopted(tmp_path, variant):
+    plan = "Approved plan"
+    topology = _long_topology_1207(plan)
+    phase = topology.phases[0]
+    by_number = {}
+    if variant == "no-identity":
+        by_number[970] = {
+            "number": 970,
+            "title": _phase_issue_title(56, 1, phase),
+            "url": "https://github.com/OWNER/REPO/issues/970",
+            "body": "Mentions #56 but carries no phase identity.",
+        }
+    elif variant == "foreign-parent":
+        by_number[970] = _foreign_child_1207(phase, plan, 970)
+    comments = (_model_summary_1207(topology, plan, {1: 970, 2: 971}),)
+    runner = FakeRunner(search_issues_payload=[], issue_payloads_by_number=by_number)
+
+    recovered = _call_1207(
+        runner, tmp_path, topology, plan, comments=comments, source="model",
+        preflight_only=True, flat_child_limit=5,
+    )
+
+    assert all(item.issue_number not in {970} for item in recovered)
+    assert recovered[0].origin != "adopted"
+    assert not runner.issues
+
+
+def test_duplicate_search_and_recorded_hit_fits_exact_child_limit(tmp_path):
+    plan = "Approved fresh staged plan"
+    topology = _fresh_recovery_topology(plan)
+    children = [_fresh_child_issue(p, plan, 980 + i) for i, p in enumerate(topology.phases)]
+    runner = FakeRunner(
+        search_issues_payload=children,
+        issue_payloads_by_number={child["number"]: child for child in children},
+    )
+    comments = (_summary_comment_1207(topology, plan, children),)
+
+    recovered = _call_1207(
+        runner, tmp_path, topology, plan, comments=comments, preflight_only=True,
+        flat_child_limit=len(topology.phases),
+    )
+
+    assert [item.origin for item in recovered] == ["adopted", "adopted"]
+
+
+def test_dry_run_recovery_makes_no_issue_view_reads_or_adoptions(tmp_path):
+    plan = "Approved fresh staged plan"
+    topology = _long_topology_1207(plan)
+    children = [_legacy_child_1207(p, plan, 990 + i) for i, p in enumerate(topology.phases)]
+    runner = FakeRunner(
+        search_issues_payload=[],
+        issue_payloads_by_number={child["number"]: child for child in children},
+    )
+    comments = (_summary_comment_1207(topology, plan, children),)
+
+    recovered = _call_1207(
+        runner, tmp_path, topology, plan, comments=comments, preflight_only=True, dry_run=True
+    )
+
+    assert all(item.origin != "adopted" for item in recovered)
+    assert not any(cmd[:3] == ["gh", "issue", "view"] for cmd, _cwd in runner.commands)
+    assert not runner.issues
